@@ -46,9 +46,10 @@ test("each direction has its own independently rendered interface", async () => 
 });
 
 test("ships the engine and a project-bound social card", async () => {
-  const [demo, layout, engine] = await Promise.all([
+  const [demo, layout, stylesheet, engine] = await Promise.all([
     readFile(new URL("../app/ui-demo.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../engine/scraper.py", import.meta.url), "utf8"),
   ]);
   for (const component of ["CommandUI", "PaperUI", "AuroraUI", "TerminalUI", "BentoUI"]) {
@@ -57,7 +58,7 @@ test("ships the engine and a project-bound social card", async () => {
   assert.match(layout, /\/og\.png/);
   assert.match(engine, /__version__ = "3\.3\.2"/);
   await access(new URL("../public/og.png", import.meta.url));
-  await access(new URL("../public/media/86-backdrop.jpg", import.meta.url));
-  await access(new URL("../public/media/86-poster.jpg", import.meta.url));
+  assert.doesNotMatch(demo, /86-不存在|EIGHTY SIX/);
+  assert.doesNotMatch(stylesheet, /media\/86-/);
   await assert.rejects(access(new URL("../app/_sites-preview", root)));
 });

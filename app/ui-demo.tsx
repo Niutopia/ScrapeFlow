@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-const defaultPath = "/quark/影视/番剧/86不存.ZDZQ 全2季 1080P";
+const defaultPath = "/quark/影视/番剧/待整理目录";
 const stages = ["读取目录", "识别媒体", "解析压缩包", "生成计划"];
 
 function useScrapeDemo() {
@@ -34,7 +34,7 @@ export function CommandUI() {
       <header className="infuse-nav"><a href="/" className="media-brand"><i>SF</i><b>ScrapeFlow</b></a><nav><button className="active">刮削</button><button>任务</button><button>资料库</button></nav><StatusDot /></header>
       <section className="infuse-content">
         <Back number="01" label="INFUSE DIRECTION" />
-        <div className="infuse-title"><span>MEDIA AUTOMATION</span><h1>86-不存在的战区-</h1><p>2021&nbsp;&nbsp;·&nbsp;&nbsp;TV&nbsp;&nbsp;·&nbsp;&nbsp;23 集&nbsp;&nbsp;·&nbsp;&nbsp;TMDB 8.1</p></div>
+        <div className="infuse-title"><span>MEDIA AUTOMATION</span><h1>把目录变成媒体库</h1><p>AList&nbsp;&nbsp;·&nbsp;&nbsp;TMDB&nbsp;&nbsp;·&nbsp;&nbsp;Infuse 标准命名</p></div>
         <div className="infuse-command">
           <label><small>ALIST 媒体路径</small><input value={d.path} onChange={e => d.setPath(e.target.value)} /></label>
           <button onClick={d.start} disabled={d.running}><i>{d.running ? "•••" : "▶"}</i><span>{d.running ? stages[Math.min(d.stage, 3)] : d.stage === 4 ? "重新分析" : "开始刮削"}</span></button>
@@ -64,10 +64,10 @@ export function PaperUI() {
 export function AuroraUI() {
   const d = useScrapeDemo();
   const rows = [
-    ["[桜都字幕组] EIGHTY SIX [01-23 Fin v2]", "文件夹", "17.6 GB", "待分析"],
-    ["EIGHTY SIX [01-23].7z.001", "分卷压缩包", "2.15 GB", "检测到密码"],
-    ["EIGHTY SIX [01-23].7z.002", "分卷压缩包", "2.15 GB", "关联分卷"],
-    ["密码：ruach@66", "文件夹", "—", "密码候选"],
+    ["[字幕组] 番剧合集 [01-24] 1080P", "文件夹", "18.4 GB", "待分析"],
+    ["Anime.Collection.7z.001", "分卷压缩包", "2.15 GB", "检测到密码"],
+    ["Anime.Collection.7z.002", "分卷压缩包", "2.15 GB", "关联分卷"],
+    ["密码说明", "文件夹", "—", "密码候选"],
   ];
   return (
     <main className="nas-ui" data-ui="03-synology">
@@ -87,10 +87,34 @@ export function TerminalUI() {
   const d = useScrapeDemo();
   return (
     <main className="emby-ui" data-ui="04-emby">
-      <aside className="emby-side"><a href="/" className="emby-logo"><i>▶</i><b>ScrapeFlow</b></a><Back number="04" label="EMBY DIRECTION" /><nav><span>媒体</span><button className="active">⌂&nbsp; 控制台</button><button>＋&nbsp; 新建刮削</button><button>▦&nbsp; 媒体库</button><span>管理</span><button>◷&nbsp; 活动记录</button><button>☷&nbsp; 计划审核</button><button>⚙&nbsp; 设置</button></nav><footer><span>N</span><div><b>niutopia</b><small>管理员</small></div></footer></aside>
-      <section className="emby-main"><header><div><h1>媒体控制台</h1><p>欢迎回来。今天有 1 个目录等待整理。</p></div><StatusDot /></header>
-        <section className="emby-launch"><div className="emby-poster" /><div className="emby-info"><span>NEW SCRAPE</span><h2>86-不存在的战区-</h2><p>检测到分卷压缩包与密码文件夹。输入或确认路径，ScrapeFlow 将生成审核计划。</p><label><input value={d.path} onChange={e => d.setPath(e.target.value)} /><button onClick={d.start} disabled={d.running}>{d.running ? "处理中" : "开始分析"}</button></label></div><div className="emby-score"><small>TMDB 匹配</small><b>{d.stage === 4 ? "98%" : "—"}</b><span>{d.stage === 4 ? "高置信度" : "等待分析"}</span></div></section>
-        <section className="emby-panels"><article><header><b>处理进度</b><span>{d.stage}/4</span></header>{stages.map((stage, i) => <div className={d.stage > i ? "done" : d.running && d.stage === i ? "live" : ""} key={stage}><i>{d.stage > i ? "✓" : i + 1}</i><span><b>{stage}</b><small>{["识别目录内容", "查找官方资料", "组合并展开分卷", "准备重命名清单"][i]}</small></span><em>{d.stage > i ? "完成" : "等待"}</em></div>)}</article><article className="emby-activity"><header><b>最近活动</b><button>全部记录</button></header><p><i className="green" /><span><b>AList 连接成功</b><small>刚刚 · 12ms</small></span></p><p><i /><span><b>等待新的整理任务</b><small>安全计划模式</small></span></p>{d.stage === 4 && <p><i className="green" /><span><b>计划生成完成</b><small>94 项文件操作待审核</small></span></p>}</article></section>
+      <aside className="emby-side">
+        <a href="/" className="emby-logo"><i>▶</i><b>ScrapeFlow</b><small>MEDIA SERVER</small></a>
+        <Back number="04" label="EMBY DIRECTION" />
+        <nav><span>主要功能</span><button className="active">⌂<b>控制台</b></button><button>＋<b>新建刮削</b></button><button>▦<b>媒体库</b><em>1</em></button><span>系统管理</span><button>◷<b>活动记录</b></button><button>☷<b>计划审核</b><em className="review">3</em></button><button>⚙<b>偏好设置</b></button></nav>
+        <div className="emby-engine"><i /><span><b>整理引擎</b><small>3.3.2 · 工作正常</small></span></div>
+        <footer><span>N</span><div><b>niutopia</b><small>服务器管理员</small></div><i>···</i></footer>
+      </aside>
+      <section className="emby-main">
+        <header className="emby-topbar"><div className="emby-search">⌕<span>搜索媒体、任务或文件路径</span><kbd>⌘ K</kbd></div><button>◷</button><button>♧</button><StatusDot /><span className="emby-top-avatar">N</span></header>
+        <div className="emby-welcome"><div><span>SCRAPEFLOW DASHBOARD</span><h1>媒体服务器</h1><p>从一个 AList 路径开始，自动完成识别、解压与标准化整理。</p></div><div className="emby-date"><small>服务器时间</small><b>07:56</b><span>2026 / 07 / 18</span></div></div>
+        <section className="emby-hero">
+          <div className="emby-art" aria-hidden="true"><i className="reel one" /><i className="reel two" /><i className="play">▶</i><span>SCRAPEFLOW</span></div>
+          <div className="emby-hero-copy"><span>NEW SCRAPE JOB</span><h2>开始整理新的媒体目录</h2><p>粘贴 AList 路径。系统会先读取目录并生成审核计划，不会直接移动或删除文件。</p>
+            <label className="emby-path"><i>⌁</i><div><small>ALIST SOURCE PATH</small><input aria-label="AList 媒体路径" value={d.path} onChange={e => d.setPath(e.target.value)} /></div><button>浏览</button></label>
+            <div className="emby-hero-actions"><button className="emby-start" onClick={d.start} disabled={d.running}><i>{d.running ? "•••" : "▶"}</i>{d.running ? stages[Math.min(d.stage, 3)] : d.stage === 4 ? "重新生成计划" : "分析并生成计划"}</button><span><i>✓</i> 安全计划模式</span><span><i>✓</i> 保留原压缩包</span></div>
+          </div>
+        </section>
+        <section className="emby-stats">
+          <article><i className="mint">▦</i><span><small>发现视频</small><b>{d.stage === 4 ? "24" : "—"}</b></span><em>{d.stage === 4 ? "+24" : "等待"}</em></article>
+          <article><i className="blue">CC</i><span><small>匹配字幕</small><b>{d.stage === 4 ? "48" : "—"}</b></span><em>{d.stage === 4 ? "100%" : "等待"}</em></article>
+          <article><i className="amber">▱</i><span><small>压缩分卷</small><b>{d.stage > 2 ? "7" : "—"}</b></span><em>{d.stage > 2 ? "可展开" : "等待"}</em></article>
+          <article><i className="violet">✓</i><span><small>计划操作</small><b>{d.stage === 4 ? "96" : "—"}</b></span><em>{d.stage === 4 ? "待审核" : "等待"}</em></article>
+        </section>
+        <section className="emby-workgrid">
+          <article className="emby-progress-panel"><header><div><b>本次处理流程</b><small>{d.running ? "任务正在运行" : d.stage === 4 ? "计划生成完成" : "尚未启动"}</small></div><span>{d.stage}/4</span></header><div className="emby-progressbar"><i style={{ width: `${d.stage * 25}%` }} /></div>{stages.map((stage, i) => <div className={`emby-step ${d.stage > i ? "done" : d.running && d.stage === i ? "live" : ""}`} key={stage}><i>{d.stage > i ? "✓" : i + 1}</i><span><b>{stage}</b><small>{["盘点视频、字幕与压缩分卷", "匹配 TMDB 标题、年份和季数", "读取密码并校验解压目标", "准备重命名、移动与海报清单"][i]}</small></span><em>{d.stage > i ? "完成" : d.running && d.stage === i ? "进行中" : "等待"}</em></div>)}</article>
+          <article className="emby-preview-panel"><header><div><b>识别预览</b><small>TMDB 匹配结果</small></div><button>查看详情</button></header><div className="emby-media-placeholder"><i>▶</i><span>MEDIA</span></div><h3>{d.stage === 4 ? "媒体标题已成功匹配" : "等待识别媒体"}</h3><p>{d.stage === 4 ? "电视剧 · 2 季 · 24 集 · 高置信度" : "开始分析后会显示官方名称与季集映射。"}</p><div><span><b>{d.stage === 4 ? "98%" : "—"}</b><small>匹配度</small></span><span><b>{d.stage === 4 ? "2" : "—"}</b><small>季</small></span><span><b>{d.stage === 4 ? "24" : "—"}</b><small>集</small></span></div></article>
+          <article className="emby-activity"><header><div><b>实时活动</b><small>服务器事件</small></div><button>全部记录</button></header><p><i className="green" /><span><b>AList 服务已连接</b><small>刚刚 · 延迟 12ms</small></span></p><p><i className={d.stage > 0 ? "green" : ""} /><span><b>{d.stage > 0 ? "源目录读取完成" : "等待新的整理任务"}</b><small>{d.stage > 0 ? "发现媒体与压缩文件" : "安全计划模式已启用"}</small></span></p><p><i className={d.stage === 4 ? "green" : ""} /><span><b>{d.stage === 4 ? "审核计划已生成" : "写操作保持锁定"}</b><small>{d.stage === 4 ? "96 项操作等待确认" : "确认计划前不会修改文件"}</small></span></p></article>
+        </section>
       </section>
     </main>
   );
@@ -106,7 +130,7 @@ export function BentoUI() {
         <div className="fusion-copy"><Back number="05" label="SCRAPEFLOW ORIGINAL" /><span className="fusion-kicker">CINEMATIC MEDIA AUTOMATION</span><h1>从下载完成，<br />到海报墙亮起。</h1><p>一个路径，完成识别、解压、季集映射、标准命名与图稿准备。</p><div className="fusion-trust"><span>TMDB</span><span>ALIST</span><span>INFUSE</span><span>SAFE PLAN</span></div></div>
         <section className="fusion-console"><header><div><span>新建任务</span><b>{d.stage === 4 ? "计划已就绪" : "等待路径"}</b></div><i>{d.stage === 4 ? "94 项" : "01"}</i></header><label><span>媒体路径</span><textarea value={d.path} onChange={e => d.setPath(e.target.value)} rows={2} /></label><div className="fusion-options"><button className="active">自动识别</button><button>剧集</button><button>电影</button><span>仅生成计划&nbsp; ✓</span></div><button className="fusion-run" onClick={d.start} disabled={d.running}><span>{d.running ? stages[Math.min(d.stage, 3)] : d.stage === 4 ? "重新生成计划" : "生成刮削计划"}</span><b>→</b></button><div className="fusion-steps">{stages.map((stage, i) => <div className={d.stage > i ? "done" : d.running && d.stage === i ? "live" : ""} key={stage}><i>{d.stage > i ? "✓" : i + 1}</i><span>{stage}</span></div>)}</div></section>
       </section>
-      <section className="fusion-result"><div className="fusion-poster" /><div><span>匹配预览</span><h2>{d.stage === 4 ? "86-不存在的战区-" : "等待媒体识别"}</h2><p>{d.stage === 4 ? "2021 · 2 季 · 23 集 · TMDB 100565" : "完成分析后，这里会显示匹配结果与季集映射。"}</p></div><div className="fusion-counts"><span><b>{d.stage === 4 ? "23" : "—"}</b>视频</span><span><b>{d.stage === 4 ? "46" : "—"}</b>字幕</span><span><b>{d.stage === 4 ? "7" : "—"}</b>分卷</span></div><button>查看完整计划</button></section>
+      <section className="fusion-result"><div className="fusion-poster" /><div><span>匹配预览</span><h2>{d.stage === 4 ? "媒体标题已成功匹配" : "等待媒体识别"}</h2><p>{d.stage === 4 ? "电视剧 · 2 季 · 24 集 · 高置信度" : "完成分析后，这里会显示匹配结果与季集映射。"}</p></div><div className="fusion-counts"><span><b>{d.stage === 4 ? "24" : "—"}</b>视频</span><span><b>{d.stage === 4 ? "48" : "—"}</b>字幕</span><span><b>{d.stage === 4 ? "7" : "—"}</b>分卷</span></div><button>查看完整计划</button></section>
     </main>
   );
 }
