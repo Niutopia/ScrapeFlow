@@ -1,2 +1,2 @@
-import { TerminalUI } from "../../ui-demo";
-export default function Page() { return <TerminalUI />; }
+import { LocalApp } from "../../local-app";
+export default function Page() { return <LocalApp />; }
