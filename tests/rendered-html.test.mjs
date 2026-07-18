@@ -20,7 +20,7 @@ test("server-renders a selector for all five ScrapeFlow directions", async () =>
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /<title>ScrapeFlow · AList 媒体自动整理<\/title>/);
-  for (const title of ["深海控制台", "纸张编辑部", "极光向导", "终端机", "媒体便当"]) {
+  for (const title of ["沉浸式任务卡", "影院式工作台", "媒体文件管家", "媒体服务器中心", "ScrapeFlow Cinema"]) {
     assert.match(html, new RegExp(title));
   }
   for (const route of ["01", "02", "03", "04", "05"]) {
@@ -31,11 +31,11 @@ test("server-renders a selector for all five ScrapeFlow directions", async () =>
 
 test("each direction has its own independently rendered interface", async () => {
   const directions = [
-    ["01", "01-command"],
-    ["02", "02-paper"],
-    ["03", "03-aurora"],
-    ["04", "04-terminal"],
-    ["05", "05-bento"],
+    ["01", "01-infuse"],
+    ["02", "02-appletv"],
+    ["03", "03-synology"],
+    ["04", "04-emby"],
+    ["05", "05-fusion"],
   ];
 
   for (const [route, marker] of directions) {
@@ -57,5 +57,7 @@ test("ships the engine and a project-bound social card", async () => {
   assert.match(layout, /\/og\.png/);
   assert.match(engine, /__version__ = "3\.3\.2"/);
   await access(new URL("../public/og.png", import.meta.url));
+  await access(new URL("../public/media/86-backdrop.jpg", import.meta.url));
+  await access(new URL("../public/media/86-poster.jpg", import.meta.url));
   await assert.rejects(access(new URL("../app/_sites-preview", root)));
 });

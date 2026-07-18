@@ -1,38 +1,39 @@
 const directions = [
-  { id: "01", name: "深海控制台", en: "Midnight Command", note: "三栏任务控制中心", className: "mini-command" },
-  { id: "02", name: "纸张编辑部", en: "Paper Studio", note: "杂志式线性表单", className: "mini-paper" },
-  { id: "03", name: "极光向导", en: "Aurora Wizard", note: "沉浸式分步操作", className: "mini-aurora" },
-  { id: "04", name: "终端机", en: "Operator Terminal", note: "命令行工作台", className: "mini-terminal" },
-  { id: "05", name: "媒体便当", en: "Media Bento", note: "彩色模块化面板", className: "mini-bento" },
+  { id: "01", code: "INFUSE", name: "沉浸式任务卡", note: "大幅媒体艺术 · 极简悬浮控制", tone: "infuse" },
+  { id: "02", code: "TV", name: "影院式工作台", note: "Apple TV 式内容层次 · 横向浏览", tone: "tv" },
+  { id: "03", code: "NAS", name: "媒体文件管家", note: "群晖式可靠管理 · 清晰表格流程", tone: "nas" },
+  { id: "04", code: "EMBY", name: "媒体服务器中心", note: "高效侧栏 · 海报与任务并行", tone: "emby" },
+  { id: "05", code: "SF", name: "ScrapeFlow Cinema", note: "影音沉浸与专业控制的原创融合", tone: "fusion" },
 ];
 
 export default function Home() {
   return (
-    <main className="selector-page">
-      <header className="selector-header">
-        <a className="selector-brand" href="#top"><i>SF</i><span>ScrapeFlow</span></a>
-        <span className="selector-status"><i /> DESIGN EXPLORATION · 05 DIRECTIONS</span>
+    <main className="pick-page">
+      <header className="pick-nav">
+        <a className="pick-brand" href="#top"><i>SF</i><b>ScrapeFlow</b></a>
+        <span>MEDIA AUTOMATION · DESIGN ROUND 02</span>
       </header>
-      <section className="selector-intro" id="top">
-        <span>ALIST MEDIA AUTOMATION</span>
-        <h1>五套真正不同的<br />刮削工作台</h1>
-        <p>每一套都有独立的信息架构、操作路径和视觉语言。点击进入完整界面，体验输入路径、启动任务与查看结果。</p>
+      <section className="pick-hero" id="top">
+        <div><span>五套全新方向</span><h1>像打开影音库一样，<br />开始一次刮削。</h1></div>
+        <p>重新从 Infuse、Apple TV、群晖与 Emby 的产品语言出发。它们不只是配色不同，而是五种不同的使用方式。</p>
       </section>
-      <section className="direction-grid">
-        {directions.map((item) => (
-          <a className="direction-card" href={`/ui/${item.id}`} key={item.id}>
-            <div className={`mini-ui ${item.className}`} aria-hidden="true">
-              <i className="mini-a" /><i className="mini-b" /><i className="mini-c" /><i className="mini-d" /><i className="mini-e" />
+      <section className="pick-grid">
+        {directions.map((item, index) => (
+          <a className={`pick-card ${item.tone}`} href={`/ui/${item.id}`} key={item.id}>
+            <div className="pick-visual" aria-hidden="true">
+              <div className="pv-backdrop" />
+              <div className="pv-sidebar" />
+              <div className="pv-window" />
+              <div className="pv-poster" />
+              <div className="pv-line one" />
+              <div className="pv-line two" />
+              <div className="pv-action" />
             </div>
-            <div className="direction-meta">
-              <span>{item.id}</span>
-              <div><strong>{item.name}</strong><small>{item.en} · {item.note}</small></div>
-              <b>↗</b>
-            </div>
+            <div className="pick-copy"><span>0{index + 1} / {item.code}</span><h2>{item.name}</h2><p>{item.note}</p><b>进入体验&nbsp; →</b></div>
           </a>
         ))}
       </section>
-      <footer className="selector-footer"><span>SCRAPEFLOW / UI DIRECTIONS</span><span>选择后接入本机刮削引擎</span></footer>
+      <footer className="pick-footer"><span>ALIST × TMDB × INFUSE</span><span>所有方案目前使用安全模拟数据</span></footer>
     </main>
   );
 }
