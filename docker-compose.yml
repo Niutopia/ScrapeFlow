@@ -1,0 +1,168 @@
+name: scrapeflow
+
+services:
+  alist:
+    image: xhofe/alist:v3.62.0@sha256:ee46012c344c0f40387b1c1aeddee4c114887764d3aebdd1d7bba83920423c5e
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Official entrypoint only needs these while it fixes volume ownership
+      # and drops to PUID/PGID before starting the server.
+      - CHOWN
+      - SETGID
+      - SETUID
+    pids_limit: 256
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      UMASK: "022"
+    ports:
+      - "127.0.0.1:5244:5244"
+    volumes:
+      # Keep credentials and the SQLite database outside Docker Desktop's
+      # managed volume store. Override SCRAPEFLOW_HOST_STATE_ROOT from the
+      # Compose shell or a project .env file when moving this workspace.
+      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data
+      # Large media archives can exceed Docker Desktop's internal VM disk.
+      # Keep only AList's disposable extraction cache on the host workspace;
+      # source media and persistent AList state remain in their original stores.
+      - ./.runtime/alist-temp:/opt/alist/data/temp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5244/api/public/settings"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    image: scrapeflow-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 128
+    env_file:
+      - .env.local
+    environment:
+      ALIST_URL: http://alist:5244
+      SCRAPEFLOW_API_HOST: 0.0.0.0
+      SCRAPEFLOW_STATE_DIR: /data
+      SCRAPEFLOW_DOCKER: "1"
+      SCRAPEFLOW_TRUST_DOCKER_ALIST: "1"
+      SCRAPEFLOW_AUTO_EXECUTE_MEDIA: ${SCRAPEFLOW_AUTO_EXECUTE_MEDIA:-1}
+      SCRAPEFLOW_AUTO_REPLENISH_MISSING: ${SCRAPEFLOW_AUTO_REPLENISH_MISSING:-1}
+      TMDB_BASE_URL: ${TMDB_BASE_URL_DOCKER:-https://api.themoviedb.org/3}
+      TMDB_PROXY_URL: ${TMDB_PROXY_URL_DOCKER:-}
+      # The first deployment that introduces durable control must not release
+      # currently Docker-paused work before an operator explicitly resumes it.
+      # Once /data/global-control.json exists, that persisted API state wins.
+      SCRAPEFLOW_START_PAUSED: "1"
+      SCRAPEFLOW_REMOTE_ROLLBACK_ROOT: ${SCRAPEFLOW_REMOTE_ROLLBACK_ROOT:-/quark/影视/ScrapeFlow/事务回滚}
+      SCRAPEFLOW_REPLENISHMENT_ADAPTER: ${SCRAPEFLOW_REPLENISHMENT_ADAPTER:-python3 /app/engine/tools/replenishment_local_adapter.py}
+      SCRAPEFLOW_REPLENISHMENT_PANSOU_URL: ${SCRAPEFLOW_REPLENISHMENT_PANSOU_URL:-https://s.panhunt.com/api/search}
+      SCRAPEFLOW_REPLENISHMENT_PANSOU_MAX_SHARES: ${SCRAPEFLOW_REPLENISHMENT_PANSOU_MAX_SHARES:-30}
+      SCRAPEFLOW_REPLENISHMENT_SHARE_SEARCH_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_SHARE_SEARCH_TIMEOUT:-120}
+      SCRAPEFLOW_REPLENISHMENT_DOWNLOAD_DIR: ${SCRAPEFLOW_REPLENISHMENT_DOWNLOAD_DIR:-/var/tmp/scrapeflow/replenishment}
+      SCRAPEFLOW_REPLENISHMENT_UNSCRAPED_ROOT: ${SCRAPEFLOW_REPLENISHMENT_UNSCRAPED_ROOT:-/quark/影视/ScrapeFlow/补源}
+      # A zero-speed torrent is not a useful running task. Fail it after five
+      # minutes so the coordinator can expose a real failure and try a later
+      # candidate on this title's next source review.
+      SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT:-300}
+      SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT:-45}
+      # Optional source-scoped proxy. Keep it empty unless the operator has
+      # explicitly configured a trusted host proxy.
+      SCRAPEFLOW_REPLENISHMENT_ACG_PROXY: ${SCRAPEFLOW_REPLENISHMENT_ACG_PROXY_DOCKER:-}
+      # AnimeTosho's official feed remains useful for older anime metadata and
+      # is a required redundant source while ACG.RIP is only best-effort.
+      SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH:-1}
+      # SubsPlease adds current-anime single-file magnets. It remains
+      # best-effort because its search API is not a complete historical index.
+      SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH:-1}
+      # Mikan adds a public RSS search with directly verifiable Torrent
+      # enclosures and is best-effort because it is anime-specific.
+      SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH:-1}
+      SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH:-1}
+      # TokyoTosho replaces unreachable Nyaa as a required independent live
+      # index. It is HTTP-only background search and never controls Quark UI.
+      SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH:-1}
+      SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_URL: ${SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_URL:-https://tokyo-tosho.net}
+      SCRAPEFLOW_REPLENISHMENT_SEARCH_WORKERS: ${SCRAPEFLOW_REPLENISHMENT_SEARCH_WORKERS:-2}
+      SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT:-21600}
+      # Zero means the service keeps rotating/retrying until a fresh exact-title
+      # audit proves the gap is closed; users never need to click a retry button.
+      SCRAPEFLOW_REPLENISHMENT_MAX_ROUNDS: ${SCRAPEFLOW_REPLENISHMENT_MAX_ROUNDS:-0}
+      # 一、二级各至少完成 30 次有效资源级尝试；基础设施故障不计数。
+      SCRAPEFLOW_REPLENISHMENT_MIN_CLOUD_ATTEMPTS: ${SCRAPEFLOW_REPLENISHMENT_MIN_CLOUD_ATTEMPTS:-30}
+      SCRAPEFLOW_REPLENISHMENT_RETRY_DELAY: ${SCRAPEFLOW_REPLENISHMENT_RETRY_DELAY:-30}
+      SCRAPEFLOW_REPLENISHMENT_ARRIVAL_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_ARRIVAL_TIMEOUT:-120}
+      # Quark Helper URL/token and optional recovery tuning come directly from
+      # env_file above.  Do not mirror them with Compose interpolation: an
+      # unset project-shell variable would overwrite the env_file value.
+      SCRAPEFLOW_EXECUTION_WORKERS: ${SCRAPEFLOW_EXECUTION_WORKERS:-1}
+      TZ: ${TZ:-Asia/Shanghai}
+      TMPDIR: /var/tmp/scrapeflow
+    depends_on:
+      alist:
+        condition: service_healthy
+    volumes:
+      # Jobs, journals, title-closure evidence and the durable global pause live on
+      # host APFS so a Docker Desktop reset cannot silently replace them.
+      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data
+      - ./.runtime/api-temp:/var/tmp/scrapeflow
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    expose:
+      - "8765"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8765),2); s.close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 10
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gateway:
+    image: scrapeflow-web:local
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${SCRAPEFLOW_PORT:-3010}:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 5s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

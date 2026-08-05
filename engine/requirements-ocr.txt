@@ -1,0 +1,4 @@
+# On-demand API OCR lane.  Debian/glibc supplies the onnxruntime wheel ABI and
+# the image installs system ffmpeg, so no second bundled ffmpeg is needed here.
+rapidocr==3.9.2
+onnxruntime==1.28.0

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  ScrapeFlow host-state backup LaunchAgent template.
+
+  Install after replacing every /absolute/path/to placeholder (replace any
+  existing agent with the same label first):
+    cp scripts/com.scrapeflow.host-state-backup.plist.example \
+       ~/Library/LaunchAgents/com.scrapeflow.host-state-backup.plist
+    launchctl unload ~/Library/LaunchAgents/com.scrapeflow.host-state-backup.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.scrapeflow.host-state-backup.plist
+    launchctl list | grep scrapeflow.host-state-backup
+
+  The script coordinates with the API (default http://127.0.0.1:3010, the
+  nginx gateway port).  If SCRAPEFLOW_PORT in .env.local is not 3010, update
+  --api-url here to match.  The script pauses the system itself, waits up to
+  --quiesce-timeout seconds for in-flight media/recovery writes and
+  replenishment searches to drain,
+  snapshots, and always restores the previous pause state.
+-->
+<dict>
+  <key>Label</key>
+  <string>com.scrapeflow.host-state-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/python3</string>
+    <string>/absolute/path/to/ScrapeFlow/scripts/backup_host_state.py</string>
+    <string>--state-root</string>
+    <string>/absolute/path/to/ScrapeFlow/state</string>
+    <string>--backup-root</string>
+    <string>/absolute/path/to/ScrapeFlow/backups</string>
+    <string>--retention</string>
+    <string>14</string>
+    <string>--api-url</string>
+    <string>http://127.0.0.1:3010</string>
+    <string>--quiesce-timeout</string>
+    <string>600</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/absolute/path/to/scrapeflow-host-state-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/absolute/path/to/scrapeflow-host-state-backup.log</string>
+</dict>
+</plist>

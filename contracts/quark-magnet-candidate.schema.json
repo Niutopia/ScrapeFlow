@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrapeflow.local/contracts/quark-magnet-candidate.schema.json",
+  "title": "ScrapeFlow Quark magnet offline candidate",
+  "type": "object",
+  "required": [
+    "provider",
+    "locator",
+    "release_name",
+    "selected_gap_ids",
+    "acquisition"
+  ],
+  "properties": {
+    "provider": {
+      "const": "quark_magnet"
+    },
+    "locator": {
+      "type": "string",
+      "pattern": "^quark_magnet:[0-9A-Fa-f]{40}$"
+    },
+    "release_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "selected_gap_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^S[0-9]{2}E[0-9]{2,3}$"
+      }
+    },
+    "acquisition": {
+      "type": "object",
+      "required": [
+        "kind",
+        "magnet_url",
+        "expected_files"
+      ],
+      "properties": {
+        "kind": {
+          "const": "quark_magnet_offline"
+        },
+        "magnet_url": {
+          "type": "string",
+          "pattern": "^magnet:\\?[^#]*xt=urn:btih:(?:[0-9A-Fa-f]{40}|[A-Za-z2-7]{32})(?:&|$)"
+        },
+        "expected_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "size",
+              "gap_ids"
+            ],
+            "properties": {
+              "torrent_index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "gap_ids": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^S[0-9]{2}E[0-9]{2,3}$"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "torrent_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "local_fallback": {
+          "type": "object",
+          "required": [
+            "kind",
+            "url",
+            "file_index_by_gap",
+            "file_size_by_index",
+            "file_path_by_index"
+          ],
+          "properties": {
+            "kind": {
+              "const": "torrent"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "file_index_by_gap": {
+              "type": "object"
+            },
+            "file_size_by_index": {
+              "type": "object"
+            },
+            "file_path_by_index": {
+              "type": "object"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "fallback_locator": {
+      "type": "string",
+      "pattern": "^torrent:"
+    }
+  },
+  "additionalProperties": true
+}

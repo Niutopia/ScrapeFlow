@@ -13,14 +13,24 @@ function close(code = 0) {
   for (const child of children) {
     if (!child.killed) child.kill("SIGTERM");
   }
-  setTimeout(() => process.exit(code), 300);
+  const forceTimer = setTimeout(() => {
+    for (const child of children) {
+      if (!child.killed) child.kill("SIGKILL");
+    }
+    process.exit(code);
+  }, 5000);
+  forceTimer.unref();
+  Promise.all(children.map(child => new Promise(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", resolve);
+  }))).then(() => process.exit(code));
 }
 
 for (const child of children) {
   child.on("exit", (code, signal) => {
-    if (!closing && code !== 0) {
-      console.error(`本地服务异常退出: ${signal ?? code}`);
-      close(code ?? 1);
+    if (!closing) {
+      console.error(`本地服务意外退出: ${signal ?? code ?? "unknown"}`);
+      close(code === 0 ? 1 : (code ?? 1));
     }
   });
 }

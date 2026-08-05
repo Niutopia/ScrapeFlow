@@ -1,0 +1,21 @@
+[
+  "queued",
+  "planning_archives",
+  "starting_archive_execution",
+  "extracting_archives",
+  "planning_media",
+  "awaiting_media_approval",
+  "starting_media_execution",
+  "executing_media",
+  "replenishing",
+  "planning_recovery",
+  "awaiting_recovery_approval",
+  "starting_recovery_execution",
+  "executing_recovery",
+  "cancelling",
+  "recovery_required",
+  "completed",
+  "recovered",
+  "failed",
+  "cancelled"
+]

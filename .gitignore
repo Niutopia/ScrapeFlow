@@ -15,7 +15,6 @@
 
 # next.js
 /.next/
-/.vinext/
 /out/
 
 # misc
@@ -37,10 +36,14 @@ yarn-error.log*
 
 # typescript
 next-env.d.ts
-/dist/
-/.wrangler/
+*.tsbuildinfo
 /outputs/
 /work/
+/state/
+/backups/
 /.scrapeflow/
+/.runtime/
 __pycache__/
+*.pyc
+.pytest_cache/
 *.pyc
