@@ -1,5 +1,5 @@
 import type {
-  BrowseResult, GlobalControl, Health, Job, JobRetryOptions, TargetCategory,
+  BrowseResult, GlobalControl, Health, Job, LibraryAudit,
 } from "./contracts";
 
 const API_ROOT = "/api";
@@ -41,29 +41,14 @@ export const scrapeFlowApi = {
   browse: (path: string, refresh = false) => request<BrowseResult>(
     `/browse?path=${encodeURIComponent(path)}&refresh=${refresh ? "1" : "0"}`,
   ),
-  create: (
-    path: string,
-    category: TargetCategory,
-    tmdbId?: number,
-    mediaType?: "tv" | "movie",
-  ) => post<{ job: Job }>("/jobs", {
-    path,
-    category,
-    type: tmdbId ? (mediaType || (category === "电影" ? "movie" : "tv")) : "auto",
-    ...(tmdbId ? { tmdb_id: tmdbId } : {}),
-    absolute: false,
-    prefer_simplified: true,
-  }),
-  approve: (id: string, digest: string) => post<{ job: Job }>(`/jobs/${id}/approve`, { digest }),
-  recover: (id: string) => post<{ job: Job }>(`/jobs/${id}/recover`, { confirm: true }),
-  cancel: (id: string) => post<{ job: Job }>(`/jobs/${id}/cancel`, { confirm: true }),
-  keepExisting: (id: string) => post<{ job: Job }>(`/jobs/${id}/resolve`, {
-    action: "keep_existing",
-    confirm: true,
-  }),
-  retry: (id: string, options: JobRetryOptions = {}) => post<{ job: Job }>(`/jobs/${id}/retry`, options),
-  remove: (id: string) => request<{ deleted: string }>(`/jobs/${id}`, { method: "DELETE" }),
-  clearData: () => request<{ cleared: number }>("/jobs", { method: "DELETE" }),
-  pause: (reason?: string) => post<GlobalControl>("/control/pause", reason ? { confirm: true, reason } : { confirm: true }),
-  resume: () => post<GlobalControl>("/control/resume", { confirm: true }),
+  /** Submitting a path starts the automatic identity-to-cleanup workflow. */
+  create: (path: string) => post<{ job: Job }>("/jobs", { path }),
+  /** This only asks the scheduler to retry now; it does not release a plan. */
+  retry: (id: string) => post<{ job: Job }>(`/jobs/${id}/retry`, {}),
+  cancel: (id: string) => post<{ job: Job }>(`/jobs/${id}/cancel`, {}),
+  pause: (reason?: string) => post<GlobalControl>("/control/pause", reason ? { reason } : {}),
+  resume: () => post<GlobalControl>("/control/resume", {}),
+  /** A read-only structural scan of the three formal media roots. */
+  latestAudit: () => request<{ audit: LibraryAudit | null }>("/library-audit/latest"),
+  runAudit: () => post<{ audit: LibraryAudit }>("/library-audit/run", {}),
 };

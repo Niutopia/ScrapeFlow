@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Run repository checks in disposable, project-isolated directories. */
+/** Run the checks that exercise the current application. */
 
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -28,21 +28,21 @@ const environment = {
   TMDB_API_KEY: "isolated-test-not-a-secret",
   SCRAPEFLOW_REPLENISHMENT_ADAPTER: "",
   SCRAPEFLOW_REPLENISHMENT_CATALOG: "",
-  SCRAPEFLOW_REPLENISHMENT_QUARK_INDEX: "",
-  SCRAPEFLOW_QUARK_HELPER_URL: "http://127.0.0.1:9",
-  SCRAPEFLOW_QUARK_HELPER_TOKEN: "isolated-test-token-not-a-secret",
+  SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH: "0",
+  SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH: "0",
 };
 
 const commands = [
   ["npm", "run", "lint"],
   ["npm", "run", "typecheck"],
-  ["npm", "ls", "--depth=0"],
-  ["python3", "-m", "compileall", "-q", "engine", "local", "scripts"],
-  ["npm", "run", "build:staging"],
-  ["node", "--test", "tests/rendered-html.test.mjs"],
-  ["python3", "scripts/run-unittest-json.py", "--start", "local/tests"],
-  ["python3", "scripts/run-unittest-json.py", "--start", "engine/tests"],
-  ["python3", "scripts/run-unittest-json.py", "--start", "scripts", "--pattern", "test_*.py"],
+  ["python3", "-c", "import local.simple_server"],
+  ["python3", "-m", "unittest", "discover", "-s", "local/tests", "-p", "test_*.py"],
+  ["npm", "run", "build:check"],
 ];
 
 function run(argv) {

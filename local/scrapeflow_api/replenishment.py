@@ -16,14 +16,24 @@ from engine.scrapeflow.replenishment_acquisition import (
 )
 
 
-ACTIONABLE_GAP_KINDS = frozenset({"missing_episode", "missing_season"})
+# Movies and episodes share the provider-neutral acquisition path. Subtitle
+# gaps use a subtitle-only materializer and never enter the video path.
+ACTIONABLE_GAP_KINDS = frozenset({
+    "missing_episode", "missing_season", "missing_media", "missing_subtitle",
+})
 PROVIDER_ORDER = {
-    "quark_share": 0, "quark_magnet": 1, "cloud_share": 2, "magnet": 3,
+    "cloud_share": 0, "magnet": 1,
 }
 QUALITY_ORDER = {"2160p": 3, "1080p": 2, "720p": 1, "unknown": 0}
+_VIDEO_SUFFIXES = frozenset({
+    ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
+    ".mp4", ".mpeg", ".mpg", ".mts", ".rm", ".rmvb", ".ts", ".webm", ".wmv",
+})
 EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(\d{1,3})[\s._-]*E0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*E?0*(\d{1,4})(?!\d))?",
+    r"(?<![A-Z0-9])S0*(\d{1,3})[\s._-]*E(?:P)?\s*0*(\d{1,4})(?!\d)"
+    # Keep this duplicated matcher aligned with the Engine shared parser:
+    # title numbers after a separator are not implicit range endpoints.
+    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
     re.I,
 )
 X_EPISODE_RE = re.compile(
@@ -37,6 +47,26 @@ SEASON_DASH_EPISODE_RE = re.compile(
     r"(?:\s*[-~–—]\s*(?:E(?:P)?\s*)?0*(\d{1,3}))?(?!\d|P\b)",
     re.I,
 )
+# Chinese release groups commonly pair the season-local and whole-series
+# ordinals as ``[S4][17_89]``.  Keep this evidence separate from ordinary
+# bracket/range fallbacks: a bare ``[17_89]`` has no explicit season and must
+# not inherit a request-wide default season.
+DUAL_SEASON_BRACKET_EPISODE_RE = re.compile(
+    r"\[\s*S0*(?P<season>\d{1,3})\s*\]\s*"
+    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
+    re.I,
+)
+# Also accept the narrow unbracketed-season spelling ``S4[17_89]``.
+DUAL_SEASON_MARKED_BRACKET_EPISODE_RE = re.compile(
+    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})(?![A-Z0-9])\s*"
+    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
+    re.I,
+)
+DUAL_SEASON_TRAILING_BRACKET_EPISODE_RE = re.compile(
+    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})\s*\]\s*"
+    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
+    re.I,
+)
 CHINESE_EPISODE_RE = re.compile(
     r"第\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*季"
     r"[^\n]{0,30}?第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话]"
@@ -44,7 +74,7 @@ CHINESE_EPISODE_RE = re.compile(
 )
 EPISODE_ONLY_RE = re.compile(
     r"(?<![A-Z0-9])E(?:P)?0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*E?(?:P)?0*(\d{1,4})(?!\d))?",
+    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
     re.I,
 )
 CHINESE_EPISODE_ONLY_RE = re.compile(
@@ -79,6 +109,9 @@ BAD_AVAILABILITY_MARKERS = (
     "not available", "dead", "offline", "expired", "invalid", "unavailable",
     "blocked", "banned", "deleted", "失效", "过期", "封禁", "删除", "不可用",
 )
+_SWARM_MAX_AGE_SECONDS = 6 * 60 * 60
+_SWARM_MAX_FUTURE_SKEW_SECONDS = 5 * 60
+_SWARM_COUNT_LIMIT = 1_000_000_000
 CHINESE_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
                   "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 CHINESE_NUMERALS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
@@ -91,6 +124,39 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
     label = str(gap.get("label") or "").strip()
     if not label:
         return None
+    if kind == "missing_media":
+        gap_id = str(gap.get("id") or "").strip()
+        if not gap_id:
+            # Produce a deterministic request coordinate when the audit row
+            # does not supply one.
+            gap_id = f"missing_media:{_normalized_text(label) or 'movie'}"
+        return {
+            "id": gap_id,
+            "kind": kind,
+            "label": label,
+            "reason": str(gap.get("reason") or ""),
+            "title": label,
+            **({"source": str(gap["source"])} if isinstance(gap.get("source"), str) else {}),
+        }
+    if kind == "missing_subtitle":
+        gap_id = str(gap.get("id") or "").strip()
+        target_video = gap.get("path")
+        if not gap_id or not isinstance(target_video, str) or not target_video.startswith("/"):
+            return None
+            # The target video path is the pairing coordinate. Provider
+        # release names only decide which subtitle payload is fetched; they
+        # never decide the final sidecar path.
+        return {
+            "id": gap_id,
+            "kind": kind,
+            "label": label,
+            "reason": str(gap.get("reason") or ""),
+            "title": label,
+            "path": target_video,
+            **({"source": str(gap["source"])} if isinstance(gap.get("source"), str) else {}),
+            **({"subtitle_language": str(gap["subtitle_language"])}
+               if isinstance(gap.get("subtitle_language"), str) else {}),
+        }
     episode_match = EPISODE_RE.search(label)
     if episode_match:
         season = int(episode_match.group(1))
@@ -138,6 +204,7 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
             "kind": "missing_episode", "season": season, "episodes": episodes,
             "label": label, "reason": str(gap.get("reason") or ""),
             "season_name": str(gap.get("season_name") or "").strip(),
+            **({"source": str(gap["source"])} if isinstance(gap.get("source"), str) else {}),
             "title": episode_title,
             **({"title_aliases": title_aliases} if title_aliases else {}),
             **({"source_episode_aliases": source_episode_aliases}
@@ -152,6 +219,7 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
             "id": f"S{season:02d}", "kind": "missing_season", "season": season,
             "episodes": [], "label": label, "reason": str(gap.get("reason") or ""),
             "season_name": str(gap.get("season_name") or label[season_match.end():]).strip(),
+            **({"source": str(gap["source"])} if isinstance(gap.get("source"), str) else {}),
             "expected_episode_count": gap.get("expected_episode_count"),
         }
     return None
@@ -247,6 +315,529 @@ def _deduplicated_strings(values: Sequence[Any], *, limit: int = 40) -> list[str
     return output
 
 
+_S00_MOVIE_ALIAS_MAX_EPISODES = 3
+_S00_GENERIC_MOVIE_TITLES = frozenset({
+    "special", "specialepisode", "ova", "oad", "sp", "extra", "bonus",
+    "episode", "movie", "特典", "特别篇", "特別篇", "番外", "番外篇",
+    "总集篇", "總集篇", "剧场版", "劇場版", "映像特典",
+})
+_ROMAN_SEQUEL_TOKENS = frozenset({
+    "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+})
+_NONZERO_SEASON_TOKEN_RE = re.compile(
+    r"(?:s|season)0*[1-9]\d{0,2}(?:e(?:p)?\d{1,4})?",
+    re.I,
+)
+_ORDINAL_SEASON_TOKEN_RE = re.compile(r"[1-9]\d{0,2}(?:st|nd|rd|th)", re.I)
+_CHINESE_NONZERO_SEASON_RE = re.compile(
+    r"第\s*(?:[一二三四五六七八九十百两]|[1-9]\d*)\s*季",
+)
+_COMPACT_NONZERO_SEASON_SUFFIX_RE = re.compile(
+    r"(?:s|season)0*[1-9]\d{0,2}(?:e(?:p)?\d{1,4})?"
+    r"|第(?:[一二三四五六七八九十百两]|[1-9]\d*)季",
+    re.I,
+)
+_COMPACT_ROMAN_SEQUEL_SUFFIX_RE = re.compile(
+    r"(?:viii|vii|iii|vi|iv|ix|ii|v|x)(?=(?:s|season|e|ep|\d|$))",
+    re.I,
+)
+
+
+def _identity_tokens(value: Any) -> tuple[str, ...]:
+    """Split identity text without joining an adjacent sequel marker.
+
+    ``_normalized_text`` intentionally drops punctuation for ordinary alias
+    matching.  This companion representation retains word boundaries so a
+    base work such as ``Date A Live`` cannot silently match the ``II`` in a
+    similarly named continuation.
+    """
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("_", " ")
+    return tuple(re.findall(r"[^\W_]+", text))
+
+
+def _tokens_start_nonzero_season(tokens: Sequence[str], index: int) -> bool:
+    """Return whether a token position starts an explicit later-season tag."""
+    if index >= len(tokens):
+        return False
+    token = tokens[index]
+    if token in _ROMAN_SEQUEL_TOKENS or _NONZERO_SEASON_TOKEN_RE.fullmatch(token):
+        return True
+    if _ORDINAL_SEASON_TOKEN_RE.fullmatch(token):
+        return True
+    if token in {"s", "season"} and index + 1 < len(tokens):
+        following = tokens[index + 1]
+        return (
+            following in _ROMAN_SEQUEL_TOKENS
+            or bool(re.fullmatch(r"0*[1-9]\d{0,2}", following))
+            or bool(_ORDINAL_SEASON_TOKEN_RE.fullmatch(following))
+        )
+    return False
+
+
+def _alias_has_explicit_nonzero_season_marker(alias: Any) -> bool:
+    """Recognize a season/continuation marker carried by one media alias."""
+    text = unicodedata.normalize("NFKC", str(alias or "")).casefold()
+    tokens = _identity_tokens(text)
+    return (
+        bool(_CHINESE_NONZERO_SEASON_RE.search(text))
+        or any(_tokens_start_nonzero_season(tokens, index) for index in range(len(tokens)))
+    )
+
+
+def _alias_has_unseasoned_candidate_match(
+    alias: Any,
+    alias_key: str,
+    candidate_values: Sequence[str],
+) -> bool:
+    """Return whether an alias matches outside an immediately following sequel tag."""
+    alias_tokens = _identity_tokens(alias)
+    if not alias_tokens:
+        return False
+    for value in candidate_values:
+        haystack = _normalized_text(value)
+        if not haystack or alias_key not in haystack:
+            continue
+        candidate_tokens = _identity_tokens(value)
+        matching_positions = [
+            index
+            for index in range(0, len(candidate_tokens) - len(alias_tokens) + 1)
+            if candidate_tokens[index:index + len(alias_tokens)] == alias_tokens
+        ]
+        # Preserve the existing punctuation-insensitive identity behavior for
+        # aliases which cannot be located at a word boundary, except when the
+        # normalized suffix itself is an unmistakable later-season marker
+        # (for example ``DateALiveS02`` or ``约会大作战第二季``).
+        if not matching_positions:
+            offsets = [
+                index for index in range(len(haystack))
+                if haystack.startswith(alias_key, index)
+            ]
+            if any(
+                not (
+                    _COMPACT_NONZERO_SEASON_SUFFIX_RE.match(
+                        haystack[index + len(alias_key):],
+                    )
+                    or _COMPACT_ROMAN_SEQUEL_SUFFIX_RE.match(
+                        haystack[index + len(alias_key):],
+                    )
+                )
+                for index in offsets
+            ):
+                return True
+            continue
+        if any(
+            not _tokens_start_nonzero_season(
+                candidate_tokens, index + len(alias_tokens),
+            )
+            for index in matching_positions
+        ):
+            return True
+    return False
+
+
+def _is_s00_missing_episode(gap: Mapping[str, Any]) -> bool:
+    if gap.get("kind") != "missing_episode":
+        return False
+    if gap.get("season") == 0:
+        return True
+    return bool(re.fullmatch(r"S00E\d{2,4}(?:-E\d{2,4})?", str(gap.get("id") or "")))
+
+
+def _strict_s00_gap_title_key(value: Any, *, media_keys: set[str]) -> str | None:
+    """Return a gap-local title only when it is specific enough to override a sequel alias."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    key = _normalized_text(text)
+    if (
+        len(key) < 4
+        or key in media_keys
+        or key in _S00_GENERIC_MOVIE_TITLES
+    ):
+        return None
+    # One unqualified Latin word (for example ``Judgement``) is not a strict
+    # special-title proof.  Non-Latin titles do not require whitespace, while
+    # a two-word Latin title retains enough specificity for this narrow guard.
+    latin_words = re.findall(r"[a-z0-9]+", text)
+    if key.isascii() and len(latin_words) < 2:
+        return None
+    return key
+
+
+def _has_strict_s00_gap_evidence(
+    request: Mapping[str, Any],
+    candidate_values: Sequence[str],
+    *,
+    media_keys: set[str],
+) -> bool:
+    """Find current-gap evidence without promoting it to a work alias.
+
+    This is deliberately an exception only for an S00 row otherwise matched
+    solely by a continuation alias.  A non-generic official special title, or
+    an audit-declared source coordinate plus source series title, can disprove
+    that the continuation suffix is the only identity evidence.  The values
+    remain gap-local: they are never copied into ``media.aliases``.
+    """
+    normalized_values = [_normalized_text(value) for value in candidate_values]
+    for raw_gap in (
+        request.get("gaps") if isinstance(request.get("gaps"), list) else []
+    ):
+        if not isinstance(raw_gap, Mapping) or not _is_s00_missing_episode(raw_gap):
+            continue
+        title_keys = {
+            key
+            for value in [
+                raw_gap.get("title"),
+                *(
+                    raw_gap.get("title_aliases")
+                    if isinstance(raw_gap.get("title_aliases"), list) else []
+                ),
+            ]
+            if (key := _strict_s00_gap_title_key(value, media_keys=media_keys))
+        }
+        if any(
+            title_key in candidate_value
+            for title_key in title_keys
+            for candidate_value in normalized_values
+            if candidate_value
+        ):
+            return True
+
+        for source_alias in raw_gap.get("source_episode_aliases") or []:
+            if not isinstance(source_alias, Mapping):
+                continue
+            season = source_alias.get("season")
+            episode = source_alias.get("episode")
+            if (
+                type(season) is not int or season <= 0
+                or type(episode) is not int or episode <= 0
+            ):
+                continue
+            source_titles = {
+                key
+                for value in source_alias.get("series_titles") or []
+                if isinstance(value, str)
+                and len(key := _normalized_text(value)) >= 3
+            }
+            if not source_titles:
+                continue
+            source_id = f"S{season:02d}E{episode:02d}"
+            has_source_coordinate = any(
+                source_id in _expanded_episode_ids(value)
+                for value in candidate_values
+            )
+            has_source_title = any(
+                source_title in candidate_value
+                for source_title in source_titles
+                for candidate_value in normalized_values
+                if candidate_value
+            )
+            if has_source_coordinate and has_source_title:
+                return True
+    return False
+
+
+def _tmdb_title_values(row: Mapping[str, Any]) -> list[str]:
+    """Return only title fields suitable for an identity-bearing TMDB match."""
+    return [
+        value.strip() for key in (
+            "title", "name", "original_title", "original_name",
+        )
+        if isinstance((value := row.get(key)), str) and value.strip()
+    ]
+
+
+def _specific_s00_movie_title(
+    value: Any, *, tv_identity_keys: set[str],
+) -> tuple[str, str] | None:
+    """Accept a title only when it is useful, non-generic S00 movie evidence."""
+    title = str(value or "").strip()
+    key = _normalized_text(title)
+    if not key or key in tv_identity_keys or key in _S00_GENERIC_MOVIE_TITLES:
+        return None
+    # A bare ordinal or an S00 coordinate is episode bookkeeping, never a
+    # movie identity.  Keeping this narrow prevents a large special-season
+    # audit from turning generic labels into broad movie searches.
+    if re.fullmatch(r"(?:s\d{1,3}e)?\d{1,4}(?:集|话|話)?", key):
+        return None
+    has_han = any("\u3400" <= char <= "\u9fff" for char in key)
+    if len(key) < 3 and not (has_han and len(key) >= 2):
+        return None
+    return title, key
+
+
+def _s00_movie_aliases(
+    getter: object,
+    *,
+    title: str,
+    title_key: str,
+    tv_identity_keys: set[str],
+) -> list[str]:
+    """Resolve one explicitly titled S00 movie, or return no aliases.
+
+    A movie search result is accepted only when exactly one result carries
+    both the special's own title and the already-verified TV identity.  Every
+    subsequent TMDB request must also succeed before any new alias is used;
+    this deliberately favors a missed search over a cross-work expansion.
+    """
+    if not callable(getter):
+        return []
+    try:
+        search = getter("/search/movie", query=title)
+    except Exception:
+        return []
+    rows = search.get("results") if isinstance(search, Mapping) else None
+    if not isinstance(rows, list):
+        return []
+
+    matching_ids: set[int] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        movie_id = row.get("id")
+        if type(movie_id) is not int or movie_id <= 0:
+            continue
+        evidence = [_normalized_text(value) for value in _tmdb_title_values(row)]
+        if not any(title_key in value for value in evidence):
+            continue
+        if not any(
+            identity_key in value
+            for identity_key in tv_identity_keys
+            for value in evidence
+        ):
+            continue
+        matching_ids.add(movie_id)
+    if len(matching_ids) != 1:
+        return []
+    movie_id = next(iter(matching_ids))
+
+    try:
+        movie = getter(f"/movie/{movie_id}")
+        alternatives = getter(f"/movie/{movie_id}/alternative_titles")
+    except Exception:
+        return []
+    if not isinstance(movie, Mapping) or not isinstance(alternatives, Mapping):
+        return []
+    returned_id = movie.get("id")
+    if returned_id is not None and (
+        type(returned_id) is not int or returned_id != movie_id
+    ):
+        return []
+    alternative_rows = alternatives.get("titles")
+    if not isinstance(alternative_rows, list):
+        alternative_rows = alternatives.get("results")
+    if not isinstance(alternative_rows, list):
+        return []
+
+    values: list[Any] = list(_tmdb_title_values(movie))
+    for row in alternative_rows:
+        if isinstance(row, Mapping):
+            values.extend(_tmdb_title_values(row))
+    return _deduplicated_strings(values, limit=16)
+
+
+def _enrich_small_s00_movie_aliases(
+    output: dict[str, Any],
+    getter: object,
+    *,
+    tmdb_id: int,
+    tv_aliases: Sequence[str],
+) -> None:
+    """Add movie aliases only for one small, unambiguous TV S00 request."""
+    scan_report = output.get("scan_report")
+    if not isinstance(scan_report, Mapping):
+        return
+    raw_gaps = scan_report.get("resource_gaps")
+    if not isinstance(raw_gaps, list):
+        return
+    tv_identity_keys = {
+        key for value in tv_aliases
+        if (key := _normalized_text(value))
+    }
+    if not tv_identity_keys:
+        return
+
+    # One range can encode a whole special season, so bound by the number of
+    # requested episodes rather than by only the number of JSON gap rows.
+    s00_episode_count = 0
+    titles: dict[str, tuple[str, list[int]]] = {}
+    for index, raw_gap in enumerate(raw_gaps):
+        if not isinstance(raw_gap, Mapping):
+            continue
+        media = raw_gap.get("media")
+        if isinstance(media, Mapping) and "tmdb_id" in media:
+            raw_media_id = media.get("tmdb_id")
+            if type(raw_media_id) is not int or raw_media_id != tmdb_id:
+                continue
+        identity = _gap_identity(raw_gap)
+        if (
+            identity is None
+            or identity.get("kind") != "missing_episode"
+            or identity.get("season") != 0
+        ):
+            continue
+        episodes = identity.get("episodes")
+        if not isinstance(episodes, list) or not episodes:
+            return
+        s00_episode_count += len(episodes)
+        # A missing S00 title is not permission to search aliases or labels.
+        # The audit's explicit episode title is the only allowed query.
+        specific = _specific_s00_movie_title(
+            raw_gap.get("title"), tv_identity_keys=tv_identity_keys,
+        )
+        if specific is None:
+            continue
+        title, key = specific
+        stored = titles.get(key)
+        if stored is None:
+            titles[key] = (title, [index])
+        else:
+            stored[1].append(index)
+
+    if (
+        not titles
+        or s00_episode_count > _S00_MOVIE_ALIAS_MAX_EPISODES
+        or len(titles) > _S00_MOVIE_ALIAS_MAX_EPISODES
+    ):
+        return
+
+    resolved: dict[int, list[str]] = {}
+    for title, indexes in titles.values():
+        title_key = _normalized_text(title)
+        aliases = _s00_movie_aliases(
+            getter,
+            title=title,
+            title_key=title_key,
+            tv_identity_keys=tv_identity_keys,
+        )
+        if not aliases:
+            continue
+        for index in indexes:
+            resolved[index] = aliases
+    if not resolved:
+        return
+
+    changed = False
+    updated_gaps: list[Any] = list(raw_gaps)
+    for index, aliases in resolved.items():
+        raw_gap = raw_gaps[index]
+        if not isinstance(raw_gap, Mapping):
+            continue
+        existing = raw_gap.get("title_aliases")
+        combined = _deduplicated_strings(
+            [
+                *(existing if isinstance(existing, list) else []),
+                *aliases,
+            ],
+            limit=16,
+        )
+        if combined == (existing if isinstance(existing, list) else []):
+            continue
+        row = dict(raw_gap)
+        row["title_aliases"] = combined
+        updated_gaps[index] = row
+        changed = True
+    if changed:
+        report_copy = dict(scan_report)
+        report_copy["resource_gaps"] = updated_gaps
+        output["scan_report"] = report_copy
+
+
+def enrich_replenishment_plan_aliases(
+    plan: Mapping[str, Any],
+    tmdb_client: object | None,
+) -> dict[str, Any]:
+    """Add authoritative TMDB title aliases to one provider request plan.
+
+    Audit-owned roots are bootstrapped from local NFO files and therefore may
+    only contain a translated title.  Provider releases commonly use TMDB's
+    original or alternative title (for example, an English release for a
+    Chinese NFO).  Fetching aliases for the already-verified TMDB id preserves
+    the strict identity check: aliases come from that exact TMDB record, while
+    the candidate still has to contain one of them in its release evidence.
+
+    This helper is best-effort and leaves the input unchanged when the client
+    or response is unavailable.  The bounded copy keeps provider query size
+    and persisted plan state predictable.
+    """
+    output = copy.deepcopy(dict(plan))
+    metadata = output.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return output
+    raw_id = metadata.get("tmdb_id")
+    if isinstance(raw_id, bool):
+        return output
+    try:
+        tmdb_id = int(raw_id)
+    except (TypeError, ValueError):
+        return output
+    if tmdb_id <= 0:
+        return output
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return output
+    mode = str(
+        metadata.get("media_type")
+        or metadata.get("type")
+        or output.get("mode")
+        or "tv"
+    ).casefold()
+    endpoint = "movie" if mode == "movie" else "tv"
+    values: list[Any] = [metadata.get("title"), metadata.get("original_title")]
+    # The primary TMDB record is the authoritative source for the canonical
+    # localized and original titles.  Alternative-title responses often omit
+    # one or both (notably a canonical English release name), so consult both
+    # endpoints independently.  A small fake or a transient upstream failure
+    # on either endpoint must not discard useful evidence from the other.
+    try:
+        primary = getter(f"/{endpoint}/{tmdb_id}")
+    except Exception:
+        primary = None
+    if isinstance(primary, Mapping):
+        values.extend(_tmdb_title_values(primary))
+    # The configured TMDB locale can be a local display language whose record
+    # omits a globally used release title.  Put the authoritative English TV
+    # primary/original fields ahead of user-held alternatives so the bounded
+    # alias list cannot squeeze out a base-work identity such as Date A Live.
+    # This is intentionally TV-only; a movie's primary record already names
+    # the actual work being materialized.
+    if endpoint == "tv":
+        try:
+            english_primary = getter(f"/tv/{tmdb_id}", language="en-US")
+        except Exception:
+            english_primary = None
+        if isinstance(english_primary, Mapping):
+            values.extend(_tmdb_title_values(english_primary))
+    existing = metadata.get("aliases")
+    if isinstance(existing, list):
+        values.extend(existing)
+    try:
+        alternatives = getter(f"/{endpoint}/{tmdb_id}/alternative_titles")
+    except Exception:
+        alternatives = None
+    if isinstance(alternatives, Mapping):
+        rows = alternatives.get("results")
+        if not isinstance(rows, list):
+            rows = alternatives.get("titles")
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                values.extend(_tmdb_title_values(row))
+    aliases = _deduplicated_strings(values, limit=24)
+    if not aliases:
+        return output
+    metadata_copy = dict(metadata)
+    metadata_copy["aliases"] = aliases
+    output["metadata"] = metadata_copy
+    # TMDB represents some TV special-season entries as standalone movies.
+    # Keep that bridge intentionally tiny and identity-bound: it enriches
+    # query-only gap aliases in memory and never changes the persisted root.
+    if endpoint == "tv":
+        _enrich_small_s00_movie_aliases(
+            output, getter, tmdb_id=tmdb_id, tv_aliases=aliases,
+        )
+    return output
+
+
 def _chinese_number(number: int) -> str | None:
     if 0 <= number <= 10:
         return CHINESE_NUMERALS[number]
@@ -289,6 +880,34 @@ def _episode_ranges(value: Any) -> list[tuple[int, int, int]]:
         season, start, end = values[0], values[1], values[2] or values[1]
         if isinstance(season, int) and isinstance(start, int) and isinstance(end, int):
             output.append((season, start, end))
+    dual_matches = [
+        match for pattern in (
+            DUAL_SEASON_BRACKET_EPISODE_RE,
+            DUAL_SEASON_MARKED_BRACKET_EPISODE_RE,
+            DUAL_SEASON_TRAILING_BRACKET_EPISODE_RE,
+        ) for match in pattern.finditer(text)
+    ]
+    if dual_matches:
+        dual_values = {
+            (
+                int(match.group("season")),
+                int(match.group("local")),
+                int(match.group("absolute")),
+            )
+            for match in dual_matches
+        }
+        # Distinct pairs in one member are ambiguous; do not turn a pack or
+        # unrelated metadata into a guessed episode coordinate.
+        if len(dual_values) == 1:
+            season, local, absolute = next(iter(dual_values))
+            if season > 0 and local > 0 and absolute > local and absolute <= 9999:
+                has_conflicting_explicit = any(
+                    item_season == season
+                    and not (item_start <= local <= item_end)
+                    for item_season, item_start, item_end in output
+                )
+                if not has_conflicting_explicit:
+                    output.append((season, local, local))
     return output
 
 
@@ -391,6 +1010,16 @@ def _request_gap_ids(request: Mapping[str, Any]) -> tuple[set[str], dict[str, di
         if not isinstance(gap, Mapping) or not isinstance(gap.get("id"), str):
             continue
         identity = str(gap["id"])
+        # A subtitle's ID can legitimately embed ``S01E01`` while still
+        # identifying a *sidecar* rather than the episode video itself.  Keep
+        # it whole so candidate coverage, durable gap state and the exact
+        # formal-library video path all use the same coordinate.  Expanding it
+        # to ``S01E01`` here used to make a successful download appear
+        # unresolved because the coordinator could no longer find its state
+        # file by the original subtitle-gap ID.
+        if gap.get("kind") in {"missing_media", "missing_subtitle"}:
+            lookup[identity] = dict(gap)
+            continue
         expanded = _expanded_episode_ids(identity)
         if expanded:
             for item in expanded:
@@ -527,17 +1156,16 @@ def build_replenishment_request(
         "gaps": gaps, "query_groups": groups,
         "search_queries": _search_queries(aliases, year, groups),
         "rules": {
-            "title_identity_is_hard_gate": True, "name_coverage_is_hard_gate": True,
+            "require_title_identity": True, "require_name_coverage": True,
             "file_listing_restricts_claimed_coverage": True,
-            "provider_order": ["quark_share", "quark_magnet", "cloud_share", "magnet"],
+            "provider_order": ["cloud_share", "magnet"],
             "provider_fallback_is_per_gap": True,
             "quality_ladder": ["2160p", "1080p", "720p"],
             "allow_720p_only_without_1080p_or_better": True,
             "newest_before_quality_within_provider": True,
             "allow_multiple_candidates_to_cover_all_gaps": True,
-            # Season 00 is a required replenishment lane.  This marker changes
-            # only the evidence mapping for OVA/OAD numbering; it is never a
-            # waiver and never permits the coordinator to stop retrying.
+            # Season 00 uses OVA/OAD numbering while remaining a required
+            # acquisition lane.
             **({
                 "optional_discovery_only": True,
                 "season_zero_replenishment_required": True,
@@ -549,7 +1177,7 @@ def build_replenishment_request(
 def build_replenishment_requests(
     plan: Mapping[str, Any], *, job_id: str, round_number: int,
 ) -> dict[str, Any]:
-    """Split combined/batch plan gaps into identity-safe project requests."""
+    """Build one automatic acquisition request per media identity."""
     metadata = plan.get("metadata") if isinstance(plan.get("metadata"), Mapping) else {}
     raw_gaps = (
         plan.get("scan_report", {}).get("resource_gaps")
@@ -657,6 +1285,87 @@ def _timestamp(value: Any) -> float:
     return parsed.timestamp()
 
 
+def _swarm_count(value: Any) -> int | None:
+    """Parse a bounded non-negative swarm count without trusting coercion."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= _SWARM_COUNT_LIMIT else None
+    if isinstance(value, str) and re.fullmatch(r"\d{1,10}", value.strip()):
+        parsed = int(value.strip())
+        return parsed if parsed <= _SWARM_COUNT_LIMIT else None
+    return None
+
+
+def _swarm_timestamp(value: Any) -> float:
+    """Accept only an explicit ISO/epoch observation timestamp."""
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        if value != value or value < 0:  # NaN and negative epochs are invalid.
+            return 0.0
+        return float(value)
+    return _timestamp(value)
+
+
+def _swarm_preference(candidate: Mapping[str, Any]) -> tuple[int, int, int]:
+    """Return a liveness-only sort key after candidate hard gates.
+
+    ``2`` means a fresh positive seed observation, ``0`` an explicit fresh
+    zero-seed observation, and ``1`` neutral (missing, stale or malformed).
+    The helper is intentionally observational: callers use it only in sort
+    keys after identity and manifest/coverage validation has accepted a row.
+    """
+    nested = candidate.get("swarm")
+    source: Mapping[str, Any] = nested if isinstance(nested, Mapping) else candidate
+    seed_value = next(
+        (source.get(key) for key in ("seeders", "seeds", "seed") if key in source),
+        None,
+    )
+    seeds = _swarm_count(seed_value)
+    if seeds is None:
+        return (1, 0, 0)
+    leecher_value = next(
+        (
+            source.get(key)
+            for key in ("leechers", "leeches", "peers")
+            if key in source
+        ),
+        None,
+    )
+    leechers = _swarm_count(leecher_value)
+    if leechers is None:
+        leechers = 0
+    observed_value = next(
+        (
+            source.get(key)
+            for key in ("observed_at", "swarm_observed_at", "tracker_updated")
+            if key in source
+        ),
+        None,
+    )
+    if observed_value is None and source is not candidate:
+        observed_value = next(
+            (
+                candidate.get(key)
+                for key in ("swarm_observed_at", "observed_at", "tracker_updated")
+                if key in candidate
+            ),
+            None,
+        )
+    observed = _swarm_timestamp(observed_value)
+    now = datetime.now(timezone.utc).timestamp()
+    if (
+        observed <= 0
+        or now - observed > _SWARM_MAX_AGE_SECONDS
+        or observed - now > _SWARM_MAX_FUTURE_SKEW_SECONDS
+    ):
+        return (1, 0, 0)
+    if seeds == 0:
+        return (0, 0, 0)
+    return (2, seeds, leechers)
+
+
 def _normalized_quality(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or "unknown")).casefold()
     if any(marker in text for marker in ("2160", "4k", "uhd", "3840x2160")):
@@ -695,40 +1404,55 @@ def _coverage_tokens(value: Any, *, default_seasons: set[int] | None = None) -> 
         return set()
     output: set[str] = set()
     for item in value:
-        output.update(_expanded_episode_ids(item))
+        # An explicit SxxEyy token owns the episode coordinate.  Do not let a
+        # bare numeric title suffix (``S00E01 - 86 - Eighty Six``) be inferred
+        # as another episode by the anime dash fallback below.
+        explicit_episode_ids = _expanded_episode_ids(item)
+        output.update(explicit_episode_ids)
+        has_marked_episode = bool(
+            EPISODE_ONLY_RE.search(item) or CHINESE_EPISODE_ONLY_RE.search(item)
+        )
         season_match = re.fullmatch(r"\s*(?:S0*(\d{1,3})|Season\s+0*(\d{1,3})|第\s*(\d{1,3})\s*季)\s*", item, re.I)
         if season_match:
             output.add(f"S{int(next(group for group in season_match.groups() if group)):02d}")
         intrinsic_seasons = _season_markers(item)
-        effective_seasons = intrinsic_seasons or (default_seasons or set())
+        explicit_seasons = {
+            int(match.group(1))
+            for token in explicit_episode_ids
+            if (match := re.fullmatch(r"S(\d+)E\d+", token))
+        }
+        effective_seasons = explicit_seasons or intrinsic_seasons or (default_seasons or set())
         if len(effective_seasons) == 1:
             # A per-file path such as ``Season 2/... - 01.mkv`` carries
             # stronger evidence than the request's default season.  Applying
             # the S01 request default to that naked ordinal used to make a
             # multi-season pack falsely cover S01 with its S02 files.
             season = next(iter(effective_seasons))
-            for match in EPISODE_ONLY_RE.finditer(item):
-                start, end = int(match.group(1)), int(match.group(2) or match.group(1))
-                if 0 < start <= end and end - start <= 5000:
-                    output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-            for match in CHINESE_EPISODE_ONLY_RE.finditer(item):
-                start = _parse_chinese_number(match.group(1))
-                end = _parse_chinese_number(match.group(2)) if match.group(2) else start
-                if isinstance(start, int) and isinstance(end, int) and 0 < start <= end and end - start <= 5000:
-                    output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-            for pattern in (ANIME_EPISODE_RANGE_RE, ANIME_BRACKET_RANGE_RE):
-                for match in pattern.finditer(item):
-                    start, end = int(match.group(1)), int(match.group(2))
-                    if 0 < start <= end <= 999 and end - start <= 500:
+            # Explicit SxxEyy coordinates own their season.  Do not apply a
+            # request-wide default to later bare E##/第##集 tokens.
+            if not explicit_episode_ids:
+                for match in EPISODE_ONLY_RE.finditer(item):
+                    start, end = int(match.group(1)), int(match.group(2) or match.group(1))
+                    if 0 < start <= end and end - start <= 5000:
                         output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-            for match in ANIME_BRACKET_EPISODE_RE.finditer(item):
-                episode = int(match.group(1))
-                if 0 < episode <= 999:
-                    output.add(f"S{season:02d}E{episode:02d}")
-            for match in ANIME_DASH_EPISODE_RE.finditer(item):
-                episode = int(match.group(1))
-                if 0 < episode <= 999:
-                    output.add(f"S{season:02d}E{episode:02d}")
+                for match in CHINESE_EPISODE_ONLY_RE.finditer(item):
+                    start = _parse_chinese_number(match.group(1))
+                    end = _parse_chinese_number(match.group(2)) if match.group(2) else start
+                    if isinstance(start, int) and isinstance(end, int) and 0 < start <= end and end - start <= 5000:
+                        output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
+            # Unmarked anime forms are fallback evidence only.  Explicit
+            # episode coordinates make bracket/title numbers non-authoritative.
+            if not explicit_episode_ids and not has_marked_episode:
+                for pattern in (ANIME_EPISODE_RANGE_RE, ANIME_BRACKET_RANGE_RE):
+                    for match in pattern.finditer(item):
+                        start, end = int(match.group(1)), int(match.group(2))
+                        if 0 < start <= end <= 999 and end - start <= 500:
+                            output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
+                for pattern in (ANIME_BRACKET_EPISODE_RE, ANIME_DASH_EPISODE_RE):
+                    for match in pattern.finditer(item):
+                        episode = int(match.group(1))
+                        if 0 < episode <= 999:
+                            output.add(f"S{season:02d}E{episode:02d}")
     return output
 
 
@@ -748,6 +1472,131 @@ def _candidate_file_coverage(candidate: Mapping[str, Any], seasons: set[int]) ->
                 if isinstance(name, str):
                     values.append(name)
     return supplied, _coverage_tokens(values, default_seasons=seasons)
+
+
+def _candidate_has_video_file(candidate: Mapping[str, Any]) -> bool:
+    """Return true only when candidate evidence names a real video file."""
+    raw_files = candidate.get("files")
+    if not isinstance(raw_files, list):
+        return False
+    for item in raw_files:
+        value = item if isinstance(item, str) else (
+            item.get("path") or item.get("name")
+            if isinstance(item, Mapping) else None
+        )
+        if isinstance(value, str) and PurePosixPath(value).suffix.casefold() in _VIDEO_SUFFIXES:
+            return True
+    return False
+
+
+def _candidate_has_subtitle_file(candidate: Mapping[str, Any]) -> bool:
+    """Return true only when candidate evidence names a subtitle payload."""
+    raw_files = candidate.get("files")
+    if not isinstance(raw_files, list):
+        return False
+    return any(
+        isinstance(value, str)
+        and PurePosixPath(value).suffix.casefold() in {
+            ".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt",
+        }
+        for item in raw_files
+        for value in [
+            item if isinstance(item, str) else (
+                item.get("path") or item.get("name")
+                if isinstance(item, Mapping) else None
+            )
+        ]
+    )
+
+
+def _subtitle_file_matches_language(path: str, requested: object) -> bool:
+    """Keep an automatic subtitle request on its configured language lane.
+
+    A candidate without an explicit language marker remains a search miss so
+    the automatic retry can choose another release instead of attaching the
+    wrong language sidecar.
+    """
+    language = str(requested or "").strip().casefold()
+    if not language:
+        return True
+    marker = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", path.casefold())
+    if any(token in language for token in ("zh", "中文", "chinese", "简", "繁")):
+        return any(token in marker for token in ("zh", "zho", "chi", "chs", "cht", "中文", "简", "繁"))
+    if any(token in language for token in ("en", "english", "英文", "英语")):
+        return any(token in marker for token in (" en ", "eng", "english", "英文", "英语"))
+    if any(token in language for token in ("ja", "japanese", "日文", "日语")):
+        return any(token in marker for token in (" ja ", "jpn", "japanese", "日文", "日语"))
+    return True
+
+
+def _candidate_has_subtitle_for_gap(candidate: Mapping[str, Any], gap: Mapping[str, Any]) -> bool:
+    raw_files = candidate.get("files")
+    if not isinstance(raw_files, list):
+        return False
+    return any(
+        isinstance(value, str)
+        and PurePosixPath(value).suffix.casefold() in {
+            ".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt",
+        }
+        and _subtitle_file_matches_language(value, gap.get("subtitle_language"))
+        for item in raw_files
+        for value in [
+            item if isinstance(item, str) else (
+                item.get("path") or item.get("name")
+                if isinstance(item, Mapping) else None
+            )
+        ]
+    )
+
+
+def _exact_subtitle_file_coverage(
+    candidate: Mapping[str, Any], gap_lookup: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    """Return only subtitle gaps explicitly paired to a candidate file.
+
+    A subtitle-only request may contain many audited videos.  Seeing *a*
+    Chinese sidecar in a Torrent is not evidence that it belongs to every one
+    of them.  The local adapter has already performed that pairing and emits
+    both the exact gap ids in ``file_coverage`` and the selected manifest
+    indices in ``file_index_by_gap``.  Keep the selector bound to those
+    coordinates so it cannot later ask the materializer for an absent index.
+    """
+    subtitle_ids = {
+        gap_id
+        for gap_id, gap in gap_lookup.items()
+        if gap.get("kind") == "missing_subtitle"
+    }
+    if not subtitle_ids:
+        return set()
+
+    raw_file_coverage = candidate.get("file_coverage")
+    explicit_file_coverage = {
+        str(value)
+        for value in raw_file_coverage
+        if isinstance(value, str) and value in subtitle_ids
+    } if isinstance(raw_file_coverage, list) else set()
+
+    acquisition = candidate.get("acquisition")
+    raw_index_by_gap = (
+        acquisition.get("file_index_by_gap")
+        if isinstance(acquisition, Mapping) else None
+    )
+    if isinstance(raw_index_by_gap, Mapping):
+        mapped = {
+            gap_id
+            for gap_id in subtitle_ids
+            if isinstance((indices := raw_index_by_gap.get(gap_id)), list)
+            and any(type(index) is int and index > 0 for index in indices)
+        }
+        # A local Torrent candidate supplies both fields.  If it supplies an
+        # inconsistent file_coverage list, fail closed rather than let a
+        # malformed provider row broaden the requested work.
+        return mapped & explicit_file_coverage if isinstance(raw_file_coverage, list) else mapped
+
+    # Non-Torrent providers have no manifest-index map.  They may still make
+    # an explicit direct gap claim, but never receive a language-only
+    # fallback that expands one sidecar to every subtitle gap.
+    return explicit_file_coverage
 
 
 def _identity_matches(request: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
@@ -770,14 +1619,45 @@ def _identity_matches(request: Mapping[str, Any], candidate: Mapping[str, Any]) 
     aliases = media.get("aliases") if isinstance(media.get("aliases"), list) else [media.get("title")]
     haystack_values = _identity_text_values(candidate)
     haystacks = [_normalized_text(value) for value in haystack_values]
-    title_matches = any(
-        alias_key and any(alias_key in haystack for haystack in haystacks if haystack)
-        for alias in aliases if (alias_key := _normalized_text(alias))
-    )
-    if not title_matches:
+    matching_aliases = [
+        (str(alias), alias_key)
+        for alias in aliases
+        if (alias_key := _normalized_text(alias))
+        and any(alias_key in haystack for haystack in haystacks if haystack)
+    ]
+    if not matching_aliases:
         # This is also the franchise-sibling guard: a provider cannot turn a
         # Railgun release into Index merely by copying Index's requested ID.
         return False
+    # Season 00 belongs to a TV work but frequently maps to a standalone
+    # special.  A parent record can legitimately carry aliases for later TV
+    # seasons, yet an S00 candidate named only by ``II``/``S02``/``Season 2``
+    # is not thereby proven to be the current special.  Do not weaken normal
+    # positive-season matching, and do not turn a gap's movie aliases into
+    # ordinary media identity.  This narrow check applies only when the
+    # continuation alias is the *only* work evidence.
+    s00_missing_episode = any(
+        isinstance(gap, Mapping) and _is_s00_missing_episode(gap)
+        for gap in (
+            request.get("gaps") if isinstance(request.get("gaps"), list) else []
+        )
+    )
+    if s00_missing_episode:
+        media_keys = {
+            alias_key for alias in aliases
+            if (alias_key := _normalized_text(alias))
+        }
+        has_unseasoned_match = any(
+            not _alias_has_explicit_nonzero_season_marker(alias)
+            and _alias_has_unseasoned_candidate_match(
+                alias, alias_key, haystack_values,
+            )
+            for alias, alias_key in matching_aliases
+        )
+        if not has_unseasoned_match and not _has_strict_s00_gap_evidence(
+            request, haystack_values, media_keys=media_keys,
+        ):
+            return False
 
     expected_format = str(media.get("media_format") or "").strip()
     if expected_format not in {"animation", "live_action"}:
@@ -808,7 +1688,27 @@ def _name_coverage(
     raw_coverage = _expanded_episode_ids(name) | _coverage_tokens(
         candidate.get("name_coverage"), default_seasons=name_seasons,
     ) | _coverage_tokens([name], default_seasons=request_seasons)
-    coverage = set(raw_coverage)
+    subtitle_gap_ids = {
+        gap_id for gap_id, gap in gap_lookup.items()
+        if gap.get("kind") == "missing_subtitle"
+    }
+    # Release-name tokens, season labels, and episode-title hints are valid
+    # media discovery evidence, but are never a subtitle pairing claim.
+    coverage = set(raw_coverage) - subtitle_gap_ids
+    generic_media_gaps = {
+        gap_id for gap_id, gap in gap_lookup.items()
+        if gap.get("kind") == "missing_media"
+    }
+    if generic_media_gaps and _candidate_has_video_file(candidate):
+        # A movie gap has no SxxEyy token. The selected payload must contain a
+        # video and match the requested identity.
+        coverage.update(generic_media_gaps)
+    exact_subtitle_gaps = _exact_subtitle_file_coverage(candidate, gap_lookup)
+    if exact_subtitle_gaps:
+        # Unlike a movie, a subtitle sidecar must be paired with the exact
+        # audited video before selection.  Do not infer that one sidecar
+        # covers siblings in the same subtitle-only request.
+        coverage.update(exact_subtitle_gaps)
     explicit_whole_seasons = {
         int(token[1:]) for token in raw_coverage if re.fullmatch(r"S\d{2,3}", token)
     }
@@ -822,7 +1722,7 @@ def _name_coverage(
     for season in whole_season_claims:
         coverage.update(
             gap_id for gap_id, gap in gap_lookup.items()
-            if gap.get("season") == season
+            if gap.get("kind") != "missing_subtitle" and gap.get("season") == season
         )
     normalized_name = _normalized_text(name)
     identity_haystacks = [
@@ -842,6 +1742,8 @@ def _name_coverage(
                 file_haystacks.append(key)
     semantic_file_supported: set[str] = set()
     for gap_id, gap in gap_lookup.items():
+        if gap.get("kind") == "missing_subtitle":
+            continue
         episode_titles = {
             normalized
             for value in [
@@ -878,7 +1780,8 @@ def _name_coverage(
             claimed_seasons.add(int(group["season"]))
             coverage.update(
                 gap_id for gap_id, gap in gap_lookup.items()
-                if gap.get("season") == group["season"]
+                if gap.get("kind") != "missing_subtitle"
+                and gap.get("season") == group["season"]
             )
     for gap_id, gap in gap_lookup.items():
         expected = gap.get("expected_episode_count")
@@ -897,15 +1800,18 @@ def _name_coverage(
     coverage &= set(gap_lookup)
     file_listing_supplied, file_coverage = _candidate_file_coverage(candidate, claimed_seasons)
     if file_listing_supplied:
-        file_supported = file_coverage & set(gap_lookup)
+        file_supported = (file_coverage & set(gap_lookup)) - subtitle_gap_ids
         file_supported.update(semantic_file_supported)
+        if generic_media_gaps and _candidate_has_video_file(candidate):
+            file_supported.update(generic_media_gaps)
+        file_supported.update(exact_subtitle_gaps)
         for token in file_coverage:
             if not re.fullmatch(r"S\d{2,3}", token):
                 continue
             season = int(token[1:])
             file_supported.update(
                 gap_id for gap_id, gap in gap_lookup.items()
-                if gap.get("season") == season
+                if gap.get("kind") != "missing_subtitle" and gap.get("season") == season
             )
         for gap_id, gap in gap_lookup.items():
             expected = gap.get("expected_episode_count")
@@ -969,446 +1875,200 @@ def _candidate_infohash_aliases(candidate: Mapping[str, Any]) -> set[str]:
     return aliases
 
 
-_PERMANENT_EXHAUSTION_KINDS = frozenset({
-    "search_complete_no_candidates", "resource_failure_floor_reached",
-})
-
-
-def _verified_exhaustion_proof(
-    provider_exhausted: Mapping[str, Any], provider: str, *,
-    required_resource_floor: int = 0,
-) -> Mapping[str, Any] | None:
-    """Accept complete durable proofs, never labels or naked booleans."""
-    entry = provider_exhausted.get(provider)
-    if not isinstance(entry, Mapping) or entry.get("exhausted") is not True:
-        return None
-    proof = entry.get("proof")
-    if not isinstance(proof, Mapping):
-        return None
-    kind = str(proof.get("kind") or "")
-    if kind not in _PERMANENT_EXHAUSTION_KINDS:
-        return None
-    if kind == "search_complete_no_candidates":
-        required = proof.get("required_sources")
-        completed = proof.get("completed_sources")
-        if (
-            not isinstance(required, list)
-            or not required
-            or not all(isinstance(item, str) and item for item in required)
-            or not isinstance(completed, list)
-            or not all(isinstance(item, str) and item for item in completed)
-            or set(required) - set(completed)
-            or type(proof.get("candidate_count")) is not int
-            or proof["candidate_count"] != 0
-            or type(proof.get("excluded_candidate_count")) is not int
-            or proof["excluded_candidate_count"] < 0
-        ):
-            return None
-    else:
-        required_floor = proof.get("required_floor")
-        distinct_failures = proof.get("distinct_failure_count")
-        if (
-            type(required_floor) is not int
-            or required_floor <= 0
-            or required_floor < required_resource_floor
-            or type(distinct_failures) is not int
-            or distinct_failures < required_floor
-        ):
-            return None
-    return proof
-
-
-def _local_torrent_gate(
-    request: Mapping[str, Any],
-) -> tuple[bool, int, int, Mapping[str, Any] | None]:
-    """Resolve the fail-closed tier-3 gate and expose its audit inputs.
-
-    Resource-failure counts alone may advance between cloud candidates, but
-    must never authorize local Torrent while a required cloud search source
-    still has uninspected candidates.  A complete required-source exhaustion
-    proof can cross the cloud/local boundary without an artificial failure
-    count: a genuinely empty cloud search space has no resources to fail.
-    """
-    rules = request.get("rules") if isinstance(request.get("rules"), Mapping) else {}
-    attempts = (
-        request.get("provider_attempts")
-        if isinstance(request.get("provider_attempts"), Mapping) else {}
-    )
-    exhausted = (
-        request.get("provider_exhausted")
-        if isinstance(request.get("provider_exhausted"), Mapping) else {}
-    )
-    try:
-        floor = max(0, min(int(rules.get("minimum_attempts_per_cloud_lane") or 0), 1000))
-        offline_attempts = max(0, int(attempts.get("quark_magnet") or 0))
-    except (TypeError, ValueError):
-        return False, 0, 0, None
-    proof = _verified_exhaustion_proof(
-        exhausted, "quark_magnet", required_resource_floor=floor,
-    )
-    unlocked = bool(
-        isinstance(proof, Mapping)
-        and proof.get("kind") == "search_complete_no_candidates"
-    )
-    return unlocked, floor, offline_attempts, proof
-
-
-def _has_exact_quark_share_manifest(candidate: Mapping[str, Any]) -> bool:
-    """Require the file-id/path/size evidence needed by fast-save."""
-    acquisition = candidate.get("acquisition")
-    if not isinstance(acquisition, Mapping):
-        return False
-    gap_map = acquisition.get("file_id_by_gap")
-    path_map = acquisition.get("file_path_by_id")
-    size_map = acquisition.get("file_size_by_id")
-    if not all(isinstance(value, Mapping) and value for value in (
-        gap_map, path_map, size_map,
-    )):
-        return False
-    for gap, raw_ids in gap_map.items():
-        file_ids = [raw_ids] if isinstance(raw_ids, str) else raw_ids
-        if (
-            not isinstance(gap, str) or not gap
-            or not isinstance(file_ids, list) or not file_ids
-            or not all(isinstance(file_id, str) and file_id for file_id in file_ids)
-        ):
-            return False
-        for file_id in file_ids:
-            path = path_map.get(file_id)
-            size = size_map.get(file_id)
-            if not isinstance(path, str) or not path.strip() or type(size) is not int or size <= 0:
-                return False
-    return True
-
-
 def select_replenishment_candidates(
     request: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Select a per-gap provider-first bundle instead of requiring one mega-release."""
+    """Select a provider-neutral, per-gap bundle.
+
+    Unsupported provider artifacts are untrusted input and are rejected before any
+    selection can be persisted or resumed. Generic HTTP adapters may use
+    cloud_share; the bundled local adapter uses exact magnet/Torrent.
+    """
     gap_ids, gap_lookup = _request_gap_ids(request)
     if not gap_ids:
-        return {"status": "empty", "selections": [], "covered_gap_ids": [], "uncovered_gap_ids": []}
+        return {
+            "status": "empty", "selections": [],
+            "covered_gap_ids": [], "uncovered_gap_ids": [],
+        }
 
-    excluded_rows = request.get("excluded_candidates")
-    excluded = excluded_rows if isinstance(excluded_rows, list) else []
-    local_torrent_unlocked, _, _, local_torrent_proof = _local_torrent_gate(request)
-    infrastructure_suppressed_cloud_locators = {
-        str(item.get("locator") or "").strip()
-        for item in excluded
-        if isinstance(item, Mapping)
-        and item.get("provider") in {"quark_share", "quark_magnet"}
-        and isinstance(item.get("until_epoch"), (int, float))
-        and str(item.get("reason") or "").endswith("_infrastructure_failure")
-        and item.get("locator")
-    }
-    infrastructure_suppressed_cloud_hashes: dict[str, set[str]] = defaultdict(set)
-    for item in excluded:
-        if (
-            isinstance(item, Mapping)
-            and item.get("provider") in {"quark_share", "quark_magnet"}
-            and isinstance(item.get("until_epoch"), (int, float))
-            and str(item.get("reason") or "").endswith("_infrastructure_failure")
-        ):
-            infrastructure_suppressed_cloud_hashes[str(item["provider"])].update(
-                _candidate_infohash_aliases(item)
-            )
+    raw_excluded = request.get("excluded_candidates")
+    excluded = raw_excluded if isinstance(raw_excluded, list) else []
     excluded_locators = {
-        str(item.get("locator") or "").strip()
-        for item in excluded if isinstance(item, Mapping) and item.get("locator")
+        (str(row.get("provider") or "*"), str(row.get("locator") or "").strip())
+        for row in excluded
+        if isinstance(row, Mapping) and str(row.get("locator") or "").strip()
     }
-    excluded_hashes_by_provider: dict[str, set[str]] = defaultdict(set)
-    for item in excluded:
-        if not isinstance(item, Mapping):
-            continue
-        provider = str(item.get("provider") or "*")
-        excluded_hashes_by_provider[provider].update(_candidate_infohash_aliases(item))
+    excluded_hashes: dict[str, set[str]] = defaultdict(set)
+    for row in excluded:
+        if isinstance(row, Mapping):
+            excluded_hashes[str(row.get("provider") or "*")].update(
+                _candidate_infohash_aliases(row)
+            )
 
-    valid_by_locator: dict[str, dict[str, Any]] = {}
-    infrastructure_blocked_cloud_by_gap: dict[str, set[str]] = defaultdict(set)
     rejections: Counter[str] = Counter()
-    candidate_counts: Counter[str] = Counter(
-        str(item.get("provider") or "unknown")
-        for item in candidates if isinstance(item, Mapping)
-    )
     rejections_by_provider: dict[str, Counter[str]] = defaultdict(Counter)
-    durable_rejections: list[dict[str, Any]] = []
+    candidate_counts: Counter[str] = Counter(
+        str(row.get("provider") or "unknown")
+        for row in candidates if isinstance(row, Mapping)
+    )
+    valid_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def reject(
-        provider_name: Any, reason: str, rejected_candidate: Mapping[str, Any] | None = None,
-    ) -> None:
+    def reject(provider: Any, reason: str) -> None:
+        name = str(provider or "unknown")
         rejections[reason] += 1
-        rejections_by_provider[str(provider_name or "unknown")][reason] += 1
-        if (
-            reason in {"known_unavailable", "title_identity_mismatch", "name_or_file_coverage_miss"}
-            and provider_name in {"quark_share", "quark_magnet"}
-            and isinstance(rejected_candidate, Mapping)
-            and isinstance(rejected_candidate.get("locator"), str)
-            and rejected_candidate.get("locator").strip()
-        ):
-            durable_rejections.append({
-                "provider": provider_name,
-                "locator": rejected_candidate["locator"].strip(),
-                "infohash": rejected_candidate.get("infohash"),
-                "release_name": rejected_candidate.get("release_name"),
-                "reason": reason,
-            })
+        rejections_by_provider[name][reason] += 1
 
     for raw in candidates:
+        if not isinstance(raw, Mapping):
+            reject("unknown", "candidate_not_object")
+            continue
         candidate = dict(raw)
-        provider = candidate.get("provider")
+        provider = str(candidate.get("provider") or "")
+        if provider not in PROVIDER_ORDER:
+            reject(provider, "unsupported_provider")
+            continue
         release_name = candidate.get("release_name")
         locator = candidate.get("locator")
-        if provider not in PROVIDER_ORDER:
-            reject(provider, "unsupported_provider"); continue
-        if provider == "magnet" and not local_torrent_unlocked:
-            # Older search artifacts may contain a cloud/local pair.  Treat
-            # the local row as untrusted input until the current request has
-            # both the tier-2 floor and permanent exhaustion proof.
-            reject(provider, "local_torrent_locked"); continue
+        if not isinstance(release_name, str) or not release_name.strip():
+            reject(provider, "missing_release_name")
+            continue
+        if not isinstance(locator, str) or not locator.strip():
+            reject(provider, "missing_locator")
+            continue
         acquisition = candidate.get("acquisition")
-        # The two automated cloud lanes are executable contracts, not merely
-        # source labels.  In particular, accepting a legacy ``quark_share``
-        # row without its exact file-id manifest lets it win provider ranking
-        # and then fail before fast-save can ever be called.  Local ``magnet``
-        # rows remain backward compatible because old verified catalogs did
-        # not persist an acquisition object.
-        if provider in {"quark_share", "quark_magnet"} or (
-            provider == "magnet" and isinstance(acquisition, Mapping)
-        ):
+        if provider == "magnet" and isinstance(acquisition, Mapping):
             try:
                 acquisition_lane(candidate)
             except AcquisitionRouteError:
-                reject(provider, "provider_acquisition_mismatch"); continue
-        if provider == "quark_share" and not _has_exact_quark_share_manifest(candidate):
-            reject(provider, "incomplete_quark_share_manifest"); continue
-        if not isinstance(release_name, str) or not release_name.strip():
-            reject(provider, "missing_release_name"); continue
-        if not isinstance(locator, str) or not locator.strip():
-            reject(provider, "missing_locator"); continue
+                reject(provider, "provider_acquisition_mismatch")
+                continue
         locator_key = locator.strip()
-        excluded_hashes = (
-            excluded_hashes_by_provider.get(str(provider), set())
-            | excluded_hashes_by_provider.get("*", set())
-        )
+        infohashes = _candidate_infohash_aliases(candidate)
+        if (
+            (provider, locator_key) in excluded_locators
+            or ("*", locator_key) in excluded_locators
+            or bool(infohashes & (
+                excluded_hashes.get(provider, set())
+                | excluded_hashes.get("*", set())
+            ))
+        ):
+            reject(provider, "excluded_candidate")
+            continue
         if not _candidate_available(candidate):
-            reject(provider, "known_unavailable", candidate); continue
+            reject(provider, "known_unavailable")
+            continue
         if not _identity_matches(request, candidate):
-            reject(provider, "title_identity_mismatch", candidate); continue
+            reject(provider, "title_identity_mismatch")
+            continue
         coverage = _name_coverage(request, candidate, gap_lookup)
         if not coverage:
-            reject(provider, "name_or_file_coverage_miss", candidate); continue
-        candidate_hashes = _candidate_infohash_aliases(candidate)
-        if locator_key in excluded_locators or bool(
-            excluded_hashes and candidate_hashes & excluded_hashes
-        ):
-            provider_name = str(provider)
-            if (
-                provider_name in {"quark_share", "quark_magnet"}
-                and (
-                    locator_key in infrastructure_suppressed_cloud_locators
-                    or bool(
-                        candidate_hashes
-                        & infrastructure_suppressed_cloud_hashes.get(provider_name, set())
-                    )
-                )
-            ):
-                for gap_id in coverage:
-                    infrastructure_blocked_cloud_by_gap[gap_id].add(provider_name)
-                reject(provider, "cloud_infrastructure_suppression")
-            else:
-                reject(provider, "excluded_candidate")
+            reject(provider, "name_or_file_coverage_miss")
             continue
-        candidate["resolution"] = _normalized_quality(candidate.get("resolution") or release_name)
+        candidate["provider"] = provider
+        candidate["release_name"] = release_name.strip()
         candidate["locator"] = locator_key
+        candidate["resolution"] = _normalized_quality(
+            candidate.get("resolution") or release_name
+        )
         candidate["coverage"] = sorted(coverage)
-        existing = valid_by_locator.get(locator_key)
-        if existing is None:
-            valid_by_locator[locator_key] = candidate
+        identity = (provider, locator_key)
+        current = valid_by_identity.get(identity)
+        if current is None:
+            valid_by_identity[identity] = candidate
             continue
         reject(provider, "duplicate_locator")
-        combined_coverage = sorted(set(existing["coverage"]) | set(candidate["coverage"]))
-        def evidence_rank(item: Mapping[str, Any]) -> tuple[int, int, float, int]:
-            return (
-                len(item.get("coverage") or []),
-                1 if item.get("availability") == "verified" else 0,
-                _timestamp(item.get("updated_at")),
-                QUALITY_ORDER[str(item.get("resolution") or "unknown")],
-            )
-        preferred = candidate if evidence_rank(candidate) > evidence_rank(existing) else existing
-        preferred["coverage"] = combined_coverage
-        valid_by_locator[locator_key] = preferred
+        combined = sorted(set(current["coverage"]) | set(candidate["coverage"]))
+        preferred = max((current, candidate), key=lambda item: (
+            _swarm_preference(item),
+            len(item.get("coverage") or []),
+            1 if item.get("availability") == "verified" else 0,
+            _timestamp(item.get("updated_at")),
+            QUALITY_ORDER[str(item.get("resolution") or "unknown")],
+        ))
+        preferred["coverage"] = combined
+        valid_by_identity[identity] = preferred
 
-    valid = list(valid_by_locator.values())
-    eligible_counts = Counter(str(item.get("provider") or "unknown") for item in valid)
-
-    rules = request.get("rules") if isinstance(request.get("rules"), Mapping) else {}
-    raw_attempts = request.get("provider_attempts")
-    provider_attempts = raw_attempts if isinstance(raw_attempts, Mapping) else {}
-    raw_exhausted = request.get("provider_exhausted")
-    provider_exhausted = raw_exhausted if isinstance(raw_exhausted, Mapping) else {}
-    try:
-        minimum_attempts = int(rules.get("minimum_attempts_per_cloud_lane") or 0)
-    except (TypeError, ValueError):
-        minimum_attempts = 0
-    minimum_attempts = max(0, min(minimum_attempts, 1000))
-    share_attempts = int(provider_attempts.get("quark_share") or 0)
-    offline_attempts = int(provider_attempts.get("quark_magnet") or 0)
-    required_attempt_provider: str | None = None
-    selection_pool = valid
-    share_exhausted = _verified_exhaustion_proof(
-        provider_exhausted, "quark_share",
-        required_resource_floor=minimum_attempts,
-    ) is not None
-    offline_exhausted = _verified_exhaustion_proof(
-        provider_exhausted, "quark_magnet",
-        required_resource_floor=minimum_attempts,
-    ) is not None
-    if minimum_attempts and share_attempts < minimum_attempts and not share_exhausted:
-        required_attempt_provider = "quark_share"
-        selection_pool = [
-            item for item in valid if item.get("provider") == "quark_share"
-        ]
-    elif (
-        minimum_attempts or candidate_counts.get("magnet", 0) > 0
-    ) and not offline_exhausted:
-        required_attempt_provider = "quark_magnet"
-        # A newly discovered first-lane candidate always remains preferable;
-        # otherwise stay inside the second cloud lane until its own budget is
-        # exhausted.  Local Torrent is deliberately absent from this pool.
-        selection_pool = [
-            item for item in valid
-            if item.get("provider") != "magnet"
-        ]
-    elif not minimum_attempts and any(
-        item.get("provider") == "magnet" for item in valid
-    ):
-        excluded_rows = request.get("excluded_candidates")
-        excluded_rows = excluded_rows if isinstance(excluded_rows, list) else []
-        first_lane_failed = any(
-            isinstance(row, Mapping)
-            and (
-                row.get("provider") == "quark_share"
-                or str(row.get("locator") or "").startswith((
-                    "quark_share:", "quark-share:",
-                ))
-            )
-            for row in excluded_rows
-        )
-        second_lane_failed = any(
-            isinstance(row, Mapping)
-            and row.get("provider") == "quark_magnet"
-            and row.get("failure_scope") != "infrastructure"
-            and not isinstance(row.get("until_epoch"), (int, float))
-            for row in excluded_rows
-        )
-        if first_lane_failed and not (
-            second_lane_failed or offline_exhausted
-        ):
-            # Hard fail-closed invariant: an excluded/failed first-lane share
-            # can advance only to Quark cloud offline, never directly to a
-            # local Torrent, even if the caller forgot the numeric floor.
-            required_attempt_provider = "quark_magnet"
-            selection_pool = [
-                item for item in valid if item.get("provider") == "quark_magnet"
-            ]
-
-    selected_by_locator: dict[str, dict[str, Any]] = {}
-    infrastructure_blocked_gap_ids: list[str] = []
+    valid = list(valid_by_identity.values())
+    eligible_counts = Counter(str(row["provider"]) for row in valid)
+    selected_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     for gap_id in sorted(gap_ids):
-        covering = [item for item in selection_pool if gap_id in item["coverage"]]
+        covering = [row for row in valid if gap_id in row["coverage"]]
         if not covering:
             continue
-        provider_rank = min(PROVIDER_ORDER[str(item["provider"])] for item in covering)
-        # A broken helper/network is not evidence that this resource requires
-        # local download.  Permit another executable cloud lane, but do not
-        # cross the cloud/local boundary until the cloud candidate itself has
-        # a durable resource-level failure/exclusion.
-        if (
-            provider_rank >= PROVIDER_ORDER["magnet"]
-            and infrastructure_blocked_cloud_by_gap.get(gap_id)
-        ):
-            infrastructure_blocked_gap_ids.append(gap_id)
-            rejections["cloud_infrastructure_must_retry_before_local"] += 1
-            continue
-        pool = [item for item in covering if PROVIDER_ORDER[str(item["provider"])] == provider_rank]
-        high = [item for item in pool if QUALITY_ORDER[str(item["resolution"])] >= QUALITY_ORDER["1080p"]]
-        known_720 = [item for item in pool if item["resolution"] == "720p"]
-        pool = high or known_720 or pool
-        winner = max(pool, key=lambda item: (
-            _timestamp(item.get("updated_at")), QUALITY_ORDER[str(item["resolution"])],
-            len(item["coverage"]), 1 if item.get("availability") == "verified" else 0,
-            str(item.get("release_name") or "").casefold(),
+        provider_rank = min(PROVIDER_ORDER[str(row["provider"])] for row in covering)
+        pool = [
+            row for row in covering
+            if PROVIDER_ORDER[str(row["provider"])] == provider_rank
+        ]
+        high = [
+            row for row in pool
+            if QUALITY_ORDER[str(row["resolution"])] >= QUALITY_ORDER["1080p"]
+        ]
+        known_720 = [row for row in pool if row["resolution"] == "720p"]
+        winner = max(high or known_720 or pool, key=lambda row: (
+            _swarm_preference(row),
+            _timestamp(row.get("updated_at")),
+            QUALITY_ORDER[str(row["resolution"])],
+            len(row["coverage"]),
+            1 if row.get("availability") == "verified" else 0,
+            str(row.get("release_name") or "").casefold(),
         ))
-        locator = str(winner["locator"])
-        selected = selected_by_locator.setdefault(locator, dict(winner, selected_gap_ids=[]))
+        identity = (str(winner["provider"]), str(winner["locator"]))
+        selected = selected_by_identity.setdefault(
+            identity, dict(winner, selected_gap_ids=[]),
+        )
         selected["selected_gap_ids"].append(gap_id)
 
-    selections = sorted(selected_by_locator.values(), key=lambda item: (
-        PROVIDER_ORDER[str(item["provider"])], -len(item["selected_gap_ids"]),
-        -_timestamp(item.get("updated_at")), -QUALITY_ORDER[str(item["resolution"])],
+    selections = sorted(selected_by_identity.values(), key=lambda row: (
+        PROVIDER_ORDER[str(row["provider"])],
+        -len(row["selected_gap_ids"]),
+        tuple(-value for value in _swarm_preference(row)),
+        -_timestamp(row.get("updated_at")),
+        -QUALITY_ORDER[str(row["resolution"])],
     ))
-    # Persist the exact per-gap order as audit evidence.  The coordinator
-    # excludes or temporarily suppresses only the failed locator and calls the
-    # selector again, so the next round advances along this chain instead of
-    # jumping directly from a share failure to a large local download.
-    def acquisition_kind_label(item: Mapping[str, Any]) -> str:
-        acquisition = item.get("acquisition")
-        return str(acquisition.get("kind") or "legacy") if isinstance(
-            acquisition, Mapping
-        ) else "legacy"
+
+    def acquisition_kind(row: Mapping[str, Any]) -> str:
+        acquisition = row.get("acquisition")
+        return (
+            str(acquisition.get("kind") or "external_http")
+            if isinstance(acquisition, Mapping)
+            else "external_http"
+        )
 
     provider_chain_by_gap = {
         gap_id: [
             {
-                "provider": item["provider"],
-                "locator": item["locator"],
-                "acquisition_kind": acquisition_kind_label(item),
+                "provider": row["provider"],
+                "locator": row["locator"],
+                "acquisition_kind": acquisition_kind(row),
             }
-            for item in sorted(
-                (candidate for candidate in valid if gap_id in candidate["coverage"]),
+            for row in sorted(
+                (item for item in valid if gap_id in item["coverage"]),
                 key=lambda item: (
                     PROVIDER_ORDER[str(item["provider"])],
+                    tuple(-value for value in _swarm_preference(item)),
                     -_timestamp(item.get("updated_at")),
-                    -QUALITY_ORDER[str(item["resolution"])],
+                    -QUALITY_ORDER[str(item.get("resolution") or "unknown")],
                     str(item.get("locator") or ""),
                 ),
             )
         ]
         for gap_id in sorted(gap_ids)
     }
-    covered = {gap_id for item in selections for gap_id in item["selected_gap_ids"]}
+    covered = {
+        gap_id for selection in selections
+        for gap_id in selection["selected_gap_ids"]
+    }
     uncovered = gap_ids - covered
     return {
         "status": "complete" if not uncovered else ("partial" if covered else "no_match"),
-        "selections": selections, "covered_gap_ids": sorted(covered),
-        "uncovered_gap_ids": sorted(uncovered), "candidate_count": len(candidates),
-        "eligible_candidate_count": len(valid), "rejection_reasons": dict(sorted(rejections.items())),
-        "durably_rejected_candidates": durable_rejections,
+        "selections": selections,
+        "covered_gap_ids": sorted(covered),
+        "uncovered_gap_ids": sorted(uncovered),
+        "candidate_count": len(candidates),
+        "eligible_candidate_count": len(valid),
+        "rejection_reasons": dict(sorted(rejections.items())),
         "provider_chain_by_gap": provider_chain_by_gap,
-        "infrastructure_blocked_gap_ids": infrastructure_blocked_gap_ids,
-        "required_attempt_provider": (
-            required_attempt_provider if not selections else None
-        ),
-        "required_attempt_blocked_by_infrastructure": bool(
-            required_attempt_provider
-            and any(
-                required_attempt_provider in providers
-                for providers in infrastructure_blocked_cloud_by_gap.values()
-            )
-        ),
-        "minimum_attempts_per_cloud_lane": minimum_attempts,
-        "provider_attempts": {
-            "quark_share": share_attempts,
-            "quark_magnet": offline_attempts,
-        },
-        "provider_exhausted": {
-            "quark_share": share_exhausted,
-            "quark_magnet": offline_exhausted,
-        },
-        "local_torrent_unlocked": local_torrent_unlocked,
-        "local_torrent_exhaustion_proof": (
-            dict(local_torrent_proof) if local_torrent_proof is not None else None
-        ),
         "provider_diagnostics": {
             provider: {
                 "candidate_count": candidate_counts.get(provider, 0),
@@ -1420,30 +2080,3 @@ def select_replenishment_candidates(
             for provider in PROVIDER_ORDER
         },
     }
-
-
-def select_replenishment_candidate(
-    request: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
-) -> dict[str, Any] | None:
-    """Backward-compatible single-candidate view for older callers."""
-    bundle = select_replenishment_candidates(request, candidates)
-    selections = bundle["selections"]
-    return selections[0] if bundle["status"] == "complete" and len(selections) == 1 else None
-
-
-def validate_acquisition_results(value: Mapping[str, Any]) -> list[str]:
-    if value.get("status") != "ready":
-        raise ValueError("查补适配器未返回 ready 状态")
-    sources = value.get("source_paths")
-    if sources is None and isinstance(value.get("source_path"), str):
-        sources = [value["source_path"]]
-    if not isinstance(sources, list) or not sources or not all(
-        isinstance(source, str) and source.strip() for source in sources
-    ):
-        raise ValueError("查补适配器缺少 source_path/source_paths")
-    return list(dict.fromkeys(source.strip() for source in sources))
-
-
-def validate_acquisition_result(value: Mapping[str, Any]) -> str:
-    """Backward-compatible first source path."""
-    return validate_acquisition_results(value)[0]

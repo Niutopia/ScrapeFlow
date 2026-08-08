@@ -1,14 +1,9 @@
-"""Domain models shared by planning, execution and recovery."""
+"""Domain models for the automatic planning workflow."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Any, Mapping
-
-from .serialization import write_json_reserved
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, order=True)
@@ -43,7 +38,6 @@ class PlannedFile:
     episode_key: str | None = None
     source_size: int | None = None
     source_modified: str | None = None
-    source_hash: str | None = None
 
     @property
     def requires_rename(self) -> bool:
@@ -58,12 +52,11 @@ class PlannedCleanup:
     reason: str
     source_size: int | None = None
     source_modified: str | None = None
-    source_hash: str | None = None
 
 
 @dataclass
 class PlannedProblem:
-    """A source file that needs explicit attention during plan review."""
+    """A source file that the automatic planner could not place."""
 
     source_path: str
     reason: str
@@ -72,13 +65,12 @@ class PlannedProblem:
 
 @dataclass(frozen=True)
 class PlanNotice:
-    """Machine-readable planning notice used by gates and the UI."""
+    """Machine-readable planning notice."""
 
     code: str
     severity: str
-    requires_review: bool
     message: str
-    evidence: dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -94,48 +86,6 @@ class Plan:
     notices: list[PlanNotice] = field(default_factory=list)
     decision_trace: dict[str, Any] = field(default_factory=dict)
     scan_report: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ExecutionRecord:
-    action: str
-    source: str
-    target: str
-    status: str
-    message: str = ""
-
-
-def _plan_sha256(plan: Mapping[str, Any]) -> str:
-    payload = json.dumps(
-        plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-@dataclass
-class ExecutionJournal:
-    created_at: str
-    plan: dict[str, Any]
-    records: list[ExecutionRecord]
-    success: bool = False
-
-    def save(self, path: Path) -> None:
-        payload = {
-            "created_at": self.created_at,
-            "plan_sha256": _plan_sha256(self.plan),
-            "plan": self.plan,
-            "records": [asdict(item) for item in self.records],
-            "success": self.success,
-        }
-        write_json_reserved(path, payload)
-
-
-@dataclass
-class RecoveryState:
-    item: PlannedFile
-    current_dir: str
-    current_name: str
-    entry: Mapping[str, Any]
 
 
 @dataclass(frozen=True)

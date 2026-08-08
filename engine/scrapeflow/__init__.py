@@ -1,8 +1,3 @@
-"""Reusable ScrapeFlow engine package.
+"""Automatic identity matching, media planning and provider services."""
 
-The legacy :mod:`engine.scraper` module remains the compatibility CLI and
-facade while implementation modules move into this package incrementally.
-"""
-
-__version__ = "3.3.2"
-
+__version__ = "4.0.0"

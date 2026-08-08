@@ -1,7 +1,7 @@
 """Deterministic canonical layout for independently identified works.
 
-The planner deliberately separates two questions which the legacy scraper
-mixed together:
+The planner deliberately separates two questions which the runtime facade
+previously mixed together:
 
 * identity is *only* ``(metadata namespace, id)``;
 * a title boundary may propose a franchise/family container, but can never

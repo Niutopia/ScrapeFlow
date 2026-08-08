@@ -74,12 +74,12 @@ def validate_routing(source_root: str, target_root: str) -> RoutingContext:
         if _within(target, forbidden):
             raise ValueError(f"禁止使用已废弃目标目录 {forbidden}: {target}")
         relative_target = posixpath.relpath(target, category_root)
-        legacy_segments = {
+        reserved_segments = {
             segment.casefold()
             for segment in relative_target.split("/")
             if segment not in {"", "."}
         } & {"movies", "specials"}
-        if legacy_segments:
+        if reserved_segments:
             raise ValueError(
                 "禁止使用 Movies/Specials 中间目录；系列电影必须直接位于系列根目录，"
                 f"TV 特别篇必须位于所属作品 Season 00: {target}"

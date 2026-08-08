@@ -3,11 +3,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { ApiRequestError, scrapeFlowApi } from "../core/api-client";
 import type {
-  BrowseResult, GlobalControl, Health, Job, JobRetryOptions, TargetCategory,
+  BrowseResult, GlobalControl, Health, Job, LibraryAudit,
 } from "../core/contracts";
-import { ACTIVE_PHASES, APPROVAL_PHASES, UNSCRAPED_MEDIA_ROOT } from "../core/job-state";
+import { ACTIVE_PHASES, UNSCRAPED_MEDIA_ROOT, isFailed } from "../core/job-state";
 
 function errorMessage(error: unknown, fallback: string) {
+  if (error instanceof ApiRequestError && error.status === 504) {
+    return "请求超时；系统会根据 AList 实际状态继续核对，请刷新任务查看进度。";
+  }
   return error instanceof Error ? error.message : fallback;
 }
 
@@ -29,6 +32,10 @@ export function useScrapeFlow() {
   const [browser, setBrowser] = useState<BrowseResult | null>(null);
   const [browserPending, setBrowserPending] = useState(false);
   const [createConflict, setCreateConflict] = useState<Job | null>(null);
+  const [libraryAudit, setLibraryAudit] = useState<LibraryAudit | null>(null);
+  const [auditPending, setAuditPending] = useState(false);
+  const [auditError, setAuditError] = useState("");
+
   const mergeJob = useCallback((incoming: Job) => {
     const next = normalizeJob(incoming);
     setSelected(next);
@@ -71,6 +78,33 @@ export function useScrapeFlow() {
     }
   }, []);
 
+  const refreshLibraryAudit = useCallback(async () => {
+    try {
+      const response = await scrapeFlowApi.latestAudit();
+      setLibraryAudit(response.audit ?? null);
+      setAuditError("");
+      return response.audit ?? null;
+    } catch (cause) {
+      setAuditError(errorMessage(cause, "无法读取最近媒体库审计"));
+      return null;
+    }
+  }, []);
+
+  const runLibraryAudit = useCallback(async () => {
+    setAuditPending(true);
+    setAuditError("");
+    try {
+      const response = await scrapeFlowApi.runAudit();
+      setLibraryAudit(response.audit ?? null);
+      return response.audit ?? null;
+    } catch (cause) {
+      setAuditError(errorMessage(cause, "媒体库审计失败"));
+      return null;
+    } finally {
+      setAuditPending(false);
+    }
+  }, []);
+
   const setGlobalPause = useCallback(async (paused: boolean, reason?: string) => {
     try {
       setControl(await scrapeFlowApi[paused ? "pause" : "resume"](reason));
@@ -86,34 +120,33 @@ export function useScrapeFlow() {
     let disposed = false;
     const restore = async () => {
       const [, queue] = await Promise.all([
-        refreshHealth(), refreshJobs(), refreshControl(),
+        refreshHealth(), refreshJobs(), refreshControl(), refreshLibraryAudit(),
       ]);
       if (disposed) return;
-      const active = queue.find(job => APPROVAL_PHASES.has(job.phase) || job.phase === "recovery_required")
-        ?? queue.find(job => ACTIVE_PHASES.has(job.phase))
+      const active = queue.find(job => ACTIVE_PHASES.has(job.phase))
+        ?? queue.find(isFailed)
         ?? queue[0];
       if (active) {
         try {
           const response = await scrapeFlowApi.job(active.id);
           if (!disposed) mergeJob(response.job);
         } catch {
-          // The queue still renders; health/error surfaces handle diagnostics.
+          // The compact queue remains useful if loading one detail fails.
         }
       }
       if (!disposed) setInitializing(false);
     };
     void restore();
-    // Pause/resume initiated elsewhere (or restored after a process restart)
-    // reaches the dashboard within one heartbeat.
     const healthTimer = window.setInterval(() => {
       void refreshHealth();
       void refreshControl();
+      void refreshLibraryAudit();
     }, 12000);
     return () => {
       disposed = true;
       window.clearInterval(healthTimer);
     };
-  }, [mergeJob, refreshControl, refreshHealth, refreshJobs]);
+  }, [mergeJob, refreshControl, refreshHealth, refreshJobs, refreshLibraryAudit]);
 
   const hasActiveJobs = jobs.some(job => ACTIVE_PHASES.has(job.phase));
   const selectedActiveId = selected && ACTIVE_PHASES.has(selected.phase) ? selected.id : null;
@@ -123,16 +156,12 @@ export function useScrapeFlow() {
     let timer = 0;
     const poll = async () => {
       if (!disposed) await refreshJobs();
-      // The queue endpoint intentionally omits plans. Refresh the selected live
-      // task as well so its stage, candidate and resource details do not freeze
-      // at the version that was first expanded.
       if (!disposed && selectedActiveId) {
         try {
           const response = await scrapeFlowApi.job(selectedActiveId);
           if (!disposed) mergeJob(response.job);
         } catch {
-          // Queue polling remains authoritative for the row. A later tick will
-          // retry the detail without replacing a visible operation error.
+          // The next heartbeat repeats the read-only refresh.
         }
       }
       if (!disposed) timer = window.setTimeout(poll, 1000);
@@ -159,30 +188,21 @@ export function useScrapeFlow() {
     }
   };
 
-  const createJob = async (
-    source: string,
-    category: TargetCategory | "",
-    tmdbId?: number,
-    mediaType?: "tv" | "movie",
-  ) => {
+  const createJob = async (source: string) => {
     const path = source.trim().replace(/\/+$/, "");
-    if (!path || path === UNSCRAPED_MEDIA_ROOT) {
-      setOperationError(`请选择 ${UNSCRAPED_MEDIA_ROOT} 下的具体媒体目录`);
-      return false;
-    }
-    if (!category) {
-      setOperationError("请选择目标分类：番剧、美剧或电影");
+    if (!path) {
+      setOperationError("请输入或选择来源目录");
       return false;
     }
     if (!health?.connected || !health.tmdb_configured) {
-      setOperationError("AList 与 TMDB 就绪后才能创建任务");
+      setOperationError("AList 与 TMDB 就绪后才能开始自动整理");
       return false;
     }
     setPending(true);
     setOperationError("");
     setCreateConflict(null);
     try {
-      const response = await scrapeFlowApi.create(path, category, tmdbId, mediaType);
+      const response = await scrapeFlowApi.create(path);
       mergeJob(response.job);
       return true;
     } catch (cause) {
@@ -192,11 +212,11 @@ export function useScrapeFlow() {
           const existing = normalizeJob(candidate as Job);
           mergeJob(existing);
           setCreateConflict(existing);
-          setOperationError(`这个目录已有任务 #${existing.id}，未重复创建；已在新建页显示原任务。`);
+          setOperationError(`这个目录已有自动任务 #${existing.id}，没有重复创建。`);
           return false;
         }
       }
-      setOperationError(errorMessage(cause, "无法创建任务"));
+      setOperationError(errorMessage(cause, "无法创建自动任务"));
       return false;
     } finally {
       setPending(false);
@@ -218,47 +238,15 @@ export function useScrapeFlow() {
     }
   };
 
-  const approve = async () => {
-    if (!selected?.digest) return false;
+  const retry = async (job: Job) => {
     setPending(true);
     setOperationError("");
     try {
-      const response = await scrapeFlowApi.approve(selected.id, selected.digest);
+      const response = await scrapeFlowApi.retry(job.id);
       mergeJob(response.job);
       return true;
     } catch (cause) {
-      setOperationError(errorMessage(cause, "计划批准失败"));
-      return false;
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const recover = async (job = selected) => {
-    if (!job) return false;
-    setPending(true);
-    setOperationError("");
-    try {
-      const response = await scrapeFlowApi.recover(job.id);
-      mergeJob(response.job);
-      return true;
-    } catch (cause) {
-      setOperationError(errorMessage(cause, "恢复检查启动失败"));
-      return false;
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const retry = async (job: Job, options: JobRetryOptions = {}) => {
-    setPending(true);
-    setOperationError("");
-    try {
-      const response = await scrapeFlowApi.retry(job.id, options);
-      mergeJob(response.job);
-      return true;
-    } catch (cause) {
-      setOperationError(errorMessage(cause, "任务重试失败"));
+      setOperationError(errorMessage(cause, "无法请求自动重试"));
       return false;
     } finally {
       setPending(false);
@@ -280,68 +268,15 @@ export function useScrapeFlow() {
     }
   };
 
-  const keepExisting = async (job: Job) => {
-    setPending(true);
-    setOperationError("");
-    try {
-      const response = await scrapeFlowApi.keepExisting(job.id);
-      mergeJob(response.job);
-      return true;
-    } catch (cause) {
-      setOperationError(errorMessage(cause, "无法保留现有版本"));
-      return false;
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const remove = async (job: Job) => {
-    setPending(true);
-    setOperationError("");
-    try {
-      await scrapeFlowApi.remove(job.id);
-      setJobs(previous => previous.filter(item => item.id !== job.id));
-      setSelected(previous => previous?.id === job.id ? null : previous);
-      return true;
-    } catch (cause) {
-      setOperationError(errorMessage(cause, "无法删除任务记录"));
-      return false;
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const clearData = async () => {
-    setPending(true);
-    setOperationError("");
-    try {
-      await scrapeFlowApi.clearData();
-      setJobs([]);
-      setSelected(null);
-      setBrowser(previous => previous ? {
-        ...previous,
-        directories: previous.directories.map(directory => ({
-          name: directory.name,
-          path: directory.path,
-        })),
-      } : null);
-      return true;
-    } catch (cause) {
-      setOperationError(errorMessage(cause, "无法清空本地任务与处理历史"));
-      return false;
-    } finally {
-      setPending(false);
-    }
-  };
-
   const error = operationError || queueError;
   const errorSource = operationError ? "operation" as const : queueError ? "queue" as const : null;
 
   return {
     health, healthError, jobs, selected, initializing, pending, error, errorSource, createConflict,
     browser, browserPending, refreshHealth, refreshJobs, loadJob,
-    createJob, browse, approve, recover, retry, cancel, keepExisting, remove, clearData,
+    createJob, browse, retry, cancel,
     control, controlError, refreshControl, setGlobalPause,
+    libraryAudit, auditPending, auditError, refreshLibraryAudit, runLibraryAudit,
     dismissError: () => setOperationError(""),
   };
 }

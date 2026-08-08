@@ -6,36 +6,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# Runtime tools used by archive extraction, replenishment, subtitle inspection
-# and OCR frame extraction.  Debian/glibc is required for the published
-# onnxruntime wheels; OpenCV and ONNX Runtime need the three small shared-lib
-# packages below, while --no-install-recommends keeps GUI/build tooling out.
+# The API process owns intake, planning, library writes, audit and acquisition.
+# aria2c downloads selected torrents; ffprobe checks downloaded media streams.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        aria2 \
         ca-certificates \
+        aria2 \
         ffmpeg \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 \
-        p7zip-full \
         tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 999 scrapeflow \
-    && useradd --system --uid 999 --gid scrapeflow --home-dir /app \
-        --no-create-home --shell /usr/sbin/nologin scrapeflow \
-    && mkdir -p /data/jobs /var/tmp/scrapeflow \
-    && chown -R scrapeflow:scrapeflow /app /data /var/tmp/scrapeflow
+    && mkdir -p /data/jobs /var/tmp/scrapeflow
 
-COPY engine/requirements-ocr.txt /tmp/requirements-ocr.txt
-RUN python3 -m pip install --requirement /tmp/requirements-ocr.txt \
-    && python3 -c "import cv2, onnxruntime; from rapidocr import RapidOCR" \
-    && rm -f /tmp/requirements-ocr.txt
+COPY engine ./engine
+COPY local ./local
 
-COPY --chown=scrapeflow:scrapeflow engine ./engine
-COPY --chown=scrapeflow:scrapeflow local ./local
-COPY --chown=scrapeflow:scrapeflow contracts ./contracts
-
-USER scrapeflow
 EXPOSE 8765
-CMD ["python3", "-m", "local.server"]
+CMD ["python3", "-m", "local.simple_server"]

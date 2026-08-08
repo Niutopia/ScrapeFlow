@@ -9,7 +9,7 @@
     "local": "node scripts/local.mjs",
     "dev": "next dev",
     "build": "next build",
-    "build:staging": "node scripts/build-web-staging.mjs",
+    "build:check": "node scripts/build-web-staging.mjs",
     "test": "node scripts/check.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit --incremental false",
