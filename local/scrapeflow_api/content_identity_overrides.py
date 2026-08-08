@@ -21,6 +21,8 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 
+from engine.scrapeflow.media_policy import VIDEO_EXTENSIONS
+
 
 CONTENT_IDENTITY_OVERRIDE_SCHEMA_VERSION = 1
 CONTENT_IDENTITY_OVERRIDE_KIND = "content_identity_overrides"
@@ -44,9 +46,7 @@ FATE_IDENTITY_VERSION = "fate-strange-fake-movie-v1"
 
 _CONTENT_PROBE_BYTES = 8 * 1024 * 1024
 _CONTENT_PROBE_TIMEOUT_SECONDS = 30
-_VIDEO_SUFFIXES = frozenset({
-    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov", ".webm", ".wmv", ".iso",
-})
+_VIDEO_SUFFIXES = VIDEO_EXTENSIONS
 # The witness was recorded from the exact child object.  Keeping this compact
 # and explicit makes a metadata-only collision fail closed: every selected
 # container, stream, tag, chapter and prefix field must match.

@@ -2,9 +2,9 @@
 
 The Engine keeps its runtime entrypoints in ``engine.scraper``.  This module
 only classifies caller-owned metadata and path strings; it never opens a
-provider, writes a plan, or performs a remote operation. Runtime wrappers pass
-the live ``VIDEO_EXTS`` collection so the classification policy stays aligned
-with the Engine's source of truth.
+provider, writes a plan, or performs a remote operation. The canonical video
+collection is imported from ``media_policy`` so quality admission and
+planning cannot drift.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Collection, Mapping
 
+from .media_policy import VIDEO_EXTENSIONS
+
 
 # A regular feature-length film or episode is many orders of magnitude larger
 # than this.  Keep an immutable floor even when an operator chooses a higher
@@ -23,10 +25,9 @@ from typing import Any, Collection, Mapping
 # back exactly.
 ABSOLUTE_MINIMUM_VIDEO_BYTES = 64 * 1024
 DEFAULT_MINIMUM_VIDEO_BYTES = 1024 * 1024
-VIDEO_FILE_EXTENSIONS = frozenset({
-    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".wmv", ".mov",
-    ".webm", ".flv", ".mpeg", ".mpg", ".rmvb", ".strm",
-})
+# Keep the public name for callers that imported the quality module directly;
+# the canonical collection now lives in ``media_policy``.
+VIDEO_FILE_EXTENSIONS = VIDEO_EXTENSIONS
 
 
 def minimum_video_bytes() -> int:

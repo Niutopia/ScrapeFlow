@@ -5,9 +5,8 @@ import { ACTIVE_PHASES, PHASE, formatDate, isFailed } from "../core/job-state";
 
 function providerLabel(provider?: string) {
   switch (provider) {
-    case "http": return "HTTP 来源";
-    case "torrent": return "Torrent 来源";
-    case "local": return "本地来源";
+    case "magnet": return "磁力 / Torrent 来源";
+    case "cloud_share": return "云分享来源（当前不可用）";
     default: return "自动来源";
   }
 }

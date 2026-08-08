@@ -91,10 +91,22 @@ function completionLabel(audit: LibraryAudit) {
 function observationSummary(audit: LibraryAudit | null) {
   const duplicateCount = audit?.duplicates?.length ?? 0;
   const emptyDirectoryCount = audit?.empty_directories?.length ?? 0;
-  if (!duplicateCount && !emptyDirectoryCount) return null;
+  const archiveCount = audit?.archives?.length ?? 0;
+  const attachmentCount = audit?.attachments?.length ?? 0;
+  const unknownFileCount = audit?.unknown_files?.length ?? 0;
+  const orphanSubtitleCount = audit?.orphan_subtitles?.length ?? 0;
+  const categorizedResidualCount = archiveCount + attachmentCount + unknownFileCount;
+  const residualCount = audit?.residuals?.length ?? 0;
+  const uncategorizedResidualCount = Math.max(0, residualCount - categorizedResidualCount);
+  if (!duplicateCount && !emptyDirectoryCount && !residualCount && !orphanSubtitleCount) return null;
   const labels = [
     duplicateCount ? `${duplicateCount} 组疑似重复` : "",
     emptyDirectoryCount ? `${emptyDirectoryCount} 个空目录` : "",
+    archiveCount ? `${archiveCount} 个归档包` : "",
+    attachmentCount ? `${attachmentCount} 个附件` : "",
+    unknownFileCount ? `${unknownFileCount} 个未知文件` : "",
+    uncategorizedResidualCount ? `${uncategorizedResidualCount} 个保留残留` : "",
+    orphanSubtitleCount ? `${orphanSubtitleCount} 个孤立字幕` : "",
   ].filter(Boolean);
   return `${labels.join("、")}仅作观察，不会自动删除或移动。`;
 }

@@ -43,8 +43,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from engine.scraper import AListClient, ApiError, ScraperError, join_remote, split_remote
-from engine.scrapeflow.replenishment_acquisition import (
-    AcquisitionRouteError, acquisition_lane,
+from engine.scrapeflow.provider_capabilities import (
+    ACTIVE_PROVIDERS,
+    candidate_capability_error,
+    provider_capability_snapshot,
 )
 from engine.scrapeflow.serialization import atomic_write_json
 
@@ -211,10 +213,14 @@ from engine.scrapeflow.media_quality import (
     minimum_video_bytes,
     video_size_is_admissible,
 )
+from engine.scrapeflow.media_policy import (
+    SUBTITLE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+)
 
 
-VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".webm"})
-SUBTITLE_EXTENSIONS = frozenset({".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"})
+# Compatibility names are intentionally kept local because this adapter's
+# public helpers accept an ``allowed_payload_extensions`` default.
 MAX_TORRENT_BYTES = 8 * 1024 * 1024
 ANIME_PLAIN_EPISODE_RE = re.compile(
     r"(?:^|[\s._-])0*(\d{1,3})(?=\s*(?:\[[^\]]+\]\s*)*$)", re.I,
@@ -694,7 +700,7 @@ def _dynamic_search_timeout_seconds(request: Mapping[str, Any]) -> int:
 
 
 def _search(request: Mapping[str, Any]) -> dict[str, Any]:
-    """Search generic HTTP/Torrent sources only; never register a cloud bridge."""
+    """Search exact local Torrent sources only; never register a cloud bridge."""
     media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
     tmdb_id = media.get("tmdb_id")
     if type(tmdb_id) is not int or tmdb_id <= 0:
@@ -723,7 +729,7 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
                     if not isinstance(row, Mapping):
                         continue
                     candidate = dict(row)
-                    if candidate.get("provider") in {"cloud_share", "magnet"}:
+                    if str(candidate.get("provider") or "") in ACTIVE_PROVIDERS:
                         output.extend(_catalog_torrent_candidate_variants(candidate))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         warnings.append(f"已核验候选目录不可用: {type(exc).__name__}")
@@ -762,7 +768,8 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
             rows = [dict(row) for row in result if isinstance(row, Mapping)]
             rows = [
                 row for row in rows
-                if row.get("provider") in {"cloud_share", "magnet"}
+                if str(row.get("provider") or "") in ACTIVE_PROVIDERS
+                and candidate_capability_error(row) is None
             ]
             output.extend(row for row in rows if str(row.get("locator") or "") not in existing_locators)
             telemetry[label] = {
@@ -788,7 +795,9 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
     for row in output:
         provider = str(row.get("provider") or "")
         locator = str(row.get("locator") or "")
-        if provider not in {"cloud_share", "magnet"} or not locator:
+        if provider not in ACTIVE_PROVIDERS or not locator:
+            continue
+        if candidate_capability_error(row) is not None:
             continue
         deduplicated.setdefault((provider, locator), row)
     required_rows = [
@@ -806,10 +815,11 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
         "candidates": list(deduplicated.values()),
         "excluded_candidate_count": len(existing_rows),
         "warnings": warnings,
-        "lane_status": {"cloud_share": {"status": "ready"}, "magnet": {"status": "ready"}},
+        "lane_status": provider_capability_snapshot(),
+        "provider_capabilities": provider_capability_snapshot(),
         "source_telemetry": telemetry,
         "search_complete": search_complete,
-        "active_search_lane": "generic",
+        "active_search_lane": "magnet_torrent",
     }
 
 
@@ -1761,9 +1771,9 @@ def _torrent_candidate_variants(
 def _catalog_torrent_candidate_variants(
     candidate: Mapping[str, Any], *, include_local: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return one provider-neutral catalog candidate."""
+    """Return one catalog candidate only when it is executable locally."""
     local = dict(candidate)
-    return [local] if include_local else []
+    return [local] if include_local and candidate_capability_error(local) is None else []
 
 
 def _search_nyaa(
@@ -3605,9 +3615,13 @@ def _preflight_dispatch(
         raise ReplenishmentInfrastructureError(
             "选择文件缺少 selections", stage="artifact_validation",
         )
-    if any(_selection_acquisition_kind(row) != "torrent" for row in rows):
+    if any(
+        _selection_acquisition_kind(row) != "torrent"
+        or candidate_capability_error(row) is not None
+        for row in rows
+    ):
         raise ReplenishmentInfrastructureError(
-            "本地适配器只接受 exact Torrent selection；其他来源必须使用独立 generic HTTP adapter",
+            "本地适配器只接受可执行的 magnet/torrent selection",
             stage="artifact_validation",
         )
     return _preflight(
@@ -3693,9 +3707,13 @@ def _acquire_dispatch(
         raise ReplenishmentInfrastructureError(
             "选择文件缺少 selections", stage="artifact_validation",
         )
-    if any(_selection_acquisition_kind(row) != "torrent" for row in rows):
+    if any(
+        _selection_acquisition_kind(row) != "torrent"
+        or candidate_capability_error(row) is not None
+        for row in rows
+    ):
         raise ReplenishmentInfrastructureError(
-            "本地适配器拒绝非 Torrent acquisition；没有云端执行 fallback",
+            "本地适配器拒绝不可执行 provider/acquisition；没有云端 fallback",
             stage="artifact_validation",
         )
     if not automatic:

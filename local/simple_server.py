@@ -24,6 +24,7 @@ from engine.scrapeflow.media_quality import (
     is_production_test_media_path,
     is_video_filename,
 )
+from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     EngineJob,
@@ -253,6 +254,7 @@ class SimpleApplication:
             "connected": self.remote_configured,
             "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
             "engine_configured": self.engine_configured,
+            "provider_capabilities": provider_capability_snapshot(),
             "intake_monitoring": self._intake_monitor_enabled(),
             "intake": {
                 "enabled": self._intake_monitor_enabled(),
@@ -798,9 +800,7 @@ class SimpleApplication:
             if (
                 not isinstance(path, str)
                 or not path.startswith(expected_target.rstrip("/") + "/")
-                or Path(path).suffix.casefold() not in {
-                    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov", ".webm", ".wmv", ".iso",
-                }
+                or not is_video_filename(path)
                 or not isinstance(row.get("subtitle_language"), str)
                 or not row.get("subtitle_language", "").strip()
             ):

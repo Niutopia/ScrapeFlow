@@ -21,6 +21,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.replenishment_matching import (
+    EPISODE_ONLY_RE,
+    EPISODE_RE,
+    audit_episode_tokens,
+)
+from engine.scrapeflow.residual_policy import classify_residual
+from engine.scrapeflow.media_policy import (
+    POSTER_EXTENSIONS,
+    SUBTITLE_EXTENSIONS,
+    TEMPORARY_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+)
 from local.scrapeflow_api.content_identity_overrides import (
     apply_content_identity_overrides,
 )
@@ -31,44 +43,15 @@ DEFAULT_FORMAL_LIBRARY_ROOTS = (
     "/quark/影视/番剧",
     "/quark/影视/美剧",
 )
-VIDEO_SUFFIXES = frozenset({
-    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov", ".webm", ".wmv", ".iso",
-})
-SUBTITLE_SUFFIXES = frozenset({".ass", ".ssa", ".srt", ".vtt", ".idx", ".sub", ".sup", ".mks"})
-POSTER_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
-TEMPORARY_SUFFIXES = frozenset({
-    ".part", ".partial", ".tmp", ".temp", ".crdownload", ".aria2", ".download", ".!qb",
-})
+# Compatibility aliases: extension policy is owned by Engine media_policy.
+VIDEO_SUFFIXES = VIDEO_EXTENSIONS
+SUBTITLE_SUFFIXES = SUBTITLE_EXTENSIONS
+POSTER_SUFFIXES = POSTER_EXTENSIONS
+TEMPORARY_SUFFIXES = TEMPORARY_EXTENSIONS
 
-# These expressions intentionally cover only explicit episode notation.  A
-# library audit must never guess that an arbitrary number in a filename is an
-# episode (that would create a false acquisition request).  ``Season N`` is
-# accepted as context for the common ``01.mkv``/``E01.mkv`` form.
-_SEASON_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})[ ._-]*E0*(?P<episode>\d{1,4})(?!\d)",
-    re.IGNORECASE,
-)
-_SEASON_EPISODE_RANGE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})[ ._-]*E0*(?P<start>\d{1,4})"
-    r"\s*(?:-|–|—|~|～)\s*"
-    r"(?:S0*(?P<end_season>\d{1,3})[ ._-]*)?E0*(?P<end>\d{1,4})(?!\d)",
-    re.IGNORECASE,
-)
-_EPISODE_ONLY_RE = re.compile(
-    r"(?<![A-Z0-9])E(?:P)?0*(?P<episode>\d{1,4})(?!\d)",
-    re.IGNORECASE,
-)
-_EPISODE_RANGE_RE = re.compile(
-    r"(?<![A-Z0-9])E(?:P)?0*(?P<start>\d{1,4})"
-    r"\s*(?:-|–|—|~|～)\s*E(?:P)?0*(?P<end>\d{1,4})(?!\d)",
-    re.IGNORECASE,
-)
-# A range must be explicit at both ends and remain small.  This handles the
-# common double-episode release while refusing a malformed/batch filename
-# such as ``S01E01-E9999`` from claiming an entire season.
-_MAX_EXPLICIT_EPISODE_RANGE = 24
-_SEASON_DIR_RE = re.compile(r"^(?:season|s)\s*0*(\d{1,3})$", re.IGNORECASE)
-_BARE_EPISODE_RE = re.compile(r"(?:^|[ ._\[(?-])0*(\d{1,4})(?:\]|$)")
+# Episode coordinate parsing is shared with provider selection and Engine
+# planning.  The two imported expressions below are used only for the NFO
+# boundary check; all coverage extraction goes through ``audit_episode_tokens``.
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _MOVIE_DIRECTORY_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>[^()]{1,32})\)$")
 _ANCILLARY_VIDEO_RE = re.compile(
@@ -256,6 +239,86 @@ def _kind(path: str) -> str | None:
     return None
 
 
+_SUBTITLE_COMPANION_SUFFIX_RE = re.compile(
+    r"(?:[. _-]+(?:"
+    r"zh(?:[-_](?:cn|tw|hans|hant))?|chi|chs|cht|"
+    r"简(?:中|体)?|繁(?:中|体)?|中文字幕|中文|"
+    r"en(?:g)?|english|ja|jpn|japanese|subtitle\d*"
+    r"))+$",
+    re.IGNORECASE,
+)
+
+
+def _subtitle_companion_key(path: str) -> tuple[str, str]:
+    """Return a conservative directory/stem pairing key for sidecars.
+
+    This is an audit observation only: a failure to find a companion leaves a
+    subtitle visible as an orphan, but never authorizes a delete or a provider
+    write.  Strip only conventional language/subtitle tails so editions such
+    as ``v2`` remain part of the exact video identity.
+    """
+    pure = PurePosixPath(path)
+    stem = _SUBTITLE_COMPANION_SUFFIX_RE.sub("", pure.stem.casefold()).rstrip(" ._-")
+    return str(pure.parent).casefold(), stem
+
+
+def _residual_observations(
+    files: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, object]]]:
+    """Classify retained non-canonical files without turning them into work.
+
+    The audit needs to make attachments, archives, unknown data and detached
+    sidecars visible.  ``residual_policy`` deliberately does not grant delete
+    authority from any of those classifications, so every row here is an
+    observation rather than an ``automatic_tasks`` item.
+    """
+    video_keys = {
+        _subtitle_companion_key(str(row["path"]))
+        for row in files
+        if _kind(str(row.get("path") or "")) == "video"
+    }
+    output: dict[str, list[dict[str, object]]] = {
+        "residuals": [],
+        "archives": [],
+        "attachments": [],
+        "unknown_files": [],
+        "orphan_subtitles": [],
+    }
+    for row in files:
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        kind = _kind(path)
+        if kind == "subtitle":
+            if _subtitle_companion_key(path) not in video_keys:
+                output["orphan_subtitles"].append({
+                    "path": path,
+                    "size": row.get("size"),
+                    "reason": "no_exact_video_companion",
+                })
+            continue
+        if kind is not None:
+            continue
+        decision = classify_residual(path)
+        observation: dict[str, object] = {
+            "path": path,
+            "size": row.get("size"),
+            "residual_kind": decision.kind,
+            "action": decision.action,
+            "evidence": list(decision.reasons),
+        }
+        output["residuals"].append(observation)
+        if decision.kind == "archive":
+            output["archives"].append(observation)
+        elif decision.kind == "unknown":
+            output["unknown_files"].append(observation)
+        else:
+            output["attachments"].append(observation)
+    for rows in output.values():
+        rows.sort(key=lambda item: str(item.get("path") or "").casefold())
+    return output
+
+
 def _is_episode_nfo(path: str) -> bool:
     """Return whether an NFO basename carries an explicit episode token.
 
@@ -266,12 +329,7 @@ def _is_episode_nfo(path: str) -> bool:
     a bare number remains an explicit movie-sidecar boundary.
     """
     stem = PurePosixPath(path).stem
-    return any(pattern.search(stem) for pattern in (
-        _SEASON_EPISODE_RANGE_RE,
-        _SEASON_EPISODE_RE,
-        _EPISODE_RANGE_RE,
-        _EPISODE_ONLY_RE,
-    ))
+    return bool(EPISODE_RE.search(stem) or EPISODE_ONLY_RE.search(stem))
 
 
 def _accepts_refresh(listing: Callable[..., object]) -> bool:
@@ -351,7 +409,14 @@ class SimpleLibraryAuditor:
         if all(status == "completed" for status in statuses):
             report.update(status="completed", available=True, complete=True)
             self._findings(report)
-            report["clean"] = not report["automatic_tasks"]
+            # Attachments and orphan sidecars are not automatic work, but a
+            # report containing them is not a clean library snapshot either.
+            # They remain observation-only and never create a delete request.
+            report["clean"] = not (
+                report["automatic_tasks"]
+                or report["residuals"]
+                or report["orphan_subtitles"]
+            )
         elif "unavailable" in statuses:
             report["status"] = "unavailable"
         else:
@@ -376,11 +441,18 @@ class SimpleLibraryAuditor:
             "inventory": [],
             "zero_byte_files": [],
             "temporary_entries": [],
+            "residuals": [],
+            "archives": [],
+            "attachments": [],
+            "unknown_files": [],
+            "orphan_subtitles": [],
             "duplicates": [],
             "empty_directories": [],
             "observations": {
                 "video_files": [], "subtitle_files": [], "nfo_files": [], "poster_files": [],
                 "media_directories": [], "ancillary_media": [],
+                "residuals": [], "archives": [], "attachments": [],
+                "unknown_files": [], "orphan_subtitles": [],
             },
             "automatic_tasks": [],
             "errors": [],
@@ -502,6 +574,10 @@ class SimpleLibraryAuditor:
         report["empty_directories"] = sorted(
             (path for path, count in children.items() if count == 0), key=str.casefold
         )
+        residuals = _residual_observations(files)
+        for key, rows in residuals.items():
+            report[key] = rows
+            report["observations"][key] = [dict(row) for row in rows]
 
         media_dirs: list[dict[str, object]] = []
         tv_roots = tuple(
@@ -2145,73 +2221,9 @@ def _observed_ancillary_media(
     return sorted(observations, key=lambda row: str(row["path"]).casefold())
 
 
-def _bounded_episode_range_tokens(
-    season: int,
-    start: int,
-    end: int,
-    *,
-    end_season: int | None = None,
-) -> set[tuple[int, int]]:
-    """Return a small, same-season explicit episode range or no evidence."""
-    if (
-        season < 0
-        or end_season not in {None, season}
-        or start <= 0
-        or end < start
-        or end - start + 1 > _MAX_EXPLICIT_EPISODE_RANGE
-    ):
-        return set()
-    return {(season, episode) for episode in range(start, end + 1)}
-
-
-def _episode_tokens(path: str, *, default_season: int | None = None) -> set[tuple[int, int]]:
-    """Extract only explicit episode tokens from one audited video path."""
-    tokens: set[tuple[int, int]] = set()
-    for match in _SEASON_EPISODE_RANGE_RE.finditer(path):
-        season = int(match.group("season"))
-        end_season = match.group("end_season")
-        tokens.update(_bounded_episode_range_tokens(
-            season,
-            int(match.group("start")),
-            int(match.group("end")),
-            end_season=int(end_season) if end_season is not None else None,
-        ))
-    for match in _SEASON_EPISODE_RE.finditer(path):
-        season, episode = int(match.group("season")), int(match.group("episode"))
-        if season >= 0 and episode > 0:
-            tokens.add((season, episode))
-    if tokens:
-        return tokens
-    if default_season is None:
-        return tokens
-    for match in _EPISODE_RANGE_RE.finditer(path):
-        tokens.update(_bounded_episode_range_tokens(
-            default_season,
-            int(match.group("start")),
-            int(match.group("end")),
-        ))
-    for match in _EPISODE_ONLY_RE.finditer(path):
-        episode = int(match.group("episode"))
-        if episode > 0:
-            tokens.add((default_season, episode))
-    if tokens:
-        return tokens
-    # Season 2/01.mkv and [01].mkv are common anime layouts.  Infer from a
-    # clearly named season directory, never from an arbitrary movie number.
-    parts = PurePosixPath(path).parts
-    season = next(
-        (int(match.group(1)) for part in reversed(parts) if (match := _SEASON_DIR_RE.match(part))),
-        default_season,
-    )
-    if season is None:
-        return tokens
-    stem = PurePosixPath(path).stem
-    match = re.search(r"(?:^|[ ._\[(?-])0*(\d{1,4})(?:\]|$)", stem)
-    if match:
-        episode = int(match.group(1))
-        if episode > 0:
-            tokens.add((season, episode))
-    return tokens
+# Compatibility alias for callers/tests that still import the Local helper.
+# The implementation intentionally lives in the provider-neutral shared parser.
+_episode_tokens = audit_episode_tokens
 
 
 def _language_keys(value: object) -> set[str]:

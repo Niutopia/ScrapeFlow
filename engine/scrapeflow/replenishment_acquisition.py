@@ -1,13 +1,19 @@
-"""Provider-neutral acquisition routing.
+"""Acquisition routing for the currently executable local provider lane.
 
-Only generic HTTP and exact Torrent lanes are executable. Unsupported provider
-artifacts are rejected before they can reach a materializer.
+The process ships one materializer: exact magnet/Torrent acquisition.  The
+HTTP protocol remains injectable as a future extension point, but it is not a
+current capability and must never make a cloud-share candidate runnable.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
+
+from .provider_capabilities import (
+    EXECUTABLE_ACQUISITION_KIND,
+    candidate_capability_error,
+)
 
 
 class AcquisitionRouteError(RuntimeError):
@@ -42,16 +48,16 @@ class ArrivalVerifierPort(Protocol):
 
 
 def acquisition_lane(selection: Mapping[str, Any]) -> str:
-    """Validate provider/kind alignment and return a generic execution lane."""
+    """Validate the real materializer contract and return its execution lane."""
+    error = candidate_capability_error(selection)
+    if error is None:
+        return EXECUTABLE_ACQUISITION_KIND
     provider = str(selection.get("provider") or "")
     acquisition = selection.get("acquisition")
     kind = str(acquisition.get("kind") or "") if isinstance(acquisition, Mapping) else ""
-    if provider == "magnet" and kind == "torrent":
-        return "torrent"
-    if provider == "cloud_share" and kind in {"http", "http_download", "external_http"}:
-        return "http"
     raise AcquisitionRouteError(
-        f"provider/acquisition kind mismatch: provider={provider!r}, kind={kind!r}"
+        "no executable materializer for "
+        f"provider={provider!r}, kind={kind!r} ({error})"
     )
 
 
@@ -69,10 +75,11 @@ def acquire_selection(
     selects the compatible injected lane, normalizes its ready result, and
     verifies the arrival when a verifier is supplied.
     """
+    # Keep the optional HTTP argument for a future materializer integration,
+    # but do not let its presence alter today's fail-closed capability.
+    del acquire_http
     lane = acquisition_lane(selection)
-    handler = acquire_torrent if lane == "torrent" else acquire_http
-    if handler is None:
-        raise AcquisitionRouteError(f"{lane} lane has no injected executor")
+    handler = acquire_torrent
     try:
         result = handler(selection, destination)
     except AcquisitionRouteError:

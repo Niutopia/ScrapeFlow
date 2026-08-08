@@ -97,6 +97,7 @@ class FakeSearch:
                 "title": "Example Show",
                 "year": "2020",
                 "files": ["Example.Show.S01E01.mkv"],
+                "acquisition": {"kind": "torrent"},
             }],
         }
 
@@ -510,6 +511,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "release_name": "[Group] Mayuri Judgment (1080p)",
             "files": ["Mayuri Judgment 1080p.mkv"],
             "availability": "metadata_verified",
+            "acquisition": {"kind": "torrent"},
         }])
 
         self.assertEqual(selected["status"], "no_match")
@@ -839,6 +841,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 "year": "2020",
                 "files": ["Example.Show.S01E01.mkv"],
                 "resolution": "1080p",
+                "acquisition": {"kind": "torrent"},
                 **swarm,
             }
 
@@ -2590,6 +2593,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     "release_name": "Example Show S01E01-E02 1080p",
                     "title": "Example Show", "year": "2020",
                     "files": ["Example.Show.S01E01.mkv"],
+                    "acquisition": {"kind": "torrent"},
                 }]}
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -2643,6 +2647,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     "title": "Example Movie",
                     "year": "2020",
                     "files": ["Example.Movie.2020.mkv"],
+                    "acquisition": {"kind": "torrent"},
                 }]}
 
         class MovieMaterializer(FakeMaterializer):
@@ -3338,6 +3343,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "title": "Example Show",
             "year": "2020",
             "files": ["Example.Show.S01E01.mkv"],
+            "acquisition": {"kind": "torrent"},
         }
         fallback = {
             "provider": "magnet",
@@ -3347,6 +3353,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "title": "Example Show",
             "year": "2020",
             "files": ["Example.Show.S01E01.mkv"],
+            "acquisition": {"kind": "torrent"},
         }
 
         class Search:

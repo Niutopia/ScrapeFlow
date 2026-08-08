@@ -17,6 +17,11 @@ from engine.scrapeflow.replenishment_matching import (
     normalized_text as _normalized_text,
     season_markers as _season_markers,
 )
+from engine.scrapeflow.provider_capabilities import candidate_capability_error
+from engine.scrapeflow.media_policy import (
+    SUBTITLE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+)
 
 from .replenishment import (
     build_replenishment_requests,
@@ -27,13 +32,8 @@ from .redaction import redact_error, redact_value
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
-_VIDEO_EXTENSIONS = frozenset({
-    ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
-    ".mp4", ".mpeg", ".mpg", ".mts", ".rm", ".rmvb", ".ts", ".webm", ".wmv",
-})
-_SUBTITLE_EXTENSIONS = frozenset({
-    ".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt",
-})
+_VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+_SUBTITLE_EXTENSIONS = SUBTITLE_EXTENSIONS
 _GAP_SLUG = re.compile(r"[^a-zA-Z0-9._-]+")
 _EPISODE_TOKEN = re.compile(r"(?<![A-Z0-9])S0*(\d{1,3})[ ._-]*E0*(\d{1,4})(?!\d)", re.I)
 _SEASON_TOKEN = re.compile(r"(?<![A-Z0-9])S0*(\d{1,3})(?!\d)", re.I)
@@ -112,6 +112,12 @@ class LocalTorrentAutomaticMaterializer:
         workspace: Path,
         alist: object,
     ) -> Mapping[str, object]:
+        for selection in selections:
+            reason = candidate_capability_error(selection)
+            if reason is not None:
+                raise AutomaticReplenishmentError(
+                    "本地 Torrent materializer 拒绝不可执行补源候选: " + reason,
+                )
         method = getattr(self.delegate, "acquire", None)
         if not callable(method):
             raise AutomaticReplenishmentError("Torrent materializer 不支持 acquire")

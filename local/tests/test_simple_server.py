@@ -104,6 +104,8 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["mode"], "automatic")
         self.assertTrue(health["connected"])
         self.assertTrue(health["engine_configured"])
+        self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
+        self.assertEqual(health["provider_capabilities"]["cloud_share"]["status"], "unavailable")
 
         status, control = self.request("GET", "/api/control")
         self.assertEqual(status, 200)

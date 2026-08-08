@@ -30,6 +30,7 @@ from typing import Any, Collection, Iterable, Mapping, Sequence
 from . import identity_matching as _identity_matching
 from . import media_naming as _media_naming
 from . import media_quality as _media_quality
+from . import media_policy as _media_policy
 from . import plan_artifacts as _plan_artifacts
 from . import remote_paths as _remote_paths
 from .canonical_work_tree import (
@@ -124,10 +125,7 @@ def _trace_io(message: str) -> None:
         print(f"SCRAPEFLOW_TRACE_IO {message}", file=sys.stderr, flush=True)
 
 
-VIDEO_EXTS = {
-    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".wmv", ".mov",
-    ".webm", ".flv", ".mpeg", ".mpg", ".rmvb", ".strm",
-}
+VIDEO_EXTS = _media_policy.VIDEO_EXTENSIONS
 
 
 def emit_progress(
@@ -146,8 +144,8 @@ def emit_progress(
         "message": message,
     }
     print(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
-SUBTITLE_EXTS = {".ass", ".srt", ".ssa", ".sub", ".idx", ".vtt", ".sup", ".mks"}
-MEDIA_EXTS = VIDEO_EXTS | SUBTITLE_EXTS
+SUBTITLE_EXTS = _media_policy.SUBTITLE_EXTENSIONS
+MEDIA_EXTS = _media_policy.MEDIA_EXTENSIONS
 
 # Pure filename/classification policy lives in ``media_naming``.  Keep these
 # aliases in the runtime namespace because planner dispatch tables resolve

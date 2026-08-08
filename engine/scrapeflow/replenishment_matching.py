@@ -12,22 +12,29 @@ from typing import Any
 import unicodedata
 
 
+_INTEGER_EPISODE_END = r"(?!\d|\.\d{1,3}(?:$|[\s._\-\[\](){}]|v\d))"
+
+
 EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(\d{1,3})[\s._-]*E(?:P)?\s*0*(\d{1,4})(?!\d)"
+    r"(?<![A-Z0-9])S0*(\d{1,3})[\s._-]*E(?:P)?\s*0*(\d{1,4})"
+    + _INTEGER_EPISODE_END
     # Require an episode marker at the end of a range.  A bare title number
     # after a separator (``S00E01 - 86 - Eighty Six``) is not E86.
-    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
+    + r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})"
+    + _INTEGER_EPISODE_END + r")?",
     re.I,
 )
 X_EPISODE_RE = re.compile(
-    r"(?<!\d)0*(\d{1,3})\s*[x×]\s*0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*0*(\d{1,4})(?!\d))?",
+    r"(?<!\d)0*(\d{1,3})\s*[x×]\s*0*(\d{1,4})"
+    + _INTEGER_EPISODE_END
+    + r"(?:\s*[-~–—]\s*0*(\d{1,4})" + _INTEGER_EPISODE_END + r")?",
     re.I,
 )
 SEASON_DASH_EPISODE_RE = re.compile(
     r"(?<![A-Z0-9])(?:S|Season\s+)0*(\d{1,3})\s*[-–—]\s*"
-    r"(?:E(?:P)?\s*)?0*(\d{1,3})"
-    r"(?:\s*[-~–—]\s*(?:E(?:P)?\s*)?0*(\d{1,3}))?(?!\d|P\b)",
+    r"(?:E(?:P)?\s*)?0*(\d{1,3})" + _INTEGER_EPISODE_END
+    + r"(?:\s*[-~–—]\s*(?:E(?:P)?\s*)?0*(\d{1,3})"
+    + _INTEGER_EPISODE_END + r")?(?!P\b)",
     re.I,
 )
 # Some Chinese release groups put the season marker and a pair of episode
@@ -63,8 +70,9 @@ CHINESE_EPISODE_RE = re.compile(
     r"(?:\s*[-~–—至到]\s*第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话])?",
 )
 EPISODE_ONLY_RE = re.compile(
-    r"(?<![A-Z0-9])E(?:P)?0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
+    r"(?<![A-Z0-9])E(?:P)?0*(\d{1,4})" + _INTEGER_EPISODE_END
+    + r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})"
+    + _INTEGER_EPISODE_END + r")?",
     re.I,
 )
 CHINESE_EPISODE_ONLY_RE = re.compile(
@@ -96,6 +104,26 @@ SEASON_RANGE_RE = re.compile(
 CHINESE_SEASON_RE = re.compile(
     r"第\s*([一二三四五六七八九十百零〇两\d]{1,5})\s*季"
 )
+# A decimal episode (for example ``01.5``) is a distinct source coordinate.
+# It is deliberately not folded into the integer ``E01`` coverage token.  The
+# Engine's planner handles fractional extras separately; acquisition matching
+# must therefore fail closed instead of allowing a fractional member to
+# satisfy an ordinary episode gap.
+FRACTIONAL_EPISODE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"S0*(?P<season>\d{1,3})[\s._-]*E(?:P)?\s*"
+    r"|0*(?P<x_season>\d{1,3})\s*[x×]\s*"
+    r"|E(?:P)?\s*"
+    r")?0*(?P<whole>\d{1,3})\.(?P<fraction>\d{1,3})"
+    r"(?!\d)(?=$|[\s._\-\[\](){}]|v\d)",
+    re.I,
+)
+# Only a clearly delimited season directory may provide the season context for
+# a bare ordinal such as ``Season 2/01.mkv``.  This is shared so the audit and
+# provider candidate gates cannot invent different defaults.
+SEASON_DIRECTORY_RE = re.compile(
+    r"^(?:season|s)\s*0*(\d{1,3})$", re.I,
+)
 CHINESE_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
     "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
@@ -107,7 +135,7 @@ def normalized_text(value: Any) -> str:
     return re.sub(r"[^\w\u3400-\u9fff]+", "", text)
 
 
-def _parse_chinese_number(value: str) -> int | None:
+def parse_chinese_number(value: str) -> int | None:
     text = value.strip()
     if text.isdecimal():
         return int(text)
@@ -116,7 +144,7 @@ def _parse_chinese_number(value: str) -> int | None:
     if "百" in text:
         left, right = text.split("百", 1)
         hundreds = CHINESE_DIGITS.get(left, 1 if not left else -1)
-        remainder = _parse_chinese_number(right) if right else 0
+        remainder = parse_chinese_number(right) if right else 0
         return None if hundreds < 0 or remainder is None else hundreds * 100 + remainder
     if "十" in text:
         left, right = text.split("十", 1)
@@ -126,7 +154,7 @@ def _parse_chinese_number(value: str) -> int | None:
     return None
 
 
-def _episode_ranges(value: Any) -> list[tuple[int, int, int]]:
+def episode_ranges(value: Any) -> list[tuple[int, int, int]]:
     text = str(value or "")
     output: list[tuple[int, int, int]] = []
     # Parse canonical ``SxxEyy``/``4x17`` forms first.  The season-dash form
@@ -141,7 +169,7 @@ def _episode_ranges(value: Any) -> list[tuple[int, int, int]]:
             output.append((season, start, end))
     for match in CHINESE_EPISODE_RE.finditer(text):
         values = [
-            _parse_chinese_number(item) if item else None
+            parse_chinese_number(item) if item else None
             for item in match.groups()
         ]
         season, start, end = values[0], values[1], values[2] or values[1]
@@ -194,10 +222,32 @@ def _episode_ranges(value: Any) -> list[tuple[int, int, int]]:
     return output
 
 
+# Private compatibility alias for older Engine-side callers.  New code should
+# use ``episode_ranges``; keeping the alias avoids a needless schema/API break
+# while ensuring there is still exactly one implementation.
+_episode_ranges = episode_ranges
+_parse_chinese_number = parse_chinese_number
+
+
 def expanded_episode_ids(value: Any) -> set[str]:
+    return _range_tokens(value, maximum_span=5000)
+
+
+def _range_tokens(
+    value: Any, *, maximum_span: int,
+    include_oversized_start: bool = False,
+) -> set[str]:
     output: set[str] = set()
-    for season, start, end in _episode_ranges(value):
-        if season < 0 or start <= 0 or end < start or end - start > 5000:
+    for season, start, end in episode_ranges(value):
+        span = end - start + 1
+        if season < 0 or start <= 0 or end < start:
+            continue
+        if span > maximum_span:
+            # The audit needs to retain the explicitly proven first endpoint
+            # while refusing to claim an unbounded/batch range.  Provider
+            # matching leaves this disabled and rejects the whole range.
+            if include_oversized_start:
+                output.add(f"S{season:02d}E{start:02d}")
             continue
         output.update(
             f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1)
@@ -211,24 +261,67 @@ def season_markers(value: str) -> set[int]:
         for match in SEASON_RE.finditer(value)
     }
     for match in SEASON_RANGE_RE.finditer(value):
-        between = value[match.end(1):match.start(2)]
-        if (
-            re.search(r"\s[-~–—]\s", between)
-            and not re.search(r"[-~–—]\s*S", between, re.I)
-        ):
+        # ``S04-89``/``S04 - 89`` is the common season-local episode
+        # shorthand, not a request for every season 04 through 89.  A true
+        # season range carries an explicit ``S`` on the second endpoint.  The
+        # ambiguous bare-endpoint form therefore contributes only the first
+        # season marker; episode_ranges() owns the episode coordinate.
+        second_endpoint = value[match.end(1):match.end(2)]
+        if not re.search(r"\bS\s*0*\d", second_endpoint, re.I):
             continue
         start, end = int(match.group(1)), int(match.group(2))
         if 0 < start <= end <= 999 and end - start <= 100:
             output.update(range(start, end + 1))
     for match in CHINESE_SEASON_RE.finditer(value):
-        number = _parse_chinese_number(match.group(1))
+        number = parse_chinese_number(match.group(1))
         if isinstance(number, int) and number > 0:
             output.add(number)
     return output
 
 
+def fractional_episode_tokens(
+    value: Any, *, default_seasons: set[int] | None = None,
+) -> set[str]:
+    """Return explicit fractional coordinates without integer coercion.
+
+    Fractional labels are evidence for a separate Engine ``EpisodeKey`` and
+    must never satisfy a normal integer episode gap.  When exactly one season
+    is proven by the same filename (or by a caller's bounded default), the
+    token is rendered as ``SxxEyy.f``.  Ambiguous season context is omitted.
+    """
+    text = str(value or "")
+    matches = list(FRACTIONAL_EPISODE_RE.finditer(text))
+    if not matches:
+        return set()
+    explicit = {
+        season
+        for season, _start, _end in episode_ranges(text)
+        if season >= 0
+    }
+    explicit.update(
+        int(group)
+        for match in matches
+        for group in (match.group("season"), match.group("x_season"))
+        if group is not None
+    )
+    seasons = explicit or season_markers(text) or (default_seasons or set())
+    if len(seasons) != 1:
+        return set()
+    season = next(iter(seasons))
+    output: set[str] = set()
+    for match in matches:
+        whole = int(match.group("whole"))
+        fraction = match.group("fraction").rstrip("0") or "0"
+        if whole > 0 and fraction != "0":
+            output.add(f"S{season:02d}E{whole:02d}.{fraction}")
+    return output
+
+
 def coverage_tokens(
     value: Any, *, default_seasons: set[int] | None = None,
+    maximum_span: int = 5000,
+    include_oversized_start: bool = False,
+    allow_bare_numeric: bool = False,
 ) -> set[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         return set()
@@ -238,20 +331,25 @@ def coverage_tokens(
         # numeric dash suffix is title/edition text unless it carries its own
         # episode marker.  Otherwise ``S00E01 - 86 - Eighty Six`` would still
         # gain a false S00E86 through the anime fallback below.
-        explicit_episode_ids = expanded_episode_ids(item)
+        explicit_episode_ids = _range_tokens(
+            item,
+            maximum_span=maximum_span,
+            include_oversized_start=include_oversized_start,
+        )
         output.update(explicit_episode_ids)
         has_marked_episode = bool(
             EPISODE_ONLY_RE.search(item) or CHINESE_EPISODE_ONLY_RE.search(item)
         )
         season_match = re.fullmatch(
-            r"\s*(?:S0*(\d{1,3})|Season\s+0*(\d{1,3})|第\s*(\d{1,3})\s*季)\s*",
+            r"\s*(?:S0*(\d{1,3})|Season\s+0*(\d{1,3})|第\s*([一二三四五六七八九十百零〇两\d]{1,5})\s*季)\s*",
             item,
             re.I,
         )
         if season_match:
-            output.add(
-                f"S{int(next(group for group in season_match.groups() if group)):02d}"
-            )
+            raw_season = next(group for group in season_match.groups() if group)
+            season_number = parse_chinese_number(raw_season)
+            if isinstance(season_number, int) and season_number >= 0:
+                output.add(f"S{season_number:02d}")
         intrinsic_seasons = season_markers(item)
         explicit_seasons = {
             int(match.group(1))
@@ -271,17 +369,17 @@ def coverage_tokens(
             for match in EPISODE_ONLY_RE.finditer(item):
                 start = int(match.group(1))
                 end = int(match.group(2) or match.group(1))
-                if 0 < start <= end and end - start <= 5000:
+                if 0 < start <= end and end - start + 1 <= maximum_span:
                     output.update(
                         f"S{season:02d}E{episode:02d}"
                         for episode in range(start, end + 1)
                     )
             for match in CHINESE_EPISODE_ONLY_RE.finditer(item):
-                start = _parse_chinese_number(match.group(1))
-                end = _parse_chinese_number(match.group(2)) if match.group(2) else start
+                start = parse_chinese_number(match.group(1))
+                end = parse_chinese_number(match.group(2)) if match.group(2) else start
                 if (
                     isinstance(start, int) and isinstance(end, int)
-                    and 0 < start <= end and end - start <= 5000
+                    and 0 < start <= end and end - start + 1 <= maximum_span
                 ):
                     output.update(
                         f"S{season:02d}E{episode:02d}"
@@ -294,7 +392,7 @@ def coverage_tokens(
             for pattern in (ANIME_EPISODE_RANGE_RE, ANIME_BRACKET_RANGE_RE):
                 for match in pattern.finditer(item):
                     start, end = int(match.group(1)), int(match.group(2))
-                    if 0 < start <= end <= 999 and end - start <= 500:
+                    if 0 < start <= end <= 999 and end - start + 1 <= min(maximum_span, 500):
                         output.update(
                             f"S{season:02d}E{episode:02d}"
                             for episode in range(start, end + 1)
@@ -304,10 +402,65 @@ def coverage_tokens(
                     episode = int(match.group(1))
                     if 0 < episode <= 999:
                         output.add(f"S{season:02d}E{episode:02d}")
+        if allow_bare_numeric and not explicit_episode_ids and not has_marked_episode:
+            # A bare ordinal is accepted only with an explicit season context:
+            # either one season directory in the path or one caller-supplied
+            # default.  Reject decimal/fractional labels and quality tags.
+            season_from_path = next(
+                (
+                    int(match.group(1))
+                    for part in re.split(r"[/\\]", item)[:-1]
+                    if (match := SEASON_DIRECTORY_RE.fullmatch(part.strip()))
+                ),
+                None,
+            )
+            bare_season = season_from_path
+            if bare_season is None and len(effective_seasons) == 1:
+                bare_season = season
+            if bare_season is not None:
+                stem = re.split(r"[/\\]", item)[-1]
+                stem = re.sub(r"\.[^.]+$", "", stem)
+                if FRACTIONAL_EPISODE_RE.search(stem):
+                    continue
+                bare_match = re.search(
+                    r"(?:^|[ ._\[(?-])0*(\d{1,4})(?:\]|$)", stem,
+                )
+                if bare_match:
+                    episode = int(bare_match.group(1))
+                    if 0 < episode <= 9999:
+                        output.add(f"S{bare_season:02d}E{episode:02d}")
+    return output
+
+
+def audit_episode_tokens(
+    value: Any, *, default_season: int | None = None,
+    maximum_span: int = 24,
+) -> set[tuple[int, int]]:
+    """Return bounded audit coordinates using the shared coverage parser.
+
+    A malformed oversized range keeps its explicit first endpoint as evidence
+    (matching the historical audit behavior), while the rest of the range is
+    rejected.  Bare ordinals may use a caller default or a ``Season N`` path,
+    but fractional labels remain outside integer coverage.
+    """
+    defaults = {default_season} if isinstance(default_season, int) and default_season >= 0 else None
+    raw = coverage_tokens(
+        [str(value or "")],
+        default_seasons=defaults,
+        maximum_span=maximum_span,
+        include_oversized_start=True,
+        allow_bare_numeric=True,
+    )
+    output: set[tuple[int, int]] = set()
+    for token in raw:
+        match = re.fullmatch(r"S(\d+)E(\d+)", token)
+        if match:
+            output.add((int(match.group(1)), int(match.group(2))))
     return output
 
 
 __all__ = [
-    "coverage_tokens", "expanded_episode_ids", "normalized_text",
-    "season_markers",
+    "audit_episode_tokens", "coverage_tokens", "episode_ranges",
+    "expanded_episode_ids", "fractional_episode_tokens", "normalized_text",
+    "parse_chinese_number", "season_markers",
 ]

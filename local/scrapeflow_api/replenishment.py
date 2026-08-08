@@ -14,6 +14,23 @@ import copy
 from engine.scrapeflow.replenishment_acquisition import (
     AcquisitionRouteError, acquisition_lane,
 )
+from engine.scrapeflow.replenishment_matching import (
+    EPISODE_RE,
+    SEASON_RE,
+    coverage_tokens as _coverage_tokens,
+    episode_ranges as _episode_ranges,
+    expanded_episode_ids as _expanded_episode_ids,
+    season_markers as _season_markers,
+)
+from engine.scrapeflow.provider_capabilities import (
+    ACTIVE_PROVIDERS,
+    UNAVAILABLE_PROVIDERS,
+    provider_capability_snapshot,
+)
+from engine.scrapeflow.media_policy import (
+    SUBTITLE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+)
 
 
 # Movies and episodes share the provider-neutral acquisition path. Subtitle
@@ -21,90 +38,10 @@ from engine.scrapeflow.replenishment_acquisition import (
 ACTIONABLE_GAP_KINDS = frozenset({
     "missing_episode", "missing_season", "missing_media", "missing_subtitle",
 })
-PROVIDER_ORDER = {
-    "cloud_share": 0, "magnet": 1,
-}
+PROVIDER_ORDER = {provider: index for index, provider in enumerate(sorted(ACTIVE_PROVIDERS))}
+PROVIDER_DIAGNOSTIC_NAMES = tuple((*sorted(ACTIVE_PROVIDERS), *sorted(UNAVAILABLE_PROVIDERS)))
 QUALITY_ORDER = {"2160p": 3, "1080p": 2, "720p": 1, "unknown": 0}
-_VIDEO_SUFFIXES = frozenset({
-    ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
-    ".mp4", ".mpeg", ".mpg", ".mts", ".rm", ".rmvb", ".ts", ".webm", ".wmv",
-})
-EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(\d{1,3})[\s._-]*E(?:P)?\s*0*(\d{1,4})(?!\d)"
-    # Keep this duplicated matcher aligned with the Engine shared parser:
-    # title numbers after a separator are not implicit range endpoints.
-    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
-    re.I,
-)
-X_EPISODE_RE = re.compile(
-    r"(?<!\d)0*(\d{1,3})\s*[x×]\s*0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*0*(\d{1,4})(?!\d))?",
-    re.I,
-)
-SEASON_DASH_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])(?:S|Season\s+)0*(\d{1,3})\s*[-–—]\s*"
-    r"(?:E(?:P)?\s*)?0*(\d{1,3})"
-    r"(?:\s*[-~–—]\s*(?:E(?:P)?\s*)?0*(\d{1,3}))?(?!\d|P\b)",
-    re.I,
-)
-# Chinese release groups commonly pair the season-local and whole-series
-# ordinals as ``[S4][17_89]``.  Keep this evidence separate from ordinary
-# bracket/range fallbacks: a bare ``[17_89]`` has no explicit season and must
-# not inherit a request-wide default season.
-DUAL_SEASON_BRACKET_EPISODE_RE = re.compile(
-    r"\[\s*S0*(?P<season>\d{1,3})\s*\]\s*"
-    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
-    re.I,
-)
-# Also accept the narrow unbracketed-season spelling ``S4[17_89]``.
-DUAL_SEASON_MARKED_BRACKET_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})(?![A-Z0-9])\s*"
-    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
-    re.I,
-)
-DUAL_SEASON_TRAILING_BRACKET_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(?P<season>\d{1,3})\s*\]\s*"
-    r"\[\s*0*(?P<local>\d{1,4})\s*[_/]\s*0*(?P<absolute>\d{1,4})\s*\]",
-    re.I,
-)
-CHINESE_EPISODE_RE = re.compile(
-    r"第\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*季"
-    r"[^\n]{0,30}?第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话]"
-    r"(?:\s*[-~–—至到]\s*第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话])?",
-)
-EPISODE_ONLY_RE = re.compile(
-    r"(?<![A-Z0-9])E(?:P)?0*(\d{1,4})(?!\d)"
-    r"(?:\s*[-~–—]\s*E(?:P)?\s*0*(\d{1,4})(?!\d))?",
-    re.I,
-)
-CHINESE_EPISODE_ONLY_RE = re.compile(
-    r"第\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话]"
-    r"(?:\s*[-~–—至到]\s*第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话])?",
-)
-ANIME_EPISODE_RANGE_RE = re.compile(
-    r"(?<!\d)\(\s*0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})\s*\)(?!\d)",
-    re.I,
-)
-ANIME_BRACKET_RANGE_RE = re.compile(
-    r"\[\s*0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})\s*(?:全集|全|Fin)?\s*\]",
-    re.I,
-)
-ANIME_BRACKET_EPISODE_RE = re.compile(r"\[\s*0*(\d{1,3})\s*\]", re.I)
-ANIME_DASH_EPISODE_RE = re.compile(
-    r"\s[-–—]\s*0*(\d{1,3})(?=\s|\(|\[|$)",
-    re.I,
-)
-SEASON_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(\d{1,3})(?!\d)(?!\s*E\d)"
-    r"|\bSeason\s+0*(\d{1,3})\b",
-    re.I,
-)
-SEASON_RANGE_RE = re.compile(
-    r"(?<![A-Z0-9])S0*(\d{1,3})\s*[-~–—]\s*"
-    r"S?0*(\d{1,3})(?!\d)(?!\s*E\d)",
-    re.I,
-)
-CHINESE_SEASON_RE = re.compile(r"第\s*([一二三四五六七八九十百零〇两\d]{1,5})\s*季")
+_VIDEO_SUFFIXES = VIDEO_EXTENSIONS
 BAD_AVAILABILITY_MARKERS = (
     "not available", "dead", "offline", "expired", "invalid", "unavailable",
     "blocked", "banned", "deleted", "失效", "过期", "封禁", "删除", "不可用",
@@ -112,8 +49,6 @@ BAD_AVAILABILITY_MARKERS = (
 _SWARM_MAX_AGE_SECONDS = 6 * 60 * 60
 _SWARM_MAX_FUTURE_SKEW_SECONDS = 5 * 60
 _SWARM_COUNT_LIMIT = 1_000_000_000
-CHINESE_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
-                  "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 CHINESE_NUMERALS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
 
 
@@ -157,17 +92,23 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
             **({"subtitle_language": str(gap["subtitle_language"])}
                if isinstance(gap.get("subtitle_language"), str) else {}),
         }
-    episode_match = EPISODE_RE.search(label)
-    if episode_match:
-        season = int(episode_match.group(1))
-        start = int(episode_match.group(2))
-        end = int(episode_match.group(3) or start)
+    parsed_episodes = _episode_ranges(label)
+    if parsed_episodes:
+        season, start, end = parsed_episodes[0]
         if season < 0 or start <= 0 or end < start:
             return None
         episodes = list(range(start, end + 1))
         episode_title = str(gap.get("title") or "").strip()
         if not episode_title:
-            episode_title = label[episode_match.end():].strip(" -–—:：")
+            # Keep the historical compact title extraction for canonical
+            # SxxEyy labels.  Other shared syntaxes (Chinese, ``4x17``, dual
+            # ordinals) retain their complete label rather than inventing a
+            # second parser merely to trim display text.
+            episode_match = EPISODE_RE.search(label)
+            episode_title = (
+                label[episode_match.end():].strip(" -–—:：")
+                if episode_match else label
+            )
         raw_title_aliases = gap.get("title_aliases")
         title_aliases = _deduplicated_strings(
             raw_title_aliases if isinstance(raw_title_aliases, list) else [],
@@ -210,15 +151,19 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
             **({"source_episode_aliases": source_episode_aliases}
                if source_episode_aliases else {}),
         }
-    season_match = SEASON_RE.search(label)
-    if kind == "missing_season" and season_match:
-        season = int(season_match.group(1) or season_match.group(2))
+    seasons = _season_markers(label)
+    if kind == "missing_season" and len(seasons) == 1:
+        season = next(iter(seasons))
         if season < 0:
             return None
+        season_match = SEASON_RE.search(label)
         return {
             "id": f"S{season:02d}", "kind": "missing_season", "season": season,
             "episodes": [], "label": label, "reason": str(gap.get("reason") or ""),
-            "season_name": str(gap.get("season_name") or label[season_match.end():]).strip(),
+            "season_name": str(
+                gap.get("season_name")
+                or (label[season_match.end():] if season_match else label)
+            ).strip(),
             **({"source": str(gap["source"])} if isinstance(gap.get("source"), str) else {}),
             "expected_episode_count": gap.get("expected_episode_count"),
         }
@@ -849,77 +794,6 @@ def _chinese_number(number: int) -> str | None:
     return None
 
 
-def _parse_chinese_number(value: str) -> int | None:
-    text = value.strip()
-    if text.isdecimal():
-        return int(text)
-    if text in CHINESE_DIGITS:
-        return CHINESE_DIGITS[text]
-    if "百" in text:
-        left, right = text.split("百", 1)
-        hundreds = CHINESE_DIGITS.get(left, 1 if not left else -1)
-        remainder = _parse_chinese_number(right) if right else 0
-        return None if hundreds < 0 or remainder is None else hundreds * 100 + remainder
-    if "十" in text:
-        left, right = text.split("十", 1)
-        tens = CHINESE_DIGITS.get(left, 1 if not left else -1)
-        ones = CHINESE_DIGITS.get(right, 0 if not right else -1)
-        return None if tens < 0 or ones < 0 else tens * 10 + ones
-    return None
-
-
-def _episode_ranges(value: Any) -> list[tuple[int, int, int]]:
-    text = str(value or "")
-    output: list[tuple[int, int, int]] = []
-    for pattern in (EPISODE_RE, X_EPISODE_RE, SEASON_DASH_EPISODE_RE):
-        for match in pattern.finditer(text):
-            season = int(match.group(1)); start = int(match.group(2)); end = int(match.group(3) or start)
-            output.append((season, start, end))
-    for match in CHINESE_EPISODE_RE.finditer(text):
-        values = [_parse_chinese_number(item) if item else None for item in match.groups()]
-        season, start, end = values[0], values[1], values[2] or values[1]
-        if isinstance(season, int) and isinstance(start, int) and isinstance(end, int):
-            output.append((season, start, end))
-    dual_matches = [
-        match for pattern in (
-            DUAL_SEASON_BRACKET_EPISODE_RE,
-            DUAL_SEASON_MARKED_BRACKET_EPISODE_RE,
-            DUAL_SEASON_TRAILING_BRACKET_EPISODE_RE,
-        ) for match in pattern.finditer(text)
-    ]
-    if dual_matches:
-        dual_values = {
-            (
-                int(match.group("season")),
-                int(match.group("local")),
-                int(match.group("absolute")),
-            )
-            for match in dual_matches
-        }
-        # Distinct pairs in one member are ambiguous; do not turn a pack or
-        # unrelated metadata into a guessed episode coordinate.
-        if len(dual_values) == 1:
-            season, local, absolute = next(iter(dual_values))
-            if season > 0 and local > 0 and absolute > local and absolute <= 9999:
-                has_conflicting_explicit = any(
-                    item_season == season
-                    and not (item_start <= local <= item_end)
-                    for item_season, item_start, item_end in output
-                )
-                if not has_conflicting_explicit:
-                    output.append((season, local, local))
-    return output
-
-
-def _expanded_episode_ids(value: Any) -> set[str]:
-    output: set[str] = set()
-    for season, start, end in _episode_ranges(value):
-        if season < 0 or start <= 0 or end < start or end - start > 5000:
-            continue
-        output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-    return output
-
-
 def suppress_gaps_satisfied_by_planned_videos(
     plan: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
@@ -1158,7 +1032,7 @@ def build_replenishment_request(
         "rules": {
             "require_title_identity": True, "require_name_coverage": True,
             "file_listing_restricts_claimed_coverage": True,
-            "provider_order": ["cloud_share", "magnet"],
+            "provider_order": list(PROVIDER_ORDER),
             "provider_fallback_is_per_gap": True,
             "quality_ladder": ["2160p", "1080p", "720p"],
             "allow_720p_only_without_1080p_or_better": True,
@@ -1377,85 +1251,6 @@ def _normalized_quality(value: Any) -> str:
     return "unknown"
 
 
-def _season_markers(value: str) -> set[int]:
-    output = {int(match.group(1) or match.group(2)) for match in SEASON_RE.finditer(value)}
-    for match in SEASON_RANGE_RE.finditer(value):
-        between = value[match.end(1):match.start(2)]
-        if (
-            re.search(r"\s[-~–—]\s", between)
-            and not re.search(r"[-~–—]\s*S", between, re.I)
-        ):
-            # Current anime release names commonly use ``S4 - 16`` for
-            # season 4 episode 16. The episode parser already recognizes that
-            # explicit shape; do not reinterpret it as season range 4–16.
-            continue
-        start, end = int(match.group(1)), int(match.group(2))
-        if 0 < start <= end <= 999 and end - start <= 100:
-            output.update(range(start, end + 1))
-    for match in CHINESE_SEASON_RE.finditer(value):
-        number = _parse_chinese_number(match.group(1))
-        if isinstance(number, int) and number > 0:
-            output.add(number)
-    return output
-
-
-def _coverage_tokens(value: Any, *, default_seasons: set[int] | None = None) -> set[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        return set()
-    output: set[str] = set()
-    for item in value:
-        # An explicit SxxEyy token owns the episode coordinate.  Do not let a
-        # bare numeric title suffix (``S00E01 - 86 - Eighty Six``) be inferred
-        # as another episode by the anime dash fallback below.
-        explicit_episode_ids = _expanded_episode_ids(item)
-        output.update(explicit_episode_ids)
-        has_marked_episode = bool(
-            EPISODE_ONLY_RE.search(item) or CHINESE_EPISODE_ONLY_RE.search(item)
-        )
-        season_match = re.fullmatch(r"\s*(?:S0*(\d{1,3})|Season\s+0*(\d{1,3})|第\s*(\d{1,3})\s*季)\s*", item, re.I)
-        if season_match:
-            output.add(f"S{int(next(group for group in season_match.groups() if group)):02d}")
-        intrinsic_seasons = _season_markers(item)
-        explicit_seasons = {
-            int(match.group(1))
-            for token in explicit_episode_ids
-            if (match := re.fullmatch(r"S(\d+)E\d+", token))
-        }
-        effective_seasons = explicit_seasons or intrinsic_seasons or (default_seasons or set())
-        if len(effective_seasons) == 1:
-            # A per-file path such as ``Season 2/... - 01.mkv`` carries
-            # stronger evidence than the request's default season.  Applying
-            # the S01 request default to that naked ordinal used to make a
-            # multi-season pack falsely cover S01 with its S02 files.
-            season = next(iter(effective_seasons))
-            # Explicit SxxEyy coordinates own their season.  Do not apply a
-            # request-wide default to later bare E##/第##集 tokens.
-            if not explicit_episode_ids:
-                for match in EPISODE_ONLY_RE.finditer(item):
-                    start, end = int(match.group(1)), int(match.group(2) or match.group(1))
-                    if 0 < start <= end and end - start <= 5000:
-                        output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-                for match in CHINESE_EPISODE_ONLY_RE.finditer(item):
-                    start = _parse_chinese_number(match.group(1))
-                    end = _parse_chinese_number(match.group(2)) if match.group(2) else start
-                    if isinstance(start, int) and isinstance(end, int) and 0 < start <= end and end - start <= 5000:
-                        output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-            # Unmarked anime forms are fallback evidence only.  Explicit
-            # episode coordinates make bracket/title numbers non-authoritative.
-            if not explicit_episode_ids and not has_marked_episode:
-                for pattern in (ANIME_EPISODE_RANGE_RE, ANIME_BRACKET_RANGE_RE):
-                    for match in pattern.finditer(item):
-                        start, end = int(match.group(1)), int(match.group(2))
-                        if 0 < start <= end <= 999 and end - start <= 500:
-                            output.update(f"S{season:02d}E{episode:02d}" for episode in range(start, end + 1))
-                for pattern in (ANIME_BRACKET_EPISODE_RE, ANIME_DASH_EPISODE_RE):
-                    for match in pattern.finditer(item):
-                        episode = int(match.group(1))
-                        if 0 < episode <= 999:
-                            output.add(f"S{season:02d}E{episode:02d}")
-    return output
-
-
 def _candidate_file_coverage(candidate: Mapping[str, Any], seasons: set[int]) -> tuple[bool, set[str]]:
     values: list[str] = []
     supplied = False
@@ -1496,9 +1291,7 @@ def _candidate_has_subtitle_file(candidate: Mapping[str, Any]) -> bool:
         return False
     return any(
         isinstance(value, str)
-        and PurePosixPath(value).suffix.casefold() in {
-            ".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt",
-        }
+        and PurePosixPath(value).suffix.casefold() in SUBTITLE_EXTENSIONS
         for item in raw_files
         for value in [
             item if isinstance(item, str) else (
@@ -1535,9 +1328,7 @@ def _candidate_has_subtitle_for_gap(candidate: Mapping[str, Any], gap: Mapping[s
         return False
     return any(
         isinstance(value, str)
-        and PurePosixPath(value).suffix.casefold() in {
-            ".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt",
-        }
+        and PurePosixPath(value).suffix.casefold() in SUBTITLE_EXTENSIONS
         and _subtitle_file_matches_language(value, gap.get("subtitle_language"))
         for item in raw_files
         for value in [
@@ -1880,9 +1671,10 @@ def select_replenishment_candidates(
 ) -> dict[str, Any]:
     """Select a provider-neutral, per-gap bundle.
 
-    Unsupported provider artifacts are untrusted input and are rejected before any
-    selection can be persisted or resumed. Generic HTTP adapters may use
-    cloud_share; the bundled local adapter uses exact magnet/Torrent.
+    Unsupported provider artifacts are untrusted input and are rejected before
+    any selection can be persisted or resumed.  The current process has only
+    one materializer, so a runnable row must be an exact ``magnet/torrent``
+    pair rather than a historical cloud-share or HTTP claim.
     """
     gap_ids, gap_lookup = _request_gap_ids(request)
     if not gap_ids:
@@ -1923,7 +1715,7 @@ def select_replenishment_candidates(
             reject("unknown", "candidate_not_object")
             continue
         candidate = dict(raw)
-        provider = str(candidate.get("provider") or "")
+        provider = str(candidate.get("provider") or "").strip().casefold()
         if provider not in PROVIDER_ORDER:
             reject(provider, "unsupported_provider")
             continue
@@ -1935,13 +1727,15 @@ def select_replenishment_candidates(
         if not isinstance(locator, str) or not locator.strip():
             reject(provider, "missing_locator")
             continue
-        acquisition = candidate.get("acquisition")
-        if provider == "magnet" and isinstance(acquisition, Mapping):
-            try:
-                acquisition_lane(candidate)
-            except AcquisitionRouteError:
-                reject(provider, "provider_acquisition_mismatch")
-                continue
+        # The selector is a durable boundary: every selected candidate must
+        # already carry the exact materializer contract.  Accepting a bare
+        # magnet locator here would only defer a guaranteed materializer
+        # failure until after a task state record had been created.
+        try:
+            acquisition_lane(candidate)
+        except AcquisitionRouteError:
+            reject(provider, "provider_acquisition_mismatch")
+            continue
         locator_key = locator.strip()
         infohashes = _candidate_infohash_aliases(candidate)
         if (
@@ -2030,9 +1824,9 @@ def select_replenishment_candidates(
     def acquisition_kind(row: Mapping[str, Any]) -> str:
         acquisition = row.get("acquisition")
         return (
-            str(acquisition.get("kind") or "external_http")
+            str(acquisition.get("kind") or "unknown")
             if isinstance(acquisition, Mapping)
-            else "external_http"
+            else "unknown"
         )
 
     provider_chain_by_gap = {
@@ -2069,6 +1863,7 @@ def select_replenishment_candidates(
         "eligible_candidate_count": len(valid),
         "rejection_reasons": dict(sorted(rejections.items())),
         "provider_chain_by_gap": provider_chain_by_gap,
+        "provider_capabilities": provider_capability_snapshot(),
         "provider_diagnostics": {
             provider: {
                 "candidate_count": candidate_counts.get(provider, 0),
@@ -2077,6 +1872,6 @@ def select_replenishment_candidates(
                     rejections_by_provider.get(provider, Counter()).items()
                 )),
             }
-            for provider in PROVIDER_ORDER
+            for provider in PROVIDER_DIAGNOSTIC_NAMES
         },
     }

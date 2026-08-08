@@ -16,6 +16,20 @@ import posixpath
 import re
 import unicodedata
 
+from .media_policy import (
+    ARCHIVE_EXTENSIONS,
+    AUDIO_EXTENSIONS,
+    DOCUMENT_EXTENSIONS,
+    EXECUTABLE_EXTENSIONS,
+    FONT_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    MANIFEST_EXTENSIONS,
+    SUBTITLE_EXTENSIONS,
+    TEMPORARY_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    is_archive_filename,
+)
+
 
 CLEANUP_AFTER_READBACK = "cleanup_after_readback"
 DEFER_SUBTITLE = "defer_subtitle"
@@ -25,34 +39,9 @@ APPLEDOUBLE_CLEANUP_REASON = "macOS AppleDouble 隐藏文件"
 DS_STORE_CLEANUP_REASON = "macOS .DS_Store 隐藏文件"
 REBUILDABLE_STAGING_TEMP_CLEANUP_REASON = "任务自有可重建下载临时文件"
 
-VIDEO_EXTENSIONS = frozenset({
-    ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov", ".webm",
-})
-SUBTITLE_EXTENSIONS = frozenset({
-    ".ass", ".ssa", ".srt", ".vtt", ".idx", ".sub", ".sup", ".mks",
-})
-AUDIO_EXTENSIONS = frozenset({
-    ".aac", ".ac3", ".eac3", ".dts", ".dtshd", ".flac", ".m4a", ".mka",
-    ".mp3", ".ogg", ".opus", ".thd", ".truehd", ".tta", ".wav", ".ape",
-})
-DOCUMENT_EXTENSIONS = frozenset({
-    ".azw", ".azw3", ".cbr", ".cbz", ".djvu", ".doc", ".docx", ".epub",
-    ".fb2", ".mobi", ".odt", ".pdf", ".rtf",
-})
-FONT_EXTENSIONS = frozenset({".otf", ".ttf", ".ttc", ".woff", ".woff2"})
-MANIFEST_EXTENSIONS = frozenset({
-    ".md5", ".sha1", ".sha256", ".sfv", ".torrent", ".nzb",
-})
-ARCHIVE_EXTENSIONS = frozenset({".zip", ".rar", ".7z", ".001"})
-IMAGE_EXTENSIONS = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
-EXECUTABLE_EXTENSIONS = frozenset({
-    ".app", ".bat", ".cmd", ".com", ".dll", ".exe", ".msi", ".ps1", ".sh",
-    ".command",
-})
-REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES = frozenset({
-    ".aria2", ".crdownload", ".download", ".part", ".partial", ".temp", ".tmp",
-    ".!qb",
-})
+# Compatibility alias retained for the cleanup implementation and existing
+# callers.  The authoritative collection is ``media_policy.TEMPORARY_EXTENSIONS``.
+REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES = TEMPORARY_EXTENSIONS
 
 _BOOK_CONTEXT_RE = re.compile(
     r"(?:^|[/\\._\-\s\[\]()])(?:novels?|manga|comics?|books?|"
@@ -199,7 +188,7 @@ def classify_residual(source_path: str, *, reason: str = "") -> ResidualDecision
         return ResidualDecision(KEEP_UNPLANNED, "unknown_image", (f"extension={suffix}",))
     if suffix in VIDEO_EXTENSIONS and _THEME_VIDEO_RE.search(name):
         return ResidualDecision(KEEP_UNPLANNED, "theme_video", ("theme_name",))
-    if suffix in ARCHIVE_EXTENSIONS:
+    if is_archive_filename(normalized):
         return ResidualDecision(KEEP_UNPLANNED, "archive", ("needs_extraction",))
     if suffix in VIDEO_EXTENSIONS:
         return ResidualDecision(KEEP_UNPLANNED, "video", ("not_in_plan",))
@@ -212,12 +201,22 @@ def classify_residual(source_path: str, *, reason: str = "") -> ResidualDecision
 
 __all__ = [
     "APPLEDOUBLE_CLEANUP_REASON",
+    "ARCHIVE_EXTENSIONS",
+    "AUDIO_EXTENSIONS",
     "CLEANUP_AFTER_READBACK",
+    "DOCUMENT_EXTENSIONS",
     "DEFER_SUBTITLE",
     "DS_STORE_CLEANUP_REASON",
+    "EXECUTABLE_EXTENSIONS",
+    "FONT_EXTENSIONS",
+    "IMAGE_EXTENSIONS",
     "KEEP_UNPLANNED",
+    "MANIFEST_EXTENSIONS",
     "REBUILDABLE_STAGING_TEMP_CLEANUP_REASON",
+    "REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES",
     "ResidualDecision",
+    "SUBTITLE_EXTENSIONS",
+    "VIDEO_EXTENSIONS",
     "classify_residual",
     "cleanup_allowlist_reason",
     "cleanup_reason_for",

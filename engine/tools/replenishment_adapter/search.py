@@ -6,21 +6,32 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import engine.tools._replenishment_local_adapter_impl as _impl
-
-
-ACTIVE_PROVIDERS = frozenset({"cloud_share", "magnet"})
+from engine.scrapeflow.provider_capabilities import (
+    ACTIVE_PROVIDERS,
+    candidate_capability_error,
+    provider_capability_snapshot,
+)
 
 
 def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a safe search projection with no provider-specific commands."""
+    """Return only candidates accepted by the current Torrent materializer.
+
+    Search is an evidence boundary, not a promise that every historical
+    source can be delivered.  Cloud-share/HTTP rows are intentionally dropped
+    here; their unavailable status remains visible in ``lane_status``.
+    """
     output = dict(result)
     candidates = []
+    rejected: dict[str, int] = {}
     for row in result.get("candidates") or []:
         if not isinstance(row, Mapping):
+            rejected["candidate_not_object"] = rejected.get("candidate_not_object", 0) + 1
             continue
-        provider = str(row.get("provider") or "")
         locator = str(row.get("locator") or "")
-        if provider not in ACTIVE_PROVIDERS or not locator:
+        error = candidate_capability_error(row)
+        if error is not None or not locator:
+            reason = error or "missing_locator"
+            rejected[reason] = rejected.get(reason, 0) + 1
             continue
         candidate = dict(row)
         # Search results are data; materialization is a separate step.
@@ -31,11 +42,12 @@ def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
                 candidate.pop(key, None)
         candidates.append(candidate)
     output["candidates"] = candidates
-    output["active_search_lane"] = "generic"
-    output["lane_status"] = {
-        "cloud_share": {"status": "ready"},
-        "magnet": {"status": "ready"},
-    }
+    output["active_search_lane"] = "magnet_torrent"
+    output["active_provider"] = "magnet"
+    output["lane_status"] = provider_capability_snapshot()
+    output["provider_capabilities"] = provider_capability_snapshot()
+    output["candidate_rejections"] = rejected
+    output["provider_rejections"] = dict(rejected)
     return output
 
 
@@ -80,6 +92,7 @@ def candidate_variants(
         dict(row) for row in rows
         if isinstance(row, Mapping)
         and str(row.get("provider") or "") in ACTIVE_PROVIDERS
+        and candidate_capability_error(row) is None
     ]
 
 

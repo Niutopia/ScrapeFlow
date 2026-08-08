@@ -178,6 +178,51 @@ class SimpleLibraryAuditTests(unittest.TestCase):
             sorted([anime_root, placeholder, us_root], key=str.casefold),
         )
 
+    def test_residuals_archives_and_orphan_subtitles_are_visible_but_not_delete_tasks(self) -> None:
+        movie_root, anime_root, us_root = DEFAULT_FORMAL_LIBRARY_ROOTS
+        movie = f"{movie_root}/Residuals"
+        client = TreeAList({
+            movie_root: [{"name": "Residuals", "is_dir": True}],
+            movie: [
+                {"name": "Example.mkv", "is_dir": False, "size": 10},
+                {"name": "Example.zh-CN.srt", "is_dir": False, "size": 2},
+                {"name": "Detached.en.srt", "is_dir": False, "size": 2},
+                {"name": "notes.pdf", "is_dir": False, "size": 3},
+                {"name": "source.7z", "is_dir": False, "size": 4},
+                {"name": "mystery.payload", "is_dir": False, "size": 5},
+                {"name": "movie.nfo", "is_dir": False, "size": 6},
+                {"name": "poster.jpg", "is_dir": False, "size": 7},
+            ],
+            anime_root: [],
+            us_root: [],
+        })
+
+        report = SimpleLibraryAuditor(client).scan()
+
+        self.assertFalse(report["clean"])
+        self.assertEqual(report["automatic_tasks"], [])
+        self.assertEqual(
+            [row["path"] for row in report["orphan_subtitles"]],
+            [f"{movie}/Detached.en.srt"],
+        )
+        self.assertEqual(
+            [row["path"] for row in report["archives"]], [f"{movie}/source.7z"],
+        )
+        attachments = {
+            row["path"]: row["residual_kind"]
+            for row in report["attachments"]
+        }
+        self.assertEqual(attachments[f"{movie}/notes.pdf"], "document_or_comic")
+        self.assertEqual(
+            [row["path"] for row in report["unknown_files"]],
+            [f"{movie}/mystery.payload"],
+        )
+        self.assertEqual(report["observations"]["archives"], report["archives"])
+        self.assertTrue(all(
+            row["kind"] not in {"archive", "orphan_subtitle", "unknown_file"}
+            for row in report["automatic_tasks"]
+        ))
+
     def test_tv_season_inherits_nearest_tvshow_nfo_and_poster(self) -> None:
         movie_root, anime_root, us_root = DEFAULT_FORMAL_LIBRARY_ROOTS
         bundle = f"{anime_root}/Bundle"

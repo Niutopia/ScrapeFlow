@@ -7,10 +7,22 @@ export const JOB_PHASES = [
 ] as const;
 
 export type JobPhase = typeof JOB_PHASES[number];
-export type ReplenishmentProvider = "http" | "torrent" | "local" | "unknown";
+// The current backend exposes provider identity (magnet), while acquisition
+// kind (torrent) is a separate field in the provider capability contract.
+// cloud_share remains representable for unavailable legacy state, but it is
+// never an active/ready provider.
+export type ReplenishmentProvider = "magnet" | "cloud_share" | "unknown";
+
+export type ProviderCapability = {
+  status: "ready" | "unavailable" | "deferred" | string;
+  acquisition_kinds?: string[];
+  materializer?: string | null;
+  reason?: string;
+};
 
 export type ReplenishmentSelection = {
   provider?: ReplenishmentProvider;
+  acquisition_kind?: "torrent" | string;
   release_name?: string;
   resolution?: string;
   updated_at?: string | null;
@@ -98,6 +110,7 @@ export type Health = {
   tmdb_configured: boolean;
   engine_configured: boolean;
   message?: string;
+  provider_capabilities?: Record<string, ProviderCapability>;
   intake_monitoring: boolean;
   intake?: {
     enabled: boolean;
@@ -206,6 +219,25 @@ export type LibraryAuditObservation = LibraryAuditSafety & {
   metadata_source?: string | null;
 };
 
+/**
+ * A retained file which the audit makes visible without treating it as an
+ * implicit cleanup instruction.  In particular, archive and unknown files
+ * remain operator-review evidence until a later, explicit workflow owns them.
+ */
+export type LibraryAuditResidualObservation = LibraryAuditSafety & {
+  path?: string;
+  size?: number;
+  residual_kind?: string;
+  action?: string;
+  evidence?: string[];
+};
+
+export type LibraryAuditOrphanSubtitle = LibraryAuditSafety & {
+  path?: string;
+  size?: number;
+  reason?: string;
+};
+
 export type LibraryAudit = {
   started_at?: string;
   finished_at?: string | null;
@@ -234,12 +266,22 @@ export type LibraryAudit = {
   /** Observations are retained for review and are never implicit delete work. */
   duplicates?: LibraryAuditDuplicate[];
   empty_directories?: Array<string | LibraryAuditEmptyDirectory>;
+  residuals?: LibraryAuditResidualObservation[];
+  archives?: LibraryAuditResidualObservation[];
+  attachments?: LibraryAuditResidualObservation[];
+  unknown_files?: LibraryAuditResidualObservation[];
+  orphan_subtitles?: LibraryAuditOrphanSubtitle[];
   observations?: {
     video_files?: Array<{ path?: string; size?: number }>;
     subtitle_files?: Array<{ path?: string; size?: number }>;
     nfo_files?: Array<{ path?: string; size?: number }>;
     poster_files?: Array<{ path?: string; size?: number }>;
     media_directories?: LibraryAuditObservation[];
+    residuals?: LibraryAuditResidualObservation[];
+    archives?: LibraryAuditResidualObservation[];
+    attachments?: LibraryAuditResidualObservation[];
+    unknown_files?: LibraryAuditResidualObservation[];
+    orphan_subtitles?: LibraryAuditOrphanSubtitle[];
   };
   automatic_tasks?: Array<{
     kind: string;

@@ -77,6 +77,7 @@ export function OperationsOverview({ health, control, jobs, audit }: {
   const acquiring = jobs.filter(job => ACQUISITION_PHASES.has(job.phase)).length;
   const latest = [...jobs].sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
   const auditState = auditSummary(audit);
+  const torrentProviderReady = health?.provider_capabilities?.magnet?.status === "ready";
   const intakeError = health?.intake?.last_error;
   const intake = health?.intake_monitoring === false
     ? { value: "未启用", detail: "当前只接受 Web 或 API 提交来源路径", tone: "quiet" }
@@ -101,7 +102,7 @@ export function OperationsOverview({ health, control, jobs, audit }: {
     </div>
     <footer className="operations-overview-footer">
       {latest ? <div><span>最近活动</span><b>{jobTitle(latest)}</b><small>{PHASE[latest.phase]?.label || latest.phase} · 更新于 {formatDate(latest.updated_at)}</small></div> : <div><span>最近活动</span><b>暂无任务</b><small>新的来源会由待刮削监听自动加入队列。</small></div>}
-      <p><b>自动策略：</b>正式媒体库保持单写入；下载、审计和搜索可并发执行。</p>
+      <p><b>自动策略：</b>正式媒体库保持单写入；下载、审计和搜索可并发执行。{torrentProviderReady ? "当前补源仅使用磁力 / Torrent。" : "当前没有可执行的补源来源。"}</p>
     </footer>
   </section>;
 }
