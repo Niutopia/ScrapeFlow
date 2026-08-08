@@ -1,7 +1,7 @@
 export const JOB_PHASES = [
   "queued", "analyzing", "identity_matching", "planning", "executing_media",
   "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
-  "acquiring", "staging_verifying", "child_planning", "child_executing",
+  "acquiring", "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
   "final_verifying", "completed", "failed", "failed_identity", "failed_provider",
   "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 ] as const;

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import posixpath
@@ -44,6 +45,8 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
 )
+from local.scrapeflow_api.control_state import PersistentControlState
+from local.scrapeflow_api.redaction import redact_error, redact_value
 
 
 _TARGET_CATEGORY_PARENTS = {
@@ -103,6 +106,12 @@ class ApplicationError(RuntimeError):
     """The automatic application cannot complete the requested operation."""
 
 
+def _redacted_job_payload(job: EngineJob) -> dict[str, object]:
+    """Return a safe persisted root-job document without mutating the job."""
+    redacted = redact_value(job.as_dict())
+    return dict(redacted) if isinstance(redacted, Mapping) else job.as_dict()
+
+
 class SimpleApplication:
     """HTTP-facing composition root for automatic intake and delivery.
 
@@ -137,6 +146,7 @@ class SimpleApplication:
         self._automatic_replenishment: AutomaticReplenishmentRuntime | None = None
         self._automatic_replenishment_lock = threading.Lock()
         self._control_path = self.state_root / "global-control.json"
+        self._control_state = PersistentControlState(self._control_path)
         self._control_lock = threading.Lock()
         self._automatic_lock = threading.RLock()
         self._automatic_executor: ThreadPoolExecutor | None = None
@@ -162,7 +172,7 @@ class SimpleApplication:
             "last_error": None,
             "last_scheduled_count": 0,
         }
-        self._ensure_control_document()
+        self._recover_persisted_engine_jobs()
         # Existing automatic jobs are resumed in the background.
         self._start_startup_thread(self._resume_automatic_jobs, name="scrapeflow-resume")
         if self._automatic_audit_enabled():
@@ -191,25 +201,8 @@ class SimpleApplication:
         self._startup_threads.append(thread)
         thread.start()
 
-    def _ensure_control_document(self) -> None:
-        """Create the one persisted control document on an unbootstrapped root."""
-        if not self._control_path.exists():
-            raw_start_paused = os.getenv("SCRAPEFLOW_START_PAUSED", "0").strip().casefold()
-            if raw_start_paused not in {"0", "1", "false", "true", "no", "yes"}:
-                raise ApplicationError("SCRAPEFLOW_START_PAUSED 必须是 0/1 或 true/false")
-            paused = raw_start_paused in {"1", "true", "yes"}
-            atomic_write_json(
-                self._control_path,
-                {
-                    "version": 1,
-                    "paused": paused,
-                    "scheduler_paused": paused,
-                    "persistent": True,
-                    "updated_at": _now(),
-                    "reason": "startup pause" if paused else None,
-                },
-                allow_nan=False,
-            )
+    def _recover_persisted_engine_jobs(self) -> None:
+        """Recover Engine records without changing the operator control state."""
         try:
             recover_persisted_engine_jobs(self.state_root)
         except EngineWorkerBusyError:
@@ -294,7 +287,7 @@ class SimpleApplication:
         }
         provider_active = {
             "gap_discovering", "provider_searching", "acquiring",
-            "staging_verifying", "child_planning", "child_executing",
+            "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
             "final_verifying", "cleaning", "child_failed", "retry_wait",
         }
         with self._automatic_lock:
@@ -710,7 +703,7 @@ class SimpleApplication:
                 updated = replace(current, summary=summary, updated_at=_now())
                 atomic_write_json(
                     runner.jobs_root / f"{current.id}.json",
-                    updated.as_dict(),
+                    _redacted_job_payload(updated),
                     allow_nan=False,
                 )
                 reconcile_interrupted_gap_states(self.state_root, current.id, error=message)
@@ -937,7 +930,7 @@ class SimpleApplication:
                     )
                 if provider_status in {
                     "gap_discovering", "provider_searching", "acquiring",
-                    "staging_verifying", "child_planning", "child_executing",
+                    "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
                     "final_verifying", "cleaning",
                 }:
                     return provider_status, str(
@@ -1088,9 +1081,13 @@ class SimpleApplication:
             phase=phase,
             updated_at=_now(),
             summary=summary,
-            error=str(error) or type(error).__name__,
+            error=redact_error(error),
         )
-        atomic_write_json(runner.jobs_root / f"{job_id}.json", updated.as_dict(), allow_nan=False)
+        atomic_write_json(
+            runner.jobs_root / f"{job_id}.json",
+            _redacted_job_payload(updated),
+            allow_nan=False,
+        )
         if phase == "retry_wait":
             self._queue_automatic_job(job_id, delay=float(summary["next_retry_seconds"] or 1))
         elif phase == "failed_identity" and summary.get("automatic_terminal") is True:
@@ -1321,7 +1318,9 @@ class SimpleApplication:
                             summary["automatic_stage"] = "gap_discovering"
                             atomic_write_json(
                                 runner.jobs_root / f"{job_id}.json",
-                                replace(current, summary=summary, updated_at=_now()).as_dict(),
+                                _redacted_job_payload(
+                                    replace(current, summary=summary, updated_at=_now()),
+                                ),
                                 allow_nan=False,
                             )
             except Exception:
@@ -1362,7 +1361,8 @@ class SimpleApplication:
         summary = dict(current.summary)
         prior = current.summary.get("replenishment")
         merged = dict(prior) if isinstance(prior, Mapping) else {}
-        merged.update(dict(outcome))
+        safe_outcome = redact_value(dict(outcome))
+        merged.update(dict(safe_outcome) if isinstance(safe_outcome, Mapping) else dict(outcome))
         # A successful retry can follow a cooperative cancellation in the
         # same persisted root.  Remove transient failure/cancellation fields
         # that are absent from the new outcome; otherwise the dashboard and
@@ -1377,7 +1377,11 @@ class SimpleApplication:
         if isinstance(outcome.get("attempts"), int):
             summary["replenishment_attempts"] = outcome["attempts"]
         updated = replace(current, summary=summary, updated_at=_now())
-        atomic_write_json(runner.jobs_root / f"{current.id}.json", updated.as_dict(), allow_nan=False)
+        atomic_write_json(
+            runner.jobs_root / f"{current.id}.json",
+            _redacted_job_payload(updated),
+            allow_nan=False,
+        )
 
     def _record_replenishment_progress(
         self,
@@ -1398,14 +1402,24 @@ class SimpleApplication:
             prior = current.summary.get("replenishment")
             replenishment = dict(prior) if isinstance(prior, Mapping) else {}
             now = _now()
-            replenishment.update({"status": phase, "updated_at": now, **dict(details)})
+            redacted_details = redact_value(dict(details))
+            safe_details = (
+                dict(redacted_details)
+                if isinstance(redacted_details, Mapping)
+                else dict(details)
+            )
+            replenishment.update({
+                "status": phase,
+                "updated_at": now,
+                **safe_details,
+            })
 
             # A provider attempt owns a real, restartable Engine child, but
             # that child is an implementation detail rather than a second
             # public task.  Keep its latest phase on the root projection so
             # the operations page can explain what is happening without
             # enumerating (or accidentally scheduling) the child record.
-            child_id = details.get("child_job_id")
+            child_id = safe_details.get("child_job_id")
             if isinstance(child_id, str) and child_id:
                 raw_children = replenishment.get("child_jobs")
                 children: list[dict[str, object]] = []
@@ -1417,16 +1431,16 @@ class SimpleApplication:
                         and isinstance(row.get("id"), str)
                         and row.get("id")
                     ]
-                child_phase = details.get("child_phase")
+                child_phase = safe_details.get("child_phase")
                 child_row: dict[str, object] = {
                     "id": child_id,
                     "phase": child_phase if isinstance(child_phase, str) and child_phase else phase,
                     "updated_at": now,
                 }
-                round_number = details.get("round")
+                round_number = safe_details.get("round")
                 if isinstance(round_number, int):
                     child_row["round"] = round_number
-                error = details.get("error")
+                error = safe_details.get("error")
                 if isinstance(error, str) and error:
                     child_row["error"] = error
                 replaced = False
@@ -1441,7 +1455,11 @@ class SimpleApplication:
             summary["replenishment"] = replenishment
             summary["automatic_stage"] = phase
             updated = replace(current, summary=summary, updated_at=now)
-            atomic_write_json(runner.jobs_root / f"{current.id}.json", updated.as_dict(), allow_nan=False)
+            atomic_write_json(
+                runner.jobs_root / f"{current.id}.json",
+                _redacted_job_payload(updated),
+                allow_nan=False,
+            )
         except Exception:
             return
 
@@ -1545,7 +1563,7 @@ class SimpleApplication:
                     "status": "failed" if terminal else "retry_wait",
                     "terminal": terminal,
                     "attempts": provider_attempts,
-                    "error": str(exc) or type(exc).__name__,
+                    "error": redact_error(exc),
                     "next_retry_seconds": None if terminal else 30,
                 })
                 if not terminal:
@@ -2196,8 +2214,10 @@ class SimpleApplication:
             old_audit = job.summary.get("audit")
             persisted_error = job.error
             if audit_state is not None:
-                persisted_error = str(
-                    audit_state.get("error") or audit_state.get("message") or "媒体库审计仍有未收口问题"
+                persisted_error = redact_error(
+                    audit_state.get("error")
+                    or audit_state.get("message")
+                    or "媒体库审计仍有未收口问题"
                 )
             elif old_audit is not None or provider_projection_cleared or (
                 provider_relevant
@@ -2217,7 +2237,11 @@ class SimpleApplication:
                 updated = replace(
                     job, plan=plan, summary=summary, error=persisted_error, updated_at=_now(),
                 )
-                atomic_write_json(runner.jobs_root / f"{job.id}.json", updated.as_dict(), allow_nan=False)
+                atomic_write_json(
+                    runner.jobs_root / f"{job.id}.json",
+                    _redacted_job_payload(updated),
+                    allow_nan=False,
+                )
 
             if provider_relevant:
                 for row in provider_relevant:
@@ -2257,7 +2281,7 @@ class SimpleApplication:
                     state.update({
                         "status": "retry_wait" if attempts <= self._automatic_retry_limit() else "failed",
                         "repair_attempts": attempts,
-                        "error": str(exc) or type(exc).__name__,
+                        "error": redact_error(exc),
                         "message": "NFO/海报自动修复失败，将继续自动重试",
                         "retryable": attempts <= self._automatic_retry_limit(),
                         "next_retry_seconds": min(60.0, float(2 ** max(0, attempts - 1)))
@@ -2267,12 +2291,14 @@ class SimpleApplication:
                     current_summary["audit"] = state
                     atomic_write_json(
                         runner.jobs_root / f"{job.id}.json",
-                        replace(
-                            current,
-                            summary=current_summary,
-                            error=str(exc) or type(exc).__name__,
-                            updated_at=_now(),
-                        ).as_dict(),
+                        _redacted_job_payload(
+                            replace(
+                                current,
+                                summary=current_summary,
+                                error=redact_error(exc),
+                                updated_at=_now(),
+                            ),
+                        ),
                         allow_nan=False,
                     )
                     audit_retry_needed = attempts <= self._automatic_retry_limit()
@@ -2294,7 +2320,9 @@ class SimpleApplication:
                     current_summary["audit"] = state
                     atomic_write_json(
                         runner.jobs_root / f"{job.id}.json",
-                        replace(current, summary=current_summary, updated_at=_now()).as_dict(),
+                        _redacted_job_payload(
+                            replace(current, summary=current_summary, updated_at=_now()),
+                        ),
                         allow_nan=False,
                     )
 
@@ -2564,7 +2592,11 @@ class SimpleApplication:
                 }
                 summary["replenishment_attempts"] = 0
                 retried = replace(engine_job, summary=summary, updated_at=_now(), error=None)
-                atomic_write_json(runner.jobs_root / f"{engine_job.id}.json", retried.as_dict(), allow_nan=False)
+                atomic_write_json(
+                    runner.jobs_root / f"{engine_job.id}.json",
+                    _redacted_job_payload(retried),
+                    allow_nan=False,
+                )
                 self._queue_provider_job(job_id)
                 return self.public_engine_job(retried)
             if self._is_terminal_automatic_failure(engine_job):
@@ -2585,7 +2617,7 @@ class SimpleApplication:
                 )
                 atomic_write_json(
                     runner.jobs_root / f"{engine_job.id}.json",
-                    retried.as_dict(),
+                    _redacted_job_payload(retried),
                     allow_nan=False,
                 )
                 self._queue_automatic_job(job_id)
@@ -2620,6 +2652,7 @@ class SimpleApplication:
             "failed_provider": "failed_provider",
             "failed_write": "failed_write",
             "failed_verification": "failed_verification",
+            "failed_cleanup": "failed_cleanup",
             "cancelled": "cancelled",
         }.get(job.phase, job.phase)
         audit_message: str | None = None
@@ -2635,7 +2668,7 @@ class SimpleApplication:
                 provider_phase = str(replenishment.get("status") or "")
                 if provider_phase in {
                     "gap_discovering", "provider_searching", "acquiring",
-                    "staging_verifying", "child_planning", "child_executing",
+                    "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
                     "final_verifying", "cleaning", "child_failed", "retry_wait",
                 }:
                     display_phase = "retry_wait" if provider_phase == "child_failed" else provider_phase
@@ -2684,6 +2717,7 @@ class SimpleApplication:
             "provider_searching": (89, "系统正在自动搜索补源候选"),
             "acquiring": (91, "系统正在自动获取补源文件"),
             "staging_verifying": (93, "系统正在核对补源 staging"),
+            "subtitle_installing": (94, "系统正在安装精确绑定字幕"),
             "child_planning": (95, "系统正在自动规划补源"),
             "child_executing": (97, "系统正在自动整理补源"),
             "final_verifying": (98, "系统正在核对补源最终结果"),
@@ -2749,26 +2783,18 @@ class SimpleApplication:
             if summary.get("next_retry_seconds") is not None
             else replenishment.get("next_retry_seconds")
         )
-        return payload
+        redacted = redact_value(payload)
+        return dict(redacted) if isinstance(redacted, Mapping) else payload
 
     def control(self) -> dict[str, object]:
         with self._control_lock:
-            return self._read_control()
+            return self._control_state.read()
 
     def set_paused(self, paused: bool, reason: str | None = None) -> dict[str, object]:
         if not isinstance(paused, bool):
             raise TypeError("paused must be boolean")
         with self._control_lock:
-            now = _now()
-            payload = {
-                "version": 1,
-                "paused": paused,
-                "scheduler_paused": paused,
-                "persistent": True,
-                "updated_at": now,
-                "reason": (reason or "operator pause") if paused else None,
-            }
-            atomic_write_json(self._control_path, payload, allow_nan=False)
+            payload = self._control_state.set_paused(paused, reason)
         if not paused and not self._closed.is_set():
             self._start_startup_thread(
                 self._resume_automatic_jobs,
@@ -2790,10 +2816,6 @@ class SimpleApplication:
         self._closed.set()
         self._intake_stop.set()
         self._intake_wake.set()
-        try:
-            self.set_paused(True, "shutdown")
-        except Exception:
-            pass
         executors = [
             self._automatic_executor,
             self._provider_executor,
@@ -2808,24 +2830,6 @@ class SimpleApplication:
         for startup in list(self._startup_threads):
             if startup is not threading.current_thread():
                 startup.join(timeout=1.0)
-
-    def _read_control(self) -> dict[str, object]:
-        try:
-            payload = json.loads(self._control_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {
-                "paused": False,
-                "scheduler_paused": False,
-                "persistent": True,
-                "updated_at": None,
-                "reason": None,
-            }
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ApplicationError("控制状态不可读") from exc
-        if not isinstance(payload, dict):
-            raise ApplicationError("控制状态格式错误")
-        return payload
-
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -2859,6 +2863,71 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def application(self) -> SimpleApplication:
         return self.server.application  # type: ignore[attr-defined,no-any-return]
 
+    @staticmethod
+    def _loopback_authority_allowed(authority: object) -> bool:
+        """Accept only a syntactically valid loopback Host/Origin authority."""
+        if not isinstance(authority, str) or not authority or authority != authority.strip():
+            return False
+        try:
+            parsed = urllib.parse.urlsplit(f"//{authority}")
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return False
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or not hostname
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            return False
+        if hostname.casefold() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    def _origin_matches_loopback_host(self) -> bool:
+        """Validate an optional browser Origin against the received Host."""
+        host = self.headers.get("Host", "")
+        if not self._loopback_authority_allowed(host):
+            return False
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        if origin != origin.strip():
+            return False
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.casefold() != host.casefold()
+        ):
+            return False
+        return self._loopback_authority_allowed(parsed.netloc)
+
+    def _local_same_origin_allowed(self) -> bool:
+        if not self._origin_matches_loopback_host():
+            return False
+        return self.headers.get("Sec-Fetch-Site", "").strip().casefold() != "cross-site"
+
+    def _reject_nonlocal_request(self) -> bool:
+        if self._local_same_origin_allowed():
+            return False
+        self._send(403, {"error": "仅允许同源本机 ScrapeFlow 页面访问"})
+        return True
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path, query = self._path()
         try:
@@ -2886,6 +2955,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self._handle_error(exc)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        if self._reject_nonlocal_request():
+            return
         path, _query = self._path()
         try:
             payload = self._json_body()
@@ -2934,6 +3005,9 @@ class SimpleHandler(BaseHTTPRequestHandler):
         return parsed.path.rstrip("/") or "/", urllib.parse.parse_qs(parsed.query)
 
     def _json_body(self) -> dict[str, object]:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+        if content_type != "application/json":
+            raise ValueError("请求 Content-Type 必须是 application/json")
         raw_length = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_length)
@@ -2982,10 +3056,11 @@ class SimpleHandler(BaseHTTPRequestHandler):
             status = 503
         else:
             status = 500
-        self._send(status, {"error": str(exc) or type(exc).__name__})
+        message = str(exc) or type(exc).__name__
+        self._send(status, {"error": redact_error(message)})
 
     def _send(self, status: int, payload: Mapping[str, object]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        body = json.dumps(redact_value(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

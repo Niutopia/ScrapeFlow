@@ -2430,6 +2430,50 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(tmdb.search_calls, 0)
         self.assertNotIn("title_aliases", enriched["scan_report"]["resource_gaps"][0])
 
+    def test_gap_state_redacts_configured_credentials_before_persistence(self) -> None:
+        password = "gap-password-not-public"
+        token = "gap-token-not-public"
+        api_key = "gap-api-key-not-public"
+        with patch.dict(
+            "os.environ",
+            {
+                "SCRAPEFLOW_TEST_PASSWORD": password,
+                "SCRAPEFLOW_TEST_TOKEN": token,
+                "SCRAPEFLOW_TEST_API_KEY": api_key,
+            },
+            clear=False,
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                alist = MemoryAList()
+                runtime = AutomaticReplenishmentRuntime(
+                    Path(temporary),
+                    engine_runner=FakeEngine(),
+                    alist=alist,
+                    search=FakeSearch(),
+                    materializer=FakeMaterializer(alist),
+                )
+                path = runtime._write_gap(  # noqa: SLF001 - durable boundary
+                    {
+                        "id": "S01E01",
+                        "job_id": "redaction-root",
+                        "phase": "retry_wait",
+                        "error": (
+                            f"password={password}; token={token}; api_key={api_key}"
+                        ),
+                        "outcome": {
+                            "error": RuntimeError(
+                                f"provider password={password}; token={token}"
+                            ),
+                        },
+                        "gap": {"authorization": token},
+                    }
+                )
+                persisted_gap = path.read_text(encoding="utf-8")
+
+        for secret in (password, token, api_key):
+            self.assertNotIn(secret, persisted_gap)
+        self.assertIn("<redacted>", persisted_gap)
+
     def test_one_gap_runs_search_staging_child_and_owned_cleanup(self) -> None:
         plan = {
             "mode": "tv",

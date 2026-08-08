@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from engine.scrapeflow.serialization import atomic_write_json
 from local.simple_server import SimpleApplication, make_server
@@ -75,13 +76,16 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         method: str,
         path: str,
         payload: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, object]]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request_headers = {"Content-Type": "application/json"} if body is not None else {}
+        request_headers.update(headers or {})
         request = urllib.request.Request(
             self.base + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json"} if body is not None else {},
+            headers=request_headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=3) as response:
@@ -280,6 +284,168 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             with self.subTest(path=path):
                 status, _ = self.request("POST", path, body)
                 self.assertEqual(status, 404)
+
+    def test_post_requires_json_and_rejects_cross_site_or_non_loopback_hosts(self) -> None:
+        attempts = (
+            (
+                "text/plain",
+                {"Content-Type": "text/plain"},
+                400,
+            ),
+            (
+                "cross-site origin",
+                {"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+                403,
+            ),
+            (
+                "cross-site fetch metadata",
+                {"Sec-Fetch-Site": "Cross-Site"},
+                403,
+            ),
+            (
+                "non-loopback host",
+                {"Host": "evil.example"},
+                403,
+            ),
+        )
+        for label, headers, expected_status in attempts:
+            with self.subTest(label=label):
+                status, _ = self.request("POST", "/api/control/resume", {}, headers)
+                self.assertEqual(status, expected_status)
+                self.assertTrue(self.application.control()["paused"])
+
+    def test_post_allows_same_origin_host_forwarded_by_the_local_proxy(self) -> None:
+        # The local Node proxy passes the browser's Host through to the API,
+        # just as nginx does with ``$http_host`` in Docker.  Its listen port is
+        # intentionally different from the private API port.
+        proxy_host = "127.0.0.1:3010"
+        status, resumed = self.request(
+            "POST",
+            "/api/control/resume",
+            {},
+            {
+                "Host": proxy_host,
+                "Origin": f"http://{proxy_host}",
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(resumed["paused"])
+        self.application.set_paused(True, "test")
+
+    def test_api_errors_and_public_jobs_redact_runtime_secrets(self) -> None:
+        alist_password = "alist-password-not-public"
+        tmdb_key = "tmdb-key-not-public"
+        provider_token = "provider-token-not-public"
+        archive_password = "archive-password-not-public"
+        unconfigured_api_key = "unconfigured-api-key-not-public"
+        with patch.dict(
+            "os.environ",
+            {
+                "ALIST_PASSWORD": alist_password,
+                "TMDB_API_KEY": tmdb_key,
+                "SCRAPEFLOW_REPLENISHMENT_TOKEN": provider_token,
+            },
+            clear=False,
+        ):
+            job = self.runner.create_automatic_job("/library/待刮削/Redaction")
+            failed = replace(
+                job,
+                phase="failed",
+                plan={
+                    "nested": {
+                        "token": provider_token,
+                        "archive_password": archive_password,
+                        "message": f"password={alist_password}; api_key={tmdb_key}",
+                    },
+                },
+                error=f"AList password={alist_password}; token={provider_token}; api_key={tmdb_key}",
+            )
+            atomic_write_json(
+                self.runner.jobs_root / f"{job.id}.json",
+                failed.as_dict(),
+                allow_nan=False,
+            )
+
+            # The scheduler's durable retry boundary must redact the complete
+            # root document as well, even when an exception string contains
+            # credentials that arrived from a provider/client.
+            self.application._record_automatic_retry(  # noqa: SLF001 - persistence boundary
+                job.id,
+                RuntimeError(
+                    f"password={alist_password}; token={provider_token}; api_key={tmdb_key}"
+                ),
+                stage="provider",
+            )
+            persisted_root = (
+                self.runner.jobs_root / f"{job.id}.json"
+            ).read_text(encoding="utf-8")
+            for secret in (alist_password, tmdb_key, provider_token, archive_password):
+                self.assertNotIn(secret, persisted_root)
+            self.assertIn("<redacted>", persisted_root)
+
+            serialized_direct_job = json.dumps(
+                self.application.public_engine_job(failed), ensure_ascii=False,
+            )
+            for secret in (alist_password, tmdb_key, provider_token, archive_password):
+                self.assertNotIn(secret, serialized_direct_job)
+            status, public = self.request("GET", f"/api/jobs/{job.id}")
+            self.assertEqual(status, 200)
+            serialized_job = json.dumps(public, ensure_ascii=False)
+            for secret in (alist_password, tmdb_key, provider_token, archive_password):
+                self.assertNotIn(secret, serialized_job)
+            self.assertIn("<redacted>", serialized_job)
+
+            with patch.object(
+                self.application,
+                "create_task",
+                side_effect=RuntimeError(
+                    "password=" + alist_password
+                    + "; token=" + provider_token
+                    + "; api key=" + unconfigured_api_key,
+                ),
+            ):
+                status, error_payload = self.request(
+                    "POST", "/api/jobs", {"path": "/library/待刮削/NoLeak"},
+                )
+            self.assertEqual(status, 500)
+            serialized_error = json.dumps(error_payload, ensure_ascii=False)
+            for secret in (alist_password, tmdb_key, provider_token, unconfigured_api_key):
+                self.assertNotIn(secret, serialized_error)
+            self.assertIn("<redacted>", serialized_error)
+
+    def test_subtitle_installing_is_a_visible_active_provider_phase(self) -> None:
+        job = self.runner.create_automatic_job("/library/待刮削/SubtitleInstall")
+        active = replace(
+            job,
+            phase="executed",
+            plan={"scan_report": {"resource_gaps": [{"kind": "missing_subtitle"}]}},
+            summary={
+                **job.summary,
+                "replenishment": {
+                    "status": "subtitle_installing",
+                    "message": "正在绑定字幕",
+                },
+            },
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{job.id}.json",
+            active.as_dict(),
+            allow_nan=False,
+        )
+
+        status, payload = self.request("GET", f"/api/jobs/{job.id}")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["phase"], "subtitle_installing")
+        self.assertEqual(payload["job"]["progress"]["stage"], "subtitle_installing")
+        self.assertEqual(payload["job"]["progress"]["percent"], 94)
+        self.assertEqual(payload["job"]["progress"]["message"], "系统正在安装精确绑定字幕")
+        status, health = self.request("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["operations"]["provider_active"], 1)
 
 
 if __name__ == "__main__":

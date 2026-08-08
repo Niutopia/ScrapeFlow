@@ -53,6 +53,9 @@ const apiEnv = {
   ...env,
   SCRAPEFLOW_API_HOST: env.SCRAPEFLOW_API_HOST || "127.0.0.1",
   SCRAPEFLOW_API_PORT: String(apiPort),
+  // Docker explicitly mounts /data. Native `npm run local` instead keeps
+  // durable state inside the ignored project-local runtime directory.
+  SCRAPEFLOW_STATE_DIR: env.SCRAPEFLOW_STATE_DIR || ".scrapeflow",
 };
 const nextEnv = { ...env, PORT: String(nextPort) };
 
@@ -68,13 +71,17 @@ function isApiRequest(url) {
   return url === "/api" || url.startsWith("/api/");
 }
 
-function forwardRequest(req, res, targetPort) {
+function forwardRequest(req, res, targetPort, { preserveHost = false } = {}) {
+  const headers = { ...req.headers };
+  // The browser's Host must reach the API unchanged so its strict Origin/Host
+  // same-origin check still works through this loopback development proxy.
+  if (!preserveHost || !headers.host) headers.host = `127.0.0.1:${targetPort}`;
   const target = request({
     hostname: "127.0.0.1",
     port: targetPort,
     path: req.url || "/",
     method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
+    headers,
   }, targetResponse => {
     res.writeHead(targetResponse.statusCode ?? 502, targetResponse.headers);
     targetResponse.pipe(res);
@@ -87,7 +94,8 @@ function forwardRequest(req, res, targetPort) {
 }
 
 const proxy = createServer((req, res) => {
-  forwardRequest(req, res, isApiRequest(req.url || "") ? apiPort : nextPort);
+  const apiRequest = isApiRequest(req.url || "");
+  forwardRequest(req, res, apiRequest ? apiPort : nextPort, { preserveHost: apiRequest });
 });
 
 // Next's development HMR uses a WebSocket upgrade.  Forward upgrades to the

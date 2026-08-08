@@ -26,7 +26,12 @@ from engine.scrapeflow.media_quality import (
     minimum_video_bytes,
     video_size_is_admissible,
 )
+from engine.scrapeflow.residual_policy import (
+    cleanup_allowlist_reason,
+    is_task_owned_staging_root,
+)
 from engine.scrapeflow.serialization import atomic_write_json
+from local.scrapeflow_api.redaction import redact_error
 
 
 class SimpleEngineError(RuntimeError):
@@ -122,7 +127,7 @@ _ENGINE_PHASES = frozenset({
     "queued", "analyzing", "identity_matching", "planning", "planned",
     "executing", "verifying", "cleaning", "executed", "completed",
     "retry_wait", "failed", "failed_identity", "failed_provider",
-    "failed_write", "failed_verification", "cancelled",
+    "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 })
 
 # Provider replenishment children are deliberately narrower than ordinary
@@ -231,6 +236,78 @@ def _is_provider_media_only_plan(plan: object) -> bool:
         isinstance(metadata, Mapping)
         and metadata.get(_PROVIDER_MEDIA_ONLY_METADATA_KEY) is True
     )
+
+
+def _require_problem_free_plan(plan: object, *, stage: str) -> None:
+    """Refuse every formal-write path while a plan still has open problems.
+
+    Planner validation is useful but not a write boundary: persisted plans can
+    predate a validation change and tests/providers may inject their own
+    executor.  Keep this guard in the runner as well as the concrete executor
+    so changing ``executor=`` cannot turn a problem-bearing plan into a move,
+    upload, or cleanup operation.
+    """
+    problems = list(getattr(plan, "problem_files", ()) or ())
+    if not problems:
+        return
+    first = problems[0]
+    path = str(getattr(first, "source_path", "") or "<unknown>")
+    reason = str(getattr(first, "reason", "") or "")
+    detail = f": {path}" + (f"（{reason}）" if reason else "")
+    raise EngineExecutionError(
+        f"{stage}拒绝含有 {len(problems)} 个未闭合问题文件的计划{detail}"
+    )
+
+
+def _require_cleanup_allowlist(plan: object, *, stage: str) -> None:
+    """Verify cleanup rows before any executor can issue an AList delete.
+
+    This is intentionally independent from plan-time validation. A persisted
+    pre-convergence plan, or an injected executor, must not regain authority
+    to delete a font/PDF/theme video merely because its old cleanup reason
+    looks familiar.
+    """
+    raw_root = getattr(plan, "source_root", None)
+    source_root = _safe_remote_path(
+        raw_root,
+        field="cleanup source_root",
+        allow_root=False,
+    )
+    source_prefix = source_root.rstrip("/") + "/"
+    for item in list(getattr(plan, "cleanup_files", ()) or ()):
+        raw_path = getattr(item, "source_path", None)
+        raw_dir = getattr(item, "source_dir", None)
+        raw_name = getattr(item, "original_name", None)
+        raw_reason = getattr(item, "reason", None)
+        source_path = _safe_remote_path(
+            raw_path,
+            field="cleanup source_path",
+            allow_root=False,
+        )
+        source_dir = _safe_remote_path(
+            raw_dir,
+            field="cleanup source_dir",
+            allow_root=False,
+        )
+        if (
+            not isinstance(raw_name, str)
+            or not raw_name
+            or "/" in raw_name
+            or "\\" in raw_name
+            or raw_name in {".", ".."}
+            or posixpath.join(source_dir, raw_name) != source_path
+        ):
+            raise EngineExecutionError(f"{stage}拒绝不一致的清理路径: {source_path}")
+        if source_path != source_root and not source_path.startswith(source_prefix):
+            raise EngineExecutionError(f"{stage}拒绝任务来源外的清理项: {source_path}")
+        expected_reason = cleanup_allowlist_reason(
+            source_path,
+            task_root=source_root,
+        )
+        if expected_reason is None or raw_reason != expected_reason:
+            raise EngineExecutionError(
+                f"{stage}拒绝非白名单或非任务自有清理项: {source_path}"
+            )
 
 
 def _mark_provider_media_only_body(body: Mapping[str, object]) -> dict[str, object]:
@@ -410,7 +487,11 @@ class EngineJob:
         if self.execution is not None:
             result["execution"] = dict(self.execution)
         if self.error is not None:
-            result["error"] = self.error
+            # ``EngineJob`` is the durable job-JSON boundary.  Individual
+            # failure paths also redact their returned job objects, while
+            # this guard keeps a newly added writer from persisting an error
+            # string verbatim by accident.
+            result["error"] = redact_error(self.error)
         return result
 
     @classmethod
@@ -834,8 +915,7 @@ class SimplePlanExecutor:
 
     @staticmethod
     def _owned_source_root(path: str) -> bool:
-        normalized = path.rstrip("/")
-        return "/待刮削/" in normalized or "/ScrapeFlow/补源/" in normalized
+        return is_task_owned_staging_root(path)
 
     def _cleanup_empty_source_tree(self, root: str) -> list[str]:
         """Remove only empty directories inside one task-owned source tree."""
@@ -895,9 +975,11 @@ class SimplePlanExecutor:
             item for item in all_files
             if not media_only or getattr(item, "media_kind", None) == "video"
         ]
-        problems = list(getattr(plan, "problem_files", ()) or ())
-        if problems:
-            raise EngineExecutionError(f"计划仍有 {len(problems)} 个问题文件，不能执行")
+        _require_problem_free_plan(plan, stage="计划执行")
+        # Validate every cleanup row before the first media move. This avoids
+        # a partial formal write followed by discovery that an old plan wanted
+        # to delete a user-owned attachment.
+        _require_cleanup_allowlist(plan, stage="计划执行")
         if media_only and not files:
             raise EngineExecutionError("provider media-only child 没有可执行视频")
         if media_only:
@@ -2156,70 +2238,79 @@ class SimpleEngineRunner:
             if isinstance(plan, Mapping):
                 engine = __import__("engine.scraper", fromlist=["plan_from_dict"])
                 plan = engine.plan_from_dict(plan)
-            return plan
-        engine = __import__("engine.scraper", fromlist=["build_movie_plan"])
-        current = request
-        if current.tmdb_id is None:
-            matcher = getattr(engine, "auto_match_tmdb", None)
-            if not callable(matcher):
-                raise SimpleEngineError("当前 Engine 没有 auto_match_tmdb")
-            query = current.query or posixpath.basename(current.source_path)
-            requested_type = None if current.media_type == "auto" else current.media_type
-            match, _candidates = matcher(
-                self.tmdb,
-                query,
-                media_type=requested_type,
-            )
-            current = replace(
-                current,
-                media_type=str(match.media_type),
-                tmdb_id=int(match.tmdb_id),
-            )
-        if current.media_type == "movie":
-            plan = engine.build_movie_plan(
-                self.alist,
-                self.tmdb,
-                src_path=current.source_path,
-                parent_path=current.parent_path,
-                tmdb_id=int(current.tmdb_id),
-                ignore_orphan_temp=current.ignore_orphan_temp,
-            )
-        elif current.media_type == "tv":
-            plan = engine.build_tv_plan_smart(
-                auto_episode_mode=current.auto_episode_mode,
-                alist=self.alist,
-                tmdb_client=self.tmdb,
-                src_path=current.source_path,
-                parent_path=current.parent_path,
-                tmdb_id=int(current.tmdb_id),
-                season=current.season,
-                absolute=current.absolute,
-                prefer_simplified=current.prefer_simplified,
-                allow_unmapped=current.allow_unmapped,
-                ignore_orphan_temp=current.ignore_orphan_temp,
-                episode_map_path=None,
-                episode_group_id=current.episode_group_id,
-            )
-        elif current.media_type == "collection":
-            if current.collection_map:
-                raise EngineRequestError(
-                    "简化入口暂不把内嵌 collection_map 写成临时文件；请使用 allow_index_mapping 或注入 planner"
-                )
-            plan = engine.build_collection_plan(
-                self.alist,
-                self.tmdb,
-                src_path=current.source_path,
-                parent_path=current.parent_path,
-                tmdb_id=int(current.tmdb_id),
-                mapping_path=None,
-                allow_index_mapping=current.allow_index_mapping,
-                ignore_orphan_temp=current.ignore_orphan_temp,
-            )
         else:
-            raise EngineRequestError("无法确定媒体类型；请提供 movie、tv 或 collection")
-        finalize = getattr(engine, "finalize_plan_evidence", None)
-        if callable(finalize):
-            finalize(plan)
+            engine = __import__("engine.scraper", fromlist=["build_movie_plan"])
+            current = request
+            if current.tmdb_id is None:
+                matcher = getattr(engine, "auto_match_tmdb", None)
+                if not callable(matcher):
+                    raise SimpleEngineError("当前 Engine 没有 auto_match_tmdb")
+                query = current.query or posixpath.basename(current.source_path)
+                requested_type = None if current.media_type == "auto" else current.media_type
+                match, _candidates = matcher(
+                    self.tmdb,
+                    query,
+                    media_type=requested_type,
+                )
+                current = replace(
+                    current,
+                    media_type=str(match.media_type),
+                    tmdb_id=int(match.tmdb_id),
+                )
+            if current.media_type == "movie":
+                plan = engine.build_movie_plan(
+                    self.alist,
+                    self.tmdb,
+                    src_path=current.source_path,
+                    parent_path=current.parent_path,
+                    tmdb_id=int(current.tmdb_id),
+                    ignore_orphan_temp=current.ignore_orphan_temp,
+                )
+            elif current.media_type == "tv":
+                plan = engine.build_tv_plan_smart(
+                    auto_episode_mode=current.auto_episode_mode,
+                    alist=self.alist,
+                    tmdb_client=self.tmdb,
+                    src_path=current.source_path,
+                    parent_path=current.parent_path,
+                    tmdb_id=int(current.tmdb_id),
+                    season=current.season,
+                    absolute=current.absolute,
+                    prefer_simplified=current.prefer_simplified,
+                    allow_unmapped=current.allow_unmapped,
+                    ignore_orphan_temp=current.ignore_orphan_temp,
+                    episode_map_path=None,
+                    episode_group_id=current.episode_group_id,
+                )
+            elif current.media_type == "collection":
+                if current.collection_map:
+                    raise EngineRequestError(
+                        "简化入口暂不把内嵌 collection_map 写成临时文件；请使用 allow_index_mapping 或注入 planner"
+                    )
+                plan = engine.build_collection_plan(
+                    self.alist,
+                    self.tmdb,
+                    src_path=current.source_path,
+                    parent_path=current.parent_path,
+                    tmdb_id=int(current.tmdb_id),
+                    mapping_path=None,
+                    allow_index_mapping=current.allow_index_mapping,
+                    ignore_orphan_temp=current.ignore_orphan_temp,
+                )
+            else:
+                raise EngineRequestError("无法确定媒体类型；请提供 movie、tv 或 collection")
+
+        # ``finalize_plan_evidence`` belonged to the retired transaction-era
+        # planner.  The current model's finalizer is still required for every
+        # runner plan, including injected planners used by provider children
+        # and tests, because it builds the persisted scan-report projection.
+        engine = __import__("engine.scraper", fromlist=["finalize_plan"])
+        finalize = getattr(engine, "finalize_plan", None)
+        if not callable(finalize):
+            raise SimpleEngineError("当前 Engine 缺少 finalize_plan")
+        finalized = finalize(plan)
+        if finalized is not None:
+            plan = finalized
         if self.validate:
             validate = getattr(engine, "validate_plan", None)
             if callable(validate):
@@ -2400,6 +2491,11 @@ class SimpleEngineRunner:
             return planned
 
     def _invoke_executor(self, plan: object) -> Mapping[str, object]:
+        # Keep the gate here too. ``repair_automatic_artifacts`` and injected
+        # executors both use this path, so neither can bypass the runner's
+        # formal-write boundary by calling a different execution entrypoint.
+        _require_problem_free_plan(plan, stage="执行器")
+        _require_cleanup_allowlist(plan, stage="执行器")
         executor = self.executor
         method = getattr(executor, "execute", None)
         target = method if callable(method) else executor if callable(executor) else None
@@ -2426,6 +2522,21 @@ class SimpleEngineRunner:
             if not callable(parser):
                 raise SimpleEngineError("Engine 缺少 plan_from_dict")
             plan = parser(job.plan)
+            try:
+                # Do this before persisting ``executing``. A problem-bearing
+                # plan must never look like it began a formal write, even for
+                # an injected executor that would otherwise accept it.
+                _require_problem_free_plan(plan, stage="计划执行")
+                _require_cleanup_allowlist(plan, stage="计划执行")
+            except EngineExecutionError as exc:
+                blocked = replace(
+                    job,
+                    phase="failed",
+                    updated_at=_now(),
+                    error=redact_error(exc),
+                )
+                atomic_write_json(self._job_path(job_id), blocked.as_dict(), allow_nan=False)
+                raise
             if _is_provider_media_only_plan(plan):
                 try:
                     _require_provider_tv_child_primary_videos(plan, stage="child 执行")
@@ -2445,7 +2556,7 @@ class SimpleEngineRunner:
                     executing,
                     phase="failed",
                     updated_at=_now(),
-                    error=str(exc) or type(exc).__name__,
+                    error=redact_error(exc),
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 raise
@@ -2512,7 +2623,10 @@ class SimpleEngineRunner:
                     job,
                     phase="retry_wait",
                     updated_at=_now(),
-                    error=f"恢复检查暂时无法确认远端结果，将自动重试: {str(exc) or type(exc).__name__}",
+                    error=(
+                        "恢复检查暂时无法确认远端结果，将自动重试: "
+                        f"{redact_error(exc)}"
+                    ),
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 return failed
@@ -2555,6 +2669,8 @@ class SimpleEngineRunner:
         return {"size": size}
 
     def _readback_plan(self, plan: object) -> dict[str, object]:
+        _require_problem_free_plan(plan, stage="恢复检查")
+        _require_cleanup_allowlist(plan, stage="恢复检查")
         media_only = _is_provider_media_only_plan(plan)
         files = [
             item for item in list(getattr(plan, "files", ()) or ())
@@ -2669,7 +2785,7 @@ class SimpleEngineRunner:
                 job,
                 phase="cancelled",
                 updated_at=_now(),
-                error=(reason.strip() or "cancelled by operator"),
+                error=redact_error(reason.strip() or "cancelled by operator"),
             )
             atomic_write_json(self._job_path(job_id), cancelled.as_dict(), allow_nan=False)
             return cancelled

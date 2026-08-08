@@ -42,7 +42,6 @@ services:
       SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
       TMDB_BASE_URL: ${TMDB_BASE_URL_DOCKER:-https://api.themoviedb.org/3}
       TMDB_PROXY_URL: ${TMDB_PROXY_URL_DOCKER:-}
-      SCRAPEFLOW_START_PAUSED: ${SCRAPEFLOW_START_PAUSED:-0}
       TZ: ${TZ:-Asia/Shanghai}
       TMPDIR: /var/tmp/scrapeflow
     depends_on:

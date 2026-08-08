@@ -6,7 +6,7 @@ export const UNSCRAPED_MEDIA_ROOT = `${MEDIA_ROOT}/待刮削`;
 export const ACTIVE_PHASES = new Set<JobPhase>([
   "queued", "analyzing", "identity_matching", "planning", "executing_media",
   "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
-  "acquiring", "staging_verifying", "child_planning", "child_executing",
+  "acquiring", "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
   "final_verifying",
 ]);
 
@@ -29,6 +29,7 @@ export const PHASE: Record<JobPhase, PhaseMeta> = {
   provider_searching: { label: "自动搜索补源", detail: "正在从已配置来源筛选合格候选", progress: 89, step: 4, tone: "live" },
   acquiring: { label: "自动获取补源", detail: "正在下载或复制候选到任务暂存区", progress: 91, step: 4, tone: "live" },
   staging_verifying: { label: "核对补源文件", detail: "正在检查暂存内容、大小和覆盖范围", progress: 93, step: 4, tone: "live" },
+  subtitle_installing: { label: "安装字幕", detail: "正在绑定已核对的字幕与正式视频", progress: 96, step: 4, tone: "live" },
   child_planning: { label: "自动规划补源", detail: "正在为已到盘资源生成内部补源计划", progress: 95, step: 4, tone: "live" },
   child_executing: { label: "自动整理补源", detail: "正在把已核对资源写入正式媒体库", progress: 97, step: 4, tone: "live" },
   final_verifying: { label: "最终核对", detail: "正在确认补源结果并收口缺口", progress: 98, step: 5, tone: "live" },

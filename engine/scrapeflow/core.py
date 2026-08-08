@@ -105,7 +105,11 @@ from .remote_paths import (
     safe_name,
     split_remote,
 )
-from .residual_policy import classify_residual, cleanup_reason_for
+from .residual_policy import (
+    classify_residual,
+    cleanup_allowlist_reason,
+    cleanup_reason_for,
+)
 
 __version__ = "4.0.0"
 DEFAULT_ALIST_URL = "http://127.0.0.1:5244"
@@ -2656,16 +2660,14 @@ def _filter_media(files: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 
 def cleanup_reason(name: str) -> str | None:
-    if name.startswith("._"):
-        return "macOS AppleDouble 隐藏文件"
-    suffix = Path(name).suffix.lower()
-    if suffix in VIDEO_EXTS and DISPOSABLE_VIDEO_TAG_RE.search(name):
-        return "无字幕片头/片尾/光盘菜单视频"
-    if suffix in ADVERTISEMENT_IMAGE_EXTS and ADVERTISEMENT_IMAGE_RE.search(name):
-        return "发布组广告图片"
-    if suffix in FONT_RESOURCE_EXTS and FONT_RESOURCE_RE.search(name):
-        return "字体资源包"
-    return None
+    """Return a cleanup reason only for name-only OS litter.
+
+    Release labels such as ``NCOP``, an advertisement image, or a font are
+    useful residual evidence but no longer authorize deletion.  They remain
+    in source until a user handles them or a later, task-owned staging flow
+    proves they are rebuildable temporary content.
+    """
+    return cleanup_reason_for(classify_residual(name))
 
 
 def _contextual_cleanup_reason(item: Mapping[str, Any]) -> str | None:
@@ -2699,7 +2701,6 @@ def _contextual_cleanup_reason(item: Mapping[str, Any]) -> str | None:
 
 def _planned_cleanup_files(files: Iterable[Mapping[str, Any]]) -> list[PlannedCleanup]:
     entries = [dict(item) for item in files]
-    contextual_cleanup = _contextual_theme_cleanup_paths(entries)
     planned: list[PlannedCleanup] = []
     seen: set[str] = set()
     for item in entries:
@@ -2707,12 +2708,7 @@ def _planned_cleanup_files(files: Iterable[Mapping[str, Any]]) -> list[PlannedCl
         full_path = item.get("full_path")
         if item.get("is_dir") or not isinstance(name, str) or not isinstance(full_path, str):
             continue
-        reason = cleanup_reason(name) or _contextual_cleanup_reason(item)
-        if (
-            reason is None
-            and _collision_key(normalize_remote_path(full_path)) in contextual_cleanup
-        ):
-            reason = "经特典目录与同集正片交叉确认的片头/片尾视频"
+        reason = cleanup_reason(name)
         if reason is None:
             decision = classify_residual(full_path)
             reason = cleanup_reason_for(decision)
@@ -2758,10 +2754,40 @@ def _append_cleanup_warning(warnings: list[str], cleanup_files: Sequence[Planned
     warnings.append(f"写入并回读成功后清理任务来源中的无用文件：{preview}{suffix}")
 
 
+def _restrict_cleanup_to_allowlist(plan: Plan) -> None:
+    """Drop legacy destructive cleanup rows before a current plan is used.
+
+    Older planner branches can still derive duplicate/theme cleanup rows while
+    the current light-weight workflow deliberately retains those files.  Do
+    not turn that legacy decision into a validation failure or an accidental
+    delete: retain the source and make the reduced plan say so explicitly.
+    Persisted plans are *not* repaired here; the runner rejects any such row
+    again immediately before an executor can write.
+    """
+    source_root = normalize_remote_path(plan.source_root).rstrip("/") or "/"
+    allowed: list[PlannedCleanup] = []
+    retained: list[PlannedCleanup] = []
+    for item in plan.cleanup_files:
+        expected = cleanup_allowlist_reason(
+            item.source_path,
+            task_root=source_root,
+        )
+        if expected == item.reason:
+            allowed.append(item)
+        else:
+            retained.append(item)
+    if not retained:
+        return
+    plan.cleanup_files = allowed
+    plan.warnings.append(
+        f"{len(retained)} 个非任务临时残留已保留在来源；不会自动清理"
+    )
+
+
 def _cleanup_is_generated_housekeeping(item: PlannedCleanup) -> bool:
     """Return true only for operating-system litter, never for media assets."""
     name = item.original_name.casefold()
-    return name.startswith("._") or name in {".ds_store", "thumbs.db", "desktop.ini"}
+    return name.startswith("._") or name == ".ds_store"
 
 
 def _unparsed_media_paths(
@@ -6581,16 +6607,6 @@ def build_tv_plan(
                 f"{len(preferred_excluded_subtitles)} 个繁体字幕已有同发行简体对应；"
                 "备选字幕已保留在源目录"
             )
-            problem_files.extend(
-                PlannedProblem(
-                    source_path=path,
-                    reason=(
-                        "同发行简体字幕已被选用；该备选字幕将保留于"
-                        "源目录"
-                    ),
-                )
-                for path in preferred_excluded_subtitle_paths
-            )
     if auto_special_title_match and groups is not all_groups:
         _remap_postseason_oav_suffix(groups, special_titles)
         _remap_numbered_specials_by_official_label(groups, special_titles)
@@ -6786,16 +6802,6 @@ def build_tv_plan(
                     reason="无对应视频或无法唯一编号的字幕；保留原位并标记规划未闭合",
                 )
                 for path in retained_subtitles
-            ),
-            *(
-                PlannedProblem(
-                    source_path=path,
-                    reason=(
-                        "同发行简体字幕已被选用；该备选字幕将保留于"
-                        "源目录"
-                    ),
-                )
-                for path in preferred_excluded_subtitle_paths
             ),
         ]
         if unparsed_videos:
@@ -7271,6 +7277,21 @@ def build_tv_plan(
         },
         cleanup_files=cleanup_files,
         problem_files=problem_files,
+        # ``parse_ep_files(..., prefer_simplified=True)`` is the existing
+        # subtitle preference selector. Its intentionally excluded traditional
+        # companion is a retained alternative, not an unresolved identity or
+        # pairing error. Keep it visible in the scan report without turning it
+        # into a problem-file gate that would stop the verified media plan.
+        scan_report={
+            "deferred_subtitles": [
+                {
+                    "source_path": path,
+                    "action": "preserve_at_source",
+                    "reason": "preferred_simplified_subtitle",
+                }
+                for path in preferred_excluded_subtitle_paths
+            ],
+        } if preferred_excluded_subtitle_paths else {},
     )
     if not absolute and season > 0:
         try:
@@ -9785,6 +9806,7 @@ def validate_plan(
     plan: Plan,
 ) -> None:
     _demote_unpaired_subtitles(alist, plan)
+    _restrict_cleanup_to_allowlist(plan)
     if not plan.files:
         if plan.problem_files:
             preview = "；".join(

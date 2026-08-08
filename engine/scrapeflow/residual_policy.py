@@ -1,9 +1,18 @@
-"""Classify files that are not part of the canonical media plan."""
+"""Fail-closed classification and cleanup rules for residual source files.
+
+Residual classification is deliberately non-destructive.  A file being an
+audio track, a comic, a font, a manifest, an image, or a likely OP/ED is not
+proof that this task created it or that it is safe to remove.  Only operating
+system litter and a narrowly proven task-staging download temporary are
+eligible for unattended cleanup; callers must still check ownership at the
+write boundary.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+import posixpath
 import re
 import unicodedata
 
@@ -11,6 +20,10 @@ import unicodedata
 CLEANUP_AFTER_READBACK = "cleanup_after_readback"
 DEFER_SUBTITLE = "defer_subtitle"
 KEEP_UNPLANNED = "keep_unplanned"
+
+APPLEDOUBLE_CLEANUP_REASON = "macOS AppleDouble 隐藏文件"
+DS_STORE_CLEANUP_REASON = "macOS .DS_Store 隐藏文件"
+REBUILDABLE_STAGING_TEMP_CLEANUP_REASON = "任务自有可重建下载临时文件"
 
 VIDEO_EXTENSIONS = frozenset({
     ".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov", ".webm",
@@ -32,6 +45,14 @@ MANIFEST_EXTENSIONS = frozenset({
 })
 ARCHIVE_EXTENSIONS = frozenset({".zip", ".rar", ".7z", ".001"})
 IMAGE_EXTENSIONS = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
+EXECUTABLE_EXTENSIONS = frozenset({
+    ".app", ".bat", ".cmd", ".com", ".dll", ".exe", ".msi", ".ps1", ".sh",
+    ".command",
+})
+REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES = frozenset({
+    ".aria2", ".crdownload", ".download", ".part", ".partial", ".temp", ".tmp",
+    ".!qb",
+})
 
 _BOOK_CONTEXT_RE = re.compile(
     r"(?:^|[/\\._\-\s\[\]()])(?:novels?|manga|comics?|books?|"
@@ -49,26 +70,6 @@ _ADVERTISEMENT_IMAGE_RE = re.compile(
     re.I,
 )
 
-_TRUSTED_REASONS = frozenset({
-    "macOS AppleDouble 隐藏文件",
-    "无字幕片头/片尾/光盘菜单视频",
-    "发布组广告图片",
-    "字体资源包",
-    "经特典目录与同集正片交叉确认的片头/片尾视频",
-    "特典动画广告/Animated Magia Report Commercial",
-})
-
-_CLEANUP_REASONS = {
-    "appledouble": "macOS AppleDouble 隐藏文件",
-    "detached_audio": "外挂音轨/独立音频附件",
-    "document": "小说、漫画或文档附件",
-    "font": "字体资源包",
-    "manifest": "发布校验/下载清单文件",
-    "book_image": "小说/漫画目录图像",
-    "advertisement": "发布组广告图片",
-    "theme_video": "非正片片头/片尾/宣传视频",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class ResidualDecision:
@@ -81,56 +82,144 @@ class ResidualDecision:
         return self.action == CLEANUP_AFTER_READBACK
 
 
+def _normalized_path(path: str) -> str:
+    value = unicodedata.normalize("NFKC", path).replace("\\", "/")
+    if not value.startswith("/"):
+        value = "/" + value
+    return posixpath.normpath(value)
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _is_rebuildable_download_temp_name(name: str) -> bool:
+    lowered = name.casefold()
+    return (
+        lowered.startswith(".scraper-tmp-")
+        or any(lowered.endswith(suffix) for suffix in REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES)
+    )
+
+
+def is_task_owned_staging_root(path: str) -> bool:
+    """Recognize the only current automatic staging layout.
+
+    The automatic replenishment runtime creates
+    ``.../ScrapeFlow/补源/<job-id>/<attempt-id>/...``.  Merely living below a
+    broad media root or intake folder is not ownership evidence.  Keep this
+    convention narrow until an explicit task-staging identity is persisted in
+    the current plan model.
+    """
+    normalized = _normalized_path(path)
+    parts = [part for part in normalized.split("/") if part]
+    folded = [part.casefold() for part in parts]
+    for index in range(len(parts) - 1):
+        if folded[index] == "scrapeflow" and parts[index + 1] == "补源":
+            return len(parts[index + 2:]) >= 2
+    return False
+
+
+def cleanup_allowlist_reason(
+    source_path: str,
+    *,
+    task_root: str | None = None,
+) -> str | None:
+    """Return the sole accepted cleanup reason, or ``None`` when unsafe.
+
+    This function proves only static name/path eligibility.  The executor
+    additionally verifies that the cleanup row's source directory and name
+    match exactly before calling AList ``remove``.
+    """
+    normalized = _normalized_path(source_path)
+    name = PurePosixPath(normalized).name
+    if name.startswith("._"):
+        return APPLEDOUBLE_CLEANUP_REASON
+    if name.casefold() == ".ds_store":
+        return DS_STORE_CLEANUP_REASON
+    if task_root is None or not _is_rebuildable_download_temp_name(name):
+        return None
+    root = _normalized_path(task_root)
+    if is_task_owned_staging_root(root) and _path_is_within(normalized, root):
+        return REBUILDABLE_STAGING_TEMP_CLEANUP_REASON
+    return None
+
+
 def cleanup_reason_for(
     decision: ResidualDecision, *, trusted_reason: str = "",
 ) -> str | None:
+    """Expose only the tiny name-only cleanup whitelist to planners.
+
+    ``trusted_reason`` remains a compatibility parameter but cannot expand
+    the whitelist: historic planner labels for fonts, advertisements, and
+    theme videos are no longer delete authority.
+    """
+    del trusted_reason
     if not decision.can_cleanup:
         return None
-    normalized = unicodedata.normalize("NFKC", trusted_reason).strip()
-    if decision.kind == "planner_non_feature":
-        return normalized if normalized in _TRUSTED_REASONS else None
-    return _CLEANUP_REASONS.get(decision.kind)
+    if decision.kind == "appledouble":
+        return APPLEDOUBLE_CLEANUP_REASON
+    if decision.kind == "ds_store":
+        return DS_STORE_CLEANUP_REASON
+    return None
 
 
 def classify_residual(source_path: str, *, reason: str = "") -> ResidualDecision:
-    normalized = unicodedata.normalize("NFKC", source_path).replace("\\", "/")
-    if not normalized.startswith("/"):
-        normalized = "/" + normalized
+    """Classify a residual without granting deletion authority from its type."""
+    del reason
+    normalized = _normalized_path(source_path)
     name = PurePosixPath(normalized).name
     suffix = PurePosixPath(name).suffix.casefold()
-    known_reason = unicodedata.normalize("NFKC", reason).strip()
     if suffix in SUBTITLE_EXTENSIONS:
         return ResidualDecision(DEFER_SUBTITLE, "subtitle", (f"extension={suffix}",))
-    if known_reason in _TRUSTED_REASONS:
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "planner_non_feature", (known_reason,))
     if name.startswith("._"):
         return ResidualDecision(CLEANUP_AFTER_READBACK, "appledouble", ("appledouble",))
+    if name.casefold() == ".ds_store":
+        return ResidualDecision(CLEANUP_AFTER_READBACK, "ds_store", ("ds_store",))
+    if _is_rebuildable_download_temp_name(name):
+        return ResidualDecision(
+            KEEP_UNPLANNED,
+            "rebuildable_download_temp",
+            ("requires_task_owned_staging_root",),
+        )
     if suffix in AUDIO_EXTENSIONS:
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "detached_audio", (f"extension={suffix}",))
+        return ResidualDecision(KEEP_UNPLANNED, "detached_audio", (f"extension={suffix}",))
     if suffix in DOCUMENT_EXTENSIONS:
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "document", (f"extension={suffix}",))
+        return ResidualDecision(KEEP_UNPLANNED, "document_or_comic", (f"extension={suffix}",))
     if suffix in FONT_EXTENSIONS:
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "font", (f"extension={suffix}",))
+        return ResidualDecision(KEEP_UNPLANNED, "font", (f"extension={suffix}",))
     if suffix in MANIFEST_EXTENSIONS:
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "manifest", (f"extension={suffix}",))
-    if suffix in IMAGE_EXTENSIONS and _BOOK_CONTEXT_RE.search(normalized):
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "book_image", ("book_context",))
-    if suffix in IMAGE_EXTENSIONS and _ADVERTISEMENT_IMAGE_RE.search(name):
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "advertisement", ("advertisement_name",))
+        return ResidualDecision(KEEP_UNPLANNED, "manifest", (f"extension={suffix}",))
+    if suffix in EXECUTABLE_EXTENSIONS:
+        return ResidualDecision(KEEP_UNPLANNED, "unknown_executable", (f"extension={suffix}",))
+    if suffix in IMAGE_EXTENSIONS:
+        if _BOOK_CONTEXT_RE.search(normalized):
+            return ResidualDecision(KEEP_UNPLANNED, "book_image", ("book_context",))
+        if _ADVERTISEMENT_IMAGE_RE.search(name):
+            return ResidualDecision(KEEP_UNPLANNED, "advertisement_image", ("advertisement_name",))
+        return ResidualDecision(KEEP_UNPLANNED, "unknown_image", (f"extension={suffix}",))
     if suffix in VIDEO_EXTENSIONS and _THEME_VIDEO_RE.search(name):
-        return ResidualDecision(CLEANUP_AFTER_READBACK, "theme_video", ("theme_name",))
+        return ResidualDecision(KEEP_UNPLANNED, "theme_video", ("theme_name",))
     if suffix in ARCHIVE_EXTENSIONS:
         return ResidualDecision(KEEP_UNPLANNED, "archive", ("needs_extraction",))
     if suffix in VIDEO_EXTENSIONS:
         return ResidualDecision(KEEP_UNPLANNED, "video", ("not_in_plan",))
-    return ResidualDecision(KEEP_UNPLANNED, "unknown", ((f"extension={suffix}" if suffix else "no_extension"),))
+    return ResidualDecision(
+        KEEP_UNPLANNED,
+        "unknown",
+        ((f"extension={suffix}" if suffix else "no_extension"),),
+    )
 
 
 __all__ = [
+    "APPLEDOUBLE_CLEANUP_REASON",
     "CLEANUP_AFTER_READBACK",
     "DEFER_SUBTITLE",
+    "DS_STORE_CLEANUP_REASON",
     "KEEP_UNPLANNED",
+    "REBUILDABLE_STAGING_TEMP_CLEANUP_REASON",
     "ResidualDecision",
     "classify_residual",
+    "cleanup_allowlist_reason",
     "cleanup_reason_for",
+    "is_task_owned_staging_root",
 ]

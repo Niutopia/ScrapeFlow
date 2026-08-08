@@ -23,6 +23,7 @@ from .replenishment import (
     enrich_replenishment_plan_aliases,
     select_replenishment_candidates,
 )
+from .redaction import redact_error, redact_value
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
@@ -190,9 +191,14 @@ def reconcile_interrupted_gap_states(
         if not isinstance(raw, Mapping) or str(raw.get("phase") or "") not in _INTERRUPTED_GAP_PHASES:
             continue
         state = dict(raw)
-        state.update({"phase": "retry_wait", "updated_at": _now(), "error": error})
+        state.update({"phase": "retry_wait", "updated_at": _now(), "error": redact_error(error)})
         try:
-            atomic_write_json(path, state, allow_nan=False)
+            redacted = redact_value(state)
+            atomic_write_json(
+                path,
+                dict(redacted) if isinstance(redacted, Mapping) else state,
+                allow_nan=False,
+            )
         except OSError:
             continue
         updated += 1
@@ -248,7 +254,12 @@ class AutomaticReplenishmentRuntime:
         if callback is None:
             return
         try:
-            callback(job, phase, dict(details))
+            redacted = redact_value(dict(details))
+            callback(
+                job,
+                phase,
+                dict(redacted) if isinstance(redacted, Mapping) else dict(details),
+            )
         except Exception:
             return
 
@@ -331,7 +342,12 @@ class AutomaticReplenishmentRuntime:
             job_id = str(state.get("job_id") or "job")
             path = self.gaps_root / _GAP_SLUG.sub("-", job_id).strip(".-") / _gap_file_name(gap_id)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        atomic_write_json(path, dict(state), allow_nan=False)
+        redacted = redact_value(dict(state))
+        atomic_write_json(
+            path,
+            dict(redacted) if isinstance(redacted, Mapping) else dict(state),
+            allow_nan=False,
+        )
         return path
 
     def _gap_path(self, *, job_id: str, gap_id: str) -> Path:
@@ -1764,7 +1780,7 @@ class AutomaticReplenishmentRuntime:
                         self._progress(
                             job, "child_failed", round=round_number,
                             child_job_id=child.id, child_phase="failed",
-                            error=str(exc) or type(exc).__name__,
+                            error=redact_error(exc),
                         )
             finally:
                 # A pause is a no-new-write boundary.  In particular, do not
@@ -1791,7 +1807,7 @@ class AutomaticReplenishmentRuntime:
                     job,
                     "retry_wait",
                     round=round_number,
-                    error=str(attempt_error) or type(attempt_error).__name__,
+                    error=redact_error(attempt_error),
                     attempt_failure_stage=getattr(
                         attempt_error, "failure_stage", None,
                     ),
@@ -1813,7 +1829,9 @@ class AutomaticReplenishmentRuntime:
                     ],
                 )
                 if round_number >= self.max_candidate_rounds:
-                    self._progress(job, "retry_wait", round=round_number, error=str(attempt_error))
+                    self._progress(
+                        job, "retry_wait", round=round_number, error=redact_error(attempt_error),
+                    )
                     raise AutomaticReplenishmentError(
                         f"补源已尝试 {round_number} 轮仍失败: {attempt_error}"
                     ) from attempt_error
@@ -1959,13 +1977,13 @@ class AutomaticReplenishmentRuntime:
                         state.update({
                             "phase": "retry_wait",
                             "updated_at": _now(),
-                            "error": str(exc) or type(exc).__name__,
+                            "error": redact_error(exc),
                         })
                         self._write_gap(state, path)
                 outcomes.append({
                     "request": active_request,
                     "resolved_gap_ids": [],
-                    "error": str(exc) or type(exc).__name__,
+                    "error": redact_error(exc),
                     "cancelled": True,
                 })
                 # Do not create state or invoke a provider for another request
@@ -1981,12 +1999,16 @@ class AutomaticReplenishmentRuntime:
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if state.get("phase") != "resolved":
-                        state.update({"phase": "retry_wait", "updated_at": _now(), "error": str(exc) or type(exc).__name__})
+                        state.update({
+                            "phase": "retry_wait",
+                            "updated_at": _now(),
+                            "error": redact_error(exc),
+                        })
                         self._write_gap(state, path)
                 outcomes.append({
                     "request": active_request,
                     "resolved_gap_ids": [],
-                    "error": str(exc) or type(exc).__name__,
+                    "error": redact_error(exc),
                 })
         return {
             "job_id": job.id,

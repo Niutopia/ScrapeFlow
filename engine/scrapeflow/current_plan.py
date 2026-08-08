@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import asdict
 import json
+from pathlib import Path
+import re
 from typing import Any, Mapping
+import unicodedata
 
 from .errors import PlanError
+from .media_naming import subtitle_language
 from .models import Plan, PlanNotice, PlannedCleanup, PlannedFile, PlannedProblem
+from .remote_paths import join_remote, normalize_remote_path
 
 
 def _object(value: Any, field: str) -> dict[str, Any]:
@@ -133,8 +139,145 @@ def plan_from_dict(raw: Mapping[str, Any]) -> Plan:
     )
 
 
+def _collision_key(value: str) -> str:
+    """Use the current path/name comparison normalization without core imports."""
+    return unicodedata.normalize("NFC", value).casefold().rstrip(" .")
+
+
+def _subtitle_companion_key(target_dir: str, final_name: str) -> tuple[str, str]:
+    """Map an external subtitle filename to its exact final-video stem.
+
+    The current naming policy emits language suffixes such as ``.zh-CN`` or
+    ``.subtitle2`` immediately before the subtitle extension.  Removing only
+    that suffix preserves a video's `` - v2``/edition identity, so alternates
+    cannot be coalesced across distinct final video files.
+    """
+    stem = Path(final_name).stem
+    stem = re.sub(
+        r"\.(?:zh-CN|zh-TW|en|ja)(?:\.\d+)*$|\.subtitle(?:\.\d+|\d*)$",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    return _collision_key(normalize_remote_path(target_dir)), _collision_key(stem)
+
+
+def _subtitle_track_rank(items: list[PlannedFile]) -> tuple[object, ...]:
+    """Return a deterministic, current-policy rank for one logical track."""
+    representative = min(items, key=lambda item: _collision_key(item.source_path))
+    language_rank = {
+        "zh-CN": 0,
+        "zh-TW": 1,
+        "en": 2,
+        "ja": 3,
+        None: 4,
+    }.get(subtitle_language(representative.final_name), 5)
+    # Keep the retired selector's narrow release heuristic: a same-language
+    # copy under a literal ``子集化字幕`` source directory is less useful than
+    # the ordinary release track.  This is only a deterministic tie-breaker;
+    # it never grants cleanup authority to either source.
+    source_key = unicodedata.normalize("NFKC", representative.source_path).casefold()
+    subset_rank = 1 if re.search(r"(?:^|/)子集化字幕(?:/|$)", source_key) else 0
+    extension_rank = {
+        ".ass": 0,
+        ".ssa": 1,
+        ".srt": 2,
+        ".vtt": 3,
+        ".idx": 4,
+        ".sub": 4,
+        ".sup": 5,
+    }.get(Path(representative.final_name).suffix.casefold(), 10)
+    canonical_suffix_rank = 0 if re.search(
+        r"\.(?:zh-CN|zh-TW|en|ja)$|\.subtitle$",
+        Path(representative.final_name).stem,
+        re.IGNORECASE,
+    ) else 1
+    return (
+        language_rank,
+        subset_rank,
+        extension_rank,
+        canonical_suffix_rank,
+        _collision_key(representative.source_path),
+    )
+
+
+def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
+    """Keep one logical subtitle track beside each exact planned video.
+
+    ``.idx``/``.sub`` siblings have the same filename stem and therefore stay
+    together as one logical track.  Other tracks remain untouched at source
+    and are recorded as deferred evidence; they are never problem files or
+    cleanup candidates.
+    """
+    video_keys = {
+        _subtitle_companion_key(item.target_dir, item.final_name)
+        for item in plan.files
+        if item.media_kind == "video"
+    }
+    tracks: dict[tuple[str, str], dict[str, list[PlannedFile]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for item in plan.files:
+        if item.media_kind != "subtitle":
+            continue
+        companion_key = _subtitle_companion_key(item.target_dir, item.final_name)
+        if companion_key not in video_keys:
+            continue
+        track_key = _collision_key(Path(item.final_name).stem)
+        tracks[companion_key][track_key].append(item)
+
+    demoted_ids: set[int] = set()
+    demoted: list[dict[str, str]] = []
+    for track_groups in tracks.values():
+        if len(track_groups) <= 1:
+            continue
+        preferred_key, preferred_items = min(
+            track_groups.items(),
+            key=lambda pair: _subtitle_track_rank(pair[1]),
+        )
+        preferred_path = min(
+            (item.source_path for item in preferred_items),
+            key=_collision_key,
+        )
+        for track_key, items in track_groups.items():
+            if track_key == preferred_key:
+                continue
+            for item in items:
+                demoted_ids.add(id(item))
+                demoted.append({
+                    "source_path": item.source_path,
+                    "planned_target_path": join_remote(item.target_dir, item.final_name),
+                    "action": "defer_until_exact_video_subtitle_closure",
+                    "reason": "alternate_subtitle_track",
+                    "preferred_source_path": preferred_path,
+                })
+    if not demoted_ids:
+        return
+
+    plan.files = [item for item in plan.files if id(item) not in demoted_ids]
+    deferred = plan.scan_report.setdefault("deferred_subtitles", [])
+    if not isinstance(deferred, list):
+        raise PlanError("scan_report.deferred_subtitles 必须是数组")
+    existing_sources = {
+        _collision_key(str(row.get("source_path")))
+        for row in deferred
+        if isinstance(row, Mapping) and isinstance(row.get("source_path"), str)
+    }
+    deferred.extend(
+        row for row in demoted
+        if _collision_key(row["source_path"]) not in existing_sources
+    )
+    warning = (
+        "同一视频的多份外挂字幕仅保留 1 条首选轨道；"
+        f"{len(demoted_ids)} 个备选字幕已保留在源目录"
+    )
+    if warning not in plan.warnings:
+        plan.warnings.append(warning)
+
+
 def finalize_plan(plan: Plan) -> Plan:
     """Complete ordinary summaries needed by the automatic runner."""
+    _retain_one_subtitle_track_per_exact_video(plan)
     existing = {(notice.code, notice.message) for notice in plan.notices}
     for warning in plan.warnings:
         key = ("planning_warning", warning)
