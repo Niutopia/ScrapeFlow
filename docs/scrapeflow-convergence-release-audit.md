@@ -2,6 +2,8 @@
 
 日期：2026-08-09
 
+当前 release candidate HEAD：`69f6de3`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。
+
 ## T0–T1：基线、WIP 与语义
 
 - 阶段 3 基线固定为 `8f54568`；保护分支为 `codex/wip-convergence-20260809`。
@@ -53,6 +55,7 @@
 
 - `npm run check`：311 个 Python 测试通过；ESLint、TypeScript、Next.js production build 通过。
 - `git diff --check`：通过。
+- Git 工作树 clean；可回退到 `8f54568` 或任一阶段 checkpoint。
 - `local.tests.test_phase4_golden_path`：7 个正例与 9 个负例通过。
 - 全仓搜索无 `provider-gap-claims` 写入路径。
 - 运行时保持 fail-closed pause，并有两条显式 production lane gate。
