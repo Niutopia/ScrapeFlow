@@ -4593,16 +4593,17 @@ class SimpleEngineRunner:
         }
 
     def _remove_empty_archive_staging(self, job: EngineJob | str) -> list[str]:
-        """Remove and read back only a task's empty ``archive`` directory.
+        """Remove and read back only a task's ``archive`` staging subtree.
 
         AList may report an empty list for both an empty directory and a
         missing path.  Probe the exact parent/name pair before each deletion
         and again afterwards, so a failed remote cleanup cannot be recorded as
         completed merely because an exception was swallowed.  This method
-        deliberately knows only ``<task>/archive``.  It must never delete
-        ``<task>`` itself: successful source consumption moves the original
-        input to its sibling ``<task>/processed`` directory, which is not
-        staging and remains owned by the user.
+        deliberately knows only descendants of ``<task>/archive`` plus that
+        exact directory.  It must never delete ``<task>`` itself: successful
+        source consumption moves the original input to its sibling
+        ``<task>/processed`` directory, which is not staging and remains owned
+        by the user.
         """
         owner = job if isinstance(job, EngineJob) else self._read(job)
         projection = owner.summary.get("archive_preprocessed")
@@ -4611,9 +4612,12 @@ class SimpleEngineRunner:
 
         _local_root, remote_root = self._archive_task_roots(owner.id)
         listing = getattr(self.alist, "list", None)
+        remove = getattr(self.alist, "remove", None)
         remove_empty = getattr(self.alist, "remove_empty_dir", None)
         if not callable(listing):
             raise EngineExecutionError("AList 客户端缺少 list 接口，无法核对归档 staging 清理")
+        if not callable(remove):
+            raise EngineExecutionError("AList 客户端缺少 remove 接口，无法清理归档 staging 文件")
         if not callable(remove_empty):
             raise EngineExecutionError("AList 客户端缺少 remove_empty_dir 接口，无法清理归档 staging")
 
@@ -4627,6 +4631,18 @@ class SimpleEngineRunner:
             if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
                 raise EngineExecutionError(f"AList 归档 staging 目录回读格式无效: {path}")
             return list(raw)
+
+        def safe_name(directory: str, item: Mapping[str, object]) -> str:
+            name = item.get("name")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+            ):
+                raise EngineExecutionError(f"AList 归档 staging 目录出现不安全条目: {directory}")
+            return name
 
         def directory_exists(path: str) -> bool:
             parent, name = posixpath.split(path.rstrip("/"))
@@ -4644,22 +4660,45 @@ class SimpleEngineRunner:
                 raise EngineExecutionError(f"归档 staging 路径不是目录: {path}")
             return True
 
-        removed: list[str] = []
-        # The plan source-root cleanup removes the deepest extracted tree.
-        # Close only the exact task-owned archive lane; ``processed`` is a
-        # sibling below ``remote_root`` and intentionally survives.
-        for path in (f"{remote_root}/archive",):
-            if not directory_exists(path):
-                continue
-            if rows(path):
-                raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {path}")
+        def remove_empty_checked(path: str) -> None:
             try:
-                remove_empty(path)
+                deleted = remove_empty(path)
             except Exception as exc:
                 raise EngineExecutionError(f"无法清理空归档 staging 目录: {path}: {exc}") from exc
+            if deleted is False:
+                raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {path}")
             if directory_exists(path):
                 raise EngineExecutionError(f"归档 staging 清理后目录仍存在: {path}")
-            removed.append(path)
+
+        removed: list[str] = []
+        archive_root = f"{remote_root}/archive"
+
+        def purge_children(directory: str) -> None:
+            for item in rows(directory):
+                _cancellation_checkpoint()
+                name = safe_name(directory, item)
+                child = posixpath.join(directory, name)
+                if item.get("is_dir") is True:
+                    purge_children(child)
+                    if rows(child):
+                        raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {child}")
+                    remove_empty_checked(child)
+                    removed.append(child)
+                    continue
+                try:
+                    remove(directory, [name])
+                except Exception as exc:
+                    raise EngineExecutionError(f"无法清理归档 staging 文件: {child}: {exc}") from exc
+                if any(row.get("name") == name for row in rows(directory)):
+                    raise EngineExecutionError(f"归档 staging 文件清理后仍存在: {child}")
+                removed.append(child)
+
+        if directory_exists(archive_root):
+            purge_children(archive_root)
+            if rows(archive_root):
+                raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {archive_root}")
+            remove_empty_checked(archive_root)
+            removed.append(archive_root)
         return removed
 
     def record_automatic_lifecycle_decision(

@@ -320,7 +320,14 @@ class Phase4GoldenPathTests(unittest.TestCase):
             ), []
         return match
 
-    def _positive(self, name: str, archive_name: str | None, members: tuple[Member, ...]):
+    def _positive(
+        self,
+        name: str,
+        archive_name: str | None,
+        members: tuple[Member, ...],
+        *,
+        preserve_archive_staging: bool = False,
+    ):
         alist = FixtureAList()
         source = f"/library/待刮削/{name}"
         if archive_name is None:
@@ -339,6 +346,12 @@ class Phase4GoldenPathTests(unittest.TestCase):
             planned = runner.plan_automatic_job(queued.id)
         writer_allowed = not planned.plan.get("problem_files")
         formal_done = runner.execute_job(queued.id)
+        if preserve_archive_staging:
+            self.assertIsNotNone(archive_name)
+            alist.add_file(
+                f"/library/ScrapeFlow/归档/{queued.id}/archive/{archive_name}/Movie/movie.mkv",
+                VIDEO,
+            )
         restarted = SimpleEngineRunner(
             self.root, alist=alist, tmdb=object(), planner=self._planner(alist, []),
             validate=False, executor=executor, library_root="/library",
@@ -382,6 +395,7 @@ class Phase4GoldenPathTests(unittest.TestCase):
             else None
         )
         staging_prefix = f"/library/ScrapeFlow/归档/{queued.id}/archive/"
+        processed_files = sorted(path for path in alist.files if f"/{queued.id}/processed/" in path)
         record = {
             "input_tree": [archive_name or "movie.mkv"],
             "preprocessing": {
@@ -402,6 +416,8 @@ class Phase4GoldenPathTests(unittest.TestCase):
             "restart_phase": restarted.phase,
             "cleanup_rescan_jobs": rescan_jobs,
             "formal_copy_count": sum(path == TARGET_VIDEO for path, _size in formal),
+            "processed_files": processed_files,
+            "archive_staging_files": sorted(path for path in alist.files if path.startswith(staging_prefix)),
         }
         self.assertEqual(executor.calls, 1, "restart must not invoke the writer twice")
         self.assertEqual(rescan_jobs, [], "cleanup followed by intake scan must not recreate the job")
@@ -468,6 +484,22 @@ class Phase4GoldenPathTests(unittest.TestCase):
             [(TARGET_VIDEO, len(VIDEO)), (TARGET_SUBTITLE, len(SUBTITLE))],
         )
         self.assertEqual(records["dat-sidecar"]["plan"], {"mode": "movie", "files": 2, "problems": 0})
+
+    def test_final_cleanup_removes_residual_archive_staging_files(self) -> None:
+        record, events = self._positive(
+            "zip-real-staging",
+            "movie.zip",
+            (Member("Movie/movie.mkv"),),
+            preserve_archive_staging=True,
+        )
+        self.assertEqual(events, ["preprocess", "identity", "planning", "writer"])
+        self.assertEqual(record["phase"], "executed")
+        self.assertEqual(record["formal"], [(TARGET_VIDEO, len(VIDEO))])
+        self.assertEqual(record["archive_staging_files"], [])
+        self.assertEqual(
+            record["processed_files"],
+            ["/library/ScrapeFlow/归档/golden-zip-real-staging/processed/zip-real-staging/movie.zip"],
+        )
 
     def _negative(
         self, name: str, members: tuple[Member, ...], *, limits=None,
