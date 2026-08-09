@@ -1,30 +1,13 @@
-# 收敛阶段 checkpoint 与发布审计
+# 历史收敛 checkpoint 与发布审计
 
-日期：2026-08-09
+> 文档性质：2026-08-09 之前自动入口收敛的历史快照。它不代表当前工作树、当前运行时或目标货架启动门已经完成，也不授权解除暂停。
 
-当前 release candidate 以分支 `codex/scrapeflow-transactional-convergence` 的最新提交为准；部署验收必须同时记录容器健康接口中的 `build_commit` 与源码文件哈希，避免文档中的静态提交号失效。
+当前阶段门、测试要求和提交边界以[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md)为准。
 
-这份表只记录当前工作树中有测试或运行时证据支持的状态；“通过”不等于已提交，也不等于真实媒体库验收。
+历史记录中出现的阶段 3–7、来源已移动到 processed、当前 RC、源码 hash 或容器 hash 都只能解释当时的实验环境，不能作为本轮验收或内容哈希系统的要求。当前产品明确不建设媒体 SHA、源码 SHA 对比、manifest 或 receipt。
 
-| 阶段 | 当前状态 | 证据 | 备注 |
-|---|---|---|---|
-| 3 | frozen | 基线 `8f54568`、保护分支 `codex/wip-convergence-20260809` | 不修改基线，不删除混合 WIP |
-| 4A | golden path passed | `local.tests.test_phase4_golden_path`；普通视频、ZIP/7z/RAR、EXE/BIN/DAT 伪装、字幕 sidecar 及负例 fixture | source 成功移入 task-owned processed；失败保留 source；重启不重复 writer |
-| 4B | deferred | 没有真实 Provider materializer `archive_source` 输入 | 不计入已完成能力，保持 Provider SFX 关闭 |
-| 5 | bounded / capability explicit | Provider capability、same-gap fingerprint、terminal stale timer 测试 | Magnet/Torrent ready；SFX deferred；无 durable claim registry |
-| 6 | scoped / fail-closed | audit/subtitle 定向测试、strict `zh-Hans` lane | unknown 合法；probe 失败不建 Provider；不做 OCR |
-| 7 | contract tested | root/child、cancelled child、terminal cleanup、Web correction 测试 | cancelled child 不进入 active children；retry contract 仅允许四个字段 |
+保留的历史结论仅限于：
 
-## 当前发布门禁
-
-- `npm run check` 必须通过；2026-08-09 最近一次结果：312 个 Python 测试通过，lint/typecheck/build check 通过。
-- `git diff --check` 必须通过；最近一次结果：通过。
-- 真实运行时保持 fail-closed 暂停：缺少 `global-control.json` 时 `PersistentControlState` 返回 `paused=true`。
-- 生产 root 的 `provider_auto_repair_enabled` 和 `audit_auto_repair_enabled` 默认关闭，只有显式环境门禁才开放。
-- 阶段代码已提交；真实 Docker 镜像仍需在 pause 状态下重建并进行 hash/health 对齐。
-
-## 明确 parked
-
-- `provider-gap-claims.json`、锁文件、多实例 lease/ownership。
-- 没有真实 materializer 输入支撑的 Provider SFX。
-- 无限嵌套归档、OCR、完美字幕 witness、未来远端 adapter 插件框架。
+- 单 writer、路径安全、归档安全和有界 Provider/audit 是可复用的安全边界。
+- release audit 与 targeted fixture 需要在新的启动门、最终生命周期和 Web 合同下重新验证。
+- 真实运行态仍应保持 fail-closed 暂停，直到当前计划阶段 0–6 通过并由用户明确授权隔离样本。

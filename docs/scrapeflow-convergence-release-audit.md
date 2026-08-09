@@ -2,18 +2,22 @@
 
 日期：2026-08-09
 
-当前 release candidate 位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号由部署时的 `/api/health.build_commit` 和 Git 共同记录，不在本文硬编码。
+> 文档性质：这是 2026-08-09 的历史 release-candidate 审计快照，记录当时 fake 环境、分支与阶段检查的证据。它不证明当前工作树、当前运行时或“用户选择目标货架后启动”主线已经实施完成，也不授权解除暂停。
+>
+> 当前普通入站合同以[用户选择目标货架后启动实施计划](./scrapeflow-target-shelf-start-gate-plan.md)为准：发现来源只登记 `awaiting_target_shelf`，用户选择固定一级货架并通过 `/start` 后才正式执行。
+
+本审计所记录的 release candidate 当时位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号应由当时部署的 `/api/health.build_commit` 和 Git 共同记录，本文不硬编码。
 
 ## T0–T1：基线、WIP 与语义
 
-- 阶段 3 基线固定为 `8f54568`；保护分支为 `codex/wip-convergence-20260809`。
-- 当前 diff 分区及“WIP 不代表验收”声明见 `scrapeflow-convergence-wip-partition.md`。
-- 六项唯一语义决定见 `scrapeflow-convergence-decisions.md`。
+- 阶段 3 基线当时固定为 `8f54568`；保护分支为 `codex/wip-convergence-20260809`。
+- 当时的 diff 分区及“WIP 不代表验收”声明见 `scrapeflow-convergence-wip-partition.md`。
+- 当时的六项收敛语义决定见 `scrapeflow-convergence-decisions.md`；其中旧的“automatic”入站描述已被当前启动门合同取代。
 - 未执行 destructive reset，未触碰真实媒体库或真实 AList 入站数据。
 
-## T2–T5：阶段 4 主链
+## T2–T5：历史阶段 4 主链证据
 
-- automatic 顺序为 `archive_preprocess → identity → planning → writer`；预处理失败不调用 identity/writer。
+- 当时 automatic 顺序为 `archive_preprocess → identity → planning → writer`；预处理失败不调用 identity/writer。该顺序现仅适用于用户选择货架并经 `/start` 启动后的任务。
 - 普通视频、ZIP、7z、RAR、伪装 EXE/BIN/DAT 与字幕 sidecar 进入同一 planner/problem gate/`SimplePlanExecutor`。
 - 成功 automatic source 移到 task-owned processed；失败/密码错误保留 source。
 - golden fixture 在 terminal cleanup 后执行新 intake scan，断言不会重建 job；重启也不会第二次调用 writer。
@@ -23,7 +27,7 @@
 
 - 生产 root 默认：`provider_auto_repair_enabled=false`、`audit_auto_repair_enabled=false`。
 - 显式环境变量 `SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED=1` 和 `SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED=1` 才能分别开放。
-- 普通入站仍受全局 pause 控制；缺少或损坏 `global-control.json` 时 fail-closed 为 paused。
+- 当时普通入站仍受全局 pause 控制；缺少或损坏 `global-control.json` 时 fail-closed 为 paused。当前合同还要求暂停或恢复均不得绕过等待选择状态。
 - disabled lane 不创建 provider/audit timer；Web health 返回当前门禁状态。
 
 ## T7–T8：retry 与 Provider
@@ -53,11 +57,11 @@
 
 ## T12：本地发布门禁证据
 
-- `npm run check`：2026-08-09 共 312 个 Python 测试通过；ESLint、TypeScript、Next.js production build 通过。
-- `git diff --check`：通过。
-- Git 工作树 clean；可回退到 `8f54568` 或任一阶段 checkpoint。
+- `npm run check`：2026-08-09 当时共 312 个 Python 测试通过；ESLint、TypeScript、Next.js production build 通过。
+- `git diff --check`：当时通过。
+- Git 工作树当时 clean；可回退到 `8f54568` 或任一阶段 checkpoint。
 - `local.tests.test_phase4_golden_path`：7 个正例与 9 个负例通过。
 - 全仓搜索无 `provider-gap-claims` 写入路径。
 - 运行时保持 fail-closed pause，并有两条显式 production lane gate。
 
-本审计证明当前本地 fake 环境主链满足计划门禁；它不授权解除真实运行时暂停，也不把当前混合 WIP 当作已经提交的发布版本。
+本历史快照记录了当时本地 fake 环境主链满足当时计划门禁的证据；它不证明当前本地 fake 环境、当前混合 WIP 或新启动门计划已完成，也不授权解除真实运行时暂停。

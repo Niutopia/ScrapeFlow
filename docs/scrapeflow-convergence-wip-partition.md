@@ -1,56 +1,15 @@
-# 当前收敛 WIP 分区记录
+# 历史收敛 WIP 分区记录
 
-日期：2026-08-09
+> 文档性质：2026-08-09 旧收敛主线的分区快照，不是当前阶段划分，也不证明当前 WIP 已通过验收。
 
-## 基线与保护
+旧分区使用阶段 4–7 编号，并把 server、cleanup 与 Web 混在一起；因此不能再用于“目标货架启动门”实施或提交边界。
 
-- 最后一个清晰的阶段 3 基线：`8f54568`（`feat: add bounded archive safety kernel`）。
-- 当前工作树未做 reset 或删除；已建立本地保护分支 `codex/wip-convergence-20260809` 指向该基线。
-- 当前未提交差异另存为 `/tmp/scrapeflow-convergence-wip.patch`。该补丁只是恢复用备份，不代表验收或发布。
-- 运行时继续保持暂停；本记录不触碰真实媒体库或真实 AList 入站数据。
+当前唯一的产品合同、阶段编号和 dirty/untracked 文件归属见[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md#3-当前-wip-清单与阶段边界)。
 
-## 当前文件分区
+本快照仍可作为以下历史证据使用：
 
-### 阶段 4：归档接入
+- 2026-08-09 前的 archive、Provider/retry、audit/subtitle 与 root/child/cleanup 工作曾被分别审查。
+- 当时没有执行 destructive reset，也不应据此恢复、迁移、清理或重跑旧任务。
+- 历史 patch、保护分支与未提交 WIP 都不是发布证明。
 
-- `engine/scrapeflow/archive_preprocessing.py`
-- `local/tests/test_archive_preprocessing.py`
-- `local/scrapeflow_api/simple_engine_runner.py`（普通入站预处理接线及相关测试）
-- `local/tests/test_simple_engine_runner.py`（归档入口测试）
-
-### 阶段 5：Provider/retry
-
-- `local/scrapeflow_api/automatic_replenishment.py`
-- `engine/scrapeflow/provider_capabilities.py`
-- `engine/scrapeflow/replenishment_acquisition.py`
-- `local/tests/test_audit_owned_root.py`（same-gap terminal/fingerprint）
-- `local/tests/test_provider_capabilities.py`
-
-### 阶段 6：audit/subtitle
-
-- `local/scrapeflow_api/simple_library_audit.py`
-- `local/tests/test_automatic_library_gaps.py`
-- `engine/scrapeflow/residual_policy.py`
-- `engine/scrapeflow/subtitle_content.py`
-- `local/scrapeflow_api/subtitle_policy.py`
-- `local/tests/test_subtitle_content.py`
-- `local/tests/test_subtitle_policy_override.py`
-- `local/tests/test_subtitle_sidecar_evidence.py`
-- `local/tests/test_subtitle_writer_validation.py`
-
-### 阶段 7：root/child/cleanup/Web
-
-- `local/simple_server.py`
-- `local/tests/test_recovery_matrix.py`
-- `local/tests/test_root_child_projection.py`
-- `local/tests/test_terminal_cleanup.py`
-- `app/core/api-client.ts`
-- `app/components/task-expansion.tsx`
-- `app/components/task-row.tsx`
-- `app/hooks/use-scrapeflow.ts`
-- `app/hooks/use-dashboard-controller.ts`
-- `app/scrapeflow-app.tsx`
-
-后续提交必须只覆盖一个阶段；当前混合 WIP 未通过完整阶段验收。
-
-阶段 checkpoint 与发布审计见 [scrapeflow-phase-checkpoints.md](scrapeflow-phase-checkpoints.md)。
+当前实施以新计划的阶段 0–6 为准；旧状态治理独立、只读，不能混入功能 checkpoint。

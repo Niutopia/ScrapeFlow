@@ -1,5 +1,9 @@
 # ScrapeFlow 阶段 3：轻量归档安全内核
 
+> 文档性质：2026-08-08 的历史归档内核说明，不是当前目标货架启动门的阶段 3，也不证明当前 WIP 已完成。
+>
+> 当前阶段定义见[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md)。
+
 本阶段把归档处理收敛为 `engine/scrapeflow/archive.py` 的两个边界：
 `ArchiveInspector` 负责有界魔数、分卷、密码候选、7-Zip `-slt` listing、成员路径和展开预算；
 `ArchiveExtractor` 只把已选择的视频/字幕写入任务自有 staging，并回读路径、大小、链接状态，最后做视频

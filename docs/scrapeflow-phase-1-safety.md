@@ -1,5 +1,9 @@
 # ScrapeFlow 阶段 1 主链安全收敛
 
+> 文档性质：2026-08-08 的历史安全收敛快照，不是当前目标货架启动门的阶段 1，也不证明当前 WIP 已完成。
+>
+> 当前阶段定义见[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md)。
+
 > 记录时间：2026-08-08
 >
 > 前置 checkpoint：`143506b chore: checkpoint single-user migration baseline`
