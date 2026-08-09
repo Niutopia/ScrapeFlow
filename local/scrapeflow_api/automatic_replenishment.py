@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import posixpath
 import re
@@ -21,6 +22,10 @@ from engine.scrapeflow.provider_capabilities import candidate_capability_error
 from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+)
+from engine.scrapeflow.subtitle_content import (
+    DEFAULT_MAX_PREFIX_BYTES,
+    classify_subtitle_content,
 )
 
 from .replenishment import (
@@ -97,11 +102,21 @@ class AutomaticMaterializer(Protocol):
 class LocalTorrentAutomaticMaterializer:
     """Use the bundled Torrent downloader with a task-owned staging root."""
 
-    def __init__(self, delegate: object | None = None) -> None:
+    def __init__(
+        self,
+        delegate: object | None = None,
+        *,
+        archive_preprocessor: object | None = None,
+    ) -> None:
         if delegate is None:
             from engine.tools.replenishment_adapter.materialize import LocalTorrentMaterializer
             delegate = LocalTorrentMaterializer()
         self.delegate = delegate
+        # Optional shared ingress adapter.  It receives only a completed
+        # task-owned delivery and can replace an explicitly marked archive/SFX
+        # row with extracted media in the same staging tree; it never writes a
+        # formal-library target.
+        self.archive_preprocessor = archive_preprocessor
 
     def acquire(
         self,
@@ -134,7 +149,26 @@ class LocalTorrentAutomaticMaterializer:
         result = method(wrapper, workspace, automatic=True, client=alist)
         if not isinstance(result, Mapping):
             raise AutomaticReplenishmentError("Torrent materializer 返回无效")
-        return dict(result)
+        delivery = dict(result)
+        preprocessor = self.archive_preprocessor
+        preprocess = getattr(preprocessor, "prepare_provider_delivery", None)
+        if not callable(preprocess):
+            return delivery
+        try:
+            prepared = preprocess(
+                delivery,
+                request=dict(request),
+                staging_root=staging_root,
+                workspace=workspace,
+                alist=alist,
+            )
+        except TypeError:
+            # Retain a tiny positional compatibility shape for a focused test
+            # double; production uses the keyword-only shared adapter.
+            prepared = preprocess(delivery)
+        if not isinstance(prepared, Mapping):
+            raise AutomaticReplenishmentError("归档预处理返回无效 delivery")
+        return dict(prepared)
 
 
 def _now() -> str:
@@ -881,6 +915,102 @@ class AutomaticReplenishmentRuntime:
         unique = sorted(set(candidates))
         return unique[0] if len(unique) == 1 else None
 
+    @staticmethod
+    def _installer_accepts_subtitle_language(installer: object) -> bool:
+        """Return whether a writer exposes the current language contract.
+
+        A few pre-convergence test/extension doubles still implement the old
+        ``install_subtitle_sidecar(source, target, expected_size, video_path)``
+        shape.  They cannot receive the validation contract and are retained
+        only as a compatibility lane when no bounded AList reader is present.
+        A writer that accepts the new keyword (or arbitrary keywords) is
+        treated as a current writer and must not bypass content validation.
+        """
+        try:
+            parameters = inspect.signature(installer).parameters
+        except (TypeError, ValueError):
+            # An opaque callable is not safe to classify as a legacy double.
+            return True
+        if "subtitle_language" in parameters:
+            return True
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _validate_subtitle_source_content(
+        self,
+        source: str,
+        required_language: object,
+        *,
+        installer: object,
+    ) -> Mapping[str, object] | None:
+        """Require bounded, positive subtitle content before a formal move.
+
+        The production ``SimplePlanExecutor`` exposes the same validator and
+        reads through its AList client.  We prefer that shared validator when
+        available; otherwise this coordinator uses the AList bounded-prefix
+        port directly.  A missing reader is fail-closed for current writers,
+        while an old writer double (which cannot accept ``subtitle_language``)
+        remains callable in focused legacy tests only.
+        """
+        language = str(required_language or "zh")
+        validator = getattr(self.engine_runner, "validate_subtitle_source_content", None)
+        reader = getattr(self.alist, "read_file_prefix", None)
+        if not callable(reader):
+            reader = getattr(self.alist, "read_file_bytes", None)
+
+        verdict: Mapping[str, object] | None = None
+        if callable(reader):
+            try:
+                try:
+                    prefix = reader(source, max_bytes=DEFAULT_MAX_PREFIX_BYTES)
+                except TypeError:
+                    prefix = reader(source, DEFAULT_MAX_PREFIX_BYTES)
+            except Exception as exc:
+                raise AutomaticReplenishmentError(
+                    "字幕内容读取失败，已拒绝正式写入"
+                ) from exc
+            result = classify_subtitle_content(
+                prefix, language, max_bytes=DEFAULT_MAX_PREFIX_BYTES,
+            )
+            if isinstance(result, Mapping):
+                verdict = result
+        elif callable(validator) and self._installer_accepts_subtitle_language(installer):
+            # A custom runner may own a different bounded reader (for example
+            # a local staging port), so use its shared validator when the
+            # coordinator's AList object has no read method.
+            try:
+                try:
+                    result = validator(source, language)
+                except TypeError:
+                    result = validator(
+                        source_path=source, required_language=language,
+                    )
+            except Exception as exc:
+                raise AutomaticReplenishmentError(
+                    "字幕内容校验失败，已拒绝正式写入"
+                ) from exc
+            if isinstance(result, Mapping):
+                verdict = result
+        elif not self._installer_accepts_subtitle_language(installer):
+            # Legacy doubles are intentionally kept out of production: they
+            # lack the language keyword and are used only where no reader is
+            # available.  The default writer below still enforces validation.
+            return None
+
+        if verdict is None:
+            verdict = {
+                "status": "unknown",
+                "reason": "subtitle_content_reader_unavailable",
+            }
+        if str(verdict.get("status") or "").casefold() != "satisfied":
+            reason = str(verdict.get("reason") or "subtitle_content_unknown")
+            raise AutomaticReplenishmentError(
+                f"字幕内容未通过语言校验: {reason}"
+            )
+        return dict(verdict)
+
     def _install_companion_subtitles(
         self,
         *,
@@ -922,13 +1052,28 @@ class AutomaticReplenishmentRuntime:
             self._raise_if_cancelled(
                 job, round_number=round_number, boundary="subtitle_write",
             )
+            self._validate_subtitle_source_content(
+                source, language, installer=installer,
+            )
             self._progress(
                 job, "subtitle_installing", gap_id=str(spec.get("gap_id") or ""),
                 target=target, companion=True,
             )
-            result = installer(
-                source, target, expected_size=size, video_path=video_target,
-            )
+            try:
+                result = installer(
+                    source, target, expected_size=size, video_path=video_target,
+                    subtitle_language=str(language),
+                )
+            except TypeError as exc:
+                # Focused legacy test executors may not expose the optional
+                # language keyword.  Production runner/executor does; only
+                # retry when the signature, rather than the write itself,
+                # rejected that keyword.
+                if "subtitle_language" not in str(exc):
+                    raise
+                result = installer(
+                    source, target, expected_size=size, video_path=video_target,
+                )
             if not isinstance(result, Mapping) or int(result.get("size") or 0) != size:
                 raise AutomaticReplenishmentError("伴随字幕正式库回读大小不匹配")
             installed.append({
@@ -1036,7 +1181,19 @@ class AutomaticReplenishmentRuntime:
     @staticmethod
     def _subtitle_marker(value: object) -> str:
         text = str(value or "zh").casefold()
-        if any(token in text for token in ("zh", "中文", "简中", "簡中", "chinese")):
+        # Keep regional Chinese lanes distinct in the final sidecar name.
+        # Generic ``zh`` retains the existing compact suffix; an explicit
+        # Traditional/Hant request must never be rewritten as a Simplified
+        # ``.zh`` file that a later audit could mistake for the target lane.
+        if any(token in text for token in (
+            "hant", "zh-tw", "zh_tw", "zhtw", "cht", "繁中", "繁體", "繁体",
+        )):
+            return "zh-tw"
+        if any(token in text for token in (
+            "hans", "zh-cn", "zh_cn", "zhcn", "chs", "简中", "简體", "简体",
+        )):
+            return "zh-cn"
+        if text.strip() in {"zh", "zho", "chi", "cmn", "中文", "chinese"}:
             return "zh"
         if any(token in text for token in ("en", "英文", "英语", "english")):
             return "en"
@@ -1128,7 +1285,19 @@ class AutomaticReplenishmentRuntime:
             )
             target = f"{posixpath.splitext(video_path)[0]}.{self._subtitle_marker(gap.get('subtitle_language'))}{suffix}"
             self._progress(job, "subtitle_installing", gap_id=str(gap_id), target=target)
-            result = installer(source, target, expected_size=size, video_path=video_path)
+            language = gap.get("subtitle_language") or "zh"
+            self._validate_subtitle_source_content(
+                source, language, installer=installer,
+            )
+            try:
+                result = installer(
+                    source, target, expected_size=size, video_path=video_path,
+                    subtitle_language=str(language),
+                )
+            except TypeError as exc:
+                if "subtitle_language" not in str(exc):
+                    raise
+                result = installer(source, target, expected_size=size, video_path=video_path)
             if not isinstance(result, Mapping) or int(result.get("size") or 0) != size:
                 raise AutomaticReplenishmentError("字幕正式库回读大小不匹配")
             installed_ids.add(gap_id)

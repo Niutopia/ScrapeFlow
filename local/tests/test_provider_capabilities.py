@@ -18,6 +18,7 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
 )
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
+from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 
 
 def _torrent_candidate() -> dict[str, object]:
@@ -54,21 +55,22 @@ def _cloud_share_candidate() -> dict[str, object]:
 
 
 class ProviderCapabilityTests(unittest.TestCase):
-    def test_cloud_share_http_has_no_acquisition_lane_or_injected_fallback(self) -> None:
+    def test_provider_sfx_is_explicitly_deferred_without_real_archive_delivery(self) -> None:
+        snapshot = provider_capability_snapshot()
+        self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
+
+    def test_cloud_share_has_no_acquisition_lane_or_injected_fallback(self) -> None:
         cloud = _cloud_share_candidate()
         with self.assertRaises(AcquisitionRouteError):
             acquisition_lane(cloud)
 
-        http = Mock(return_value={"status": "ready"})
         torrent = Mock(return_value={"status": "ready"})
         with self.assertRaises(AcquisitionRouteError):
             acquire_selection(
                 cloud,
                 "/task/staging",
-                acquire_http=http,
                 acquire_torrent=torrent,
             )
-        http.assert_not_called()
         torrent.assert_not_called()
 
     def test_magnet_torrent_routes_to_the_only_executor(self) -> None:
@@ -177,6 +179,31 @@ class ProviderCapabilityTests(unittest.TestCase):
             )
         self.assertEqual(result, {"status": "ready"})
         delegate.acquire.assert_called_once()
+
+    def test_local_automatic_materializer_calls_shared_archive_preprocessor(self) -> None:
+        delegate = Mock()
+        delegate.acquire.return_value = {"status": "ready", "files": []}
+        archive_adapter = Mock()
+        archive_adapter.prepare_provider_delivery.return_value = {
+            "status": "ready", "files": [], "archive_preprocessed": True,
+        }
+        materializer = LocalTorrentAutomaticMaterializer(
+            delegate=delegate,
+            archive_preprocessor=archive_adapter,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = materializer.acquire(
+                {"media": {"tmdb_id": 1}},
+                [_torrent_candidate()],
+                staging_root="/library/ScrapeFlow/补源/job/attempt",
+                workspace=Path(directory),
+                alist=object(),
+            )
+        self.assertTrue(result["archive_preprocessed"])
+        archive_adapter.prepare_provider_delivery.assert_called_once()
+        kwargs = archive_adapter.prepare_provider_delivery.call_args.kwargs
+        self.assertEqual(kwargs["staging_root"], "/library/ScrapeFlow/补源/job/attempt")
+        self.assertNotIn("formal_target", kwargs)
 
 
 if __name__ == "__main__":

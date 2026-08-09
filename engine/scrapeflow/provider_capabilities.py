@@ -35,6 +35,9 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
             "status": "ready",
             "acquisition_kinds": [EXECUTABLE_ACQUISITION_KIND],
             "materializer": "LocalTorrentMaterializer",
+            # The current real materializer returns media-only deliveries;
+            # no production archive_source fixture has proved provider SFX.
+            "sfx": {"status": "deferred", "reason": "no_real_archive_source_materializer_input"},
         },
         "cloud_share": {
             "status": "unavailable",

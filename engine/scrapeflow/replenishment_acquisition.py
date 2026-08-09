@@ -35,12 +35,6 @@ class DeliveryError(AcquisitionRouteError):
     reusable_candidate = True
 
 
-class HttpAcquirePort(Protocol):
-    def __call__(
-        self, selection: Mapping[str, Any], destination: str,
-    ) -> Mapping[str, Any]: ...
-
-
 class ArrivalVerifierPort(Protocol):
     def __call__(
         self, destination: str, expected_files: Sequence[Mapping[str, Any]],
@@ -65,7 +59,6 @@ def acquire_selection(
     selection: Mapping[str, Any],
     destination: str,
     *,
-    acquire_http: HttpAcquirePort | None = None,
     verify_arrival: ArrivalVerifierPort | None = None,
     acquire_torrent: Callable[[Mapping[str, Any], str], Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -75,9 +68,6 @@ def acquire_selection(
     selects the compatible injected lane, normalizes its ready result, and
     verifies the arrival when a verifier is supplied.
     """
-    # Keep the optional HTTP argument for a future materializer integration,
-    # but do not let its presence alter today's fail-closed capability.
-    del acquire_http
     lane = acquisition_lane(selection)
     handler = acquire_torrent
     try:
