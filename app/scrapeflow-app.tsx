@@ -67,7 +67,11 @@ export function ScrapeFlowApp() {
                 const detailJob = expanded && current?.id === job.id ? current : job;
                 return <div className={`taskdesk-job ${expanded ? "expanded" : ""}`} key={job.id} data-job-id={job.id}>
                   <TaskRow job={job} selected={expanded} expanded={expanded} pending={flow.pending} onToggle={() => void toggleTaskPanel(job)} onRetry={() => void flow.retry(job)} />
-                  {expanded ? <TaskExpansion job={detailJob} pending={flow.pending} onClose={() => setExpandedId(null)} onRetry={() => flow.retry(detailJob)} onCancel={() => flow.cancel(detailJob)} /> : null}
+                  {expanded ? <TaskExpansion job={detailJob} pending={flow.pending} onClose={() => setExpandedId(null)} onRetry={(correction) => flow.retry(detailJob, correction)} onCancel={() => flow.cancel(detailJob)} onCleanup={async () => {
+                    const removed = await flow.cleanup(detailJob);
+                    if (removed) setExpandedId(null);
+                    return removed;
+                  }} /> : null}
                 </div>;
               })}
               {!visibleJobs.length ? <div className="taskdesk-empty"><i>✓</i><b>这个列表暂时为空</b><span>待刮削监听发现来源后会自动加入任务队列。</span></div> : null}

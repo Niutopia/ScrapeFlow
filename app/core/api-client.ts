@@ -15,6 +15,13 @@ export class ApiRequestError extends Error {
   }
 }
 
+export type RetryCorrection = {
+  tmdb_id?: number;
+  media_type?: "movie" | "tv" | "collection";
+  season?: number;
+  archive_password?: string;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_ROOT}${path}`, {
     ...init,
@@ -44,8 +51,13 @@ export const scrapeFlowApi = {
   /** Submitting a path starts the automatic identity-to-cleanup workflow. */
   create: (path: string) => post<{ job: Job }>("/jobs", { path }),
   /** This only asks the scheduler to retry now; it does not release a plan. */
-  retry: (id: string) => post<{ job: Job }>(`/jobs/${id}/retry`, {}),
+  retry: (id: string, correction: RetryCorrection = {}) => post<{ job: Job }>(`/jobs/${id}/retry`, correction),
   cancel: (id: string) => post<{ job: Job }>(`/jobs/${id}/cancel`, {}),
+  /** Terminal-only local record cleanup; it never deletes the media library. */
+  cleanup: (id: string) => post<{ cleanup: { job_id: string; removed: boolean } }>(
+    `/jobs/${id}/cleanup`,
+    {},
+  ),
   pause: (reason?: string) => post<GlobalControl>("/control/pause", reason ? { reason } : {}),
   resume: () => post<GlobalControl>("/control/resume", {}),
   /** A read-only structural scan of the three formal media roots. */

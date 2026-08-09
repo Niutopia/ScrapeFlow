@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { ApiRequestError, scrapeFlowApi } from "../core/api-client";
+import type { RetryCorrection } from "../core/api-client";
 import type {
   BrowseResult, GlobalControl, Health, Job, LibraryAudit,
 } from "../core/contracts";
@@ -238,11 +239,11 @@ export function useScrapeFlow() {
     }
   };
 
-  const retry = async (job: Job) => {
+  const retry = async (job: Job, correction: RetryCorrection = {}) => {
     setPending(true);
     setOperationError("");
     try {
-      const response = await scrapeFlowApi.retry(job.id);
+      const response = await scrapeFlowApi.retry(job.id, correction);
       mergeJob(response.job);
       return true;
     } catch (cause) {
@@ -268,13 +269,31 @@ export function useScrapeFlow() {
     }
   };
 
+  const cleanup = async (job: Job) => {
+    setPending(true);
+    setOperationError("");
+    try {
+      const response = await scrapeFlowApi.cleanup(job.id);
+      if (response.cleanup.removed) {
+        setJobs(previous => previous.filter(item => item.id !== job.id));
+        setSelected(previous => previous?.id === job.id ? null : previous);
+      }
+      return response.cleanup.removed;
+    } catch (cause) {
+      setOperationError(errorMessage(cause, "无法安全清理任务记录"));
+      return false;
+    } finally {
+      setPending(false);
+    }
+  };
+
   const error = operationError || queueError;
   const errorSource = operationError ? "operation" as const : queueError ? "queue" as const : null;
 
   return {
     health, healthError, jobs, selected, initializing, pending, error, errorSource, createConflict,
     browser, browserPending, refreshHealth, refreshJobs, loadJob,
-    createJob, browse, retry, cancel,
+    createJob, browse, retry, cancel, cleanup,
     control, controlError, refreshControl, setGlobalPause,
     libraryAudit, auditPending, auditError, refreshLibraryAudit, runLibraryAudit,
     dismissError: () => setOperationError(""),

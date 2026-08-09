@@ -1,6 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import type { Job } from "../core/contracts";
+import type { RetryCorrection } from "../core/api-client";
 import { ACTIVE_PHASES, PHASE, formatDate, isFailed } from "../core/job-state";
 
 function providerLabel(provider?: string) {
@@ -27,24 +29,31 @@ function phaseCopy(job: Job) {
   return "自动尝试已经结束。请查看错误，处理原因后主动重试。";
 }
 
-export function TaskExpansion({ job, pending, onClose, onRetry, onCancel }: {
+export function TaskExpansion({ job, pending, onClose, onRetry, onCancel, onCleanup }: {
   job: Job;
   pending: boolean;
   onClose: () => void;
-  onRetry: () => Promise<boolean>;
+  onRetry: (correction?: RetryCorrection) => Promise<boolean>;
   onCancel: () => Promise<boolean>;
+  onCleanup: () => Promise<boolean>;
 }) {
   if (ACTIVE_PHASES.has(job.phase)) {
     return <LiveTaskPanel job={job} pending={pending} onClose={onClose} onCancel={onCancel} />;
   }
   if (isFailed(job)) {
-    return <AutomaticFailurePanel job={job} pending={pending} onClose={onClose} onRetry={onRetry} />;
+    return <AutomaticFailurePanel job={job} pending={pending} onClose={onClose} onRetry={onRetry} onCleanup={onCleanup} />;
   }
-  if (job.phase !== "completed") return null;
-  return <TaskSuccessPanel job={job} onClose={onClose} />;
+  if (job.phase === "completed") return <TaskSuccessPanel job={job} pending={pending} onClose={onClose} onCleanup={onCleanup} />;
+  if (job.phase === "cancelled") return <CancelledTaskPanel job={job} pending={pending} onClose={onClose} onCleanup={onCleanup} />;
+  return null;
 }
 
-function TaskSuccessPanel({ job, onClose }: { job: Job; onClose: () => void }) {
+function TaskSuccessPanel({ job, pending, onClose, onCleanup }: {
+  job: Job;
+  pending: boolean;
+  onClose: () => void;
+  onCleanup: () => Promise<boolean>;
+}) {
   const title = job.plan?.title || job.identity?.title || job.source.split("/").at(-1) || job.source;
   const count = job.plan?.file_count ?? 0;
   const cleanupCount = job.plan?.cleanup_file_count ?? 0;
@@ -62,11 +71,24 @@ function TaskSuccessPanel({ job, onClose }: { job: Job; onClose: () => void }) {
       <div><dt>目标目录</dt><dd>{job.plan?.target_root || job.parent}</dd></div>
       {cleanupCount ? <div><dt>已自动清理</dt><dd>{cleanupCount}</dd></div> : <div><dt>完成时间</dt><dd>{formatDate(job.updated_at)}</dd></div>}
     </dl>
-    <button onClick={onClose}>收起</button>
+    <div className="replenishment-failure-actions"><button onClick={onClose}>收起</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button></div>
     {(resourceGaps.length || selectedReleases.length) ? <ul className="taskdesk-success-gaps">
       {selectedReleases.map((selection, index) => selection.release_name ? <li key={`${selection.release_name}-${index}`}><b>自动补源候选 {index + 1}</b><span>{selection.release_name}{selection.selected_gap_ids?.length ? ` · 覆盖 ${selection.selected_gap_ids.join("、")}` : ""}</span></li> : null)}
       {resourceGaps.map((gap, index) => <li key={`${gap.kind || "gap"}-${gap.label || index}`}><b>{gap.label || gap.kind || "资源缺口"}</b><span>{gap.reason || "等待下次媒体库审计"}</span></li>)}
     </ul> : null}
+  </section>;
+}
+
+function CancelledTaskPanel({ job, pending, onClose, onCleanup }: {
+  job: Job;
+  pending: boolean;
+  onClose: () => void;
+  onCleanup: () => Promise<boolean>;
+}) {
+  const title = job.plan?.title || job.identity?.title || job.source.split("/").at(-1) || job.source;
+  return <section className="replenishment-failure-panel" aria-label={`${title}已停止任务`}>
+    <header><div><span>TERMINAL TASK</span><h3>{title}</h3><p>任务已停止。清理只会移除这项任务拥有的本地状态和 staging，不会删除正式媒体库。</p></div><div className="replenishment-failure-actions"><button onClick={onClose}>收起</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button></div></header>
+    <footer><p>来源目录：{job.source}</p><small>最后更新 {formatDate(job.updated_at)}</small></footer>
   </section>;
 }
 
@@ -140,13 +162,37 @@ function LiveTaskPanel({ job, pending, onClose, onCancel }: { job: Job; pending:
   </section>;
 }
 
-function AutomaticFailurePanel({ job, pending, onClose, onRetry }: { job: Job; pending: boolean; onClose: () => void; onRetry: () => Promise<boolean> }) {
+function AutomaticFailurePanel({ job, pending, onClose, onRetry, onCleanup }: {
+  job: Job;
+  pending: boolean;
+  onClose: () => void;
+  onRetry: (correction?: RetryCorrection) => Promise<boolean>;
+  onCleanup: () => Promise<boolean>;
+}) {
   const title = job.plan?.title || job.identity?.title || job.source.split("/").at(-1) || job.source;
   const replenishment = job.plan?.replenishment;
   const selections = replenishment?.selections
     ?? (replenishment?.selection ? [replenishment.selection] : []);
+  const [tmdbId, setTmdbId] = useState("");
+  const [mediaType, setMediaType] = useState<RetryCorrection["media_type"]>("movie");
+  const [season, setSeason] = useState("");
+  const [archivePassword, setArchivePassword] = useState("");
+  const needsIdentityCorrection = job.phase === "failed_identity";
+  const submitRetry = () => {
+    const correction: RetryCorrection = {};
+    if (tmdbId.trim()) correction.tmdb_id = Number(tmdbId);
+    if (needsIdentityCorrection) {
+      correction.media_type = mediaType;
+      if (season.trim()) correction.season = Number(season);
+    }
+    if (archivePassword) correction.archive_password = archivePassword;
+    setArchivePassword("");
+    void onRetry(correction);
+  };
   return <section className="replenishment-failure-panel" aria-label={`${title}自动失败详情`}>
-    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{phaseCopy(job)}</p></div><div className="replenishment-failure-actions"><button className="primary" disabled={pending} onClick={() => void onRetry()}>{pending ? "正在请求…" : "立即重试"}</button><button onClick={onClose}>收起</button></div></header>
+    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{phaseCopy(job)}</p></div><div className="replenishment-failure-actions"><button className="primary" disabled={pending} onClick={submitRetry}>{pending ? "正在请求…" : "立即重试"}</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button><button onClick={onClose}>收起</button></div></header>
+    {needsIdentityCorrection ? <fieldset className="identity-correction"><legend>人工修正身份</legend><label>TMDB ID<input inputMode="numeric" value={tmdbId} onChange={event => setTmdbId(event.target.value)} /></label><label>媒体类型<select value={mediaType} onChange={event => setMediaType(event.target.value as RetryCorrection["media_type"])}><option value="movie">电影</option><option value="tv">剧集</option><option value="collection">合集</option></select></label><label>季（可选）<input inputMode="numeric" value={season} onChange={event => setSeason(event.target.value)} /></label></fieldset> : null}
+    <label className="identity-correction">归档密码（一次性，可选）<input type="password" autoComplete="off" value={archivePassword} onChange={event => setArchivePassword(event.target.value)} /></label>
     <dl>
       <div><dt>失败阶段</dt><dd>{PHASE[job.phase]?.label || job.phase}</dd></div>
       <div><dt>自动尝试</dt><dd>{attemptCount(job)} 次</dd></div>

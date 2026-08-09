@@ -56,7 +56,7 @@ export function useDashboardController() {
   };
 
   const toggleTaskPanel = async (job: Job) => {
-    const expandable = ACTIVE_PHASES.has(job.phase) || isFailed(job) || job.phase === "completed";
+    const expandable = ACTIVE_PHASES.has(job.phase) || isFailed(job) || job.phase === "completed" || job.phase === "cancelled";
     if (!expandable) return;
     const row = document.querySelector<HTMLElement>(`[data-job-id="${job.id}"]`);
     const previousTop = row?.getBoundingClientRect().top;
