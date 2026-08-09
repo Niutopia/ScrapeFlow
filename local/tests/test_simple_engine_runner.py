@@ -8,6 +8,7 @@ import posixpath
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -54,6 +55,7 @@ FAKE_VIDEO_SIZE = len(FAKE_VIDEO_BYTES)
 class FakeAList:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
+        self.directories: set[str] = set()
         self.moves: list[tuple[str, str, list[str]]] = []
         self.renames: list[tuple[str, str]] = []
         self.uploads: list[str] = []
@@ -61,6 +63,36 @@ class FakeAList:
     def exact_file_info(self, path: str) -> dict[str, object] | None:
         value = self.files.get(path)
         return None if value is None else {"size": len(value)}
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        normalized = path.rstrip("/") or "/"
+        prefix = normalized.rstrip("/") + "/"
+        directory_paths = set(self.directories)
+        for full_path in self.files:
+            parts = full_path.strip("/").split("/")[:-1]
+            current = ""
+            for part in parts:
+                current += "/" + part
+                directory_paths.add(current)
+        rows: dict[str, dict[str, object]] = {}
+        for directory in directory_paths:
+            if not directory.startswith(prefix):
+                continue
+            remainder = directory[len(prefix):]
+            if remainder and "/" not in remainder:
+                rows[remainder] = {"name": remainder, "is_dir": True}
+        for full_path, value in self.files.items():
+            if not full_path.startswith(prefix):
+                continue
+            remainder = full_path[len(prefix):]
+            if remainder and "/" not in remainder:
+                rows[remainder] = {
+                    "name": remainder,
+                    "is_dir": False,
+                    "size": len(value),
+                }
+        return [rows[name] for name in sorted(rows)]
 
     def read_file_prefix(self, path: str, *, max_bytes: int) -> bytes:
         value = self.files.get(path)
@@ -231,17 +263,23 @@ class DelayedFinalRenameVisibilityAList(FakeAList):
 
 
 def fake_plan(_request: EngineRequest, _alist: object, _tmdb: object) -> Plan:
+    selected_parent = _request.parent_path
+    target_root = (
+        f"{selected_parent.rstrip('/')}/Movie (2020)"
+        if _request.target_shelf is not None
+        else "/library/Movie (2020)"
+    )
     return Plan(
         mode="movie",
         source_root="/incoming/movie",
-        target_root="/library/Movie (2020)",
+        target_root=target_root,
         files=[
             PlannedFile(
                 source_path="/incoming/movie/source.mkv",
                 source_dir="/incoming/movie",
                 original_name="source.mkv",
                 final_name="Movie (2020).mkv",
-                target_dir="/library/Movie (2020)",
+                target_dir=target_root,
                 media_kind="video",
                 source_size=FAKE_VIDEO_SIZE,
             )
@@ -434,7 +472,11 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             confidence=0.99, decision_trace={},
         )
         with patch("engine.scraper.auto_match_tmdb", side_effect=lambda *args, **kwargs: events.append("resolve_identity") or (match, [])):
-            job = runner.plan_automatic("/incoming/archive", job_id="auto-archive-order")
+            job = runner.plan_automatic(
+                "/incoming/archive",
+                job_id="auto-archive-order",
+                target_shelf="movie",
+            )
         self.assertEqual(events, ["archive_preprocess", "resolve_identity"])
         self.assertEqual(job.request["source_path"], "/task-staging/archive")
         self.assertEqual(job.summary["ingress_source_path"], "/incoming/archive")
@@ -448,7 +490,9 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             validate=False, executor=lambda _plan: events.append("writer") or {"ok": True},
             archive_preprocessor=OrderedArchivePreprocessor(events, fail=True),
         )
-        queued = runner.create_automatic_job("/incoming/archive", job_id="auto-archive-fail")
+        self.alist.directories.add("/incoming/archive")
+        waiting = runner.create_automatic_job("/incoming/archive", job_id="auto-archive-fail")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         with self.assertRaises(RuntimeError):
             runner.plan_automatic_job(queued.id)
         self.assertEqual(events, ["archive_preprocess"])
@@ -478,6 +522,26 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         consumed = runner._consume_archive_source(prepared)  # noqa: SLF001 - lifecycle boundary
         self.assertEqual(consumed["status"], "moved_to_processed")
         self.assertTrue(str(consumed["target"]).startswith("/library/ScrapeFlow/归档/archive-consume/processed/"))
+
+    def test_successful_normal_video_uses_the_same_archive_processed_lane(self) -> None:
+        alist = ArchiveLifecycleAList()
+        alist.directories.add("/incoming/normal")
+        runner = SimpleEngineRunner(
+            self.root, alist=alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=lambda _plan: {"ok": True}, library_root="/library",
+        )
+        job = runner.create_automatic_job("/incoming/normal", job_id="normal-consume")
+        prepared = replace(
+            job,
+            phase="executed",
+            summary={**job.summary, "automatic": True, "ingress_source_path": "/incoming/normal"},
+        )
+        atomic_write_json(runner._job_path(job.id), prepared.as_dict(), allow_nan=False)
+
+        consumed = runner._consume_archive_source(prepared)  # noqa: SLF001 - lifecycle boundary
+
+        self.assertEqual(consumed["status"], "moved_to_processed")
+        self.assertTrue(str(consumed["target"]).startswith("/library/ScrapeFlow/归档/normal-consume/processed/"))
 
     def test_runner_finalizes_an_injected_plan_before_persisting(self) -> None:
         plan = fake_plan(self.request, self.alist, object())
@@ -1455,6 +1519,191 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         cancelled = restarted.cancel_job(next_job.id)
         self.assertEqual(cancelled.phase, "cancelled")
 
+    def test_processing_cancel_waits_for_current_executor_boundary(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[object] = []
+
+        def blocking_executor(plan: object) -> dict[str, object]:
+            calls.append(plan)
+            started.set()
+            self.assertTrue(release.wait(timeout=3))
+            return {"ok": True}
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=blocking_executor,
+        )
+        job = runner.plan_job(self.request, job_id="engine-processing-cancel")
+        result: list[object] = []
+
+        def run() -> None:
+            result.append(runner.execute_job(job.id))
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started.wait(timeout=3))
+        requested = runner.cancel_job(job.id, reason="safe stop")
+        self.assertEqual(requested.phase, "executing")
+        release.set()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(runner.get_job(job.id).phase, "cancelled")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(runner._cancel_request_path(job.id).exists())  # noqa: SLF001
+
+    def test_planning_cancel_stops_after_archive_preprocessor_boundary(self) -> None:
+        self.alist.directories.add("/incoming/archive")
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_preprocessor(request, *, job_id=None, retry_password=None):
+            del job_id, retry_password
+            started.set()
+            self.assertTrue(release.wait(timeout=3))
+            return request, None
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            archive_preprocessor=object(),
+        )
+        waiting = runner.create_automatic_job("/incoming/archive", job_id="engine-planning-cancel")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+        result: list[object] = []
+
+        with patch.object(
+            runner,
+            "_preprocess_ordinary_request_details",
+            side_effect=blocking_preprocessor,
+        ):
+            worker = threading.Thread(
+                target=lambda: result.append(runner.plan_automatic_job(queued.id))
+            )
+            worker.start()
+            self.assertTrue(started.wait(timeout=3))
+            requested = runner.cancel_job(queued.id, reason="stop planning")
+            self.assertEqual(requested.phase, "archive_preprocessing")
+            release.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(runner.get_job(queued.id).phase, "cancelled")
+        self.assertEqual(getattr(result[0], "phase", None), "cancelled")
+
+    def test_queued_cancel_is_not_blocked_by_another_job_worker_lock(self) -> None:
+        self.alist.directories.add("/incoming/queued")
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+        )
+        waiting = runner.create_pending_job("/incoming/queued", job_id="engine-queued-cancel")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_other_job_lock() -> None:
+            with runner.worker_lock():
+                entered.set()
+                release.wait(timeout=3)
+
+        holder = threading.Thread(target=hold_other_job_lock)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=3))
+        cancelled = runner.cancel_job(queued.id, reason="cancel while another job runs")
+        self.assertEqual(cancelled.phase, "queued")
+        self.assertTrue(runner._cancel_request_path(queued.id).exists())  # noqa: SLF001
+        release.set()
+        holder.join(timeout=3)
+
+        self.assertFalse(holder.is_alive())
+        cancelled = runner.cancel_job(queued.id, reason="cancel while another job runs")
+        self.assertEqual(cancelled.phase, "cancelled")
+        self.assertEqual(runner.get_job(queued.id).phase, "cancelled")
+        self.assertEqual(self.alist.moves, [])
+
+    def test_restart_consumes_a_durable_processing_cancel_request(self) -> None:
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"ok": True},
+        )
+        job = runner.plan_job(self.request, job_id="engine-restart-cancel")
+        active_summary = runner._with_active_operation(job.summary, kind="formal_write")  # noqa: SLF001
+        active = replace(job, phase="executing", summary=active_summary)
+        atomic_write_json(runner._job_path(job.id), active.as_dict(), allow_nan=False)  # noqa: SLF001
+        atomic_write_json(
+            runner._cancel_request_path(job.id),  # noqa: SLF001
+            {
+                "operation_id": active_summary["active_operation"]["id"],
+                "requested_at": "2026-08-09T00:00:00Z",
+                "reason": "restart stop",
+            },
+            allow_nan=False,
+        )
+
+        restarted = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"unexpected": True},
+        )
+        recovered = restarted.get_job(job.id)
+        self.assertEqual(recovered.phase, "cancelled")
+        self.assertTrue(recovered.summary["cancellation"]["recovered_after_restart"])
+        self.assertFalse(restarted._cancel_request_path(job.id).exists())  # noqa: SLF001
+
+    def test_restart_cancel_marks_an_interrupted_cleanup_as_cancelled(self) -> None:
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+        )
+        job = runner.plan_job(self.request, job_id="engine-cleanup-restart-cancel")
+        active_summary = runner._with_active_operation(job.summary, kind="final_cleanup")  # noqa: SLF001
+        active_summary["lifecycle"] = {
+            "cleanup": {"status": "running"},
+        }
+        active = replace(job, phase="cleaning", summary=active_summary)
+        atomic_write_json(runner._job_path(job.id), active.as_dict(), allow_nan=False)  # noqa: SLF001
+        atomic_write_json(
+            runner._cancel_request_path(job.id),  # noqa: SLF001
+            {
+                "operation_id": active_summary["active_operation"]["id"],
+                "requested_at": "2026-08-09T00:00:00Z",
+                "reason": "stop cleanup",
+            },
+            allow_nan=False,
+        )
+
+        restarted = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+        )
+        cancelled = restarted.get_job(job.id)
+        self.assertEqual(cancelled.phase, "cancelled")
+        self.assertEqual(cancelled.summary["lifecycle"]["cleanup"]["status"], "cancelled")
+
     def test_recovery_readback_marks_fully_written_engine_job_completed(self) -> None:
         runner = SimpleEngineRunner(
             self.root,
@@ -1544,14 +1793,19 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             validate=False,
             executor=lambda _plan: {"ok": True},
         )
-        queued = runner.create_automatic_job("/incoming/movie")
+        waiting = runner.create_automatic_job("/incoming/movie")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         self.assertEqual(queued.phase, "queued")
         identity = AutomaticIdentity(
             media_type="movie", tmdb_id=1, title="Movie", year="2020",
-            confidence=0.99, target_parent="/library/电影", season=None, trace={},
+            confidence=0.99, target_parent="/quark/影视/电影", season=None, trace={},
+            target_shelf="movie", target_shelf_root="/quark/影视/电影",
         )
         original = runner.resolve_automatic_request
-        runner.resolve_automatic_request = lambda _source: (self.request, identity)  # type: ignore[method-assign]
+        runner.resolve_automatic_request = lambda _source, **_kwargs: (  # type: ignore[method-assign]
+            replace(self.request, parent_path="/quark/影视/电影", target_shelf="movie"),
+            identity,
+        )
         try:
             planned = runner.plan_automatic_job(queued.id)
         finally:

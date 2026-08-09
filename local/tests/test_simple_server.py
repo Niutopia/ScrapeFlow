@@ -31,6 +31,11 @@ class FakeAList:
             "/library/电影": [],
             "/library/番剧": [],
             "/library/美剧": [],
+            "/library/待刮削": [
+                {"name": "Example", "is_dir": True},
+                {"name": "AutomaticOnly", "is_dir": True},
+                {"name": "PlainFile", "is_dir": False, "size": 3},
+            ],
         }
 
     def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
@@ -105,6 +110,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["mode"], "automatic")
         self.assertTrue(health["connected"])
         self.assertTrue(health["engine_configured"])
+        self.assertEqual(health["build_version"], "target-shelf-rc1")
         self.assertIn("build_commit", health)
         self.assertIn("build_time", health)
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
@@ -116,8 +122,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
         created = self.create_job()
         job_id = created["id"]
-        self.assertEqual(created["phase"], "queued")
+        self.assertEqual(created["phase"], "awaiting_target_shelf")
         self.assertEqual(created["source"], "/library/待刮削/Example")
+        self.assertIsNone(created["target_shelf"])
+        self.assertIsNone(created["target_root"])
+        self.assertEqual(created["allowed_target_shelves"], ["movie", "anime", "us_tv"])
         self.assertNotIn("identity_override", created["plan"])
         persisted = self.runner.get_job(job_id)
         self.assertEqual(persisted.request, {"source_path": "/library/待刮削/Example"})
@@ -183,18 +192,85 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         original_queue = self.application._queue_automatic_job  # noqa: SLF001 - intake boundary
         self.application._queue_automatic_job = queued.append  # type: ignore[method-assign]
         try:
-            self.application.set_paused(False, "test intake filter")
             scheduled = self.application._scan_inbound_once()  # noqa: SLF001 - intake boundary
         finally:
             self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
-            self.application.set_paused(True, "test")
         self.assertEqual(len(scheduled), 1)
-        self.assertEqual(queued, scheduled)
+        self.assertEqual(queued, [])
         created = self.runner.get_job(scheduled[0])
         self.assertEqual(created.request["source_path"], "/library/待刮削/Real Release")
+        self.assertEqual(created.phase, "awaiting_target_shelf")
+
+    def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
+        self.remote.entries["/library/待刮削"] = [
+            {"name": "Example", "is_dir": True},
+        ]
+        created = self.create_job()
+        queued: list[str] = []
+        original_queue = self.application._queue_automatic_job  # noqa: SLF001 - start gate assertion
+        self.application._queue_automatic_job = queued.append  # type: ignore[method-assign]
+        try:
+            status, payload = self.request(
+                "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "anime"},
+            )
+        finally:
+            self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
+        self.assertEqual(status, 200)
+        started = payload["job"]
+        self.assertEqual(started["phase"], "queued")
+        self.assertEqual(started["target_shelf"], "anime")
+        self.assertEqual(started["target_root"], "/library/番剧")
+        self.assertEqual(queued, [])
+        selected_at = started["selected_at"]
+        status, repeated = self.request(
+            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "anime"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repeated["job"]["selected_at"], selected_at)
+        status, conflict = self.request(
+            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "movie"},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("不能更改", conflict["error"])
+
+    def test_start_rejects_invalid_request_or_missing_source_without_losing_waiting_job(self) -> None:
+        status, rejected = self.request("POST", "/api/jobs", {"path": "/library/待刮削/Missing"})
+        self.assertEqual(status, 400)
+        self.assertIn("来源目录不存在", rejected["error"])
+        self.assertEqual(self.runner.list_jobs(), [])
+
+        created = self.create_job()
+        status, invalid = self.request(
+            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "/library/电影"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("target_shelf", invalid["error"])
+        # The intake evidence is deliberately rechecked at start time: a
+        # directory can disappear after registration but before a shelf is
+        # selected.  That must leave the waiting record untouched.
+        self.remote.entries["/library/待刮削"] = []
+        status, missing = self.request(
+            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "movie"},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("不存在", missing["error"])
+        self.assertEqual(self.runner.get_job(created["id"]).phase, "awaiting_target_shelf")
+
+    def test_submission_requires_a_direct_existing_source_directory(self) -> None:
+        for source in (
+            "/library/待刮削/Missing",
+            "/library/待刮削/PlainFile",
+            "/library/待刮削/Example/nested",
+        ):
+            with self.subTest(source=source):
+                status, payload = self.request("POST", "/api/jobs", {"path": source})
+                self.assertEqual(status, 400)
+                self.assertIn("error", payload)
+                self.assertEqual(self.runner.list_jobs(), [])
 
     def test_retry_reopens_a_terminal_automatic_failure(self) -> None:
-        job = self.runner.create_automatic_job("/library/待刮削/Retry")
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        job = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         failed = replace(
             job,
             phase="failed_identity",
@@ -214,6 +290,44 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(reopened.phase, "queued")
         self.assertFalse(reopened.summary["automatic_terminal"])
         self.assertEqual(reopened.summary["automatic_attempts"], 0)
+        self.assertEqual(reopened.target_shelf, "movie")
+        self.assertEqual(reopened.target_root, "/library/电影")
+        self.assertIsNotNone(reopened.selected_at)
+
+    def test_legacy_automatic_retry_is_rejected_without_reopening_it(self) -> None:
+        job = self.runner.create_automatic_job("/library/待刮削/Retry")
+        failed = replace(
+            job,
+            phase="failed_identity",
+            summary={**job.summary, "automatic_terminal": True, "automatic_attempts": 3},
+            error="identity exhausted",
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{job.id}.json",
+            failed.as_dict(),
+            allow_nan=False,
+        )
+
+        status, payload = self.request("POST", f"/api/jobs/{job.id}/retry", {})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少已确认的目标货架", payload["error"])
+        unchanged = self.runner.get_job(job.id)
+        self.assertEqual(unchanged.phase, "failed_identity")
+        self.assertIsNone(unchanged.target_shelf)
+
+        legacy_without_flag = replace(
+            unchanged,
+            summary={"mode": "auto", "automatic_terminal": True},
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{job.id}.json",
+            legacy_without_flag.as_dict(),
+            allow_nan=False,
+        )
+        status, payload = self.request("POST", f"/api/jobs/{job.id}/retry", {})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少已确认的目标货架", payload["error"])
+        self.assertEqual(self.runner.get_job(job.id).phase, "failed_identity")
 
     def test_successful_terminal_cleanup_releases_cleanup_fence(self) -> None:
         job = self.runner.create_automatic_job("/library/待刮削/Fence")
@@ -228,9 +342,81 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertTrue(result["removed"])
         self.assertNotIn(job.id, self.application._cleanup_fences)  # noqa: SLF001
 
+    def test_failed_cleanup_retry_dispatches_only_the_finalizer(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        failed = replace(
+            selected,
+            phase="failed_cleanup",
+            plan={"mode": "movie"},
+            summary={
+                **selected.summary,
+                "automatic": True,
+                "automatic_terminal": True,
+                "cleanup_only_retry": True,
+            },
+            error="cleanup failed",
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{selected.id}.json",
+            failed.as_dict(),
+            allow_nan=False,
+        )
+        completed = replace(failed, phase="executed", error=None)
+        with patch.object(
+            self.runner,
+            "finalize_automatic_lifecycle",
+            return_value=completed,
+        ) as finalizer, patch.object(
+            self.application,
+            "_queue_automatic_job",
+        ) as ordinary_queue, patch.object(
+            self.application,
+            "_queue_provider_job",
+        ) as provider_queue:
+            status, payload = self.request("POST", f"/api/jobs/{selected.id}/retry", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["engine_phase"], "executed")
+        finalizer.assert_called_once_with(selected.id)
+        ordinary_queue.assert_not_called()
+        provider_queue.assert_not_called()
+
+    def test_cleanup_only_retry_cannot_fall_through_to_formal_writer(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        retry_wait = replace(
+            selected,
+            phase="retry_wait",
+            plan={"mode": "movie"},
+            summary={
+                **selected.summary,
+                "automatic": True,
+                "automatic_terminal": False,
+                "cleanup_only_retry": True,
+            },
+            error="cleanup still pending",
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{selected.id}.json",
+            retry_wait.as_dict(),
+            allow_nan=False,
+        )
+        with patch.object(self.application, "control", return_value={"paused": False}), patch.object(
+            self.runner,
+            "recover_job",
+        ) as recover, patch.object(
+            self.runner,
+            "execute_automatic",
+        ) as execute:
+            self.application._run_automatic_job(selected.id)  # noqa: SLF001
+        recover.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(self.runner.get_job(selected.id).phase, "retry_wait")
+
     def test_retry_identity_correction_rejects_client_controlled_metadata_and_parent(self) -> None:
         """Web retry exposes only the bounded identity/password contract."""
-        job = self.runner.create_automatic_job("/library/待刮削/Correction")
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        job = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         failed = replace(
             job,
             phase="failed_identity",
@@ -274,6 +460,25 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["job"]["phase"], "cancelled")
         self.assertEqual(self.runner.get_job(job.id).phase, "cancelled")
+
+    def test_cancel_stops_a_queued_selected_job_without_touching_its_source(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        queued = self.runner.start_automatic_job(pending.id, target_shelf="anime")
+        self.assertEqual(queued.phase, "queued")
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{queued.id}/cancel", {"reason": "operator stop"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["phase"], "cancelled")
+        cancelled = self.runner.get_job(queued.id)
+        self.assertEqual(cancelled.phase, "cancelled")
+        self.assertEqual(cancelled.target_shelf, "anime")
+        self.assertEqual(cancelled.target_root, "/library/番剧")
+        self.assertIn(
+            {"name": "Example", "is_dir": True},
+            self.remote.entries["/library/待刮削"],
+        )
 
     def test_cancel_closes_terminal_identity_failure_without_remote_delete(self) -> None:
         source = "/library/待刮削/identity-never-matched"
@@ -518,6 +723,106 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         status, health = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["operations"]["provider_active"], 1)
+
+    def test_disabled_lanes_settle_verified_executed_root_without_queueing(self) -> None:
+        self.application.set_paused(False, "test")
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        lifecycle = {
+            "formal_write": {"status": "verified", "updated_at": "fixture"},
+            "cleanup": {"status": "pending", "updated_at": "fixture"},
+        }
+        executed = replace(
+            selected,
+            phase="executed",
+            plan={"scan_report": {"resource_gaps": []}},
+            summary={**selected.summary, "lifecycle": lifecycle},
+        )
+        atomic_write_json(self.runner.jobs_root / f"{selected.id}.json", executed.as_dict(), allow_nan=False)
+        with patch.object(self.application, "_audit_auto_repair_enabled", return_value=False), patch.object(
+            self.application, "_provider_auto_repair_enabled", return_value=False,
+        ), patch.object(
+            self.runner, "finalize_automatic_lifecycle", return_value=executed,
+        ) as finalizer:
+            handled = self.application._settle_disabled_automatic_lifecycle(executed)  # noqa: SLF001
+        self.assertTrue(handled)
+        finalizer.assert_called_once_with(selected.id)
+        persisted = self.runner.get_job(selected.id)
+        self.assertEqual(persisted.summary["lifecycle"]["audit"]["status"], "deferred")
+        self.assertEqual(persisted.summary["lifecycle"]["provider"]["status"], "deferred")
+        self.assertTrue(persisted.summary["lifecycle"]["cleanup_ready"])
+
+    def test_completed_with_gaps_is_terminal_attention_projection(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        gap = {"id": "missing-episode", "kind": "missing_media", "label": "S01E02"}
+        lifecycle = {
+            "formal_write": {"status": "verified"},
+            "audit": {"status": "trusted"},
+            "provider": {"status": "deferred", "reason": "disabled"},
+            "cleanup": {"status": "completed"},
+            "cleanup_ready": True,
+        }
+        executed = replace(
+            selected,
+            phase="executed",
+            plan={"scan_report": {"resource_gaps": [gap]}},
+            summary={**selected.summary, "lifecycle": lifecycle},
+        )
+        public = self.application.public_engine_job(executed)
+        self.assertEqual(public["phase"], "completed_with_gaps")
+        self.assertEqual(public["engine_phase"], "executed")
+        self.assertEqual(public["progress"]["percent"], 100)
+        self.assertEqual(public["progress"]["completed"], 1)
+        self.assertEqual(public["plan"]["resource_gaps"], [gap])
+        self.assertEqual(public["plan"]["resource_gap_count"], 1)
+        self.assertIn("1 项资源缺口", public["progress"]["message"])
+
+    def test_public_gap_projection_keeps_active_and_failed_provider_states(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        gap = {"id": "missing-episode", "kind": "missing_media"}
+        for status, terminal, expected in (
+            ("provider_searching", False, "provider_searching"),
+            ("failed", True, "failed_provider"),
+        ):
+            with self.subTest(status=status):
+                job = replace(
+                    selected,
+                    phase="executed",
+                    plan={"scan_report": {"resource_gaps": [gap]}},
+                    summary={
+                        **selected.summary,
+                        "replenishment": {"status": status, "terminal": terminal},
+                        "lifecycle": {
+                            "formal_write": {"status": "verified"},
+                            "audit": {"status": "trusted"},
+                            "provider": {"status": "pending" if not terminal else "terminal"},
+                            "cleanup": {"status": "completed"},
+                        },
+                    },
+                )
+                self.assertEqual(self.application.public_engine_job(job)["phase"], expected)
+
+    def test_unknown_audit_never_projects_as_completed_with_gaps(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        job = replace(
+            selected,
+            phase="executed",
+            plan={"scan_report": {"resource_gaps": [{"kind": "missing_media"}]}},
+            summary={
+                **selected.summary,
+                "audit": {"status": "unknown", "message": "证据不足"},
+                "lifecycle": {
+                    "formal_write": {"status": "verified"},
+                    "audit": {"status": "unknown"},
+                    "provider": {"status": "deferred"},
+                    "cleanup": {"status": "completed"},
+                },
+            },
+        )
+        self.assertEqual(self.application.public_engine_job(job)["phase"], "failed_verification")
 
 
 if __name__ == "__main__":

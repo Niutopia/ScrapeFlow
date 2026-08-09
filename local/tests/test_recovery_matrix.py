@@ -178,6 +178,9 @@ class RecoveryMatrixTests(unittest.TestCase):
             request={"source_path": self.source},
             plan={"mode": "movie"},
             summary={"automatic": True, "automatic_terminal": False},
+            target_shelf="movie",
+            target_root="/library/电影",
+            selected_at="2026-01-01T00:00:00Z",
         )
         terminal = replace(
             initial,

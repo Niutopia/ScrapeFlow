@@ -375,6 +375,50 @@ class AutomaticReplenishmentRuntime:
         )
         return isinstance(expected, str) and isinstance(actual, str) and expected == actual
 
+    @staticmethod
+    def _child_inherits_target_shelf(root: EngineJob, child: EngineJob) -> bool:
+        """Keep a provider child inside its root's user-confirmed shelf.
+
+        Audit-owned legacy roots predate the intake selection gate and retain
+        their existing work-root validation above. Ordinary selected roots
+        must carry exactly the same semantic shelf and fixed first-level root
+        into every child request/record; copying only a derived work path is
+        not enough to prove the user choice survived the provider boundary.
+        """
+        if root.target_shelf is None and root.target_root is None:
+            # Roots written before the start-gate schema have no durable
+            # shelf fields.  Keep the pre-gate work-root check above as the
+            # compatibility boundary; newly registered public roots always
+            # carry both fields before a provider child can be created.
+            return True
+        return (
+            isinstance(root.target_shelf, str)
+            and isinstance(root.target_root, str)
+            and child.target_shelf == root.target_shelf
+            and child.target_root == root.target_root
+        )
+
+    @staticmethod
+    def _request_inherits_target_shelf(
+        root: EngineJob,
+        request: Mapping[str, object],
+    ) -> bool:
+        """Check shelf coordinates before asking Engine to persist a child.
+
+        The post-plan ``EngineJob`` check remains the durable fail-closed
+        boundary.  This earlier request check closes the smaller window in
+        which a custom/legacy runner could persist a mismatched child and only
+        then report the mismatch to the replenishment runtime.
+        """
+        if root.target_shelf is None and root.target_root is None:
+            return True
+        return (
+            isinstance(root.target_shelf, str)
+            and isinstance(root.target_root, str)
+            and request.get("target_shelf") == root.target_shelf
+            and request.get("parent_path") == root.target_root
+        )
+
     def _write_gap(self, state: Mapping[str, object], existing_path: Path | None = None) -> Path:
         path = existing_path
         if path is None:
@@ -1849,7 +1893,15 @@ class AutomaticReplenishmentRuntime:
                         child_request["source_path"] = self._media_child_staging_root(
                             acquisition, staging, staging_files,
                         )
+                        if not self._request_inherits_target_shelf(job, child_request):
+                            raise AutomaticReplenishmentError(
+                                "补源 child 请求未继承根任务的目标货架，拒绝规划"
+                            )
                         child = self._plan_internal_child(child_request, root_job_id=job.id)
+                        if not self._child_inherits_target_shelf(job, child):
+                            raise AutomaticReplenishmentError(
+                                "补源 child 未继承根任务的目标货架，拒绝写入"
+                            )
                         if not self._audit_child_target_matches(job, child):
                             raise AutomaticReplenishmentError(
                                 "审计补源 child 目标与已审计正式目录不一致，拒绝写入"

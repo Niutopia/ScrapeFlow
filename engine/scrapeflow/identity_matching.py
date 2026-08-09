@@ -211,6 +211,12 @@ def _alternative_tmdb_titles(
 
 def _query_from_source(src: str) -> str:
     name = normalize_remote_path(src).rstrip("/").rsplit("/", 1)[-1]
+    # Archive preprocessing keeps the original archive basename as its
+    # task-staging leaf.  The extension is transport metadata, not a TMDB
+    # title token, so strip only the closed archive suffix set before the
+    # regular release-name cleanup below.
+    name = re.sub(r"\.part\d+\.rar\s*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\.(?:zip|7z|rar|001|r0\d)\s*$", "", name, flags=re.IGNORECASE)
     # Commonly shared 86 release folders abbreviate the Chinese subtitle to
     # ``不存/ZDZQ``. Keep this bounded canonical alias instead of sending an
     # unsearchable release-code fragment to TMDB.

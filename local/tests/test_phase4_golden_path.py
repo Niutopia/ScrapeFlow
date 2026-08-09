@@ -8,7 +8,7 @@ checkpoint row required by T5.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import posixpath
 import tempfile
@@ -19,6 +19,7 @@ from unittest.mock import patch
 from engine.scrapeflow.archive import ArchiveError, ArchiveLimits, RunnerResult
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
 from engine.scrapeflow.models import Plan, PlannedFile, PlannedProblem
+from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     EngineRequest,
@@ -119,6 +120,7 @@ class FixtureAList:
         self.files: dict[str, bytes] = {}
         self.directories: set[str] = {"/", "/incoming", "/library"}
         self.moves: list[tuple[str, str, tuple[str, ...]]] = []
+        self.remove_empty_calls: list[str] = []
 
     def add_file(self, path: str, payload: bytes) -> None:
         self.files[path] = bytes(payload)
@@ -206,6 +208,22 @@ class FixtureAList:
             target = f"{source_dir.rstrip('/')}/{name}"
             self.files.pop(target, None)
             self.directories.discard(target)
+
+    def remove_empty_dir(self, path: str) -> None:
+        """Model the narrow production cleanup operation, not recursive rm.
+
+        The golden path deliberately rejects a non-empty task parent.  That
+        makes the assertion below prove the finalizer only removes archive
+        staging and does not hide a production ``processed`` ownership bug in
+        a permissive fake.
+        """
+        normalized = path.rstrip("/") or "/"
+        self.remove_empty_calls.append(normalized)
+        if normalized not in self.directories:
+            raise AssertionError(f"missing directory: {normalized}")
+        if self.list(normalized):
+            raise AssertionError(f"directory is not empty: {normalized}")
+        self.directories.remove(normalized)
 
 
 class RecordingArchiveAdapter:
@@ -315,15 +333,30 @@ class Phase4GoldenPathTests(unittest.TestCase):
             archive_format=_listing_format(archive_name),
         )
         runner, executor = self._runner(alist, archive_runner, events)
-        queued = runner.create_automatic_job(source, job_id=f"golden-{name}")
+        waiting = runner.create_automatic_job(source, job_id=f"golden-{name}")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         with patch("engine.scraper.auto_match_tmdb", side_effect=self._identity(events)):
             planned = runner.plan_automatic_job(queued.id)
         writer_allowed = not planned.plan.get("problem_files")
-        done = runner.execute_job(queued.id)
+        formal_done = runner.execute_job(queued.id)
         restarted = SimpleEngineRunner(
             self.root, alist=alist, tmdb=object(), planner=self._planner(alist, []),
             validate=False, executor=executor, library_root="/library",
         ).execute_job(queued.id)
+        lifecycle = dict(formal_done.summary.get("lifecycle") or {})
+        lifecycle["audit"] = {"status": "trusted", "updated_at": "fixture"}
+        lifecycle["provider"] = {"status": "no_gap", "updated_at": "fixture"}
+        lifecycle["cleanup_ready"] = True
+        ready = replace(
+            formal_done,
+            summary={**formal_done.summary, "lifecycle": lifecycle},
+        )
+        atomic_write_json(
+            runner.jobs_root / f"{queued.id}.json",
+            ready.as_dict(),
+            allow_nan=False,
+        )
+        done = runner.finalize_automatic_lifecycle(queued.id)
         runner.cleanup_terminal_job(queued.id)
         with patch.object(SimpleApplication, "_start_startup_thread"):
             application = SimpleApplication(
@@ -376,6 +409,22 @@ class Phase4GoldenPathTests(unittest.TestCase):
         self.assertFalse(any(path.startswith(staging_prefix) for path in alist.files))
         if archive_name is not None:
             self.assertIsNotNone(processed)
+            remote_task_root = f"/library/ScrapeFlow/归档/{queued.id}"
+            archive_root = f"{remote_task_root}/archive"
+            self.assertIn(
+                archive_root,
+                alist.remove_empty_calls,
+                "cleanup must remove the empty archive staging root",
+            )
+            self.assertTrue(
+                all(
+                    path == archive_root or path.startswith(archive_root + "/")
+                    for path in alist.remove_empty_calls
+                ),
+                "cleanup may remove archive descendants, never the task parent or processed source",
+            )
+            self.assertIn(remote_task_root, alist.directories)
+            self.assertNotIn(remote_task_root, alist.remove_empty_calls)
         return record, events
 
     def test_positive_fixture_records_the_complete_converged_chain(self) -> None:
@@ -436,7 +485,8 @@ class Phase4GoldenPathTests(unittest.TestCase):
             ),
             events, limits=limits, problem=problem,
         )
-        job = runner.create_automatic_job(source, job_id=f"negative-{name}")
+        waiting = runner.create_automatic_job(source, job_id=f"negative-{name}")
+        job = runner.start_automatic_job(waiting.id, target_shelf="movie")
         try:
             with patch("engine.scraper.auto_match_tmdb", side_effect=self._identity(events)):
                 planned = runner.plan_automatic_job(job.id, retry_password=retry_password)

@@ -8,6 +8,7 @@ reconciled from AList state before they are retried.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import json
 import os
@@ -36,6 +37,13 @@ from engine.scrapeflow.subtitle_content import (
     DEFAULT_MAX_PREFIX_BYTES,
     classify_subtitle_content,
 )
+from engine.scrapeflow.target_shelf import (
+    TargetShelf,
+    parse_target_shelf,
+    target_root_for_shelf,
+    target_shelf_allows_media_type,
+    target_shelf_for_root,
+)
 from local.scrapeflow_api.redaction import redact_error
 
 
@@ -49,6 +57,34 @@ class EngineRequestError(SimpleEngineError, ValueError):
 
 class EngineExecutionError(SimpleEngineError):
     """A simple plan operation failed or could not be read back."""
+
+
+class EngineCancellationRequested(EngineExecutionError):
+    """A durable operator cancellation reached a safe Engine boundary."""
+
+
+class EngineJobConflictError(EngineExecutionError):
+    """A valid request conflicts with durable job/source state."""
+
+
+class TargetShelfPolicyConflictError(EngineJobConflictError):
+    """TMDB media type conflicts with the user's selected target shelf."""
+
+    def __init__(
+        self,
+        *,
+        target_shelf: TargetShelf | str,
+        media_type: str,
+        identity: object | None = None,
+    ) -> None:
+        selected = parse_target_shelf(target_shelf)
+        super().__init__(
+            "TMDB 识别结果与用户选择的目标货架冲突: "
+            f"{media_type or 'unknown'} 不能进入 {selected.value}"
+        )
+        self.target_shelf = selected.value
+        self.media_type = media_type
+        self.identity = identity
 
 
 class EngineRecoveryMatrixError(EngineExecutionError):
@@ -150,6 +186,12 @@ class AutomaticIdentity:
     target_parent: str
     season: int | None
     trace: Mapping[str, object]
+    target_shelf: str | None = None
+    # ``target_root`` historically means the concrete planned work directory
+    # in identity/audit consumers.  Keep the selected first-level shelf under
+    # an unambiguous name so it can never widen a scoped audit to a whole
+    # library category.
+    target_shelf_root: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -161,6 +203,8 @@ class AutomaticIdentity:
             "target_parent": self.target_parent,
             "season": self.season,
             "trace": dict(self.trace),
+            "target_shelf": self.target_shelf,
+            "target_shelf_root": self.target_shelf_root,
         }
 
 
@@ -173,10 +217,35 @@ _AUDIT_ROOT_GAP_KINDS = frozenset({
 # visible, identity-verified video.  It must never be accepted by the media
 # child planner as an episode/movie acquisition request.
 _AUDIT_SUBTITLE_GAP_KINDS = frozenset({"missing_subtitle"})
+
+# Automatic roots keep their ingress/archive cleanup evidence until the
+# audit/provider lifecycle has reached a durable terminal decision.  A
+# ContextVar carries that one-shot execution policy through injected executor
+# wrappers without changing the public Plan model or forcing every test/
+# provider executor to accept a new keyword argument.
+_DEFER_TASK_CLEANUP: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "scrapeflow_defer_task_cleanup", default=False,
+)
+# The executor deliberately receives no new public argument.  A runner-owned
+# ContextVar lets the concrete executor stop between remote operations while
+# preserving the existing injected-executor protocol.
+_CANCEL_REQUEST_CHECK: contextvars.ContextVar[Callable[[], bool] | None] = (
+    contextvars.ContextVar("scrapeflow_cancel_request_check", default=None)
+)
+
+
+def _cancellation_checkpoint() -> None:
+    """Stop only at an operation boundary when an operator requested it."""
+    checker = _CANCEL_REQUEST_CHECK.get()
+    if callable(checker) and checker():
+        raise EngineCancellationRequested("操作员已请求取消；当前远端操作完成后停止任务")
+
+
 _ENGINE_PHASES = frozenset({
-    "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
+    "awaiting_target_shelf", "queued", "analyzing", "archive_preprocessing", "identity_matching",
+    "target_policy_conflict", "planning", "planned",
     "executing", "verifying", "cleaning", "executed", "completed",
-    "retry_wait", "failed", "failed_identity", "failed_provider",
+    "retry_wait", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider",
     "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 })
 
@@ -185,7 +254,7 @@ _ENGINE_PHASES = frozenset({
 # a provider/audit projection beside it; ``cleanup_terminal_job`` checks both
 # before removing any task-owned local state.
 _CLEANUP_TERMINAL_PHASES = frozenset({
-    "executed", "completed", "failed", "failed_identity", "failed_provider",
+    "executed", "completed", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider",
     "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 })
 _CLEANUP_ACTIVE_PROVIDER_STATUSES = frozenset({
@@ -455,6 +524,7 @@ class EngineRequest:
     source_path: str
     parent_path: str
     media_type: str
+    target_shelf: str | None = None
     tmdb_id: int | None = None
     query: str | None = None
     season: int = 1
@@ -477,6 +547,14 @@ class EngineRequest:
         media_type = payload.get("media_type", payload.get("type", "auto"))
         if media_type not in _MEDIA_TYPES:
             raise EngineRequestError("media_type 必须是 auto、movie、tv 或 collection")
+        raw_target_shelf = payload.get("target_shelf")
+        if raw_target_shelf is None:
+            target_shelf = None
+        else:
+            try:
+                target_shelf = parse_target_shelf(raw_target_shelf).value
+            except ValueError as exc:
+                raise EngineRequestError(str(exc)) from exc
         raw_id = payload.get("tmdb_id", payload.get("id"))
         tmdb_id: int | None
         if raw_id is None or raw_id == "":
@@ -513,6 +591,7 @@ class EngineRequest:
             source_path=source,
             parent_path=parent,
             media_type=str(media_type),
+            target_shelf=target_shelf,
             tmdb_id=tmdb_id,
             query=query.strip() if isinstance(query, str) else None,
             season=raw_season,
@@ -539,6 +618,9 @@ class EngineJob:
     request: Mapping[str, object]
     plan: Mapping[str, object]
     summary: Mapping[str, object]
+    target_shelf: str | None = None
+    target_root: str | None = None
+    selected_at: str | None = None
     execution: Mapping[str, object] | None = None
     error: str | None = None
 
@@ -551,6 +633,9 @@ class EngineJob:
             "request": dict(self.request),
             "plan": dict(self.plan),
             "summary": dict(self.summary),
+            "target_shelf": self.target_shelf,
+            "target_root": self.target_root,
+            "selected_at": self.selected_at,
         }
         if self.execution is not None:
             result["execution"] = dict(self.execution)
@@ -582,6 +667,33 @@ class EngineJob:
         error = raw.get("error")
         if error is not None and not isinstance(error, str):
             raise SimpleEngineError(f"Engine job {job_id} 的错误记录格式无效")
+        raw_target_shelf = raw.get("target_shelf")
+        if raw_target_shelf is None:
+            target_shelf = None
+        else:
+            try:
+                target_shelf = parse_target_shelf(raw_target_shelf).value
+            except ValueError as exc:
+                raise SimpleEngineError(f"Engine job {job_id} 的 target_shelf 无效") from exc
+        raw_target_root = raw.get("target_root")
+        if raw_target_root is None:
+            target_root = None
+        else:
+            try:
+                target_root = _safe_remote_path(
+                    raw_target_root,
+                    field="target_root",
+                    allow_root=False,
+                )
+            except EngineRequestError as exc:
+                raise SimpleEngineError(f"Engine job {job_id} 的 target_root 无效") from exc
+        selected_at = raw.get("selected_at")
+        if selected_at is not None and not isinstance(selected_at, str):
+            raise SimpleEngineError(f"Engine job {job_id} 的 selected_at 记录格式无效")
+        if target_shelf is None and (target_root is not None or selected_at is not None):
+            raise SimpleEngineError(f"Engine job {job_id} 的目标货架记录不完整")
+        if target_shelf is not None and (target_root is None or selected_at is None):
+            raise SimpleEngineError(f"Engine job {job_id} 的目标货架记录不完整")
         return cls(
             id=job_id,
             phase=str(phase),
@@ -590,6 +702,9 @@ class EngineJob:
             request=dict(request),
             plan=dict(plan),
             summary=dict(summary),
+            target_shelf=target_shelf,
+            target_root=target_root,
+            selected_at=selected_at,
             execution=dict(execution) if isinstance(execution, Mapping) else None,
             error=error,
         )
@@ -608,6 +723,18 @@ def recover_persisted_engine_jobs(state_root: Path) -> list[EngineJob]:
     if not jobs_root.exists():
         return []
     recovered: list[EngineJob] = []
+    cancel_root = root / "cancel-requests"
+    cancel_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def read_cancel_marker(path: Path) -> Mapping[str, object] | None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return dict(raw) if isinstance(raw, Mapping) else None
+
     with _engine_worker_lock(root):
         for path in sorted(jobs_root.glob("*.json")):
             try:
@@ -617,12 +744,76 @@ def recover_persisted_engine_jobs(state_root: Path) -> list[EngineJob]:
             if not isinstance(raw, Mapping):
                 raise SimpleEngineError(f"Engine job 记录不是对象: {path.stem}")
             job = EngineJob.from_dict(raw)
+            active = job.summary.get("active_operation")
+            operation_id = active.get("id") if isinstance(active, Mapping) else None
+            marker_path = cancel_root / f"{job.id}.json"
+            active_phases = {
+                "archive_preprocessing", "identity_matching", "planning",
+                "executing", "verifying", "cleaning",
+            }
+            marker = read_cancel_marker(marker_path)
+            matches_marker = (
+                job.phase in active_phases
+                and isinstance(operation_id, str)
+                and isinstance(marker, Mapping)
+                and marker.get("operation_id") == operation_id
+            )
+            # A cancel request is allowed to arrive while restart recovery has
+            # the worker lock. Before converting an interrupted execution to
+            # retry_wait and dropping its operation id, read the marker once
+            # more under that same lock.
+            if not matches_marker and job.phase == "executing":
+                marker = read_cancel_marker(marker_path)
+                matches_marker = (
+                    isinstance(operation_id, str)
+                    and isinstance(marker, Mapping)
+                    and marker.get("operation_id") == operation_id
+                )
+            if matches_marker:
+                summary = dict(job.summary)
+                summary.pop("active_operation", None)
+                lifecycle_raw = summary.get("lifecycle")
+                if isinstance(lifecycle_raw, Mapping):
+                    lifecycle = dict(lifecycle_raw)
+                    cleanup_raw = lifecycle.get("cleanup")
+                    if isinstance(cleanup_raw, Mapping) and cleanup_raw.get("status") == "running":
+                        cleanup = dict(cleanup_raw)
+                        cleanup.update({"status": "cancelled", "updated_at": _now()})
+                        lifecycle["cleanup"] = cleanup
+                        summary["lifecycle"] = lifecycle
+                summary["cancellation"] = {
+                    "status": "cancelled",
+                    "cancelled_at": _now(),
+                    "recovered_after_restart": True,
+                }
+                reason = marker.get("reason")
+                cancelled = replace(
+                    job,
+                    phase="cancelled",
+                    updated_at=_now(),
+                    summary=summary,
+                    error=redact_error(
+                        reason if isinstance(reason, str) else "cancelled by operator"
+                    ),
+                )
+                atomic_write_json(path, cancelled.as_dict(), allow_nan=False)
+                try:
+                    marker_path.unlink()
+                except FileNotFoundError:
+                    pass
+                recovered.append(cancelled)
+                continue
             if job.phase != "executing":
                 continue
+            summary = dict(job.summary)
+            summary.pop("active_operation", None)
+            if isinstance(operation_id, str):
+                summary["recovered_operation_id"] = operation_id
             recovered_job = replace(
                 job,
                 phase="retry_wait",
                 updated_at=_now(),
+                summary=summary,
                 error=(
                     "Engine 在远端结果写入前重启；已排入自动 AList 回读和重试。"
                 ),
@@ -1070,7 +1261,46 @@ class SimplePlanExecutor:
         visit(root)
         return removed
 
+    def finalize_cleanup(self, plan: object) -> Mapping[str, object]:
+        """Apply only the plan-owned residual cleanup after lifecycle gates.
+
+        Formal media moves and artifact writes are intentionally absent from
+        this method.  It is the re-entrant final step used after a trusted
+        scoped audit and any provider decision; every row is revalidated from
+        the persisted plan before the first remote delete.
+        """
+        _cancellation_checkpoint()
+        _require_cleanup_allowlist(plan, stage="最终清理")
+        cleanup_items = list(getattr(plan, "cleanup_files", ()) or ())
+        cleaned: list[str] = []
+        if cleanup_items:
+            remove = getattr(self.alist, "remove", None)
+            if not callable(remove):
+                raise EngineExecutionError("AList 客户端缺少 remove 接口，无法执行最终清理")
+            for item in cleanup_items:
+                _cancellation_checkpoint()
+                source_path = str(getattr(item, "source_path"))
+                source_dir = str(getattr(item, "source_dir"))
+                original = str(getattr(item, "original_name"))
+                if self._exact(source_path) is None:
+                    continue
+                remove(source_dir, [original])
+                if self._exact(source_path) is not None:
+                    raise EngineExecutionError(f"最终清理后源文件仍存在: {source_path}")
+                cleaned.append(source_path)
+                _cancellation_checkpoint()
+        _cancellation_checkpoint()
+        removed_source_directories = self._cleanup_empty_source_tree(
+            str(getattr(plan, "source_root", ""))
+        )
+        return {
+            "cleanup": cleaned,
+            "cleanup_count": len(cleaned),
+            "removed_source_directories": removed_source_directories,
+        }
+
     def execute(self, plan: object) -> Mapping[str, object]:
+        _cancellation_checkpoint()
         all_files = list(getattr(plan, "files", ()) or ())
         media_only = _is_provider_media_only_plan(plan)
         # Provider children are deliberately video-only transactions.  A
@@ -1113,6 +1343,10 @@ class SimplePlanExecutor:
                 )
         moved: list[dict[str, object]] = []
         for item in files:
+            # One file is one coherent remote move/readback unit.  Never
+            # interrupt an AList call, but do not begin another unit after an
+            # operator has cancelled the running job.
+            _cancellation_checkpoint()
             source_path = str(getattr(item, "source_path"))
             source_dir = str(getattr(item, "source_dir"))
             original = str(getattr(item, "original_name"))
@@ -1153,8 +1387,10 @@ class SimplePlanExecutor:
                 item, observed["size"], path=target_path, stage="正式库回读",
             )
             moved.append({"source": source_path, "target": target_path, "status": "moved", **observed})
+            _cancellation_checkpoint()
 
         for item in moved:
+            _cancellation_checkpoint()
             self._verify_source_absent(str(item["source"]))
 
         artifacts: list[dict[str, object]] = []
@@ -1167,6 +1403,7 @@ class SimplePlanExecutor:
             planned_nfos = getattr(__import__("engine.scraper", fromlist=["planned_nfos"]), "planned_nfos", None)
             if callable(planned_nfos):
                 for target, data in planned_nfos(plan):
+                    _cancellation_checkpoint()
                     if not isinstance(target, str) or not isinstance(data, (bytes, bytearray)):
                         raise EngineExecutionError("Engine 生成的 NFO 结构无效")
                     self._ensure_dir(posixpath.dirname(target) or "/")
@@ -1177,6 +1414,7 @@ class SimplePlanExecutor:
             downloader = getattr(self.tmdb, "download_poster", None) if self.tmdb is not None else None
             if callable(planned_artwork):
                 for target, image_path, role in planned_artwork(plan):
+                    _cancellation_checkpoint()
                     if not callable(downloader):
                         raise EngineExecutionError("计划包含海报，但 TMDB 客户端没有 download_poster")
                     data = downloader(image_path)
@@ -1186,32 +1424,28 @@ class SimplePlanExecutor:
                     observed = self._upload_bytes(target, bytes(data), "image/jpeg")
                     artifacts.append({"target": target, "kind": role, **observed})
 
-        cleaned: list[str] = []
-        remove = getattr(self.alist, "remove", None)
-        if not callable(remove):
-            raise EngineExecutionError("AList 客户端缺少 remove 接口，无法执行计划清理项")
-        for item in list(getattr(plan, "cleanup_files", ()) or ()):
-            source_path = str(getattr(item, "source_path"))
-            source_dir = str(getattr(item, "source_dir"))
-            original = str(getattr(item, "original_name"))
-            if self._exact(source_path) is None:
-                continue
-            remove(source_dir, [original])
-            if self._exact(source_path) is not None:
-                raise EngineExecutionError(f"清理后源文件仍存在: {source_path}")
-            cleaned.append(source_path)
-        removed_source_directories = self._cleanup_empty_source_tree(
-            str(getattr(plan, "source_root", ""))
-        )
+        if _DEFER_TASK_CLEANUP.get():
+            pending_cleanup = [
+                str(getattr(item, "source_path"))
+                for item in list(getattr(plan, "cleanup_files", ()) or ())
+            ]
+            cleanup_result: Mapping[str, object] = {
+                "cleanup": [],
+                "cleanup_count": 0,
+                "removed_source_directories": [],
+                "cleanup_deferred": True,
+                "cleanup_pending": pending_cleanup,
+            }
+        else:
+            _cancellation_checkpoint()
+            cleanup_result = self.finalize_cleanup(plan)
         return {
             "files": moved,
             "file_count": len(moved),
             "artifacts": artifacts,
             "artifact_count": len(artifacts),
             "media_only": media_only,
-            "cleanup": cleaned,
-            "cleanup_count": len(cleaned),
-            "removed_source_directories": removed_source_directories,
+            **dict(cleanup_result),
         }
 
 
@@ -1233,7 +1467,12 @@ class SimpleEngineRunner:
         self.state_root = Path(state_root).resolve()
         self.jobs_root = self.state_root / "jobs"
         self.locks_root = self.state_root / "locks"
+        # A cancellation request may be written while another process owns
+        # the single formal-write lock.  Keep it outside ``jobs`` so listing
+        # durable jobs can never mistake a request marker for a job record.
+        self.cancel_requests_root = self.state_root / "cancel-requests"
         self.jobs_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.cancel_requests_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.alist = alist
         self.tmdb = tmdb
         self.planner = planner
@@ -1257,6 +1496,162 @@ class SimpleEngineRunner:
 
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_root / f"{_safe_job_id(job_id)}.json"
+
+    def _cancel_request_path(self, job_id: str) -> Path:
+        return self.cancel_requests_root / f"{_safe_job_id(job_id)}.json"
+
+    @staticmethod
+    def _active_operation_id(job: EngineJob) -> str | None:
+        active = job.summary.get("active_operation")
+        if not isinstance(active, Mapping):
+            return None
+        identifier = active.get("id")
+        return identifier if isinstance(identifier, str) and identifier else None
+
+    @staticmethod
+    def _with_active_operation(
+        summary: Mapping[str, object],
+        *,
+        kind: str,
+    ) -> dict[str, object]:
+        updated = dict(summary)
+        updated.pop("recovered_operation_id", None)
+        updated["active_operation"] = {
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "started_at": _now(),
+        }
+        return updated
+
+    @staticmethod
+    def _without_active_operation(summary: Mapping[str, object]) -> dict[str, object]:
+        updated = dict(summary)
+        updated.pop("active_operation", None)
+        return updated
+
+    def _read_cancel_request(self, job_id: str) -> Mapping[str, object] | None:
+        try:
+            raw = json.loads(self._cancel_request_path(job_id).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # A malformed marker must never block or broaden formal work.
+            # It is safe to discard because it has no authenticated operation
+            # identity to apply to.
+            self._clear_cancel_request(job_id)
+            return None
+        return dict(raw) if isinstance(raw, Mapping) else None
+
+    def _clear_cancel_request(self, job_id: str) -> None:
+        try:
+            self._cancel_request_path(job_id).unlink()
+        except FileNotFoundError:
+            pass
+
+    def _cancel_requested(self, job: EngineJob) -> bool:
+        operation_id = self._active_operation_id(job)
+        if operation_id is None:
+            return False
+        request = self._read_cancel_request(job.id)
+        return (
+            isinstance(request, Mapping)
+            and request.get("operation_id") == operation_id
+        )
+
+    def _cancel_request_matches(
+        self,
+        job: EngineJob,
+        request: Mapping[str, object],
+    ) -> bool:
+        """Match a cancellation to one durable job operation or idle revision."""
+        operation_id = self._active_operation_id(job)
+        if operation_id is not None:
+            return request.get("operation_id") == operation_id
+        recovered_operation_id = job.summary.get("recovered_operation_id")
+        if (
+            job.phase == "retry_wait"
+            and isinstance(recovered_operation_id, str)
+            and request.get("kind") == "running"
+        ):
+            return request.get("operation_id") == recovered_operation_id
+        return (
+            request.get("kind") == "inactive"
+            and request.get("phase") == job.phase
+            and request.get("updated_at") == job.updated_at
+        )
+
+    def _request_running_cancellation(self, job: EngineJob, *, reason: str) -> None:
+        operation_id = self._active_operation_id(job)
+        if operation_id is None:
+            raise EngineWorkerBusyError(
+                "Engine 任务正在切换状态；请稍后再次取消"
+            )
+        atomic_write_json(
+            self._cancel_request_path(job.id),
+            {
+                "kind": "running",
+                "operation_id": operation_id,
+                "requested_at": _now(),
+                "reason": redact_error(reason),
+            },
+            allow_nan=False,
+        )
+
+    def _request_inactive_cancellation(self, job: EngineJob, *, reason: str) -> None:
+        """Fence an idle revision before cancelling it without the global lock.
+
+        This path is used only when another job owns the global formal-write
+        lock.  No worker can concurrently begin this queued/planned revision
+        without first acquiring that lock; the marker makes a just-released
+        scheduler consume cancellation before it can advance the job.
+        """
+        atomic_write_json(
+            self._cancel_request_path(job.id),
+            {
+                "kind": "inactive",
+                "phase": job.phase,
+                "updated_at": job.updated_at,
+                "requested_at": _now(),
+                "reason": redact_error(reason),
+            },
+            allow_nan=False,
+        )
+
+    def _cancelled_job(self, job: EngineJob, *, reason: str) -> EngineJob:
+        summary = self._without_active_operation(job.summary)
+        lifecycle_raw = summary.get("lifecycle")
+        if isinstance(lifecycle_raw, Mapping):
+            lifecycle = dict(lifecycle_raw)
+            cleanup_raw = lifecycle.get("cleanup")
+            if isinstance(cleanup_raw, Mapping) and cleanup_raw.get("status") == "running":
+                cleanup = dict(cleanup_raw)
+                cleanup.update({"status": "cancelled", "updated_at": _now()})
+                lifecycle["cleanup"] = cleanup
+                summary["lifecycle"] = lifecycle
+        summary["cancellation"] = {
+            "status": "cancelled",
+            "cancelled_at": _now(),
+        }
+        cancelled = replace(
+            job,
+            phase="cancelled",
+            updated_at=_now(),
+            summary=summary,
+            error=redact_error(reason.strip() or "cancelled by operator"),
+        )
+        atomic_write_json(self._job_path(job.id), cancelled.as_dict(), allow_nan=False)
+        self._clear_cancel_request(job.id)
+        return cancelled
+
+    def _consume_cancel_request(self, job: EngineJob) -> EngineJob | None:
+        request = self._read_cancel_request(job.id)
+        if not isinstance(request, Mapping) or not self._cancel_request_matches(job, request):
+            return None
+        reason = request.get("reason")
+        return self._cancelled_job(
+            job,
+            reason=reason if isinstance(reason, str) else "cancelled by operator",
+        )
 
     def _read(self, job_id: str) -> EngineJob:
         path = self._job_path(job_id)
@@ -1335,15 +1730,158 @@ class SimpleEngineRunner:
         return dict(result)
 
     def find_by_source(self, source_path: str) -> EngineJob | None:
-        """Return an existing non-terminal job for duplicate-submit checks."""
+        """Return the durable public owner of an ingress path, if any.
+
+        Source consumption now occurs after the root workflow settles, rather
+        than immediately after the formal move.  Keep every persisted public
+        root as the source owner until an explicit terminal cleanup removes
+        its record; otherwise an intake rescan could recreate a second job for
+        a source that still belongs to an audit/provider lifecycle.
+        """
         normalized = _safe_remote_path(source_path, field="source_path", allow_root=False)
         for job in self.list_jobs():
             if job.summary.get("internal_child") is True:
                 continue
-            candidate = job.summary.get("ingress_source_path") or job.request.get("source_path")
-            if candidate == normalized and job.phase not in {"executed", "failed", "cancelled"}:
+            raw_candidate = job.summary.get("ingress_source_path") or job.request.get("source_path")
+            candidate_value = (
+                raw_candidate.rstrip("/")
+                if isinstance(raw_candidate, str) and raw_candidate != "/"
+                else raw_candidate
+            )
+            try:
+                candidate = _safe_remote_path(
+                    candidate_value,
+                    field="persisted ingress_source_path",
+                    allow_root=False,
+                )
+            except EngineRequestError:
+                # Old malformed JSON remains read-only; it must not become a
+                # new source of ownership decisions or a reason to widen the
+                # current intake boundary.
+                continue
+            if candidate == normalized:
                 return job
         return None
+
+    def _confirmed_target_selection(self, job: EngineJob) -> tuple[TargetShelf, str]:
+        """Rebuild and verify a persisted ordinary-job shelf selection."""
+        if job.target_shelf is None or job.target_root is None or job.selected_at is None:
+            raise EngineRequestError("自动任务尚未选择目标货架，不能启动正式处理")
+        try:
+            shelf = parse_target_shelf(job.target_shelf)
+            expected_root = target_root_for_shelf(self.library_root, shelf)
+        except ValueError as exc:
+            raise EngineRequestError("自动任务的目标货架记录无效") from exc
+        if job.target_root != expected_root:
+            raise EngineRequestError("自动任务的目标货架根目录与服务策略不一致")
+        return shelf, expected_root
+
+    @staticmethod
+    def _job_ingress_source(job: EngineJob) -> str:
+        source = job.summary.get("ingress_source_path") or job.request.get("source_path")
+        return _safe_remote_path(source, field="ingress_source_path", allow_root=False)
+
+    def source_directory_exists(self, source_path: str) -> bool:
+        """Prove one source is a direct remote directory through its parent.
+
+        AList returns an empty list both for an empty directory and, on some
+        backends, a missing path.  Inspecting the exact parent/name pair keeps
+        the start gate narrow and makes an empty source directory observable
+        without treating a broad recursive read as evidence.
+        """
+        source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        parent, name = posixpath.split(source)
+        if not parent or not name:
+            return False
+        self._ensure_authenticated(self.alist)
+        listing = getattr(self.alist, "list", None)
+        if not callable(listing):
+            return False
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            # Focused/test AList clients may not expose ``refresh``.  Treat a
+            # failure in the compatibility call exactly like a failed narrow
+            # probe (the start gate must remain fail-closed), rather than
+            # letting an arbitrary provider exception escape as HTTP 500.
+            try:
+                rows = listing(parent)
+            except Exception:
+                return False
+        except Exception:
+            return False
+        if not isinstance(rows, list):
+            return False
+        matches = [
+            row for row in rows
+            if isinstance(row, Mapping) and row.get("name") == name
+        ]
+        return len(matches) == 1 and matches[0].get("is_dir") is True
+
+    def mark_waiting_source_missing(self, job_id: str) -> EngineJob:
+        """Record a passive intake observation without deleting/retrying a job."""
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.phase != "awaiting_target_shelf":
+                return job
+            summary = dict(job.summary)
+            if summary.get("waiting_source_state") == "missing" and job.error:
+                return job
+            summary["waiting_source_state"] = "missing"
+            updated = replace(
+                job,
+                summary=summary,
+                updated_at=_now(),
+                error="待选择来源目录已不存在；已保留任务记录",
+            )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return updated
+
+    def create_pending_job(
+        self,
+        source_path: str,
+        *,
+        job_id: str | None = None,
+    ) -> EngineJob:
+        """Persist inbound ownership without starting formal processing."""
+        source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        if is_production_test_media_path(source):
+            raise EngineRequestError("生产 E2E 测试目录不能创建自动任务")
+        # Intake polling and an explicit POST can arrive together.  Re-check
+        # durable ownership under the existing process lock so neither caller
+        # creates a second pending root for the same source.
+        with self.worker_lock():
+            existing = self.find_by_source(source)
+            if existing is not None:
+                return existing
+            identifier = job_id or f"engine-{uuid.uuid4().hex}"
+            _safe_job_id(identifier)
+            if self._job_path(identifier).exists():
+                raise SimpleEngineError(f"Engine job 已存在: {identifier}")
+            now = _now()
+            job = EngineJob(
+                id=identifier,
+                phase="awaiting_target_shelf",
+                created_at=now,
+                updated_at=now,
+                request={"source_path": source},
+                plan={},
+                summary={
+                    "automatic": True,
+                    "automatic_stage": "awaiting_target_shelf",
+                    "source_root": source,
+                    "ingress_source_path": source,
+                    "mode": "auto",
+                    "automatic_attempts": 0,
+                    "automatic_terminal": False,
+                    "next_retry_seconds": None,
+                },
+                target_shelf=None,
+                target_root=None,
+                selected_at=None,
+            )
+            atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
+            return job
 
     def create_automatic_job(
         self,
@@ -1351,37 +1889,95 @@ class SimpleEngineRunner:
         *,
         job_id: str | None = None,
     ) -> EngineJob:
-        """Persist a queued source before doing any network/TMDB work."""
-        source = _safe_remote_path(source_path, field="source_path", allow_root=False)
-        if is_production_test_media_path(source):
-            raise EngineRequestError("生产 E2E 测试目录不能创建自动任务")
-        existing = self.find_by_source(source)
-        if existing is not None:
-            return existing
-        identifier = job_id or f"engine-{uuid.uuid4().hex}"
-        _safe_job_id(identifier)
-        if self._job_path(identifier).exists():
-            raise SimpleEngineError(f"Engine job 已存在: {identifier}")
-        now = _now()
-        job = EngineJob(
-            id=identifier,
-            phase="queued",
-            created_at=now,
-            updated_at=now,
-            request={"source_path": source},
-            plan={},
-            summary={
+        """Compatibility alias for the no-side-effect inbound registration."""
+        return self.create_pending_job(source_path, job_id=job_id)
+
+    def start_automatic_job(
+        self,
+        job_id: str,
+        *,
+        target_shelf: object,
+    ) -> EngineJob:
+        """Atomically persist one user shelf selection and make a root queueable.
+
+        This is the only ordinary-root transition that may enter ``queued``.
+        It holds the existing cross-process worker lock only while it reads
+        and replaces the JSON record; no archive, TMDB, planner, writer or
+        provider operation occurs within this method.
+        """
+        try:
+            selected = parse_target_shelf(target_shelf)
+            selected_root = target_root_for_shelf(self.library_root, selected)
+        except ValueError as exc:
+            raise EngineRequestError(str(exc)) from exc
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.summary.get("internal_child") is True or job.summary.get("audit_owned") is True:
+                raise EngineJobConflictError("内部任务不能通过用户目标货架启动")
+            if job.phase not in {"awaiting_target_shelf", "target_policy_conflict"}:
+                # A duplicate start is idempotent only while the selected
+                # root is still in the pre-terminal workflow.  Once the job
+                # is completed/cancelled or has a terminal bounded failure,
+                # reopening it belongs to the explicit retry/reopen contract;
+                # /start must not silently revive a terminal record.
+                if job.phase in _CLEANUP_TERMINAL_PHASES:
+                    raise EngineJobConflictError(
+                        "任务已经进入终态，请通过 retry 或明确的重新打开流程处理"
+                    )
+                if job.target_shelf == selected.value and job.target_root == selected_root:
+                    # Keep selected_at unchanged: a duplicate start is a read
+                    # of the durable transition, not a new selection event.
+                    return job
+                raise EngineJobConflictError("任务已经开始，不能更改目标货架")
+            source = self._job_ingress_source(job)
+            if not self.source_directory_exists(source):
+                raise EngineJobConflictError("待选择来源目录已不存在；已保留任务记录")
+            # A waiting root should not have a child.  Check it anyway so a
+            # malformed/imported record cannot re-open a root while an
+            # internal provider child still owns state under the same id.
+            children = [
+                candidate
+                for candidate in self.list_jobs()
+                if candidate.summary.get("root_job_id") == job.id
+                and candidate.phase not in {"executed", "completed", "failed", "cancelled"}
+            ]
+            if children:
+                raise EngineJobConflictError("任务仍有活动内部子任务，不能重新选择目标货架")
+            summary = dict(job.summary)
+            summary.update({
                 "automatic": True,
-                "automatic_stage": "identity_matching",
+                "automatic_stage": "queued",
                 "source_root": source,
-                "mode": "auto",
-                "automatic_attempts": 0,
+                "ingress_source_path": source,
+                "target_shelf": selected.value,
+                "selected_target_root": selected_root,
+                "target_work_path": None,
                 "automatic_terminal": False,
                 "next_retry_seconds": None,
-            },
-        )
-        atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
-        return job
+            })
+            # A target-policy conflict never has a formal plan.  Drop only
+            # stale result projections; an explicit manual identity correction
+            # remains a user-requested retry input and still goes through the
+            # same compatibility matrix after the new shelf is selected.
+            summary.pop("identity", None)
+            summary.pop("resource_gaps", None)
+            summary.pop("waiting_source_state", None)
+            selected_at = _now()
+            updated = replace(
+                job,
+                phase="queued",
+                updated_at=selected_at,
+                request={"source_path": source},
+                plan={},
+                summary=summary,
+                target_shelf=selected.value,
+                target_root=selected_root,
+                selected_at=selected_at,
+                execution=None,
+                error=None,
+            )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return updated
 
     @staticmethod
     def _audit_text(value: object, *, field: str, required: bool = False) -> str:
@@ -2229,6 +2825,16 @@ class SimpleEngineRunner:
         if root.phase not in _CLEANUP_TERMINAL_PHASES:
             raise EngineWorkerBusyError(f"任务仍在运行，不能清理记录: {root.phase}")
         summary = root.summary if isinstance(root.summary, Mapping) else {}
+        if summary.get("automatic") is True and root.phase in {
+            "executed", "completed", "failed_cleanup",
+        }:
+            lifecycle = summary.get("lifecycle")
+            cleanup = lifecycle.get("cleanup") if isinstance(lifecycle, Mapping) else None
+            if lifecycle is not None and (
+                not isinstance(cleanup, Mapping)
+                or cleanup.get("status") != "completed"
+            ):
+                raise EngineWorkerBusyError("任务最终 source/staging 清理尚未完成，不能删除记录")
         if (
             root.phase in {"failed", "failed_provider"}
             and summary.get("automatic") is True
@@ -2381,46 +2987,151 @@ class SimpleEngineRunner:
             value = 0.88
         return max(0.5, min(0.99, value))
 
-    def _automatic_target_parent(
-        self,
-        match: object,
-        source_path: str,
-    ) -> str:
-        """Choose the library shelf from machine evidence, never a UI choice."""
-        media_type = str(getattr(match, "media_type", ""))
-        if media_type == "movie":
-            return f"{self.library_root}/电影"
-        if media_type != "tv":
-            raise EngineRequestError(f"自动匹配返回了不支持的媒体类型: {media_type}")
-        lowered = source_path.casefold()
-        anime_markers = ("/番剧/", "/番組/", "/anime/", "/animation/", "/动漫/")
-        is_animation = any(marker in lowered for marker in anime_markers)
-        # TMDB details are the authoritative fallback when the inbound folder
-        # is the neutral /待刮削 root.  A failed enrichment must not discard a
-        # confident TV match or leave its shelf undecided.
-        details: Mapping[str, object] = {}
-        getter = getattr(self.tmdb, "get", None)
-        if callable(getter):
-            try:
-                raw = getter(f"/tv/{int(getattr(match, 'tmdb_id'))}")
-                if isinstance(raw, Mapping):
-                    details = raw
-            except Exception:
-                details = {}
-        genres = details.get("genres")
-        if isinstance(genres, list):
-            is_animation = is_animation or any(
-                isinstance(row, Mapping) and row.get("id") == 16 for row in genres
+    def _target_root_for_confirmed_shelf(self, value: object) -> tuple[TargetShelf, str]:
+        """Resolve a user-confirmed shelf without consulting TMDB heuristics."""
+        try:
+            shelf = parse_target_shelf(value)
+            return shelf, target_root_for_shelf(self.library_root, shelf)
+        except ValueError as exc:
+            raise EngineRequestError(str(exc)) from exc
+
+    @staticmethod
+    def _require_plan_target_shelf_containment(
+        plan: object,
+        *,
+        target_root: str,
+        stage: str,
+    ) -> None:
+        """Keep every formal target inside one confirmed first-level shelf.
+
+        The planner normally receives the selected root as its parent, but a
+        persisted plan or an injected planner is still untrusted at the
+        single-writer boundary. Validate the concrete work root and every
+        target file before the plan can be stored or replayed.
+        """
+        shelf_root = _safe_remote_path(
+            target_root,
+            field=f"{stage} target_shelf_root",
+            allow_root=False,
+        )
+        prefix = shelf_root + "/"
+
+        def require_within(value: object, *, field: str) -> str:
+            path = _safe_remote_path(value, field=f"{stage} {field}", allow_root=False)
+            if not path.startswith(prefix):
+                raise EngineRequestError(
+                    f"{stage}拒绝目标货架外的路径: {path}"
+                )
+            return path
+
+        def require_basename(value: object, *, field: str) -> str:
+            if (
+                not isinstance(value, str)
+                or not value
+                or value in {".", ".."}
+                or "/" in value
+                or "\\" in value
+                or "\x00" in value
+            ):
+                raise EngineRequestError(f"{stage} {field} 必须是安全文件名")
+            return value
+
+        require_within(getattr(plan, "target_root", None), field="target_work_path")
+        metadata = getattr(plan, "metadata", None)
+        if isinstance(metadata, Mapping):
+            series_root = metadata.get("series_root")
+            if series_root is not None:
+                require_within(series_root, field="metadata.series_root")
+        for index, item in enumerate(list(getattr(plan, "files", ()) or ())):
+            source_path = _safe_remote_path(
+                getattr(item, "source_path", None),
+                field=f"{stage} files[{index}].source_path",
+                allow_root=False,
             )
-        if details.get("original_language") in {"ja", "zh", "ko"}:
-            is_animation = is_animation or details.get("original_language") == "ja"
-        countries = details.get("origin_country")
-        if isinstance(countries, list) and "JP" in countries:
-            is_animation = True
-        return (
-            f"{self.library_root}/番剧"
-            if is_animation
-            else f"{self.library_root}/美剧"
+            source_dir = _safe_remote_path(
+                getattr(item, "source_dir", None),
+                field=f"{stage} files[{index}].source_dir",
+                allow_root=False,
+            )
+            original_name = require_basename(
+                getattr(item, "original_name", None),
+                field=f"files[{index}].original_name",
+            )
+            if source_path != posixpath.join(source_dir, original_name):
+                raise EngineRequestError(
+                    f"{stage} files[{index}] 的来源路径与文件名不一致"
+                )
+            target_dir = require_within(
+                getattr(item, "target_dir", None),
+                field=f"files[{index}].target_dir",
+            )
+            final_name = require_basename(
+                getattr(item, "final_name", None),
+                field=f"files[{index}].final_name",
+            )
+            # The executor checks this intermediate path before a rename, so
+            # it is a formal-library target too (not just the final name).
+            require_within(
+                posixpath.join(target_dir, original_name),
+                field=f"files[{index}].intermediate_target_path",
+            )
+            require_within(
+                posixpath.join(target_dir, final_name),
+                field=f"files[{index}].target_path",
+            )
+
+        # NFO and artwork targets are derived from metadata (collection/batch
+        # member roots in particular), not necessarily from ``files``.  Run
+        # the same pure projections used by the writer and gate every target
+        # before a plan can be persisted, replayed, or repaired.
+        try:
+            engine = __import__("engine.scraper", fromlist=["planned_nfos", "planned_artwork"])
+            artifact_functions = (
+                ("nfo", getattr(engine, "planned_nfos", None)),
+                ("artwork", getattr(engine, "planned_artwork", None)),
+            )
+            for kind, function in artifact_functions:
+                if not callable(function):
+                    raise EngineRequestError(f"{stage}缺少 {kind} 目标投影")
+                outputs = function(plan)
+                if not isinstance(outputs, (list, tuple)):
+                    raise EngineRequestError(f"{stage}{kind} 目标投影格式无效")
+                for index, output in enumerate(outputs):
+                    if not isinstance(output, (list, tuple)) or not output:
+                        raise EngineRequestError(f"{stage}{kind}[{index}] 目标投影格式无效")
+                    require_within(output[0], field=f"{kind}[{index}].target_path")
+        except EngineRequestError:
+            raise
+        except Exception as exc:
+            raise EngineRequestError(f"{stage}无法验证元数据/艺术图目标: {exc}") from exc
+
+    def _require_persisted_target_shelf_containment(
+        self,
+        job: EngineJob,
+        plan: object,
+        *,
+        stage: str,
+    ) -> None:
+        """Revalidate a selected job before any execution or recovery.
+
+        Plain direct planner tests/tools predate the public automatic intake
+        and are not ordinary roots.  A durable automatic root, however, can
+        never use that compatibility lane to write or recover without a
+        complete user selection.
+        """
+        if job.target_shelf is None and job.target_root is None and job.selected_at is None:
+            if (
+                job.summary.get("automatic") is True
+                and job.summary.get("audit_owned") is not True
+                and job.summary.get("internal_child") is not True
+            ):
+                raise EngineRequestError("自动任务尚未选择目标货架，不能进入正式处理")
+            return
+        _selected, expected_root = self._confirmed_target_selection(job)
+        self._require_plan_target_shelf_containment(
+            plan,
+            target_root=expected_root,
+            stage=stage,
         )
 
     def _archive_task_roots(self, job_id: str) -> tuple[Path, str]:
@@ -2458,6 +3169,9 @@ class SimpleEngineRunner:
         method = getattr(adapter, "prepare_ordinary_request", None)
         if not callable(method):
             return request, None
+        # Archive inspection may perform the first remote listing/download;
+        # authenticate at this post-start boundary before invoking it.
+        self._ensure_authenticated(self.alist)
         local_staging, remote_staging = self._archive_task_roots(job_id)
         kwargs = {
             "alist": self.alist,
@@ -2486,6 +3200,49 @@ class SimpleEngineRunner:
             projection = None
         return replace(request, source_path=normalized), projection
 
+    def _reusable_archive_projection(
+        self,
+        job: EngineJob,
+        request: EngineRequest,
+    ) -> tuple[EngineRequest, Mapping[str, object] | None]:
+        """Reuse one durable archive staging projection after a conflict.
+
+        A target-shelf conflict happens after archive extraction has already
+        been verified.  Re-running the adapter on reselection would create a
+        second task staging tree (and can consume a one-shot archive source).
+        Only accept a projection that still points inside this job's exact
+        archive staging root; malformed or foreign records fail closed.
+        """
+        raw = job.summary.get("archive_preprocessed")
+        if not isinstance(raw, Mapping) or raw.get("changed") is not True:
+            return request, None
+        source = raw.get("source_path")
+        task_staging = raw.get("task_staging")
+        if not isinstance(source, str) or not isinstance(task_staging, str):
+            raise EngineRequestError("已验证的归档 staging 记录不完整")
+        normalized_source = _safe_remote_path(
+            source,
+            field="已验证归档 source_path",
+            allow_root=False,
+        )
+        expected_local, expected_remote = self._archive_task_roots(job.id)
+        local_staging = Path(task_staging)
+        if not local_staging.is_absolute():
+            raise EngineRequestError("已验证的归档 task_staging 必须是绝对本地路径")
+        if local_staging.is_symlink():
+            raise EngineRequestError("已验证的归档 task_staging 不能是符号链接")
+        try:
+            normalized_local = local_staging.resolve(strict=False)
+            normalized_expected_local = expected_local.resolve(strict=False)
+        except OSError as exc:
+            raise EngineRequestError("已验证的归档 task_staging 无法解析") from exc
+        if normalized_local != normalized_expected_local:
+            raise EngineRequestError("已验证的归档 staging 不属于当前任务")
+        archive_prefix = expected_remote + "/archive/"
+        if not normalized_source.startswith(archive_prefix):
+            raise EngineRequestError("已验证的归档 source 不属于当前任务 staging")
+        return replace(request, source_path=normalized_source), dict(raw)
+
     def _preprocess_ordinary_request(
         self, request: EngineRequest, *, job_id: str | None = None,
     ) -> EngineRequest:
@@ -2501,12 +3258,21 @@ class SimpleEngineRunner:
         self,
         source_path: str,
         payload: Mapping[str, object] | None = None,
+        *,
+        target_shelf: object | None = None,
     ) -> tuple[EngineRequest, AutomaticIdentity]:
-        """Infer identity, shelf and season from one source directory."""
-        # The automatic contract has one input: the source directory.
+        """Infer identity after the caller has durably selected a shelf."""
+        # The automatic contract has one user-controlled input in addition to
+        # the source: a closed target-shelf enum.  It is deliberately *not*
+        # passed as a TMDB media-type filter, so a real movie selected for an
+        # incompatible TV shelf becomes a policy conflict rather than a
+        # silently different match.
         del payload
         body: dict[str, object] = {}
         source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        if target_shelf is None:
+            raise EngineRequestError("自动任务尚未选择目标货架")
+        selected_shelf, selected_root = self._target_root_for_confirmed_shelf(target_shelf)
         self._ensure_authenticated(self.alist)
         engine = __import__("engine.scraper", fromlist=["auto_match_tmdb"])
         raw_type = "auto"
@@ -2562,19 +3328,7 @@ class SimpleEngineRunner:
         media_type = str(getattr(match, "media_type", ""))
         if media_type == "tv" and not isinstance(season, int):
             season = 1
-        parent = self._automatic_target_parent(
-            match,
-            source,
-        )
-        request = EngineRequest.from_mapping({
-            **body,
-            "source_path": source,
-            "parent_path": parent,
-            "media_type": media_type,
-            "tmdb_id": int(getattr(match, "tmdb_id")),
-            "query": query,
-            "season": season if isinstance(season, int) else 1,
-        })
+        parent = selected_root
         identity = AutomaticIdentity(
             media_type=media_type,
             tmdb_id=int(getattr(match, "tmdb_id")),
@@ -2584,13 +3338,33 @@ class SimpleEngineRunner:
             target_parent=parent,
             season=season if isinstance(season, int) else None,
             trace=dict(getattr(match, "decision_trace", {}) or {}),
+            target_shelf=selected_shelf.value,
+            target_shelf_root=selected_root,
         )
+        if not target_shelf_allows_media_type(selected_shelf, media_type):
+            raise TargetShelfPolicyConflictError(
+                target_shelf=selected_shelf,
+                media_type=media_type,
+                identity=identity,
+            )
+        request = EngineRequest.from_mapping({
+            **body,
+            "source_path": source,
+            "parent_path": parent,
+            "media_type": media_type,
+            "target_shelf": selected_shelf.value,
+            "tmdb_id": int(getattr(match, "tmdb_id")),
+            "query": query,
+            "season": season if isinstance(season, int) else 1,
+        })
         return request, identity
 
     def _request_from_manual_identity(
         self,
         source: str,
         correction: Mapping[str, object],
+        *,
+        target_shelf: object,
     ) -> tuple[EngineRequest, AutomaticIdentity]:
         """Build a bounded explicit retry request after identity failure.
 
@@ -2617,20 +3391,8 @@ class SimpleEngineRunner:
         # Keep title/year and target parent policy-derived.  The correction
         # request must never become a second, client-controlled planner.
         title = posixpath.basename(source.rstrip("/")) or str(raw_id)
-        parent = (
-            f"{self.library_root}/电影"
-            if media_type == "movie"
-            else f"{self.library_root}/美剧"
-        )
+        selected_shelf, parent = self._target_root_for_confirmed_shelf(target_shelf)
         year_text = "未知年份"
-        request = EngineRequest.from_mapping({
-            "source_path": source,
-            "parent_path": parent,
-            "media_type": media_type,
-            "tmdb_id": raw_id,
-            "query": title,
-            "season": raw_season if media_type == "tv" else 1,
-        })
         identity = AutomaticIdentity(
             media_type=media_type,
             tmdb_id=raw_id,
@@ -2640,7 +3402,24 @@ class SimpleEngineRunner:
             target_parent=parent,
             season=raw_season if media_type == "tv" else None,
             trace={"source": "manual_retry"},
+            target_shelf=selected_shelf.value,
+            target_shelf_root=parent,
         )
+        if not target_shelf_allows_media_type(selected_shelf, media_type):
+            raise TargetShelfPolicyConflictError(
+                target_shelf=selected_shelf,
+                media_type=media_type,
+                identity=identity,
+            )
+        request = EngineRequest.from_mapping({
+            "source_path": source,
+            "parent_path": parent,
+            "media_type": media_type,
+            "target_shelf": selected_shelf.value,
+            "tmdb_id": raw_id,
+            "query": title,
+            "season": raw_season if media_type == "tv" else 1,
+        })
         return request, identity
 
     def _build_plan(self, request: EngineRequest) -> object:
@@ -2763,6 +3542,14 @@ class SimpleEngineRunner:
         from the public root queue.
         """
         request = request if isinstance(request, EngineRequest) else EngineRequest.from_mapping(request)
+        selected_shelf: TargetShelf | None = None
+        selected_root: str | None = None
+        if request.target_shelf is not None:
+            selected_shelf, selected_root = self._target_root_for_confirmed_shelf(
+                request.target_shelf,
+            )
+            if request.parent_path != selected_root:
+                raise EngineRequestError("Engine 请求 parent_path 必须等于已确认目标货架根目录")
         if job_id is None:
             job_id = f"engine-{uuid.uuid4().hex}"
         _safe_job_id(job_id)
@@ -2777,6 +3564,12 @@ class SimpleEngineRunner:
                 request, job_id=job_id,
             )
         plan = self._build_plan(request)
+        if selected_root is not None:
+            self._require_plan_target_shelf_containment(
+                plan,
+                target_root=selected_root,
+                stage="计划生成",
+            )
         if internal_child_of is not None:
             try:
                 _require_provider_tv_child_primary_videos(plan, stage="child 计划")
@@ -2814,6 +3607,9 @@ class SimpleEngineRunner:
             request=asdict(request),
             plan=dict(body),
             summary=summary,
+            target_shelf=selected_shelf.value if selected_shelf is not None else None,
+            target_root=selected_root,
+            selected_at=now if selected_shelf is not None else None,
         )
         atomic_write_json(self._job_path(job_id), job.as_dict(), allow_nan=False)
         return job
@@ -2852,24 +3648,42 @@ class SimpleEngineRunner:
         payload: Mapping[str, object] | None = None,
         *,
         job_id: str | None = None,
+        target_shelf: object | None = None,
     ) -> EngineJob:
-        """Resolve and persist one plan without exposing identity decisions."""
+        """Resolve and persist one already-shelf-selected automatic plan.
+
+        This direct helper is used by focused tests and internal tooling; it
+        deliberately has the same selection gate as the durable HTTP path.
+        """
         if job_id is None:
             job_id = f"engine-{uuid.uuid4().hex}"
         original_source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        if target_shelf is None:
+            raise EngineRequestError("自动任务尚未选择目标货架")
+        selected_shelf, selected_root = self._target_root_for_confirmed_shelf(target_shelf)
         intake = EngineRequest.from_mapping({
             "source_path": original_source,
-            "parent_path": self.library_root,
+            "parent_path": selected_root,
             "media_type": "auto",
+            "target_shelf": selected_shelf.value,
         })
         intake, archive_projection = self._preprocess_ordinary_request_details(
             intake, job_id=job_id,
         )
-        request, identity = self.resolve_automatic_request(intake.source_path, payload)
+        request, identity = self.resolve_automatic_request(
+            intake.source_path,
+            payload,
+            target_shelf=selected_shelf,
+        )
         job = self.plan_job(request, job_id=job_id, skip_archive_preprocessing=True)
         summary = dict(job.summary)
-        summary["identity"] = identity.as_dict()
-        summary["automatic"] = True
+        summary.update({
+            "identity": identity.as_dict(),
+            "automatic": True,
+            "target_shelf": selected_shelf.value,
+            "selected_target_root": selected_root,
+            "target_work_path": summary.get("target_root"),
+        })
         if original_source != request.source_path:
             summary["ingress_source_path"] = original_source
         if archive_projection is not None:
@@ -2890,40 +3704,149 @@ class SimpleEngineRunner:
         """Resolve and persist the plan for an already queued source job."""
         with self.worker_lock():
             job = self._read(job_id)
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
             if job.phase == "planned":
                 return job
             if job.phase == "executed":
                 return job
-            source = job.request.get("source_path")
-            if not isinstance(source, str):
-                raise EngineRequestError("自动任务缺少 source_path")
-            original_source = _safe_remote_path(source, field="source_path", allow_root=False)
+            if job.phase == "awaiting_target_shelf":
+                raise EngineRequestError("自动任务尚未选择目标货架，不能规划")
+            if job.phase == "target_policy_conflict":
+                return job
+            if job.phase not in {
+                "queued", "archive_preprocessing", "identity_matching",
+                "planning", "retry_wait", "failed_identity",
+            }:
+                raise EngineJobConflictError(
+                    f"Engine job {job_id} 当前不能规划: {job.phase}"
+                )
+            selected_shelf, selected_root = self._confirmed_target_selection(job)
+            original_source = self._job_ingress_source(job)
             intake = EngineRequest.from_mapping({
                 "source_path": original_source,
-                "parent_path": self.library_root,
+                "parent_path": selected_root,
                 "media_type": "auto",
+                "target_shelf": selected_shelf.value,
             })
+            archiving_summary = self._with_active_operation(
+                {**job.summary, "automatic_stage": "archive_preprocessing"},
+                kind="planning",
+            )
             archiving = replace(
                 job,
                 phase="archive_preprocessing",
                 updated_at=_now(),
                 error=None,
-                summary={**job.summary, "automatic_stage": "archive_preprocessing"},
+                summary=archiving_summary,
             )
             atomic_write_json(self._job_path(job_id), archiving.as_dict(), allow_nan=False)
-            archive_request, archive_projection = self._preprocess_ordinary_request_details(
-                intake, job_id=job_id, retry_password=retry_password,
+            try:
+                _cancellation_checkpoint()
+                archive_request, archive_projection = self._reusable_archive_projection(job, intake)
+                if archive_projection is None:
+                    archive_request, archive_projection = self._preprocess_ordinary_request_details(
+                        intake, job_id=job_id, retry_password=retry_password,
+                    )
+                cancelled = self._consume_cancel_request(archiving)
+                if cancelled is not None:
+                    return cancelled
+            except EngineRequestError as exc:
+                summary = dict(archiving.summary)
+                summary.update({
+                    "automatic_terminal": True,
+                    "automatic_stage": "failed_archive",
+                    "archive_projection_status": "invalid",
+                })
+                summary = self._without_active_operation(summary)
+                failed = replace(
+                    archiving,
+                    phase="failed_archive",
+                    updated_at=_now(),
+                    summary=summary,
+                    error=redact_error(exc),
+                )
+                atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
+                raise
+            archive_summary = dict(archiving.summary)
+            if archive_projection is not None:
+                archive_summary["archive_preprocessed"] = dict(archive_projection)
+            if archive_request.source_path != original_source:
+                archive_summary["ingress_source_path"] = original_source
+                archive_summary["archive_source_path"] = archive_request.source_path
+            matching = replace(
+                archiving,
+                phase="identity_matching",
+                updated_at=_now(),
+                request={"source_path": archive_request.source_path},
+                summary=archive_summary,
             )
-            correction = job.summary.get("manual_identity")
-            if isinstance(correction, Mapping):
-                request, identity = self._request_from_manual_identity(archive_request.source_path, correction)
-            else:
-                request, identity = self.resolve_automatic_request(archive_request.source_path)
-            matching = replace(archiving, phase="identity_matching", updated_at=_now())
             atomic_write_json(self._job_path(job_id), matching.as_dict(), allow_nan=False)
+            cancelled = self._consume_cancel_request(matching)
+            if cancelled is not None:
+                return cancelled
+            correction = job.summary.get("manual_identity")
+            try:
+                if isinstance(correction, Mapping):
+                    request, identity = self._request_from_manual_identity(
+                        archive_request.source_path,
+                        correction,
+                        target_shelf=selected_shelf,
+                    )
+                else:
+                    request, identity = self.resolve_automatic_request(
+                        archive_request.source_path,
+                        target_shelf=selected_shelf,
+                    )
+                cancelled = self._consume_cancel_request(matching)
+                if cancelled is not None:
+                    return cancelled
+            except TargetShelfPolicyConflictError as exc:
+                summary = dict(matching.summary)
+                summary.update({
+                    "automatic": True,
+                    "automatic_stage": "target_policy_conflict",
+                    "target_shelf": selected_shelf.value,
+                    "selected_target_root": selected_root,
+                    "target_work_path": None,
+                })
+                if archive_projection is not None:
+                    # Keep the verified staging coordinates across the
+                    # conflict/reselection boundary; the next /start must
+                    # consume this projection without re-extracting.
+                    summary["archive_preprocessed"] = dict(archive_projection)
+                if archive_request.source_path != original_source:
+                    summary["ingress_source_path"] = original_source
+                if isinstance(exc.identity, AutomaticIdentity):
+                    summary["identity"] = exc.identity.as_dict()
+                summary = self._without_active_operation(summary)
+                conflicted = replace(
+                    matching,
+                    phase="target_policy_conflict",
+                    updated_at=_now(),
+                    request={"source_path": original_source},
+                    plan={},
+                    summary=summary,
+                    error=redact_error(exc),
+                    execution=None,
+                )
+                atomic_write_json(self._job_path(job_id), conflicted.as_dict(), allow_nan=False)
+                return conflicted
             planning = replace(matching, phase="planning", updated_at=_now())
             atomic_write_json(self._job_path(job_id), planning.as_dict(), allow_nan=False)
+            cancelled = self._consume_cancel_request(planning)
+            if cancelled is not None:
+                return cancelled
             plan = self._build_plan(request)
+            cancelled = self._consume_cancel_request(planning)
+            if cancelled is not None:
+                return cancelled
+            self._require_plan_target_shelf_containment(
+                plan,
+                target_root=selected_root,
+                stage="自动计划生成",
+            )
             engine = __import__("engine.scraper", fromlist=["plan_to_dict"])
             serializer = getattr(engine, "plan_to_dict", None)
             if not callable(serializer):
@@ -2936,6 +3859,11 @@ class SimpleEngineRunner:
                 "identity": identity.as_dict(),
                 "automatic": True,
                 "automatic_stage": "formal_write",
+                "target_shelf": selected_shelf.value,
+                "selected_target_root": selected_root,
+                # Keep the historical summary/plan ``target_root`` as the
+                # concrete work path; audit and Provider rely on that scope.
+                "target_work_path": summary.get("target_root"),
                 "resource_gaps": list(
                     (body.get("scan_report") or {}).get("resource_gaps") or []
                 ) if isinstance(body.get("scan_report"), Mapping) else [],
@@ -2948,6 +3876,7 @@ class SimpleEngineRunner:
                 summary["ingress_source_path"] = original_source
             if archive_projection is not None:
                 summary["archive_preprocessed"] = dict(archive_projection)
+            summary = self._without_active_operation(summary)
             planned = replace(
                 planning,
                 phase="planned",
@@ -2960,7 +3889,13 @@ class SimpleEngineRunner:
             atomic_write_json(self._job_path(job_id), planned.as_dict(), allow_nan=False)
             return planned
 
-    def _invoke_executor(self, plan: object) -> Mapping[str, object]:
+    def _invoke_executor(
+        self,
+        plan: object,
+        *,
+        defer_cleanup: bool = False,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Mapping[str, object]:
         # Keep the gate here too. ``repair_automatic_artifacts`` and injected
         # executors both use this path, so neither can bypass the runner's
         # formal-write boundary by calling a different execution entrypoint.
@@ -2971,14 +3906,73 @@ class SimpleEngineRunner:
         target = method if callable(method) else executor if callable(executor) else None
         if target is None:
             raise SimpleEngineError("无可调用的 Engine executor")
-        result = target(plan)
+        token = _DEFER_TASK_CLEANUP.set(bool(defer_cleanup))
+        cancel_token = _CANCEL_REQUEST_CHECK.set(cancel_requested)
+        try:
+            result = target(plan)
+        finally:
+            _CANCEL_REQUEST_CHECK.reset(cancel_token)
+            _DEFER_TASK_CLEANUP.reset(token)
         if not isinstance(result, Mapping):
             return {"result": _jsonable(result)}
         return dict(result)
 
+    @staticmethod
+    def _with_verified_automatic_formal_write(
+        summary: Mapping[str, object],
+        *,
+        reset_cleanup: bool,
+    ) -> dict[str, object]:
+        """Persist the formal-write fact without erasing cleanup recovery.
+
+        The ordinary root has two durable boundaries: formal media/artifact
+        write, then the later source/staging cleanup.  A restart readback or
+        an artifact repair may prove the first boundary again while the second
+        is pending or has already failed.  Keep the latter state (and its
+        per-step evidence) intact unless a fresh formal execution explicitly
+        replaces it.
+        """
+        updated = dict(summary)
+        lifecycle_raw = updated.get("lifecycle")
+        lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
+        now = _now()
+
+        formal_raw = lifecycle.get("formal_write")
+        formal = dict(formal_raw) if isinstance(formal_raw, Mapping) else {}
+        formal.update({"status": "verified", "updated_at": now})
+        lifecycle["formal_write"] = formal
+
+        cleanup_raw = lifecycle.get("cleanup")
+        cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
+        known_cleanup_states = {"pending", "running", "failed", "completed"}
+        if reset_cleanup or cleanup.get("status") not in known_cleanup_states:
+            lifecycle["cleanup"] = {
+                "status": "pending",
+                "updated_at": now,
+            }
+        else:
+            # Preserve failed/running/completed state and any durable step
+            # facts.  This is what lets a restarted cleanup retry without a
+            # second writer invocation.
+            lifecycle["cleanup"] = cleanup
+
+        # Do not let a stale prior audit/provider decision authorize cleanup
+        # after a newly executed formal write.  Recovery instead preserves an
+        # existing true decision because it only read back the same write.
+        if reset_cleanup:
+            lifecycle["cleanup_ready"] = False
+        elif type(lifecycle.get("cleanup_ready")) is not bool:
+            lifecycle["cleanup_ready"] = False
+
+        updated["lifecycle"] = lifecycle
+        return updated
+
     def execute_job(self, job_id: str) -> EngineJob:
         with self.worker_lock():
             job = self._read(job_id)
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
             if job.phase == "executed":
                 return job
             if job.summary.get("audit_owned") is True:
@@ -2992,6 +3986,15 @@ class SimpleEngineRunner:
             if not callable(parser):
                 raise SimpleEngineError("Engine 缺少 plan_from_dict")
             plan = parser(job.plan)
+            self._require_persisted_target_shelf_containment(
+                job,
+                plan,
+                stage="计划执行",
+            )
+            defer_cleanup = (
+                job.summary.get("automatic") is True
+                and job.summary.get("internal_child") is not True
+            )
             try:
                 # Do this before persisting ``executing``. A problem-bearing
                 # plan must never look like it began a formal write, even for
@@ -3016,32 +4019,67 @@ class SimpleEngineRunner:
                 job,
                 phase="executing",
                 updated_at=_now(),
+                summary=self._with_active_operation(
+                    job.summary,
+                    kind="formal_write",
+                ),
                 error=None,
             )
             atomic_write_json(self._job_path(job_id), executing.as_dict(), allow_nan=False)
             try:
-                result = self._invoke_executor(plan)
+                result = self._invoke_executor(
+                    plan,
+                    defer_cleanup=defer_cleanup,
+                    cancel_requested=lambda: self._cancel_requested(executing),
+                )
                 result = dict(result)
-                consumed = self._consume_archive_source(job)
-                if consumed is not None:
-                    result["archive_source_consumption"] = consumed
+                if defer_cleanup:
+                    result.setdefault("cleanup_deferred", True)
+                    result.setdefault(
+                        "cleanup_pending",
+                        [
+                            str(getattr(item, "source_path"))
+                            for item in list(getattr(plan, "cleanup_files", ()) or ())
+                        ],
+                    )
+                cancelled = self._consume_cancel_request(executing)
+                if cancelled is not None:
+                    return cancelled
+            except EngineCancellationRequested:
+                cancelled = self._consume_cancel_request(executing)
+                return cancelled or self._cancelled_job(
+                    executing,
+                    reason="cancelled by operator",
+                )
             except Exception as exc:
+                cancelled = self._consume_cancel_request(executing)
+                if cancelled is not None:
+                    return cancelled
                 failed = replace(
                     executing,
                     phase="failed",
                     updated_at=_now(),
+                    summary=self._without_active_operation(executing.summary),
                     error=redact_error(exc),
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 raise
+            summary = self._without_active_operation(executing.summary)
+            if defer_cleanup:
+                summary = self._with_verified_automatic_formal_write(
+                    summary,
+                    reset_cleanup=True,
+                )
             done = replace(
                 executing,
                 phase="executed",
                 updated_at=_now(),
+                summary=summary,
                 execution=result,
                 error=None,
             )
             atomic_write_json(self._job_path(job_id), done.as_dict(), allow_nan=False)
+            self._clear_cancel_request(job_id)
             return done
 
     def _consume_archive_source(self, job: EngineJob) -> Mapping[str, object] | None:
@@ -3062,7 +4100,10 @@ class SimpleEngineRunner:
         parent, name = posixpath.split(source.rstrip("/"))
         if not parent or not name:
             raise EngineExecutionError("归档原始来源路径无效，无法隔离")
-        lane = "归档" if isinstance(projection, Mapping) else "入站"
+        # Every automatic ingress owns the same task-scoped processed lane;
+        # ordinary videos and extracted archives must not split ownership
+        # between ``入站`` and ``归档``.
+        lane = "归档"
         processed_root = _safe_remote_path(
             f"{self.library_root}/ScrapeFlow/{lane}/{_safe_job_id(job.id)}/processed",
             field="archive processed root",
@@ -3090,8 +4131,16 @@ class SimpleEngineRunner:
                 parent_rows = listing(parent)
             except Exception:
                 parent_rows = []
+            # A parent listing can contain a regular file with the same name
+            # as an intake directory (or stale metadata from a previous
+            # move).  The lifecycle boundary owns a directory, so only an
+            # explicit directory row is admissible here.  Failing closed is
+            # important: moving a same-named file would consume an object
+            # outside the persisted ingress ownership proof.
             exists = isinstance(parent_rows, list) and any(
-                isinstance(row, Mapping) and row.get("name") == name
+                isinstance(row, Mapping)
+                and row.get("name") == name
+                and row.get("is_dir") is True
                 for row in parent_rows
             )
         if not exists:
@@ -3129,9 +4178,28 @@ class SimpleEngineRunner:
             if job.summary.get("audit_owned") is True:
                 raise SimpleEngineError("审计创建的根任务没有可直接重放的元数据计划")
             plan = self._plan_from_job(job)
-            result = self._invoke_executor(plan)
+            self._require_persisted_target_shelf_containment(
+                job,
+                plan,
+                stage="元数据修复",
+            )
+            result = self._invoke_executor(
+                plan,
+                defer_cleanup=(
+                    job.summary.get("automatic") is True
+                    and job.summary.get("internal_child") is not True
+                ),
+            )
             summary = dict(job.summary)
             summary["last_artifact_repair_at"] = _now()
+            if (
+                job.summary.get("automatic") is True
+                and job.summary.get("internal_child") is not True
+            ):
+                summary = self._with_verified_automatic_formal_write(
+                    summary,
+                    reset_cleanup=False,
+                )
             repaired = replace(
                 job,
                 updated_at=_now(),
@@ -3152,11 +4220,36 @@ class SimpleEngineRunner:
         """
         with self.worker_lock():
             job = self._read(job_id)
-            if job.phase in {"planned", "executed", "cancelled"}:
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
+            # Recovery is a readback boundary for an already-persisted plan;
+            # it must never manufacture a retry record for an intake gate or
+            # an identity/planning phase that has no executable plan yet.
+            # In particular, a direct recovery call (or a stale timer) must
+            # leave ``awaiting_target_shelf`` untouched.
+            recoverable_phases = {
+                "executing", "verifying", "cleaning", "retry_wait", "failed",
+                "failed_write", "failed_verification", "failed_cleanup",
+            }
+            if job.phase not in recoverable_phases:
+                return job
+            if not job.plan:
                 return job
             try:
                 plan = self._plan_from_job(job)
-                execution = self._readback_plan(plan)
+                self._require_persisted_target_shelf_containment(
+                    job,
+                    plan,
+                    stage="恢复检查",
+                )
+                execution = self._readback_plan(
+                    plan,
+                    allow_pending_cleanup=(
+                        job.summary.get("automatic") is True
+                        and job.summary.get("internal_child") is not True
+                    ),
+                )
             except EngineRecoveryMatrixError as exc:
                 # A matrix conflict is a durable fact, not a transient
                 # provider error.  Keep the plan and paths for operator
@@ -3213,6 +4306,29 @@ class SimpleEngineRunner:
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 return failed
+            except EngineRequestError as exc:
+                # A persisted-path or target-shelf policy violation is not a
+                # remote visibility transient.  Retrying it would only keep
+                # an invalid plan on the scheduler and risk a later bypass.
+                summary = dict(job.summary)
+                summary["recovery"] = {
+                    "status": "terminal",
+                    "reason": "target_shelf_policy_violation",
+                }
+                summary["automatic_terminal"] = True
+                failed = replace(
+                    job,
+                    phase="failed_verification",
+                    updated_at=_now(),
+                    summary=summary,
+                    execution=None,
+                    error=(
+                        "恢复检查发现计划路径违反目标货架策略，已停止: "
+                        f"{redact_error(exc)}"
+                    ),
+                )
+                atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
+                return failed
             except Exception as exc:
                 summary = dict(job.summary)
                 summary["recovery"] = {
@@ -3231,10 +4347,26 @@ class SimpleEngineRunner:
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 return failed
+            summary = dict(job.summary)
+            if (
+                job.summary.get("automatic") is True
+                and job.summary.get("internal_child") is not True
+            ):
+                # A successful exact-path readback is the same formal-write
+                # proof as a synchronous executor return.  Older automatic
+                # JSON records predate this lifecycle field, while a failed
+                # cleanup record may already carry step evidence; normalize
+                # both without re-running the writer or downgrading a failed
+                # cleanup to a fresh pending state.
+                summary = self._with_verified_automatic_formal_write(
+                    summary,
+                    reset_cleanup=False,
+                )
             recovered = replace(
                 job,
                 phase="executed",
                 updated_at=_now(),
+                summary=summary,
                 execution=execution,
                 error=None,
             )
@@ -3269,7 +4401,12 @@ class SimpleEngineRunner:
             raise SimpleEngineError(f"AList readback 没有有效大小: {path}")
         return {"size": size}
 
-    def _readback_plan(self, plan: object) -> dict[str, object]:
+    def _readback_plan(
+        self,
+        plan: object,
+        *,
+        allow_pending_cleanup: bool = False,
+    ) -> dict[str, object]:
         _require_problem_free_plan(plan, stage="恢复检查")
         _require_cleanup_allowlist(plan, stage="恢复检查")
         media_only = _is_provider_media_only_plan(plan)
@@ -3429,12 +4566,16 @@ class SimpleEngineRunner:
                         raise EngineExecutionError(f"恢复检查找不到海报: {target}")
                     verified_artifacts.append({"target": target, "kind": str(role), "size": int(observed["size"])})
         cleaned: list[str] = []
+        pending_cleanup: list[str] = []
         for item in list(getattr(plan, "cleanup_files", ()) or ()):
             source = _safe_remote_path(
                 str(getattr(item, "source_path")),
                 field="cleanup_source_path",
                 allow_root=False,
             )
+            if allow_pending_cleanup:
+                pending_cleanup.append(source)
+                continue
             if self._exact_info(source, wait_for_visibility=False) is not None:
                 raise EngineExecutionError(f"恢复检查发现清理项仍存在: {source}")
             cleaned.append(source)
@@ -3447,44 +4588,519 @@ class SimpleEngineRunner:
             "media_only": media_only,
             "cleanup": cleaned,
             "cleanup_count": len(cleaned),
+            "cleanup_deferred": allow_pending_cleanup,
+            "cleanup_pending": pending_cleanup,
         }
 
-    def cancel_job(self, job_id: str, *, reason: str = "cancelled by operator") -> EngineJob:
-        """Mark a not-yet-executed plan cancelled without touching AList.
+    def _remove_empty_archive_staging(self, job: EngineJob | str) -> list[str]:
+        """Remove and read back only a task's empty ``archive`` directory.
 
-        ``failed_identity`` is intentionally included: a terminal identity
-        failure can retain its inbound source forever, and an operator needs
-        a local, reversible projection to close that task without deleting or
-        moving the source remotely.
+        AList may report an empty list for both an empty directory and a
+        missing path.  Probe the exact parent/name pair before each deletion
+        and again afterwards, so a failed remote cleanup cannot be recorded as
+        completed merely because an exception was swallowed.  This method
+        deliberately knows only ``<task>/archive``.  It must never delete
+        ``<task>`` itself: successful source consumption moves the original
+        input to its sibling ``<task>/processed`` directory, which is not
+        staging and remains owned by the user.
+        """
+        owner = job if isinstance(job, EngineJob) else self._read(job)
+        projection = owner.summary.get("archive_preprocessed")
+        if not isinstance(projection, Mapping) or projection.get("changed") is not True:
+            return []
+
+        _local_root, remote_root = self._archive_task_roots(owner.id)
+        listing = getattr(self.alist, "list", None)
+        remove_empty = getattr(self.alist, "remove_empty_dir", None)
+        if not callable(listing):
+            raise EngineExecutionError("AList 客户端缺少 list 接口，无法核对归档 staging 清理")
+        if not callable(remove_empty):
+            raise EngineExecutionError("AList 客户端缺少 remove_empty_dir 接口，无法清理归档 staging")
+
+        def rows(path: str) -> list[Mapping[str, object]]:
+            try:
+                raw = listing(path, refresh=True)
+            except TypeError:
+                raw = listing(path)
+            except Exception as exc:
+                raise EngineExecutionError(f"无法读取归档 staging 目录: {path}: {exc}") from exc
+            if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
+                raise EngineExecutionError(f"AList 归档 staging 目录回读格式无效: {path}")
+            return list(raw)
+
+        def directory_exists(path: str) -> bool:
+            parent, name = posixpath.split(path.rstrip("/"))
+            if not parent or not name:
+                raise EngineExecutionError(f"归档 staging 路径无效: {path}")
+            matches = [
+                item for item in rows(parent)
+                if item.get("name") == name
+            ]
+            if len(matches) > 1:
+                raise EngineExecutionError(f"归档 staging 父目录出现重名条目: {path}")
+            if not matches:
+                return False
+            if matches[0].get("is_dir") is not True:
+                raise EngineExecutionError(f"归档 staging 路径不是目录: {path}")
+            return True
+
+        removed: list[str] = []
+        # The plan source-root cleanup removes the deepest extracted tree.
+        # Close only the exact task-owned archive lane; ``processed`` is a
+        # sibling below ``remote_root`` and intentionally survives.
+        for path in (f"{remote_root}/archive",):
+            if not directory_exists(path):
+                continue
+            if rows(path):
+                raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {path}")
+            try:
+                remove_empty(path)
+            except Exception as exc:
+                raise EngineExecutionError(f"无法清理空归档 staging 目录: {path}: {exc}") from exc
+            if directory_exists(path):
+                raise EngineExecutionError(f"归档 staging 清理后目录仍存在: {path}")
+            removed.append(path)
+        return removed
+
+    def record_automatic_lifecycle_decision(
+        self,
+        job_id: str,
+        *,
+        audit_status: str,
+        provider_status: str,
+        cleanup_ready: bool,
+        reason: str | None = None,
+    ) -> EngineJob:
+        """Persist the audit/provider decision that gates final cleanup."""
+        if not isinstance(audit_status, str) or not audit_status:
+            raise EngineRequestError("lifecycle audit status 无效")
+        if not isinstance(provider_status, str) or not provider_status:
+            raise EngineRequestError("lifecycle provider status 无效")
+        if type(cleanup_ready) is not bool:
+            raise EngineRequestError("lifecycle cleanup_ready 必须是布尔值")
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.summary.get("automatic") is not True:
+                return job
+            summary = dict(job.summary)
+            lifecycle_raw = summary.get("lifecycle")
+            lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
+            cleanup_raw = lifecycle.get("cleanup")
+            cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
+            # A delayed audit/provider callback must not re-open a root whose
+            # source/staging evidence was already consumed.  Similarly, do
+            # not let a new decision overwrite the in-progress record that a
+            # finalizer will use for crash recovery.
+            if cleanup.get("status") == "completed":
+                return job
+            if cleanup.get("status") == "running":
+                raise EngineWorkerBusyError("任务最终清理正在执行，不能覆盖生命周期决定")
+            now = _now()
+            lifecycle["audit"] = {
+                "status": audit_status,
+                "updated_at": now,
+            }
+            provider: dict[str, object] = {
+                "status": provider_status,
+                "updated_at": now,
+            }
+            if reason:
+                provider["reason"] = redact_error(reason)
+            lifecycle["provider"] = provider
+            lifecycle["cleanup_ready"] = cleanup_ready
+            summary["lifecycle"] = lifecycle
+            updated = replace(job, summary=summary, updated_at=now)
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return updated
+
+    def finalize_automatic_lifecycle(self, job_id: str) -> EngineJob:
+        """Finish task-owned source/staging cleanup after audit/provider gates.
+
+        The method is deliberately separate from ``execute_job``.  It is
+        idempotent and only accepts a durable ``lifecycle.cleanup_ready``
+        decision written by the audit/provider coordinator, so a writer or a
+        stale provider callback cannot consume ingress early.
         """
         with self.worker_lock():
             job = self._read(job_id)
-            if job.phase == "executed":
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
+            if job.summary.get("internal_child") is True:
+                raise EngineJobConflictError("内部 child 不能执行根任务最终清理")
+            if job.summary.get("automatic") is not True:
+                raise EngineRequestError("只有 automatic 根任务使用最终生命周期清理")
+            lifecycle_raw = job.summary.get("lifecycle")
+            lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
+            cleanup_raw = lifecycle.get("cleanup")
+            cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
+            if cleanup.get("status") == "completed":
+                # Earlier drafts could leave a successfully retried cleanup
+                # in ``failed_cleanup``.  Normalize that public projection on
+                # the idempotent path without running any remote operation.
+                if job.phase == "failed_cleanup":
+                    normalized = replace(
+                        job,
+                        phase="executed",
+                        updated_at=_now(),
+                        error=None,
+                    )
+                    atomic_write_json(
+                        self._job_path(job.id), normalized.as_dict(), allow_nan=False,
+                    )
+                    return normalized
                 return job
-            if job.phase == "executing":
-                raise EngineWorkerBusyError("Engine 任务正在执行；请等待当前远端操作结束")
-            if job.phase not in {"planned", "failed", "failed_identity", "cancelled"}:
-                raise SimpleEngineError(f"Engine job {job_id} 当前不能取消: {job.phase}")
-            if job.phase == "cancelled":
-                return job
-            cancelled = replace(
-                job,
-                phase="cancelled",
-                updated_at=_now(),
-                error=redact_error(reason.strip() or "cancelled by operator"),
+            formal_write = lifecycle.get("formal_write")
+            if not isinstance(formal_write, Mapping) or formal_write.get("status") != "verified":
+                raise EngineWorkerBusyError("正式写入/回读尚未形成可清理事实")
+            if lifecycle.get("cleanup_ready") is not True:
+                raise EngineWorkerBusyError("审计或补源尚未形成最终清理决定")
+            audit = lifecycle.get("audit")
+            provider = lifecycle.get("provider")
+            if not (
+                isinstance(audit, Mapping)
+                and isinstance(audit.get("status"), str)
+                and audit.get("status")
+                and isinstance(provider, Mapping)
+                and isinstance(provider.get("status"), str)
+                and provider.get("status")
+            ):
+                raise EngineWorkerBusyError("审计/补源决定记录不完整，不能最终清理")
+            if job.phase not in {"executed", "completed", "cleaning", "failed_cleanup"}:
+                raise EngineWorkerBusyError(f"任务当前不能最终清理: {job.phase}")
+            children = self._owned_children(job)
+            if any(
+                child.phase not in _CLEANUP_TERMINAL_PHASES
+                for child in children
+            ):
+                raise EngineWorkerBusyError("任务仍有活动内部子任务，不能最终清理")
+
+            steps_raw = cleanup.get("steps")
+            steps = dict(steps_raw) if isinstance(steps_raw, Mapping) else {}
+            attempts_raw = cleanup.get("attempts")
+            attempts = attempts_raw if isinstance(attempts_raw, int) and not isinstance(attempts_raw, bool) else 0
+            cleanup["status"] = "running"
+            cleanup["attempts"] = attempts + 1
+            cleanup["steps"] = steps
+            cleanup["updated_at"] = _now()
+            cleanup.pop("error", None)
+            lifecycle["cleanup"] = cleanup
+            running_summary = self._with_active_operation(
+                job.summary,
+                kind="final_cleanup",
             )
-            atomic_write_json(self._job_path(job_id), cancelled.as_dict(), allow_nan=False)
-            return cancelled
+            running_summary["lifecycle"] = lifecycle
+            running = replace(
+                job,
+                phase="cleaning",
+                summary=running_summary,
+                updated_at=_now(),
+                error=None,
+            )
+            atomic_write_json(self._job_path(job.id), running.as_dict(), allow_nan=False)
+
+            current = running
+            missing = object()
+            cancel_token = _CANCEL_REQUEST_CHECK.set(
+                lambda: self._cancel_requested(current)
+            )
+
+            def prior_result(step: str) -> object:
+                raw = steps.get(step)
+                if isinstance(raw, Mapping) and raw.get("status") == "completed":
+                    return raw.get("result", missing)
+                return missing
+
+            def update_projection(
+                summary: dict[str, object],
+                step: str,
+                result: object,
+            ) -> None:
+                if step == "source_consumption":
+                    if isinstance(result, Mapping):
+                        summary["source_fate"] = str(result.get("status") or "already_consumed")
+                    else:
+                        summary["source_fate"] = "already_consumed"
+                    return
+                staging_raw = summary.get("staging_fate")
+                staging = dict(staging_raw) if isinstance(staging_raw, Mapping) else {}
+                if step == "plan_cleanup":
+                    staging["plan_cleanup"] = result
+                elif step == "archive_remote_staging":
+                    staging["archive_remote_removed"] = result
+                elif step == "archive_local_staging":
+                    staging["archive_local_removed"] = bool(result)
+                summary["staging_fate"] = staging
+
+            def persist_completed_step(step: str, result: object) -> None:
+                nonlocal current
+                now = _now()
+                steps[step] = {
+                    "status": "completed",
+                    "updated_at": now,
+                    "result": _jsonable(result),
+                }
+                cleanup["status"] = "running"
+                cleanup["steps"] = steps
+                cleanup["updated_at"] = now
+                cleanup.pop("error", None)
+                lifecycle["cleanup"] = cleanup
+                summary = dict(current.summary)
+                summary["lifecycle"] = dict(lifecycle)
+                update_projection(summary, step, _jsonable(result))
+                current = replace(
+                    current,
+                    phase="cleaning",
+                    summary=summary,
+                    updated_at=now,
+                    error=None,
+                )
+                atomic_write_json(
+                    self._job_path(current.id), current.as_dict(), allow_nan=False,
+                )
+
+            current_step = "plan_cleanup"
+            try:
+                _cancellation_checkpoint()
+                stored_cleanup = prior_result("plan_cleanup")
+                if isinstance(stored_cleanup, Mapping):
+                    cleanup_result: Mapping[str, object] = dict(stored_cleanup)
+                else:
+                    plan = self._plan_from_job(current)
+                    cleanup_result = SimplePlanExecutor(self.alist, self.tmdb).finalize_cleanup(plan)
+                    if not isinstance(cleanup_result, Mapping):
+                        raise EngineExecutionError("最终清理返回无效结果")
+                    cleanup_result = dict(cleanup_result)
+                    persist_completed_step("plan_cleanup", cleanup_result)
+
+                current_step = "source_consumption"
+                _cancellation_checkpoint()
+                stored_consumed = prior_result("source_consumption")
+                if isinstance(stored_consumed, Mapping):
+                    consumed: Mapping[str, object] | None = dict(stored_consumed)
+                else:
+                    consumed = self._consume_archive_source(current)
+                    consumed_result: Mapping[str, object] = (
+                        dict(consumed)
+                        if isinstance(consumed, Mapping)
+                        else {"status": "already_consumed"}
+                    )
+                    persist_completed_step("source_consumption", consumed_result)
+
+                current_step = "archive_remote_staging"
+                _cancellation_checkpoint()
+                stored_staging = prior_result("archive_remote_staging")
+                if isinstance(stored_staging, list) and all(isinstance(item, str) for item in stored_staging):
+                    staging_removed = list(stored_staging)
+                else:
+                    staging_removed = self._remove_empty_archive_staging(current)
+                    persist_completed_step("archive_remote_staging", staging_removed)
+
+                current_step = "archive_local_staging"
+                _cancellation_checkpoint()
+                stored_local = prior_result("archive_local_staging")
+                if type(stored_local) is bool:
+                    local_archive_removed = stored_local
+                else:
+                    local_archive_removed = self._remove_owned_local_tree(
+                        self.state_root / "archive-staging",
+                        current.id,
+                        label="archive local staging",
+                    )
+                    persist_completed_step("archive_local_staging", local_archive_removed)
+            except EngineCancellationRequested:
+                cancelled = self._consume_cancel_request(current)
+                return cancelled or self._cancelled_job(
+                    current,
+                    reason="cancelled by operator",
+                )
+            except Exception as exc:
+                failed_lifecycle = dict(lifecycle)
+                now = _now()
+                steps[current_step] = {
+                    "status": "failed",
+                    "error": redact_error(exc),
+                    "updated_at": now,
+                }
+                failed_cleanup = dict(cleanup)
+                failed_cleanup.update({
+                    "status": "failed",
+                    "error": redact_error(exc),
+                    "updated_at": now,
+                    "steps": steps,
+                })
+                failed_lifecycle["cleanup"] = failed_cleanup
+                failed_summary = self._without_active_operation(current.summary)
+                failed_summary["cleanup_only_retry"] = True
+                failed_summary["lifecycle"] = failed_lifecycle
+                failed = replace(
+                    current,
+                    phase="failed_cleanup",
+                    summary=failed_summary,
+                    updated_at=now,
+                    error=redact_error(exc),
+                )
+                atomic_write_json(self._job_path(current.id), failed.as_dict(), allow_nan=False)
+                return failed
+            finally:
+                _CANCEL_REQUEST_CHECK.reset(cancel_token)
+
+            final_lifecycle = dict(lifecycle)
+            final_cleanup = dict(cleanup)
+            final_cleanup.update({
+                "status": "completed",
+                "updated_at": _now(),
+                "steps": steps,
+            })
+            final_cleanup.pop("error", None)
+            final_lifecycle["cleanup"] = final_cleanup
+            final_summary = self._without_active_operation(current.summary)
+            final_summary.pop("cleanup_only_retry", None)
+            final_summary["lifecycle"] = final_lifecycle
+            final_summary["source_fate"] = str(
+                consumed.get("status") if isinstance(consumed, Mapping) else "already_consumed"
+            )
+            staging_raw = final_summary.get("staging_fate")
+            final_summary["staging_fate"] = {
+                **(dict(staging_raw) if isinstance(staging_raw, Mapping) else {}),
+                "archive_remote_removed": staging_removed,
+                "archive_local_removed": bool(local_archive_removed),
+                "plan_cleanup": dict(cleanup_result),
+            }
+            execution = dict(current.execution) if isinstance(current.execution, Mapping) else {}
+            execution["final_cleanup"] = dict(cleanup_result)
+            if isinstance(consumed, Mapping):
+                execution["archive_source_consumption"] = dict(consumed)
+            completed = replace(
+                current,
+                phase="completed" if job.phase == "completed" else "executed",
+                summary=final_summary,
+                execution=execution,
+                updated_at=_now(),
+                error=None,
+            )
+            atomic_write_json(self._job_path(completed.id), completed.as_dict(), allow_nan=False)
+            self._clear_cancel_request(job_id)
+            return completed
+
+    def cancel_job(self, job_id: str, *, reason: str = "cancelled by operator") -> EngineJob:
+        """Cancel a queued job immediately or a running one at a safe boundary.
+
+        A queued/inactive job changes only its durable projection and never
+        touches AList.  When another process owns the formal-write lock,
+        archive/identity/planning/executing/cleanup phases receive a
+        task-scoped request marker;
+        the current remote operation completes, then the owning worker marks
+        the job cancelled before another move, upload, or cleanup action.
+        """
+        normalized_reason = reason.strip() or "cancelled by operator"
+        immediate_phases = {
+            "awaiting_target_shelf", "target_policy_conflict", "queued",
+            "archive_preprocessing", "identity_matching", "planning", "planned",
+            "retry_wait", "failed", "failed_archive", "failed_identity",
+            "failed_planning", "failed_provider", "failed_write",
+            "failed_verification", "failed_cleanup", "executing", "verifying",
+            "cleaning", "cancelled",
+        }
+        try:
+            with self.worker_lock():
+                job = self._read(job_id)
+                if job.phase in {"executed", "completed"}:
+                    self._clear_cancel_request(job_id)
+                    return job
+                if job.phase not in immediate_phases:
+                    raise SimpleEngineError(
+                        f"Engine job {job_id} 当前不能取消: {job.phase}"
+                    )
+                if job.phase == "cancelled":
+                    self._clear_cancel_request(job_id)
+                    return job
+                return self._cancelled_job(job, reason=normalized_reason)
+        except EngineWorkerBusyError:
+            # Fence an idle revision before atomically closing it. Another
+            # task owns the global worker lock, so this job cannot start until
+            # that lock is released; its marker protects the tiny release
+            # race. Active operations instead consume a marker at their next
+            # safe AList/planning boundary.
+            job = self._read(job_id)
+            inactive_phases = {
+                "awaiting_target_shelf", "target_policy_conflict", "queued",
+                "planned", "retry_wait", "failed", "failed_archive",
+                "failed_identity", "failed_planning", "failed_provider",
+                "failed_write", "failed_verification", "failed_cleanup",
+            }
+            if job.phase in inactive_phases:
+                self._request_inactive_cancellation(job, reason=normalized_reason)
+                try:
+                    with self.worker_lock():
+                        latest = self._read(job_id)
+                        if (
+                            latest.phase != job.phase
+                            or latest.updated_at != job.updated_at
+                        ):
+                            self._clear_cancel_request(job_id)
+                            return latest
+                        return self._consume_cancel_request(latest) or latest
+                except EngineWorkerBusyError:
+                    # The marker is the durable cancellation intent. Do not
+                    # overwrite the stale queued snapshot while the other
+                    # worker still owns the lock; its next planning boundary
+                    # will consume the marker before any formal operation.
+                    return self._read(job_id)
+            if job.phase not in {
+                "archive_preprocessing", "identity_matching", "planning",
+                "executing", "verifying", "cleaning",
+            }:
+                raise
+            operation_id = self._active_operation_id(job)
+            self._request_running_cancellation(job, reason=normalized_reason)
+            # Close the small restart/finish race around the marker write. If
+            # the worker released its lock before the marker landed, consume
+            # it under the lock now; if the operation already advanced, clear
+            # the stale marker rather than applying it to a later retry.
+            try:
+                with self.worker_lock():
+                    latest = self._read(job_id)
+                    if (
+                        latest.phase == "retry_wait"
+                        and latest.summary.get("recovered_operation_id") == operation_id
+                    ):
+                        # Restart recovery saw an interrupted write before
+                        # this request could acquire its lock.  The explicit
+                        # operator intent still owns that recovered operation;
+                        # cancel it rather than allowing a later readback or
+                        # replay to revive the job.
+                        self._clear_cancel_request(job_id)
+                        return self._cancelled_job(latest, reason=normalized_reason)
+                    if (
+                        operation_id is None
+                        or self._active_operation_id(latest) != operation_id
+                        or latest.phase not in {
+                            "archive_preprocessing", "identity_matching", "planning",
+                            "executing", "verifying", "cleaning",
+                        }
+                    ):
+                        self._clear_cancel_request(job_id)
+                        return latest
+                    return self._consume_cancel_request(latest) or latest
+            except EngineWorkerBusyError:
+                latest = self._read(job_id)
+                if self._active_operation_id(latest) != operation_id:
+                    self._clear_cancel_request(job_id)
+                return latest
 
 
 __all__ = [
     "AutomaticIdentity",
+    "EngineCancellationRequested",
     "EngineExecutionError",
     "EngineJob",
+    "EngineJobConflictError",
     "EngineJobNotFoundError",
     "EngineRequest",
     "EngineRequestError",
     "EngineWorkerBusyError",
+    "TargetShelfPolicyConflictError",
     "recover_persisted_engine_jobs",
     "SimpleEngineError",
     "SimpleEngineRunner",

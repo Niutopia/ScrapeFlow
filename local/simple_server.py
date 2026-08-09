@@ -28,9 +28,11 @@ from engine.scrapeflow.media_quality import (
 )
 from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
+from engine.scrapeflow.target_shelf import target_shelf_values
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     EngineJob,
+    EngineJobConflictError,
     EngineJobNotFoundError,
     EngineRequestError,
     EngineWorkerBusyError,
@@ -52,13 +54,6 @@ from local.scrapeflow_api.automatic_replenishment import (
 from local.scrapeflow_api.control_state import PersistentControlState
 from local.scrapeflow_api.redaction import redact_error, redact_value
 
-
-_TARGET_CATEGORY_PARENTS = {
-    "番剧": "/quark/影视/番剧",
-    "美剧": "/quark/影视/美剧",
-    "电影": "/quark/影视/电影",
-}
-_CATEGORY_MEDIA_TYPES = {"电影": "movie", "番剧": "tv", "美剧": "tv"}
 
 # These findings enter the automatic provider queue. Media gaps become Engine
 # child stages; subtitle gaps use a separate sidecar writer bound to the exact
@@ -202,6 +197,7 @@ class SimpleApplication:
             "last_scan_at": None,
             "last_error": None,
             "last_scheduled_count": 0,
+            "last_registered_count": 0,
         }
         self._recover_persisted_engine_jobs()
         # Existing automatic jobs are resumed in the background.
@@ -284,6 +280,7 @@ class SimpleApplication:
             "connected": self.remote_configured,
             "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
             "engine_configured": self.engine_configured,
+            "build_version": os.getenv("SCRAPEFLOW_BUILD_VERSION", "").strip() or "target-shelf-rc1",
             "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or None,
             "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or None,
             "provider_capabilities": provider_capability_snapshot(),
@@ -320,7 +317,7 @@ class SimpleApplication:
             "executing", "verifying", "cleaning", "retry_wait",
         }
         failed_engine_phases = {
-            "failed", "failed_identity", "failed_provider", "failed_write",
+            "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider", "failed_write",
             "failed_verification", "failed_cleanup",
         }
         provider_active = {
@@ -346,12 +343,18 @@ class SimpleApplication:
         active_public_phases = active_engine_phases | provider_active
         return {
             "jobs_total": len(engine_jobs),
+            "jobs_awaiting_target_shelf": sum(
+                1 for phase in public_phases if phase == "awaiting_target_shelf"
+            ),
             "jobs_active": sum(1 for phase in public_phases if phase in active_public_phases),
             "jobs_failed": sum(1 for phase in public_phases if phase in failed_engine_phases),
-            # Count the public root state, not merely the formal Engine move
-            # fact. An executed media move with unresolved audit findings is
-            # deliberately not a completed project.
-            "jobs_completed": sum(1 for phase in public_phases if phase == "completed"),
+            # Count terminal public root states, not merely the formal Engine
+            # move fact. Deferred Provider gaps are complete work with a
+            # visible attention state, rather than active background work.
+            "jobs_completed": sum(
+                1 for phase in public_phases
+                if phase in {"completed", "completed_with_gaps"}
+            ),
             "provider_active": sum(
                 1
                 for job in engine_jobs
@@ -445,15 +448,16 @@ class SimpleApplication:
         }
 
     def _scan_inbound_once(self) -> list[str]:
-        """Turn each direct child of ``/待刮削`` into one automatic job.
+        """Register each direct child of ``/待刮削`` as a waiting root.
 
         Only directories are accepted.  Treating loose files at the intake
         root as one job could accidentally combine unrelated titles, so they
         are left untouched until placed in their own source directory.  This
-        method reads AList with ``refresh=True`` and never moves or deletes
-        anything itself.
+        method reads AList with ``refresh=True`` and only writes a small local
+        ownership record.  It intentionally runs while globally paused: pause
+        blocks formal work, not passive discovery of a user-visible choice.
         """
-        if self.control().get("paused") is True or not self.engine_configured:
+        if not self.engine_configured:
             return []
         runner = self._get_engine_runner()
         client = getattr(runner, "alist", None) or self._alist_client
@@ -488,10 +492,15 @@ class SimpleApplication:
                 existing[str(key)] = job
         except Exception:
             existing = {}
-        scheduled: list[str] = []
-        create = getattr(runner, "create_automatic_job", None)
+        registered: list[str] = []
+        seen_sources: set[str] = set()
+        create = getattr(runner, "create_pending_job", None)
         if not callable(create):
-            return scheduled
+            # Keep a small compatibility fallback for injected focused
+            # runners. The real runner exposes create_pending_job.
+            create = getattr(runner, "create_automatic_job", None)
+        if not callable(create):
+            return registered
         for row in rows:
             if not isinstance(row, Mapping) or row.get("is_dir") is not True:
                 continue
@@ -506,20 +515,34 @@ class SimpleApplication:
             # TMDB/provider retry slot in the first place.
             if is_production_test_media_path(source):
                 continue
+            seen_sources.add(source)
             job = existing.get(source)
             if job is None:
                 job = create(source)
-            elif not self._automatic_job_needs_dispatch(job):
-                continue
-            self._queue_automatic_job(job.id)
-            scheduled.append(job.id)
+                registered.append(job.id)
+        # A missing waiting source is an observation, not an instruction to
+        # delete/retry/recreate it. Persist a clear error only after a
+        # successful narrow listing of the intake root.
+        marker = getattr(runner, "mark_waiting_source_missing", None)
+        if callable(marker):
+            for source, job in existing.items():
+                if (
+                    job.phase == "awaiting_target_shelf"
+                    and source.startswith(root.rstrip("/") + "/")
+                    and source not in seen_sources
+                ):
+                    try:
+                        marker(job.id)
+                    except Exception:
+                        pass
         with self._automatic_lock:
             self._intake_status.update({
                 "last_scan_at": _now(),
                 "last_error": None,
-                "last_scheduled_count": len(scheduled),
+                "last_scheduled_count": 0,
+                "last_registered_count": len(registered),
             })
-        return scheduled
+        return registered
 
     def _intake_monitor_loop(self) -> None:
         while not self._intake_stop.is_set():
@@ -534,6 +557,7 @@ class SimpleApplication:
                         "last_scan_at": _now(),
                         "last_error": "待刮削目录暂时不可读取，将自动重试",
                         "last_scheduled_count": 0,
+                        "last_registered_count": 0,
                     })
             self._intake_wake.wait(self._intake_scan_seconds())
             self._intake_wake.clear()
@@ -915,6 +939,27 @@ class SimpleApplication:
             and job.summary.get("audit_work_key")
         )
 
+    @classmethod
+    def _ordinary_job_has_confirmed_selection(cls, job: EngineJob) -> bool:
+        """Allow the scheduler to touch only a shelf-selected ordinary root.
+
+        Audit-owned roots are a separate, explicitly scoped lifecycle lane and
+        do not carry a user shelf.  Every other job must have all three
+        durable selection fields before a worker can be queued or resumed;
+        this single predicate keeps legacy records fail-closed across startup,
+        retry and timer races.
+        """
+        if cls._is_audit_owned_root(job):
+            return True
+        return (
+            isinstance(job.target_shelf, str)
+            and bool(job.target_shelf)
+            and isinstance(job.target_root, str)
+            and bool(job.target_root)
+            and isinstance(job.selected_at, str)
+            and bool(job.selected_at)
+        )
+
     @staticmethod
     def _audit_root_gap_is_safe(row: Mapping[str, object], job: EngineJob) -> bool:
         """Keep an audit-created root limited to its validated media work.
@@ -1009,10 +1054,12 @@ class SimpleApplication:
         """
         if not isinstance(job.summary, Mapping):
             return job.phase in {
-                "failed_identity", "failed_write", "failed_verification", "failed_cleanup",
+                "failed_archive", "failed_identity", "failed_planning", "failed_write",
+                "failed_verification", "failed_cleanup",
             }
         return job.summary.get("automatic_terminal") is True or job.phase in {
-            "failed_identity", "failed_write", "failed_verification", "failed_cleanup",
+            "failed_archive", "failed_identity", "failed_planning", "failed_write",
+            "failed_verification", "failed_cleanup",
         }
 
     @staticmethod
@@ -1079,13 +1126,33 @@ class SimpleApplication:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _audit_phase_for_job(job: EngineJob) -> tuple[str | None, str | None]:
-        """Map unresolved audit state to an existing public phase.
+    def _lifecycle_allows_completed_with_gaps(job: EngineJob) -> bool:
+        """Whether known gaps are terminally deferred rather than in flight.
 
-        The Web already understands ``retry_wait``, ``failed_provider`` and
-        ``failed_verification``.  Reusing those states keeps the root task
-        visibly incomplete without adding another UI-controlled state.
+        ``completed_with_gaps`` is deliberately a public projection, not a
+        new Engine phase.  The durable Engine record remains ``executed`` so
+        recovery and cleanup keep their small existing state machine.  This
+        predicate requires final cleanup to have completed and both optional
+        lanes to have recorded an explicit deferred/skipped outcome; it never
+        treats a missing, active, failed, or unknown decision as completion.
         """
+        if job.phase not in {"executed", "completed"}:
+            return False
+        lifecycle_raw = job.summary.get("lifecycle")
+        lifecycle = lifecycle_raw if isinstance(lifecycle_raw, Mapping) else {}
+        cleanup = lifecycle.get("cleanup") if isinstance(lifecycle.get("cleanup"), Mapping) else {}
+        if cleanup.get("status") != "completed":
+            return False
+        audit = lifecycle.get("audit") if isinstance(lifecycle.get("audit"), Mapping) else {}
+        provider = lifecycle.get("provider") if isinstance(lifecycle.get("provider"), Mapping) else {}
+        return (
+            str(audit.get("status") or "").casefold() in {"trusted", "deferred", "skipped"}
+            and str(provider.get("status") or "").casefold() in {"deferred", "skipped"}
+        )
+
+    @staticmethod
+    def _audit_phase_for_job(job: EngineJob) -> tuple[str | None, str | None]:
+        """Map audit state to a truthful public root-workflow phase."""
         summary_audit = job.summary.get("audit")
         audit = dict(summary_audit) if isinstance(summary_audit, Mapping) else {}
         status = str(audit.get("status") or "").casefold()
@@ -1144,7 +1211,11 @@ class SimpleApplication:
                     # audit.  Keep the task pending until the next scan proves
                     # that the resource gap disappeared.
                     return "retry_wait", "补源已返回，等待全库审计确认缺口已消失"
+            if SimpleApplication._lifecycle_allows_completed_with_gaps(job):
+                return "completed_with_gaps", f"已完成正式整理；保留 {len(gaps)} 项资源缺口（自动补源已跳过）"
             return "gap_discovering", "系统正在自动处理媒体库缺口"
+        if gaps and SimpleApplication._lifecycle_allows_completed_with_gaps(job):
+            return "completed_with_gaps", f"已完成正式整理；保留 {len(gaps)} 项资源缺口（自动补源已跳过）"
         return None, None
 
     @staticmethod
@@ -1183,6 +1254,75 @@ class SimpleApplication:
             "unknown", "blocked", "failed_provider", "failed", "retry_wait", "repairing", "pending",
         }
 
+    def _settle_disabled_automatic_lifecycle(self, job: EngineJob) -> bool:
+        """Close a verified ordinary root when both optional lanes are off.
+
+        Audit and Provider are intentionally opt-in in the production root.
+        A successful formal write must not remain forever in ``cleaning``
+        merely because neither optional lane was scheduled.  This is a narrow
+        lifecycle decision, not a substitute audit: it runs only for a
+        verified, ordinary automatic root, records both lanes as deferred,
+        and then delegates all source/staging work to the existing finalizer.
+
+        ``True`` means the caller is in the disabled-lane regime and must not
+        queue an audit as a fallback.  Existing unknown, pending, failed, or
+        live Provider decisions deliberately remain untouched; disabling a
+        lane must never turn known unresolved evidence into permission to
+        consume the source.
+        """
+        if self._audit_auto_repair_enabled() or self._provider_auto_repair_enabled():
+            return False
+        if self._closed.is_set() or self.control().get("paused") is True:
+            return True
+        if (
+            self._is_internal_child(job)
+            or self._is_audit_owned_root(job)
+            or job.summary.get("automatic") is not True
+            or job.phase not in {"executed", "completed"}
+        ):
+            return True
+
+        lifecycle_raw = job.summary.get("lifecycle")
+        lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
+        cleanup = lifecycle.get("cleanup") if isinstance(lifecycle.get("cleanup"), Mapping) else {}
+        if cleanup.get("status") in {"completed", "running"}:
+            return True
+        formal_write = lifecycle.get("formal_write")
+        if not isinstance(formal_write, Mapping) or formal_write.get("status") != "verified":
+            return True
+
+        audit = lifecycle.get("audit") if isinstance(lifecycle.get("audit"), Mapping) else {}
+        provider = lifecycle.get("provider") if isinstance(lifecycle.get("provider"), Mapping) else {}
+        audit_status = str(audit.get("status") or "").casefold()
+        provider_status = str(provider.get("status") or "").casefold()
+        # ``trusted`` is the only prior audit conclusion safe to retain; a
+        # fresh empty decision is also safe because the lanes are explicitly
+        # disabled. Any other existing decision contains unresolved evidence.
+        if audit_status and audit_status not in {"trusted", "deferred", "skipped", "no_gap"}:
+            return True
+        if provider_status and provider_status not in {"deferred", "skipped", "no_gap"}:
+            return True
+        with self._automatic_lock:
+            future = self._provider_futures.get(job.id)
+            if future is not None and not future.done():
+                return True
+        try:
+            runner = self._get_engine_runner()
+            decided = runner.record_automatic_lifecycle_decision(
+                job.id,
+                audit_status="deferred",
+                provider_status="deferred",
+                cleanup_ready=True,
+                reason="audit_and_provider_auto_repair_disabled",
+            )
+            runner.finalize_automatic_lifecycle(decided.id)
+        except (EngineWorkerBusyError, EngineExecutionError, EngineRequestError):
+            # The finalizer persists its own failed_cleanup record.  A busy
+            # worker/restart will revisit the same idempotent decision; never
+            # route it back into plan/write or an optional disabled lane.
+            pass
+        return True
+
     @staticmethod
     def _audit_row_matches_job(
         row: Mapping[str, object], *, job_tmdb: object, job_target: object,
@@ -1214,6 +1354,12 @@ class SimpleApplication:
         """Run one persisted plan from the automatic scheduler."""
         if self._closed.is_set() or self.control().get("paused") is True:
             return
+        try:
+            queued_job = self._get_engine_runner().get_job(job_id)
+        except (EngineJobNotFoundError, SimpleEngineError):
+            return
+        if not self._ordinary_job_has_confirmed_selection(queued_job):
+            return
 
         def submit() -> None:
             if self._closed.is_set() or self.control().get("paused") is True:
@@ -1231,6 +1377,11 @@ class SimpleApplication:
     @staticmethod
     def _automatic_failure_stage(error: Exception, job: EngineJob | None = None) -> str:
         text = str(error).casefold()
+        if job is not None:
+            if job.phase == "archive_preprocessing":
+                return "archive"
+            if job.phase == "planning":
+                return "planning"
         if job is not None and not job.plan:
             return "identity"
         if any(token in text for token in ("tmdb", "匹配", "identity", "作品身份", "confidence")):
@@ -1248,48 +1399,81 @@ class SimpleApplication:
     ) -> None:
         """Persist bounded retry state for the automatic scheduler."""
         runner = self._get_engine_runner()
+        phase: str | None = None
+        retry_delay: float | None = None
+        summary: dict[str, object] = {}
         try:
-            job = runner.get_job(job_id)
+            # Retry projection and cancellation share the same durable worker
+            # fence. A stale exception handler must never resurrect a job that
+            # an operator just cancelled or arm a timer from an old snapshot.
+            with runner.worker_lock():
+                job = runner.get_job(job_id)
+                cancelled = runner._consume_cancel_request(job)  # noqa: SLF001 - fenced transition
+                if cancelled is not None:
+                    self._cancel_job_timers(job_id)
+                    return
+                if job.phase in {"executed", "cancelled"} or self._is_terminal_automatic_failure(job):
+                    self._cancel_job_timers(job_id)
+                    return
+                summary = dict(job.summary)
+                # A stale planning/execute operation id must not survive a retry and
+                # accidentally match a later cancellation request.
+                summary.pop("active_operation", None)
+                stage = stage or self._automatic_failure_stage(error, job)
+                if stage == "cleanup" or job.phase == "failed_cleanup":
+                    # Keep this lane out of the ordinary retry scheduler.  A later
+                    # explicit retry may invoke only the idempotent lifecycle
+                    # finalizer.
+                    summary["cleanup_only_retry"] = True
+                attempts = int(summary.get("automatic_attempts") or 0) + 1
+                summary["automatic_attempts"] = attempts
+                summary[f"{stage}_attempts"] = int(summary.get(f"{stage}_attempts") or 0) + 1
+                summary["automatic_stage"] = stage
+                summary["next_retry_seconds"] = None
+                phase = {
+                    "archive": "failed_archive",
+                    "identity": "failed_identity",
+                    "planning": "failed_planning",
+                    "provider": "failed_provider",
+                    "verification": "failed_verification",
+                    "cleanup": "failed_cleanup",
+                }.get(stage, "failed_write")
+                if stage == "cleanup" or job.phase == "failed_cleanup":
+                    # Cleanup is a separate idempotent finalizer boundary. Never turn
+                    # its failure into retry_wait, which would send a second formal
+                    # writer through the ordinary scheduler.
+                    phase = "failed_cleanup"
+                    summary["automatic_terminal"] = True
+                elif attempts <= self._automatic_retry_limit():
+                    retry_delay = min(60.0, float(2 ** max(0, attempts - 1)))
+                    summary["next_retry_seconds"] = retry_delay
+                    phase = "retry_wait"
+                    summary["automatic_terminal"] = False
+                else:
+                    summary["automatic_terminal"] = True
+                updated = replace(
+                    job,
+                    phase=phase,
+                    updated_at=_now(),
+                    summary=summary,
+                    error=redact_error(error),
+                )
+                atomic_write_json(
+                    runner.jobs_root / f"{job_id}.json",
+                    _redacted_job_payload(updated),
+                    allow_nan=False,
+                )
         except EngineJobNotFoundError:
             return
-        if job.phase in {"executed", "cancelled"}:
+        except EngineWorkerBusyError:
+            # The current worker will either persist its own terminal state or
+            # be reconciled by the next scheduler pass; do not overwrite it
+            # from this stale exception handler.
             return
-        summary = dict(job.summary)
-        stage = stage or self._automatic_failure_stage(error, job)
-        attempts = int(summary.get("automatic_attempts") or 0) + 1
-        summary["automatic_attempts"] = attempts
-        summary[f"{stage}_attempts"] = int(summary.get(f"{stage}_attempts") or 0) + 1
-        summary["automatic_stage"] = stage
-        summary["next_retry_seconds"] = None
-        phase = {
-            "identity": "failed_identity",
-            "provider": "failed_provider",
-            "verification": "failed_verification",
-            "cleanup": "failed_cleanup",
-        }.get(stage, "failed_write")
-        if attempts <= self._automatic_retry_limit():
-            delay = min(60.0, float(2 ** max(0, attempts - 1)))
-            summary["next_retry_seconds"] = delay
-            phase = "retry_wait"
-            summary["automatic_terminal"] = False
-        else:
-            summary["automatic_terminal"] = True
-        updated = replace(
-            job,
-            phase=phase,
-            updated_at=_now(),
-            summary=summary,
-            error=redact_error(error),
-        )
-        atomic_write_json(
-            runner.jobs_root / f"{job_id}.json",
-            _redacted_job_payload(updated),
-            allow_nan=False,
-        )
         if phase != "retry_wait":
             self._cancel_job_timers(job_id)
         if phase == "retry_wait":
-            self._queue_automatic_job(job_id, delay=float(summary["next_retry_seconds"] or 1))
+            self._queue_automatic_job(job_id, delay=float(retry_delay or 1))
         elif phase == "failed_identity" and summary.get("automatic_terminal") is True:
             # A terminal identity failure has no trusted work root.  Do not
             # widen it into a full-library scan; only an explicit operator
@@ -1517,9 +1701,27 @@ class SimpleApplication:
             job = runner.get_job(job_id)
             if self._is_internal_child(job):
                 return
-            if job.phase in {"executed", "cancelled"}:
+            if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
+                return
+            # A pre-gate legacy record must never become a formal operation
+            # merely because a timer or stale retry scheduled it.
+            if not self._ordinary_job_has_confirmed_selection(job):
+                return
+            if job.phase in {"executed", "completed"}:
+                self._settle_disabled_automatic_lifecycle(job)
+                return
+            if job.phase == "cancelled":
                 return
             if self._is_terminal_automatic_failure(job):
+                return
+            if job.summary.get("cleanup_only_retry") is True:
+                # Never route a cleanup-only record through recovery or the
+                # formal writer. The public retry endpoint owns finalizer
+                # dispatch for this lane.
+                return
+            if job.phase == "failed_cleanup":
+                # Only an explicit public retry may invoke the lifecycle
+                # finalizer; this worker must never replay the formal plan.
                 return
             # A queued/retry identity job has no plan yet.  Resolve it inside
             # the same scheduler; a transient TMDB error is persisted and
@@ -1543,9 +1745,9 @@ class SimpleApplication:
                             # it or the process exits.
                             self._retry_archive_passwords.pop(job_id, None)
                 except Exception as exc:
-                    self._record_automatic_retry(job_id, exc, stage="identity")
+                    self._record_automatic_retry(job_id, exc)
                     return
-            if job.phase in {"executing", "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup"}:
+            if job.phase in {"executing", "retry_wait", "failed", "failed_write", "failed_verification"}:
                 job = runner.recover_job(job_id)
                 # The restart matrix may have converted an ambiguous write
                 # into a durable terminal verification failure.  Never fall
@@ -1556,18 +1758,24 @@ class SimpleApplication:
                     return
                 if job.phase == "executed":
                     job = self._sync_replenishment_child(job)
-                    if self._has_provider_gaps(job):
+                    if self._settle_disabled_automatic_lifecycle(job):
+                        return
+                    # Audit-owned roots are created by a trusted audit
+                    # projection and already sit on the provider lane; they
+                    # retain their historical dispatch path. Ordinary roots
+                    # must wait for the post-write scoped audit below.
+                    if self._is_audit_owned_root(job) and self._has_provider_gaps(job):
                         self._queue_provider_job(job.id)
                     target = self._job_audit_target(job)
                     if isinstance(target, str):
                         self._queue_scoped_library_audit([target], delay=0.5)
                     return
-            if job.phase not in {"planned", "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup"}:
+            if job.phase not in {"planned", "retry_wait", "failed", "failed_write", "failed_verification"}:
                 return
             done = runner.execute_automatic(job_id)
             done = self._sync_replenishment_child(done)
-            if self._has_provider_gaps(done):
-                self._queue_provider_job(done.id)
+            if self._settle_disabled_automatic_lifecycle(done):
+                return
             # The child may have committed a video while another audit was
             # already running.  Ask the audit coordinator for one fresh pass
             # after that run settles; this is still read-only and does not
@@ -1593,9 +1801,18 @@ class SimpleApplication:
         try:
             runner = self._get_engine_runner()
             paused = self.control().get("paused") is True
-            provider_gap_keys: set[tuple[str, ...]] = set()
             for job in runner.list_jobs():
                 if self._is_internal_child(job):
+                    continue
+                if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
+                    continue
+                if not self._ordinary_job_has_confirmed_selection(job):
+                    # Legacy pre-gate roots remain discoverable/read-only but
+                    # cannot be recovered into archive/TMDB/planning/writing.
+                    continue
+                if job.summary.get("cleanup_only_retry") is True:
+                    # A cleanup-only retry is operator-driven and must not be
+                    # requeued as an ordinary plan/write job on restart.
                     continue
                 if paused:
                     if job.phase in {"executed", "completed"}:
@@ -1611,44 +1828,12 @@ class SimpleApplication:
                     "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup",
                 }:
                     self._queue_automatic_job(job.id)
-                elif job.phase == "executed":
+                elif job.phase in {"executed", "completed"}:
                     job = self._sync_replenishment_child(job)
-                    if self._has_provider_gaps(job):
-                        scan = job.plan.get("scan_report") if isinstance(job.plan.get("scan_report"), Mapping) else {}
-                        rows = scan.get("resource_gaps") if isinstance(scan, Mapping) else []
-                        metadata = job.plan.get("metadata") if isinstance(job.plan.get("metadata"), Mapping) else {}
-                        identity = job.summary.get("identity") if isinstance(job.summary.get("identity"), Mapping) else {}
-                        job_tmdb = identity.get("tmdb_id") or metadata.get("tmdb_id") or job.summary.get("tmdb_id")
-                        job_target = (
-                            metadata.get("series_root")
-                            or metadata.get("target_root")
-                            or job.plan.get("target_root")
-                            or identity.get("target_root")
-                        )
-                        queue_owner = False
-                        for row in rows if isinstance(rows, list) else []:
-                            if not isinstance(row, Mapping):
-                                continue
-                            if self._audit_row_kind(row) not in _AUTOMATIC_PROVIDER_GAP_KINDS:
-                                continue
-                            media = row.get("media") if isinstance(row.get("media"), Mapping) else {}
-                            row_tmdb = media.get("tmdb_id") if isinstance(media, Mapping) else None
-                            row_target = media.get("target_root") if isinstance(media, Mapping) else None
-                            key = (
-                                str(row_tmdb if row_tmdb is not None else job_tmdb or ""),
-                                str(row_target if isinstance(row_target, str) and row_target else job_target or ""),
-                                self._audit_row_kind(row),
-                                str(row.get("season") or ""),
-                                str(row.get("episode") or ""),
-                                str(row.get("path") or ""),
-                            )
-                            if not any(key):
-                                key = (str(row.get("id") or ""),)
-                            if key not in provider_gap_keys:
-                                provider_gap_keys.add(key)
-                                queue_owner = True
-                        if queue_owner:
-                            self._queue_provider_job(job.id)
+                    if self._settle_disabled_automatic_lifecycle(job):
+                        continue
+                    if self._is_audit_owned_root(job) and self._has_provider_gaps(job):
+                        self._queue_provider_job(job.id)
                     replenishment = job.summary.get("replenishment")
                     if (
                         isinstance(replenishment, Mapping)
@@ -2804,6 +2989,70 @@ class SimpleApplication:
                     allow_nan=False,
                 )
 
+            # Ordinary roots keep ingress/archive cleanup pending until this
+            # fresh scoped audit has produced a durable provider decision.
+            # Provider-owned audit roots have no user ingress and therefore do
+            # not enter this lifecycle lane.
+            if (
+                job.summary.get("automatic") is True
+                and not self._is_audit_owned_root(job)
+                and callable(getattr(runner, "record_automatic_lifecycle_decision", None))
+            ):
+                prior_provider = (
+                    summary.get("replenishment")
+                    if isinstance(summary.get("replenishment"), Mapping)
+                    else {}
+                )
+                if relevant_unknowns:
+                    lifecycle_audit = "unknown"
+                    lifecycle_provider = "deferred"
+                    lifecycle_ready = False
+                    lifecycle_reason = "audit_evidence_unknown"
+                elif unsupported_relevant:
+                    lifecycle_audit = "trusted"
+                    lifecycle_provider = "unsupported"
+                    lifecycle_ready = False
+                    lifecycle_reason = "unsupported_provider_gap"
+                elif provider_relevant:
+                    lifecycle_audit = "trusted"
+                    if isinstance(prior_provider, Mapping) and prior_provider.get("terminal") is True:
+                        lifecycle_provider = "terminal"
+                        lifecycle_ready = True
+                        lifecycle_reason = "provider_terminal_decision"
+                    elif not self._provider_auto_repair_enabled():
+                        lifecycle_provider = "deferred"
+                        lifecycle_ready = True
+                        lifecycle_reason = "provider_auto_repair_disabled"
+                    else:
+                        lifecycle_provider = "pending"
+                        lifecycle_ready = False
+                        lifecycle_reason = "provider_pending"
+                elif repair_relevant:
+                    lifecycle_audit = "trusted"
+                    lifecycle_provider = "deferred"
+                    lifecycle_ready = False
+                    lifecycle_reason = "metadata_repair_pending"
+                else:
+                    lifecycle_audit = "trusted"
+                    lifecycle_provider = "no_gap"
+                    lifecycle_ready = True
+                    lifecycle_reason = "no_provider_gap"
+                try:
+                    lifecycle_job = runner.record_automatic_lifecycle_decision(
+                        job.id,
+                        audit_status=lifecycle_audit,
+                        provider_status=lifecycle_provider,
+                        cleanup_ready=lifecycle_ready,
+                        reason=lifecycle_reason,
+                    )
+                    if lifecycle_ready:
+                        runner.finalize_automatic_lifecycle(lifecycle_job.id)
+                except (EngineWorkerBusyError, EngineExecutionError, EngineRequestError):
+                    # A cleanup race or a remote transient remains durable as
+                    # pending/failed state; it must never cause a writer or
+                    # provider replay from this audit callback.
+                    pass
+
             if provider_relevant:
                 for row in provider_relevant:
                     kind = self._audit_row_kind(row)
@@ -2912,15 +3161,16 @@ class SimpleApplication:
             raise EngineRequestError("来源必须是绝对远端目录")
         if is_production_test_media_path(normalized):
             raise EngineRequestError("生产 E2E 测试目录不能创建自动任务")
-        if self.enforce_engine_roots:
-            inbound = f"{self.remote_root.rstrip('/')}/待刮削/"
-            replenishment = f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源/"
-            if not (normalized.startswith(inbound) or normalized.startswith(replenishment)):
-                raise EngineRequestError("来源只能来自待刮削目录或系统补源目录")
+        inbound = f"{self.remote_root.rstrip('/')}/待刮削/"
+        if not normalized.startswith(inbound):
+            raise EngineRequestError("来源只能来自待刮削目录的直接子目录")
+        relative = normalized[len(inbound):]
+        if not relative or "/" in relative or "\\" in relative or relative in {".", ".."}:
+            raise EngineRequestError("来源必须是待刮削目录的直接子目录")
         return normalized
 
     def create_task(self, payload: Mapping[str, object]) -> EngineJob:
-        """Submit one source directory and immediately queue automatic execution."""
+        """Register one source directory without entering the worker queue."""
         unknown = set(payload) - {"path", "source_path"}
         if unknown:
             raise EngineRequestError("任务入口只接受 path 或 source_path")
@@ -2935,11 +3185,15 @@ class SimpleApplication:
         except SimpleEngineError:
             existing = None
         if existing is not None:
-            self._queue_automatic_job(existing.id)
             return existing
-        job = runner.create_automatic_job(normalized_source)
-        self._queue_automatic_job(job.id)
-        return job
+        if not runner.source_directory_exists(normalized_source):
+            raise EngineRequestError("来源目录不存在或不是可读取的目录")
+        create = getattr(runner, "create_pending_job", None)
+        if not callable(create):
+            create = getattr(runner, "create_automatic_job", None)
+        if not callable(create):
+            raise EngineRequestError("Engine 缺少待处理任务登记入口")
+        return create(normalized_source)
 
     def engine_jobs(self) -> list[EngineJob]:
         if self._engine_runner is not None or self.engine_configured:
@@ -3160,6 +3414,28 @@ class SimpleApplication:
         self._cancel_job_timers(job_id)
         return self.public_engine_job(result)
 
+    def start_public_job(
+        self,
+        job_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Persist one user shelf choice, then conditionally submit the root."""
+        if not isinstance(payload, Mapping):
+            raise EngineRequestError("启动请求必须是 JSON 对象")
+        if set(payload) != {"target_shelf"}:
+            raise EngineRequestError("启动请求只接受 target_shelf")
+        runner = self._get_engine_runner()
+        selected = runner.start_automatic_job(
+            job_id,
+            target_shelf=payload.get("target_shelf"),
+        )
+        # The durable selection is authoritative even while paused. The
+        # scheduler is deliberately a second, conditional step so saving a
+        # choice never opens archive/TMDB/writer/provider work by itself.
+        if self.control().get("paused") is not True:
+            self._queue_automatic_job(selected.id)
+        return self.public_engine_job(selected)
+
     def cleanup_public_job(self, job_id: str) -> dict[str, object]:
         """Discard one terminal root's owned local state, never media files.
 
@@ -3234,6 +3510,12 @@ class SimpleApplication:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         if not isinstance(payload, Mapping):
             raise EngineRequestError("重试请求必须是 JSON 对象")
+        if engine_job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
+            raise EngineRequestError("任务尚未通过目标货架启动门；请使用 /start 选择目标货架")
+        if not self._ordinary_job_has_confirmed_selection(engine_job):
+            raise EngineRequestError(
+                "旧 automatic 任务缺少已确认的目标货架；保持只读，不允许重试或自动恢复"
+            )
         allowed = {"tmdb_id", "media_type", "season", "archive_password"}
         unknown = set(payload) - allowed
         if unknown:
@@ -3243,6 +3525,25 @@ class SimpleApplication:
         password = None
         if raw_password is not None:
             password = self._retry_archive_password(raw_password)
+        if engine_job.phase == "failed_cleanup":
+            # Cleanup retry is intentionally not a second plan/write retry:
+            # the formal target is already durable, and only the idempotent
+            # finalizer may resume its recorded cleanup steps.
+            if correction is not None or password is not None:
+                raise EngineRequestError("failed_cleanup 只允许空请求重试最终清理")
+            retry_summary = dict(engine_job.summary)
+            retry_summary["cleanup_only_retry"] = True
+            retry_summary["automatic_terminal"] = True
+            marked = replace(
+                engine_job,
+                phase="failed_cleanup",
+                summary=retry_summary,
+                updated_at=_now(),
+                error=None,
+            )
+            marked = self._persist_retry_transition(engine_job, marked)
+            retried = self._get_engine_runner().finalize_automatic_lifecycle(job_id)
+            return self.public_engine_job(retried)
         error_text = str(engine_job.error or "").casefold()
         archive_failure = (
             isinstance(engine_job.summary.get("archive_preprocessed"), Mapping)
@@ -3253,7 +3554,6 @@ class SimpleApplication:
                 raise EngineRequestError("身份修正只允许用于 failed_identity 任务")
             if password is not None and not archive_failure:
                 raise EngineRequestError("当前任务没有可重试的归档失败")
-            runner = self._get_engine_runner()
             summary = dict(engine_job.summary)
             summary.update({
                 "manual_identity": correction,
@@ -3275,11 +3575,7 @@ class SimpleApplication:
                 error=None,
                 execution=None,
             )
-            atomic_write_json(
-                runner.jobs_root / f"{engine_job.id}.json",
-                _redacted_job_payload(retried),
-                allow_nan=False,
-            )
+            retried = self._persist_retry_transition(engine_job, retried)
             if password is not None:
                 with self._automatic_lock:
                     self._retry_archive_passwords[engine_job.id] = password
@@ -3304,7 +3600,6 @@ class SimpleApplication:
                 and replenishment.get("status") == "failed"
                 and replenishment.get("terminal") is True
             ):
-                runner = self._get_engine_runner()
                 summary = dict(engine_job.summary)
                 summary["replenishment"] = {
                     **dict(replenishment),
@@ -3316,15 +3611,10 @@ class SimpleApplication:
                 }
                 summary["replenishment_attempts"] = 0
                 retried = replace(engine_job, summary=summary, updated_at=_now(), error=None)
-                atomic_write_json(
-                    runner.jobs_root / f"{engine_job.id}.json",
-                    _redacted_job_payload(retried),
-                    allow_nan=False,
-                )
+                retried = self._persist_retry_transition(engine_job, retried)
                 self._queue_provider_job(job_id)
                 return self.public_engine_job(retried)
             if self._is_terminal_automatic_failure(engine_job):
-                runner = self._get_engine_runner()
                 summary = dict(engine_job.summary)
                 summary.update({
                     "automatic_terminal": False,
@@ -3339,15 +3629,31 @@ class SimpleApplication:
                     updated_at=_now(),
                     error=None,
                 )
-                atomic_write_json(
-                    runner.jobs_root / f"{engine_job.id}.json",
-                    _redacted_job_payload(retried),
-                    allow_nan=False,
-                )
+                retried = self._persist_retry_transition(engine_job, retried)
                 self._queue_automatic_job(job_id)
                 return self.public_engine_job(retried)
             self._queue_automatic_job(job_id)
-            return self.public_engine_job(self._get_engine_runner().get_job(job_id))
+        return self.public_engine_job(self._get_engine_runner().get_job(job_id))
+
+    def _persist_retry_transition(
+        self,
+        expected: EngineJob,
+        updated: EngineJob,
+    ) -> EngineJob:
+        """Persist one retry transition only if its source revision is current."""
+        runner = self._get_engine_runner()
+        with runner.worker_lock():
+            latest = runner.get_job(expected.id)
+            if latest.phase == "cancelled":
+                raise EngineJobConflictError("任务已取消，不能被重试请求重新打开")
+            if latest.phase != expected.phase or latest.updated_at != expected.updated_at:
+                raise EngineJobConflictError("任务状态已变化，请刷新后再重试")
+            atomic_write_json(
+                runner.jobs_root / f"{expected.id}.json",
+                _redacted_job_payload(updated),
+                allow_nan=False,
+            )
+            return updated
 
     @staticmethod
     def public_engine_job(job: EngineJob) -> dict[str, object]:
@@ -3360,6 +3666,7 @@ class SimpleApplication:
             else {}
         )
         display_phase = {
+            "awaiting_target_shelf": "awaiting_target_shelf",
             "queued": "queued",
             "analyzing": "analyzing",
             "archive_preprocessing": "archive_preprocessing",
@@ -3373,13 +3680,25 @@ class SimpleApplication:
             "executed": "completed",
             "completed": "completed",
             "failed": "failed",
+            "failed_archive": "failed_archive",
             "failed_identity": "failed_identity",
+            "failed_planning": "failed_planning",
             "failed_provider": "failed_provider",
             "failed_write": "failed_write",
             "failed_verification": "failed_verification",
             "failed_cleanup": "failed_cleanup",
             "cancelled": "cancelled",
+            "target_policy_conflict": "target_policy_conflict",
         }.get(job.phase, job.phase)
+        lifecycle = summary.get("lifecycle") if isinstance(summary.get("lifecycle"), Mapping) else {}
+        cleanup_state = lifecycle.get("cleanup") if isinstance(lifecycle, Mapping) else {}
+        if (
+            job.summary.get("automatic") is True
+            and job.phase in {"executed", "completed"}
+            and isinstance(cleanup_state, Mapping)
+            and cleanup_state.get("status") in {"pending", "running"}
+        ):
+            display_phase = "cleaning"
         audit_message: str | None = None
         # The formal write can be verified while a machine-discovered gap is
         # still searching/downloading.  Keep the durable Engine fact as
@@ -3403,6 +3722,19 @@ class SimpleApplication:
                     audit_message = None
         payload["phase"] = display_phase
         payload["engine_phase"] = job.phase
+        # ``EngineJob.target_root`` is the user-confirmed first-level shelf.
+        # Existing summary/plan target_root remains the concrete work path for
+        # audit/provider compatibility, exposed separately below.
+        payload["target_shelf"] = job.target_shelf
+        payload["target_root"] = job.target_root
+        payload["target_work_path"] = (
+            summary.get("target_work_path")
+            or summary.get("target_root")
+            or None
+        )
+        payload["selected_at"] = job.selected_at
+        payload["allowed_target_shelves"] = list(target_shelf_values())
+        payload["lifecycle"] = dict(lifecycle)
         payload["source"] = (
             "全库审计"
             if SimpleApplication._is_audit_owned_root(job)
@@ -3412,12 +3744,14 @@ class SimpleApplication:
         payload["parent"] = summary.get("target_root")
         payload["media_type"] = summary.get("mode")
         plan_body = dict(job.plan)
+        resource_gaps = SimpleApplication._job_resource_gaps(job)
         payload["plan"] = {
             "kind": "media",
             "title": summary.get("title"),
             "tmdb_id": summary.get("tmdb_id"),
             "source_root": summary.get("source_root"),
             "target_root": summary.get("target_root"),
+            "target_work_path": summary.get("target_work_path") or summary.get("target_root"),
             "file_count": summary.get("file_count"),
             "normal_file_count": summary.get("file_count"),
             "warning_count": summary.get("warning_count"),
@@ -3428,6 +3762,12 @@ class SimpleApplication:
             "cleanup_files": list(plan_body.get("cleanup_files") or []),
             "notices": list(plan_body.get("notices") or []),
             "scan_report": dict(plan_body.get("scan_report") or {}),
+            # The scan report remains available as evidence, but the Web
+            # contract consumes these stable top-level fields.  Do not force
+            # each UI surface to understand the audit's nested schema.
+            "resource_gaps": resource_gaps,
+            "resource_gap_count": len(resource_gaps),
+            "gap_count": len(resource_gaps),
             "replenishment": replenishment or None,
         }
         audit_projection = summary.get("audit")
@@ -3461,18 +3801,24 @@ class SimpleApplication:
             provider_message = audit_message
         payload["progress"] = {
             "stage": display_phase,
-            "completed": 1 if display_phase == "completed" else 0,
+            "completed": 1 if display_phase in {"completed", "completed_with_gaps"} else 0,
             "total": int(summary.get("file_count") or 0),
-            "percent": 100 if display_phase == "completed" else provider_percent or 0,
+            "percent": 100 if display_phase in {"completed", "completed_with_gaps"} else provider_percent or 0,
             "message": (
                 provider_message
                 if provider_message is not None
                 else "系统已生成计划，正在自动排队执行"
                 if job.phase == "planned"
+                else "等待用户选择电影、番剧或美剧目标货架"
+                if job.phase == "awaiting_target_shelf"
+                else "TMDB 识别结果与目标货架冲突；请重新选择货架后启动"
+                if job.phase == "target_policy_conflict"
                 else "系统正在等待下一次自动重试"
                 if job.phase == "retry_wait"
                 else "Engine 计划已执行并完成远端大小核验"
                 if job.phase == "executed" and display_phase == "completed"
+                else f"已完成正式整理；保留 {len(resource_gaps)} 项资源缺口（自动补源已跳过）"
+                if display_phase == "completed_with_gaps"
                 else "媒体库审计仍有未收口问题"
                 if job.phase == "executed"
                 else job.phase
@@ -3485,11 +3831,11 @@ class SimpleApplication:
         )
         if SimpleApplication._is_audit_owned_root(job):
             payload["readback"] = {
-                "status": "verified" if display_phase == "completed" else "pending",
-                "checked_at": job.updated_at if display_phase == "completed" else None,
+                "status": "verified" if display_phase in {"completed", "completed_with_gaps"} else "pending",
+                "checked_at": job.updated_at if display_phase in {"completed", "completed_with_gaps"} else None,
                 "message": (
                     "全库审计已确认缺口消失"
-                    if display_phase == "completed"
+                    if display_phase in {"completed", "completed_with_gaps"}
                     else "审计只记录现有库状态；正式写入由补源 child 完成"
                 ),
             }
@@ -3716,6 +4062,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "not found"})
                     return
                 job_id, operation = urllib.parse.unquote(pieces[3]), pieces[4]
+                if operation == "start":
+                    self._send(
+                        200,
+                        {"job": self.application.start_public_job(job_id, payload)},
+                    )
+                    return
                 if operation == "retry":
                     self._send(200, {"job": self.application.retry_public_job(job_id, payload)})
                     return
