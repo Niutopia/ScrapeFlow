@@ -2,7 +2,7 @@
 
 日期：2026-08-09
 
-当前 release candidate HEAD：`69f6de3`。
+当前 release candidate 以分支 `codex/scrapeflow-transactional-convergence` 的最新提交为准；部署验收必须同时记录容器健康接口中的 `build_commit` 与源码文件哈希，避免文档中的静态提交号失效。
 
 这份表只记录当前工作树中有测试或运行时证据支持的状态；“通过”不等于已提交，也不等于真实媒体库验收。
 
@@ -17,7 +17,7 @@
 
 ## 当前发布门禁
 
-- `npm run check` 必须通过；最近一次结果：311 个 Python 测试通过、lint/typecheck/build check 通过。
+- `npm run check` 必须通过；2026-08-09 最近一次结果：312 个 Python 测试通过，lint/typecheck/build check 通过。
 - `git diff --check` 必须通过；最近一次结果：通过。
 - 真实运行时保持 fail-closed 暂停：缺少 `global-control.json` 时 `PersistentControlState` 返回 `paused=true`。
 - 生产 root 的 `provider_auto_repair_enabled` 和 `audit_auto_repair_enabled` 默认关闭，只有显式环境门禁才开放。

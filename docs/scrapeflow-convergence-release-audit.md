@@ -2,7 +2,7 @@
 
 日期：2026-08-09
 
-当前 release candidate HEAD：`69f6de3`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。
+当前 release candidate 位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号由部署时的 `/api/health.build_commit` 和 Git 共同记录，不在本文硬编码。
 
 ## T0–T1：基线、WIP 与语义
 
@@ -53,7 +53,7 @@
 
 ## T12：本地发布门禁证据
 
-- `npm run check`：311 个 Python 测试通过；ESLint、TypeScript、Next.js production build 通过。
+- `npm run check`：2026-08-09 共 312 个 Python 测试通过；ESLint、TypeScript、Next.js production build 通过。
 - `git diff --check`：通过。
 - Git 工作树 clean；可回退到 `8f54568` 或任一阶段 checkpoint。
 - `local.tests.test_phase4_golden_path`：7 个正例与 9 个负例通过。

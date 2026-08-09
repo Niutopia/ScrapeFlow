@@ -217,7 +217,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
     def test_successful_terminal_cleanup_releases_cleanup_fence(self) -> None:
         job = self.runner.create_automatic_job("/library/待刮削/Fence")
-        terminal = replace(job, phase="failed", error="terminal fixture")
+        terminal = replace(
+            job,
+            phase="failed",
+            summary={**job.summary, "automatic_terminal": True},
+            error="terminal fixture",
+        )
         atomic_write_json(self.runner.jobs_root / f"{job.id}.json", terminal.as_dict(), allow_nan=False)
         result = self.application.cleanup_public_job(job.id)
         self.assertTrue(result["removed"])
