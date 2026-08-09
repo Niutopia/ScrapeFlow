@@ -57,11 +57,20 @@ export function useScrapeFlow() {
     }
   }, []);
 
-  const refreshJobs = useCallback(async () => {
+  const refreshJobs = useCallback(async (syncSelectedDetail = true) => {
     try {
       const response = await scrapeFlowApi.jobs();
       const next = response.jobs.map(normalizeJob);
       setJobs(next);
+      if (syncSelectedDetail) {
+        setSelected(current => {
+          if (!current) return current;
+          const refreshed = next.find(job => job.id === current.id);
+          if (!refreshed) return null;
+          if (ACTIVE_PHASES.has(current.phase) && ACTIVE_PHASES.has(refreshed.phase)) return current;
+          return refreshed;
+        });
+      }
       setQueueError("");
       return next;
     } catch (cause) {
@@ -157,7 +166,7 @@ export function useScrapeFlow() {
     let disposed = false;
     let timer = 0;
     const poll = async () => {
-      if (!disposed) await refreshJobs();
+      if (!disposed) await refreshJobs(false);
       if (!disposed && selectedActiveId) {
         try {
           const response = await scrapeFlowApi.job(selectedActiveId);

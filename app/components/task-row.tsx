@@ -16,6 +16,10 @@ function automaticAttemptLabel(job: Job) {
   return total > 0 ? `自动尝试 ${total} 次` : "";
 }
 
+function canRetryFromRow(job: Job) {
+  return canRetry(job) && !!job.target_shelf;
+}
+
 export function TaskRow({ job, selected, expanded, pending, onToggle, onRetry }: { job: Job; selected: boolean; expanded: boolean; pending: boolean; onToggle: () => void; onRetry: () => void }) {
   const isQueued = typeof job.queue_position === "number" && job.queue_position > 0;
   const queueName = job.queue_kind === "execution" ? "文件操作" : "分析";
@@ -33,7 +37,7 @@ export function TaskRow({ job, selected, expanded, pending, onToggle, onRetry }:
   const active = ACTIVE_PHASES.has(job.phase);
   const startable = START_GATE_PHASES.has(job.phase);
   const failed = isFailed(job);
-  const retryable = canRetry(job);
+  const retryable = canRetryFromRow(job);
   const expandable = startable || active || resultAvailable || failed || job.phase === "cancelled";
   const action = expanded ? { label: "收起", run: onToggle } : startable ? { label: job.phase === "target_policy_conflict" ? "重新选择" : "选择货架", run: onToggle } : resultAvailable ? { label: "查看结果", run: onToggle } : job.phase === "cancelled" ? { label: "清理记录", run: onToggle } : failed && retryable ? { label: "立即重试", run: onRetry } : failed ? { label: "查看异常", run: onToggle } : active ? { label: "查看自动进度", run: onToggle } : null;
   const titleContent = <><i className={`tone-${meta.tone}`} /><span><b>{title}</b><small>{job.source}</small></span></>;

@@ -70,6 +70,9 @@ export function OperationsOverview({ health, control, jobs, audit }: {
 }) {
   const paused = !!control?.paused;
   const connected = !!health?.connected && !!health.tmdb_configured && !!health.engine_configured;
+  const waiting = typeof health?.operations?.jobs_awaiting_target_shelf === "number"
+    ? health.operations.jobs_awaiting_target_shelf
+    : jobs.filter(job => job.phase === "awaiting_target_shelf").length;
   const queued = jobs.filter(job => job.phase === "queued").length;
   const processing = jobs.filter(job => ACTIVE_PHASES.has(job.phase) && !["queued", "retry_wait"].includes(job.phase)).length;
   const retrying = jobs.filter(job => job.phase === "retry_wait").length;
@@ -95,6 +98,7 @@ export function OperationsOverview({ health, control, jobs, audit }: {
     <div className="operations-overview-grid">
       <article className="operations-metric" data-tone={paused ? "attention" : connected ? "success" : "quiet"}><span>调度器</span><b>{paused ? "已暂停" : connected ? "运行中" : "未就绪"}</b><small>{paused ? control?.reason || "新任务会保持排队" : "自动派发和重试已启用"}</small></article>
       <article className="operations-metric" data-tone={intake.tone}><span>待刮削监听</span><b>{intake.value}</b><small>{intake.detail}</small></article>
+      <article className="operations-metric" data-tone={waiting ? "attention" : "quiet"}><span>启动门</span><b>{waiting}</b><small>等待选择货架：{waiting}</small></article>
       <article className="operations-metric" data-tone={queued ? "live" : "quiet"}><span>等待队列</span><b>{queued}</b><small>{queued ? "个已选任务等待调度" : "没有已选待调度任务"}</small></article>
       <article className="operations-metric" data-tone={processing ? "live" : "quiet"}><span>正在处理</span><b>{processing}</b><small>{retrying ? `${retrying} 个任务正在自动退避` : "识别、写入或核对中的任务"}</small></article>
       <article className="operations-metric" data-tone={attention ? "danger" : "success"}><span>需关注</span><b>{attention}</b><small>{attention ? "失败任务已停止，请查看原因或主动重试" : "没有失败任务"}</small></article>

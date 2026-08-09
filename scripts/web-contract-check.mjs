@@ -41,6 +41,7 @@ function appFiles(directory = join(repository, "app")) {
 
 const React = require("react");
 const { renderToStaticMarkup } = require("react-dom/server");
+const { OperationsOverview } = require("../app/components/operations-overview.tsx");
 const { TaskExpansion } = require("../app/components/task-expansion.tsx");
 const { TaskRow } = require("../app/components/task-row.tsx");
 const { scrapeFlowApi } = require("../app/core/api-client.ts");
@@ -98,13 +99,33 @@ assert.match(conflictMarkup, /selected shelf does not match TMDB media type/);
 
 const failedIdentityMarkup = renderToStaticMarkup(
   React.createElement(TaskExpansion, {
-    job: job({ phase: "failed_identity", error: "identity failed" }),
+    job: job({ phase: "failed_identity", error: "identity failed", target_shelf: "movie" }),
     pending: false,
     ...handlers,
   }),
 );
 assert.match(failedIdentityMarkup, /<option value=""(?: selected="")?>/);
 assert.doesNotMatch(failedIdentityMarkup, /collection/i);
+assert.doesNotMatch(failedIdentityMarkup, /归档密码/);
+
+const failedArchiveMarkup = renderToStaticMarkup(
+  React.createElement(TaskExpansion, {
+    job: job({ phase: "failed_archive", error: "archive failed", target_shelf: "anime" }),
+    pending: false,
+    ...handlers,
+  }),
+);
+assert.match(failedArchiveMarkup, /归档密码/);
+
+const legacyFailedMarkup = renderToStaticMarkup(
+  React.createElement(TaskExpansion, {
+    job: job({ phase: "failed_planning", error: "legacy failure", target_shelf: null }),
+    pending: false,
+    ...handlers,
+  }),
+);
+assert.match(legacyFailedMarkup, /旧任务未确认目标货架，不能自动重试/);
+assert.doesNotMatch(legacyFailedMarkup, /立即重试/);
 
 const waitingRow = renderToStaticMarkup(
   React.createElement(TaskRow, {
@@ -118,6 +139,47 @@ const waitingRow = renderToStaticMarkup(
 );
 assert.match(waitingRow, /<button class="taskdesk-task"/);
 assert.match(waitingRow, /class="row-primary"/);
+
+const legacyFailedRow = renderToStaticMarkup(
+  React.createElement(TaskRow, {
+    job: job({ phase: "failed_planning", error: "legacy failure", target_shelf: null }),
+    selected: false,
+    expanded: false,
+    pending: false,
+    onToggle: () => {},
+    onRetry: () => {},
+  }),
+);
+assert.match(legacyFailedRow, /查看异常/);
+assert.doesNotMatch(legacyFailedRow, /立即重试/);
+
+const overviewMarkup = renderToStaticMarkup(
+  React.createElement(OperationsOverview, {
+    health: {
+      ok: true,
+      mode: "automatic",
+      connected: true,
+      tmdb_configured: true,
+      engine_configured: true,
+      intake_monitoring: false,
+      operations: {
+        jobs_total: 2,
+        jobs_awaiting_target_shelf: 7,
+        jobs_active: 0,
+        jobs_failed: 0,
+        jobs_completed: 0,
+        provider_active: 0,
+        formal_write_workers: 0,
+        provider_workers: 0,
+        audit_running: false,
+      },
+    },
+    control: { paused: true, updated_at: null, reason: null, persistent: true },
+    jobs: [job(), job({ id: "job-2", phase: "queued", target_shelf: "movie" })],
+    audit: null,
+  }),
+);
+assert.match(overviewMarkup, /等待选择货架：7/);
 
 const calls = [];
 globalThis.fetch = async (url, init = {}) => {

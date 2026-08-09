@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Job, TargetShelf } from "../core/contracts";
 import type { RetryCorrection } from "../core/api-client";
-import { ACTIVE_PHASES, PHASE, START_GATE_PHASES, formatDate, isFailed } from "../core/job-state";
+import { ACTIVE_PHASES, PHASE, START_GATE_PHASES, canRetry, formatDate, isFailed } from "../core/job-state";
 
 const DEFAULT_TARGET_SHELVES: TargetShelf[] = ["movie", "anime", "us_tv"];
 const TARGET_SHELF_COPY: Record<TargetShelf, { label: string; detail: string }> = {
@@ -25,6 +25,10 @@ function attemptCount(job: Job) {
   if (typeof attempts === "number") return attempts;
   if (!attempts) return 0;
   return attempts.total ?? Math.max(attempts.identity ?? 0, attempts.write ?? 0, attempts.acquisition ?? 0);
+}
+
+function canRetryFromFailurePanel(job: Job) {
+  return canRetry(job) && !!job.target_shelf;
 }
 
 function phaseCopy(job: Job) {
@@ -223,10 +227,17 @@ function AutomaticFailurePanel({ job, pending, onClose, onRetry, onCleanup }: {
   const [mediaType, setMediaType] = useState<RetryCorrection["media_type"] | "">("");
   const [season, setSeason] = useState("");
   const [archivePassword, setArchivePassword] = useState("");
-  const needsIdentityCorrection = job.phase === "failed_identity";
+  const retryable = canRetryFromFailurePanel(job);
+  const retryBlockedByMissingShelf = canRetry(job) && !job.target_shelf;
+  const needsIdentityCorrection = retryable && job.phase === "failed_identity";
+  const acceptsArchivePassword = retryable && job.phase === "failed_archive";
   const hasTmdbId = !!tmdbId.trim();
   const missingMediaType = needsIdentityCorrection && hasTmdbId && !mediaType;
+  useEffect(() => {
+    setArchivePassword("");
+  }, [acceptsArchivePassword, job.id]);
   const submitRetry = () => {
+    if (!retryable) return;
     const correction: RetryCorrection = {};
     if (needsIdentityCorrection && hasTmdbId) {
       if (!mediaType) return;
@@ -234,14 +245,14 @@ function AutomaticFailurePanel({ job, pending, onClose, onRetry, onCleanup }: {
       correction.media_type = mediaType;
       if (season.trim()) correction.season = Number(season);
     }
-    if (archivePassword) correction.archive_password = archivePassword;
+    if (acceptsArchivePassword && archivePassword) correction.archive_password = archivePassword;
     setArchivePassword("");
     void onRetry(correction);
   };
   return <section className="replenishment-failure-panel" aria-label={`${title}自动失败详情`}>
-    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{phaseCopy(job)}</p></div><div className="replenishment-failure-actions"><button className="primary" disabled={pending || missingMediaType} onClick={submitRetry}>{pending ? "正在请求…" : "立即重试"}</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button><button onClick={onClose}>收起</button></div></header>
+    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{retryBlockedByMissingShelf ? "旧任务未确认目标货架，不能自动重试" : phaseCopy(job)}</p></div><div className="replenishment-failure-actions">{retryable ? <button className="primary" disabled={pending || missingMediaType} onClick={submitRetry}>{pending ? "正在请求…" : "立即重试"}</button> : null}<button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button><button onClick={onClose}>收起</button></div></header>
     {needsIdentityCorrection ? <fieldset className="identity-correction"><legend>人工修正身份</legend><label>TMDB ID<input inputMode="numeric" value={tmdbId} onChange={event => setTmdbId(event.target.value)} /></label><label>媒体类型<select value={mediaType} onChange={event => setMediaType(event.target.value as RetryCorrection["media_type"] | "")}><option value="">不指定</option><option value="movie">电影</option><option value="tv">剧集</option></select></label><label>季（可选）<input inputMode="numeric" value={season} onChange={event => setSeason(event.target.value)} /></label></fieldset> : null}
-    <label className="identity-correction">归档密码（一次性，可选）<input type="password" autoComplete="off" value={archivePassword} onChange={event => setArchivePassword(event.target.value)} /></label>
+    {acceptsArchivePassword ? <label className="identity-correction">归档密码（一次性，可选）<input type="password" autoComplete="off" value={archivePassword} onChange={event => setArchivePassword(event.target.value)} /></label> : null}
     <dl>
       <div><dt>失败阶段</dt><dd>{PHASE[job.phase]?.label || job.phase}</dd></div>
       <div><dt>自动尝试</dt><dd>{attemptCount(job)} 次</dd></div>
