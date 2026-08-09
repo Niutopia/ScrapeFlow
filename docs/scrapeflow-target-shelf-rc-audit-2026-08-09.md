@@ -4,11 +4,13 @@
 
 分支：`codex/scrapeflow-transactional-convergence`
 
-发布标识：`target-shelf-rc1`
+发布标识：`target-shelf-rc2`
 
 ## 审计结论
 
-当前工作树已形成“目标货架启动门”本地 release candidate：普通来源先登记为 `awaiting_target_shelf`，用户通过 Dashboard 或 `/start` 选择 `movie`、`anime`、`us_tv` 后才允许归档、TMDB、规划和写入。Provider/audit 自动 lane 默认仍关闭。
+当前源码已形成“目标货架启动门”本地 `target-shelf-rc2`：普通来源先登记为 `awaiting_target_shelf`，用户通过 Dashboard 或 `/start` 选择 `movie`、`anime`、`us_tv` 后才允许归档、TMDB、规划和写入。Provider/audit 自动 lane 默认仍关闭。
+
+本轮 rc2 只收掉 Web/文档尾项：waiting/conflict 展开详情随低频 jobs 刷新同步，Operations Overview 单独显示等待选择货架数量，缺少 `target_shelf` 的 legacy 失败任务不在任务行/详情中显示无效重试，归档密码输入只在 `failed_archive` 失败详情中显示。
 
 本审计只证明阶段 0–6 的本地源码、fake AList、单机测试和 Web 构建门禁；它不证明真实媒体库样本已通过，也不授权解除全局暂停或恢复日常 intake。
 
@@ -21,8 +23,8 @@
 | 2 已选主链 | 通过 | `local/scrapeflow_api/simple_engine_runner.py` 在 worker/plan/execute/recovery 前校验 shelf；归档后缀身份查询、类型兼容矩阵、target root containment 和 problem gate 由 `test_target_shelf_start_gate.py` 与 `test_simple_engine_runner.py` 覆盖。 |
 | 3 恢复、重试与取消 | 通过 | `test_simple_server.py` 覆盖 queued cancel、legacy retry 拒绝、target conflict 重选、cleanup-only retry 不落回 writer；`test_recovery_matrix.py` 与 runner 测试覆盖重启边界。 |
 | 4 source/staging/audit/provider | 通过 | `test_phase4_golden_path.py` 覆盖普通视频、ZIP/7z/RAR、伪装归档、密码错误、路径穿越、processed 保留和 archive staging 清理；`test_simple_server.py` 覆盖 disabled lanes 收口与 `completed_with_gaps` 投影。 |
-| 5 Web 闭环 | 通过 | `app` 只通过 `target_shelf` 调 `/start`，不发送 `target_parent`；waiting/conflict 可见、可展开、可重选；`scripts/web-contract-check.mjs` 渲染关键组件并验证 `/start` payload、retry contract 和无 `target_parent`。 |
-| 6 本地 RC | 通过 | `SCRAPEFLOW_BUILD_VERSION` 默认 `target-shelf-rc1`；`npm run check`、`git diff --check` 通过；没有真实 AList 数据测试、媒体 SHA、源码 SHA manifest 或应用内 rollback。 |
+| 5 Web 闭环 | 通过 | `app` 只通过 `target_shelf` 调 `/start`，不发送 `target_parent`；waiting/conflict 可见、可展开、可重选；Web contract check 覆盖 `/start` payload、legacy retry 隐藏、归档密码输入范围、waiting 数量和无 `target_parent`。 |
+| 6 本地 RC | 通过 | `target-shelf-rc2` 作为本地源码冻结标识；后续隔离或部署运行时通过 `SCRAPEFLOW_BUILD_VERSION` 暴露该普通 build_version；`npm run check`、`git diff --check` 通过；没有真实 AList 数据测试、媒体 SHA、源码 SHA manifest 或应用内 rollback。 |
 
 ## 已执行门禁
 
@@ -34,7 +36,7 @@ npm run check
 
 ```text
 Web target-shelf contract check passed
-Ran 345 tests in 19.877s
+Ran 345 tests in 19.907s
 OK
 production Web build compiled successfully
 ```

@@ -1,6 +1,6 @@
 # ScrapeFlow 目标货架启动门收敛计划
 
-> 状态：当前唯一产品合同；工作树仍是 WIP，尚未发布。
+> 状态：当前唯一产品合同；阶段 0–6 已形成本地 RC；尚未部署，真实隔离样本未执行。
 >
 > 日期：2026-08-09
 >
@@ -150,7 +150,7 @@
 - 所有 targeted tests 与 Python 全量测试零错误。
 - npm run check、ESLint、TypeScript、Web contract check、production Web build、git diff --check 通过。
 - 工作树阶段边界清楚；不做真实 AList 数据测试、媒体哈希、源码哈希或应用内 rollback。
-- 发布标识只使用普通 build_version；当前本地 RC 默认值为 target-shelf-rc1。
+- 发布标识只使用普通 build_version；N2 冻结标识为 target-shelf-rc2，后续隔离或部署运行时通过 SCRAPEFLOW_BUILD_VERSION 暴露。
 
 ### 阶段 7：经明确授权的隔离真实样本
 
