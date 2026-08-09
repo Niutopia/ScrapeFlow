@@ -1,8 +1,8 @@
 # 运行态只读审计（2026-08-09）
 
-本报告只读采集，未重启、重建、迁移、删除状态，也未解除 pause。
+本报告先记录部署前的只读采集，再记录同日受控部署结果。全程未迁移、删除或恢复旧任务，也未解除 pause。
 
-## 源码与容器不一致
+## 部署前：源码与容器不一致
 
 - 工作树 HEAD：`8f54568`。
 - 工作树 `simple_server.py` 与 API 容器内版本 hash 不一致。
@@ -31,3 +31,16 @@
 4. 新镜像启动后核对容器源码 hash、`build_commit`/health、lane gates 和 `/api/control`。
 5. 只用隔离样本验证普通 lane；Provider/audit 自动 lane 继续关闭。
 6. 不批量删除旧 JSON/gap/staging，不以旧 backlog 变绿作为验收标准。
+
+## 受控部署结果
+
+- release candidate：`1b7ed3edcf8735edeac25e2ca2dac6e4e9eb2d9c`。
+- API image：`sha256:60a1641cd789857121c56c15919bd4064dbbed8ca3b729a912c830859c068d19`。
+- Web image：`sha256:bedca9ac3d60bf01d20b15728dd40163d0a425a6662a02603f8a9d4b35ad7af6`。
+- API、gateway 与 AList 均为 healthy。Compose 因依赖关系一并重建了 AList 容器，但沿用原持久卷，未修改或清理数据。
+- `/api/health.build_commit` 与 release candidate 一致；宿主和 API 容器内 `simple_server.py`、`simple_engine_runner.py` 的 SHA-256 分别完全一致。
+- `/api/control` 仍为 `paused=true`、`scheduler_paused=true`；旧容器退出时将暂停原因更新为 `shutdown`，暂停状态没有解除。
+- `provider_auto_repair_enabled=false`、`audit_auto_repair_enabled=false`、`intake.enabled=false`、`formal_write_workers=0`、`provider_workers=0`。
+- 部署后的只读复核仍为 jobs 94、engine-jobs 2、gaps 1121、staging 37 个文件（61 个目录，约 3.5GB）、journals 0、locks 1；未对这些对象执行清理或续跑。
+
+阶段 4B 的真实 Provider `archive_source` / SFX 输入仍为 deferred；本次部署不把它表述为已通过，也没有运行真实媒体样本。
