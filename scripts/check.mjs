@@ -40,6 +40,7 @@ const environment = {
 const commands = [
   ["npm", "run", "lint"],
   ["npm", "run", "typecheck"],
+  ["node", "scripts/web-contract-check.mjs"],
   ["python3", "-c", "import local.simple_server"],
   ["python3", "-m", "unittest", "discover", "-s", "local/tests", "-p", "test_*.py"],
   ["npm", "run", "build:check"],
