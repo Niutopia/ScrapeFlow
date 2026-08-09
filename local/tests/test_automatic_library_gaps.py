@@ -183,6 +183,26 @@ class AutomaticLibraryGapTests(unittest.TestCase):
                 )
                 self.assertEqual(result["status"], "satisfied")
 
+    def test_zh_hans_lane_rejects_traditional_and_keeps_unqualified_unknown(self) -> None:
+        simplified = classify_embedded_subtitle_streams(
+            [{"index": 1, "codec_name": "ass", "tags": {"language": "zh-Hans"}}],
+            "zh-Hans",
+        )
+        traditional = classify_embedded_subtitle_streams(
+            [{"index": 1, "codec_name": "ass", "tags": {"language": "zh-Hant"}}],
+            "zh-Hans",
+        )
+        unqualified = classify_embedded_subtitle_streams(
+            [{"index": 1, "codec_name": "ass", "tags": {"language": "zh"}}],
+            "zh-Hans",
+        )
+        self.assertEqual(simplified["status"], "satisfied")
+        self.assertEqual(simplified["tracks"][0]["lane"], "zh-Hans")
+        self.assertEqual(traditional["status"], "missing")
+        self.assertEqual(traditional["tracks"][0]["lane"], "non-zh-Hans")
+        self.assertEqual(unqualified["status"], "unknown")
+        self.assertEqual(unqualified["tracks"][0]["lane"], "unknown")
+
     def test_embedded_subtitle_track_classifier_keeps_ambiguous_track_unknown(self) -> None:
         result = classify_embedded_subtitle_streams(
             [{"index": 2, "codec_name": "ass", "tags": {}}], "zh",

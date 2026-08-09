@@ -33,8 +33,17 @@ from engine.scrapeflow.media_policy import (
     TEMPORARY_EXTENSIONS,
     VIDEO_EXTENSIONS,
 )
+from engine.scrapeflow.subtitle_content import (
+    DEFAULT_MAX_PREFIX_BYTES,
+    classify_subtitle_content,
+    normalize_subtitle_language,
+)
 from local.scrapeflow_api.content_identity_overrides import (
     apply_content_identity_overrides,
+)
+from local.scrapeflow_api.subtitle_policy import (
+    load_subtitle_policy_overrides,
+    subtitle_policy_for_work,
 )
 
 
@@ -91,6 +100,7 @@ _SUBTITLE_EVIDENCE_DEFINITIVE_STATUSES = frozenset({"satisfied", "missing"})
 _SUBTITLE_EVIDENCE_SOURCES = frozenset({
     "embedded",
     "embedded_complete_mkv_prefix",
+    "external_subtitle_content",
 })
 _SUBTITLE_EVIDENCE_REASONS = frozenset({
     "alist_file_link_unavailable",
@@ -106,6 +116,15 @@ _SUBTITLE_EVIDENCE_REASONS = frozenset({
     "subtitle_probe_error",
     "subtitle_probe_untrusted_evidence",
     "unsafe_provider_headers",
+    "subtitle_content_reader_unavailable",
+    "subtitle_content_read_error",
+    "subtitle_content_unavailable",
+    "subtitle_decode_or_format_unknown",
+    "subtitle_language_ambiguous",
+    "subtitle_language_match",
+    "subtitle_language_mismatch",
+    "unsupported_required_language",
+    "no_external_sidecar",
 })
 
 
@@ -784,6 +803,18 @@ def _engine_work(
     for name in (
         "expected_episodes", "season_episodes", "official_episodes",
         "seasons", "official_seasons",
+    ):
+        if name in identity:
+            source[name] = identity[name]
+        elif name in metadata:
+            source[name] = metadata[name]
+    # A work-level subtitle policy is an explicit operator decision, never a
+    # filename/media-quality inference. Preserve only these recognised fields
+    # so the semantic audit can apply the same rule after NFO/job merging.
+    for name in (
+        "subtitle_override", "subtitle_policy", "subtitle_policy_override",
+        "hard_subtitle", "has_hard_subtitle", "no_subtitle",
+        "subtitle_not_required",
     ):
         if name in identity:
             source[name] = identity[name]
@@ -2293,12 +2324,36 @@ def subtitle_evidence_ledger_path(state_root: str | Path) -> Path:
 
 
 def _subtitle_evidence_language(required_language: str | Sequence[str]) -> str | None:
-    """Canonicalise the configured lane without preserving arbitrary input."""
-    languages: set[str] = set()
+    """Canonicalise the configured lane without collapsing zh-Hant into zh.
+
+    The broader audit filename/stream matcher intentionally has a coarse
+    ``zh`` lane for backwards compatibility.  A durable content verdict must
+    be stricter: traditional Chinese and simplified Chinese are different
+    requirements, so they need distinct coordinates in the ledger key.  Keep
+    compact ASCII tokens here so the existing key/cursor validators remain
+    bounded and backwards-compatible (``zh``/``ja``/``en`` plus ``zht``).
+    """
+    values: Sequence[object]
     if isinstance(required_language, str):
-        languages.update(_language_keys(required_language))
+        values = (required_language,)
     elif isinstance(required_language, (list, tuple, set, frozenset)):
-        for value in required_language:
+        values = tuple(required_language)
+    else:
+        return None
+    languages: set[str] = set()
+    for value in values:
+        normalized = normalize_subtitle_language(value)
+        if normalized == "simplified_chinese":
+            languages.add("zh")
+        elif normalized == "traditional_chinese":
+            # ``zht`` is deliberately ASCII and three characters so it fits
+            # the ledger's bounded language-token grammar.
+            languages.add("zht")
+        elif normalized == "japanese":
+            languages.add("ja")
+        else:
+            # Preserve the existing narrow lanes (notably English) for
+            # embedded ffprobe callers while rejecting arbitrary strings.
             languages.update(_language_keys(value))
     if not languages:
         return None
@@ -2308,6 +2363,8 @@ def _subtitle_evidence_language(required_language: str | Sequence[str]) -> str |
 def _subtitle_evidence_identity(
     raw: object,
     required_language: str | Sequence[str],
+    *,
+    allow_sidecar: bool = False,
 ) -> dict[str, object] | None:
     """Normalise one inventory row for safe evidence lookup.
 
@@ -2315,6 +2372,8 @@ def _subtitle_evidence_identity(
     and a provider version token.  A path lacking either can still be probed
     during this audit, but cannot inherit a prior verdict after a restart.
     That conservative rule is what makes same-path replacement fail closed.
+    ``allow_sidecar`` extends the same key contract to an external subtitle;
+    the default remains video-only for embedded ffprobe callers.
     """
     language = _subtitle_evidence_language(required_language)
     if language is None:
@@ -2331,7 +2390,8 @@ def _subtitle_evidence_identity(
         candidate_size = None
         candidate_version = None
     path = _canonical_optional_path(candidate_path)
-    if path is None or _kind(path) != "video":
+    kind = _kind(path) if path is not None else None
+    if path is None or (kind != "video" and not (allow_sidecar and kind == "subtitle")):
         return None
     size = (
         candidate_size
@@ -2598,6 +2658,40 @@ def _subtitle_track_language_keys(value: object) -> set[str]:
     return keys
 
 
+def _subtitle_track_zh_hans_lane(value: object) -> str:
+    """Classify one track into the deliberately tiny Chinese language set.
+
+    The generic ``zh`` key above is retained for legacy non-content callers,
+    but it is too coarse for the audit contract: an unqualified ``zh`` tag
+    cannot prove simplified Chinese and ``zh-Hant`` must never satisfy a
+    ``zh-Hans`` requirement.  This helper therefore returns only the public
+    three-way lane (``zh-Hans``, ``non-zh-Hans`` or ``unknown``).
+    """
+    text = str(value or "").strip().casefold().replace("_", "-")
+    compact = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", text)
+    if not text or compact in {"und", "unknown", "unk", "mul", "mis", "zxx"}:
+        return "unknown"
+    if (
+        compact in {"zhhans", "zhcn", "chs", "simplified", "simplifiedchinese"}
+        or any(marker in text for marker in ("zh-hans", "简体", "简中", "简体中文", "中文简体"))
+    ):
+        return "zh-Hans"
+    if (
+        compact in {"zhhant", "zhtw", "cht", "traditional", "traditionalchinese"}
+        or any(marker in text for marker in ("zh-hant", "繁體", "繁体", "繁中", "中文繁體"))
+    ):
+        return "non-zh-Hans"
+    # An unqualified Chinese tag is intentionally ambiguous.  Any other
+    # explicit language is conclusive non-target evidence for zh-Hans.
+    if compact in {"zh", "zho", "chi", "cmn", "chinese", "中文"}:
+        return "unknown"
+    if _has_explicit_subtitle_language_code(text):
+        return "non-zh-Hans"
+    if any(marker in text for marker in ("english", "英文", "英语", "英語", "japanese", "日文", "日语", "日語")):
+        return "non-zh-Hans"
+    return "unknown"
+
+
 def _has_explicit_subtitle_language_code(value: object) -> bool:
     """Return whether ffprobe supplied a concrete ISO-639-ish code."""
     text = str(value or "").strip().casefold().replace("_", "-")
@@ -2625,6 +2719,25 @@ def classify_embedded_subtitle_streams(
             required.update(_language_keys(value))
     if not required:
         return {"status": "unknown", "reason": "unsupported_required_language"}
+    required_values = (
+        (required_language,)
+        if isinstance(required_language, str)
+        else tuple(required_language)
+        if isinstance(required_language, (list, tuple, set, frozenset))
+        else ()
+    )
+    # Keep the historical coarse ``zh`` lane for compatibility, while the
+    # explicit ``zh-Hans`` request gets the strict three-way classification.
+    required_lane = (
+        "zh-Hans"
+        if any(
+            isinstance(value, str)
+            and ("zh-hans" in value.casefold().replace("_", "-")
+                 or value.strip().casefold() in {"chs", "zhcn"})
+            for value in required_values
+        )
+        else None
+    )
     classified: list[dict[str, object]] = []
     has_unknown = False
     has_match = False
@@ -2636,9 +2749,20 @@ def classify_embedded_subtitle_streams(
         title = str(tags.get("title") or "").strip()
         evidence = f"{language} {title}".strip()
         keys = _subtitle_track_language_keys(evidence)
+        zh_lane = _subtitle_track_zh_hans_lane(evidence) if required_lane else None
+        if required_lane:
+            if zh_lane == "zh-Hans":
+                keys = {"zh"}
+            elif zh_lane == "non-zh-Hans":
+                keys = set()
+            else:
+                keys = set()
         if keys & required:
             classification = "matching"
             has_match = True
+        elif required_lane and zh_lane == "unknown":
+            classification = "unknown"
+            has_unknown = True
         elif not language and not title:
             classification = "unknown"
             has_unknown = True
@@ -2653,13 +2777,16 @@ def classify_embedded_subtitle_streams(
                 has_unknown = True
         else:
             classification = "non_matching"
-        classified.append({
+        classified_row = {
             "index": raw.get("index"),
             "codec_name": raw.get("codec_name"),
             "language": language,
             "title": title,
             "classification": classification,
-        })
+        }
+        if required_lane:
+            classified_row["lane"] = zh_lane or "unknown"
+        classified.append(classified_row)
     if has_match:
         status = "satisfied"
     elif has_unknown:
@@ -3026,6 +3153,64 @@ def probe_remote_subtitle_streams(
         return {"status": "unknown", "reason": "subtitle_probe_error"}
 
 
+def probe_remote_subtitle_content(
+    client: object,
+    subtitle_path: str,
+    required_language: str | Sequence[str],
+    *,
+    max_probe_bytes: int | None = None,
+) -> dict[str, object]:
+    """Classify one external subtitle through a bounded AList prefix read.
+
+    This is deliberately separate from the video ``ffprobe`` lane.  A sidecar
+    is a text object, so reading a finite prefix is both cheaper and safer than
+    handing a signed URL to a parser.  Missing reader support or any read/
+    decode/format ambiguity is an ``unknown`` result and can never authorize a
+    subtitle task by itself.
+    """
+    limit = (
+        max_probe_bytes
+        if isinstance(max_probe_bytes, int) and not isinstance(max_probe_bytes, bool)
+        else DEFAULT_MAX_PREFIX_BYTES
+    )
+    limit = max(1024, min(DEFAULT_MAX_PREFIX_BYTES * 16, limit))
+    reader = getattr(client, "read_file_prefix", None)
+    if not callable(reader):
+        reader = getattr(client, "read_file_bytes", None)
+    if not callable(reader):
+        return {
+            "status": "unknown",
+            "source": "external_subtitle_content",
+            "reason": "subtitle_content_reader_unavailable",
+        }
+    try:
+        try:
+            prefix = reader(subtitle_path, max_bytes=limit)
+        except TypeError:
+            prefix = reader(subtitle_path, limit)
+    except Exception:
+        return {
+            "status": "unknown",
+            "source": "external_subtitle_content",
+            "reason": "subtitle_content_read_error",
+        }
+    result = classify_subtitle_content(
+        prefix, required_language, max_bytes=limit,
+    )
+    if not isinstance(result, Mapping):
+        return {
+            "status": "unknown",
+            "source": "external_subtitle_content",
+            "reason": "subtitle_decode_or_format_unknown",
+        }
+    # Keep the compact classification in the in-memory audit report; the
+    # ledger normalizer strips it before durable persistence.
+    return {
+        **dict(result),
+        "source": "external_subtitle_content",
+    }
+
+
 def _make_ephemeral_alist_subtitle_checker(
     client: object,
     required_language: str | Sequence[str],
@@ -3315,6 +3500,26 @@ def make_alist_subtitle_checker(
     prefetch_started = False
     prefetch_finished = False
 
+    # External sidecar probes are independently bounded.  Keep this state in
+    # the durable checker closure (rather than the ephemeral embedded checker)
+    # so audit and ledger callers share one finite content-read budget.
+    sidecar_cache: dict[str, Mapping[str, object]] = {}
+    sidecar_started_at: float | None = None
+    sidecar_count = 0
+    sidecar_lock = threading.Lock()
+    sidecar_max_files = _subtitle_probe_int(
+        "SCRAPEFLOW_SUBTITLE_CONTENT_PROBE_MAX_FILES",
+        256,
+        minimum=1,
+        maximum=4096,
+    )
+    sidecar_budget_seconds = _subtitle_probe_seconds(
+        "SCRAPEFLOW_SUBTITLE_CONTENT_PROBE_BUDGET_SECONDS",
+        30.0,
+        minimum=0.0,
+        maximum=300.0,
+    )
+
     def unknown(reason: str) -> Mapping[str, object]:
         return {"status": "unknown", "reason": reason}
 
@@ -3379,6 +3584,119 @@ def make_alist_subtitle_checker(
         outcome = put(path, identity, result)
         persist_ledger()
         return outcome
+
+    def sidecar_evidence(sidecar_rows: Sequence[object]) -> Mapping[str, object]:
+        """Aggregate bounded content verdicts for sidecars of one exact video."""
+        nonlocal sidecar_started_at, sidecar_count
+        rows: list[dict[str, object]] = []
+        for raw in sidecar_rows:
+            if isinstance(raw, Mapping):
+                path = _canonical_optional_path(raw.get("path"))
+                if path is None or _kind(path) != "subtitle":
+                    continue
+                row = {"path": path}
+                for key in ("size", "version"):
+                    if key in raw:
+                        row[key] = raw.get(key)
+                rows.append(row)
+            elif isinstance(raw, str):
+                path = _canonical_optional_path(raw)
+                if path is not None and _kind(path) == "subtitle":
+                    rows.append({"path": path})
+        # Keep one exact sidecar per path and cap a malformed inventory's fan
+        # out before any provider reads occur.
+        unique: dict[str, dict[str, object]] = {}
+        for row in rows:
+            unique.setdefault(str(row["path"]), row)
+        rows = list(unique.values())[:16]
+        if not rows:
+            return {"status": "missing", "source": "external_subtitle_content", "reason": "no_external_sidecar"}
+
+        # Sidecars use the same durable identity contract as embedded media:
+        # exact canonical path, non-negative byte size, provider version and
+        # configured language.  A missing version is still probed, but cannot
+        # inherit evidence across process restarts.
+        identities: dict[str, dict[str, object]] = {}
+        for row in rows:
+            identity = _subtitle_evidence_identity(
+                row, required_language, allow_sidecar=True,
+            )
+            if identity is not None:
+                identities[str(row["path"])] = identity
+        if identities:
+            ledger.invalidate_mutated(tuple(identities.values()))
+        results: list[Mapping[str, object]] = []
+        for row in rows:
+            path = str(row["path"])
+            identity = identities.get(path)
+            key = _subtitle_evidence_key(identity) if identity is not None else None
+            if key is None:
+                # Keep unversioned rows distinct in this audit-local cache;
+                # they are intentionally never eligible for durable reuse.
+                key = json.dumps(
+                    ["ephemeral", path, row.get("size"), row.get("version"), _subtitle_evidence_language(required_language)],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            with sidecar_lock:
+                cached_sidecar = sidecar_cache.get(key)
+                if cached_sidecar is not None:
+                    results.append(cached_sidecar)
+                    continue
+            if identity is not None:
+                persisted = ledger.lookup(identity)
+                if persisted is not None and persisted.get("status") in _SUBTITLE_EVIDENCE_DEFINITIVE_STATUSES:
+                    with sidecar_lock:
+                        sidecar_cache[key] = persisted
+                    results.append(persisted)
+                    continue
+                # Unknown diagnostics are intentionally not reused as a
+                # verdict; this audit may retry the bounded content probe.
+            # The cardinality/time budget applies even when the inventory
+            # lacks a version/size and therefore cannot use the durable key.
+            # Such a row is still probeable once, but must never create an
+            # unbounded sidecar read lane.
+            with sidecar_lock:
+                if sidecar_started_at is None:
+                    sidecar_started_at = time.monotonic()
+                budget_exhausted = (
+                    sidecar_count >= sidecar_max_files
+                    or time.monotonic() - sidecar_started_at >= sidecar_budget_seconds
+                )
+                if budget_exhausted:
+                    result = {
+                        "status": "unknown",
+                        "source": "external_subtitle_content",
+                        "reason": "subtitle_probe_budget_exhausted",
+                    }
+                    sidecar_cache[key] = result
+                    results.append(result)
+                    continue
+                sidecar_count += 1
+            result = probe_remote_subtitle_content(client, path, required_language)
+            with sidecar_lock:
+                sidecar_cache[key] = result
+            if identity is not None:
+                ledger.record(identity, result)
+            results.append(result)
+        persist_ledger()
+        if any(str(row.get("status") or "").casefold() == "satisfied" for row in results):
+            return {"status": "satisfied", "source": "external_subtitle_content"}
+        if any(str(row.get("status") or "").casefold() == "unknown" for row in results):
+            reason = next(
+                (str(row.get("reason")) for row in results if row.get("reason")),
+                "subtitle_decode_or_format_unknown",
+            )
+            return {
+                "status": "unknown",
+                "source": "external_subtitle_content",
+                "reason": reason,
+            }
+        return {
+            "status": "missing",
+            "source": "external_subtitle_content",
+            "reason": "subtitle_language_mismatch",
+        }
 
     def prefetch(video_rows: Sequence[object]) -> None:
         nonlocal deadline, prefetch_started, prefetch_finished
@@ -3542,6 +3860,7 @@ def make_alist_subtitle_checker(
             persist_ledger()
 
     setattr(check, "prefetch", prefetch)
+    setattr(check, "sidecar_evidence", sidecar_evidence)
     return check
 
 
@@ -3552,7 +3871,10 @@ def _subtitle_satisfies(paths: Sequence[str], video_path: str, required: set[str
         path for path in paths
         if PurePosixPath(path).parent == parent
         and PurePosixPath(path).suffix.casefold() in SUBTITLE_SUFFIXES
-        and PurePosixPath(path).stem.casefold().split(".", 1)[0] == stem
+        and (
+            PurePosixPath(path).stem.casefold() == stem
+            or PurePosixPath(path).stem.casefold().startswith(stem + ".")
+        )
     ]
     if not sidecars:
         return False
@@ -3565,6 +3887,39 @@ def _subtitle_satisfies(paths: Sequence[str], video_path: str, required: set[str
         or _language_keys(PurePosixPath(path).stem) & required
         for path in sidecars
     )
+
+
+def _subtitle_sidecar_rows(
+    file_rows: Sequence[Mapping[str, object]], video_path: str,
+) -> list[dict[str, object]]:
+    """Return exact same-directory/stem sidecars with size/version evidence."""
+    parent = PurePosixPath(video_path).parent
+    stem = PurePosixPath(video_path).stem.casefold()
+    output: list[dict[str, object]] = []
+    for raw in file_rows:
+        path = raw.get("path")
+        if not isinstance(path, str):
+            continue
+        pure = PurePosixPath(path)
+        if (
+            pure.parent != parent
+            or pure.suffix.casefold() not in SUBTITLE_SUFFIXES
+            or not (
+                pure.stem.casefold() == stem
+                or pure.stem.casefold().startswith(stem + ".")
+            )
+        ):
+            continue
+        row: dict[str, object] = {"path": path}
+        for key in ("size", "version"):
+            if key in raw:
+                row[key] = raw.get(key)
+        if "version" not in row:
+            version = _inventory_file_version(raw)
+            if version is not None:
+                row["version"] = version
+        output.append(row)
+    return output
 
 
 def _subtitle_check_evidence(
@@ -3591,6 +3946,28 @@ def _subtitle_check_evidence(
             result = {**result, "status": "missing"}
         return _normalise_subtitle_evidence_result(result)
     return {"status": "unknown", "reason": "subtitle_probe_error"}
+
+
+def _merge_subtitle_evidence(
+    *evidence_rows: Mapping[str, object],
+) -> dict[str, object]:
+    """Combine embedded and external evidence without collapsing unknowns."""
+    rows = [row for row in evidence_rows if isinstance(row, Mapping)]
+    if any(str(row.get("status") or "").casefold() == "satisfied" for row in rows):
+        return {"status": "satisfied", "source": "combined"}
+    unknown = next(
+        (row for row in rows if str(row.get("status") or "").casefold() == "unknown"),
+        None,
+    )
+    if unknown is not None:
+        return {
+            "status": "unknown",
+            "reason": _safe_subtitle_evidence_reason(unknown.get("reason")),
+            **({"source": unknown.get("source")} if unknown.get("source") else {}),
+        }
+    if rows and all(str(row.get("status") or "").casefold() == "missing" for row in rows):
+        return {"status": "missing", "source": "combined"}
+    return {"status": "unknown", "reason": "subtitle_evidence_unavailable"}
 
 
 def _subtitle_check_result(
@@ -3669,6 +4046,7 @@ def build_automatic_library_gaps(
     episode_catalog: Mapping[object, object] | Callable[[Mapping[str, object]], object] | None = None,
     required_subtitle_language: str | Sequence[str] | None = None,
     subtitle_checker: Callable[[str], object] | None = None,
+    subtitle_policy_overrides: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Derive machine-readable semantic gaps from a completed inventory.
 
@@ -3725,20 +4103,24 @@ def build_automatic_library_gaps(
         for item in required_subtitle_language:
             required.update(_language_keys(item))
 
-    # Probe only videos that lack a matching external sidecar.  The checker
-    # supplied by the composition root exposes an optional bounded prefetch;
-    # ordinary injected test callables remain untouched and synchronous.
+    # The production checker exposes both a bounded embedded prefetch and an
+    # external-sidecar content hook.  When the hook exists, prefetch all video
+    # rows: a filename marker alone is not enough to skip an embedded probe if
+    # the sidecar later proves traditional/Japanese/unknown.  Legacy injected
+    # checkers retain the old filename fast path for compatibility.
     prefetch = getattr(subtitle_checker, "prefetch", None)
+    sidecar_probe = getattr(subtitle_checker, "sidecar_evidence", None)
     if required and callable(prefetch) and works:
         probe_paths = [
             video_rows_by_path.get(path, {"path": path}) for path in video_paths
-            if not _subtitle_satisfies(file_paths, path, required)
+            if callable(sidecar_probe) or not _subtitle_satisfies(file_paths, path, required)
         ]
         prefetch(probe_paths)
 
     gaps: list[dict[str, object]] = []
     unknowns: list[dict[str, object]] = []
     work_results: list[dict[str, object]] = []
+    applied_subtitle_policies: list[dict[str, object]] = []
     covered_video_paths: set[str] = set()
     for raw_work in works:
         if not isinstance(raw_work, Mapping):
@@ -3860,18 +4242,61 @@ def build_automatic_library_gaps(
                         result["gaps"].append(gap)
 
         if required:
+            subtitle_policy = subtitle_policy_for_work(
+                {"metadata": metadata},
+                required_subtitle_language,
+                subtitle_policy_overrides,
+            )
             for path in work_videos:
-                if _subtitle_satisfies(file_paths, path, required):
+                sidecar_evidence: Mapping[str, object] | None = None
+                sidecar_rows = _subtitle_sidecar_rows(file_rows, path)
+                if callable(sidecar_probe) and sidecar_rows:
+                    try:
+                        raw_sidecar_evidence = sidecar_probe(sidecar_rows)
+                    except Exception:
+                        raw_sidecar_evidence = {
+                            "status": "unknown",
+                            "source": "external_subtitle_content",
+                            "reason": "subtitle_content_read_error",
+                        }
+                    if isinstance(raw_sidecar_evidence, Mapping):
+                        sidecar_evidence = dict(raw_sidecar_evidence)
+                elif _subtitle_satisfies(file_paths, path, required):
+                    # Compatibility path for small injected checkers that do
+                    # not expose a bounded content reader.  The real AList
+                    # checker always takes the branch above.
                     continue
                 subtitle_evidence = _subtitle_check_evidence(subtitle_checker, path)
-                subtitle_status = str(subtitle_evidence.get("status") or "").casefold()
+                combined = _merge_subtitle_evidence(
+                    *(row for row in (sidecar_evidence, subtitle_evidence) if row is not None)
+                )
+                subtitle_status = str(combined.get("status") or "").casefold()
+                if subtitle_status == "satisfied":
+                    continue
                 if subtitle_status != "missing":
                     result["unknown"] = True
                     unknowns.append({
                         "kind": "unknown_subtitle_evidence", "work": work_key,
                         "target_root": target_root, "path": path,
-                        "reason": _safe_subtitle_evidence_reason(subtitle_evidence.get("reason")),
+                        "reason": _safe_subtitle_evidence_reason(combined.get("reason")),
                     })
+                    continue
+                if subtitle_policy is not None:
+                    # This is a user-confirmed policy, not a content probe:
+                    # only suppress a conclusive missing gap.  Unknown
+                    # sidecar/ffprobe evidence remains visible and therefore
+                    # cannot be silently painted green by a hard-subtitle
+                    # setting.
+                    applied = {
+                        "work": work_key,
+                        "target_root": target_root,
+                        "tmdb_id": tmdb_id,
+                        "path": path,
+                        "subtitle_language": str(required_subtitle_language or "zh"),
+                        **dict(subtitle_policy),
+                    }
+                    result.setdefault("subtitle_policy_overrides", []).append(applied)
+                    applied_subtitle_policies.append(applied)
                     continue
                 label = f"{title + ' ' if title else ''}{PurePosixPath(path).name}"
                 gap = _semantic_gap(
@@ -3982,6 +4407,7 @@ def build_automatic_library_gaps(
         "unknowns": unknowns,
         "unknown_count": len(unknowns),
         "works": work_results,
+        "subtitle_policy_overrides": applied_subtitle_policies,
         # These are explicit observed extras only.  They are intentionally
         # absent from coverage, gaps and acquisition projects.
         "ancillary_media": ancillary_media,
@@ -3997,6 +4423,7 @@ def attach_automatic_gaps(
     episode_catalog: Mapping[object, object] | Callable[[Mapping[str, object]], object] | None = None,
     required_subtitle_language: str | Sequence[str] | None = None,
     subtitle_checker: Callable[[str], object] | None = None,
+    subtitle_policy_overrides: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Return a copy of a structural report with automatic semantic gaps."""
     enriched = dict(report)
@@ -4008,6 +4435,7 @@ def attach_automatic_gaps(
         enriched, works, episode_catalog=episode_catalog,
         required_subtitle_language=required_subtitle_language,
         subtitle_checker=subtitle_checker,
+        subtitle_policy_overrides=subtitle_policy_overrides,
     )
     enriched["semantic"] = semantic
     enriched["gaps"] = list(semantic["gaps"])
@@ -4040,6 +4468,7 @@ def audit_and_persist(
     episode_catalog: Mapping[object, object] | Callable[[Mapping[str, object]], object] | None = None,
     required_subtitle_language: str | Sequence[str] | None = None,
     subtitle_checker: Callable[[str], object] | None = None,
+    subtitle_policy_overrides: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Write the replaceable structural plus optional semantic report."""
     auditor = SimpleLibraryAuditor(
@@ -4048,10 +4477,16 @@ def audit_and_persist(
     )
     report = auditor.scan()
     if works or episode_catalog is not None or required_subtitle_language is not None:
+        policies = (
+            list(subtitle_policy_overrides)
+            if subtitle_policy_overrides is not None
+            else load_subtitle_policy_overrides(state_root)
+        )
         report = attach_automatic_gaps(
             report, works, episode_catalog=episode_catalog,
             required_subtitle_language=required_subtitle_language,
             subtitle_checker=subtitle_checker,
+            subtitle_policy_overrides=policies,
         )
     atomic_write_json(latest_audit_path(state_root), report, allow_nan=False)
     return report
@@ -4066,6 +4501,7 @@ def run_automatic_library_audit(
     formal_roots: Sequence[str] = DEFAULT_FORMAL_LIBRARY_ROOTS,
     required_subtitle_language: str | Sequence[str] | None = None,
     subtitle_checker: Callable[[str], object] | None = None,
+    subtitle_policy_overrides: Sequence[Mapping[str, object]] | None = None,
     max_directories: int = 20_000,
     max_files: int = 250_000,
     clock: Callable[[], str] | None = None,
@@ -4102,6 +4538,11 @@ def run_automatic_library_audit(
         client,
         state_root,
     )
+    policies = (
+        list(subtitle_policy_overrides)
+        if subtitle_policy_overrides is not None
+        else load_subtitle_policy_overrides(state_root)
+    )
     catalog = TmdbEpisodeCatalog(tmdb_client) if tmdb_client is not None else None
     if catalog is not None:
         # Warm one snapshot per unique TV identity before the semantic pass.
@@ -4119,6 +4560,7 @@ def run_automatic_library_audit(
         episode_catalog=catalog,
         required_subtitle_language=required_subtitle_language,
         subtitle_checker=subtitle_checker,
+        subtitle_policy_overrides=policies,
     )
     semantic = report.get("semantic")
     if isinstance(semantic, dict):
@@ -4182,6 +4624,8 @@ __all__ = [
     "automatic_job_gaps", "automatic_works_from_engine_jobs",
     "bootstrap_automatic_works_from_library", "build_automatic_library_gaps",
     "classify_embedded_subtitle_streams", "latest_audit_path",
-    "make_alist_subtitle_checker", "probe_remote_subtitle_streams",
+    "make_alist_subtitle_checker", "probe_remote_subtitle_content",
+    "probe_remote_subtitle_streams",
+    "load_subtitle_policy_overrides", "subtitle_policy_for_work",
     "run_automatic_library_audit",
 ]

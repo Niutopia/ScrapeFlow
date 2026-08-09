@@ -94,16 +94,17 @@ def is_task_owned_staging_root(path: str) -> bool:
     """Recognize the only current automatic staging layout.
 
     The automatic replenishment runtime creates
-    ``.../ScrapeFlow/补源/<job-id>/<attempt-id>/...``.  Merely living below a
-    broad media root or intake folder is not ownership evidence.  Keep this
-    convention narrow until an explicit task-staging identity is persisted in
-    the current plan model.
+    ``.../ScrapeFlow/补源/<job-id>/<attempt-id>/...`` and ordinary archive
+    intake creates ``.../ScrapeFlow/归档/<job-id>/...``.  Merely living below a
+    broad media root or intake folder is not ownership evidence: both layouts
+    require at least a job component and a task/attempt component after the
+    marker.
     """
     normalized = _normalized_path(path)
     parts = [part for part in normalized.split("/") if part]
     folded = [part.casefold() for part in parts]
     for index in range(len(parts) - 1):
-        if folded[index] == "scrapeflow" and parts[index + 1] == "补源":
+        if folded[index] == "scrapeflow" and parts[index + 1] in {"补源", "归档"}:
             return len(parts[index + 2:]) >= 2
     return False
 
