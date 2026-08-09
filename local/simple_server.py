@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -25,6 +27,7 @@ from engine.scrapeflow.media_quality import (
     is_video_filename,
 )
 from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
+from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     EngineJob,
@@ -130,6 +133,7 @@ class SimpleApplication:
         remote: object | None = None,
         engine_runner: SimpleEngineRunner | None = None,
         enforce_engine_roots: bool | None = None,
+        archive_preprocessor: object | None = None,
     ) -> None:
         self.state_root = Path(state_root or os.getenv("SCRAPEFLOW_STATE_DIR", "/data")).resolve()
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -143,6 +147,17 @@ class SimpleApplication:
         candidate = remote if remote is not None else self._build_remote()
         self._alist_client = candidate
         self._engine_runner = engine_runner
+        staging_prefix = f"{self.remote_root.rstrip('/')}/ScrapeFlow"
+        local_staging_prefix = (self.state_root / "archive-staging").resolve()
+        self._archive_preprocessor = archive_preprocessor or ArchivePreprocessingAdapter(
+            staging_root_validator=lambda path: (
+                path == staging_prefix or path.startswith(staging_prefix + "/")
+            ),
+            local_staging_root_validator=lambda path: (
+                Path(path).resolve() == local_staging_prefix
+                or local_staging_prefix in Path(path).resolve().parents
+            ),
+        )
         self._engine_runner_lock = threading.Lock()
         self._automatic_replenishment: AutomaticReplenishmentRuntime | None = None
         self._automatic_replenishment_lock = threading.Lock()
@@ -154,9 +169,24 @@ class SimpleApplication:
         self._automatic_futures: dict[str, Future[object]] = {}
         self._provider_executor: ThreadPoolExecutor | None = None
         self._provider_futures: dict[str, Future[object]] = {}
+        # Delayed retries are real scheduler state, not fire-and-forget
+        # ``threading.Timer`` instances.  Each lane/root key has at most one
+        # pending callback so manual retry, terminal completion and shutdown
+        # can cancel it before it creates another attempt.
+        self._scheduled_timers: dict[tuple[str, str], threading.Timer] = {}
+        # A terminal cleanup fences callbacks for the root while its durable
+        # JSON/staging ownership check and deletion run.  Keeping the fence
+        # through the runner's inter-process lock closes the small window in
+        # which a timer could fire after the HTTP guard but before cleanup.
+        self._cleanup_fences: set[str] = set()
+        # A manually supplied archive password is deliberately memory-only.
+        # It is consumed by the next planning attempt and never enters a job,
+        # gap record, retry timer or public projection.
+        self._retry_archive_passwords: dict[str, str] = {}
         self._audit_lock = threading.RLock()
         self._audit_executor: ThreadPoolExecutor | None = None
         self._audit_future: Future[object] | None = None
+        self._pending_audit_roots: set[str] = set()
         # A provider child can finish while a read-only full-library audit is
         # still traversing the old inventory.  Keep one coalesced follow-up
         # request so the newly committed video is audited (and can acquire a
@@ -254,7 +284,13 @@ class SimpleApplication:
             "connected": self.remote_configured,
             "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
             "engine_configured": self.engine_configured,
+            "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or None,
+            "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or None,
             "provider_capabilities": provider_capability_snapshot(),
+            "lane_gates": {
+                "provider_auto_repair_enabled": self._provider_auto_repair_enabled(),
+                "audit_auto_repair_enabled": self._audit_auto_repair_enabled(),
+            },
             "intake_monitoring": self._intake_monitor_enabled(),
             "intake": {
                 "enabled": self._intake_monitor_enabled(),
@@ -280,7 +316,7 @@ class SimpleApplication:
         except Exception:
             engine_jobs = []
         active_engine_phases = {
-            "queued", "analyzing", "identity_matching", "planning", "planned",
+            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
             "executing", "verifying", "cleaning", "retry_wait",
         }
         failed_engine_phases = {
@@ -356,7 +392,23 @@ class SimpleApplication:
 
     def _automatic_audit_enabled(self) -> bool:
         """Run the startup audit by default only for the real media root."""
-        return _env_bool("SCRAPEFLOW_AUTOMATIC_AUDIT", self.enforce_engine_roots)
+        return self._audit_auto_repair_enabled() and _env_bool(
+            "SCRAPEFLOW_AUTOMATIC_AUDIT", self.enforce_engine_roots,
+        )
+
+    def _provider_auto_repair_enabled(self) -> bool:
+        """Explicit production gate for Provider workers and retry timers."""
+        return _env_bool(
+            "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED",
+            not self.enforce_engine_roots,
+        )
+
+    def _audit_auto_repair_enabled(self) -> bool:
+        """Explicit production gate for background audit/repair scheduling."""
+        return _env_bool(
+            "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED",
+            not self.enforce_engine_roots,
+        )
 
     def _start_intake_monitor(self) -> None:
         if self._closed.is_set() or not self._intake_monitor_enabled():
@@ -388,7 +440,7 @@ class SimpleApplication:
         monitor into an endless duplicate-job generator.
         """
         return job.phase in {
-            "queued", "analyzing", "identity_matching", "planning", "planned",
+            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
             "executing", "verifying", "cleaning", "retry_wait", "failed",
         }
 
@@ -419,11 +471,21 @@ class SimpleApplication:
         if not isinstance(rows, list):
             raise ApplicationError("AList 待刮削目录响应格式无效")
         try:
-            existing = {
-                str(job.request.get("source_path")): job
-                for job in runner.list_jobs()
-                if isinstance(job.request.get("source_path"), str)
-            }
+            existing = {}
+            for job in runner.list_jobs():
+                if not isinstance(job.request.get("source_path"), str):
+                    continue
+                # Archive preprocessing deliberately changes the planner's
+                # source to task staging.  Intake de-duplication must retain
+                # the original ingress directory or a successful archive job
+                # would be recreated on every monitor pass.
+                original = (
+                    job.summary.get("ingress_source_path")
+                    if isinstance(job.summary, Mapping)
+                    else None
+                )
+                key = original if isinstance(original, str) else job.request.get("source_path")
+                existing[str(key)] = job
         except Exception:
             existing = {}
         scheduled: list[str] = []
@@ -513,6 +575,7 @@ class SimpleApplication:
                 alist=alist,
                 tmdb=tmdb,
                 library_root=self.remote_root,
+                archive_preprocessor=self._archive_preprocessor,
             )
             self._engine_runner = runner
             return runner
@@ -525,6 +588,115 @@ class SimpleApplication:
                     thread_name_prefix="scrapeflow-formal-write",
                 )
             return self._automatic_executor
+
+    def _cancel_scheduled_timer(self, lane: str, owner: str) -> bool:
+        """Cancel one pending timer without touching a running worker."""
+        key = (lane, owner)
+        with self._automatic_lock:
+            timer = self._scheduled_timers.pop(key, None)
+        if timer is None:
+            return False
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+        return True
+
+    def _cancel_job_timers(self, job_id: str) -> bool:
+        """Cancel the two delayed queues that can own one public root."""
+        automatic = self._cancel_scheduled_timer("automatic", job_id)
+        provider = self._cancel_scheduled_timer("provider", job_id)
+        return automatic or provider
+
+    @staticmethod
+    def _retry_archive_password(value: object) -> str:
+        if not isinstance(value, str):
+            raise EngineRequestError("归档密码必须是字符串")
+        password = value.strip()
+        if not password or len(password) > 128 or any(ord(char) < 32 for char in password):
+            raise EngineRequestError("归档密码无效")
+        return password
+
+    @staticmethod
+    def _manual_identity_correction(payload: Mapping[str, object]) -> dict[str, object] | None:
+        """Validate the intentionally small failed-identity correction form."""
+        # Identity correction is deliberately a four-field contract.  Shelf
+        # naming, title/year metadata and the formal parent are derived by the
+        # existing planner/policy; accepting them from Web would let a client
+        # steer writes outside that policy.
+        identity_fields = {"tmdb_id", "media_type", "season"}
+        if not any(field in payload for field in identity_fields):
+            return None
+        raw_id = payload.get("tmdb_id")
+        if isinstance(raw_id, str) and raw_id.isascii() and raw_id.isdecimal():
+            raw_id = int(raw_id)
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
+            raise EngineRequestError("手工修正需要正整数 tmdb_id")
+        media_type = payload.get("media_type")
+        if not isinstance(media_type, str) or media_type.strip().casefold() not in {"movie", "tv"}:
+            raise EngineRequestError("手工修正需要 media_type=movie 或 tv")
+        correction: dict[str, object] = {
+            "tmdb_id": raw_id,
+            "media_type": media_type.strip().casefold(),
+        }
+        raw_season = payload.get("season", 1)
+        if isinstance(raw_season, str) and raw_season.isascii() and raw_season.isdecimal():
+            raw_season = int(raw_season)
+        if isinstance(raw_season, bool) or not isinstance(raw_season, int) or not 0 <= raw_season <= 999:
+            raise EngineRequestError("手工修正 season 必须是 0–999 的整数")
+        correction["season"] = raw_season
+        return correction
+
+    def _schedule_timer(
+        self,
+        lane: str,
+        owner: str,
+        delay: float,
+        callback: Callable[[], None],
+    ) -> None:
+        """Replace a delayed callback atomically and run immediate work now.
+
+        The wrapper removes itself before invoking the queue callback.  A
+        callback which schedules a new retry therefore cannot accidentally
+        cancel its own replacement, while a stale cancelled timer becomes a
+        no-op after checking identity under the same lock.
+        """
+        key = (lane, owner)
+        if delay <= 0:
+            with self._automatic_lock:
+                if owner in self._cleanup_fences:
+                    return
+                self._cancel_scheduled_timer(lane, owner)
+                callback()
+            return
+        with self._automatic_lock:
+            old = self._scheduled_timers.pop(key, None)
+            if old is not None:
+                try:
+                    old.cancel()
+                except Exception:
+                    pass
+
+            timer: threading.Timer
+
+            def fire() -> None:
+                with self._automatic_lock:
+                    if owner in self._cleanup_fences:
+                        self._scheduled_timers.pop(key, None)
+                        return
+                    if self._scheduled_timers.get(key) is not timer:
+                        return
+                    self._scheduled_timers.pop(key, None)
+                    # Run the submit/reconciliation callback under the same
+                    # re-entrant lock.  Cleanup therefore cannot observe an
+                    # empty timer/future pair between this pop and callback's
+                    # future insertion.
+                    callback()
+
+            timer = threading.Timer(float(delay), fire)
+            timer.daemon = True
+            self._scheduled_timers[key] = timer
+            timer.start()
 
     @staticmethod
     def _automatic_retry_limit() -> int:
@@ -641,6 +813,14 @@ class SimpleApplication:
     @classmethod
     def _provider_job_allowed(cls, job: EngineJob) -> bool:
         """Return whether a root may enter the current provider dispatch lane."""
+        # A terminal provider attempt is a deliberate per-gap stop boundary.
+        # Timers/futures that raced with exhaustion must not re-enter the lane;
+        # only ``retry_public_job`` clears this projection for an explicit
+        # operator retry (a fresh audit with a different fingerprint clears
+        # the old projection before it is queued).
+        replenishment = job.summary.get("replenishment") if isinstance(job.summary, Mapping) else None
+        if isinstance(replenishment, Mapping) and replenishment.get("terminal") is True:
+            return False
         pilot_tmdb = cls._provider_pilot_tmdb()
         if pilot_tmdb is not None and cls._provider_job_tmdb(job) != pilot_tmdb:
             return False
@@ -876,6 +1056,29 @@ class SimpleApplication:
         return str(row.get("kind") or "").strip().casefold()
 
     @staticmethod
+    def _provider_gap_fingerprint(rows: Sequence[Mapping[str, object]]) -> str:
+        """Stable identity for one fresh provider-gap observation."""
+        canonical: list[dict[str, object]] = []
+        for row in rows:
+            media = row.get("media") if isinstance(row.get("media"), Mapping) else {}
+            canonical.append({
+                "kind": SimpleApplication._audit_row_kind(row),
+                "tmdb_id": media.get("tmdb_id") if isinstance(media, Mapping) else row.get("tmdb_id"),
+                "target_root": media.get("target_root") if isinstance(media, Mapping) else row.get("target_root"),
+                "path": row.get("path"),
+                "season": row.get("season"),
+                "episode": row.get("episode"),
+                "subtitle_language": row.get("subtitle_language"),
+            })
+        payload = json.dumps(
+            sorted(canonical, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True)),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _audit_phase_for_job(job: EngineJob) -> tuple[str | None, str | None]:
         """Map unresolved audit state to an existing public phase.
 
@@ -1023,12 +1226,7 @@ class SimpleApplication:
                     self._run_automatic_job, job_id,
                 )
 
-        if delay > 0:
-            timer = threading.Timer(delay, submit)
-            timer.daemon = True
-            timer.start()
-        else:
-            submit()
+        self._schedule_timer("automatic", job_id, delay, submit)
 
     @staticmethod
     def _automatic_failure_stage(error: Exception, job: EngineJob | None = None) -> str:
@@ -1088,15 +1286,227 @@ class SimpleApplication:
             _redacted_job_payload(updated),
             allow_nan=False,
         )
+        if phase != "retry_wait":
+            self._cancel_job_timers(job_id)
         if phase == "retry_wait":
             self._queue_automatic_job(job_id, delay=float(summary["next_retry_seconds"] or 1))
         elif phase == "failed_identity" and summary.get("automatic_terminal") is True:
-            # A terminal identity failure may have no plan and therefore is
-            # not picked up by the normal execution queue.  Keep the latest
-            # full-library snapshot moving so an identity bootstrap or a
-            # newly available TMDB response can be observed without a manual
-            # action.  The audit itself is read-only and remains single-flight.
-            self._queue_library_audit(delay=1.0)
+            # A terminal identity failure has no trusted work root.  Do not
+            # widen it into a full-library scan; only an explicit operator
+            # audit (or a later retry that supplies identity) may establish a
+            # bounded work scope.
+            return
+
+    def _sync_replenishment_child(self, root: EngineJob) -> EngineJob:
+        """Project durable provider-child state back onto one public root.
+
+        Provider children are implementation records and are intentionally not
+        listed as public tasks.  A process restart can nevertheless leave the
+        root's last progress callback one phase behind the child JSON (for
+        example ``child_executing`` after the child was already read back as
+        ``executed``).  Refresh the child rows from durable records before the
+        scheduler makes a new provider decision.  The method is local-state
+        reconciliation only; it never invokes a provider or writes the media
+        library.
+        """
+        runner = self._engine_runner
+        if runner is None:
+            try:
+                runner = self._get_engine_runner()
+            except Exception:
+                return root
+        try:
+            current = runner.get_job(root.id)
+            if self._is_internal_child(current):
+                return current
+            persisted = runner.list_jobs()
+        except Exception:
+            return root
+
+        children: list[EngineJob] = []
+        for candidate in persisted:
+            if not self._is_internal_child(candidate):
+                continue
+            child_summary = candidate.summary if isinstance(candidate.summary, Mapping) else {}
+            if child_summary.get("root_job_id") != current.id:
+                continue
+            reconciled = candidate
+            # A child can be left in-flight when the API process disappears.
+            # ``recover_job`` performs exact readback and is deliberately
+            # read-only; use it when available, but keep a malformed/temporary
+            # fixture visible rather than dropping the child projection.
+            recover = getattr(runner, "recover_job", None)
+            if callable(recover) and candidate.phase in {
+                "executing", "verifying", "cleaning", "retry_wait",
+            }:
+                try:
+                    maybe = recover(candidate.id)
+                    if isinstance(maybe, EngineJob):
+                        reconciled = maybe
+                except Exception:
+                    pass
+            children.append(reconciled)
+
+        if not children:
+            return current
+
+        prior_replenishment = current.summary.get("replenishment")
+        replenishment = (
+            dict(prior_replenishment)
+            if isinstance(prior_replenishment, Mapping)
+            else {}
+        )
+        prior_rows_raw = replenishment.get("child_jobs")
+        prior_rows: dict[str, dict[str, object]] = {}
+        if isinstance(prior_rows_raw, list):
+            for raw in prior_rows_raw:
+                if not isinstance(raw, Mapping):
+                    continue
+                child_id = raw.get("id")
+                if isinstance(child_id, str) and child_id:
+                    prior_rows[child_id] = dict(raw)
+
+        successful_phases = {"executed", "completed"}
+        failed_phases = {
+            "failed", "failed_identity", "failed_provider", "failed_write",
+            "failed_verification", "failed_cleanup",
+        }
+        active_phases = {
+            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
+            "executing", "verifying", "cleaning", "retry_wait",
+        }
+        public_phase = {
+            "queued": "child_planning", "analyzing": "child_planning",
+            "identity_matching": "child_planning", "planning": "child_planning",
+            "planned": "child_planning", "executing": "child_executing",
+            "verifying": "final_verifying", "cleaning": "cleaning",
+            "retry_wait": "retry_wait",
+        }
+        child_rows: list[dict[str, object]] = []
+        for child in sorted(children, key=lambda item: (item.updated_at, item.id)):
+            phase = child.phase
+            row = dict(prior_rows.pop(child.id, {}))
+            row.update({
+                "id": child.id,
+                "phase": phase,
+                "engine_phase": phase,
+                "public_phase": (
+                    "completed" if phase in successful_phases
+                    else "child_failed" if phase in failed_phases
+                    else "cancelled" if phase == "cancelled"
+                    else public_phase.get(phase, phase)
+                ),
+                "updated_at": child.updated_at,
+                "terminal": phase in successful_phases or phase in failed_phases or phase == "cancelled",
+                "success": phase in successful_phases,
+            })
+            if child.error:
+                row["error"] = redact_error(child.error)
+            elif phase in successful_phases:
+                row.pop("error", None)
+            child_rows.append(row)
+        # Preserve historical child attempts after their JSON is manually
+        # archived; current rows above always win for an existing id.
+        child_rows.extend(prior_rows.values())
+        child_rows.sort(key=lambda row: (str(row.get("updated_at") or ""), str(row.get("id") or "")))
+
+        active_children = [child for child in children if child.phase in active_phases]
+        failed_children = [child for child in children if child.phase in failed_phases]
+        successful_children = [child for child in children if child.phase in successful_phases]
+        cancelled_children = [child for child in children if child.phase == "cancelled"]
+        prior_status = str(replenishment.get("status") or "").casefold()
+        prior_terminal = replenishment.get("terminal") is True
+        if active_children:
+            current_child = max(active_children, key=lambda item: (item.updated_at, item.id))
+            status = public_phase.get(current_child.phase, "retry_wait")
+            terminal = False
+            error = current_child.error
+        elif failed_children:
+            # Preserve an explicit exhausted provider budget.  A child failure
+            # discovered during restart is otherwise retryable by design.
+            status = prior_status if prior_terminal and prior_status in {
+                "failed", "failed_provider",
+            } else "child_failed"
+            terminal = prior_terminal and status in {"failed", "failed_provider"}
+            error = next(
+                (child.error for child in reversed(sorted(failed_children, key=lambda item: item.updated_at)) if child.error),
+                None,
+            )
+        elif successful_children:
+            status = (
+                prior_status if prior_terminal and prior_status in {"failed", "failed_provider"}
+                else "completed"
+            )
+            terminal = (
+                (prior_terminal and status in {"failed", "failed_provider"})
+                or status == "completed"
+            )
+            error = None
+        elif cancelled_children:
+            status = "cancelled"
+            terminal = True
+            error = None
+        else:
+            status, terminal, error = prior_status or "retry_wait", prior_terminal, None
+
+        prior_core = {
+            key: value
+            for key, value in replenishment.items()
+            if key != "updated_at"
+        }
+        next_core = {
+            **prior_core,
+            "status": status,
+            "terminal": terminal,
+            "child_jobs": child_rows,
+        }
+        if error:
+            next_core["error"] = redact_error(error)
+        elif status == "completed":
+            next_core.pop("error", None)
+        current_core = (
+            {
+                key: value
+                for key, value in prior_replenishment.items()
+                if key != "updated_at"
+            }
+            if isinstance(prior_replenishment, Mapping)
+            else {}
+        )
+        if (
+            next_core == current_core
+            and str(current.summary.get("automatic_stage") or "") == status
+        ):
+            return current
+        replenishment.update({**next_core, "updated_at": _now()})
+        summary = dict(current.summary)
+        summary["replenishment"] = replenishment
+        summary["automatic_stage"] = status
+        updated = replace(current, summary=summary, updated_at=_now())
+        lock_factory = getattr(runner, "worker_lock", None)
+        if callable(lock_factory):
+            try:
+                with lock_factory():
+                    # Cleanup and formal execution share this lock. Re-read
+                    # before writing so a concurrent terminal cleanup cannot
+                    # be undone by this projection pass.
+                    latest = runner.get_job(current.id)
+                    if latest.as_dict() != current.as_dict():
+                        return latest
+                    atomic_write_json(
+                        runner.jobs_root / f"{current.id}.json",
+                        _redacted_job_payload(updated),
+                        allow_nan=False,
+                    )
+            except EngineJobNotFoundError:
+                return current
+        else:
+            atomic_write_json(
+                runner.jobs_root / f"{current.id}.json",
+                _redacted_job_payload(updated),
+                allow_nan=False,
+            )
+        return updated
 
     def _run_automatic_job(self, job_id: str) -> None:
         """Reconcile first, then execute only the still-missing plan work."""
@@ -1114,33 +1524,62 @@ class SimpleApplication:
             # A queued/retry identity job has no plan yet.  Resolve it inside
             # the same scheduler; a transient TMDB error is persisted and
             # retried rather than returned as a transient HTTP error.
-            if job.phase in {"queued", "identity_matching", "planning", "failed_identity"} or (
+            if job.phase in {"queued", "archive_preprocessing", "identity_matching", "planning", "failed_identity"} or (
                 job.phase == "retry_wait" and not job.plan
             ):
                 try:
-                    job = runner.plan_automatic_job(job_id)
+                    with self._automatic_lock:
+                        retry_password = self._retry_archive_passwords.get(job_id)
+                    job = (
+                        runner.plan_automatic_job(job_id, retry_password=retry_password)
+                        if retry_password is not None
+                        else runner.plan_automatic_job(job_id)
+                    )
+                    if retry_password is not None:
+                        with self._automatic_lock:
+                            # Consume only after the planner persisted its
+                            # result. A wrong password remains available for
+                            # this in-memory retry until the caller replaces
+                            # it or the process exits.
+                            self._retry_archive_passwords.pop(job_id, None)
                 except Exception as exc:
                     self._record_automatic_retry(job_id, exc, stage="identity")
                     return
             if job.phase in {"executing", "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup"}:
                 job = runner.recover_job(job_id)
+                # The restart matrix may have converted an ambiguous write
+                # into a durable terminal verification failure.  Never fall
+                # through to execute_automatic: that would turn a confirmed
+                # target/source conflict back into another write retry.
+                if self._is_terminal_automatic_failure(job):
+                    self._cancel_job_timers(job_id)
+                    return
                 if job.phase == "executed":
-                    self._sync_replenishment_child(job)
+                    job = self._sync_replenishment_child(job)
                     if self._has_provider_gaps(job):
                         self._queue_provider_job(job.id)
-                    self._queue_library_audit(delay=0.5)
+                    target = self._job_audit_target(job)
+                    if isinstance(target, str):
+                        self._queue_scoped_library_audit([target], delay=0.5)
                     return
             if job.phase not in {"planned", "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup"}:
                 return
             done = runner.execute_automatic(job_id)
-            self._sync_replenishment_child(done)
+            done = self._sync_replenishment_child(done)
             if self._has_provider_gaps(done):
                 self._queue_provider_job(done.id)
             # The child may have committed a video while another audit was
             # already running.  Ask the audit coordinator for one fresh pass
             # after that run settles; this is still read-only and does not
             # widen the provider/root identity.
-            self._queue_library_audit(delay=0.5, rerun_if_busy=True)
+            target = self._job_audit_target(done)
+            if isinstance(target, str):
+                self._queue_scoped_library_audit(
+                    [target], delay=0.5, rerun_if_busy=True,
+                )
+            # A committed provider child must always have the durable root
+            # coordinates above.  Missing coordinates are not permission to
+            # scan the entire formal library.
         except EngineWorkerBusyError:
             # Another process is already proving the same remote state.  A
             # short requeue is enough; no second writer is started.
@@ -1168,11 +1607,12 @@ class SimpleApplication:
                 if self._is_terminal_automatic_failure(job):
                     continue
                 if job.phase in {
-                    "queued", "identity_matching", "planning", "planned", "executing",
+                    "queued", "archive_preprocessing", "identity_matching", "planning", "planned", "executing",
                     "retry_wait", "failed", "failed_write", "failed_verification", "failed_cleanup",
                 }:
                     self._queue_automatic_job(job.id)
                 elif job.phase == "executed":
+                    job = self._sync_replenishment_child(job)
                     if self._has_provider_gaps(job):
                         scan = job.plan.get("scan_report") if isinstance(job.plan.get("scan_report"), Mapping) else {}
                         rows = scan.get("resource_gaps") if isinstance(scan, Mapping) else []
@@ -1209,8 +1649,21 @@ class SimpleApplication:
                                 queue_owner = True
                         if queue_owner:
                             self._queue_provider_job(job.id)
+                    replenishment = job.summary.get("replenishment")
+                    if (
+                        isinstance(replenishment, Mapping)
+                        and replenishment.get("status") == "completed"
+                        and isinstance(replenishment.get("child_jobs"), list)
+                    ):
+                        # A recovered child proves its own move, not a global
+                        # inventory. Re-audit only this root's work scope.
+                        target = self._job_audit_target(job)
+                        if isinstance(target, str):
+                            self._queue_scoped_library_audit([target], delay=0.5)
                     if self._audit_needs_retry(job):
-                        self._queue_library_audit(delay=1.0)
+                        target = self._job_audit_target(job)
+                        if isinstance(target, str):
+                            self._queue_scoped_library_audit([target], delay=1.0)
         except Exception:
             # Health/status endpoints remain available while a network or
             # credential issue is repaired; an explicit resume/retry will
@@ -1249,7 +1702,9 @@ class SimpleApplication:
                 engine_runner=runner,
                 alist=client,
                 search=ReplenishmentSearchService(),
-                materializer=LocalTorrentAutomaticMaterializer(),
+                materializer=LocalTorrentAutomaticMaterializer(
+                    archive_preprocessor=self._archive_preprocessor,
+                ),
                 staging_root=f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源",
                 progress=self._record_replenishment_progress,
                 cancel_requested=self._provider_runtime_cancel_requested,
@@ -1258,7 +1713,11 @@ class SimpleApplication:
             return runtime
 
     def _queue_provider_job(self, job_id: str, *, delay: float = 0.0) -> None:
-        if self._closed.is_set() or self.control().get("paused") is True:
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._provider_auto_repair_enabled()
+        ):
             return
 
         # A fresh full-library audit may rediscover the same gap while its
@@ -1276,6 +1735,18 @@ class SimpleApplication:
         # closed rather than making an intended one-work pilot broad again.
         pilot_tmdb = self._provider_pilot_tmdb()
 
+        # Do not even arm a timer for an exhausted gap.  This check is
+        # intentionally durable (rather than relying on the in-memory future
+        # map), so a restart or a stale audit callback cannot resurrect the
+        # same fingerprint.  ``retry_public_job`` clears ``terminal`` before
+        # explicitly queueing a new attempt.
+        try:
+            current = self._get_engine_runner().get_job(job_id)
+        except Exception:
+            return
+        if self._is_internal_child(current) or not self._provider_job_allowed(current):
+            return
+
         # Publish the non-green provider stage before submitting the worker.
         # ThreadPoolExecutor submission is asynchronous; without this small
         # durable projection a just-audited root could be rendered
@@ -1287,7 +1758,11 @@ class SimpleApplication:
                 # and re-check the future after the initial fast-path check.
                 # A provider can become live between those two points.
                 with self._automatic_lock:
-                    if self._closed.is_set() or self.control().get("paused") is True:
+                    if (
+                        self._closed.is_set()
+                        or self.control().get("paused") is True
+                        or not self._provider_auto_repair_enabled()
+                    ):
                         return
                     existing = self._provider_futures.get(job_id)
                     if existing is not None and not existing.done():
@@ -1329,7 +1804,11 @@ class SimpleApplication:
                 pass
 
         def submit() -> None:
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or not self._provider_auto_repair_enabled()
+            ):
                 return
             with self._automatic_lock:
                 # The pilot environment can change while a delayed retry is
@@ -1348,12 +1827,7 @@ class SimpleApplication:
                     self._run_automatic_replenishment, job_id,
                 )
 
-        if delay > 0:
-            timer = threading.Timer(delay, submit)
-            timer.daemon = True
-            timer.start()
-        else:
-            submit()
+        self._schedule_timer("provider", job_id, delay, submit)
 
     def _record_replenishment_summary(self, job: EngineJob, outcome: Mapping[str, object]) -> None:
         runner = self._get_engine_runner()
@@ -1363,6 +1837,9 @@ class SimpleApplication:
         merged = dict(prior) if isinstance(prior, Mapping) else {}
         safe_outcome = redact_value(dict(outcome))
         merged.update(dict(safe_outcome) if isinstance(safe_outcome, Mapping) else dict(outcome))
+        fingerprint = current.summary.get("provider_gap_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            merged["gap_fingerprint"] = fingerprint
         # A successful retry can follow a cooperative cancellation in the
         # same persisted root.  Remove transient failure/cancellation fields
         # that are absent from the new outcome; otherwise the dashboard and
@@ -1469,12 +1946,21 @@ class SimpleApplication:
         # selector changes; re-check both immediately before doing any provider
         # work so the global pause remains a real dispatch boundary.
         self._provider_pilot_tmdb()
-        if self._closed.is_set() or self.control().get("paused") is True:
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._provider_auto_repair_enabled()
+        ):
             return
         try:
             runner = self._get_engine_runner()
             job = runner.get_job(job_id)
             if self._is_internal_child(job):
+                return
+            # Re-check the durable terminal boundary after the future starts;
+            # a provider timer may have been queued just before another worker
+            # exhausted the same gap.
+            if not self._provider_job_allowed(job):
                 return
             if job.phase != "executed":
                 return
@@ -1534,6 +2020,8 @@ class SimpleApplication:
                 outcome["status"] = "retry_wait"
                 outcome["next_retry_seconds"] = 30
             self._record_replenishment_summary(job, outcome)
+            if outcome.get("terminal") is True:
+                self._cancel_job_timers(job_id)
             if cancelled:
                 # The runtime has already persisted gap-level retry_wait. Do
                 # not trigger a fresh audit or delayed provider timer while a
@@ -1543,7 +2031,13 @@ class SimpleApplication:
             # read-only audit was still traversing the previous inventory.
             # Coalesce one follow-up so that fresh media gets its configured
             # subtitle probe and, if absent, the pure sidecar lane.
-            self._queue_library_audit(delay=0.5, rerun_if_busy=True)
+            target = self._job_audit_target(job)
+            if isinstance(target, str):
+                self._queue_scoped_library_audit(
+                    [target], delay=0.5, rerun_if_busy=True,
+                )
+            # Missing root coordinates fail closed; never widen a provider
+            # completion callback into a formal-library scan.
             if has_error and outcome.get("terminal") is not True:
                 # Provider failures are isolated.  Requeue the gap work after a
                 # bounded delay while ordinary jobs continue flowing.
@@ -1566,6 +2060,8 @@ class SimpleApplication:
                     "error": redact_error(exc),
                     "next_retry_seconds": None if terminal else 30,
                 })
+                if terminal:
+                    self._cancel_job_timers(job_id)
                 if not terminal:
                     self._queue_provider_job(job_id, delay=30.0)
             except Exception:
@@ -1616,7 +2112,15 @@ class SimpleApplication:
         this one worker lane.  Apart from preventing two inventory scans from
         racing, that also prevents concurrent subtitle-evidence ledger writes.
         """
-        future = self._audit_pool().submit(self._run_library_audit_background)
+        scope = tuple(sorted(self._pending_audit_roots)) or None
+        self._pending_audit_roots.clear()
+        if scope is None:
+            future = self._audit_pool().submit(self._run_library_audit_background)
+        else:
+            future = self._audit_pool().submit(
+                self._run_library_audit_background,
+                scope_roots=scope,
+            )
         self._audit_future = future
 
         def clear(done: Future[object]) -> None:
@@ -1658,11 +2162,19 @@ class SimpleApplication:
         single coalesced follow-up is safer and guarantees that newly visible
         media gets a subtitle probe on the next pass.
         """
-        if self._closed.is_set() or self.control().get("paused") is True:
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._audit_auto_repair_enabled()
+        ):
             return
 
         def submit() -> None:
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or not self._audit_auto_repair_enabled()
+            ):
                 return
             with self._audit_lock:
                 if self._audit_future is not None and not self._audit_future.done():
@@ -1671,16 +2183,41 @@ class SimpleApplication:
                     return
                 self._start_library_audit_locked()
 
-        if delay > 0:
-            timer = threading.Timer(delay, submit)
-            timer.daemon = True
-            timer.start()
-        else:
-            submit()
+        self._schedule_timer("audit", "library", delay, submit)
 
-    def _run_library_audit_background(self) -> dict[str, object] | None:
+    def _queue_scoped_library_audit(
+        self,
+        target_roots: Sequence[str],
+        *,
+        delay: float = 0.0,
+        rerun_if_busy: bool = False,
+    ) -> None:
+        """Coalesce a bounded audit to the affected work roots."""
+        normalized: set[str] = set()
+        for raw in target_roots:
+            if not isinstance(raw, str) or not raw.startswith("/"):
+                continue
+            value = posixpath.normpath(raw)
+            if value != "/" and all(part not in {"", ".", ".."} for part in value.split("/")[1:]):
+                normalized.add(value)
+        if not normalized:
+            # Scope is mandatory for automatic audit/repair.  An empty or
+            # malformed scope is fail-closed rather than a global scan.
+            return
+        with self._audit_lock:
+            self._pending_audit_roots.update(normalized)
+        self._queue_library_audit(delay=delay, rerun_if_busy=rerun_if_busy)
+
+    def _run_library_audit_background(
+        self, *, scope_roots: Sequence[str] | None = None,
+    ) -> dict[str, object] | None:
         try:
-            return self._run_library_audit_once()
+            # Keep the no-scope call shape compatible with small injected
+            # audit fakes and older test/application adapters.  The scoped
+            # keyword is only part of the new bounded-audit contract.
+            if scope_roots is None:
+                return self._run_library_audit_once()
+            return self._run_library_audit_once(scope_roots=scope_roots)
         except Exception:
             # An unavailable TMDB/AList scan is represented by the next
             # explicit/automatic attempt; it must not terminate the write or
@@ -1902,6 +2439,8 @@ class SimpleApplication:
         self,
         report: Mapping[str, object],
         runner: SimpleEngineRunner | None,
+        *,
+        scope_roots: Sequence[str] | None = None,
     ) -> None:
         """Attach fresh semantic gaps to their owning automatic jobs.
 
@@ -1922,6 +2461,9 @@ class SimpleApplication:
                 job.id: job
                 for job in runner.list_jobs()
                 if not self._is_internal_child(job)
+                and self._audit_scope_matches(
+                    self._job_audit_target(job), scope_roots,
+                )
             }
         except Exception:
             return
@@ -2069,6 +2611,14 @@ class SimpleApplication:
                 row for row in new_resource_gaps
                 if self._audit_row_kind(row) in _AUTOMATIC_PROVIDER_GAP_KINDS
             ]
+            provider_gap_fingerprint = (
+                self._provider_gap_fingerprint(provider_relevant)
+                if provider_relevant else None
+            )
+            if provider_gap_fingerprint is not None:
+                summary["provider_gap_fingerprint"] = provider_gap_fingerprint
+            else:
+                summary.pop("provider_gap_fingerprint", None)
             repair_relevant = [
                 row for row in new_resource_gaps
                 if self._audit_row_kind(row) in _AUTOMATIC_REPAIR_GAP_KINDS
@@ -2081,7 +2631,18 @@ class SimpleApplication:
             # A terminal provider attempt belongs to the previous audit
             # round. A newly observed provider gap must reopen it.
             prior_replenishment = summary.get("replenishment")
-            if provider_relevant and isinstance(prior_replenishment, Mapping) and prior_replenishment.get("terminal") is True:
+            same_terminal_gap = bool(
+                provider_relevant
+                and isinstance(prior_replenishment, Mapping)
+                and prior_replenishment.get("terminal") is True
+                and prior_replenishment.get("gap_fingerprint") == provider_gap_fingerprint
+            )
+            if (
+                provider_relevant
+                and isinstance(prior_replenishment, Mapping)
+                and prior_replenishment.get("terminal") is True
+                and not same_terminal_gap
+            ):
                 child_history = prior_replenishment.get("child_jobs")
                 summary.pop("replenishment", None)
                 if isinstance(child_history, list):
@@ -2259,7 +2820,11 @@ class SimpleApplication:
                     )
                     if not any(key):
                         key = (str(row.get("id") or ""),)
-                    provider_gap_owners.setdefault(key, job.id)
+                    # Ownership is expressed by the persisted root/gap state
+                    # and this process' single provider queue.  Do not create
+                    # a second durable claim registry or lock protocol.
+                    if not same_terminal_gap:
+                        provider_gap_owners.setdefault(key, job.id)
 
             if repair_relevant:
                 if self.control().get("paused") is True:
@@ -2336,7 +2901,10 @@ class SimpleApplication:
             # A new read-only audit is the automatic retry for unknown,
             # unsupported, or failed-sidecar evidence. It is deliberately
             # delayed so one bad work cannot spin the audit thread.
-            self._queue_library_audit(delay=30.0)
+            if scope_roots:
+                self._queue_scoped_library_audit(scope_roots, delay=30.0)
+            else:
+                self._queue_library_audit(delay=30.0)
 
     def _validate_automatic_source(self, source: str) -> str:
         normalized = source.strip().rstrip("/")
@@ -2483,18 +3051,43 @@ class SimpleApplication:
         with self._audit_lock:
             future = self._audit_future
             if future is None or future.done():
+                # A user-triggered audit is intentionally global; it is the
+                # low-frequency escape hatch for identities outside a recent
+                # task's affected root.
+                self._pending_audit_roots.clear()
                 future = self._start_library_audit_locked()
         result = future.result()
         if not isinstance(result, Mapping):
             raise ApplicationError("媒体库审计未返回报告")
         return dict(result)
 
-    def _run_library_audit_once(self) -> dict[str, object]:
-        """Run one read-only audit and feed its machine gaps to automation."""
-        roots = tuple(
+    @staticmethod
+    def _audit_scope_matches(target: object, scope_roots: Sequence[str] | None) -> bool:
+        if scope_roots is None:
+            return True
+        if not isinstance(target, str) or not target.startswith("/"):
+            return False
+        return any(
+            target == root
+            or target.startswith(root.rstrip("/") + "/")
+            or root.startswith(target.rstrip("/") + "/")
+            for root in scope_roots
+        )
+
+    @classmethod
+    def _job_audit_target(cls, job: EngineJob) -> object:
+        _tmdb, target, _kind = cls._audit_job_coordinates(job)
+        return target
+
+    def _run_library_audit_once(
+        self, *, scope_roots: Sequence[str] | None = None,
+    ) -> dict[str, object]:
+        """Run one read-only full or affected-work audit and project its gaps."""
+        all_roots = tuple(
             f"{self.remote_root.rstrip('/')}/{category}"
             for category in ("电影", "番剧", "美剧")
         )
+        roots = tuple(scope_roots) if scope_roots else all_roots
         runner: SimpleEngineRunner | None = None
         jobs: list[EngineJob] = []
         if self._engine_runner is not None or self.engine_configured:
@@ -2503,6 +3096,9 @@ class SimpleApplication:
                 jobs = [
                     job for job in runner.list_jobs()
                     if not self._is_internal_child(job)
+                    and self._audit_scope_matches(
+                        self._job_audit_target(job), scope_roots,
+                    )
                 ]
             except Exception:
                 # Structural evidence is still valuable when TMDB is briefly
@@ -2538,7 +3134,7 @@ class SimpleApplication:
                 required_subtitle_language=required_subtitle_language,
                 subtitle_checker=subtitle_checker,
             )
-        self._apply_audit_gaps(report, runner)
+        self._apply_audit_gaps(report, runner, scope_roots=scope_roots)
         return {"audit": report}
 
     def _engine_job_or_none(self, job_id: str) -> EngineJob | None:
@@ -2561,13 +3157,141 @@ class SimpleApplication:
         if engine_job is None:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         result = self._get_engine_runner().cancel_job(job_id, reason=reason or "cancelled")
+        self._cancel_job_timers(job_id)
         return self.public_engine_job(result)
 
-    def retry_public_job(self, job_id: str, payload: Mapping[str, object]) -> dict[str, object]:
-        del payload
+    def cleanup_public_job(self, job_id: str) -> dict[str, object]:
+        """Discard one terminal root's owned local state, never media files.
+
+        This endpoint deliberately has no path arguments.  The runner accepts
+        only the durable root id and removes at most its JSON record, local
+        ``gaps/<id>`` and local ``staging/<id>`` after proving that no root or
+        child worker remains active.  A remote AList/formal-library delete is
+        not part of this operation.
+        """
         engine_job = self._engine_job_or_none(job_id)
         if engine_job is None:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        public_phase = str(self.public_engine_job(engine_job).get("phase") or "")
+        active_phases = {
+            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "executing_media",
+            "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
+            "acquiring", "staging_verifying", "subtitle_installing", "child_planning",
+            "child_executing", "final_verifying",
+        }
+        if public_phase in active_phases:
+            raise EngineWorkerBusyError(
+                f"任务仍在运行或等待重试，不能清理记录: {public_phase}"
+            )
+        with self._automatic_lock:
+            # Fence the root before inspecting timers.  Timer callbacks execute
+            # under this same re-entrant lock, so a callback cannot pop its
+            # timer and insert a future after this check has passed.
+            self._cleanup_fences.add(engine_job.id)
+            try:
+                self._cancel_job_timers(engine_job.id)
+                pending_timer = any(
+                    key[1] == engine_job.id
+                    for key in self._scheduled_timers
+                )
+                if pending_timer:
+                    raise EngineWorkerBusyError("任务仍有排队中的重试回调，不能清理记录")
+                for future in (
+                    self._automatic_futures.get(engine_job.id),
+                    self._provider_futures.get(engine_job.id),
+                ):
+                    if future is not None and not future.done():
+                        raise EngineWorkerBusyError("任务仍有活动 worker，不能清理记录")
+                runner = self._engine_runner
+                if runner is None:
+                    # Terminal cleanup is a local-state operation and remains
+                    # useful while AList/TMDB credentials are unavailable.
+                    # Construct a read-only runner without publishing it as a
+                    # configured writer.
+                    runner = SimpleEngineRunner(
+                        self.state_root,
+                        alist=self._alist_client or object(),
+                        tmdb=object(),
+                        validate=False,
+                        library_root=self.remote_root,
+                    )
+                result = runner.cleanup_terminal_job(engine_job.id)
+                return result
+            except Exception:
+                # A rejected/failed cleanup must remain retryable by the user;
+                # remove only the in-memory fence, while the durable runner
+                # checks continue to protect the state on the next request.
+                raise
+            finally:
+                # A successful cleanup must not retain an id for a job whose
+                # durable record no longer exists.  The fence protects only
+                # the critical section above.
+                self._cleanup_fences.discard(engine_job.id)
+
+    def retry_public_job(self, job_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+        engine_job = self._engine_job_or_none(job_id)
+        if engine_job is None:
+            raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        if not isinstance(payload, Mapping):
+            raise EngineRequestError("重试请求必须是 JSON 对象")
+        allowed = {"tmdb_id", "media_type", "season", "archive_password"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise EngineRequestError("重试请求包含不支持的修正字段")
+        correction = self._manual_identity_correction(payload)
+        raw_password = payload.get("archive_password")
+        password = None
+        if raw_password is not None:
+            password = self._retry_archive_password(raw_password)
+        error_text = str(engine_job.error or "").casefold()
+        archive_failure = (
+            isinstance(engine_job.summary.get("archive_preprocessed"), Mapping)
+            or any(token in error_text for token in ("archive", "归档", "7z", "密码", "password"))
+        )
+        if correction is not None:
+            if engine_job.phase != "failed_identity" and engine_job.summary.get("automatic_stage") != "identity":
+                raise EngineRequestError("身份修正只允许用于 failed_identity 任务")
+            if password is not None and not archive_failure:
+                raise EngineRequestError("当前任务没有可重试的归档失败")
+            runner = self._get_engine_runner()
+            summary = dict(engine_job.summary)
+            summary.update({
+                "manual_identity": correction,
+                "automatic_terminal": False,
+                "automatic_attempts": 0,
+                "next_retry_seconds": 0,
+                "requested_retry_count": int(summary.get("requested_retry_count") or 0) + 1,
+            })
+            source = summary.get("ingress_source_path") or engine_job.request.get("source_path")
+            if not isinstance(source, str) or not source.startswith("/"):
+                raise EngineRequestError("身份修正任务缺少来源路径")
+            retried = replace(
+                engine_job,
+                phase="queued",
+                request={"source_path": source},
+                plan={},
+                summary=summary,
+                updated_at=_now(),
+                error=None,
+                execution=None,
+            )
+            atomic_write_json(
+                runner.jobs_root / f"{engine_job.id}.json",
+                _redacted_job_payload(retried),
+                allow_nan=False,
+            )
+            if password is not None:
+                with self._automatic_lock:
+                    self._retry_archive_passwords[engine_job.id] = password
+            self._queue_automatic_job(job_id)
+            return self.public_engine_job(retried)
+        if password is not None:
+            if not archive_failure:
+                raise EngineRequestError("当前任务没有可重试的归档失败")
+            if engine_job.plan:
+                raise EngineRequestError("归档密码只能在重新规划前提供")
+            with self._automatic_lock:
+                self._retry_archive_passwords[engine_job.id] = password
         if engine_job is not None:
             replenishment = (
                 engine_job.summary.get("replenishment")
@@ -2638,6 +3362,7 @@ class SimpleApplication:
         display_phase = {
             "queued": "queued",
             "analyzing": "analyzing",
+            "archive_preprocessing": "archive_preprocessing",
             "identity_matching": "identity_matching",
             "planning": "planning",
             "planned": "queued",
@@ -2681,7 +3406,8 @@ class SimpleApplication:
         payload["source"] = (
             "全库审计"
             if SimpleApplication._is_audit_owned_root(job)
-            else summary.get("source_root")
+            else summary.get("ingress_source_path")
+            or summary.get("source_root")
         )
         payload["parent"] = summary.get("target_root")
         payload["media_type"] = summary.get("mode")
@@ -2816,6 +3542,14 @@ class SimpleApplication:
         self._closed.set()
         self._intake_stop.set()
         self._intake_wake.set()
+        with self._automatic_lock:
+            timers = list(self._scheduled_timers.values())
+            self._scheduled_timers.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
         executors = [
             self._automatic_executor,
             self._provider_executor,
@@ -2992,6 +3726,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                             job_id,
                             reason=self._optional_reason(payload),
                         )},
+                    )
+                    return
+                if operation == "cleanup":
+                    self._send(
+                        200,
+                        {"cleanup": self.application.cleanup_public_job(job_id)},
                     )
                     return
                 self._send(404, {"error": "not found"})

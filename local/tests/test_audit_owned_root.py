@@ -646,7 +646,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             finally:
                 app.close()
 
-    def test_terminal_identity_retry_refreshes_the_read_only_audit(self) -> None:
+    def test_terminal_identity_retry_does_not_start_global_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = SimpleEngineRunner(
@@ -667,7 +667,10 @@ class AuditOwnedRootTests(unittest.TestCase):
                     )
                 failed = runner.get_job(queued.id)
                 self.assertEqual(failed.phase, "failed_identity")
-                audit_queue.assert_called_once_with(delay=1.0)
+                # No trusted work root exists after identity failure. Automatic
+                # audit is therefore fail-closed; an operator may request a
+                # deliberate scoped/global audit explicitly.
+                audit_queue.assert_not_called()
             finally:
                 app.close()
 
@@ -833,6 +836,50 @@ class AuditOwnedRootTests(unittest.TestCase):
                     runtime.assert_not_called()
             finally:
                 app.close()
+
+    def test_terminal_provider_gap_blocks_stale_worker_and_timer(self) -> None:
+        """Retry exhaustion is a durable stop boundary for the same gap."""
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"SCRAPEFLOW_START_PAUSED": "1", "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42"}, clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            try:
+                fingerprint = SimpleApplication._provider_gap_fingerprint([_gap()])
+                app._record_replenishment_summary(job, {
+                    "status": "failed", "terminal": True, "attempts": 5,
+                    "gap_fingerprint": fingerprint, "error": "retry exhausted",
+                })
+                terminal = runner.get_job(job.id)
+                self.assertFalse(SimpleApplication._provider_job_allowed(terminal))
+                with patch.object(app, "_get_automatic_replenishment") as runtime, \
+                     patch("local.simple_server.threading.Timer") as timer:
+                    app._run_automatic_replenishment(job.id)
+                    app._queue_provider_job(job.id, delay=30.0)
+                    runtime.assert_not_called()
+                    timer.assert_not_called()
+                persisted = runner.get_job(job.id)
+                self.assertTrue(persisted.summary["replenishment"]["terminal"])
+                self.assertEqual(persisted.summary["replenishment"]["gap_fingerprint"], fingerprint)
+                self.assertEqual(persisted.summary["replenishment_attempts"], 5)
+            finally:
+                app.close()
+
+    def test_provider_gap_fingerprint_is_order_independent_and_changes_on_gap(self) -> None:
+        first = _gap()
+        second = dict(first, id="audit-row-2", season=1, episode=3)
+        a = SimpleApplication._provider_gap_fingerprint([first, second])
+        b = SimpleApplication._provider_gap_fingerprint([second, first])
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, SimpleApplication._provider_gap_fingerprint([first]))
 
     def test_fresh_audit_does_not_clobber_live_provider_progress(self) -> None:
         """A rediscovered gap must not replace an in-flight root projection.

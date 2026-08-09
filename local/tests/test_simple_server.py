@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -104,6 +105,8 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["mode"], "automatic")
         self.assertTrue(health["connected"])
         self.assertTrue(health["engine_configured"])
+        self.assertIn("build_commit", health)
+        self.assertIn("build_time", health)
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
         self.assertEqual(health["provider_capabilities"]["cloud_share"]["status"], "unavailable")
 
@@ -118,13 +121,40 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertNotIn("identity_override", created["plan"])
         persisted = self.runner.get_job(job_id)
         self.assertEqual(persisted.request, {"source_path": "/library/待刮削/Example"})
-
         status, listing = self.request("GET", "/api/jobs")
         self.assertEqual(status, 200)
         self.assertEqual([row["id"] for row in listing["jobs"]], [job_id])
         status, detail = self.request("GET", f"/api/jobs/{job_id}")
         self.assertEqual(status, 200)
         self.assertEqual(detail["job"]["id"], job_id)
+
+    def test_real_root_lane_gates_fail_closed_until_explicitly_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_INTAKE_MONITOR": "0",
+                "SCRAPEFLOW_AUTOMATIC_AUDIT": "1",
+            },
+            clear=False,
+        ):
+            state_root = Path(directory)
+            runner = SimpleEngineRunner(state_root, alist=self.remote, tmdb=object(), validate=False, library_root="/quark/影视")
+            with patch.object(SimpleApplication, "_start_startup_thread"):
+                application = SimpleApplication(
+                    state_root=state_root,
+                    remote_root="/quark/影视",
+                    remote=self.remote,
+                    engine_runner=runner,
+                    enforce_engine_roots=True,
+                )
+            try:
+                gates = application.health()["lane_gates"]
+                self.assertFalse(gates["provider_auto_repair_enabled"])
+                self.assertFalse(gates["audit_auto_repair_enabled"])
+                self.assertEqual(application._scheduled_timers, {})  # noqa: SLF001
+            finally:
+                application.close()
 
     def test_submission_accepts_only_a_source_path_and_unknown_job_is_not_found(self) -> None:
         status, payload = self.request(
@@ -184,6 +214,41 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(reopened.phase, "queued")
         self.assertFalse(reopened.summary["automatic_terminal"])
         self.assertEqual(reopened.summary["automatic_attempts"], 0)
+
+    def test_successful_terminal_cleanup_releases_cleanup_fence(self) -> None:
+        job = self.runner.create_automatic_job("/library/待刮削/Fence")
+        terminal = replace(job, phase="failed", error="terminal fixture")
+        atomic_write_json(self.runner.jobs_root / f"{job.id}.json", terminal.as_dict(), allow_nan=False)
+        result = self.application.cleanup_public_job(job.id)
+        self.assertTrue(result["removed"])
+        self.assertNotIn(job.id, self.application._cleanup_fences)  # noqa: SLF001
+
+    def test_retry_identity_correction_rejects_client_controlled_metadata_and_parent(self) -> None:
+        """Web retry exposes only the bounded identity/password contract."""
+        job = self.runner.create_automatic_job("/library/待刮削/Correction")
+        failed = replace(
+            job,
+            phase="failed_identity",
+            summary={**job.summary, "automatic_terminal": True, "automatic_attempts": 3},
+            error="identity exhausted",
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{job.id}.json",
+            failed.as_dict(),
+            allow_nan=False,
+        )
+
+        for forbidden in ("title", "year", "target_parent"):
+            status, payload = self.request(
+                "POST",
+                f"/api/jobs/{job.id}/retry",
+                {"tmdb_id": 123, "media_type": "movie", forbidden: "client override"},
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("不支持", payload["error"])
+        unchanged = self.runner.get_job(job.id)
+        self.assertEqual(unchanged.phase, "failed_identity")
+        self.assertNotIn("manual_identity", unchanged.summary)
 
     def test_cancel_stops_a_planned_root_job(self) -> None:
         job = self.runner.create_automatic_job("/library/待刮削/Cancel")

@@ -13,6 +13,7 @@ import json
 import os
 import posixpath
 import re
+import shutil
 import time
 import uuid
 from dataclasses import asdict, dataclass, replace
@@ -31,6 +32,10 @@ from engine.scrapeflow.residual_policy import (
     is_task_owned_staging_root,
 )
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.subtitle_content import (
+    DEFAULT_MAX_PREFIX_BYTES,
+    classify_subtitle_content,
+)
 from local.scrapeflow_api.redaction import redact_error
 
 
@@ -44,6 +49,51 @@ class EngineRequestError(SimpleEngineError, ValueError):
 
 class EngineExecutionError(SimpleEngineError):
     """A simple plan operation failed or could not be read back."""
+
+
+class EngineRecoveryMatrixError(EngineExecutionError):
+    """A restart readback found a durable, non-retryable state conflict.
+
+    Recovery deliberately distinguishes a provider visibility/transport error
+    (which may be retried) from facts that cannot be repaired by replaying the
+    same plan.  The latter are persisted as a terminal verification failure so
+    a scheduler cannot keep submitting an operation that might overwrite a
+    different object or silently recreate a lost source.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        source: str | None = None,
+        target: str | None = None,
+        expected_size: int | None = None,
+        actual_size: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.source = source
+        self.target = target
+        self.expected_size = expected_size
+        self.actual_size = actual_size
+
+
+class EngineRecoveryRetryableError(EngineExecutionError):
+    """A restart readback fact is known but safe to retry later."""
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        source: str | None = None,
+        target: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.source = source
+        self.target = target
 
 
 class EngineJobNotFoundError(SimpleEngineError):
@@ -124,10 +174,28 @@ _AUDIT_ROOT_GAP_KINDS = frozenset({
 # child planner as an episode/movie acquisition request.
 _AUDIT_SUBTITLE_GAP_KINDS = frozenset({"missing_subtitle"})
 _ENGINE_PHASES = frozenset({
-    "queued", "analyzing", "identity_matching", "planning", "planned",
+    "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
     "executing", "verifying", "cleaning", "executed", "completed",
     "retry_wait", "failed", "failed_identity", "failed_provider",
     "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+})
+
+# A cleanup request is intentionally narrower than a general state migration.
+# ``executed`` is the durable Engine write fact, while the application may keep
+# a provider/audit projection beside it; ``cleanup_terminal_job`` checks both
+# before removing any task-owned local state.
+_CLEANUP_TERMINAL_PHASES = frozenset({
+    "executed", "completed", "failed", "failed_identity", "failed_provider",
+    "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+})
+_CLEANUP_ACTIVE_PROVIDER_STATUSES = frozenset({
+    "gap_discovering", "provider_searching", "acquiring", "staging_verifying",
+    "subtitle_installing", "child_planning", "child_executing", "final_verifying",
+    "cleaning", "child_failed", "retry_wait",
+})
+_CLEANUP_RETRYABLE_AUDIT_STATUSES = frozenset({
+    "pending", "repairing", "retry_wait", "unknown", "blocked", "failed",
+    "failed_provider",
 })
 
 # Provider replenishment children are deliberately narrower than ordinary
@@ -868,6 +936,8 @@ class SimplePlanExecutor:
         *,
         expected_size: int,
         video_path: str | None = None,
+        subtitle_language: str | None = None,
+        subtitle_validator: Callable[..., object] | None = None,
     ) -> Mapping[str, object]:
         """Move one verified subtitle member beside an existing final video.
 
@@ -884,6 +954,15 @@ class SimplePlanExecutor:
             raise EngineExecutionError(f"字幕格式不支持: {source}")
         if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
             raise EngineExecutionError("字幕大小无效")
+        if subtitle_language is not None:
+            validator = subtitle_validator or self.validate_subtitle_source_content
+            try:
+                verdict = validator(source, subtitle_language)
+            except TypeError:
+                verdict = validator(source_path=source, required_language=subtitle_language)
+            if not isinstance(verdict, Mapping) or str(verdict.get("status") or "").casefold() != "satisfied":
+                reason = str(verdict.get("reason") or "subtitle_content_unknown") if isinstance(verdict, Mapping) else "subtitle_content_unknown"
+                raise EngineExecutionError(f"字幕内容未通过语言校验: {reason}")
         if not posixpath.dirname(target):
             raise EngineExecutionError("字幕目标路径无效")
         if video_path is not None:
@@ -911,6 +990,34 @@ class SimplePlanExecutor:
             "target": target,
             "size": int(observed["size"]),
             "status": "moved",
+        }
+
+    def validate_subtitle_source_content(
+        self,
+        source_path: str,
+        required_language: str,
+    ) -> Mapping[str, object]:
+        """Read a bounded staging prefix and require an explicit language match."""
+        reader = getattr(self.alist, "read_file_prefix", None)
+        if not callable(reader):
+            reader = getattr(self.alist, "read_file_bytes", None)
+        if not callable(reader):
+            return {
+                "status": "unknown",
+                "reason": "subtitle_content_reader_unavailable",
+            }
+        try:
+            try:
+                prefix = reader(source_path, max_bytes=DEFAULT_MAX_PREFIX_BYTES)
+            except TypeError:
+                prefix = reader(source_path, DEFAULT_MAX_PREFIX_BYTES)
+        except Exception:
+            return {"status": "unknown", "reason": "subtitle_content_read_error"}
+        result = classify_subtitle_content(
+            prefix, required_language, max_bytes=DEFAULT_MAX_PREFIX_BYTES,
+        )
+        return dict(result) if isinstance(result, Mapping) else {
+            "status": "unknown", "reason": "subtitle_decode_or_format_unknown",
         }
 
     @staticmethod
@@ -1121,6 +1228,7 @@ class SimpleEngineRunner:
         executor: PlanExecutor | Callable[..., Mapping[str, object]] | None = None,
         validate: bool = True,
         library_root: str = "/quark/影视",
+        archive_preprocessor: object | None = None,
     ) -> None:
         self.state_root = Path(state_root).resolve()
         self.jobs_root = self.state_root / "jobs"
@@ -1131,6 +1239,10 @@ class SimpleEngineRunner:
         self.planner = planner
         self.executor = executor or SimplePlanExecutor(alist, tmdb)
         self.validate = bool(validate)
+        # The optional adapter is intentionally a narrow ingress hook.  It
+        # owns only archive-to-task-staging preparation; the current Engine
+        # still owns identity, naming, problem gates and the one formal writer.
+        self.archive_preprocessor = archive_preprocessor
         self.library_root = _safe_remote_path(
             library_root.rstrip("/") or "/",
             field="library_root",
@@ -1180,16 +1292,47 @@ class SimpleEngineRunner:
         *,
         expected_size: int,
         video_path: str | None = None,
+        subtitle_language: str | None = None,
+        subtitle_validator: Callable[..., object] | None = None,
     ) -> Mapping[str, object]:
         """Install one subtitle member under the single formal write lock."""
         with self.worker_lock():
             installer = getattr(self.executor, "install_subtitle_sidecar", None)
             if not callable(installer):
                 raise EngineExecutionError("当前 Engine executor 不支持字幕侧挂写入")
-            return dict(installer(
-                source_path, target_path, expected_size=expected_size,
-                video_path=video_path,
-            ))
+            kwargs: dict[str, object] = {
+                "expected_size": expected_size,
+                "video_path": video_path,
+            }
+            if subtitle_language is not None:
+                kwargs["subtitle_language"] = subtitle_language
+            if subtitle_validator is not None:
+                kwargs["subtitle_validator"] = subtitle_validator
+            try:
+                return dict(installer(source_path, target_path, **kwargs))
+            except TypeError as exc:
+                # Focused legacy executors may not yet accept the optional
+                # language keyword.  Do not hide a real write TypeError; only
+                # retry when the signature itself rejected that keyword.
+                if subtitle_language is None or "subtitle_language" not in str(exc):
+                    raise
+                kwargs.pop("subtitle_language", None)
+                kwargs.pop("subtitle_validator", None)
+                return dict(installer(source_path, target_path, **kwargs))
+
+    def validate_subtitle_source_content(
+        self,
+        source_path: str,
+        required_language: str,
+    ) -> Mapping[str, object]:
+        """Expose the default executor's bounded subtitle validator."""
+        validator = getattr(self.executor, "validate_subtitle_source_content", None)
+        if not callable(validator):
+            raise EngineExecutionError("当前 Engine executor 不支持字幕内容校验")
+        result = validator(source_path, required_language)
+        if not isinstance(result, Mapping):
+            raise EngineExecutionError("字幕内容校验返回无效")
+        return dict(result)
 
     def find_by_source(self, source_path: str) -> EngineJob | None:
         """Return an existing non-terminal job for duplicate-submit checks."""
@@ -1197,7 +1340,7 @@ class SimpleEngineRunner:
         for job in self.list_jobs():
             if job.summary.get("internal_child") is True:
                 continue
-            candidate = job.request.get("source_path")
+            candidate = job.summary.get("ingress_source_path") or job.request.get("source_path")
             if candidate == normalized and job.phase not in {"executed", "failed", "cancelled"}:
                 return job
         return None
@@ -2070,19 +2213,158 @@ class SimpleEngineRunner:
     def _is_internal_job(job: EngineJob) -> bool:
         return isinstance(job.summary, Mapping) and job.summary.get("internal_child") is True
 
-    def clear_jobs(self) -> int:
-        removed = 0
-        for path in self.jobs_root.glob("*.json"):
-            path.unlink(missing_ok=True)
-            removed += 1
-        return removed
+    def _owned_children(self, root: EngineJob) -> list[EngineJob]:
+        return [
+            candidate
+            for candidate in self.list_jobs()
+            if self._is_internal_job(candidate)
+            and isinstance(candidate.summary, Mapping)
+            and candidate.summary.get("root_job_id") == root.id
+        ]
 
-    def delete_job(self, job_id: str) -> bool:
-        path = self._job_path(job_id)
+    def _validate_cleanup_root(self, root: EngineJob) -> list[EngineJob]:
+        """Return terminal children after proving the root is safe to forget."""
+        if self._is_internal_job(root):
+            raise EngineExecutionError("只允许清理根任务，内部 child 不能单独清理")
+        if root.phase not in _CLEANUP_TERMINAL_PHASES:
+            raise EngineWorkerBusyError(f"任务仍在运行，不能清理记录: {root.phase}")
+        summary = root.summary if isinstance(root.summary, Mapping) else {}
+        if (
+            root.phase in {"failed", "failed_provider"}
+            and summary.get("automatic") is True
+            and summary.get("automatic_terminal") is not True
+        ):
+            raise EngineWorkerBusyError("任务仍会自动重试，不能清理记录")
+        replenishment = summary.get("replenishment")
+        if isinstance(replenishment, Mapping):
+            status = str(replenishment.get("status") or "").casefold()
+            if status in _CLEANUP_ACTIVE_PROVIDER_STATUSES or (
+                status
+                and replenishment.get("terminal") is not True
+                and status not in {"completed", "resolved", "ready"}
+            ):
+                raise EngineWorkerBusyError("任务仍有未终结的补源工作，不能清理记录")
+        audit = summary.get("audit")
+        if isinstance(audit, Mapping):
+            audit_status = str(audit.get("status") or "").casefold()
+            if (
+                audit_status in _CLEANUP_RETRYABLE_AUDIT_STATUSES
+                and audit.get("retryable") is not False
+            ):
+                raise EngineWorkerBusyError("任务仍有可重试审计工作，不能清理记录")
+        children = self._owned_children(root)
+        for child in children:
+            if child.phase not in _CLEANUP_TERMINAL_PHASES:
+                raise EngineWorkerBusyError(
+                    f"根任务仍有活动 child，不能清理记录: {child.id}/{child.phase}"
+                )
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            child_replenishment = child_summary.get("replenishment")
+            if isinstance(child_replenishment, Mapping):
+                child_status = str(child_replenishment.get("status") or "").casefold()
+                if child_status in _CLEANUP_ACTIVE_PROVIDER_STATUSES or (
+                    child_status
+                    and child_replenishment.get("terminal") is not True
+                    and child_status not in {"completed", "resolved", "ready"}
+                ):
+                    raise EngineWorkerBusyError(
+                        f"根任务仍有未终结 child 状态，不能清理记录: {child.id}"
+                    )
+        return children
+
+    @staticmethod
+    def _remove_owned_local_tree(parent: Path, owner_id: str, *, label: str) -> bool:
+        """Remove exactly ``parent/<owner_id>`` and reject symlink escapes."""
+        if parent.is_symlink():
+            raise EngineExecutionError(f"{label} 根目录不允许符号链接")
+        parent = parent.resolve()
+        path = parent / _safe_job_id(owner_id)
+        if path.parent != parent:
+            raise EngineExecutionError(f"{label} 路径归属无效")
+        if path.is_symlink():
+            raise EngineExecutionError(f"{label} 不允许符号链接")
         if not path.exists():
             return False
-        path.unlink()
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            # Gap state is normally a directory and local staging is always a
+            # directory.  Unlinking an unexpected regular file is still
+            # bounded to the exact task-owned name; never recurse its parent.
+            path.unlink()
         return True
+
+    def cleanup_terminal_job(self, job_id: str) -> dict[str, object]:
+        """Safely discard one terminal root's local state.
+
+        The method intentionally does not accept paths and never calls AList:
+            only the root/owned-child JSON files, ``gaps/<root>``,
+            ``staging/<root>`` and archive preprocessing staging under this
+            runner's state root are in scope.  A
+        formal media-library path cannot enter this operation.
+        """
+        safe_id = _safe_job_id(job_id)
+        with self.worker_lock():
+            root = self._read(safe_id)
+            # Perform every ownership check while the same inter-process lock
+            # is held, before the first destructive operation.
+            children = self._validate_cleanup_root(root)
+
+            if self.jobs_root.is_symlink():
+                raise EngineExecutionError("Engine jobs 根目录不允许符号链接")
+            root_path = self._job_path(safe_id)
+            if root_path.is_symlink() or not root_path.is_file():
+                raise EngineExecutionError(f"根任务 JSON 路径无效: {safe_id}")
+            child_paths: list[tuple[str, Path]] = []
+            for child in children:
+                path = self._job_path(child.id)
+                if path.is_symlink() or not path.is_file():
+                    raise EngineExecutionError(f"child 任务 JSON 路径无效: {child.id}")
+                child_paths.append((child.id, path))
+
+            gaps_root = self.state_root / "gaps"
+            staging_root = self.state_root / "staging"
+            archive_staging_root = self.state_root / "archive-staging"
+            removed_gap = self._remove_owned_local_tree(
+                gaps_root, safe_id, label="gap state"
+            )
+            removed_staging = self._remove_owned_local_tree(
+                staging_root, safe_id, label="local staging"
+            )
+            removed_archive_staging = self._remove_owned_local_tree(
+                archive_staging_root, safe_id, label="archive local staging"
+            )
+            removed_children: list[str] = []
+            for child_id, path in child_paths:
+                path.unlink()
+                removed_children.append(child_id)
+            root_path.unlink()
+            return {
+                "job_id": safe_id,
+                "removed": True,
+                "removed_job_ids": [*removed_children, safe_id],
+                "removed_child_job_ids": removed_children,
+                "removed_gap": removed_gap,
+                "removed_staging": removed_staging,
+                "removed_archive_staging": removed_archive_staging,
+                "formal_library_touched": False,
+            }
+
+    def clear_jobs(self) -> int:
+        """Bulk state deletion is intentionally retired.
+
+        Callers must name one terminal root through ``cleanup_terminal_job``;
+        silently deleting every job cannot prove ownership or child quiescence.
+        """
+        raise EngineExecutionError("已禁用批量 Engine 任务清理，请按 terminal 根任务逐项清理")
+
+    def delete_job(self, job_id: str) -> bool:
+        """Compatibility alias for the safe terminal-root cleanup boundary."""
+        try:
+            result = self.cleanup_terminal_job(job_id)
+        except EngineJobNotFoundError:
+            return False
+        return bool(result.get("removed"))
 
     @staticmethod
     def _ensure_authenticated(client: object) -> None:
@@ -2140,6 +2422,80 @@ class SimpleEngineRunner:
             if is_animation
             else f"{self.library_root}/美剧"
         )
+
+    def _archive_task_roots(self, job_id: str) -> tuple[Path, str]:
+        """Return deterministic local/remote task-owned archive roots.
+
+        The roots are derived from the durable job id, never from an inbound
+        basename.  This gives restart/cleanup code an exact ownership key and
+        keeps an archive output outside both the source tree and formal shelf.
+        """
+        safe_id = _safe_job_id(job_id)
+        local_root = self.state_root / "archive-staging" / safe_id
+        remote_root = _safe_remote_path(
+            f"{self.library_root}/ScrapeFlow/归档/{safe_id}",
+            field="archive remote staging root",
+            allow_root=False,
+        )
+        return local_root, remote_root
+
+    def _preprocess_ordinary_request_details(
+        self,
+        request: EngineRequest,
+        *,
+        job_id: str,
+        retry_password: str | None = None,
+    ) -> tuple[EngineRequest, Mapping[str, object] | None]:
+        """Let an injected archive adapter replace only a source with staging.
+
+        The composition root supplies both sides of the ownership boundary.
+        Small test adapters from the migration era may expose the old narrow
+        signature, so the fallback is intentionally one-way and never passes a
+        password or a formal-library target.
+        """
+
+        adapter = self.archive_preprocessor
+        method = getattr(adapter, "prepare_ordinary_request", None)
+        if not callable(method):
+            return request, None
+        local_staging, remote_staging = self._archive_task_roots(job_id)
+        kwargs = {
+            "alist": self.alist,
+            "task_staging": local_staging,
+            "remote_staging_root": remote_staging,
+        }
+        if retry_password is not None:
+            kwargs["retry_password"] = retry_password
+        try:
+            prepared = method(asdict(request), **kwargs)
+        except TypeError:
+            try:
+                # Small migration/test adapters may accept ``alist`` but not
+                # concrete staging kwargs.
+                prepared = method(asdict(request), alist=self.alist)
+            except TypeError:
+                prepared = method(asdict(request))
+        if not isinstance(prepared, Mapping):
+            raise EngineRequestError("归档预处理返回无效请求")
+        source = prepared.get("source_path", request.source_path)
+        if not isinstance(source, str):
+            raise EngineRequestError("归档预处理来源路径无效")
+        normalized = _safe_remote_path(source, field="archive source_path", allow_root=False)
+        projection = prepared.get("archive_preprocessed")
+        if not isinstance(projection, Mapping):
+            projection = None
+        return replace(request, source_path=normalized), projection
+
+    def _preprocess_ordinary_request(
+        self, request: EngineRequest, *, job_id: str | None = None,
+    ) -> EngineRequest:
+        """Compatibility wrapper for focused callers of the old private hook."""
+        if job_id is None:
+            job_id = f"preprocess-{uuid.uuid4().hex}"
+        result, _projection = self._preprocess_ordinary_request_details(
+            request, job_id=job_id,
+        )
+        return result
 
     def resolve_automatic_request(
         self,
@@ -2228,6 +2584,62 @@ class SimpleEngineRunner:
             target_parent=parent,
             season=season if isinstance(season, int) else None,
             trace=dict(getattr(match, "decision_trace", {}) or {}),
+        )
+        return request, identity
+
+    def _request_from_manual_identity(
+        self,
+        source: str,
+        correction: Mapping[str, object],
+    ) -> tuple[EngineRequest, AutomaticIdentity]:
+        """Build a bounded explicit retry request after identity failure.
+
+        This is deliberately a retry-only escape hatch.  It accepts one TMDB
+        id, one media type and (for TV) one season; it never accepts a target
+        path outside the configured library root or an arbitrary planner map.
+        """
+        forbidden = set(correction) - {"tmdb_id", "media_type", "season"}
+        if forbidden:
+            raise EngineRequestError("手工修正包含不支持的字段")
+        raw_id = correction.get("tmdb_id")
+        if isinstance(raw_id, str) and raw_id.isascii() and raw_id.isdecimal():
+            raw_id = int(raw_id)
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
+            raise EngineRequestError("手工修正 tmdb_id 必须是正整数")
+        media_type = str(correction.get("media_type") or "").strip().casefold()
+        if media_type not in {"movie", "tv"}:
+            raise EngineRequestError("手工修正 media_type 必须是 movie 或 tv")
+        raw_season = correction.get("season", 1)
+        if isinstance(raw_season, str) and raw_season.isascii() and raw_season.isdecimal():
+            raw_season = int(raw_season)
+        if isinstance(raw_season, bool) or not isinstance(raw_season, int) or raw_season < 0 or raw_season > 999:
+            raise EngineRequestError("手工修正 season 必须是 0–999 的整数")
+        # Keep title/year and target parent policy-derived.  The correction
+        # request must never become a second, client-controlled planner.
+        title = posixpath.basename(source.rstrip("/")) or str(raw_id)
+        parent = (
+            f"{self.library_root}/电影"
+            if media_type == "movie"
+            else f"{self.library_root}/美剧"
+        )
+        year_text = "未知年份"
+        request = EngineRequest.from_mapping({
+            "source_path": source,
+            "parent_path": parent,
+            "media_type": media_type,
+            "tmdb_id": raw_id,
+            "query": title,
+            "season": raw_season if media_type == "tv" else 1,
+        })
+        identity = AutomaticIdentity(
+            media_type=media_type,
+            tmdb_id=raw_id,
+            title=title,
+            year=year_text,
+            confidence=1.0,
+            target_parent=parent,
+            season=raw_season if media_type == "tv" else None,
+            trace={"source": "manual_retry"},
         )
         return request, identity
 
@@ -2341,6 +2753,7 @@ class SimpleEngineRunner:
         *,
         job_id: str | None = None,
         internal_child_of: str | None = None,
+        skip_archive_preprocessing: bool = False,
     ) -> EngineJob:
         """Build and persist one plan.
 
@@ -2357,6 +2770,12 @@ class SimpleEngineRunner:
             _safe_job_id(internal_child_of)
         if self._job_path(job_id).exists():
             raise SimpleEngineError(f"Engine job 已存在: {job_id}")
+        original_source = request.source_path
+        archive_projection: Mapping[str, object] | None = None
+        if internal_child_of is None and not skip_archive_preprocessing:
+            request, archive_projection = self._preprocess_ordinary_request_details(
+                request, job_id=job_id,
+            )
         plan = self._build_plan(request)
         if internal_child_of is not None:
             try:
@@ -2377,6 +2796,10 @@ class SimpleEngineRunner:
             body = _mark_provider_media_only_body(body)
         now = _now()
         summary = self._summary(plan)
+        if request.source_path != original_source:
+            summary["ingress_source_path"] = original_source
+        if archive_projection is not None:
+            summary["archive_preprocessed"] = dict(archive_projection)
         if internal_child_of is not None:
             summary.update({
                 "internal_child": True,
@@ -2431,11 +2854,26 @@ class SimpleEngineRunner:
         job_id: str | None = None,
     ) -> EngineJob:
         """Resolve and persist one plan without exposing identity decisions."""
-        request, identity = self.resolve_automatic_request(source_path, payload)
-        job = self.plan_job(request, job_id=job_id)
+        if job_id is None:
+            job_id = f"engine-{uuid.uuid4().hex}"
+        original_source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        intake = EngineRequest.from_mapping({
+            "source_path": original_source,
+            "parent_path": self.library_root,
+            "media_type": "auto",
+        })
+        intake, archive_projection = self._preprocess_ordinary_request_details(
+            intake, job_id=job_id,
+        )
+        request, identity = self.resolve_automatic_request(intake.source_path, payload)
+        job = self.plan_job(request, job_id=job_id, skip_archive_preprocessing=True)
         summary = dict(job.summary)
         summary["identity"] = identity.as_dict()
         summary["automatic"] = True
+        if original_source != request.source_path:
+            summary["ingress_source_path"] = original_source
+        if archive_projection is not None:
+            summary["archive_preprocessed"] = dict(archive_projection)
         summary["resource_gaps"] = list(
             (job.plan.get("scan_report") or {}).get("resource_gaps") or []
         ) if isinstance(job.plan.get("scan_report"), Mapping) else []
@@ -2443,7 +2881,12 @@ class SimpleEngineRunner:
         atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
         return updated
 
-    def plan_automatic_job(self, job_id: str) -> EngineJob:
+    def plan_automatic_job(
+        self,
+        job_id: str,
+        *,
+        retry_password: str | None = None,
+    ) -> EngineJob:
         """Resolve and persist the plan for an already queued source job."""
         with self.worker_lock():
             job = self._read(job_id)
@@ -2454,9 +2897,30 @@ class SimpleEngineRunner:
             source = job.request.get("source_path")
             if not isinstance(source, str):
                 raise EngineRequestError("自动任务缺少 source_path")
-            matching = replace(job, phase="identity_matching", updated_at=_now(), error=None)
+            original_source = _safe_remote_path(source, field="source_path", allow_root=False)
+            intake = EngineRequest.from_mapping({
+                "source_path": original_source,
+                "parent_path": self.library_root,
+                "media_type": "auto",
+            })
+            archiving = replace(
+                job,
+                phase="archive_preprocessing",
+                updated_at=_now(),
+                error=None,
+                summary={**job.summary, "automatic_stage": "archive_preprocessing"},
+            )
+            atomic_write_json(self._job_path(job_id), archiving.as_dict(), allow_nan=False)
+            archive_request, archive_projection = self._preprocess_ordinary_request_details(
+                intake, job_id=job_id, retry_password=retry_password,
+            )
+            correction = job.summary.get("manual_identity")
+            if isinstance(correction, Mapping):
+                request, identity = self._request_from_manual_identity(archive_request.source_path, correction)
+            else:
+                request, identity = self.resolve_automatic_request(archive_request.source_path)
+            matching = replace(archiving, phase="identity_matching", updated_at=_now())
             atomic_write_json(self._job_path(job_id), matching.as_dict(), allow_nan=False)
-            request, identity = self.resolve_automatic_request(source)
             planning = replace(matching, phase="planning", updated_at=_now())
             atomic_write_json(self._job_path(job_id), planning.as_dict(), allow_nan=False)
             plan = self._build_plan(request)
@@ -2478,6 +2942,12 @@ class SimpleEngineRunner:
                 "automatic_attempts": int(job.summary.get("automatic_attempts") or 0),
                 "next_retry_seconds": None,
             })
+            if isinstance(correction, Mapping):
+                summary["manual_identity"] = dict(correction)
+            if request.source_path != original_source:
+                summary["ingress_source_path"] = original_source
+            if archive_projection is not None:
+                summary["archive_preprocessed"] = dict(archive_projection)
             planned = replace(
                 planning,
                 phase="planned",
@@ -2551,6 +3021,10 @@ class SimpleEngineRunner:
             atomic_write_json(self._job_path(job_id), executing.as_dict(), allow_nan=False)
             try:
                 result = self._invoke_executor(plan)
+                result = dict(result)
+                consumed = self._consume_archive_source(job)
+                if consumed is not None:
+                    result["archive_source_consumption"] = consumed
             except Exception as exc:
                 failed = replace(
                     executing,
@@ -2569,6 +3043,71 @@ class SimpleEngineRunner:
             )
             atomic_write_json(self._job_path(job_id), done.as_dict(), allow_nan=False)
             return done
+
+    def _consume_archive_source(self, job: EngineJob) -> Mapping[str, object] | None:
+        """Move a successfully processed automatic source out of intake.
+
+        Failures/cancellation never call this method.  Archive input and the
+        now-empty ordinary source directory both move to a task-owned
+        processed area outside the formal library, so cleanup followed by an
+        intake scan cannot recreate the same successful job.
+        """
+        projection = job.summary.get("archive_preprocessed")
+        if job.summary.get("automatic") is not True and not isinstance(projection, Mapping):
+            return None
+        source = job.summary.get("ingress_source_path") or job.request.get("source_path")
+        if not isinstance(source, str):
+            return None
+        source = _safe_remote_path(source, field="archive ingress source", allow_root=False)
+        parent, name = posixpath.split(source.rstrip("/"))
+        if not parent or not name:
+            raise EngineExecutionError("归档原始来源路径无效，无法隔离")
+        lane = "归档" if isinstance(projection, Mapping) else "入站"
+        processed_root = _safe_remote_path(
+            f"{self.library_root}/ScrapeFlow/{lane}/{_safe_job_id(job.id)}/processed",
+            field="archive processed root",
+            allow_root=False,
+        )
+        exact = getattr(self.alist, "exact_file_info", None)
+        listing = getattr(self.alist, "list", None)
+        exists = False
+        if callable(exact):
+            try:
+                exists = exact(source) is not None
+            except Exception:
+                exists = False
+        if not exists and callable(listing):
+            try:
+                exists = bool(listing(source, refresh=True))
+            except TypeError:
+                exists = bool(listing(source))
+            except Exception:
+                exists = False
+        if not exists and callable(listing):
+            try:
+                parent_rows = listing(parent, refresh=True)
+            except TypeError:
+                parent_rows = listing(parent)
+            except Exception:
+                parent_rows = []
+            exists = isinstance(parent_rows, list) and any(
+                isinstance(row, Mapping) and row.get("name") == name
+                for row in parent_rows
+            )
+        if not exists:
+            return {"status": "already_consumed", "source": source}
+        ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
+        if callable(ensure):
+            ensure(processed_root)
+        move = getattr(self.alist, "move", None)
+        if not callable(move):
+            raise EngineExecutionError("AList 客户端缺少 move 接口，无法隔离原始归档")
+        move(parent, processed_root, [name])
+        return {
+            "status": "moved_to_processed",
+            "source": source,
+            "target": f"{processed_root}/{name}",
+        }
 
     def execute_automatic(self, job_id: str) -> EngineJob:
         """Execute or retry an automatic job."""
@@ -2618,11 +3157,73 @@ class SimpleEngineRunner:
             try:
                 plan = self._plan_from_job(job)
                 execution = self._readback_plan(plan)
-            except Exception as exc:
+            except EngineRecoveryMatrixError as exc:
+                # A matrix conflict is a durable fact, not a transient
+                # provider error.  Keep the plan and paths for operator
+                # correction, but make the phase terminal so automatic retry
+                # cannot replay a potentially destructive write.
+                recovery: dict[str, object] = {
+                    "status": "terminal",
+                    "reason": exc.reason,
+                }
+                if exc.source is not None:
+                    recovery["source"] = exc.source
+                if exc.target is not None:
+                    recovery["target"] = exc.target
+                if exc.expected_size is not None:
+                    recovery["expected_size"] = exc.expected_size
+                if exc.actual_size is not None:
+                    recovery["actual_size"] = exc.actual_size
+                summary = dict(job.summary)
+                summary["recovery"] = recovery
+                summary["automatic_terminal"] = True
+                failed = replace(
+                    job,
+                    phase="failed_verification",
+                    updated_at=_now(),
+                    summary=summary,
+                    execution=None,
+                    error=(
+                        "恢复检查发现不可自动修复的状态，已停止: "
+                        f"{redact_error(exc)}"
+                    ),
+                )
+                atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
+                return failed
+            except EngineRecoveryRetryableError as exc:
+                recovery = {
+                    "status": "retryable",
+                    "reason": exc.reason,
+                }
+                if exc.source is not None:
+                    recovery["source"] = exc.source
+                if exc.target is not None:
+                    recovery["target"] = exc.target
+                summary = dict(job.summary)
+                summary["recovery"] = recovery
                 failed = replace(
                     job,
                     phase="retry_wait",
                     updated_at=_now(),
+                    summary=summary,
+                    error=(
+                        "恢复检查确认结果尚不完整，将自动重试: "
+                        f"{redact_error(exc)}"
+                    ),
+                )
+                atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
+                return failed
+            except Exception as exc:
+                summary = dict(job.summary)
+                summary["recovery"] = {
+                    "status": "unknown",
+                    "reason": "readback_unavailable",
+                }
+                failed = replace(
+                    job,
+                    phase="retry_wait",
+                    updated_at=_now(),
+                    summary=summary,
                     error=(
                         "恢复检查暂时无法确认远端结果，将自动重试: "
                         f"{redact_error(exc)}"
@@ -2698,18 +3299,81 @@ class SimpleEngineRunner:
             _require_admissible_video_size(
                 item, expected, path=source, stage="恢复检查",
             )
-            observed = self._exact_info(target, expected_size=expected)
-            if observed is None:
-                raise EngineExecutionError(f"恢复检查找不到目标: {target}")
-            if int(observed["size"]) != expected:
-                raise EngineExecutionError(
-                    f"恢复检查目标大小不匹配: {target} expected={expected}, actual={observed['size']}"
+            # Read the target without an expected-size filter first.  The
+            # provider helper may return its last observed object when the
+            # expected size never appeared; passing ``expected`` here would
+            # collapse that durable mismatch into an indistinguishable
+            # absence and could incorrectly trigger a retry.
+            observed_target = self._exact_info(target, expected_size=None)
+            if observed_target is not None:
+                actual_target_size = int(observed_target["size"])
+                if actual_target_size != expected:
+                    raise EngineRecoveryMatrixError(
+                        "target_size_mismatch",
+                        (
+                            "恢复检查目标大小不匹配: "
+                            f"{target} expected={expected}, actual={actual_target_size}"
+                        ),
+                        source=source,
+                        target=target,
+                        expected_size=expected,
+                        actual_size=actual_target_size,
+                    )
+                _require_admissible_video_size(
+                    item, actual_target_size, path=target, stage="恢复检查",
                 )
-            _require_admissible_video_size(
-                item, observed["size"], path=target, stage="恢复检查",
-            )
-            if self._exact_info(source, wait_for_visibility=False) is not None:
-                raise EngineExecutionError(f"恢复检查发现源文件仍存在，状态不确定: {source}")
+                observed_source = self._exact_info(source, wait_for_visibility=False)
+                if observed_source is not None:
+                    source_size = int(observed_source["size"])
+                    if source_size != expected:
+                        raise EngineRecoveryMatrixError(
+                            "source_size_mismatch",
+                            (
+                                "恢复检查源文件大小不匹配: "
+                                f"{source} expected={expected}, actual={source_size}"
+                            ),
+                            source=source,
+                            target=target,
+                            expected_size=expected,
+                            actual_size=source_size,
+                        )
+                    raise EngineRecoveryMatrixError(
+                        "target_source_conflict",
+                        f"恢复检查发现目标和源文件同时存在，状态冲突: {target} / {source}",
+                        source=source,
+                        target=target,
+                        expected_size=expected,
+                        actual_size=actual_target_size,
+                    )
+            else:
+                observed_source = self._exact_info(source, wait_for_visibility=False)
+                if observed_source is None:
+                    raise EngineRecoveryMatrixError(
+                        "source_lost",
+                        f"恢复检查发现目标和源文件均不存在，来源已丢失: {source} / {target}",
+                        source=source,
+                        target=target,
+                        expected_size=expected,
+                    )
+                source_size = int(observed_source["size"])
+                if source_size != expected:
+                    raise EngineRecoveryMatrixError(
+                        "source_size_mismatch",
+                        (
+                            "恢复检查源文件大小不匹配: "
+                            f"{source} expected={expected}, actual={source_size}"
+                        ),
+                        source=source,
+                        target=target,
+                        expected_size=expected,
+                        actual_size=source_size,
+                    )
+                raise EngineRecoveryRetryableError(
+                    "target_missing_source_present",
+                    f"恢复检查发现源文件仍在但目标不存在，可安全重试: {source} -> {target}",
+                    source=source,
+                    target=target,
+                )
             verified_files.append({"source": source, "target": target, "size": expected})
 
         verified_artifacts: list[dict[str, object]] = []
@@ -2723,12 +3387,27 @@ class SimpleEngineRunner:
                 for target, content in planned_nfos(plan):
                     if not isinstance(target, str) or not isinstance(content, (bytes, bytearray)):
                         raise EngineExecutionError("Engine NFO 计划格式无效")
+                    # As with media targets, inspect the actual observed size
+                    # before deciding whether the artifact is merely missing
+                    # (safe to replay) or is a durable conflicting object
+                    # (terminal, never overwrite during recovery).
                     observed = self._exact_info(
                         target,
                         wait_for_visibility=True,
-                        expected_size=len(content),
+                        expected_size=None,
                     )
-                    if observed is None or int(observed["size"]) != len(content):
+                    if observed is not None and int(observed["size"]) != len(content):
+                        raise EngineRecoveryMatrixError(
+                            "artifact_size_mismatch",
+                            (
+                                "恢复检查 NFO 大小不匹配: "
+                                f"{target} expected={len(content)}, actual={observed['size']}"
+                            ),
+                            target=target,
+                            expected_size=len(content),
+                            actual_size=int(observed["size"]),
+                        )
+                    if observed is None:
                         raise EngineExecutionError(f"恢复检查找不到或无法核对 NFO: {target}")
                     verified_artifacts.append({"target": target, "kind": "nfo", "size": len(content)})
             planned_artwork = getattr(engine, "planned_artwork", None)
@@ -2739,7 +3418,14 @@ class SimpleEngineRunner:
                         wait_for_visibility=True,
                         expected_size=None,
                     )
-                    if observed is None or int(observed["size"]) <= 0:
+                    if observed is not None and int(observed["size"]) <= 0:
+                        raise EngineRecoveryMatrixError(
+                            "artifact_size_mismatch",
+                            f"恢复检查海报大小无效: {target} actual={observed['size']}",
+                            target=target,
+                            actual_size=int(observed["size"]),
+                        )
+                    if observed is None:
                         raise EngineExecutionError(f"恢复检查找不到海报: {target}")
                     verified_artifacts.append({"target": target, "kind": str(role), "size": int(observed["size"])})
         cleaned: list[str] = []

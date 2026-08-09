@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,6 +61,12 @@ class FakeAList:
     def exact_file_info(self, path: str) -> dict[str, object] | None:
         value = self.files.get(path)
         return None if value is None else {"size": len(value)}
+
+    def read_file_prefix(self, path: str, *, max_bytes: int) -> bytes:
+        value = self.files.get(path)
+        if value is None:
+            raise FileNotFoundError(path)
+        return value[:max_bytes]
 
     def mkdir(self, _path: str) -> None:
         return
@@ -122,6 +129,32 @@ class DelayedMoveAList(FakeAList):
         if self.move_attempts == 1:
             raise RuntimeError("transient provider move error")
         super().move(source_dir, target_dir, names)
+
+
+class ArchiveLifecycleAList(FakeAList):
+    def __init__(self) -> None:
+        super().__init__()
+        self.directories: set[str] = set()
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        if path in self.directories:
+            return [{"name": "payload.zip", "is_dir": False}]
+        return []
+
+    def ensure_directory(self, path: str) -> None:
+        self.directories.add(path)
+
+    def move(self, source_dir: str, target_dir: str, names: list[str]) -> None:
+        self.moves.append((source_dir, target_dir, list(names)))
+        for name in names:
+            source = f"{source_dir.rstrip('/')}/{name}"
+            target = f"{target_dir.rstrip('/')}/{name}"
+            if source in self.directories:
+                self.directories.remove(source)
+                self.directories.add(target)
+            elif source in self.files:
+                self.files[target] = self.files.pop(source)
 
 
 class ListingVisibleMoveAList(FakeAList):
@@ -316,6 +349,28 @@ class RecordingTMDB:
         return b"new-artwork"
 
 
+class RecordingArchivePreprocessor:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def prepare_ordinary_request(self, request, *, alist=None):
+        self.calls.append({"request": dict(request), "alist": alist})
+        return {**request, "source_path": "/task-staging/archive"}
+
+
+class OrderedArchivePreprocessor(RecordingArchivePreprocessor):
+    def __init__(self, events: list[str], *, fail: bool = False) -> None:
+        super().__init__()
+        self.events = events
+        self.fail = fail
+
+    def prepare_ordinary_request(self, request, *, alist=None):
+        self.events.append("archive_preprocess")
+        if self.fail:
+            raise RuntimeError("archive fixture rejected")
+        return {**request, "source_path": "/task-staging/archive"}
+
+
 class SimpleEngineRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -349,6 +404,80 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         done = runner.execute_job("engine-test")
         self.assertEqual(done.phase, "executed")
         self.assertEqual(done.execution, {"ok": True})
+
+    def test_optional_archive_preprocessor_replaces_ordinary_source_before_plan(self) -> None:
+        adapter = RecordingArchivePreprocessor()
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"ok": True},
+            archive_preprocessor=adapter,
+        )
+        job = runner.plan_job(self.request, job_id="engine-archive-hook")
+        self.assertEqual(job.request["source_path"], "/task-staging/archive")
+        self.assertEqual(job.plan["source_root"], "/incoming/movie")
+        self.assertEqual(len(adapter.calls), 1)
+
+    def test_automatic_archive_precedes_identity_and_planning(self) -> None:
+        events: list[str] = []
+        adapter = OrderedArchivePreprocessor(events)
+        runner = SimpleEngineRunner(
+            self.root, alist=self.alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=lambda _plan: events.append("writer") or {"ok": True},
+            archive_preprocessor=adapter,
+        )
+        match = SimpleNamespace(
+            media_type="movie", tmdb_id=1, title="Movie", year="2020",
+            confidence=0.99, decision_trace={},
+        )
+        with patch("engine.scraper.auto_match_tmdb", side_effect=lambda *args, **kwargs: events.append("resolve_identity") or (match, [])):
+            job = runner.plan_automatic("/incoming/archive", job_id="auto-archive-order")
+        self.assertEqual(events, ["archive_preprocess", "resolve_identity"])
+        self.assertEqual(job.request["source_path"], "/task-staging/archive")
+        self.assertEqual(job.summary["ingress_source_path"], "/incoming/archive")
+        self.assertEqual(job.phase, "planned")
+        self.assertNotIn("writer", events)
+
+    def test_automatic_archive_failure_never_calls_identity_or_writer(self) -> None:
+        events: list[str] = []
+        runner = SimpleEngineRunner(
+            self.root, alist=self.alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=lambda _plan: events.append("writer") or {"ok": True},
+            archive_preprocessor=OrderedArchivePreprocessor(events, fail=True),
+        )
+        queued = runner.create_automatic_job("/incoming/archive", job_id="auto-archive-fail")
+        with self.assertRaises(RuntimeError):
+            runner.plan_automatic_job(queued.id)
+        self.assertEqual(events, ["archive_preprocess"])
+        self.assertNotIn("resolve_identity", events)
+        self.assertNotIn("writer", events)
+        self.assertEqual(runner._read(queued.id).phase, "archive_preprocessing")
+
+    def test_successful_archive_source_is_moved_to_task_owned_processed_area(self) -> None:
+        alist = ArchiveLifecycleAList()
+        alist.directories.add("/incoming/archive")
+        runner = SimpleEngineRunner(
+            self.root, alist=alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=lambda _plan: {"ok": True}, library_root="/library",
+        )
+        job = runner.create_automatic_job("/incoming/archive", job_id="archive-consume")
+        prepared = replace(
+            job,
+            phase="planned",
+            request={"source_path": "/task-staging/archive"},
+            summary={
+                **job.summary,
+                "ingress_source_path": "/incoming/archive",
+                "archive_preprocessed": {"changed": True, "ingress": "archive"},
+            },
+        )
+        atomic_write_json(runner._job_path(job.id), prepared.as_dict(), allow_nan=False)
+        consumed = runner._consume_archive_source(prepared)  # noqa: SLF001 - lifecycle boundary
+        self.assertEqual(consumed["status"], "moved_to_processed")
+        self.assertTrue(str(consumed["target"]).startswith("/library/ScrapeFlow/归档/archive-consume/processed/"))
 
     def test_runner_finalizes_an_injected_plan_before_persisting(self) -> None:
         plan = fake_plan(self.request, self.alist, object())
@@ -1256,6 +1385,29 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 video_path="/library/Show/Season 01/Show.S01E01.mkv",
             )
         self.assertIn(source, self.alist.files)
+
+    def test_subtitle_sidecar_content_must_match_declared_language(self) -> None:
+        video = "/library/Show/Season 01/Show.S01E01.mkv"
+        source = "/quark/影视/ScrapeFlow/补源/root/attempt-1/Show.S01E01.zh.srt"
+        target = "/library/Show/Season 01/Show.S01E01.zh.srt"
+        content = "1\n00:00:01,000 --> 00:00:02,000\n這是一個測試\n".encode("utf-8")
+        self.alist.files[video] = b"video"
+        self.alist.files[source] = content
+        with self.assertRaisesRegex(EngineExecutionError, "语言校验"):
+            SimplePlanExecutor(self.alist).install_subtitle_sidecar(
+                source, target, expected_size=len(content), video_path=video,
+                subtitle_language="zh",
+            )
+        self.assertIn(source, self.alist.files)
+
+        self.alist.files[source] = (
+            "1\n00:00:01,000 --> 00:00:02,000\n这是一个测试\n".encode("utf-8")
+        )
+        result = SimplePlanExecutor(self.alist).install_subtitle_sidecar(
+            source, target, expected_size=len(self.alist.files[source]),
+            video_path=video, subtitle_language="zh",
+        )
+        self.assertEqual(result["status"], "moved")
 
     def test_cleanup_plan_runs_as_one_automatic_execution(self) -> None:
         calls: list[object] = []
