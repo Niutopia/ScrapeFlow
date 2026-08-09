@@ -363,6 +363,34 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px 
 .taskdesk-success-gaps { grid-column: 2 / -1; margin: 0; padding: 12px 14px; display: grid; gap: 7px; list-style: none; border: 1px solid #e2a159; background: #fff8ed; }
 .taskdesk-success-gaps li { display: grid; grid-template-columns: minmax(100px, .25fr) 1fr; gap: 10px; color: #6e4b23; font-size: 9px; line-height: 1.5; }
 
+.target-shelf-panel { padding: 22px 26px; display: grid; gap: 15px; border-top: 1px solid var(--orange); background: #fff8ed; }
+.target-shelf-panel.conflict { border-top-color: var(--red); background: #fff7f2; }
+.target-shelf-panel > header, .target-shelf-panel > footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.target-shelf-panel > header > div { min-width: 0; }
+.target-shelf-panel > header span { color: #a86116; font: 750 8px var(--font-mono); letter-spacing: .14em; }
+.target-shelf-panel.conflict > header span { color: var(--red); }
+.target-shelf-panel > header h3 { margin: 5px 0 4px; font-size: 20px; }
+.target-shelf-panel > header p { margin: 0; overflow-wrap: anywhere; color: #6e4b23; font-size: 11px; line-height: 1.55; }
+.target-shelf-panel.conflict > header p { color: #761d20; font-weight: 700; }
+.target-shelf-panel button { min-height: 36px; padding: 0 12px; flex: 0 0 auto; border: 1px solid var(--ink); background: transparent; font-size: 10px; font-weight: 700; }
+.target-shelf-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid #e2a159; background: var(--white); }
+.target-shelf-options button { min-height: 74px; padding: 12px; display: grid; align-content: center; gap: 5px; border: 0; border-right: 1px solid #ead0aa; text-align: left; }
+.target-shelf-options button:last-child { border-right: 0; }
+.target-shelf-options button:hover, .target-shelf-options button.selected { color: white; background: var(--blue); }
+.target-shelf-options b { font-size: 15px; }
+.target-shelf-options small { color: var(--muted); font: 700 8px var(--font-mono); text-transform: uppercase; }
+.target-shelf-options button:hover small, .target-shelf-options button.selected small { color: #dfe7ff; }
+.target-shelf-panel > dl { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) 140px 110px; border: 1px solid #e2a159; background: var(--white); }
+.target-shelf-panel > dl > div { min-width: 0; min-height: 56px; padding: 10px 12px; display: grid; align-content: center; gap: 5px; }
+.target-shelf-panel > dl > div + div { border-left: 1px solid #ead0aa; }
+.target-shelf-panel dt { color: var(--muted); font-size: 8px; }
+.target-shelf-panel dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 650 10px var(--font-mono); }
+.target-shelf-panel > footer { align-items: center; }
+.target-shelf-panel > footer > span { min-width: 0; color: #6e4b23; font-size: 10px; font-weight: 700; }
+.target-shelf-panel > footer > div { display: flex; align-items: center; gap: 8px; }
+.target-shelf-panel button.primary { color: white; border-color: var(--blue); background: var(--blue); }
+.target-shelf-panel button.danger { color: var(--red); border-color: var(--red); }
+
 .live-task-panel { padding: 22px 26px; display: grid; gap: 15px; border-top: 1px solid var(--blue); background: #f3f6ff; }
 .live-task-panel > header, .live-task-panel > footer, .live-task-candidates > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .live-task-panel > header > div { min-width: 0; }
@@ -504,6 +532,15 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px 
   .taskdesk-success-panel > i { width: 40px; height: 40px; }
   .taskdesk-success-panel dl { grid-column: 1 / -1; grid-template-columns: 70px 1fr; }
   .taskdesk-success-panel dl > div:last-child { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); }
+  .target-shelf-panel { padding: 18px 14px; }
+  .target-shelf-panel > header, .target-shelf-panel > footer { align-items: stretch; flex-direction: column; }
+  .target-shelf-options { grid-template-columns: 1fr; }
+  .target-shelf-options button { border-right: 0; border-bottom: 1px solid #ead0aa; }
+  .target-shelf-options button:last-child { border-bottom: 0; }
+  .target-shelf-panel > dl { grid-template-columns: 1fr; }
+  .target-shelf-panel > dl > div + div { border-left: 0; border-top: 1px solid #ead0aa; }
+  .target-shelf-panel > footer > div { align-items: stretch; flex-direction: column; }
+  .target-shelf-panel > footer button { width: 100%; }
   .live-task-panel { padding: 18px 14px; }
   .live-task-panel > header, .live-task-panel > footer { align-items: stretch; flex-direction: column; }
   .live-task-panel > header button, .live-task-panel > footer button { width: 100%; }

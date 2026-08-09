@@ -4,23 +4,30 @@ export const MEDIA_ROOT = "/quark/影视";
 export const UNSCRAPED_MEDIA_ROOT = `${MEDIA_ROOT}/待刮削`;
 
 export const ACTIVE_PHASES = new Set<JobPhase>([
-  "queued", "analyzing", "identity_matching", "planning", "executing_media",
+  "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "executing_media",
   "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
   "acquiring", "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
   "final_verifying",
 ]);
 
+export const START_GATE_PHASES = new Set<JobPhase>([
+  "awaiting_target_shelf", "target_policy_conflict",
+]);
+
 export const TERMINAL_PHASES = new Set<JobPhase>([
-  "completed", "failed", "failed_identity", "failed_provider", "failed_write",
+  "completed", "completed_with_gaps", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider", "failed_write",
   "failed_verification", "failed_cleanup", "cancelled",
 ]);
 
 type PhaseMeta = { label: string; detail: string; progress: number; step: number; tone: string };
 
 export const PHASE: Record<JobPhase, PhaseMeta> = {
+  awaiting_target_shelf: { label: "等待选择货架", detail: "请选择电影、番剧或美剧后才会启动任务", progress: 0, step: 0, tone: "quiet" },
   queued: { label: "排队中", detail: "任务已经进入本地队列", progress: 4, step: 1, tone: "quiet" },
   analyzing: { label: "分析来源", detail: "正在扫描媒体、字幕和目录线索", progress: 12, step: 1, tone: "live" },
+  archive_preprocessing: { label: "归档预处理", detail: "正在安全检查并准备归档或媒体来源", progress: 16, step: 1, tone: "live" },
   identity_matching: { label: "自动识别", detail: "正在匹配作品、类型、季度与集数", progress: 24, step: 1, tone: "live" },
+  target_policy_conflict: { label: "货架类型冲突", detail: "TMDB 类型与所选货架不兼容，请重新选择后启动", progress: 0, step: 0, tone: "attention" },
   planning: { label: "生成计划", detail: "系统正在生成媒体树、NFO、海报与清理动作", progress: 38, step: 2, tone: "live" },
   verifying: { label: "AList 核对", detail: "正在刷新目录并精确读取远端结果", progress: 82, step: 4, tone: "live" },
   cleaning: { label: "自动清理", detail: "正在清理本任务拥有的来源和暂存文件", progress: 94, step: 5, tone: "live" },
@@ -35,8 +42,11 @@ export const PHASE: Record<JobPhase, PhaseMeta> = {
   final_verifying: { label: "最终核对", detail: "正在确认补源结果并收口缺口", progress: 98, step: 5, tone: "live" },
   executing_media: { label: "整理文件", detail: "正在安全移动并校验文件", progress: 92, step: 4, tone: "live" },
   completed: { label: "整理完成", detail: "目标文件已经通过校验", progress: 100, step: 5, tone: "success" },
+  completed_with_gaps: { label: "已完成，存在缺口", detail: "正式整理和清理已完成；自动补源已跳过，仍有资源缺口", progress: 100, step: 5, tone: "attention" },
   failed: { label: "任务失败", detail: "自动尝试已经结束，请查看失败原因", progress: 0, step: 0, tone: "danger" },
+  failed_archive: { label: "归档预处理失败", detail: "归档或媒体预处理未通过，来源已保留", progress: 0, step: 0, tone: "danger" },
   failed_identity: { label: "自动识别失败", detail: "系统已耗尽身份匹配策略", progress: 0, step: 0, tone: "danger" },
+  failed_planning: { label: "计划生成失败", detail: "作品目录或媒体计划未能安全生成", progress: 0, step: 0, tone: "danger" },
   failed_provider: { label: "补源失败", detail: "系统已耗尽当前补源尝试", progress: 0, step: 0, tone: "danger" },
   failed_write: { label: "写入失败", detail: "正式库写入未能完成", progress: 0, step: 0, tone: "danger" },
   failed_verification: { label: "核对失败", detail: "AList 回读未能确认最终状态", progress: 0, step: 0, tone: "danger" },

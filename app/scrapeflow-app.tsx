@@ -67,7 +67,7 @@ export function ScrapeFlowApp() {
                 const detailJob = expanded && current?.id === job.id ? current : job;
                 return <div className={`taskdesk-job ${expanded ? "expanded" : ""}`} key={job.id} data-job-id={job.id}>
                   <TaskRow job={job} selected={expanded} expanded={expanded} pending={flow.pending} onToggle={() => void toggleTaskPanel(job)} onRetry={() => void flow.retry(job)} />
-                  {expanded ? <TaskExpansion job={detailJob} pending={flow.pending} onClose={() => setExpandedId(null)} onRetry={(correction) => flow.retry(detailJob, correction)} onCancel={() => flow.cancel(detailJob)} onCleanup={async () => {
+                  {expanded ? <TaskExpansion job={detailJob} pending={flow.pending} onClose={() => setExpandedId(null)} onStart={(targetShelf) => flow.startJob(detailJob, targetShelf)} onRetry={(correction) => flow.retry(detailJob, correction)} onCancel={() => flow.cancel(detailJob)} onCleanup={async () => {
                     const removed = await flow.cleanup(detailJob);
                     if (removed) setExpandedId(null);
                     return removed;

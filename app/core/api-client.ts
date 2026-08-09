@@ -1,5 +1,5 @@
 import type {
-  BrowseResult, GlobalControl, Health, Job, LibraryAudit,
+  BrowseResult, GlobalControl, Health, Job, LibraryAudit, TargetShelf,
 } from "./contracts";
 
 const API_ROOT = "/api";
@@ -17,7 +17,7 @@ export class ApiRequestError extends Error {
 
 export type RetryCorrection = {
   tmdb_id?: number;
-  media_type?: "movie" | "tv" | "collection";
+  media_type?: "movie" | "tv";
   season?: number;
   archive_password?: string;
 };
@@ -48,8 +48,12 @@ export const scrapeFlowApi = {
   browse: (path: string, refresh = false) => request<BrowseResult>(
     `/browse?path=${encodeURIComponent(path)}&refresh=${refresh ? "1" : "0"}`,
   ),
-  /** Submitting a path starts the automatic identity-to-cleanup workflow. */
+  /** Submitting a path only registers a task awaiting a target shelf. */
   create: (path: string) => post<{ job: Job }>("/jobs", { path }),
+  /** The sole public gate that makes an ordinary task eligible for a worker. */
+  start: (id: string, targetShelf: TargetShelf) => post<{ job: Job }>(`/jobs/${id}/start`, {
+    target_shelf: targetShelf,
+  }),
   /** This only asks the scheduler to retry now; it does not release a plan. */
   retry: (id: string, correction: RetryCorrection = {}) => post<{ job: Job }>(`/jobs/${id}/retry`, correction),
   cancel: (id: string) => post<{ job: Job }>(`/jobs/${id}/cancel`, {}),

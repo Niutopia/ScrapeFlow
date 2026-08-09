@@ -1,12 +1,15 @@
 export const JOB_PHASES = [
-  "queued", "analyzing", "identity_matching", "planning", "executing_media",
+  "awaiting_target_shelf", "queued", "analyzing", "archive_preprocessing", "identity_matching",
+  "target_policy_conflict", "planning", "executing_media",
   "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
   "acquiring", "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
-  "final_verifying", "completed", "failed", "failed_identity", "failed_provider",
+  "final_verifying", "completed", "completed_with_gaps", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider",
   "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 ] as const;
 
 export type JobPhase = typeof JOB_PHASES[number];
+/** Closed API contract; the backend remains the only path-mapping authority. */
+export type TargetShelf = "movie" | "anime" | "us_tv";
 // The current backend exposes provider identity (magnet), while acquisition
 // kind (torrent) is a separate field in the provider capability contract.
 // cloud_share remains representable for unavailable legacy state, but it is
@@ -56,6 +59,7 @@ export type PlanSummary = {
   file_count?: number;
   source_root?: string;
   target_root?: string;
+  target_work_path?: string | null;
   cleanup_file_count?: number;
   resource_gaps?: ResourceGap[];
   resource_gap_count?: number;
@@ -71,6 +75,14 @@ export type Job = {
   phase: JobPhase;
   error: string | null;
   plan: PlanSummary | null;
+  /** User-confirmed stable shelf, or null while the task is waiting. */
+  target_shelf?: TargetShelf | null;
+  /** Fixed first-level shelf root, never the concrete work directory. */
+  target_root?: string | null;
+  /** Engine-planned concrete work directory after planning succeeds. */
+  target_work_path?: string | null;
+  allowed_target_shelves?: TargetShelf[];
+  selected_at?: string | null;
   queue_position?: number | null;
   queue_kind?: "analysis" | "execution" | null;
   progress?: {
@@ -109,6 +121,9 @@ export type Health = {
   connected: boolean;
   tmdb_configured: boolean;
   engine_configured: boolean;
+  build_version?: string | null;
+  build_commit?: string | null;
+  build_time?: string | null;
   message?: string;
   provider_capabilities?: Record<string, ProviderCapability>;
   intake_monitoring: boolean;
@@ -119,9 +134,11 @@ export type Health = {
     last_scan_at?: string | null;
     last_error?: string | null;
     last_scheduled_count?: number;
+    last_registered_count?: number;
   };
   operations?: {
     jobs_total: number;
+    jobs_awaiting_target_shelf?: number;
     jobs_active: number;
     jobs_failed: number;
     jobs_completed: number;

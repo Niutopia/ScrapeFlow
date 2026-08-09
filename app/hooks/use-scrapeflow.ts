@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ApiRequestError, scrapeFlowApi } from "../core/api-client";
 import type { RetryCorrection } from "../core/api-client";
 import type {
-  BrowseResult, GlobalControl, Health, Job, LibraryAudit,
+  BrowseResult, GlobalControl, Health, Job, LibraryAudit, TargetShelf,
 } from "../core/contracts";
 import { ACTIVE_PHASES, UNSCRAPED_MEDIA_ROOT, isFailed } from "../core/job-state";
 
@@ -140,6 +140,7 @@ export function useScrapeFlow() {
     void restore();
     const healthTimer = window.setInterval(() => {
       void refreshHealth();
+      void refreshJobs();
       void refreshControl();
       void refreshLibraryAudit();
     }, 12000);
@@ -254,6 +255,21 @@ export function useScrapeFlow() {
     }
   };
 
+  const startJob = async (job: Job, targetShelf: TargetShelf) => {
+    setPending(true);
+    setOperationError("");
+    try {
+      const response = await scrapeFlowApi.start(job.id, targetShelf);
+      mergeJob(response.job);
+      return true;
+    } catch (cause) {
+      setOperationError(errorMessage(cause, "无法启动自动任务"));
+      return false;
+    } finally {
+      setPending(false);
+    }
+  };
+
   const cancel = async (job: Job) => {
     setPending(true);
     setOperationError("");
@@ -293,7 +309,7 @@ export function useScrapeFlow() {
   return {
     health, healthError, jobs, selected, initializing, pending, error, errorSource, createConflict,
     browser, browserPending, refreshHealth, refreshJobs, loadJob,
-    createJob, browse, retry, cancel, cleanup,
+    createJob, browse, startJob, retry, cancel, cleanup,
     control, controlError, refreshControl, setGlobalPause,
     libraryAudit, auditPending, auditError, refreshLibraryAudit, runLibraryAudit,
     dismissError: () => setOperationError(""),

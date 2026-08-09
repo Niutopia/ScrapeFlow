@@ -5,6 +5,7 @@ import type { Job } from "../core/contracts";
 import {
   ACTIVE_PHASES,
   MEDIA_ROOT,
+  START_GATE_PHASES,
   TERMINAL_PHASES,
   isFailed,
 } from "../core/job-state";
@@ -13,7 +14,7 @@ import { useScrapeFlow } from "./use-scrapeflow";
 export type TaskFilter = "all" | "attention" | "running" | "finished";
 export const DASHBOARD_FILTERS: Array<{ value: TaskFilter; label: string }> = [
   { value: "all", label: "全部" },
-  { value: "running", label: "自动处理中" },
+  { value: "running", label: "待启动/处理中" },
   { value: "attention", label: "异常" },
   { value: "finished", label: "已结束" },
 ];
@@ -36,8 +37,8 @@ export function useDashboardController() {
 
   const groups = useMemo(() => {
     const all = flow.jobs;
-    const attention = flow.jobs.filter(isFailed);
-    const running = flow.jobs.filter(job => ACTIVE_PHASES.has(job.phase));
+    const attention = flow.jobs.filter(job => isFailed(job) || job.phase === "target_policy_conflict");
+    const running = flow.jobs.filter(job => ACTIVE_PHASES.has(job.phase) || START_GATE_PHASES.has(job.phase));
     const finished = flow.jobs.filter(job => TERMINAL_PHASES.has(job.phase) && !isFailed(job));
     return { all, attention, running, finished };
   }, [flow.jobs]);
@@ -56,7 +57,7 @@ export function useDashboardController() {
   };
 
   const toggleTaskPanel = async (job: Job) => {
-    const expandable = ACTIVE_PHASES.has(job.phase) || isFailed(job) || job.phase === "completed" || job.phase === "cancelled";
+    const expandable = START_GATE_PHASES.has(job.phase) || ACTIVE_PHASES.has(job.phase) || isFailed(job) || job.phase === "completed" || job.phase === "completed_with_gaps" || job.phase === "cancelled";
     if (!expandable) return;
     const row = document.querySelector<HTMLElement>(`[data-job-id="${job.id}"]`);
     const previousTop = row?.getBoundingClientRect().top;

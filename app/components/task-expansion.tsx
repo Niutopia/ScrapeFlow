@@ -1,9 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import type { Job } from "../core/contracts";
+import type { Job, TargetShelf } from "../core/contracts";
 import type { RetryCorrection } from "../core/api-client";
-import { ACTIVE_PHASES, PHASE, formatDate, isFailed } from "../core/job-state";
+import { ACTIVE_PHASES, PHASE, START_GATE_PHASES, formatDate, isFailed } from "../core/job-state";
+
+const DEFAULT_TARGET_SHELVES: TargetShelf[] = ["movie", "anime", "us_tv"];
+const TARGET_SHELF_COPY: Record<TargetShelf, { label: string; detail: string }> = {
+  movie: { label: "电影", detail: "Movie" },
+  anime: { label: "番剧", detail: "Anime / TV" },
+  us_tv: { label: "美剧", detail: "US TV" },
+};
 
 function providerLabel(provider?: string) {
   switch (provider) {
@@ -29,23 +36,61 @@ function phaseCopy(job: Job) {
   return "自动尝试已经结束。请查看错误，处理原因后主动重试。";
 }
 
-export function TaskExpansion({ job, pending, onClose, onRetry, onCancel, onCleanup }: {
+export function TaskExpansion({ job, pending, onClose, onStart, onRetry, onCancel, onCleanup }: {
   job: Job;
   pending: boolean;
   onClose: () => void;
+  onStart: (targetShelf: TargetShelf) => Promise<boolean>;
   onRetry: (correction?: RetryCorrection) => Promise<boolean>;
   onCancel: () => Promise<boolean>;
   onCleanup: () => Promise<boolean>;
 }) {
+  if (START_GATE_PHASES.has(job.phase)) {
+    return <TargetShelfStartPanel job={job} pending={pending} onClose={onClose} onStart={onStart} onCancel={onCancel} />;
+  }
   if (ACTIVE_PHASES.has(job.phase)) {
     return <LiveTaskPanel job={job} pending={pending} onClose={onClose} onCancel={onCancel} />;
   }
   if (isFailed(job)) {
     return <AutomaticFailurePanel job={job} pending={pending} onClose={onClose} onRetry={onRetry} onCleanup={onCleanup} />;
   }
-  if (job.phase === "completed") return <TaskSuccessPanel job={job} pending={pending} onClose={onClose} onCleanup={onCleanup} />;
+  if (job.phase === "completed" || job.phase === "completed_with_gaps") return <TaskSuccessPanel job={job} pending={pending} onClose={onClose} onCleanup={onCleanup} />;
   if (job.phase === "cancelled") return <CancelledTaskPanel job={job} pending={pending} onClose={onClose} onCleanup={onCleanup} />;
   return null;
+}
+
+function TargetShelfStartPanel({ job, pending, onClose, onStart, onCancel }: {
+  job: Job;
+  pending: boolean;
+  onClose: () => void;
+  onStart: (targetShelf: TargetShelf) => Promise<boolean>;
+  onCancel: () => Promise<boolean>;
+}) {
+  const title = job.plan?.title || job.identity?.title || job.source.split("/").at(-1) || job.source;
+  const [targetShelf, setTargetShelf] = useState<TargetShelf | null>(null);
+  const allowedShelves = job.allowed_target_shelves?.length ? job.allowed_target_shelves : DEFAULT_TARGET_SHELVES;
+  const conflict = job.phase === "target_policy_conflict";
+  const meta = PHASE[job.phase];
+  const submit = () => {
+    if (targetShelf) void onStart(targetShelf);
+  };
+
+  return <section className={`target-shelf-panel ${conflict ? "conflict" : ""}`} aria-label={`${title}目标货架`}>
+    <header><div><span>{conflict ? "TARGET CONFLICT" : "START GATE"}</span><h3>{title}</h3><p>{job.error || meta.detail}</p></div><button type="button" onClick={onClose}>收起</button></header>
+    <div className="target-shelf-options" role="radiogroup" aria-label="目标货架">
+      {allowedShelves.map(shelf => {
+        const copy = TARGET_SHELF_COPY[shelf];
+        const selected = targetShelf === shelf;
+        return <button key={shelf} type="button" role="radio" aria-checked={selected} className={selected ? "selected" : ""} onClick={() => setTargetShelf(shelf)}><b>{copy.label}</b><small>{copy.detail}</small></button>;
+      })}
+    </div>
+    <dl>
+      <div><dt>来源目录</dt><dd>{job.source}</dd></div>
+      <div><dt>当前货架</dt><dd>{job.target_shelf ? TARGET_SHELF_COPY[job.target_shelf].label : "尚未选择"}</dd></div>
+      <div><dt>最后更新</dt><dd>{formatDate(job.updated_at)}</dd></div>
+    </dl>
+    <footer><span>{targetShelf ? `将启动到 ${TARGET_SHELF_COPY[targetShelf].label}` : "等待用户确认目标货架"}</span><div><button className="danger" type="button" disabled={pending} onClick={() => void onCancel()}>{pending ? "正在停止..." : "取消任务"}</button><button className="primary" type="button" disabled={pending || !targetShelf} onClick={submit}>{pending ? "正在启动..." : conflict ? "重新启动" : "启动任务"}</button></div></footer>
+  </section>;
 }
 
 function TaskSuccessPanel({ job, pending, onClose, onCleanup }: {
@@ -62,9 +107,10 @@ function TaskSuccessPanel({ job, pending, onClose, onCleanup }: {
   const selectedReleases = replenishment?.selections
     ?? (replenishment?.selection ? [replenishment.selection] : []);
   const readback = job.readback?.status === "verified" ? "已通过" : job.readback?.status || "已完成";
+  const hasDeferredGaps = job.phase === "completed_with_gaps";
   return <section className="taskdesk-success-panel" aria-label={`${title}自动整理结果`}>
     <i aria-hidden="true">✓</i>
-    <div><span>自动流程完成</span><h3>{title}</h3><p>自动识别、媒体整理、AList 回读和任务清理已完成。</p></div>
+    <div><span>{hasDeferredGaps ? "自动流程已完成，保留缺口" : "自动流程完成"}</span><h3>{title}</h3><p>{hasDeferredGaps ? `自动识别、媒体整理、AList 回读和任务清理已完成；自动补源已跳过，仍有 ${resourceGaps.length} 项资源缺口。` : "自动识别、媒体整理、AList 回读和任务清理已完成。"}</p></div>
     <dl>
       <div><dt>文件</dt><dd>{count || "—"}</dd></div>
       <div><dt>AList 回读</dt><dd>{readback}</dd></div>
@@ -174,14 +220,17 @@ function AutomaticFailurePanel({ job, pending, onClose, onRetry, onCleanup }: {
   const selections = replenishment?.selections
     ?? (replenishment?.selection ? [replenishment.selection] : []);
   const [tmdbId, setTmdbId] = useState("");
-  const [mediaType, setMediaType] = useState<RetryCorrection["media_type"]>("movie");
+  const [mediaType, setMediaType] = useState<RetryCorrection["media_type"] | "">("");
   const [season, setSeason] = useState("");
   const [archivePassword, setArchivePassword] = useState("");
   const needsIdentityCorrection = job.phase === "failed_identity";
+  const hasTmdbId = !!tmdbId.trim();
+  const missingMediaType = needsIdentityCorrection && hasTmdbId && !mediaType;
   const submitRetry = () => {
     const correction: RetryCorrection = {};
-    if (tmdbId.trim()) correction.tmdb_id = Number(tmdbId);
-    if (needsIdentityCorrection) {
+    if (needsIdentityCorrection && hasTmdbId) {
+      if (!mediaType) return;
+      correction.tmdb_id = Number(tmdbId);
       correction.media_type = mediaType;
       if (season.trim()) correction.season = Number(season);
     }
@@ -190,8 +239,8 @@ function AutomaticFailurePanel({ job, pending, onClose, onRetry, onCleanup }: {
     void onRetry(correction);
   };
   return <section className="replenishment-failure-panel" aria-label={`${title}自动失败详情`}>
-    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{phaseCopy(job)}</p></div><div className="replenishment-failure-actions"><button className="primary" disabled={pending} onClick={submitRetry}>{pending ? "正在请求…" : "立即重试"}</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button><button onClick={onClose}>收起</button></div></header>
-    {needsIdentityCorrection ? <fieldset className="identity-correction"><legend>人工修正身份</legend><label>TMDB ID<input inputMode="numeric" value={tmdbId} onChange={event => setTmdbId(event.target.value)} /></label><label>媒体类型<select value={mediaType} onChange={event => setMediaType(event.target.value as RetryCorrection["media_type"])}><option value="movie">电影</option><option value="tv">剧集</option><option value="collection">合集</option></select></label><label>季（可选）<input inputMode="numeric" value={season} onChange={event => setSeason(event.target.value)} /></label></fieldset> : null}
+    <header><div><span>AUTOMATIC FAILURE</span><h3>{title}</h3><p>{phaseCopy(job)}</p></div><div className="replenishment-failure-actions"><button className="primary" disabled={pending || missingMediaType} onClick={submitRetry}>{pending ? "正在请求…" : "立即重试"}</button><button className="danger" type="button" disabled={pending} onClick={() => void onCleanup()}>{pending ? "正在清理…" : "清理任务记录"}</button><button onClick={onClose}>收起</button></div></header>
+    {needsIdentityCorrection ? <fieldset className="identity-correction"><legend>人工修正身份</legend><label>TMDB ID<input inputMode="numeric" value={tmdbId} onChange={event => setTmdbId(event.target.value)} /></label><label>媒体类型<select value={mediaType} onChange={event => setMediaType(event.target.value as RetryCorrection["media_type"] | "")}><option value="">不指定</option><option value="movie">电影</option><option value="tv">剧集</option></select></label><label>季（可选）<input inputMode="numeric" value={season} onChange={event => setSeason(event.target.value)} /></label></fieldset> : null}
     <label className="identity-correction">归档密码（一次性，可选）<input type="password" autoComplete="off" value={archivePassword} onChange={event => setArchivePassword(event.target.value)} /></label>
     <dl>
       <div><dt>失败阶段</dt><dd>{PHASE[job.phase]?.label || job.phase}</dd></div>

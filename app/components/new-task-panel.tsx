@@ -9,7 +9,7 @@ function directoryState(path: string, phase: Job["phase"] | undefined, jobs: Job
     .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
   const currentPhase = matchingJob?.phase ?? phase;
   if (!currentPhase) return { key: "unprocessed", label: "未处理", rank: 0 };
-  if (currentPhase === "completed") return { key: "completed", label: "已处理", rank: 4 };
+  if (currentPhase === "completed" || currentPhase === "completed_with_gaps") return { key: "completed", label: "已处理", rank: 4 };
   if (currentPhase === "cancelled") return { key: "unprocessed", label: "未处理", rank: 0 };
   if (currentPhase.startsWith("failed")) return { key: "problem", label: "处理失败", rank: 1 };
   return { key: "running", label: "处理中", rank: 3 };

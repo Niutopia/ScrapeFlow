@@ -82,20 +82,20 @@ export function OperationsOverview({ health, control, jobs, audit }: {
   const intake = health?.intake_monitoring === false
     ? { value: "未启用", detail: "当前只接受 Web 或 API 提交来源路径", tone: "quiet" }
     : health?.intake_monitoring === true
-      ? { value: intakeError ? "读取异常" : "监控中", detail: intakeError || "发现来源后会自动入队", tone: intakeError ? "danger" : "success" }
+      ? { value: intakeError ? "读取异常" : "监控中", detail: intakeError || "发现来源后登记为待启动任务", tone: intakeError ? "danger" : "success" }
       : connected
         ? { value: "监听就绪", detail: "待刮削目录已接入自动流程", tone: "live" }
         : { value: "等待服务", detail: "连接 AList 与 TMDB 后启用监听", tone: "quiet" };
 
   return <section className="operations-overview" aria-labelledby="operations-overview-title">
     <header className="operations-overview-header">
-      <div><span>AUTOMATION OVERVIEW</span><h1 id="operations-overview-title">自动运维总览</h1><p>待刮削目录由系统持续监听：识别、整理、补源、AList 回读和清理都在后台自动完成。</p></div>
+      <div><span>AUTOMATION OVERVIEW</span><h1 id="operations-overview-title">自动运维总览</h1><p>待刮削目录由系统持续监听：来源先登记为待启动任务，选择目标货架后才进入识别、整理、AList 回读和清理。</p></div>
       <div className={`operations-overview-badge tone-${paused ? "attention" : connected ? "success" : "quiet"}`}><i aria-hidden="true" /><span>{paused ? "调度已暂停" : connected ? "自动流程在线" : "等待服务"}</span></div>
     </header>
     <div className="operations-overview-grid">
       <article className="operations-metric" data-tone={paused ? "attention" : connected ? "success" : "quiet"}><span>调度器</span><b>{paused ? "已暂停" : connected ? "运行中" : "未就绪"}</b><small>{paused ? control?.reason || "新任务会保持排队" : "自动派发和重试已启用"}</small></article>
       <article className="operations-metric" data-tone={intake.tone}><span>待刮削监听</span><b>{intake.value}</b><small>{intake.detail}</small></article>
-      <article className="operations-metric" data-tone={queued ? "live" : "quiet"}><span>等待队列</span><b>{queued}</b><small>{queued ? "个来源等待自动处理" : "没有等待来源"}</small></article>
+      <article className="operations-metric" data-tone={queued ? "live" : "quiet"}><span>等待队列</span><b>{queued}</b><small>{queued ? "个已选任务等待调度" : "没有已选待调度任务"}</small></article>
       <article className="operations-metric" data-tone={processing ? "live" : "quiet"}><span>正在处理</span><b>{processing}</b><small>{retrying ? `${retrying} 个任务正在自动退避` : "识别、写入或核对中的任务"}</small></article>
       <article className="operations-metric" data-tone={attention ? "danger" : "success"}><span>需关注</span><b>{attention}</b><small>{attention ? "失败任务已停止，请查看原因或主动重试" : "没有失败任务"}</small></article>
       <article className="operations-metric" data-tone={acquiring ? "live" : auditState.tone}><span>审计 / 补源</span><b>{acquiring ? `${acquiring} 个补源中` : auditState.value}</b><small>{acquiring ? `搜索、获取或修复中 · ${health?.operations?.provider_workers ?? 0} 个获取 worker` : auditState.detail}</small></article>
