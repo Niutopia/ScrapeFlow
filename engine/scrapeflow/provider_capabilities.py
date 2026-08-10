@@ -3,7 +3,7 @@
 ScrapeFlow currently has one executable acquisition implementation:
 ``LocalTorrentMaterializer``.  Provider discovery and the public status API
 must derive their claims from that fact instead of advertising historical
-cloud-share/HTTP lanes.  This module intentionally contains data and pure
+HTTP/cloud placeholders.  This module intentionally contains data and pure
 validation only; it does not import a materializer or perform I/O.
 """
 
@@ -16,11 +16,6 @@ from typing import Any
 EXECUTABLE_PROVIDER = "magnet"
 EXECUTABLE_ACQUISITION_KIND = "torrent"
 ACTIVE_PROVIDERS = frozenset({EXECUTABLE_PROVIDER})
-
-# Names which may still occur in old catalog/state documents.  They are kept
-# here only so callers can report an explicit unavailable status; they are not
-# part of ``ACTIVE_PROVIDERS`` and can never be selected or materialized.
-UNAVAILABLE_PROVIDERS = frozenset({"cloud_share"})
 
 
 def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
@@ -38,12 +33,6 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
             # The current real materializer returns media-only deliveries;
             # no production archive_source fixture has proved provider SFX.
             "sfx": {"status": "deferred", "reason": "no_real_archive_source_materializer_input"},
-        },
-        "cloud_share": {
-            "status": "unavailable",
-            "reason": "no_executable_materializer",
-            "acquisition_kinds": [],
-            "materializer": None,
         },
     }
 
@@ -75,7 +64,6 @@ __all__ = [
     "ACTIVE_PROVIDERS",
     "EXECUTABLE_ACQUISITION_KIND",
     "EXECUTABLE_PROVIDER",
-    "UNAVAILABLE_PROVIDERS",
     "candidate_capability_error",
     "is_executable_candidate",
     "provider_capability_snapshot",

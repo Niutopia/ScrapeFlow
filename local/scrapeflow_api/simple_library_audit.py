@@ -38,9 +38,6 @@ from engine.scrapeflow.subtitle_content import (
     classify_subtitle_content,
     normalize_subtitle_language,
 )
-from local.scrapeflow_api.content_identity_overrides import (
-    apply_content_identity_overrides,
-)
 from local.scrapeflow_api.subtitle_policy import (
     load_subtitle_policy_overrides,
     subtitle_policy_for_work,
@@ -4527,17 +4524,6 @@ def run_automatic_library_audit(
         formal_roots=auditor.roots,
     )
     works, unowned_library_works = _merge_library_and_job_works(library_works, job_works)
-    # A content witness is deliberately applied only after both the structural
-    # library identities and persisted task identities have been merged.  It
-    # may add one exact movie file to its already-proven parent movie scope;
-    # it never broadens a TV tree or crosses a ``tvshow.nfo`` boundary by
-    # pathname inference.
-    works, content_identity_override_diagnostics = apply_content_identity_overrides(
-        structural_report,
-        works,
-        client,
-        state_root,
-    )
     policies = (
         list(subtitle_policy_overrides)
         if subtitle_policy_overrides is not None
@@ -4564,7 +4550,6 @@ def run_automatic_library_audit(
     )
     semantic = report.get("semantic")
     if isinstance(semantic, dict):
-        semantic["content_identity_overrides"] = content_identity_override_diagnostics
         job_gaps = automatic_job_gaps(jobs)
         semantic["job_gaps"] = job_gaps
         semantic["job_gap_count"] = len(job_gaps)

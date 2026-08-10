@@ -853,10 +853,10 @@ class AuditOwnedRootTests(unittest.TestCase):
             )
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
-                fingerprint = SimpleApplication._provider_gap_fingerprint([_gap()])
+                signature = SimpleApplication._provider_gap_signature([_gap()])
                 app._record_replenishment_summary(job, {
                     "status": "failed", "terminal": True, "attempts": 5,
-                    "gap_fingerprint": fingerprint, "error": "retry exhausted",
+                    "gap_signature": signature, "error": "retry exhausted",
                 })
                 terminal = runner.get_job(job.id)
                 self.assertFalse(SimpleApplication._provider_job_allowed(terminal))
@@ -868,18 +868,20 @@ class AuditOwnedRootTests(unittest.TestCase):
                     timer.assert_not_called()
                 persisted = runner.get_job(job.id)
                 self.assertTrue(persisted.summary["replenishment"]["terminal"])
-                self.assertEqual(persisted.summary["replenishment"]["gap_fingerprint"], fingerprint)
+                self.assertEqual(persisted.summary["replenishment"]["gap_signature"], signature)
                 self.assertEqual(persisted.summary["replenishment_attempts"], 5)
             finally:
                 app.close()
 
-    def test_provider_gap_fingerprint_is_order_independent_and_changes_on_gap(self) -> None:
+    def test_provider_gap_signature_is_order_independent_and_changes_on_gap(self) -> None:
         first = _gap()
         second = dict(first, id="audit-row-2", season=1, episode=3)
-        a = SimpleApplication._provider_gap_fingerprint([first, second])
-        b = SimpleApplication._provider_gap_fingerprint([second, first])
+        a = SimpleApplication._provider_gap_signature([first, second])
+        b = SimpleApplication._provider_gap_signature([second, first])
         self.assertEqual(a, b)
-        self.assertNotEqual(a, SimpleApplication._provider_gap_fingerprint([first]))
+        self.assertNotEqual(a, SimpleApplication._provider_gap_signature([first]))
+        self.assertIsInstance(a, list)
+        self.assertEqual(a[0]["media_type"], "tv")
 
     def test_fresh_audit_does_not_clobber_live_provider_progress(self) -> None:
         """A rediscovered gap must not replace an in-flight root projection.

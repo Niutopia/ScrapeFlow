@@ -114,7 +114,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertIn("build_commit", health)
         self.assertIn("build_time", health)
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
-        self.assertEqual(health["provider_capabilities"]["cloud_share"]["status"], "unavailable")
+        self.assertEqual(set(health["provider_capabilities"]), {"magnet"})
 
         status, control = self.request("GET", "/api/control")
         self.assertEqual(status, 200)

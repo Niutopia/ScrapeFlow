@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import ipaddress
 import json
 import os
@@ -1103,27 +1102,37 @@ class SimpleApplication:
         return str(row.get("kind") or "").strip().casefold()
 
     @staticmethod
-    def _provider_gap_fingerprint(rows: Sequence[Mapping[str, object]]) -> str:
-        """Stable identity for one fresh provider-gap observation."""
+    def _provider_gap_signature(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+        """Stable semantic identity for one fresh provider-gap observation."""
         canonical: list[dict[str, object]] = []
         for row in rows:
             media = row.get("media") if isinstance(row.get("media"), Mapping) else {}
+            episodes = row.get("episodes")
+            episode_range: list[int] | None = None
+            if isinstance(episodes, list):
+                episode_numbers = [
+                    value for value in episodes
+                    if type(value) is int and value > 0
+                ]
+                if len(episode_numbers) > 1:
+                    episode_range = [min(episode_numbers), max(episode_numbers)]
             canonical.append({
                 "kind": SimpleApplication._audit_row_kind(row),
                 "tmdb_id": media.get("tmdb_id") if isinstance(media, Mapping) else row.get("tmdb_id"),
+                "media_type": media.get("media_type") if isinstance(media, Mapping) else row.get("media_type"),
                 "target_root": media.get("target_root") if isinstance(media, Mapping) else row.get("target_root"),
                 "path": row.get("path"),
                 "season": row.get("season"),
                 "episode": row.get("episode"),
+                "episode_range": episode_range,
                 "subtitle_language": row.get("subtitle_language"),
             })
-        payload = json.dumps(
-            sorted(canonical, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True)),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        return sorted(
+            canonical,
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
         )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _lifecycle_allows_completed_with_gaps(job: EngineJob) -> bool:
@@ -1858,11 +1867,11 @@ class SimpleApplication:
     def _provider_pool(self) -> ThreadPoolExecutor:
         with self._automatic_lock:
             if self._provider_executor is None:
-                workers_raw = os.getenv("SCRAPEFLOW_PROVIDER_WORKERS", "3").strip()
+                workers_raw = os.getenv("SCRAPEFLOW_PROVIDER_WORKERS", "1").strip()
                 try:
                     workers = max(1, min(8, int(workers_raw)))
                 except ValueError:
-                    workers = 3
+                    workers = 1
                 self._provider_executor = ThreadPoolExecutor(
                     max_workers=workers,
                     thread_name_prefix="scrapeflow-provider",
@@ -2022,9 +2031,11 @@ class SimpleApplication:
         merged = dict(prior) if isinstance(prior, Mapping) else {}
         safe_outcome = redact_value(dict(outcome))
         merged.update(dict(safe_outcome) if isinstance(safe_outcome, Mapping) else dict(outcome))
-        fingerprint = current.summary.get("provider_gap_fingerprint")
-        if isinstance(fingerprint, str) and fingerprint:
-            merged["gap_fingerprint"] = fingerprint
+        summary.pop("provider_gap_fingerprint", None)
+        merged.pop("gap_fingerprint", None)
+        signature = current.summary.get("provider_gap_signature")
+        if isinstance(signature, list) and signature:
+            merged["gap_signature"] = signature
         # A successful retry can follow a cooperative cancellation in the
         # same persisted root.  Remove transient failure/cancellation fields
         # that are absent from the new outcome; otherwise the dashboard and
@@ -2796,14 +2807,15 @@ class SimpleApplication:
                 row for row in new_resource_gaps
                 if self._audit_row_kind(row) in _AUTOMATIC_PROVIDER_GAP_KINDS
             ]
-            provider_gap_fingerprint = (
-                self._provider_gap_fingerprint(provider_relevant)
+            provider_gap_signature = (
+                self._provider_gap_signature(provider_relevant)
                 if provider_relevant else None
             )
-            if provider_gap_fingerprint is not None:
-                summary["provider_gap_fingerprint"] = provider_gap_fingerprint
+            summary.pop("provider_gap_fingerprint", None)
+            if provider_gap_signature is not None:
+                summary["provider_gap_signature"] = provider_gap_signature
             else:
-                summary.pop("provider_gap_fingerprint", None)
+                summary.pop("provider_gap_signature", None)
             repair_relevant = [
                 row for row in new_resource_gaps
                 if self._audit_row_kind(row) in _AUTOMATIC_REPAIR_GAP_KINDS
@@ -2820,7 +2832,7 @@ class SimpleApplication:
                 provider_relevant
                 and isinstance(prior_replenishment, Mapping)
                 and prior_replenishment.get("terminal") is True
-                and prior_replenishment.get("gap_fingerprint") == provider_gap_fingerprint
+                and prior_replenishment.get("gap_signature") == provider_gap_signature
             )
             if (
                 provider_relevant

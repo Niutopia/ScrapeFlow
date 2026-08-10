@@ -39,9 +39,9 @@ def _torrent_candidate() -> dict[str, object]:
     }
 
 
-def _cloud_share_candidate() -> dict[str, object]:
+def _legacy_http_candidate() -> dict[str, object]:
     return {
-        "provider": "cloud_share",
+        "provider": "legacy_http",
         "locator": "https://example.test/share/opaque",
         "release_name": "Example Show S01E01 2160p",
         "title": "Example Show",
@@ -59,15 +59,15 @@ class ProviderCapabilityTests(unittest.TestCase):
         snapshot = provider_capability_snapshot()
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
-    def test_cloud_share_has_no_acquisition_lane_or_injected_fallback(self) -> None:
-        cloud = _cloud_share_candidate()
+    def test_unsupported_provider_has_no_acquisition_lane_or_injected_fallback(self) -> None:
+        legacy = _legacy_http_candidate()
         with self.assertRaises(AcquisitionRouteError):
-            acquisition_lane(cloud)
+            acquisition_lane(legacy)
 
         torrent = Mock(return_value={"status": "ready"})
         with self.assertRaises(AcquisitionRouteError):
             acquire_selection(
-                cloud,
+                legacy,
                 "/task/staging",
                 acquire_torrent=torrent,
             )
@@ -86,17 +86,17 @@ class ProviderCapabilityTests(unittest.TestCase):
     def test_search_filters_non_executable_candidates_and_reports_truthful_lanes(self) -> None:
         service = ReplenishmentSearchService(
             lambda _request: {
-                "candidates": [_cloud_share_candidate(), _torrent_candidate()],
-                "lane_status": {"cloud_share": {"status": "ready"}},
+                "candidates": [_legacy_http_candidate(), _torrent_candidate()],
+                "lane_status": {"legacy_http": {"status": "ready"}},
             },
         )
         result = service.run({})
         self.assertEqual([row["provider"] for row in result["candidates"]], ["magnet"])
         self.assertEqual(result["lane_status"]["magnet"]["status"], "ready")
-        self.assertEqual(result["lane_status"]["cloud_share"]["status"], "unavailable")
+        self.assertNotIn("legacy_http", result["lane_status"])
         self.assertEqual(result["provider_rejections"], {"unsupported_provider": 1})
 
-    def test_selector_rejects_cloud_share_and_selects_executable_magnet(self) -> None:
+    def test_selector_rejects_unsupported_provider_and_selects_executable_magnet(self) -> None:
         request = {
             "media": {
                 "tmdb_id": 1,
@@ -123,7 +123,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             return_value={"S01E01"},
         ):
             result = select_replenishment_candidates(
-                request, [_cloud_share_candidate(), _torrent_candidate()],
+                request, [_legacy_http_candidate(), _torrent_candidate()],
             )
         self.assertEqual(result["status"], "complete")
         self.assertEqual([row["provider"] for row in result["selections"]], ["magnet"])
@@ -155,7 +155,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             {"provider_acquisition_mismatch": 1},
         )
 
-    def test_local_automatic_materializer_does_not_delegate_cloud_share(self) -> None:
+    def test_local_automatic_materializer_does_not_delegate_unsupported_provider(self) -> None:
         delegate = Mock()
         delegate.acquire.return_value = {"status": "ready"}
         materializer = LocalTorrentAutomaticMaterializer(delegate=delegate)
@@ -163,7 +163,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             with self.assertRaises(AutomaticReplenishmentError):
                 materializer.acquire(
                     {},
-                    [_cloud_share_candidate()],
+                    [_legacy_http_candidate()],
                     staging_root="/library/ScrapeFlow/补源/job/attempt",
                     workspace=Path(directory),
                     alist=object(),

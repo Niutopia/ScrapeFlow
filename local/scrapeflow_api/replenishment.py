@@ -24,7 +24,6 @@ from engine.scrapeflow.replenishment_matching import (
 )
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
-    UNAVAILABLE_PROVIDERS,
     provider_capability_snapshot,
 )
 from engine.scrapeflow.media_policy import (
@@ -39,7 +38,7 @@ ACTIONABLE_GAP_KINDS = frozenset({
     "missing_episode", "missing_season", "missing_media", "missing_subtitle",
 })
 PROVIDER_ORDER = {provider: index for index, provider in enumerate(sorted(ACTIVE_PROVIDERS))}
-PROVIDER_DIAGNOSTIC_NAMES = tuple((*sorted(ACTIVE_PROVIDERS), *sorted(UNAVAILABLE_PROVIDERS)))
+PROVIDER_DIAGNOSTIC_NAMES = tuple(sorted(ACTIVE_PROVIDERS))
 QUALITY_ORDER = {"2160p": 3, "1080p": 2, "720p": 1, "unknown": 0}
 _VIDEO_SUFFIXES = VIDEO_EXTENSIONS
 BAD_AVAILABILITY_MARKERS = (
