@@ -13,6 +13,7 @@ from local.scrapeflow_api.acceptance_package import (
     build_acceptance_package,
     compose_evidence,
     git_evidence,
+    isolated_preflight_evidence,
 )
 
 
@@ -60,6 +61,29 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"\n',
         encoding="utf-8",
     )
+
+
+def valid_isolated_declaration(root: Path) -> dict[str, object]:
+    return {
+        "api_url": "http://127.0.0.1:8765",
+        "alist_url": "http://127.0.0.1:5244",
+        "scrapeflow_state_dir": str(root / "isolated" / "scrapeflow-data"),
+        "alist_data_dir": str(root / "isolated" / "alist-data"),
+        "media_root": "/quark/影视/ScrapeFlow/验收/run-20260810",
+        "storage_label": "isolated-quark-storage-20260810",
+        "offline_backup_manifest": str(root / "backup" / "scrapeflow-offline-backup.json"),
+        "media_recovery_point": "snapshot:isolated-media-before-acceptance",
+        "provider_workers": 1,
+        "start_paused": True,
+        "intake_monitor": False,
+        "automatic_audit": False,
+        "audit_repair": False,
+        "provider_auto_repair": False,
+        "one_task_at_a_time": True,
+        "old_backlog_restored": False,
+        "bulk_retry": False,
+        "bulk_cleanup": False,
+    }
 
 
 def fake_runner(args: tuple[str, ...], cwd: Path, env: dict[str, str] | None) -> CommandResult:
@@ -137,6 +161,8 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("状态: 未完成，等待真实隔离验收和用户授权。", package)
         self.assertIn("- Git commit: abc1234", package)
         self.assertIn("- 静态部署合同: 通过", package)
+        self.assertIn("- 隔离 preflight: 未提供", package)
+        self.assertIn("- [ ] 隔离 preflight 通过", package)
         self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
         self.assertIn("| 有效夸克分享 |  | 第一阶完成，后二阶未调用 | 未执行 |  |", package)
         self.assertIn("- [ ] 三条获取线路全部真实可执行。", package)
@@ -154,6 +180,61 @@ class AcceptancePackageTests(unittest.TestCase):
 
         self.assertIn("- 静态部署合同: 失败", package)
         self.assertIn("SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED", package)
+
+    def test_preflight_evidence_reports_valid_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = isolated_preflight_evidence(valid_isolated_declaration(root), root=root / "repo")
+
+        self.assertEqual(evidence["status"], "通过")
+        self.assertEqual(evidence["issues"], [])
+        self.assertEqual(evidence["summary"]["provider_workers"], 1)
+
+    def test_package_draft_includes_preflight_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            write_contract_files(repo)
+
+            package = build_acceptance_package(
+                root=repo,
+                generated_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+                release_check_status="通过",
+                isolated_declaration=valid_isolated_declaration(root),
+                runner=fake_runner,
+            )
+
+        self.assertIn("- 隔离 preflight: 通过", package)
+        self.assertIn("- 离线备份 manifest: ", package)
+        self.assertIn("scrapeflow-offline-backup.json", package)
+        self.assertIn("- 正式媒体库外部恢复点: snapshot:isolated-media-before-acceptance", package)
+        self.assertIn("## 隔离环境声明", package)
+        self.assertIn("| media_root | /quark/影视/ScrapeFlow/验收/run-20260810 |", package)
+        self.assertIn("当前记录: 通过", package)
+
+    def test_package_draft_records_failed_preflight_without_passing_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            write_contract_files(repo)
+            declaration = valid_isolated_declaration(root)
+            declaration["provider_workers"] = 2
+            declaration["media_root"] = "/quark/影视/电影"
+
+            package = build_acceptance_package(
+                root=repo,
+                generated_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+                isolated_declaration=declaration,
+                runner=fake_runner,
+            )
+
+        self.assertIn("- 隔离 preflight: 失败", package)
+        self.assertIn("preflight 问题:", package)
+        self.assertIn("provider_workers must be 1", package)
+        self.assertIn("formal library shelves", package)
+        self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
 
 
 if __name__ == "__main__":

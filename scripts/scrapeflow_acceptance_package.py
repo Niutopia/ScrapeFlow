@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from local.scrapeflow_api.acceptance_package import build_acceptance_package  # noqa: E402
+from local.scrapeflow_api.isolated_preflight import load_declaration  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,11 +37,24 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="record the external formal media-library recovery point",
     )
+    parser.add_argument(
+        "--preflight-declaration",
+        type=Path,
+        help="include stage-10 isolated preflight declaration status in the package",
+    )
     args = parser.parse_args(argv)
+    declaration = None
+    if args.preflight_declaration is not None:
+        try:
+            declaration = load_declaration(args.preflight_declaration)
+        except (OSError, ValueError) as exc:
+            print(f"preflight declaration error: {exc}", file=sys.stderr)
+            return 2
     package = build_acceptance_package(
         release_check_status=args.release_check_status,
         backup_manifest=args.backup_manifest,
         media_recovery_point=args.media_recovery_point,
+        isolated_declaration=declaration,
     )
     if args.output is None:
         print(package)

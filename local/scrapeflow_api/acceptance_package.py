@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 
+from .isolated_preflight import isolated_preflight_issues
 from .release_checks import local_deployment_contract_issues, project_root
 
 
@@ -150,6 +151,46 @@ def compose_evidence(root: Path | None = None, runner: CommandRunner = _run_comm
     return {"status": "可读", "error": "", "services": services}
 
 
+def isolated_preflight_evidence(
+    declaration: Mapping[str, object] | None,
+    *,
+    root: Path | None = None,
+) -> dict[str, object]:
+    """Return status and safe summary fields from a stage-10 declaration."""
+    if declaration is None:
+        return {"status": "未提供", "issues": [], "summary": {}}
+    base = project_root() if root is None else Path(root)
+    payload = dict(declaration)
+    issues = isolated_preflight_issues(payload, root=base)
+    summary_keys = (
+        "api_url",
+        "alist_url",
+        "scrapeflow_state_dir",
+        "alist_data_dir",
+        "media_root",
+        "storage_label",
+        "offline_backup_manifest",
+        "media_recovery_point",
+        "provider_workers",
+        "start_paused",
+        "intake_monitor",
+        "automatic_audit",
+        "provider_auto_repair",
+        "one_task_at_a_time",
+        "old_backlog_restored",
+        "bulk_retry",
+        "bulk_cleanup",
+    )
+    return {
+        "status": "通过" if not issues else "失败",
+        "issues": issues,
+        "summary": {
+            key: payload.get(key, "")
+            for key in summary_keys
+        },
+    }
+
+
 def _sample_table(rows: tuple[tuple[str, str], ...], input_header: str) -> list[str]:
     output = [
         f"| 样本 | {input_header} | 预期 | 结果 | 证据 |",
@@ -166,6 +207,7 @@ def build_acceptance_package(
     release_check_status: str = "未执行",
     backup_manifest: str = "",
     media_recovery_point: str = "",
+    isolated_declaration: Mapping[str, object] | None = None,
     runner: CommandRunner = _run_command,
 ) -> str:
     """Build a Markdown evidence draft for final isolated acceptance."""
@@ -175,6 +217,13 @@ def build_acceptance_package(
     compose = compose_evidence(base, runner)
     deployment_issues = local_deployment_contract_issues(base)
     static_status = "通过" if not deployment_issues else "失败"
+    preflight = isolated_preflight_evidence(isolated_declaration, root=base)
+    preflight_summary = preflight["summary"]
+    if isinstance(preflight_summary, Mapping):
+        backup_manifest = backup_manifest or str(preflight_summary.get("offline_backup_manifest") or "")
+        media_recovery_point = (
+            media_recovery_point or str(preflight_summary.get("media_recovery_point") or "")
+        )
 
     lines = [
         "# ScrapeFlow 验收包草稿",
@@ -192,6 +241,7 @@ def build_acceptance_package(
         f"- Git status: {git['status']}",
         f"- 发布检查: {release_check_status}",
         f"- 静态部署合同: {static_status}",
+        f"- 隔离 preflight: {preflight['status']}",
         f"- 离线备份 manifest: {backup_manifest or '未提供'}",
         f"- 正式媒体库外部恢复点: {media_recovery_point or '未提供'}",
         "",
@@ -219,10 +269,35 @@ def build_acceptance_package(
             )
         lines.append("")
 
+    lines.extend(["## 隔离环境声明", ""])
+    if preflight["status"] == "未提供":
+        lines.extend([
+            "- 状态: 未提供",
+            "- 生成模板: `python3 scripts/scrapeflow_isolated_preflight.py --template`",
+            "- 校验命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`",
+            "",
+        ])
+    elif isinstance(preflight_summary, Mapping):
+        lines.extend([
+            f"- 状态: {preflight['status']}",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+        ])
+        for key, value in preflight_summary.items():
+            lines.append(f"| {key} | {value} |")
+        lines.append("")
+        issues = preflight["issues"]
+        if isinstance(issues, list) and issues:
+            lines.extend(["preflight 问题:", ""])
+            lines.extend(f"- {issue}" for issue in issues)
+            lines.append("")
+
     lines.extend([
         "## 预检查",
         "",
         f"- [ ] 发布检查通过，命令: `python3 scripts/scrapeflow_release_check.py`，当前记录: {release_check_status}",
+        f"- [ ] 隔离 preflight 通过，命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`，当前记录: {preflight['status']}",
         "- [ ] 离线备份 `verify` 通过。",
         "- [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。",
         "- [ ] `/api/health` 显示预期 commit 或 build version。",
@@ -266,4 +341,5 @@ __all__ = [
     "build_acceptance_package",
     "compose_evidence",
     "git_evidence",
+    "isolated_preflight_evidence",
 ]
