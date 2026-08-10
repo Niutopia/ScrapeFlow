@@ -3600,6 +3600,16 @@ def _payload_is_complete(
     return True
 
 
+def _assert_payload_has_no_incomplete_markers(payload_dir: Path) -> None:
+    """Fail before upload if aria2 left any incomplete-file marker behind."""
+    marker = next(payload_dir.rglob("*.aria2"), None) if payload_dir.is_dir() else None
+    if marker is not None:
+        raise ReplenishmentCandidateError(
+            f"aria2 未完成文件仍在补源 payload: {marker.name}",
+            stage="candidate_payload_validation",
+        )
+
+
 def _preflight(
     selection_wrapper: Mapping[str, Any], workspace: Path,
     *, resume_workspace: Path | None = None,
@@ -4077,6 +4087,7 @@ def _acquire(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
                         candidate=selection,
                     )
+            _assert_payload_has_no_incomplete_markers(payload_dir)
             size_map = acquisition["file_size_by_index"]
             path_map = acquisition["file_path_by_index"]
             for index in sorted(indices):

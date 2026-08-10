@@ -14,6 +14,7 @@ from unittest.mock import patch
 from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentRuntime,
     FixedTierAutomaticMaterializer,
+    LocalTorrentAutomaticMaterializer,
     QuarkFastSaveAutomaticMaterializer,
     QuarkMagnetAutomaticMaterializer,
 )
@@ -34,6 +35,7 @@ from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRun
 from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
+    ReplenishmentCandidateError,
     _acquire,
     _bencode,
     _download_torrent,
@@ -1773,6 +1775,161 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertIsNone(candidate)
 
+    def test_local_torrent_download_uses_only_selected_gap_indices(self) -> None:
+        request = {
+            "media": {"tmdb_id": 7, "title": "Example Show"},
+            "gaps": [{
+                "id": "S01E01", "kind": "missing_episode", "season": 1,
+                "episodes": [1], "label": "Example Show S01E01",
+            }],
+        }
+        manifest = {
+            "infohash": "d" * 40,
+            "files": {
+                1: {"path": "Unrelated.Extra.mkv", "size": 456},
+                2: {"path": "Example.Show.S01E01.mkv", "size": 123},
+            },
+        }
+        selection = {
+            "provider": "magnet",
+            "release_name": "Example Show S01E01",
+            "infohash": "d" * 40,
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "torrent",
+                "url": "https://example.test/selected.torrent",
+                "file_index_by_gap": {"S01E01": [2]},
+                "file_size_by_index": {"2": 123},
+                "file_path_by_index": {"2": "Example.Show.S01E01.mkv"},
+            },
+        }
+
+        class Client:
+            def mkdir(self, _path: str) -> None:
+                return
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            workspace = temporary_root / "data" / "staging" / "root" / "attempt"
+            video = temporary_root / "Example.Show.S01E01.mkv"
+            video.write_bytes(b"v" * 123)
+            commands: list[list[str]] = []
+
+            def run_aria2(command, **_kwargs):
+                commands.append([str(value) for value in command])
+                return Completed()
+
+            with patch(
+                "engine.tools._replenishment_local_adapter_impl._preflight",
+                return_value={"candidates": [{
+                    "manifest": manifest,
+                    "torrent_path": str(temporary_root / "candidate.torrent"),
+                }]},
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._payload_is_complete",
+                return_value=False,
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl.subprocess.run",
+                side_effect=run_aria2,
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._find_download",
+                return_value=video,
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._verify_video_payload",
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._automatic_upload",
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._verify_remote_uploads",
+            ):
+                result = _acquire(
+                    {
+                        "request": request,
+                        "selection": {"selections": [selection]},
+                        "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+                        "automatic_staging_root": (
+                            "/quark/影视/ScrapeFlow/补源/root/attempt"
+                        ),
+                    },
+                    workspace,
+                    client=Client(),
+                )
+
+        self.assertEqual(result["lane"], TIER_LOCAL_MAGNET)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--select-file=2", commands[0])
+        self.assertNotIn("--select-file=1", commands[0])
+        self.assertIn(f"--dir={workspace / 'download-01' / 'payload'}", commands[0])
+
+    def test_local_torrent_does_not_upload_when_aria2_marker_remains(self) -> None:
+        request = {
+            "media": {"tmdb_id": 7, "title": "Example Show"},
+            "gaps": [{
+                "id": "S01E01", "kind": "missing_episode", "season": 1,
+                "episodes": [1], "label": "Example Show S01E01",
+            }],
+        }
+        manifest = {
+            "infohash": "e" * 40,
+            "files": {1: {"path": "Example.Show.S01E01.mkv", "size": 123}},
+        }
+        selection = {
+            "provider": "magnet",
+            "release_name": "Example Show S01E01",
+            "infohash": "e" * 40,
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "torrent",
+                "url": "https://example.test/incomplete.torrent",
+                "file_index_by_gap": {"S01E01": [1]},
+                "file_size_by_index": {"1": 123},
+                "file_path_by_index": {"1": "Example.Show.S01E01.mkv"},
+            },
+        }
+
+        class Client:
+            def mkdir(self, _path: str) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            workspace = temporary_root / "data" / "staging" / "root" / "attempt"
+            payload = workspace / "download-01" / "payload"
+            payload.mkdir(parents=True)
+            (payload / "Example.Show.S01E01.mkv.aria2").write_text(
+                "incomplete",
+                encoding="utf-8",
+            )
+            with patch(
+                "engine.tools._replenishment_local_adapter_impl._preflight",
+                return_value={"candidates": [{
+                    "manifest": manifest,
+                    "torrent_path": str(temporary_root / "candidate.torrent"),
+                }]},
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._payload_is_complete",
+                return_value=True,
+            ), patch(
+                "engine.tools._replenishment_local_adapter_impl._automatic_upload",
+            ) as upload:
+                with self.assertRaises(ReplenishmentCandidateError):
+                    _acquire(
+                        {
+                            "request": request,
+                            "selection": {"selections": [selection]},
+                            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+                            "automatic_staging_root": (
+                                "/quark/影视/ScrapeFlow/补源/root/attempt"
+                            ),
+                        },
+                        workspace,
+                        client=Client(),
+                    )
+            upload.assert_not_called()
+
     def test_mixed_delivery_isolates_media_and_subtitle_task_subroots(self) -> None:
         """The local adapter must expose only `/media` to a child planner."""
         subtitle_id = "missing_subtitle:7:S01E02:zh"
@@ -2597,6 +2754,69 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             audit_again = runtime.run_for_job(audit_job)
             self.assertEqual(audit_again["already_resolved_gap_ids"], [])
             self.assertEqual(len(search.requests), 3)
+
+    def test_local_torrent_runtime_workspace_is_state_staging_attempt(self) -> None:
+        root_job = _example_root_job("engine-local-torrent-workspace")
+
+        class RecordingTorrentDelegate:
+            def __init__(self) -> None:
+                self.workspaces: list[Path] = []
+
+            def acquire(self, wrapper, workspace, *, automatic=False, client=None):
+                del automatic
+                self.workspaces.append(Path(workspace))
+                staging = str(wrapper["automatic_staging_root"])
+                self.assert_task_staging(staging)
+                if client is None:
+                    raise AssertionError("local torrent delegate did not receive AList client")
+                client.mkdir(posixpath.dirname(staging))
+                client.mkdir(staging)
+                client.tree[staging] = [{
+                    "name": "Example.Show.S01E01.mkv",
+                    "is_dir": False,
+                    "size": 123,
+                }]
+                return {
+                    "status": "ready",
+                    "staging_root": staging,
+                    "files": [{
+                        "path": f"{staging}/Example.Show.S01E01.mkv",
+                        "size": 123,
+                        "kind": "video",
+                        "gap_ids": ["S01E01"],
+                    }],
+                }
+
+            @staticmethod
+            def assert_task_staging(staging: str) -> None:
+                expected = "/quark/影视/ScrapeFlow/补源/engine-local-torrent-workspace/"
+                if not staging.startswith(expected):
+                    raise AssertionError("local torrent delegate saw non-task staging")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "data"
+            alist = MemoryAList()
+            engine = FakeEngine()
+            delegate = RecordingTorrentDelegate()
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=engine,
+                alist=alist,
+                search=FakeSearch(),
+                materializer=LocalTorrentAutomaticMaterializer(delegate=delegate),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(outcome["unresolved_gaps"], [])
+        self.assertEqual(len(delegate.workspaces), 1)
+        workspace = delegate.workspaces[0]
+        self.assertEqual(
+            workspace.parent,
+            state_root.resolve() / "staging" / "engine-local-torrent-workspace",
+        )
+        self.assertTrue(workspace.name.startswith("attempt-"))
 
     def test_delivery_contract_rejects_formal_library_fields_before_child(self) -> None:
         root_job = _example_root_job("engine-delivery-formal-field")
