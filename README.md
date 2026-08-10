@@ -92,6 +92,9 @@ GET  /api/browse?path=...
 - 正式媒体库、AList 数据库和其他任务不属于当前任务的清理范围。
 - 停服后的本机状态备份和隔离恢复演练见
   [离线备份与恢复演练](docs/scrapeflow-offline-backup.md)；正式媒体库恢复点必须由存储侧单独准备。
+- 隔离真实验收按
+  [验收记录模板](docs/scrapeflow-isolated-acceptance-record.md) 填写；部署与开启顺序见
+  [部署与开启顺序](docs/scrapeflow-deployment-open-order.md)。
 
 当前的产品规则、启动门状态机、实施阶段和发布检查见[用户选择目标货架后启动实施计划](docs/scrapeflow-target-shelf-start-gate-plan.md)与[架构说明](ARCHITECTURE.md)。在该计划的完成门通过前，不应因本文档解除全局暂停或开放自动执行。
 
