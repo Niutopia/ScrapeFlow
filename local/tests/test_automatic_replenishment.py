@@ -32,7 +32,11 @@ from local.scrapeflow_api.replenishment import (
     _swarm_preference,
 )
 from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRunner
-from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
+from local.scrapeflow_api.replenishment_tiers import (
+    FAILURE_INFRASTRUCTURE,
+    FAILURE_IN_DOUBT,
+    TIER_LOCAL_MAGNET,
+)
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
     ReplenishmentCandidateError,
@@ -3170,6 +3174,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
         self.assertEqual(states["S01E01"]["phase"], "resolved")
         self.assertEqual(states["S01E02"]["phase"], "retry_wait")
+        self.assertIsNone(states["S01E02"]["active_attempt"])
 
     def test_known_movie_gap_uses_the_same_child_pipeline(self) -> None:
         plan = {
@@ -4052,6 +4057,185 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
         self.assertNotIn("excluded_candidates", state)
+        self.assertEqual(state["last_error_scope"], FAILURE_INFRASTRUCTURE)
+        self.assertIsInstance(state["active_attempt"], dict)
+
+    def test_infrastructure_failure_preserves_staging_and_does_not_try_fallback(self) -> None:
+        """Infrastructure failure keeps the attempt and does not self-degrade."""
+        root_job = _example_root_job("engine-infra-preserve")
+
+        class FailingAfterStaging:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def acquire(self, _request, _selections, *, staging_root, workspace, alist):
+                del workspace
+                self.calls.append(staging_root)
+                alist.mkdir(posixpath.dirname(staging_root))
+                alist.mkdir(staging_root)
+                alist.tree[staging_root] = [{
+                    "name": "partial-download.mkv", "is_dir": False, "size": 123,
+                }]
+                raise RuntimeError("temporary AList connection failure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            alist = MemoryAList()
+            search = FakeSearch()
+            materializer = FailingAfterStaging()
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=FakeEngine(),
+                alist=alist,
+                search=search,
+                materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=3,
+            )
+            outcome = runtime.run_for_job(root_job)
+            state_path = state_root / "gaps" / root_job.id / "S01E01.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            staging = materializer.calls[0]
+
+        self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
+        self.assertEqual(len(search.requests), 1)
+        self.assertEqual(len(materializer.calls), 1)
+        self.assertEqual(state["phase"], "retry_wait")
+        self.assertEqual(state["last_error_scope"], FAILURE_INFRASTRUCTURE)
+        self.assertNotIn("excluded_candidates", state)
+        self.assertIsInstance(state["active_attempt"], dict)
+        self.assertEqual(state["active_attempt"]["staging_root"], staging)
+        self.assertEqual(
+            alist.tree[staging],
+            [{"name": "partial-download.mkv", "is_dir": False, "size": 123}],
+        )
+
+    def test_retry_reuses_preserved_active_attempt_after_infrastructure_failure(self) -> None:
+        """A retry resumes the preserved task attempt instead of minting another."""
+        root_job = _example_root_job("engine-infra-reuse")
+
+        class FailingAfterStaging:
+            def __init__(self, alist: MemoryAList) -> None:
+                self.alist = alist
+
+            def acquire(self, _request, _selections, *, staging_root, workspace, alist):
+                del workspace, alist
+                self.alist.mkdir(posixpath.dirname(staging_root))
+                self.alist.mkdir(staging_root)
+                self.alist.tree[staging_root] = [{
+                    "name": "partial-download.mkv", "is_dir": False, "size": 123,
+                }]
+                raise RuntimeError("temporary AList connection failure")
+
+        class RecordingMaterializer(FakeMaterializer):
+            def __init__(self, alist: MemoryAList) -> None:
+                super().__init__(alist)
+                self.workspaces: list[Path] = []
+
+            def acquire(self, request, selections, *, staging_root, workspace, alist):
+                self.workspaces.append(workspace)
+                return super().acquire(
+                    request,
+                    selections,
+                    staging_root=staging_root,
+                    workspace=workspace,
+                    alist=alist,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            alist = MemoryAList()
+            search = FakeSearch()
+            engine = FakeEngine()
+            first = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=engine,
+                alist=alist,
+                search=search,
+                materializer=FailingAfterStaging(alist),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=3,
+            )
+            failed = first.run_for_job(root_job)
+            state_path = state_root / "gaps" / root_job.id / "S01E01.json"
+            failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+            active = failed_state["active_attempt"]
+            staging = active["staging_root"]
+            workspace = Path(active["workspace"])
+
+            successful_materializer = RecordingMaterializer(alist)
+            second = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=engine,
+                alist=alist,
+                search=search,
+                materializer=successful_materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=3,
+            )
+            succeeded = second.run_for_job(root_job)
+            resolved_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(any(row.get("error") for row in failed["outcomes"]))
+        self.assertEqual(successful_materializer.calls, [staging])
+        self.assertEqual(successful_materializer.workspaces, [workspace])
+        self.assertEqual(succeeded["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(resolved_state["phase"], "resolved")
+        self.assertIsNone(resolved_state["active_attempt"])
+
+    def test_in_doubt_failure_preserves_attempt_without_candidate_exclusion(self) -> None:
+        """An in-doubt external task waits for reconcile and keeps staging."""
+        root_job = _example_root_job("engine-in-doubt-preserve")
+
+        class InDoubtError(RuntimeError):
+            failure_scope = FAILURE_IN_DOUBT
+            exclude_candidate = False
+            task_id = "quark-task-in-doubt"
+
+        class InDoubtMaterializer:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def acquire(self, _request, _selections, *, staging_root, workspace, alist):
+                del workspace
+                self.calls.append(staging_root)
+                alist.mkdir(posixpath.dirname(staging_root))
+                alist.mkdir(staging_root)
+                alist.tree[staging_root] = [{
+                    "name": "waiting.mkv", "is_dir": False, "size": 123,
+                }]
+                raise InDoubtError("submitted but status is unknown")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            alist = MemoryAList()
+            search = FakeSearch()
+            materializer = InDoubtMaterializer()
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=FakeEngine(),
+                alist=alist,
+                search=search,
+                materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=3,
+            )
+            outcome = runtime.run_for_job(root_job)
+            state_path = state_root / "gaps" / root_job.id / "S01E01.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            staging = materializer.calls[0]
+
+        self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
+        self.assertEqual(len(search.requests), 1)
+        self.assertEqual(len(materializer.calls), 1)
+        self.assertEqual(state["last_error_scope"], FAILURE_IN_DOUBT)
+        self.assertEqual(state["external_task_id"], "quark-task-in-doubt")
+        self.assertNotIn("excluded_candidates", state)
+        self.assertEqual(state["active_attempt"]["staging_root"], staging)
+        self.assertEqual(
+            alist.tree[staging],
+            [{"name": "waiting.mkv", "is_dir": False, "size": 123}],
+        )
 
     def test_durable_candidate_exclusions_are_bounded_and_sanitized(self) -> None:
         rows = [

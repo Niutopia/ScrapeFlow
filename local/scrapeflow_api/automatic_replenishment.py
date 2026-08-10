@@ -35,6 +35,9 @@ from .replenishment import (
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
 from .redaction import redact_error, redact_value
 from .replenishment_tiers import (
+    FAILURE_CANDIDATE,
+    FAILURE_INFRASTRUCTURE,
+    FAILURE_IN_DOUBT,
     TIER_LOCAL_MAGNET,
     TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
@@ -58,6 +61,25 @@ _DURABLE_CANDIDATE_PROVIDER_LIMIT = 64
 _DURABLE_CANDIDATE_RELEASE_NAME_LIMIT = 512
 _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
+_ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
+_FAILURE_DELIVERY = "delivery"
+_FAILURE_CANCELLED = "cancelled"
+_STRICT_TIER_ORDER = (TIER_QUARK_SHARE, TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET)
+_KNOWN_FAILURE_SCOPES = frozenset({
+    FAILURE_CANDIDATE,
+    FAILURE_INFRASTRUCTURE,
+    FAILURE_IN_DOUBT,
+    _FAILURE_DELIVERY,
+})
+_DURABLE_GAP_STATE_DEFAULTS: dict[str, object] = {
+    "tier": TIER_QUARK_SHARE,
+    "active_attempt": None,
+    "candidate_failures_by_provider": {},
+    "exhaustion_proof_by_provider": {},
+    "external_task_id": None,
+    "next_retry_at": None,
+    "last_error_scope": None,
+}
 
 # A provider candidate may optionally deliver a subtitle next to a *new*
 # media member.  This is deliberately a separate acquisition contract from
@@ -603,7 +625,13 @@ def reconcile_interrupted_gap_states(
         if not isinstance(raw, Mapping) or str(raw.get("phase") or "") not in _INTERRUPTED_GAP_PHASES:
             continue
         state = dict(raw)
-        state.update({"phase": "retry_wait", "updated_at": _now(), "error": redact_error(error)})
+        state.update({
+            "phase": "retry_wait",
+            "updated_at": _now(),
+            "error": redact_error(error),
+            "last_error_scope": FAILURE_INFRASTRUCTURE,
+            "next_retry_at": None,
+        })
         try:
             redacted = redact_value(state)
             atomic_write_json(
@@ -810,6 +838,283 @@ class AutomaticReplenishmentRuntime:
         """Return the one durable state file for a job/gap pair."""
         safe_job = _GAP_SLUG.sub("-", job_id).strip(".-")[:96] or "job"
         return self.gaps_root / safe_job / _gap_file_name(gap_id)
+
+    @staticmethod
+    def _safe_attempt_id(value: object) -> str | None:
+        if isinstance(value, str) and _ATTEMPT_ID_TOKEN.fullmatch(value):
+            return value
+        return None
+
+    @staticmethod
+    def _safe_external_task_id(value: object) -> str | None:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 256
+            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
+        ):
+            return value
+        return None
+
+    @staticmethod
+    def _copy_durable_defaults() -> dict[str, object]:
+        defaults: dict[str, object] = {}
+        for key, value in _DURABLE_GAP_STATE_DEFAULTS.items():
+            defaults[key] = dict(value) if isinstance(value, dict) else value
+        return defaults
+
+    @staticmethod
+    def _provider_failure_map(value: object) -> dict[str, list[str]]:
+        output: dict[str, list[str]] = {}
+        if not isinstance(value, Mapping):
+            return output
+        for provider, rows in value.items():
+            if provider not in _STRICT_TIER_ORDER or not isinstance(rows, list):
+                continue
+            locators = [
+                item for item in rows
+                if isinstance(item, str)
+                and item
+                and len(item) <= _DURABLE_CANDIDATE_LOCATOR_LIMIT
+            ]
+            if locators:
+                output[str(provider)] = sorted(set(locators))[-_DURABLE_CANDIDATE_EXCLUSION_LIMIT:]
+        return output
+
+    @staticmethod
+    def _exhaustion_proof_map(value: object) -> dict[str, dict[str, object]]:
+        output: dict[str, dict[str, object]] = {}
+        if not isinstance(value, Mapping):
+            return output
+        for provider, proof in value.items():
+            if provider in _STRICT_TIER_ORDER and isinstance(proof, Mapping):
+                output[str(provider)] = dict(proof)
+        return output
+
+    def _active_attempt_record(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        staging_root: str,
+        workspace: Path,
+        selections: Sequence[Mapping[str, object]],
+        external_task_id: object | None = None,
+    ) -> dict[str, object]:
+        providers = sorted({
+            str(row.get("provider") or "").strip().casefold()
+            for row in selections
+            if isinstance(row, Mapping)
+            and 0 < len(str(row.get("provider") or "").strip()) <= _DURABLE_CANDIDATE_PROVIDER_LIMIT
+        })
+        markers: list[str] = []
+        seen: set[str] = set()
+        for selection in selections:
+            normalized = self._normalized_excluded_selection(selection)
+            if normalized is None:
+                continue
+            value = normalized.get("infohash") or normalized.get("locator")
+            if isinstance(value, str) and value and value not in seen:
+                seen.add(value)
+                markers.append(value)
+        record: dict[str, object] = {
+            "attempt_id": attempt_id,
+            "staging_root": staging_root,
+            "workspace": str(workspace.resolve()),
+            "providers": providers,
+            "locators": markers[:8],
+        }
+        task_id = self._safe_external_task_id(external_task_id)
+        if task_id is not None:
+            record["external_task_id"] = task_id
+        return record
+
+    def _coerce_active_attempt(
+        self,
+        value: object,
+        *,
+        job_id: str,
+    ) -> dict[str, object] | None:
+        if not isinstance(value, Mapping):
+            return None
+        attempt_id = self._safe_attempt_id(value.get("attempt_id"))
+        if attempt_id is None:
+            return None
+        try:
+            staging = _safe_path(value.get("staging_root"), label="active attempt staging")
+        except AutomaticReplenishmentError:
+            return None
+        expected_prefix = f"{self.staging_root}/{job_id}/"
+        if not staging.startswith(expected_prefix) or posixpath.basename(staging) != attempt_id:
+            return None
+        providers = sorted({
+            item.strip().casefold()
+            for item in value.get("providers", [])
+            if isinstance(item, str)
+            and 0 < len(item.strip()) <= _DURABLE_CANDIDATE_PROVIDER_LIMIT
+        }) if isinstance(value.get("providers"), list) else []
+        locators = []
+        seen: set[str] = set()
+        raw_locators = value.get("locators")
+        if isinstance(raw_locators, list):
+            for item in raw_locators:
+                if (
+                    isinstance(item, str)
+                    and item
+                    and len(item) <= _DURABLE_CANDIDATE_LOCATOR_LIMIT
+                    and item not in seen
+                ):
+                    seen.add(item)
+                    locators.append(item)
+        record: dict[str, object] = {
+            "attempt_id": attempt_id,
+            "staging_root": staging,
+            "workspace": str((self.workspace_root / job_id / attempt_id).resolve()),
+            "providers": providers,
+            "locators": locators[:8],
+        }
+        task_id = self._safe_external_task_id(value.get("external_task_id"))
+        if task_id is not None:
+            record["external_task_id"] = task_id
+        return record
+
+    def _load_active_attempt(
+        self,
+        job_id: str,
+        gap_state_paths: Mapping[str, Path],
+    ) -> tuple[str, str, Path, dict[str, object]] | None:
+        records: dict[tuple[str, str], dict[str, object]] = {}
+        for path in dict.fromkeys(gap_state_paths.values()):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, Mapping):
+                continue
+            record = self._coerce_active_attempt(
+                state.get("active_attempt"), job_id=job_id,
+            )
+            if record is None:
+                continue
+            records[(str(record["attempt_id"]), str(record["staging_root"]))] = record
+        if len(records) != 1:
+            return None
+        record = next(iter(records.values()))
+        attempt_id = str(record["attempt_id"])
+        staging = str(record["staging_root"])
+        return attempt_id, staging, self.workspace_root / job_id / attempt_id, record
+
+    @classmethod
+    def _selection_markers(
+        cls,
+        selections: Sequence[Mapping[str, object]],
+    ) -> tuple[set[str], set[str]]:
+        providers: set[str] = set()
+        markers: set[str] = set()
+        for selection in selections:
+            if not isinstance(selection, Mapping):
+                continue
+            provider = str(selection.get("provider") or "").strip().casefold()
+            if provider:
+                providers.add(provider)
+            normalized = cls._normalized_excluded_selection(selection)
+            if normalized is None:
+                continue
+            value = normalized.get("infohash") or normalized.get("locator")
+            if isinstance(value, str) and value:
+                markers.add(value)
+        return providers, markers
+
+    @classmethod
+    def _active_attempt_matches_selections(
+        cls,
+        active_attempt: Mapping[str, object],
+        selections: Sequence[Mapping[str, object]],
+    ) -> bool:
+        providers, markers = cls._selection_markers(selections)
+        active_providers = {
+            item for item in active_attempt.get("providers", [])
+            if isinstance(item, str) and item
+        } if isinstance(active_attempt.get("providers"), list) else set()
+        active_markers = {
+            item for item in active_attempt.get("locators", [])
+            if isinstance(item, str) and item
+        } if isinstance(active_attempt.get("locators"), list) else set()
+        if active_providers and active_providers != providers:
+            return False
+        if active_markers and not markers:
+            return False
+        if active_markers and not active_markers <= markers:
+            return False
+        return True
+
+    def _update_gap_states(
+        self,
+        gap_state_paths: Mapping[str, Path],
+        *,
+        gap_ids: set[str] | None = None,
+        updates: Mapping[str, object],
+    ) -> None:
+        seen_paths: set[Path] = set()
+        for current_gap_id, path in gap_state_paths.items():
+            if gap_ids is not None and current_gap_id not in gap_ids:
+                continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            state = dict(raw) if isinstance(raw, Mapping) else {}
+            state.update(dict(updates))
+            if "updated_at" not in updates:
+                state["updated_at"] = _now()
+            self._write_gap(state, path)
+
+    @staticmethod
+    def _candidate_failure_locator(candidate: Mapping[str, object]) -> str | None:
+        locator = candidate.get("locator")
+        if isinstance(locator, str) and locator:
+            return locator
+        infohash = candidate.get("infohash")
+        if isinstance(infohash, str) and infohash:
+            return infohash
+        return None
+
+    def _durable_gap_fields(
+        self,
+        prior_state: Mapping[str, object] | None,
+        *,
+        job_id: str,
+    ) -> dict[str, object]:
+        fields = self._copy_durable_defaults()
+        if not isinstance(prior_state, Mapping):
+            return fields
+        tier = prior_state.get("tier")
+        if tier in _STRICT_TIER_ORDER:
+            fields["tier"] = str(tier)
+        active_attempt = self._coerce_active_attempt(
+            prior_state.get("active_attempt"), job_id=job_id,
+        )
+        task_id = self._safe_external_task_id(prior_state.get("external_task_id"))
+        if active_attempt is not None and task_id is not None:
+            active_attempt.setdefault("external_task_id", task_id)
+        fields["active_attempt"] = active_attempt
+        fields["candidate_failures_by_provider"] = self._provider_failure_map(
+            prior_state.get("candidate_failures_by_provider"),
+        )
+        fields["exhaustion_proof_by_provider"] = self._exhaustion_proof_map(
+            prior_state.get("exhaustion_proof_by_provider"),
+        )
+        fields["external_task_id"] = task_id
+        next_retry = prior_state.get("next_retry_at")
+        if isinstance(next_retry, str) and next_retry:
+            fields["next_retry_at"] = next_retry
+        last_scope = prior_state.get("last_error_scope")
+        if last_scope in {*_KNOWN_FAILURE_SCOPES, _FAILURE_CANCELLED}:
+            fields["last_error_scope"] = str(last_scope)
+        return fields
 
     @staticmethod
     def _request_gaps(request: Mapping[str, object]) -> list[dict[str, object]]:
@@ -1521,6 +1826,7 @@ class AutomaticReplenishmentRuntime:
             "created_at": _now(),
             "updated_at": _now(),
             "error": None,
+            **self._durable_gap_fields(prior_state, job_id=job_id),
         }
         # Candidate failures are local, task-owned evidence.  Carry only the
         # bounded, normalized identity list forward when a fresh audit
@@ -1986,6 +2292,56 @@ class AutomaticReplenishmentRuntime:
         right_locator = str(right.get("locator") or "")
         return bool(left_locator and right_locator and left_locator == right_locator)
 
+    @staticmethod
+    def _exception_chain(error: BaseException):
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            yield current
+            cause = current.__cause__ or current.__context__
+            current = cause if isinstance(cause, BaseException) else None
+
+    @classmethod
+    def _failure_scope(
+        cls,
+        error: Exception,
+        candidate_exclusions: Sequence[Mapping[str, object]] | None = None,
+    ) -> str:
+        if isinstance(error, AutomaticReplenishmentCancelled):
+            return _FAILURE_CANCELLED
+        if candidate_exclusions:
+            return FAILURE_CANDIDATE
+        for item in cls._exception_chain(error):
+            scope = getattr(item, "failure_scope", None)
+            if isinstance(scope, str):
+                normalized = scope.strip().casefold()
+                if normalized in _KNOWN_FAILURE_SCOPES:
+                    return normalized
+            if getattr(item, "exclude_candidate", False) is True:
+                return FAILURE_CANDIDATE
+        return FAILURE_INFRASTRUCTURE
+
+    @classmethod
+    def _failure_external_task_id(cls, error: Exception) -> str | None:
+        for item in cls._exception_chain(error):
+            for attribute in ("external_task_id", "task_id"):
+                value = getattr(item, attribute, None)
+                task_id = cls._safe_external_task_id(value)
+                if task_id is not None:
+                    return task_id
+        return None
+
+    @classmethod
+    def _cleanup_attempt_after_error(
+        cls,
+        error: Exception | None,
+        candidate_exclusions: Sequence[Mapping[str, object]],
+    ) -> bool:
+        if error is None:
+            return True
+        return cls._failure_scope(error, candidate_exclusions) == FAILURE_CANDIDATE
+
     @classmethod
     def _failure_candidate_exclusions(
         cls,
@@ -1999,12 +2355,17 @@ class AutomaticReplenishmentRuntime:
         Torrent materializer explicitly marks candidate-local failures with
         ``exclude_candidate=True`` and normally includes the exact selection.
         """
-        if getattr(error, "exclude_candidate", False) is not True:
+        candidate_error = None
+        for item in cls._exception_chain(error):
+            if getattr(item, "exclude_candidate", False) is True:
+                candidate_error = item
+                break
+        if candidate_error is None:
             return []
         normalized_selections = cls._merge_excluded_candidates(list(selections))
         if not normalized_selections:
             return []
-        raw_candidate = getattr(error, "candidate", None)
+        raw_candidate = getattr(candidate_error, "candidate", None)
         if isinstance(raw_candidate, Mapping):
             normalized_failure = cls._normalized_excluded_selection(raw_candidate)
             if normalized_failure is not None:
@@ -2067,7 +2428,23 @@ class AutomaticReplenishmentRuntime:
             )
             if not merged:
                 continue
+            failures = self._provider_failure_map(
+                state.get("candidate_failures_by_provider"),
+            )
+            for candidate in additions:
+                provider = str(candidate.get("provider") or "").strip().casefold()
+                locator = self._candidate_failure_locator(candidate)
+                if provider not in _STRICT_TIER_ORDER or locator is None:
+                    continue
+                failures[provider] = sorted({
+                    *failures.get(provider, []),
+                    locator,
+                })[-_DURABLE_CANDIDATE_EXCLUSION_LIMIT:]
             state["excluded_candidates"] = merged
+            state["candidate_failures_by_provider"] = failures
+            state["active_attempt"] = None
+            state["last_error_scope"] = FAILURE_CANDIDATE
+            state["next_retry_at"] = None
             state["updated_at"] = _now()
             self._write_gap(state, path)
 
@@ -2176,6 +2553,7 @@ class AutomaticReplenishmentRuntime:
             self._raise_if_cancelled(
                 job, round_number=round_number, boundary="candidate_round",
             )
+            restored_attempt = self._load_active_attempt(job.id, gap_state_paths)
             self._progress(job, "provider_searching", round=round_number)
             request_body["excluded_candidates"] = list(excluded)
             request_body["gaps"] = [dict(gap) for gap in request_gaps]
@@ -2200,16 +2578,57 @@ class AutomaticReplenishmentRuntime:
             self._raise_if_cancelled(
                 job, round_number=round_number, boundary="materialization",
             )
-            attempt_id = f"attempt-{uuid.uuid4().hex}"
-            staging = f"{self.staging_root}/{job.id}/{attempt_id}"
-            workspace = self.workspace_root / job.id / attempt_id
+            if restored_attempt is None:
+                attempt_id = f"attempt-{uuid.uuid4().hex}"
+                staging = f"{self.staging_root}/{job.id}/{attempt_id}"
+                workspace = self.workspace_root / job.id / attempt_id
+                restored_record: dict[str, object] | None = None
+            else:
+                attempt_id, staging, workspace, restored_record = restored_attempt
+                if not self._active_attempt_matches_selections(restored_record, selections):
+                    raise AutomaticReplenishmentError(
+                        "保留的补源 attempt 与当前候选不一致，等待重试核对",
+                    )
+            restored_task_id = (
+                restored_record.get("external_task_id")
+                if isinstance(restored_record, Mapping) else None
+            )
+            active_attempt = self._active_attempt_record(
+                job_id=job.id,
+                attempt_id=attempt_id,
+                staging_root=staging,
+                workspace=workspace,
+                selections=[row for row in selections if isinstance(row, Mapping)],
+                external_task_id=restored_task_id,
+            )
+            selected_providers, _selected_markers = self._selection_markers(
+                [row for row in selections if isinstance(row, Mapping)],
+            )
+            selected_tier = (
+                next(iter(selected_providers))
+                if len(selected_providers) == 1
+                and next(iter(selected_providers)) in _STRICT_TIER_ORDER
+                else None
+            )
             for gap in request_gaps:
                 gap_id = str(gap.get("id") or "")
                 state_path = gap_state_paths.get(gap_id)
                 if state_path is None:
                     continue
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state.update({"phase": "acquiring", "attempts": round_number, "updated_at": _now(), "staging_root": staging})
+                state.update({
+                    "phase": "acquiring",
+                    "attempts": round_number,
+                    "updated_at": _now(),
+                    "error": None,
+                    "staging_root": staging,
+                    "active_attempt": active_attempt,
+                    "next_retry_at": None,
+                })
+                if selected_tier is not None:
+                    state["tier"] = selected_tier
+                if isinstance(active_attempt.get("external_task_id"), str):
+                    state["external_task_id"] = active_attempt["external_task_id"]
                 self._write_gap(state, state_path)
             staging_files: list[StagingFile] = []
             child: EngineJob | None = None
@@ -2243,6 +2662,29 @@ class AutomaticReplenishmentRuntime:
                     workspace=workspace,
                     alist=self.alist,
                 )
+                external_task_id = self._safe_external_task_id(
+                    acquisition.get("external_task_id")
+                    if isinstance(acquisition, Mapping) else None
+                )
+                if external_task_id is not None:
+                    active_attempt = self._active_attempt_record(
+                        job_id=job.id,
+                        attempt_id=attempt_id,
+                        staging_root=staging,
+                        workspace=workspace,
+                        selections=[
+                            row for row in selections if isinstance(row, Mapping)
+                        ],
+                        external_task_id=external_task_id,
+                    )
+                    self._update_gap_states(
+                        gap_state_paths,
+                        updates={
+                            "active_attempt": active_attempt,
+                            "external_task_id": external_task_id,
+                            "updated_at": _now(),
+                        },
+                    )
                 # A downloader can finish just as the operator pauses. Stop
                 # before even verifying/claiming its result; no child or
                 # subtitle write may follow that boundary.
@@ -2435,11 +2877,11 @@ class AutomaticReplenishmentRuntime:
                             error=redact_error(exc),
                         )
             finally:
-                # A pause is a no-new-write boundary.  In particular, do not
-                # remove a task staging tree after cancellation: deletion is
-                # itself a remote write, and the retained task-owned tree is
-                # safe for later verification/recovery.
-                if not isinstance(attempt_error, AutomaticReplenishmentCancelled):
+                # Cleanup is allowed only after a proven success or a
+                # candidate-local invalid attempt.  Infrastructure, delivery,
+                # in-doubt and cancellation outcomes keep the task-owned tree
+                # intact for retry/reconcile.
+                if self._cleanup_attempt_after_error(attempt_error, candidate_exclusions):
                     try:
                         self._progress(job, "cleaning", round=round_number, staging_root=staging)
                         self._remove_staging(staging)
@@ -2451,6 +2893,58 @@ class AutomaticReplenishmentRuntime:
                                 f"补源尝试失败且 staging 清理失败: {attempt_error}; {cleanup_exc}"
                             )
             if attempt_error is not None:
+                scope = self._failure_scope(attempt_error, candidate_exclusions)
+                if (
+                    scope == FAILURE_INFRASTRUCTURE
+                    and not isinstance(attempt_error, AutomaticReplenishmentCancelled)
+                ):
+                    try:
+                        self._raise_if_cancelled(
+                            job,
+                            round_number=round_number,
+                            boundary="attempt_failure",
+                        )
+                    except AutomaticReplenishmentCancelled as cancel_exc:
+                        attempt_error = cancel_exc
+                        candidate_exclusions = []
+                        scope = self._failure_scope(
+                            attempt_error, candidate_exclusions,
+                        )
+                failure_task_id = (
+                    self._safe_external_task_id(active_attempt.get("external_task_id"))
+                    or self._failure_external_task_id(attempt_error)
+                )
+                if failure_task_id is not None:
+                    active_attempt = self._active_attempt_record(
+                        job_id=job.id,
+                        attempt_id=attempt_id,
+                        staging_root=staging,
+                        workspace=workspace,
+                        selections=[
+                            row for row in selections if isinstance(row, Mapping)
+                        ],
+                        external_task_id=failure_task_id,
+                    )
+                failure_updates: dict[str, object] = {
+                    "phase": "retry_wait",
+                    "updated_at": _now(),
+                    "error": redact_error(attempt_error),
+                    "last_error_scope": scope,
+                    "next_retry_at": None,
+                    "active_attempt": (
+                        None if scope == FAILURE_CANDIDATE else active_attempt
+                    ),
+                }
+                if failure_task_id is not None:
+                    failure_updates["external_task_id"] = failure_task_id
+                self._update_gap_states(
+                    gap_state_paths,
+                    gap_ids={
+                        str(gap.get("id") or "") for gap in request_gaps
+                        if isinstance(gap.get("id"), str) and gap.get("id")
+                    },
+                    updates=failure_updates,
+                )
                 # Keep the last bounded candidate failure visible while a
                 # later round is running. Without this projection a fresh
                 # search masks whether the failure was manifest, payload,
@@ -2460,6 +2954,7 @@ class AutomaticReplenishmentRuntime:
                     "retry_wait",
                     round=round_number,
                     error=redact_error(attempt_error),
+                    failure_scope=scope,
                     attempt_failure_stage=getattr(
                         attempt_error, "failure_stage", None,
                     ),
@@ -2469,20 +2964,22 @@ class AutomaticReplenishmentRuntime:
                 # the durable per-gap retry_wait state for this exception.
                 if isinstance(attempt_error, AutomaticReplenishmentCancelled):
                     raise attempt_error
+                if scope != FAILURE_CANDIDATE:
+                    raise attempt_error
                 if candidate_exclusions:
                     self._persist_excluded_candidates(
                         gap_state_paths, candidate_exclusions,
                     )
+                else:
+                    raise attempt_error
                 excluded = self._merge_excluded_candidates(
-                    excluded,
-                    [
-                        self._excluded_selection(row)
-                        for row in selections if isinstance(row, Mapping)
-                    ],
+                    excluded, candidate_exclusions,
                 )
                 if round_number >= self.max_candidate_rounds:
                     self._progress(
-                        job, "retry_wait", round=round_number, error=redact_error(attempt_error),
+                        job, "retry_wait", round=round_number,
+                        error=redact_error(attempt_error),
+                        failure_scope=scope,
                     )
                     raise AutomaticReplenishmentError(
                         f"补源已尝试 {round_number} 轮仍失败: {attempt_error}"
@@ -2510,6 +3007,18 @@ class AutomaticReplenishmentRuntime:
                 if isinstance(gap.get("id"), str) and gap.get("id")
             }
             if not resolved_now:
+                self._update_gap_states(
+                    gap_state_paths,
+                    gap_ids={
+                        str(gap.get("id") or "") for gap in request_gaps
+                        if isinstance(gap.get("id"), str) and gap.get("id")
+                    },
+                    updates={
+                        "active_attempt": None,
+                        "next_retry_at": None,
+                        "updated_at": _now(),
+                    },
+                )
                 raise AutomaticReplenishmentError("补源 child 实际文件未覆盖当前 gap")
             resolved_total.update(resolved_now)
             resolved = sorted(resolved_now)
@@ -2522,6 +3031,9 @@ class AutomaticReplenishmentRuntime:
                     "phase": "resolved",
                     "updated_at": _now(),
                     "error": None,
+                    "active_attempt": None,
+                    "last_error_scope": None,
+                    "next_retry_at": None,
                     "staging_files": [item.as_dict() for item in staging_files],
                 })
                 if completed_child is not None:
@@ -2532,12 +3044,26 @@ class AutomaticReplenishmentRuntime:
                 if str(gap.get("id") or "") not in resolved_now
             ]
             if pending:
+                pending_ids = {
+                    str(gap.get("id") or "") for gap in pending
+                    if isinstance(gap.get("id"), str) and gap.get("id")
+                }
                 excluded = self._merge_excluded_candidates(
                     excluded,
                     [
                         self._excluded_selection(row)
                         for row in selections if isinstance(row, Mapping)
                     ],
+                )
+                self._update_gap_states(
+                    gap_state_paths,
+                    gap_ids=pending_ids,
+                    updates={
+                        "active_attempt": None,
+                        "last_error_scope": FAILURE_CANDIDATE,
+                        "next_retry_at": None,
+                        "updated_at": _now(),
+                    },
                 )
                 if round_number >= self.max_candidate_rounds:
                     self._progress(
@@ -2623,6 +3149,7 @@ class AutomaticReplenishmentRuntime:
                     gap_state_paths=states,
                 ))
             except AutomaticReplenishmentCancelled as exc:
+                scope = self._failure_scope(exc, [])
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if state.get("phase") != "resolved":
@@ -2630,6 +3157,8 @@ class AutomaticReplenishmentRuntime:
                             "phase": "retry_wait",
                             "updated_at": _now(),
                             "error": redact_error(exc),
+                            "last_error_scope": scope,
+                            "next_retry_at": None,
                         })
                         self._write_gap(state, path)
                 outcomes.append({
@@ -2648,6 +3177,8 @@ class AutomaticReplenishmentRuntime:
                     "cancelled": True,
                 }
             except Exception as exc:
+                scope = self._failure_scope(exc, [])
+                task_id = self._failure_external_task_id(exc)
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if state.get("phase") != "resolved":
@@ -2655,7 +3186,11 @@ class AutomaticReplenishmentRuntime:
                             "phase": "retry_wait",
                             "updated_at": _now(),
                             "error": redact_error(exc),
+                            "last_error_scope": scope,
+                            "next_retry_at": None,
                         })
+                        if task_id is not None:
+                            state["external_task_id"] = task_id
                         self._write_gap(state, path)
                 outcomes.append({
                     "request": active_request,
