@@ -11,6 +11,30 @@ import sys
 from typing import TextIO
 
 
+REQUIRED_ENV_TEMPLATE_VALUES = {
+    "SCRAPEFLOW_START_PAUSED": "1",
+    "SCRAPEFLOW_INTAKE_MONITOR": "0",
+    "SCRAPEFLOW_AUTOMATIC_AUDIT": "0",
+    "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
+    "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
+    "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+}
+REQUIRED_COMPOSE_DEFAULTS = {
+    **REQUIRED_ENV_TEMPLATE_VALUES,
+    "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
+    "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+}
+REQUIRED_LOOPBACK_PORTS = {
+    "alist": ["127.0.0.1:5244:5244"],
+    "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"],
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ReleaseCommand:
     name: str
@@ -28,6 +52,139 @@ class ReleaseCommand:
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _read_project_text(root: Path, relative: str, issues: list[str]) -> str:
+    path = root / relative
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        issues.append(f"{relative}: cannot read: {exc}")
+        return ""
+
+
+def _env_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _service_block(compose_text: str, service: str) -> list[str]:
+    marker = f"  {service}:"
+    lines = compose_text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.rstrip() == marker:
+            start = index + 1
+            break
+    if start is None:
+        return []
+    output: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip().endswith(":"):
+            break
+        output.append(line)
+    return output
+
+
+def _strip_scalar(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        return stripped[1:-1]
+    return stripped
+
+
+def _mapping_block_values(block: list[str], header: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    start: int | None = None
+    header_indent = 0
+    for index, line in enumerate(block):
+        if line.strip() == f"{header}:":
+            start = index + 1
+            header_indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return values
+    for line in block[start:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= header_indent:
+            break
+        stripped = line.strip()
+        if stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        values[key.strip()] = _strip_scalar(value)
+    return values
+
+
+def _list_block_values(block: list[str], header: str) -> list[str]:
+    values: list[str] = []
+    start: int | None = None
+    header_indent = 0
+    for index, line in enumerate(block):
+        if line.strip() == f"{header}:":
+            start = index + 1
+            header_indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return values
+    for line in block[start:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= header_indent:
+            break
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            values.append(_strip_scalar(stripped[2:]))
+    return values
+
+
+def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
+    """Return static release/deployment default drift from the frozen contract."""
+    base = project_root() if root is None else Path(root)
+    issues: list[str] = []
+    env_text = _read_project_text(base, ".env.local.example", issues)
+    compose_text = _read_project_text(base, "docker-compose.yml", issues)
+
+    env_values = _env_values(env_text)
+    for key, expected in REQUIRED_ENV_TEMPLATE_VALUES.items():
+        actual = env_values.get(key)
+        if actual != expected:
+            issues.append(
+                f".env.local.example: {key} must default to {expected!r}, got {actual!r}"
+            )
+
+    api_block = _service_block(compose_text, "api")
+    if not api_block:
+        issues.append("docker-compose.yml: missing api service")
+    api_env = _mapping_block_values(api_block, "environment")
+    for key, expected in REQUIRED_COMPOSE_DEFAULTS.items():
+        actual = api_env.get(key)
+        required = f"${{{key}:-{expected}}}"
+        if actual != required:
+            issues.append(
+                f"docker-compose.yml api.environment: {key} must default to {required!r}, got {actual!r}"
+            )
+
+    for service, expected_ports in REQUIRED_LOOPBACK_PORTS.items():
+        block = _service_block(compose_text, service)
+        if not block:
+            issues.append(f"docker-compose.yml: missing {service} service")
+            continue
+        ports = _list_block_values(block, "ports")
+        if ports != expected_ports:
+            issues.append(
+                f"docker-compose.yml {service}.ports must be {expected_ports!r}, got {ports!r}"
+            )
+    return issues
 
 
 def release_commands(*, include_docker: bool = True) -> list[ReleaseCommand]:
@@ -200,6 +357,12 @@ def run_release_checks(
     """Run release commands serially and stop at the first failure."""
     output = stream or sys.stderr
     root = project_root()
+    deployment_issues = local_deployment_contract_issues(root)
+    if deployment_issues:
+        print("local deployment defaults violate the frozen contract:", file=output)
+        for issue in deployment_issues:
+            print(f"  {issue}", file=output)
+        return 1
     hits = active_media_fingerprint_call_hits(root)
     if hits:
         print("active code contains banned media fingerprint calls:", file=output)
@@ -223,6 +386,7 @@ __all__ = [
     "ReleaseCommand",
     "active_media_fingerprint_call_hits",
     "active_python_paths",
+    "local_deployment_contract_issues",
     "project_root",
     "release_commands",
     "run_release_checks",

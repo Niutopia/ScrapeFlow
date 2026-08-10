@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-docker",
         action="store_true",
-        help="run only Python tests and git whitespace checks",
+        help="skip compose config and Docker build; keep local static checks",
     )
     args = parser.parse_args(argv)
     return run_release_checks(include_docker=not args.skip_docker)

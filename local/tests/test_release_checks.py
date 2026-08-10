@@ -9,11 +9,67 @@ from pathlib import Path
 from local.scrapeflow_api.release_checks import (
     active_media_fingerprint_call_hits,
     active_python_paths,
+    local_deployment_contract_issues,
     release_commands,
 )
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    ENV_TEMPLATE_DEFAULTS = {
+        "SCRAPEFLOW_START_PAUSED": "1",
+        "SCRAPEFLOW_INTAKE_MONITOR": "0",
+        "SCRAPEFLOW_AUTOMATIC_AUDIT": "0",
+        "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
+        "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
+        "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+    }
+    COMPOSE_DEFAULTS = {
+        **ENV_TEMPLATE_DEFAULTS,
+        "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
+        "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+    }
+
+    def _write_deployment_contract_files(
+        self,
+        root: Path,
+        *,
+        env_overrides: dict[str, str] | None = None,
+        compose_overrides: dict[str, str] | None = None,
+        api_ports: list[str] | None = None,
+    ) -> None:
+        env_values = dict(self.ENV_TEMPLATE_DEFAULTS)
+        env_values.update(env_overrides or {})
+        (root / ".env.local.example").write_text(
+            "\n".join(f"{key}={value}" for key, value in env_values.items()) + "\n",
+            encoding="utf-8",
+        )
+        compose_values = dict(self.COMPOSE_DEFAULTS)
+        compose_values.update(compose_overrides or {})
+        api_port_values = api_ports or ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"]
+        api_env = "\n".join(
+            f"      {key}: ${{{key}:-{value}}}"
+            for key, value in compose_values.items()
+        )
+        api_ports_yaml = "\n".join(f'      - "{port}"' for port in api_port_values)
+        (root / "docker-compose.yml").write_text(
+            "name: scrapeflow\n"
+            "services:\n"
+            "  alist:\n"
+            "    ports:\n"
+            '      - "127.0.0.1:5244:5244"\n'
+            "  api:\n"
+            "    environment:\n"
+            f"{api_env}\n"
+            "    ports:\n"
+            f"{api_ports_yaml}\n",
+            encoding="utf-8",
+        )
+
     def test_release_commands_match_backend_gate_contract(self) -> None:
         commands = release_commands()
 
@@ -69,6 +125,35 @@ class ReleaseCheckTests(unittest.TestCase):
             paths = active_python_paths(root)
 
         self.assertEqual(paths, [active])
+
+    def test_deployment_contract_accepts_current_defaults(self) -> None:
+        self.assertEqual(local_deployment_contract_issues(), [])
+
+    def test_deployment_contract_rejects_unpaused_env_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(
+                root,
+                env_overrides={"SCRAPEFLOW_START_PAUSED": "0"},
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("SCRAPEFLOW_START_PAUSED" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_compose_gate_or_port_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(
+                root,
+                compose_overrides={"SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "1"},
+                api_ports=["0.0.0.0:${SCRAPEFLOW_API_PORT:-8765}:8765"],
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED" in issue for issue in issues))
+        self.assertTrue(any("api.ports" in issue for issue in issues))
 
     def test_active_code_has_no_banned_media_fingerprint_calls(self) -> None:
         self.assertEqual(active_media_fingerprint_call_hits(), [])
