@@ -34,7 +34,11 @@ from .replenishment import (
 )
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
 from .redaction import redact_error, redact_value
-from .replenishment_tiers import TIER_LOCAL_MAGNET, TIER_QUARK_SHARE
+from .replenishment_tiers import (
+    TIER_LOCAL_MAGNET,
+    TIER_QUARK_MAGNET,
+    TIER_QUARK_SHARE,
+)
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
@@ -300,6 +304,200 @@ class QuarkFastSaveAutomaticMaterializer:
         return result
 
 
+def _delivery_kind_from_name(name: str) -> str:
+    suffix = Path(name).suffix.casefold()
+    if suffix in _VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in _SUBTITLE_EXTENSIONS:
+        return "subtitle"
+    raise AutomaticReplenishmentError("补源返回了不支持的文件类型")
+
+
+def _safe_relative_delivery_path(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("/")
+        or "\\" in value
+        or posixpath.normpath(value) != value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise AutomaticReplenishmentError("补源返回了不安全的相对路径")
+    return value
+
+
+class QuarkMagnetAutomaticMaterializer:
+    """Use Quark cloud offline download to place files in task staging."""
+
+    _STATE_FILE = "quark_magnet_attempt.json"
+
+    def __init__(self, bridge: object | None = None) -> None:
+        self.bridge = bridge
+
+    def _bridge(self) -> object:
+        if self.bridge is None:
+            from engine.scrapeflow.quark_magnet_offline_bridge import (
+                HttpQuarkHelperClient,
+                QuarkMagnetOfflineBridge,
+            )
+            self.bridge = QuarkMagnetOfflineBridge(HttpQuarkHelperClient.from_env())
+        return self.bridge
+
+    @classmethod
+    def _state_path(cls, workspace: Path) -> Path:
+        return workspace / cls._STATE_FILE
+
+    @staticmethod
+    def _safe_task_id(value: object) -> str | None:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 256
+            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
+        ):
+            return value
+        return None
+
+    @classmethod
+    def _read_attempt_state(cls, workspace: Path, staging_root: str) -> dict[str, object]:
+        path = cls._state_path(workspace)
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AutomaticReplenishmentError("夸克磁力 attempt 状态不可读") from exc
+        if not isinstance(raw, Mapping):
+            raise AutomaticReplenishmentError("夸克磁力 attempt 状态无效")
+        state = dict(raw)
+        if state.get("staging_root") != staging_root:
+            raise AutomaticReplenishmentError("夸克磁力 attempt 状态不属于当前 staging")
+        return state
+
+    @classmethod
+    def _write_attempt_state(
+        cls,
+        workspace: Path,
+        *,
+        staging_root: str,
+        selection: Mapping[str, object],
+        task_id: str,
+    ) -> None:
+        safe_task = cls._safe_task_id(task_id)
+        if safe_task is None:
+            raise AutomaticReplenishmentError("夸克磁力 task_id 无效")
+        selected = selection.get("selected_gap_ids")
+        gap_ids = [
+            str(gap_id) for gap_id in selected
+            if isinstance(gap_id, str) and gap_id
+        ] if isinstance(selected, list) else []
+        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_json(
+            cls._state_path(workspace),
+            {
+                "provider": TIER_QUARK_MAGNET,
+                "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+                "staging_root": staging_root,
+                "task_id": safe_task,
+                "locator": str(selection.get("locator") or ""),
+                "selected_gap_ids": gap_ids,
+                "updated_at": _now(),
+            },
+            allow_nan=False,
+        )
+
+    def acquire(
+        self,
+        request: Mapping[str, object],
+        selections: Sequence[Mapping[str, object]],
+        *,
+        staging_root: str,
+        workspace: Path,
+        alist: object,
+    ) -> Mapping[str, object]:
+        del request
+        if len(selections) != 1:
+            raise AutomaticReplenishmentError("夸克磁力离线一次只接受一个候选")
+        selection = selections[0]
+        acquisition = selection.get("acquisition")
+        if (
+            str(selection.get("provider") or "").strip().casefold()
+            != TIER_QUARK_MAGNET
+            or not isinstance(acquisition, Mapping)
+            or str(acquisition.get("kind") or "").strip().casefold()
+            != "quark_magnet_offline"
+        ):
+            raise AutomaticReplenishmentError(
+                "夸克磁力 materializer 只接受 quark_magnet/quark_magnet_offline 候选"
+            )
+        mkdir = getattr(alist, "mkdir", None)
+        if not callable(mkdir):
+            raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
+        mkdir(posixpath.dirname(staging_root))
+        mkdir(staging_root)
+        execute = getattr(self._bridge(), "execute", None)
+        if not callable(execute):
+            raise AutomaticReplenishmentError("夸克磁力 materializer 缺少 execute")
+        state = self._read_attempt_state(workspace, staging_root)
+        existing_task_id = self._safe_task_id(state.get("task_id"))
+
+        def save_task_id(task_id: str) -> None:
+            self._write_attempt_state(
+                workspace,
+                staging_root=staging_root,
+                selection=selection,
+                task_id=task_id,
+            )
+
+        result = execute(
+            selection,
+            staging_root,
+            task_id=existing_task_id,
+            on_task_id=None if existing_task_id is not None else save_task_id,
+        )
+        if not isinstance(result, Mapping):
+            raise AutomaticReplenishmentError("夸克磁力离线返回无效")
+        result_task_id = self._safe_task_id(result.get("task_id"))
+        if result_task_id is not None:
+            save_task_id(result_task_id)
+        rows = result.get("expected_files")
+        if not isinstance(rows, list) or not rows:
+            raise AutomaticReplenishmentError("夸克磁力离线缺少 expected_files")
+        files: list[dict[str, object]] = []
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                raise AutomaticReplenishmentError("夸克磁力 expected_files 项无效")
+            relative = _safe_relative_delivery_path(raw.get("path"))
+            size = raw.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise AutomaticReplenishmentError("夸克磁力文件大小无效")
+            gap_ids = raw.get("gap_ids")
+            if not isinstance(gap_ids, list) or not gap_ids:
+                raise AutomaticReplenishmentError("夸克磁力文件缺少 gap_ids")
+            files.append({
+                "path": f"{staging_root}/{relative}",
+                "size": size,
+                "kind": _delivery_kind_from_name(relative),
+                "gap_ids": [
+                    str(gap_id) for gap_id in gap_ids
+                    if isinstance(gap_id, str) and gap_id
+                ],
+            })
+        if any(not row["gap_ids"] for row in files):
+            raise AutomaticReplenishmentError("夸克磁力文件 gap_ids 无效")
+        delivery: dict[str, object] = {
+            "status": "ready",
+            "lane": TIER_QUARK_MAGNET,
+            "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+            "staging_root": staging_root,
+            "files": files,
+        }
+        task_id = result.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            delivery["external_task_id"] = task_id
+        return delivery
+
+
 class FixedTierAutomaticMaterializer:
     """Dispatch one attempt to exactly one fixed replenishment lane."""
 
@@ -307,9 +505,11 @@ class FixedTierAutomaticMaterializer:
         self,
         *,
         quark_share: AutomaticMaterializer | None = None,
+        quark_magnet: AutomaticMaterializer | None = None,
         local_torrent: AutomaticMaterializer | None = None,
     ) -> None:
         self.quark_share = quark_share or QuarkFastSaveAutomaticMaterializer()
+        self.quark_magnet = quark_magnet or QuarkMagnetAutomaticMaterializer()
         self.local_torrent = local_torrent or LocalTorrentAutomaticMaterializer()
 
     def acquire(
@@ -327,6 +527,11 @@ class FixedTierAutomaticMaterializer:
         }
         if providers == {TIER_QUARK_SHARE}:
             return self.quark_share.acquire(
+                request, selections, staging_root=staging_root,
+                workspace=workspace, alist=alist,
+            )
+        if providers == {TIER_QUARK_MAGNET}:
+            return self.quark_magnet.acquire(
                 request, selections, staging_root=staging_root,
                 workspace=workspace, alist=alist,
             )
@@ -2474,6 +2679,7 @@ __all__ = [
     "FixedTierAutomaticMaterializer",
     "LocalTorrentAutomaticMaterializer",
     "QuarkFastSaveAutomaticMaterializer",
+    "QuarkMagnetAutomaticMaterializer",
     "StagingFile",
     "reconcile_interrupted_gap_states",
 ]

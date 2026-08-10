@@ -45,6 +45,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from engine.scraper import AListClient, ApiError, ScraperError, join_remote, split_remote
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
+    ACQUISITION_QUARK_MAGNET_OFFLINE,
+    ACQUISITION_TORRENT,
+    PROVIDER_LOCAL_MAGNET,
+    PROVIDER_QUARK_MAGNET,
     candidate_capability_error,
     provider_capability_snapshot,
 )
@@ -666,10 +670,12 @@ def _locator_infohash_aliases(values: Iterable[Any]) -> set[str]:
         locator = str(value or "").strip()
         if not locator:
             continue
-        if locator.casefold().startswith("torrent:"):
-            aliases.update(_infohash_aliases(locator.split(":", 1)[1]))
+        prefix, separator, payload = locator.partition(":")
+        if prefix.casefold() != "torrent" or not separator:
+            continue
+        aliases.update(_infohash_aliases(payload))
         match = re.search(
-            r"(?i)(?:urn:)?btih:([0-9a-f]{40}|[a-z2-7]{32})\b", locator,
+            r"(?i)(?:urn:)?btih:([0-9a-f]{40}|[a-z2-7]{32})\b", payload,
         )
         if match:
             aliases.update(_infohash_aliases(match.group(1)))
@@ -1725,7 +1731,7 @@ def _torrent_candidate(
         else "720p" if "720" in quality_text else "unknown"
     )
     candidate: dict[str, Any] = {
-        "provider": "magnet",
+        "provider": PROVIDER_LOCAL_MAGNET,
         "release_name": release_name,
         "resolution": resolution,
         "availability": "metadata_verified",
@@ -1734,7 +1740,7 @@ def _torrent_candidate(
         "file_coverage": sorted(file_coverage),
         "infohash": manifest["infohash"],
         "acquisition": {
-            "kind": "torrent", "url": torrent_url,
+            "kind": ACQUISITION_TORRENT, "url": torrent_url,
             "file_index_by_gap": gap_map,
             "file_size_by_index": {str(index): int(files[index]["size"]) for index in indices},
             "file_path_by_index": {str(index): str(files[index]["path"]) for index in indices},
@@ -1761,27 +1767,119 @@ def _torrent_candidate_variants(
     manifest: Mapping[str, Any], *, include_local: bool = True,
     swarm: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return only the exact local Torrent candidate."""
+    """Return Quark-offline plus the optional local Torrent candidate."""
     local = _torrent_candidate(
         request, release_name, torrent_url, manifest, swarm=swarm,
     )
-    return [local] if local is not None and include_local else []
+    if local is None:
+        return []
+    variants: list[dict[str, Any]] = []
+    quark = _quark_magnet_candidate(local)
+    if quark is not None:
+        variants.append(quark)
+    if include_local:
+        variants.append(local)
+    return variants
+
+
+def _quark_magnet_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project one verified Torrent manifest into the Quark magnet lane."""
+    acquisition = local.get("acquisition")
+    if (
+        str(local.get("provider") or "").strip().casefold() != PROVIDER_LOCAL_MAGNET
+        or not isinstance(acquisition, Mapping)
+        or str(acquisition.get("kind") or "").strip().casefold() != ACQUISITION_TORRENT
+    ):
+        return None
+    infohash = str(local.get("infohash") or "").strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{40}|[a-z2-7]{32}", infohash):
+        return None
+    gap_map = acquisition.get("file_index_by_gap")
+    size_map = acquisition.get("file_size_by_index")
+    path_map = acquisition.get("file_path_by_index")
+    if not (
+        isinstance(gap_map, Mapping)
+        and isinstance(size_map, Mapping)
+        and isinstance(path_map, Mapping)
+    ):
+        return None
+    expected_by_index: dict[int, dict[str, Any]] = {}
+    for raw_gap_id, raw_indices in gap_map.items():
+        if not isinstance(raw_gap_id, str) or not raw_gap_id:
+            continue
+        if not isinstance(raw_indices, list):
+            continue
+        for raw_index in raw_indices:
+            if type(raw_index) is not int or raw_index <= 0:
+                continue
+            path = path_map.get(str(raw_index), path_map.get(raw_index))
+            size = size_map.get(str(raw_index), size_map.get(raw_index))
+            if (
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size <= 0
+            ):
+                return None
+            row = expected_by_index.setdefault(
+                raw_index,
+                {
+                    "torrent_index": raw_index,
+                    "path": path,
+                    "size": size,
+                    "gap_ids": [],
+                },
+            )
+            if row["path"] != path or row["size"] != size:
+                return None
+            row["gap_ids"].append(raw_gap_id)
+    expected_files = [
+        {
+            **row,
+            "gap_ids": sorted(set(row["gap_ids"])),
+        }
+        for _index, row in sorted(expected_by_index.items())
+        if row["gap_ids"]
+    ]
+    if not expected_files:
+        return None
+    candidate = dict(local)
+    candidate.update({
+        "provider": PROVIDER_QUARK_MAGNET,
+        "locator": f"{PROVIDER_QUARK_MAGNET}:{infohash}",
+        "files": [str(row["path"]) for row in expected_files],
+        "acquisition": {
+            "kind": ACQUISITION_QUARK_MAGNET_OFFLINE,
+            "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
+            "expected_files": expected_files,
+        },
+    })
+    return candidate
 
 
 def _catalog_torrent_candidate_variants(
     candidate: Mapping[str, Any], *, include_local: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return one catalog candidate only when it is executable locally."""
+    """Return fixed-lane variants for one catalog Torrent candidate."""
     local = dict(candidate)
     acquisition = local.get("acquisition")
     if (
-        include_local
-        and str(local.get("provider") or "").strip().casefold() == "magnet"
+        str(local.get("provider") or "").strip().casefold() == PROVIDER_LOCAL_MAGNET
         and isinstance(acquisition, Mapping)
-        and str(acquisition.get("kind") or "").strip().casefold() == "torrent"
+        and str(acquisition.get("kind") or "").strip().casefold() == ACQUISITION_TORRENT
         and candidate_capability_error(local) is None
     ):
-        return [local]
+        variants: list[dict[str, Any]] = []
+        quark = _quark_magnet_candidate(local)
+        if quark is not None:
+            variants.append(quark)
+        if include_local:
+            variants.append(local)
+        return variants
     return []
 
 

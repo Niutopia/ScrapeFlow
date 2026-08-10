@@ -15,6 +15,7 @@ from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentRuntime,
     FixedTierAutomaticMaterializer,
     QuarkFastSaveAutomaticMaterializer,
+    QuarkMagnetAutomaticMaterializer,
 )
 from engine.scrapeflow.replenishment_matching import (
     coverage_tokens,
@@ -396,10 +397,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertEqual(calls[0], desired_url)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["release_name"], desired_release)
+        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        local = next(row for row in candidates if row["provider"] == "magnet")
+        self.assertEqual(local["release_name"], desired_release)
         self.assertEqual(
-            candidates[0]["acquisition"]["file_index_by_gap"], {"S00E05": [1]},
+            local["acquisition"]["file_index_by_gap"], {"S00E05": [1]},
         )
 
     def test_s00_movie_title_rows_are_preflight_prioritized_for_dmhy(self) -> None:
@@ -472,8 +474,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertEqual(calls[0], desired_torrent)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["release_name"], desired_release)
+        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        self.assertTrue(all(row["release_name"] == desired_release for row in candidates))
 
     def test_s00_title_preflight_priority_still_requires_manifest_coverage(self) -> None:
         """A matching raw name cannot bypass the exact S00 file-title gate."""
@@ -761,10 +763,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             return_value=manifest,
         ):
             candidates = _search_tokyotosho(request, set(), deadline=deadline)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["infohash"], infohash)
+        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        local = next(row for row in candidates if row["provider"] == "magnet")
+        self.assertEqual(local["infohash"], infohash)
         self.assertEqual(
-            candidates[0]["acquisition"]["file_index_by_gap"], {"S04E17": [1]},
+            local["acquisition"]["file_index_by_gap"], {"S04E17": [1]},
         )
 
         with patch(
@@ -815,10 +818,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         ):
             nyaa = _search_nyaa(request, set(), deadline=time.monotonic() + 10)
 
-        self.assertEqual(len(nyaa), 1)
-        self.assertEqual(nyaa[0]["seeders"], 0)
-        self.assertEqual(nyaa[0]["leechers"], 4)
-        self.assertEqual(_swarm_preference(nyaa[0])[0], 0)
+        self.assertEqual([row["provider"] for row in nyaa], ["quark_magnet", "magnet"])
+        nyaa_local = next(row for row in nyaa if row["provider"] == "magnet")
+        self.assertEqual(nyaa_local["seeders"], 0)
+        self.assertEqual(nyaa_local["leechers"], 4)
+        self.assertEqual(_swarm_preference(nyaa_local)[0], 0)
 
         animetosho_feed = json.dumps([{
             "title": release,
@@ -839,10 +843,14 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 request, set(), deadline=time.monotonic() + 10,
             )
 
-        self.assertEqual(len(animetosho), 1)
-        self.assertEqual(animetosho[0]["seeders"], 7)
-        self.assertEqual(animetosho[0]["leechers"], 3)
-        self.assertEqual(_swarm_preference(animetosho[0])[0], 2)
+        self.assertEqual(
+            [row["provider"] for row in animetosho],
+            ["quark_magnet", "magnet"],
+        )
+        animetosho_local = next(row for row in animetosho if row["provider"] == "magnet")
+        self.assertEqual(animetosho_local["seeders"], 7)
+        self.assertEqual(animetosho_local["leechers"], 3)
+        self.assertEqual(_swarm_preference(animetosho_local)[0], 2)
 
     def test_swarm_liveness_breaks_only_valid_candidate_ties(self) -> None:
         """Fresh positive seed beats neutral/zero only after hard gates."""
@@ -2733,6 +2741,162 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertTrue(engine.planned[0]["source_path"].startswith(
             "/quark/影视/ScrapeFlow/补源/engine-quark-share-root/attempt-",
         ))
+
+    def test_quark_magnet_offline_wins_before_local_torrent(self) -> None:
+        root_job = _example_root_job("engine-quark-magnet-root")
+        infohash = "0123456789012345678901234567890123456789"
+
+        class MagnetFirstSearch(FakeSearch):
+            def run(self, request):
+                self.requests.append(dict(request))
+                return {"candidates": [{
+                    "provider": "quark_magnet",
+                    "locator": f"quark_magnet:{infohash}",
+                    "release_name": "Example Show S01E01 1080p",
+                    "title": "Example Show",
+                    "year": "2020",
+                    "files": ["Example/Example.Show.S01E01.mkv"],
+                    "file_coverage": ["S01E01"],
+                    "acquisition": {
+                        "kind": "quark_magnet_offline",
+                        "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
+                        "expected_files": [{
+                            "torrent_index": 1,
+                            "path": "Example/Example.Show.S01E01.mkv",
+                            "size": 123,
+                            "gap_ids": ["S01E01"],
+                        }],
+                    },
+                }, {
+                    "provider": "magnet",
+                    "locator": (
+                        "magnet:?xt=urn:btih:"
+                        "0123456789012345678901234567890123456789"
+                    ),
+                    "release_name": "Example Show S01E01 1080p",
+                    "title": "Example Show",
+                    "year": "2020",
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "acquisition": {"kind": "torrent"},
+                }]}
+
+        class FakeQuarkMagnetBridge:
+            def __init__(self, alist: MemoryAList) -> None:
+                self.alist = alist
+                self.calls: list[str] = []
+
+            def execute(self, selection, destination, *, task_id=None, on_task_id=None):
+                if task_id is None and on_task_id is not None:
+                    on_task_id("quark-magnet-task-1")
+                self.calls.append(destination)
+                media_dir = f"{destination}/Example"
+                self.alist.mkdir(media_dir)
+                self.alist.tree[media_dir] = [{
+                    "name": "Example.Show.S01E01.mkv",
+                    "is_dir": False,
+                    "size": 123,
+                }]
+                return {
+                    "status": "submitted",
+                    "task_id": task_id or "quark-magnet-task-1",
+                    "expected_files": [{
+                        "path": "Example/Example.Show.S01E01.mkv",
+                        "size": 123,
+                        "gap_ids": ["S01E01"],
+                    }],
+                }
+
+        class UnexpectedLocalTorrent:
+            def acquire(self, *_args, **_kwargs):
+                raise AssertionError("local Torrent must not run after quark_magnet success")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = FakeEngine()
+            bridge = FakeQuarkMagnetBridge(alist)
+            materializer = FixedTierAutomaticMaterializer(
+                quark_magnet=QuarkMagnetAutomaticMaterializer(bridge=bridge),
+                local_torrent=UnexpectedLocalTorrent(),
+            )
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=MagnetFirstSearch(), materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(outcome["unresolved_gaps"], [])
+        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(len(bridge.calls), 1)
+        self.assertEqual(engine.executed, ["engine-child-1"])
+        self.assertTrue(engine.planned[0]["source_path"].startswith(
+            "/quark/影视/ScrapeFlow/补源/engine-quark-magnet-root/attempt-",
+        ))
+
+    def test_quark_magnet_materializer_reuses_persisted_task_id(self) -> None:
+        infohash = "0123456789012345678901234567890123456789"
+        selection = {
+            "provider": "quark_magnet",
+            "locator": f"quark_magnet:{infohash}",
+            "release_name": "Example Show S01E01 1080p",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_magnet_offline",
+                "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
+                "expected_files": [{
+                    "torrent_index": 1,
+                    "path": "Example.Show.S01E01.mkv",
+                    "size": 123,
+                    "gap_ids": ["S01E01"],
+                }],
+            },
+        }
+
+        class ReusingBridge:
+            def __init__(self) -> None:
+                self.task_ids: list[str | None] = []
+
+            def execute(self, _selection, _destination, *, task_id=None, on_task_id=None):
+                self.task_ids.append(task_id)
+                if task_id is None:
+                    task_id = "quark-magnet-task-1"
+                    if on_task_id is not None:
+                        on_task_id(task_id)
+                return {
+                    "status": "submitted",
+                    "task_id": task_id,
+                    "expected_files": [{
+                        "path": "Example.Show.S01E01.mkv",
+                        "size": 123,
+                        "gap_ids": ["S01E01"],
+                    }],
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reuse"
+            bridge = ReusingBridge()
+            materializer = QuarkMagnetAutomaticMaterializer(bridge=bridge)
+            alist = MemoryAList()
+
+            first = materializer.acquire(
+                {},
+                [selection],
+                staging_root=staging,
+                workspace=workspace,
+                alist=alist,
+            )
+            second = materializer.acquire(
+                {},
+                [selection],
+                staging_root=staging,
+                workspace=workspace,
+                alist=alist,
+            )
+
+        self.assertEqual(bridge.task_ids, [None, "quark-magnet-task-1"])
+        self.assertEqual(first["external_task_id"], "quark-magnet-task-1")
+        self.assertEqual(second["external_task_id"], "quark-magnet-task-1")
 
     def test_partial_child_output_does_not_resolve_unwritten_episode(self) -> None:
         plan = {

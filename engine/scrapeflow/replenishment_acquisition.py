@@ -1,8 +1,9 @@
 """Acquisition routing for fixed executable provider lanes.
 
-The process ships only explicit fixed handlers: Quark share fast-save and
-local magnet/Torrent acquisition.  Historical HTTP/cloud-share candidates are
-not current capabilities and must never become runnable by fallback.
+The process ships only explicit fixed handlers: Quark share fast-save, Quark
+magnet offline, and local magnet/Torrent acquisition.  Historical HTTP/cloud
+share candidates are not current capabilities and must never become runnable
+by fallback.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any, Protocol
 
 from .provider_capabilities import (
     ACQUISITION_QUARK_FAST_SAVE,
+    ACQUISITION_QUARK_MAGNET_OFFLINE,
     ACQUISITION_TORRENT,
     EXECUTABLE_ACQUISITION_KIND,
     candidate_capability_error,
@@ -69,6 +71,9 @@ def acquire_selection(
     acquire_quark_share: (
         Callable[[Mapping[str, Any], str], Mapping[str, Any]] | None
     ) = None,
+    acquire_quark_magnet: (
+        Callable[[Mapping[str, Any], str], Mapping[str, Any]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Dispatch one selected candidate to its task-owned staging destination.
 
@@ -81,6 +86,8 @@ def acquire_selection(
         handler = acquire_torrent
     elif lane == ACQUISITION_QUARK_FAST_SAVE and acquire_quark_share is not None:
         handler = acquire_quark_share
+    elif lane == ACQUISITION_QUARK_MAGNET_OFFLINE and acquire_quark_magnet is not None:
+        handler = acquire_quark_magnet
     else:
         raise AcquisitionRouteError(f"{lane} lane has no injected materializer")
     try:

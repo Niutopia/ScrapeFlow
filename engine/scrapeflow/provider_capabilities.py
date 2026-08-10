@@ -14,8 +14,10 @@ from typing import Any
 
 
 PROVIDER_QUARK_SHARE = "quark_share"
+PROVIDER_QUARK_MAGNET = "quark_magnet"
 PROVIDER_LOCAL_MAGNET = "magnet"
 ACQUISITION_QUARK_FAST_SAVE = "quark_fast_save"
+ACQUISITION_QUARK_MAGNET_OFFLINE = "quark_magnet_offline"
 ACQUISITION_TORRENT = "torrent"
 
 # Backwards-compatible names for the one local Torrent executor.
@@ -24,6 +26,7 @@ EXECUTABLE_ACQUISITION_KIND = ACQUISITION_TORRENT
 
 ACTIVE_PROVIDER_ACQUISITION_KINDS = {
     PROVIDER_QUARK_SHARE: ACQUISITION_QUARK_FAST_SAVE,
+    PROVIDER_QUARK_MAGNET: ACQUISITION_QUARK_MAGNET_OFFLINE,
     PROVIDER_LOCAL_MAGNET: ACQUISITION_TORRENT,
 }
 ACTIVE_PROVIDERS = frozenset(ACTIVE_PROVIDER_ACQUISITION_KINDS)
@@ -41,6 +44,12 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
             "status": "ready",
             "acquisition_kinds": [ACQUISITION_QUARK_FAST_SAVE],
             "materializer": "QuarkFastSaveMaterializer",
+            "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
+        },
+        PROVIDER_QUARK_MAGNET: {
+            "status": "ready",
+            "acquisition_kinds": [ACQUISITION_QUARK_MAGNET_OFFLINE],
+            "materializer": "QuarkMagnetOfflineMaterializer",
             "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
         },
         PROVIDER_LOCAL_MAGNET: {
@@ -82,10 +91,12 @@ __all__ = [
     "ACTIVE_PROVIDERS",
     "ACTIVE_PROVIDER_ACQUISITION_KINDS",
     "ACQUISITION_QUARK_FAST_SAVE",
+    "ACQUISITION_QUARK_MAGNET_OFFLINE",
     "ACQUISITION_TORRENT",
     "EXECUTABLE_ACQUISITION_KIND",
     "EXECUTABLE_PROVIDER",
     "PROVIDER_LOCAL_MAGNET",
+    "PROVIDER_QUARK_MAGNET",
     "PROVIDER_QUARK_SHARE",
     "candidate_capability_error",
     "is_executable_candidate",

@@ -12,7 +12,10 @@ from engine.scrapeflow.replenishment_acquisition import (
     acquire_selection,
     acquisition_lane,
 )
-from engine.tools.replenishment_adapter.search import ReplenishmentSearchService
+from engine.tools.replenishment_adapter.search import (
+    ReplenishmentSearchService,
+    candidate_variants,
+)
 from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentError,
     LocalTorrentAutomaticMaterializer,
@@ -21,8 +24,11 @@ from local.scrapeflow_api.replenishment import select_replenishment_candidates
 from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
 from engine.scrapeflow.provider_capabilities import (
     ACQUISITION_QUARK_FAST_SAVE,
+    ACQUISITION_QUARK_MAGNET_OFFLINE,
+    ACQUISITION_TORRENT,
     provider_capability_snapshot,
 )
+from engine.tools._replenishment_local_adapter_impl import _locator_infohash_aliases
 
 
 def _torrent_candidate() -> dict[str, object]:
@@ -65,6 +71,28 @@ def _quark_share_candidate() -> dict[str, object]:
     }
 
 
+def _quark_magnet_candidate() -> dict[str, object]:
+    torrent = _torrent_candidate()
+    return {
+        **torrent,
+        "provider": "quark_magnet",
+        "locator": "quark_magnet:0123456789012345678901234567890123456789",
+        "infohash": "0123456789012345678901234567890123456789",
+        "acquisition": {
+            "kind": "quark_magnet_offline",
+            "magnet_url": (
+                "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+            ),
+            "expected_files": [{
+                "torrent_index": 1,
+                "path": "Example.Show.S01E01.mkv",
+                "size": 1024 * 1024,
+                "gap_ids": ["S01E01"],
+            }],
+        },
+    }
+
+
 def _legacy_http_candidate() -> dict[str, object]:
     return {
         "provider": "legacy_http",
@@ -83,11 +111,15 @@ def _legacy_http_candidate() -> dict[str, object]:
 class ProviderCapabilityTests(unittest.TestCase):
     def test_provider_snapshot_exposes_only_fixed_lanes(self) -> None:
         snapshot = provider_capability_snapshot()
-        self.assertEqual(set(snapshot), {"quark_share", "magnet"})
+        self.assertEqual(set(snapshot), {"quark_share", "quark_magnet", "magnet"})
         self.assertEqual(snapshot["quark_share"]["status"], "ready")
         self.assertEqual(
             snapshot["quark_share"]["acquisition_kinds"],
             [ACQUISITION_QUARK_FAST_SAVE],
+        )
+        self.assertEqual(
+            snapshot["quark_magnet"]["acquisition_kinds"],
+            [ACQUISITION_QUARK_MAGNET_OFFLINE],
         )
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
@@ -128,12 +160,26 @@ class ProviderCapabilityTests(unittest.TestCase):
         share.assert_called_once()
         torrent.assert_not_called()
 
+    def test_quark_magnet_routes_to_injected_offline_executor(self) -> None:
+        offline = Mock(return_value={"status": "ready"})
+        torrent = Mock(return_value={"status": "ready"})
+        result = acquire_selection(
+            _quark_magnet_candidate(),
+            "/task/staging",
+            acquire_torrent=torrent,
+            acquire_quark_magnet=offline,
+        )
+        self.assertEqual(result["status"], "ready")
+        offline.assert_called_once()
+        torrent.assert_not_called()
+
     def test_search_filters_non_executable_candidates_and_reports_truthful_lanes(self) -> None:
         service = ReplenishmentSearchService(
             lambda _request: {
                 "candidates": [
                     _legacy_http_candidate(),
                     _quark_share_candidate(),
+                    _quark_magnet_candidate(),
                     _torrent_candidate(),
                 ],
                 "lane_status": {"legacy_http": {"status": "ready"}},
@@ -142,12 +188,53 @@ class ProviderCapabilityTests(unittest.TestCase):
         result = service.run({})
         self.assertEqual(
             [row["provider"] for row in result["candidates"]],
-            ["quark_share", "magnet"],
+            ["quark_share", "quark_magnet", "magnet"],
         )
         self.assertEqual(result["lane_status"]["quark_share"]["status"], "ready")
+        self.assertEqual(result["lane_status"]["quark_magnet"]["status"], "ready")
         self.assertEqual(result["lane_status"]["magnet"]["status"], "ready")
         self.assertNotIn("legacy_http", result["lane_status"])
         self.assertEqual(result["provider_rejections"], {"unsupported_provider": 1})
+
+    def test_verified_torrent_manifest_projects_quark_magnet_before_local(self) -> None:
+        request = {
+            "media": {"tmdb_id": 1, "title": "Example Show", "aliases": ["Example Show"]},
+            "gaps": [{
+                "id": "S01E01", "kind": "missing_episode", "season": 1,
+                "episodes": [1], "label": "Example Show S01E01",
+            }],
+        }
+        manifest = {
+            "root": "Example Show",
+            "infohash": "0123456789012345678901234567890123456789",
+            "files": {1: {"path": "Example.Show.S01E01.mkv", "size": 1024 * 1024}},
+        }
+
+        rows = candidate_variants(
+            request,
+            "Example Show S01E01 1080p",
+            "https://example.test/example.torrent",
+            manifest,
+            include_local=True,
+        )
+
+        self.assertEqual([row["provider"] for row in rows], ["quark_magnet", "magnet"])
+        self.assertEqual(
+            rows[0]["acquisition"]["kind"],
+            ACQUISITION_QUARK_MAGNET_OFFLINE,
+        )
+        self.assertEqual(rows[1]["acquisition"]["kind"], ACQUISITION_TORRENT)
+
+    def test_quark_magnet_locator_does_not_preexclude_local_torrent_hash(self) -> None:
+        infohash = "0123456789012345678901234567890123456789"
+
+        self.assertEqual(_locator_infohash_aliases({f"quark_magnet:{infohash}"}), set())
+        self.assertIn(
+            infohash,
+            _locator_infohash_aliases({
+                f"torrent:magnet:?xt=urn:btih:{infohash}",
+            }),
+        )
 
     def test_selector_rejects_unsupported_provider_and_prefers_quark_share(self) -> None:
         request = {
@@ -179,6 +266,7 @@ class ProviderCapabilityTests(unittest.TestCase):
                 request, [
                     _legacy_http_candidate(),
                     _torrent_candidate(),
+                    _quark_magnet_candidate(),
                     _quark_share_candidate(),
                 ],
             )
@@ -191,6 +279,10 @@ class ProviderCapabilityTests(unittest.TestCase):
         )
         self.assertEqual(
             result["provider_chain_by_gap"]["S01E01"][1]["acquisition_kind"],
+            "quark_magnet_offline",
+        )
+        self.assertEqual(
+            result["provider_chain_by_gap"]["S01E01"][2]["acquisition_kind"],
             "torrent",
         )
 
@@ -233,6 +325,14 @@ class ProviderCapabilityTests(unittest.TestCase):
                 materializer.acquire(
                     {},
                     [_quark_share_candidate()],
+                    staging_root="/library/ScrapeFlow/补源/job/attempt",
+                    workspace=Path(directory),
+                    alist=object(),
+                )
+            with self.assertRaises(AutomaticReplenishmentError):
+                materializer.acquire(
+                    {},
+                    [_quark_magnet_candidate()],
                     staging_root="/library/ScrapeFlow/补源/job/attempt",
                     workspace=Path(directory),
                     alist=object(),
