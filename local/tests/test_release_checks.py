@@ -89,6 +89,72 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("bad.py:2", hits[0])
 
+    def test_active_code_scan_reports_imported_alias_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_dir = root / "engine"
+            active_dir.mkdir()
+            banned_name = "sha" + "256"
+            (active_dir / "bad_alias.py").write_text(
+                f"from hashlib import {banned_name} as media_fingerprint\n"
+                "value = media_fingerprint(b'data')\n",
+                encoding="utf-8",
+            )
+
+            hits = active_media_fingerprint_call_hits(root)
+
+        self.assertEqual(len(hits), 1)
+        self.assertIn("bad_alias.py:2", hits[0])
+
+    def test_active_code_scan_reports_hashlib_new_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_dir = root / "engine"
+            active_dir.mkdir()
+            (active_dir / "bad_new.py").write_text(
+                "import hashlib as h\n"
+                "value = h.new('sha' + '256', b'data')\n"
+                "other = h.new(name='SHA' + '-256', data=b'data')\n",
+                encoding="utf-8",
+            )
+
+            hits = active_media_fingerprint_call_hits(root)
+
+        self.assertEqual(len(hits), 2)
+        self.assertIn("bad_new.py:2", hits[0])
+        self.assertIn("bad_new.py:3", hits[1])
+
+    def test_active_code_scan_reports_getattr_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_dir = root / "engine"
+            active_dir.mkdir()
+            (active_dir / "bad_getattr.py").write_text(
+                "import hashlib\n"
+                "value = getattr(hashlib, 'sha' + '256')(b'data')\n",
+                encoding="utf-8",
+            )
+
+            hits = active_media_fingerprint_call_hits(root)
+
+        self.assertEqual(len(hits), 1)
+        self.assertIn("bad_getattr.py:2", hits[0])
+
+    def test_active_code_scan_allows_torrent_infohash_primitive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_dir = root / "engine"
+            active_dir.mkdir()
+            (active_dir / "torrent_infohash.py").write_text(
+                "import hashlib\n"
+                "value = hashlib.sha1(b'torrent-metainfo').hexdigest()\n",
+                encoding="utf-8",
+            )
+
+            hits = active_media_fingerprint_call_hits(root)
+
+        self.assertEqual(hits, [])
+
 
 if __name__ == "__main__":
     unittest.main()

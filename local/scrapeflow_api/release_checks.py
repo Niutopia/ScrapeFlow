@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -86,18 +87,108 @@ def active_python_paths(root: Path | None = None) -> list[Path]:
     return sorted(paths)
 
 
+def _literal_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_string(node.left)
+        right = _literal_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _is_banned_algorithm_name(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().casefold().replace("-", "").replace("_", "")
+    return normalized == "sha" + "256"
+
+
+class _MediaFingerprintVisitor(ast.NodeVisitor):
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.hashlib_aliases: set[str] = set()
+        self.banned_call_aliases: set[str] = set()
+        self.hashlib_new_aliases: set[str] = set()
+        self.hits: list[str] = []
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+        for alias in node.names:
+            if alias.name == "hashlib":
+                self.hashlib_aliases.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        if node.module == "hashlib":
+            for alias in node.names:
+                imported = alias.name
+                local_name = alias.asname or alias.name
+                if _is_banned_algorithm_name(imported):
+                    self.banned_call_aliases.add(local_name)
+                elif imported == "new":
+                    self.hashlib_new_aliases.add(local_name)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        if self._is_banned_call(node):
+            self.hits.append(f"{self.path}:{node.lineno}")
+        self.generic_visit(node)
+
+    def _call_uses_banned_algorithm(self, node: ast.Call) -> bool:
+        if node.args and _is_banned_algorithm_name(_literal_string(node.args[0])):
+            return True
+        for keyword in node.keywords:
+            if keyword.arg == "name" and _is_banned_algorithm_name(_literal_string(keyword.value)):
+                return True
+        return False
+
+    def _getattr_returns_banned_call(self, node: ast.Call) -> bool:
+        if not isinstance(node.func, ast.Name) or node.func.id != "getattr":
+            return False
+        if len(node.args) < 2:
+            return False
+        base, attr = node.args[0], node.args[1]
+        return (
+            isinstance(base, ast.Name)
+            and base.id in self.hashlib_aliases
+            and _is_banned_algorithm_name(_literal_string(attr))
+        )
+
+    def _is_banned_call(self, node: ast.Call) -> bool:
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id in self.hashlib_aliases:
+                if _is_banned_algorithm_name(func.attr):
+                    return True
+                if func.attr == "new" and self._call_uses_banned_algorithm(node):
+                    return True
+        if isinstance(func, ast.Name):
+            if func.id in self.banned_call_aliases:
+                return True
+            if func.id in self.hashlib_new_aliases and self._call_uses_banned_algorithm(node):
+                return True
+        if isinstance(func, ast.Call) and self._getattr_returns_banned_call(func):
+            return True
+        return False
+
+
 def active_media_fingerprint_call_hits(root: Path | None = None) -> list[str]:
     """Find application-code calls to the banned media-content primitive."""
-    needle = "hashlib." + "sha" + "256"
     hits: list[str] = []
     for path in active_python_paths(root):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        for number, line in enumerate(text.splitlines(), start=1):
-            if needle in line:
-                hits.append(f"{path}:{number}")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError as exc:
+            hits.append(f"{path}:{exc.lineno or 1}: syntax error")
+            continue
+        visitor = _MediaFingerprintVisitor(path)
+        visitor.visit(tree)
+        hits.extend(visitor.hits)
     return hits
 
 
