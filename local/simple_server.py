@@ -1251,6 +1251,8 @@ class SimpleApplication:
         if not isinstance(audit, Mapping):
             return False
         status = str(audit.get("status") or "").casefold()
+        if audit.get("automatic_retry") is False:
+            return False
         # Bounded TMDB/subtitle evidence intentionally remains fail-closed
         # ``unknown``. Re-running the same inventory every 30 seconds cannot
         # turn it into a verdict; a fresh media commit or explicit audit is
@@ -2942,16 +2944,16 @@ class SimpleApplication:
                 audit_retry_needed = True
             elif repair_relevant:
                 audit_state = {
-                    "status": "retry_wait",
-                    "message": "系统正在自动修复 NFO/海报，等待新鲜审计确认",
+                    "status": "blocked",
+                    "message": "NFO/海报缺口已记录，等待独立 repair gate，不由审计扫描自动写入",
                     "gaps": repair_relevant,
                     "unknowns": [],
                     "gap_count": len(repair_relevant),
                     "unknown_count": 0,
-                    "retryable": True,
+                    "retryable": False,
+                    "automatic_retry": False,
                     "repair_attempts": int(previous_audit.get("repair_attempts") or 0),
                 }
-                audit_retry_needed = True
 
             if audit_state is None:
                 # Clearing this field is important: a prior unknown/repair
@@ -3086,71 +3088,6 @@ class SimpleApplication:
                     # a second durable claim registry or lock protocol.
                     if not same_terminal_gap:
                         provider_gap_owners.setdefault(key, job.id)
-
-            if repair_relevant:
-                if self.control().get("paused") is True:
-                    # A full-library scan remains read-only while the global
-                    # worker pause is active.  Keep the durable retry_wait
-                    # projection above; resume will run the repair path.
-                    continue
-                try:
-                    runner.repair_automatic_artifacts(job.id)
-                except Exception as exc:
-                    # Repair failures are first-class root failures. Keep the
-                    # task non-green and retry the audit/repair automatically
-                    # until the bounded retry budget is exhausted.
-                    current = runner.get_job(job.id)
-                    current_summary = dict(current.summary)
-                    current_audit = current_summary.get("audit")
-                    state = dict(current_audit) if isinstance(current_audit, Mapping) else dict(audit_state or {})
-                    attempts = int(state.get("repair_attempts") or 0) + 1
-                    state.update({
-                        "status": "retry_wait" if attempts <= self._automatic_retry_limit() else "failed",
-                        "repair_attempts": attempts,
-                        "error": redact_error(exc),
-                        "message": "NFO/海报自动修复失败，将继续自动重试",
-                        "retryable": attempts <= self._automatic_retry_limit(),
-                        "next_retry_seconds": min(60.0, float(2 ** max(0, attempts - 1)))
-                        if attempts <= self._automatic_retry_limit() else None,
-                        "updated_at": _now(),
-                    })
-                    current_summary["audit"] = state
-                    atomic_write_json(
-                        runner.jobs_root / f"{job.id}.json",
-                        _redacted_job_payload(
-                            replace(
-                                current,
-                                summary=current_summary,
-                                error=redact_error(exc),
-                                updated_at=_now(),
-                            ),
-                        ),
-                        allow_nan=False,
-                    )
-                    audit_retry_needed = attempts <= self._automatic_retry_limit()
-                else:
-                    # The report that triggered repair is intentionally stale;
-                    # keep retry_wait until the next fresh scan proves the
-                    # sidecars exist. A successful repair must not flash green.
-                    current = runner.get_job(job.id)
-                    current_summary = dict(current.summary)
-                    current_audit = current_summary.get("audit")
-                    state = dict(current_audit) if isinstance(current_audit, Mapping) else dict(audit_state or {})
-                    state.update({
-                        "status": "retry_wait",
-                        "message": "元数据已尝试修复，等待新鲜审计确认",
-                        "retryable": True,
-                        "next_retry_seconds": 1,
-                        "updated_at": _now(),
-                    })
-                    current_summary["audit"] = state
-                    atomic_write_json(
-                        runner.jobs_root / f"{job.id}.json",
-                        _redacted_job_payload(
-                            replace(current, summary=current_summary, updated_at=_now()),
-                        ),
-                        allow_nan=False,
-                    )
 
         # A paused control plane may persist the owner/projection but must not
         # even submit a provider future.  Resume/startup will perform the

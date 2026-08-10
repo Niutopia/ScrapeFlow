@@ -674,53 +674,63 @@ class AuditOwnedRootTests(unittest.TestCase):
             finally:
                 app.close()
 
-    def test_paused_audit_never_runs_metadata_repair(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = EmptyAList()
-            runner = SimpleEngineRunner(
-                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
-            )
-            job = EngineJob(
-                id="engine-existing-show",
-                phase="executed",
-                created_at="2026-08-07T00:00:00Z",
-                updated_at="2026-08-07T00:00:00Z",
-                request={"source_path": "/library/待刮削/Show"},
-                plan={
-                    "mode": "tv", "target_root": "/library/番剧/Show",
-                    "metadata": {"tmdb_id": 42, "title": "Show"},
-                    "scan_report": {"resource_gaps": []},
-                },
-                summary={"identity": {
-                    "tmdb_id": 42, "media_type": "tv", "target_root": "/library/番剧/Show",
-                }},
-            )
-            atomic_write_json(runner.jobs_root / f"{job.id}.json", job.as_dict(), allow_nan=False)
-            app = SimpleApplication(
-                state_root=root, remote_root="/library", remote=remote,
-                engine_runner=runner, enforce_engine_roots=False,
-            )
-            app.set_paused(True, "read-only scan")
-            calls: list[str] = []
-            original = runner.repair_automatic_artifacts
-            runner.repair_automatic_artifacts = lambda job_id: calls.append(job_id) or original(job_id)  # type: ignore[method-assign]
-            repair_gap = {
-                "id": "missing_nfo:42:Show", "kind": "missing_nfo", "label": "Show",
-                "reason": "missing", "source": "automatic_library_audit",
-                "media": {
-                    "tmdb_id": 42, "target_root": "/library/番剧/Show", "media_type": "tv",
-                },
-            }
-            try:
-                app._apply_audit_gaps(
-                    {"semantic": {"gaps": [repair_gap], "unknowns": [], "acquisition_projects": []}},
-                    runner,
+    def test_audit_never_runs_metadata_repair_directly(self) -> None:
+        for paused in (True, False):
+            with self.subTest(paused=paused), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                remote = EmptyAList()
+                runner = SimpleEngineRunner(
+                    root, alist=remote, tmdb=object(), validate=False, library_root="/library",
                 )
-                self.assertEqual(calls, [])
-                self.assertEqual(runner.get_job(job.id).summary["audit"]["status"], "retry_wait")
-            finally:
-                app.close()
+                job = EngineJob(
+                    id="engine-existing-show",
+                    phase="executed",
+                    created_at="2026-08-07T00:00:00Z",
+                    updated_at="2026-08-07T00:00:00Z",
+                    request={"source_path": "/library/待刮削/Show"},
+                    plan={
+                        "mode": "tv", "target_root": "/library/番剧/Show",
+                        "metadata": {"tmdb_id": 42, "title": "Show"},
+                        "scan_report": {"resource_gaps": []},
+                    },
+                    summary={"identity": {
+                        "tmdb_id": 42, "media_type": "tv", "target_root": "/library/番剧/Show",
+                    }},
+                )
+                atomic_write_json(runner.jobs_root / f"{job.id}.json", job.as_dict(), allow_nan=False)
+                app = SimpleApplication(
+                    state_root=root, remote_root="/library", remote=remote,
+                    engine_runner=runner, enforce_engine_roots=False,
+                )
+                if paused:
+                    app.set_paused(True, "read-only scan")
+                else:
+                    with patch.object(app, "_start_startup_thread"):
+                        app.set_paused(False)
+                calls: list[str] = []
+                runner.repair_automatic_artifacts = lambda job_id: calls.append(job_id)  # type: ignore[method-assign]
+                repair_gap = {
+                    "id": "missing_nfo:42:Show", "kind": "missing_nfo", "label": "Show",
+                    "reason": "missing", "source": "automatic_library_audit",
+                    "media": {
+                        "tmdb_id": 42, "target_root": "/library/番剧/Show", "media_type": "tv",
+                    },
+                }
+                try:
+                    with patch.object(app, "_queue_library_audit") as audit_queue:
+                        app._apply_audit_gaps(
+                            {"semantic": {"gaps": [repair_gap], "unknowns": [], "acquisition_projects": []}},
+                            runner,
+                        )
+                    persisted = runner.get_job(job.id)
+                    audit = persisted.summary["audit"]
+                    self.assertEqual(calls, [])
+                    self.assertEqual(audit["status"], "blocked")
+                    self.assertFalse(audit["automatic_retry"])
+                    self.assertFalse(SimpleApplication._audit_needs_retry(persisted))
+                    audit_queue.assert_not_called()
+                finally:
+                    app.close()
 
     def test_provider_pilot_dispatches_only_the_matching_audit_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
