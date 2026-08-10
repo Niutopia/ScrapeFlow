@@ -4020,7 +4020,8 @@ def _acquire(
                         f"{paired_gap_id} - {source.stem}", limit=170,
                     ) + extension
                     uploaded.append({
-                        "gap_ids": [], "companion_for_gap_ids": [paired_gap_id],
+                        "gap_ids": [paired_gap_id],
+                        "companion_for_gap_ids": [paired_gap_id],
                         "paired_video_index": paired_video_index,
                         "paired_video_source_name": paired_video_path,
                         "source_name": relative_path, "provider_path": relative_path,
@@ -4130,6 +4131,8 @@ def _acquire(
         shutil.rmtree(workspace)
         result: dict[str, Any] = {
             "status": "ready",
+            "lane": "magnet",
+            "attempt_id": posixpath.basename(remote_root.rstrip("/")),
             "delivery_kind": "torrent_delivery",
             "materializer": "torrent",
             "staging_root": remote_root,

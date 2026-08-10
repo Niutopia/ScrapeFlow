@@ -18,6 +18,7 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
 )
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
+from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
 from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 
 
@@ -177,7 +178,11 @@ class ProviderCapabilityTests(unittest.TestCase):
                 workspace=Path(directory),
                 alist=object(),
             )
-        self.assertEqual(result, {"status": "ready"})
+        self.assertEqual(result, {
+            "status": "ready",
+            "lane": TIER_LOCAL_MAGNET,
+            "attempt_id": "attempt",
+        })
         delegate.acquire.assert_called_once()
 
     def test_local_automatic_materializer_calls_shared_archive_preprocessor(self) -> None:
@@ -200,6 +205,8 @@ class ProviderCapabilityTests(unittest.TestCase):
                 alist=object(),
             )
         self.assertTrue(result["archive_preprocessed"])
+        self.assertEqual(result["lane"], TIER_LOCAL_MAGNET)
+        self.assertEqual(result["attempt_id"], "attempt")
         archive_adapter.prepare_provider_delivery.assert_called_once()
         kwargs = archive_adapter.prepare_provider_delivery.call_args.kwargs
         self.assertEqual(kwargs["staging_root"], "/library/ScrapeFlow/补源/job/attempt")

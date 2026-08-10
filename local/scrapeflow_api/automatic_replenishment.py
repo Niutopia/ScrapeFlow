@@ -33,7 +33,9 @@ from .replenishment import (
     enrich_replenishment_plan_aliases,
     select_replenishment_candidates,
 )
+from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
 from .redaction import redact_error, redact_value
+from .replenishment_tiers import TIER_LOCAL_MAGNET
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
@@ -118,6 +120,21 @@ class LocalTorrentAutomaticMaterializer:
         # formal-library target.
         self.archive_preprocessor = archive_preprocessor
 
+    @staticmethod
+    def _with_delivery_contract_defaults(
+        delivery: Mapping[str, object],
+        *,
+        staging_root: str,
+    ) -> dict[str, object]:
+        result = dict(delivery)
+        lane = result.get("lane", TIER_LOCAL_MAGNET)
+        if lane != TIER_LOCAL_MAGNET:
+            raise AutomaticReplenishmentError("本地 Torrent materializer 返回了错误 lane")
+        result["lane"] = TIER_LOCAL_MAGNET
+        if "attempt_id" not in result:
+            result["attempt_id"] = posixpath.basename(staging_root.rstrip("/"))
+        return result
+
     def acquire(
         self,
         request: Mapping[str, object],
@@ -153,7 +170,9 @@ class LocalTorrentAutomaticMaterializer:
         preprocessor = self.archive_preprocessor
         preprocess = getattr(preprocessor, "prepare_provider_delivery", None)
         if not callable(preprocess):
-            return delivery
+            return self._with_delivery_contract_defaults(
+                delivery, staging_root=staging_root,
+            )
         try:
             prepared = preprocess(
                 delivery,
@@ -168,7 +187,9 @@ class LocalTorrentAutomaticMaterializer:
             prepared = preprocess(delivery)
         if not isinstance(prepared, Mapping):
             raise AutomaticReplenishmentError("归档预处理返回无效 delivery")
-        return dict(prepared)
+        return self._with_delivery_contract_defaults(
+            prepared, staging_root=staging_root,
+        )
 
 
 def _now() -> str:
@@ -1222,6 +1243,52 @@ class AutomaticReplenishmentRuntime:
             raise AutomaticReplenishmentError("staging 没有可回投文件")
         return files
 
+    def _verify_delivery_contract(
+        self,
+        acquisition: Mapping[str, object],
+        *,
+        job: EngineJob,
+        attempt_id: str,
+        staging_root: str,
+        staging_files: Sequence[StagingFile],
+    ) -> dict[str, object]:
+        """Admit a materializer delivery only if its declaration matches AList."""
+        try:
+            normalized = validate_provider_delivery(
+                acquisition,
+                root_job_id=job.id,
+                attempt_id=attempt_id,
+                staging_parent=self.staging_root,
+            )
+        except ProviderDeliveryError as exc:
+            raise AutomaticReplenishmentError(
+                f"provider delivery 合同无效: {exc}"
+            ) from exc
+        if normalized.get("staging_root") != staging_root:
+            raise AutomaticReplenishmentError("delivery staging_root 与当前任务不一致")
+        raw_files = normalized.get("files")
+        if not isinstance(raw_files, list):
+            raise AutomaticReplenishmentError("delivery files 无效")
+        declared: dict[str, tuple[str, int, str]] = {}
+        for raw in raw_files:
+            if not isinstance(raw, Mapping):
+                raise AutomaticReplenishmentError("delivery files 项无效")
+            path = str(raw.get("path"))
+            if path in declared:
+                raise AutomaticReplenishmentError("delivery 重复声明 staging 文件")
+            declared[path] = (
+                path,
+                int(raw["size"]),
+                str(raw["kind"]),
+            )
+        observed = {
+            item.path: (item.path, item.size, item.kind)
+            for item in staging_files
+        }
+        if declared != observed:
+            raise AutomaticReplenishmentError("delivery 声明与 AList 回读不一致")
+        return normalized
+
     @staticmethod
     def _subtitle_marker(value: object) -> str:
         text = str(value or "zh").casefold()
@@ -1835,6 +1902,13 @@ class AutomaticReplenishmentRuntime:
                     raise AutomaticReplenishmentError("provider 获取没有返回 ready")
                 self._progress(job, "staging_verifying", round=round_number, staging_root=staging)
                 staging_files = self.verify_staging(staging)
+                self._verify_delivery_contract(
+                    acquisition,
+                    job=job,
+                    attempt_id=attempt_id,
+                    staging_root=staging,
+                    staging_files=staging_files,
+                )
                 # Validate both lane roots before any Engine child or formal
                 # subtitle write.  A malformed mixed delivery must fail
                 # closed while all bytes are still in task-owned staging.

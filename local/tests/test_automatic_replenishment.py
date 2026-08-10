@@ -26,6 +26,7 @@ from local.scrapeflow_api.replenishment import (
     _swarm_preference,
 )
 from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRunner
+from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
     _acquire,
@@ -102,6 +103,21 @@ class FakeSearch:
         }
 
 
+def _ready_delivery(
+    staging_root: str,
+    files: list[dict[str, object]],
+    **extra: object,
+) -> dict[str, object]:
+    return {
+        "status": "ready",
+        "lane": TIER_LOCAL_MAGNET,
+        "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+        "staging_root": staging_root,
+        "files": files,
+        **extra,
+    }
+
+
 class FakeMaterializer:
     def __init__(self, alist: MemoryAList) -> None:
         self.alist = alist
@@ -116,7 +132,15 @@ class FakeMaterializer:
         self.alist.tree[staging_root] = [{
             "name": "Example.Show.S01E01.mkv", "is_dir": False, "size": 123,
         }]
-        return {"status": "ready", "staging_root": staging_root}
+        return _ready_delivery(
+            staging_root,
+            [{
+                "path": f"{staging_root}/Example.Show.S01E01.mkv",
+                "size": 123,
+                "kind": "video",
+                "gap_ids": ["S01E01"],
+            }],
+        )
 
 
 class FakeEngine:
@@ -1255,6 +1279,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         result = materializer.result
         self.assertIsNotNone(result)
         assert result is not None
+        self.assertEqual(result["lane"], TIER_LOCAL_MAGNET)
+        self.assertTrue(str(result["attempt_id"]).startswith("attempt-"))
         self.assertEqual(
             result["companion_subtitle_index_by_media_gap"], {"S01E01": [2]},
         )
@@ -1936,7 +1962,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(rows[0]["gap_ids"], ["S01E01"])
         self.assertEqual(rows[1]["kind"], "subtitle")
         self.assertEqual(rows[1]["manifest_index"], 2)
-        self.assertEqual(rows[1]["gap_ids"], [])
+        self.assertEqual(rows[1]["gap_ids"], ["S01E01"])
         self.assertEqual(rows[1]["companion_for_gap_ids"], ["S01E01"])
         self.assertEqual(rows[1]["subtitle_language"], "zh")
 
@@ -2560,6 +2586,64 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             self.assertEqual(audit_again["already_resolved_gap_ids"], [])
             self.assertEqual(len(search.requests), 3)
 
+    def test_delivery_contract_rejects_formal_library_fields_before_child(self) -> None:
+        root_job = _example_root_job("engine-delivery-formal-field")
+
+        class FormalFieldMaterializer(FakeMaterializer):
+            def acquire(self, request, selections, *, staging_root, workspace, alist):
+                delivery = super().acquire(
+                    request, selections, staging_root=staging_root,
+                    workspace=workspace, alist=alist,
+                )
+                files = delivery["files"]
+                assert isinstance(files, list)
+                files[0]["target_root"] = "/quark/影视/番剧/Example Show"
+                return delivery
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = FakeEngine()
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=FakeSearch(), materializer=FormalFieldMaterializer(alist),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertIn("正式库字段", str(outcome["outcomes"][0]["error"]))
+        self.assertEqual(engine.planned, [])
+        self.assertEqual(engine.executed, [])
+
+    def test_delivery_contract_requires_declared_files_to_match_alist_readback(self) -> None:
+        root_job = _example_root_job("engine-delivery-readback-mismatch")
+
+        class SizeMismatchMaterializer(FakeMaterializer):
+            def acquire(self, request, selections, *, staging_root, workspace, alist):
+                delivery = super().acquire(
+                    request, selections, staging_root=staging_root,
+                    workspace=workspace, alist=alist,
+                )
+                files = delivery["files"]
+                assert isinstance(files, list)
+                files[0]["size"] = 456
+                return delivery
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = FakeEngine()
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=FakeSearch(), materializer=SizeMismatchMaterializer(alist),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertIn("AList 回读不一致", str(outcome["outcomes"][0]["error"]))
+        self.assertEqual(engine.planned, [])
+        self.assertEqual(engine.executed, [])
+
     def test_partial_child_output_does_not_resolve_unwritten_episode(self) -> None:
         plan = {
             "mode": "tv",
@@ -2652,14 +2736,22 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         class MovieMaterializer(FakeMaterializer):
             def acquire(self, request, selections, *, staging_root, workspace, alist):
-                result = super().acquire(
+                super().acquire(
                     request, selections, staging_root=staging_root,
                     workspace=workspace, alist=alist,
                 )
                 self.alist.tree[staging_root] = [{
                     "name": "Example.Movie.2020.mkv", "is_dir": False, "size": 456,
                 }]
-                return result
+                return _ready_delivery(
+                    staging_root,
+                    [{
+                        "path": f"{staging_root}/Example.Movie.2020.mkv",
+                        "size": 456,
+                        "kind": "video",
+                        "gap_ids": ["missing_media:8:Example Movie"],
+                    }],
+                )
 
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
@@ -2735,11 +2827,15 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist.tree[staging_root] = [{
                     "name": posixpath.basename(source), "is_dir": False, "size": 321,
                 }]
-                return {
-                    "status": "ready",
-                    "staging_root": staging_root,
-                    "files": [{"path": source, "size": 321, "gap_ids": [subtitle_gap_id]}],
-                }
+                return _ready_delivery(
+                    staging_root,
+                    [{
+                        "path": source,
+                        "size": 321,
+                        "kind": "subtitle",
+                        "gap_ids": [subtitle_gap_id],
+                    }],
+                )
 
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
@@ -2847,15 +2943,21 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist.tree[subtitle_root] = [
                     {"name": posixpath.basename(subtitle), "is_dir": False, "size": 321},
                 ]
-                return {
-                    "status": "ready", "staging_root": staging_root,
-                    "media_staging_root": media_root,
-                    "subtitle_staging_root": subtitle_root,
-                    "files": [
-                        {"path": video, "size": 123, "gap_ids": ["S01E01"]},
-                        {"path": subtitle, "size": 321, "gap_ids": [subtitle_id]},
+                return _ready_delivery(
+                    staging_root,
+                    [
+                        {
+                            "path": video, "size": 123,
+                            "kind": "video", "gap_ids": ["S01E01"],
+                        },
+                        {
+                            "path": subtitle, "size": 321,
+                            "kind": "subtitle", "gap_ids": [subtitle_id],
+                        },
                     ],
-                }
+                    media_staging_root=media_root,
+                    subtitle_staging_root=subtitle_root,
+                )
 
         class StrictPlannerEngine(FakeSubtitleEngine):
             """Approximate the production planner's subtitle rejection gate."""
@@ -2968,14 +3070,14 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     self.alist.tree[staging_root] = [{
                         "name": posixpath.basename(video), "is_dir": False, "size": 123,
                     }]
-                    return {
-                        "status": "ready", "staging_root": staging_root,
-                        **selected_acquisition,
-                        "files": [{
+                    return _ready_delivery(
+                        staging_root,
+                        [{
                             "path": video, "size": 123, "kind": "video",
                             "manifest_index": 1, "gap_ids": ["S01E01"],
                         }],
-                    }
+                        **selected_acquisition,
+                    )
                 media_root = f"{staging_root}/media"
                 subtitle_root = f"{staging_root}/subtitles"
                 self.alist.mkdir(media_root)
@@ -2992,24 +3094,24 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist.tree[subtitle_root] = [{
                     "name": posixpath.basename(subtitle), "is_dir": False, "size": 321,
                 }]
-                return {
-                    "status": "ready", "staging_root": staging_root,
-                    "media_staging_root": media_root,
-                    "subtitle_staging_root": subtitle_root,
-                    **selected_acquisition,
-                    "files": [
+                return _ready_delivery(
+                    staging_root,
+                    [
                         {
                             "path": video, "size": 123, "kind": "video",
                             "manifest_index": 1, "gap_ids": ["S01E01"],
                         },
                         {
                             "path": subtitle, "size": 321, "kind": "subtitle",
-                            "manifest_index": 2, "gap_ids": [],
+                            "manifest_index": 2, "gap_ids": ["S01E01"],
                             "companion_for_gap_ids": ["S01E01"],
                             "subtitle_language": "chs",
                         },
                     ],
-                }
+                    media_staging_root=media_root,
+                    subtitle_staging_root=subtitle_root,
+                    **selected_acquisition,
+                )
 
         class FreshMoveEngine(FakeSubtitleEngine):
             def execute_automatic(self, job_id):
@@ -3175,15 +3277,21 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist.tree[subtitle_root] = [
                     {"name": posixpath.basename(subtitle), "is_dir": False, "size": 321},
                 ]
-                return {
-                    "status": "ready", "staging_root": staging_root,
-                    "media_staging_root": media_root,
-                    "subtitle_staging_root": subtitle_root,
-                    "files": [
-                        {"path": video, "size": 123, "gap_ids": ["S01E01"]},
-                        {"path": subtitle, "size": 321, "gap_ids": [subtitle_id]},
+                return _ready_delivery(
+                    staging_root,
+                    [
+                        {
+                            "path": video, "size": 123,
+                            "kind": "video", "gap_ids": ["S01E01"],
+                        },
+                        {
+                            "path": subtitle, "size": 321,
+                            "kind": "subtitle", "gap_ids": [subtitle_id],
+                        },
                     ],
-                }
+                    media_staging_root=media_root,
+                    subtitle_staging_root=subtitle_root,
+                )
 
         class RealPlannerRunner(SimpleEngineRunner):
             def __init__(self, state_root: Path, alist: MemoryAList) -> None:
