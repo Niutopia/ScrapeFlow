@@ -19,7 +19,7 @@ ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。�
   → 清理任务拥有的来源与 staging
 ```
 
-日常使用需要配置服务、放入来源、选择目标货架并启动任务，再查看结果。系统会在短暂的网络、TMDB 或 AList 延迟后按规则重试；最终失败的任务可重新尝试或取消。Dashboard 提供目标货架选择、冲突重选和取消的最小闭环；也可以直接使用 API。
+日常使用需要配置服务、放入来源、通过 API 选择目标货架并启动任务，再查询结果。系统会在短暂的网络、TMDB 或 AList 延迟后按规则重试；最终失败的任务可重新尝试或取消。
 
 ## 最少配置
 
@@ -38,22 +38,22 @@ cp .env.local.example .env.local
 启动服务：
 
 ```sh
-docker compose --env-file .env.local build api gateway
-docker compose --env-file .env.local up -d
-curl -fsS http://127.0.0.1:3010/api/health
+docker compose --env-file .env.local build api
+docker compose --env-file .env.local up -d alist api
+curl -fsS http://127.0.0.1:8765/api/health
 ```
 
-Compose 的 API 进程入口是 `python3 -m local.simple_server`，Web 默认地址为 <http://127.0.0.1:3010>。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
+Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
 
-服务启动后会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。发现来源时只创建 `awaiting_target_shelf` 记录，不会自动执行归档预处理、TMDB、规划或写入。将 `SCRAPEFLOW_INTAKE_MONITOR=0` 时，仍可通过 `POST /api/jobs` 提交来源路径；任务同样必须由用户选择货架并调用 `/start` 后才会进入队列。
+显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。发现来源时只创建 `awaiting_target_shelf` 记录，不会自动执行归档预处理、TMDB、规划或写入。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径；任务同样必须由用户选择货架并调用 `/start` 后才会进入队列。
 
 ## 使用方式
 
 1. 创建作品目录，例如 `/quark/影视/待刮削/作品名.年份/`。
 2. 放入视频、字幕或已有元数据。
-3. 等待入站监控发现目录，或通过 Dashboard/`POST /api/jobs` 提交路径。
-4. 在 Dashboard 中选择电影、番剧或美剧并启动；也可通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv`。
-5. 在任务列表查看身份、阶段、重试次数、AList 回读和补源结果。
+3. 等待入站监控发现目录，或通过 `POST /api/jobs` 提交路径。
+4. 通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv` 启动。
+5. 通过 `GET /api/jobs` 查看身份、阶段、重试次数、AList 回读和补源结果。
 
 系统只清理本任务从入站目录移动的内容、任务创建的 staging 和明确归类的临时残留；已有正式媒体不会因名称推测而被删除。
 
@@ -77,7 +77,7 @@ POST /api/library-audit/run
 GET  /api/browse?path=...
 ```
 
-`POST /api/jobs` 只接收来源目录路径，只会登记待选择任务。`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。选择前不会调用 Engine；选择后，Engine 才根据远端事实决定作品身份、类型、季集、具体作品路径、候选和清理动作。若识别出的媒体类型与用户选择的货架不兼容，任务进入冲突状态而不会静默改选货架。Provider/audit lane 默认关闭；显式开启时，补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，内部阶段不会单独出现在 Web 任务列表中。
+`POST /api/jobs` 只接收来源目录路径，只会登记待选择任务。`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。选择前不会调用 Engine；选择后，Engine 才根据远端事实决定作品身份、类型、季集、具体作品路径、候选和清理动作。若识别出的媒体类型与用户选择的货架不兼容，任务进入冲突状态而不会静默改选货架。Provider/audit lane 默认关闭；显式开启时，补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，内部 child 只投影到所属根任务。
 
 ## 可靠性边界
 
@@ -96,10 +96,13 @@ GET  /api/browse?path=...
 ## 检查
 
 ```sh
-npm run check
+SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s local/tests -p 'test_*.py'
+git diff --check
+env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
+  docker compose config
+docker build -f Dockerfile.api .
 ```
-
-该命令运行静态检查、Web 启动门合同检查、活动 API 导入、自动化测试和生产 Web 构建。
 
 端到端测试不得加载生产 `.env.local`、生产 AList URL 或真实凭据，也不得把
 `/quark/影视/待刮削`、`/quark/影视/ScrapeFlow/补源` 当作测试夹具。请使用

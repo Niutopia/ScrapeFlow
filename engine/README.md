@@ -1,6 +1,6 @@
 # ScrapeFlow Engine
 
-Engine 是 ScrapeFlow 的业务规划层，也是作品身份、媒体树和具体作品目录规则的权威。它由本地服务在任务正式启动后调用，不读取 Web 页面状态，也不要求用户提供作品类型、TMDB 或季集。普通入站的一级目标货架不由 Engine 自动决定：用户先选择固定货架，Local 将其映射为允许的目标根后才调用 Engine。
+Engine 是 ScrapeFlow 的业务规划层，也是作品身份、媒体树和具体作品目录规则的权威。它由本地服务在任务正式启动后调用，不依赖任何客户端状态，也不要求用户提供作品类型、TMDB 或季集。普通入站的一级目标货架不由 Engine 自动决定：用户先选择固定货架，Local 将其映射为允许的目标根后才调用 Engine。
 
 ## 输入与输出
 
@@ -15,7 +15,7 @@ Engine 是 ScrapeFlow 的业务规划层，也是作品身份、媒体树和具�
 
 在用户选择 `movie`、`anime` 或 `us_tv` 并经 `/start` 确认之前，Engine 不应接收普通入站任务，也不得调用 TMDB、解包归档、生成正式计划或触发写入。选择后，Engine 在对应的 `/电影`、`/番剧` 或 `/美剧` 一级根内规划具体作品路径；身份结果与该货架不兼容时必须停止，而不是用语言、国家或路径 marker 覆盖用户选择。
 
-Engine 生成普通 JSON 计划。计划包含来源与目标路径、文件动作、元数据、资源缺口和任务拥有的清理项；凭据只从环境变量读取，不进入计划、持久化状态、前端响应或日志。
+Engine 生成普通 JSON 计划。计划包含来源与目标路径、文件动作、元数据、资源缺口和任务拥有的清理项；凭据只从环境变量读取，不进入计划、持久化状态、API 响应或日志。
 
 ## 自动补源边界
 
@@ -53,5 +53,10 @@ Local 服务负责入站登记、目标货架选择、调度、持久化和 API�
 在仓库根目录运行统一检查：
 
 ```sh
-npm run check
+SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s local/tests -p 'test_*.py'
+git diff --check
+env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
+  docker compose config
+docker build -f Dockerfile.api .
 ```

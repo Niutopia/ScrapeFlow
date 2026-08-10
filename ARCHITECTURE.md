@@ -3,7 +3,7 @@
 ## 运行总览
 
 ```text
-Web 与本地 API 客户端（目标货架选择与状态控制）
+本地 API 客户端（目标货架选择与状态控制）
                     │
                     ▼
 local.simple_server
@@ -19,7 +19,7 @@ Engine（启动后：TMDB、身份、媒体树、命名、NFO/海报、执行计
 AList（待刮削、任务专属 staging、正式媒体库）
 ```
 
-Web 与本地 API 客户端是状态与控制界面。普通来源提交后，服务仅登记 `awaiting_target_shelf`；用户必须通过 Dashboard 或 `POST /api/jobs/:id/start` 选择 `movie`、`anime` 或 `us_tv`，后端才将其映射为固定一级目标根并允许调度。用户不提交任意正式库路径；Engine 负责启动后的作品身份、媒体类型、季集、候选、具体作品目录和清理范围。若类型与用户货架冲突，服务 fail-closed，不自动改选货架。Web 大改版不属于当前最小启动门闭环。
+本地 API 客户端是状态与控制入口。普通来源提交后，服务仅登记 `awaiting_target_shelf`；用户必须通过 `POST /api/jobs/:id/start` 选择 `movie`、`anime` 或 `us_tv`，后端才将其映射为固定一级目标根并允许调度。用户不提交任意正式库路径；Engine 负责启动后的作品身份、媒体类型、季集、候选、具体作品目录和清理范围。若类型与用户货架冲突，服务 fail-closed，不自动改选货架。
 
 ## 主流程
 
@@ -85,7 +85,6 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 - `local/scrapeflow_api/automatic_replenishment.py`：审计缺口到 provider、staging、内部补源阶段和清理的自动编排。
 - `local/scrapeflow_api/simple_library_audit.py`：正式媒体库结构与语义审计，输出机器可处理的缺口。
 - `engine/scraper.py` 与 `engine/scrapeflow/`：TMDB 访问、作品树、文件命名、元数据和 AList 计划。
-- `app/`：展示根任务、审计结果、阶段进度和最终错误；不承担业务决策。
 
 ## 可靠性原则
 
@@ -100,7 +99,12 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 公共 API 见 [README.md](README.md#对外-api)。统一检查命令为：
 
 ```sh
-npm run check
+SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s local/tests -p 'test_*.py'
+git diff --check
+env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
+  docker compose config
+docker build -f Dockerfile.api .
 ```
 
 当前工作树尚未达到发布门。阶段 0–6 全部通过且用户再次明确授权后，才可在隔离目录运行一个受控样本；不得用本文件授权真实来源整理或缺口补齐。

@@ -5,10 +5,7 @@ backups
 .runtime
 .env*
 !.env.local.example
-.next
 .scrapeflow
-out
-node_modules
 outputs
 work
 engine/tests
@@ -18,4 +15,3 @@ local/**/*.md
 __pycache__
 .pytest_cache
 *.pyc
-npm-debug.log*
