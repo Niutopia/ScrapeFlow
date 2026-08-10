@@ -98,6 +98,12 @@ GET  /api/browse?path=...
 ## 检查
 
 ```sh
+python3 scripts/scrapeflow_release_check.py
+```
+
+该命令会按顺序运行：
+
+```sh
 SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s local/tests -p 'test_*.py'
 git diff --check

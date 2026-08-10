@@ -99,6 +99,12 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 公共 API 见 [README.md](README.md#对外-api)。统一检查命令为：
 
 ```sh
+python3 scripts/scrapeflow_release_check.py
+```
+
+它展开为：
+
+```sh
 SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s local/tests -p 'test_*.py'
 git diff --check
