@@ -1773,7 +1773,16 @@ def _catalog_torrent_candidate_variants(
 ) -> list[dict[str, Any]]:
     """Return one catalog candidate only when it is executable locally."""
     local = dict(candidate)
-    return [local] if include_local and candidate_capability_error(local) is None else []
+    acquisition = local.get("acquisition")
+    if (
+        include_local
+        and str(local.get("provider") or "").strip().casefold() == "magnet"
+        and isinstance(acquisition, Mapping)
+        and str(acquisition.get("kind") or "").strip().casefold() == "torrent"
+        and candidate_capability_error(local) is None
+    ):
+        return [local]
+    return []
 
 
 def _search_nyaa(

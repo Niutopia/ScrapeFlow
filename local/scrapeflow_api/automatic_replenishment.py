@@ -18,7 +18,6 @@ from engine.scrapeflow.replenishment_matching import (
     normalized_text as _normalized_text,
     season_markers as _season_markers,
 )
-from engine.scrapeflow.provider_capabilities import candidate_capability_error
 from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -35,7 +34,7 @@ from .replenishment import (
 )
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
 from .redaction import redact_error, redact_value
-from .replenishment_tiers import TIER_LOCAL_MAGNET
+from .replenishment_tiers import TIER_LOCAL_MAGNET, TIER_QUARK_SHARE
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
@@ -145,10 +144,15 @@ class LocalTorrentAutomaticMaterializer:
         alist: object,
     ) -> Mapping[str, object]:
         for selection in selections:
-            reason = candidate_capability_error(selection)
-            if reason is not None:
+            acquisition = selection.get("acquisition")
+            if (
+                str(selection.get("provider") or "").strip().casefold()
+                != TIER_LOCAL_MAGNET
+                or not isinstance(acquisition, Mapping)
+                or str(acquisition.get("kind") or "").strip().casefold() != "torrent"
+            ):
                 raise AutomaticReplenishmentError(
-                    "本地 Torrent materializer 拒绝不可执行补源候选: " + reason,
+                    "本地 Torrent materializer 只接受 magnet/torrent 候选",
                 )
         method = getattr(self.delegate, "acquire", None)
         if not callable(method):
@@ -190,6 +194,148 @@ class LocalTorrentAutomaticMaterializer:
         return self._with_delivery_contract_defaults(
             prepared, staging_root=staging_root,
         )
+
+
+class QuarkFastSaveAutomaticMaterializer:
+    """Use Quark share fast-save to place reviewed files in task staging."""
+
+    def __init__(
+        self,
+        bridge: object | None = None,
+        *,
+        session_factory: Callable[[object, str], object] | None = None,
+    ) -> None:
+        if bridge is None:
+            from engine.scrapeflow.quark_fast_save_bridge import (
+                QuarkFastSaveBridge,
+                UrlLibQuarkTransport,
+            )
+            bridge = QuarkFastSaveBridge(UrlLibQuarkTransport())
+        if session_factory is None:
+            from engine.scrapeflow.quark_fast_save_bridge import delegated_quark_session
+            session_factory = delegated_quark_session
+        self.bridge = bridge
+        self.session_factory = session_factory
+
+    @staticmethod
+    def _delivery_kind(name: str) -> str:
+        suffix = Path(name).suffix.casefold()
+        if suffix in _VIDEO_EXTENSIONS:
+            return "video"
+        if suffix in _SUBTITLE_EXTENSIONS:
+            return "subtitle"
+        raise AutomaticReplenishmentError("夸克分享快转返回了不支持的文件类型")
+
+    def acquire(
+        self,
+        request: Mapping[str, object],
+        selections: Sequence[Mapping[str, object]],
+        *,
+        staging_root: str,
+        workspace: Path,
+        alist: object,
+    ) -> Mapping[str, object]:
+        del request, workspace
+        if len(selections) != 1:
+            raise AutomaticReplenishmentError("夸克分享快转一次只接受一个候选")
+        selection = selections[0]
+        acquisition = selection.get("acquisition")
+        if (
+            str(selection.get("provider") or "").strip().casefold()
+            != TIER_QUARK_SHARE
+            or not isinstance(acquisition, Mapping)
+            or str(acquisition.get("kind") or "").strip().casefold()
+            != "quark_fast_save"
+        ):
+            raise AutomaticReplenishmentError(
+                "夸克分享 materializer 只接受 quark_share/quark_fast_save 候选"
+            )
+        mkdir = getattr(alist, "mkdir", None)
+        if not callable(mkdir):
+            raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
+        mkdir(posixpath.dirname(staging_root))
+        mkdir(staging_root)
+        session = self.session_factory(alist, staging_root)
+        execute = getattr(self.bridge, "execute", None)
+        if not callable(execute):
+            raise AutomaticReplenishmentError("夸克分享 materializer 缺少 execute")
+        save_result = execute(selection, staging_root, session)
+        if not isinstance(save_result, Mapping):
+            raise AutomaticReplenishmentError("夸克分享快转返回无效")
+        rows = save_result.get("expected_files")
+        if not isinstance(rows, list) or not rows:
+            raise AutomaticReplenishmentError("夸克分享快转缺少 expected_files")
+        files: list[dict[str, object]] = []
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                raise AutomaticReplenishmentError("夸克分享 expected_files 项无效")
+            name = _safe_name(raw.get("name"), label="夸克分享文件")
+            size = raw.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise AutomaticReplenishmentError("夸克分享文件大小无效")
+            gap_ids = raw.get("gap_ids")
+            if not isinstance(gap_ids, list) or not gap_ids:
+                raise AutomaticReplenishmentError("夸克分享文件缺少 gap_ids")
+            files.append({
+                "path": f"{staging_root}/{name}",
+                "size": size,
+                "kind": self._delivery_kind(name),
+                "gap_ids": [
+                    str(gap_id) for gap_id in gap_ids
+                    if isinstance(gap_id, str) and gap_id
+                ],
+            })
+        if any(not row["gap_ids"] for row in files):
+            raise AutomaticReplenishmentError("夸克分享文件 gap_ids 无效")
+        result: dict[str, object] = {
+            "status": "ready",
+            "lane": TIER_QUARK_SHARE,
+            "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+            "staging_root": staging_root,
+            "files": files,
+        }
+        task_id = save_result.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            result["external_task_id"] = task_id
+        return result
+
+
+class FixedTierAutomaticMaterializer:
+    """Dispatch one attempt to exactly one fixed replenishment lane."""
+
+    def __init__(
+        self,
+        *,
+        quark_share: AutomaticMaterializer | None = None,
+        local_torrent: AutomaticMaterializer | None = None,
+    ) -> None:
+        self.quark_share = quark_share or QuarkFastSaveAutomaticMaterializer()
+        self.local_torrent = local_torrent or LocalTorrentAutomaticMaterializer()
+
+    def acquire(
+        self,
+        request: Mapping[str, object],
+        selections: Sequence[Mapping[str, object]],
+        *,
+        staging_root: str,
+        workspace: Path,
+        alist: object,
+    ) -> Mapping[str, object]:
+        providers = {
+            str(row.get("provider") or "").strip().casefold()
+            for row in selections if isinstance(row, Mapping)
+        }
+        if providers == {TIER_QUARK_SHARE}:
+            return self.quark_share.acquire(
+                request, selections, staging_root=staging_root,
+                workspace=workspace, alist=alist,
+            )
+        if providers == {TIER_LOCAL_MAGNET}:
+            return self.local_torrent.acquire(
+                request, selections, staging_root=staging_root,
+                workspace=workspace, alist=alist,
+            )
+        raise AutomaticReplenishmentError("单次补源 attempt 必须只使用一个固定 lane")
 
 
 def _now() -> str:
@@ -2325,7 +2471,9 @@ __all__ = [
     "AutomaticReplenishmentCancelled",
     "AutomaticReplenishmentError",
     "AutomaticReplenishmentRuntime",
+    "FixedTierAutomaticMaterializer",
     "LocalTorrentAutomaticMaterializer",
+    "QuarkFastSaveAutomaticMaterializer",
     "StagingFile",
     "reconcile_interrupted_gap_states",
 ]

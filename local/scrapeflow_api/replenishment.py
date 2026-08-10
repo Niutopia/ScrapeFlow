@@ -30,6 +30,7 @@ from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
 )
+from .replenishment_tiers import STRICT_TIER_ORDER
 
 
 # Movies and episodes share the provider-neutral acquisition path. Subtitle
@@ -37,8 +38,14 @@ from engine.scrapeflow.media_policy import (
 ACTIONABLE_GAP_KINDS = frozenset({
     "missing_episode", "missing_season", "missing_media", "missing_subtitle",
 })
-PROVIDER_ORDER = {provider: index for index, provider in enumerate(sorted(ACTIVE_PROVIDERS))}
-PROVIDER_DIAGNOSTIC_NAMES = tuple(sorted(ACTIVE_PROVIDERS))
+PROVIDER_ORDER = {
+    provider: index
+    for index, provider in enumerate(STRICT_TIER_ORDER)
+    if provider in ACTIVE_PROVIDERS
+}
+PROVIDER_DIAGNOSTIC_NAMES = tuple(
+    sorted(ACTIVE_PROVIDERS, key=lambda provider: PROVIDER_ORDER[provider])
+)
 QUALITY_ORDER = {"2160p": 3, "1080p": 2, "720p": 1, "unknown": 0}
 _VIDEO_SUFFIXES = VIDEO_EXTENSIONS
 BAD_AVAILABILITY_MARKERS = (
@@ -1671,9 +1678,9 @@ def select_replenishment_candidates(
     """Select a provider-neutral, per-gap bundle.
 
     Unsupported provider artifacts are untrusted input and are rejected before
-    any selection can be persisted or resumed.  The current process has only
-    one materializer, so a runnable row must be an exact ``magnet/torrent``
-    pair rather than a historical cloud-share or HTTP claim.
+    any selection can be persisted or resumed.  A runnable row must be one of
+    the fixed acquisition pairs rather than a historical cloud-share or HTTP
+    claim.
     """
     gap_ids, gap_lookup = _request_gap_ids(request)
     if not gap_ids:

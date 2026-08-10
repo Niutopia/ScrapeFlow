@@ -1,10 +1,10 @@
 """The small, truthful provider capability contract.
 
-ScrapeFlow currently has one executable acquisition implementation:
-``LocalTorrentMaterializer``.  Provider discovery and the public status API
-must derive their claims from that fact instead of advertising historical
-HTTP/cloud placeholders.  This module intentionally contains data and pure
-validation only; it does not import a materializer or perform I/O.
+ScrapeFlow exposes only fixed replenishment lanes that have a materializer
+boundary.  Provider discovery and the public status API derive their claims
+from these exact pairs instead of advertising historical HTTP/cloud
+placeholders.  This module intentionally contains data and pure validation
+only; it does not import a materializer or perform I/O.
 """
 
 from __future__ import annotations
@@ -13,22 +13,39 @@ from collections.abc import Mapping
 from typing import Any
 
 
-EXECUTABLE_PROVIDER = "magnet"
-EXECUTABLE_ACQUISITION_KIND = "torrent"
-ACTIVE_PROVIDERS = frozenset({EXECUTABLE_PROVIDER})
+PROVIDER_QUARK_SHARE = "quark_share"
+PROVIDER_LOCAL_MAGNET = "magnet"
+ACQUISITION_QUARK_FAST_SAVE = "quark_fast_save"
+ACQUISITION_TORRENT = "torrent"
+
+# Backwards-compatible names for the one local Torrent executor.
+EXECUTABLE_PROVIDER = PROVIDER_LOCAL_MAGNET
+EXECUTABLE_ACQUISITION_KIND = ACQUISITION_TORRENT
+
+ACTIVE_PROVIDER_ACQUISITION_KINDS = {
+    PROVIDER_QUARK_SHARE: ACQUISITION_QUARK_FAST_SAVE,
+    PROVIDER_LOCAL_MAGNET: ACQUISITION_TORRENT,
+}
+ACTIVE_PROVIDERS = frozenset(ACTIVE_PROVIDER_ACQUISITION_KINDS)
 
 
 def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
     """Return a fresh JSON-safe snapshot for health/search projections.
 
     A new mapping is returned on every call so an API consumer cannot mutate
-    the process-wide capability declaration.  ``ready`` is reserved for the
-    one lane whose candidate kind the current materializer accepts.
+    the process-wide capability declaration.  ``ready`` is reserved for fixed
+    lanes whose candidate kind the current materializer chain accepts.
     """
     return {
-        EXECUTABLE_PROVIDER: {
+        PROVIDER_QUARK_SHARE: {
             "status": "ready",
-            "acquisition_kinds": [EXECUTABLE_ACQUISITION_KIND],
+            "acquisition_kinds": [ACQUISITION_QUARK_FAST_SAVE],
+            "materializer": "QuarkFastSaveMaterializer",
+            "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
+        },
+        PROVIDER_LOCAL_MAGNET: {
+            "status": "ready",
+            "acquisition_kinds": [ACQUISITION_TORRENT],
             "materializer": "LocalTorrentMaterializer",
             # The current real materializer returns media-only deliveries;
             # no production archive_source fixture has proved provider SFX.
@@ -45,12 +62,13 @@ def candidate_capability_error(candidate: Mapping[str, Any]) -> str | None:
     enter a durable selection or reach the local materializer.
     """
     provider = str(candidate.get("provider") or "").strip().casefold()
-    if provider != EXECUTABLE_PROVIDER:
+    expected_kind = ACTIVE_PROVIDER_ACQUISITION_KINDS.get(provider)
+    if expected_kind is None:
         return "unsupported_provider"
     acquisition = candidate.get("acquisition")
     if not isinstance(acquisition, Mapping):
         return "provider_acquisition_mismatch"
-    if str(acquisition.get("kind") or "").strip().casefold() != EXECUTABLE_ACQUISITION_KIND:
+    if str(acquisition.get("kind") or "").strip().casefold() != expected_kind:
         return "provider_acquisition_mismatch"
     return None
 
@@ -62,8 +80,13 @@ def is_executable_candidate(candidate: object) -> bool:
 
 __all__ = [
     "ACTIVE_PROVIDERS",
+    "ACTIVE_PROVIDER_ACQUISITION_KINDS",
+    "ACQUISITION_QUARK_FAST_SAVE",
+    "ACQUISITION_TORRENT",
     "EXECUTABLE_ACQUISITION_KIND",
     "EXECUTABLE_PROVIDER",
+    "PROVIDER_LOCAL_MAGNET",
+    "PROVIDER_QUARK_SHARE",
     "candidate_capability_error",
     "is_executable_candidate",
     "provider_capability_snapshot",

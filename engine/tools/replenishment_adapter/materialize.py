@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import engine.tools._replenishment_local_adapter_impl as _impl
-from engine.scrapeflow.provider_capabilities import candidate_capability_error
 
 
 def _require_executable_torrent_bundle(selection_wrapper: Mapping[str, Any]) -> None:
@@ -19,9 +18,13 @@ def _require_executable_torrent_bundle(selection_wrapper: Mapping[str, Any]) -> 
     for row in selections:
         if not isinstance(row, Mapping):
             raise ValueError("补源选择项格式无效")
-        reason = candidate_capability_error(row)
-        if reason is not None:
-            raise ValueError(f"本地 materializer 只接受 magnet/torrent: {reason}")
+        acquisition = row.get("acquisition")
+        if (
+            str(row.get("provider") or "").strip().casefold() != "magnet"
+            or not isinstance(acquisition, Mapping)
+            or str(acquisition.get("kind") or "").strip().casefold() != "torrent"
+        ):
+            raise ValueError("本地 materializer 只接受 magnet/torrent")
 
 
 class LocalTorrentMaterializer:

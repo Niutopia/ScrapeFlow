@@ -1,4 +1,4 @@
-"""Regression coverage for the one real automatic provider lane."""
+"""Regression coverage for fixed automatic provider lanes."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ from local.scrapeflow_api.automatic_replenishment import (
 )
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
 from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
-from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
+from engine.scrapeflow.provider_capabilities import (
+    ACQUISITION_QUARK_FAST_SAVE,
+    provider_capability_snapshot,
+)
 
 
 def _torrent_candidate() -> dict[str, object]:
@@ -40,6 +43,28 @@ def _torrent_candidate() -> dict[str, object]:
     }
 
 
+def _quark_share_candidate() -> dict[str, object]:
+    return {
+        "provider": "quark_share",
+        "locator": "quark_share:fixture-share",
+        "release_name": "Example Show S01E01 1080p",
+        "title": "Example Show",
+        "files": ["Example.Show.S01E01.mkv"],
+        "file_coverage": ["S01E01"],
+        "resolution": "1080p",
+        "acquisition": {
+            "kind": "quark_fast_save",
+            "share_id": "fixture-share",
+            "share_url": "https://pan.quark.cn/s/fixture-share",
+            "file_id_by_gap": {"S01E01": ["share-fid"]},
+            "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+            "file_size_by_id": {"share-fid": 1024 * 1024},
+            "save_strategy": "server_side_copy",
+            "requires_share_revalidation": True,
+        },
+    }
+
+
 def _legacy_http_candidate() -> dict[str, object]:
     return {
         "provider": "legacy_http",
@@ -56,8 +81,14 @@ def _legacy_http_candidate() -> dict[str, object]:
 
 
 class ProviderCapabilityTests(unittest.TestCase):
-    def test_provider_sfx_is_explicitly_deferred_without_real_archive_delivery(self) -> None:
+    def test_provider_snapshot_exposes_only_fixed_lanes(self) -> None:
         snapshot = provider_capability_snapshot()
+        self.assertEqual(set(snapshot), {"quark_share", "magnet"})
+        self.assertEqual(snapshot["quark_share"]["status"], "ready")
+        self.assertEqual(
+            snapshot["quark_share"]["acquisition_kinds"],
+            [ACQUISITION_QUARK_FAST_SAVE],
+        )
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
     def test_unsupported_provider_has_no_acquisition_lane_or_injected_fallback(self) -> None:
@@ -84,20 +115,41 @@ class ProviderCapabilityTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         torrent.assert_called_once()
 
+    def test_quark_share_routes_to_injected_fast_save_executor(self) -> None:
+        share = Mock(return_value={"status": "ready"})
+        torrent = Mock(return_value={"status": "ready"})
+        result = acquire_selection(
+            _quark_share_candidate(),
+            "/task/staging",
+            acquire_torrent=torrent,
+            acquire_quark_share=share,
+        )
+        self.assertEqual(result["status"], "ready")
+        share.assert_called_once()
+        torrent.assert_not_called()
+
     def test_search_filters_non_executable_candidates_and_reports_truthful_lanes(self) -> None:
         service = ReplenishmentSearchService(
             lambda _request: {
-                "candidates": [_legacy_http_candidate(), _torrent_candidate()],
+                "candidates": [
+                    _legacy_http_candidate(),
+                    _quark_share_candidate(),
+                    _torrent_candidate(),
+                ],
                 "lane_status": {"legacy_http": {"status": "ready"}},
             },
         )
         result = service.run({})
-        self.assertEqual([row["provider"] for row in result["candidates"]], ["magnet"])
+        self.assertEqual(
+            [row["provider"] for row in result["candidates"]],
+            ["quark_share", "magnet"],
+        )
+        self.assertEqual(result["lane_status"]["quark_share"]["status"], "ready")
         self.assertEqual(result["lane_status"]["magnet"]["status"], "ready")
         self.assertNotIn("legacy_http", result["lane_status"])
         self.assertEqual(result["provider_rejections"], {"unsupported_provider": 1})
 
-    def test_selector_rejects_unsupported_provider_and_selects_executable_magnet(self) -> None:
+    def test_selector_rejects_unsupported_provider_and_prefers_quark_share(self) -> None:
         request = {
             "media": {
                 "tmdb_id": 1,
@@ -124,13 +176,21 @@ class ProviderCapabilityTests(unittest.TestCase):
             return_value={"S01E01"},
         ):
             result = select_replenishment_candidates(
-                request, [_legacy_http_candidate(), _torrent_candidate()],
+                request, [
+                    _legacy_http_candidate(),
+                    _torrent_candidate(),
+                    _quark_share_candidate(),
+                ],
             )
         self.assertEqual(result["status"], "complete")
-        self.assertEqual([row["provider"] for row in result["selections"]], ["magnet"])
+        self.assertEqual([row["provider"] for row in result["selections"]], ["quark_share"])
         self.assertEqual(result["rejection_reasons"], {"unsupported_provider": 1})
         self.assertEqual(
             result["provider_chain_by_gap"]["S01E01"][0]["acquisition_kind"],
+            "quark_fast_save",
+        )
+        self.assertEqual(
+            result["provider_chain_by_gap"]["S01E01"][1]["acquisition_kind"],
             "torrent",
         )
 
@@ -165,6 +225,14 @@ class ProviderCapabilityTests(unittest.TestCase):
                 materializer.acquire(
                     {},
                     [_legacy_http_candidate()],
+                    staging_root="/library/ScrapeFlow/补源/job/attempt",
+                    workspace=Path(directory),
+                    alist=object(),
+                )
+            with self.assertRaises(AutomaticReplenishmentError):
+                materializer.acquire(
+                    {},
+                    [_quark_share_candidate()],
                     staging_root="/library/ScrapeFlow/补源/job/attempt",
                     workspace=Path(directory),
                     alist=object(),

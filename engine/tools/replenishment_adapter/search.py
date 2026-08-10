@@ -14,11 +14,11 @@ from engine.scrapeflow.provider_capabilities import (
 
 
 def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Return only candidates accepted by the current Torrent materializer.
+    """Return only candidates accepted by the fixed materializer chain.
 
     Search is an evidence boundary, not a promise that every historical
     source can be delivered.  Cloud-share/HTTP rows are intentionally dropped
-    here; their unavailable status remains visible in ``lane_status``.
+    here; only fixed quark-share and local-torrent acquisition shapes remain.
     """
     output = dict(result)
     candidates = []
@@ -42,8 +42,8 @@ def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
                 candidate.pop(key, None)
         candidates.append(candidate)
     output["candidates"] = candidates
-    output["active_search_lane"] = "magnet_torrent"
-    output["active_provider"] = "magnet"
+    output["active_search_lane"] = "strict_replenishment_chain"
+    output["active_provider"] = "fixed_chain"
     output["lane_status"] = provider_capability_snapshot()
     output["provider_capabilities"] = provider_capability_snapshot()
     output["candidate_rejections"] = rejected

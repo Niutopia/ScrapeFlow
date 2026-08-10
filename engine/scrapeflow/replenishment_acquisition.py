@@ -1,8 +1,8 @@
-"""Acquisition routing for the currently executable local provider lane.
+"""Acquisition routing for fixed executable provider lanes.
 
-The process ships one materializer: exact magnet/Torrent acquisition.  The
-HTTP protocol remains injectable as a future extension point, but it is not a
-current capability and must never make a cloud-share candidate runnable.
+The process ships only explicit fixed handlers: Quark share fast-save and
+local magnet/Torrent acquisition.  Historical HTTP/cloud-share candidates are
+not current capabilities and must never become runnable by fallback.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 from .provider_capabilities import (
+    ACQUISITION_QUARK_FAST_SAVE,
+    ACQUISITION_TORRENT,
     EXECUTABLE_ACQUISITION_KIND,
     candidate_capability_error,
 )
@@ -45,6 +47,9 @@ def acquisition_lane(selection: Mapping[str, Any]) -> str:
     """Validate the real materializer contract and return its execution lane."""
     error = candidate_capability_error(selection)
     if error is None:
+        acquisition = selection.get("acquisition")
+        if isinstance(acquisition, Mapping):
+            return str(acquisition.get("kind") or EXECUTABLE_ACQUISITION_KIND)
         return EXECUTABLE_ACQUISITION_KIND
     provider = str(selection.get("provider") or "")
     acquisition = selection.get("acquisition")
@@ -61,6 +66,9 @@ def acquire_selection(
     *,
     verify_arrival: ArrivalVerifierPort | None = None,
     acquire_torrent: Callable[[Mapping[str, Any], str], Mapping[str, Any]],
+    acquire_quark_share: (
+        Callable[[Mapping[str, Any], str], Mapping[str, Any]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Dispatch one selected candidate to its task-owned staging destination.
 
@@ -69,7 +77,12 @@ def acquire_selection(
     verifies the arrival when a verifier is supplied.
     """
     lane = acquisition_lane(selection)
-    handler = acquire_torrent
+    if lane == ACQUISITION_TORRENT:
+        handler = acquire_torrent
+    elif lane == ACQUISITION_QUARK_FAST_SAVE and acquire_quark_share is not None:
+        handler = acquire_quark_share
+    else:
+        raise AcquisitionRouteError(f"{lane} lane has no injected materializer")
     try:
         result = handler(selection, destination)
     except AcquisitionRouteError:

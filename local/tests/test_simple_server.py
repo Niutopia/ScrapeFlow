@@ -113,8 +113,9 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["build_version"], "target-shelf-rc1")
         self.assertIn("build_commit", health)
         self.assertIn("build_time", health)
+        self.assertEqual(health["provider_capabilities"]["quark_share"]["status"], "ready")
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
-        self.assertEqual(set(health["provider_capabilities"]), {"magnet"})
+        self.assertEqual(set(health["provider_capabilities"]), {"quark_share", "magnet"})
 
         status, control = self.request("GET", "/api/control")
         self.assertEqual(status, 200)

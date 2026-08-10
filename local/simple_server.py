@@ -47,6 +47,7 @@ from local.scrapeflow_api.simple_library_audit import (
 )
 from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentRuntime,
+    FixedTierAutomaticMaterializer,
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
 )
@@ -1898,8 +1899,10 @@ class SimpleApplication:
                 engine_runner=runner,
                 alist=client,
                 search=ReplenishmentSearchService(),
-                materializer=LocalTorrentAutomaticMaterializer(
-                    archive_preprocessor=self._archive_preprocessor,
+                materializer=FixedTierAutomaticMaterializer(
+                    local_torrent=LocalTorrentAutomaticMaterializer(
+                        archive_preprocessor=self._archive_preprocessor,
+                    ),
                 ),
                 staging_root=f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源",
                 progress=self._record_replenishment_progress,

@@ -11,7 +11,11 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from local.scrapeflow_api.automatic_replenishment import AutomaticReplenishmentRuntime
+from local.scrapeflow_api.automatic_replenishment import (
+    AutomaticReplenishmentRuntime,
+    FixedTierAutomaticMaterializer,
+    QuarkFastSaveAutomaticMaterializer,
+)
 from engine.scrapeflow.replenishment_matching import (
     coverage_tokens,
     expanded_episode_ids,
@@ -2643,6 +2647,92 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertIn("AList 回读不一致", str(outcome["outcomes"][0]["error"]))
         self.assertEqual(engine.planned, [])
         self.assertEqual(engine.executed, [])
+
+    def test_quark_share_fast_save_wins_before_local_torrent(self) -> None:
+        root_job = _example_root_job("engine-quark-share-root")
+
+        class ShareFirstSearch(FakeSearch):
+            def run(self, request):
+                self.requests.append(dict(request))
+                return {"candidates": [{
+                    "provider": "quark_share",
+                    "locator": "quark_share:fixture-share",
+                    "release_name": "Example Show S01E01 1080p",
+                    "title": "Example Show",
+                    "year": "2020",
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "file_coverage": ["S01E01"],
+                    "acquisition": {
+                        "kind": "quark_fast_save",
+                        "share_id": "fixture-share",
+                        "share_url": "https://pan.quark.cn/s/fixture-share",
+                        "file_id_by_gap": {"S01E01": ["share-fid"]},
+                        "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                        "file_size_by_id": {"share-fid": 123},
+                        "save_strategy": "server_side_copy",
+                        "requires_share_revalidation": True,
+                    },
+                }, {
+                    "provider": "magnet",
+                    "locator": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                    "release_name": "Example Show S01E01 1080p",
+                    "title": "Example Show",
+                    "year": "2020",
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "acquisition": {"kind": "torrent"},
+                }]}
+
+        class FakeQuarkBridge:
+            def __init__(self, alist: MemoryAList) -> None:
+                self.alist = alist
+                self.calls: list[tuple[str, object]] = []
+
+            def execute(self, selection, destination, session):
+                self.calls.append((destination, session))
+                self.alist.tree[destination] = [{
+                    "name": "Example.Show.S01E01.mkv",
+                    "is_dir": False,
+                    "size": 123,
+                }]
+                return {
+                    "status": "submitted",
+                    "task_id": "quark-task-1",
+                    "expected_files": [{
+                        "name": "Example.Show.S01E01.mkv",
+                        "size": 123,
+                        "gap_ids": ["S01E01"],
+                    }],
+                }
+
+        class UnexpectedLocalTorrent:
+            def acquire(self, *_args, **_kwargs):
+                raise AssertionError("local Torrent must not run after quark_share success")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = FakeEngine()
+            bridge = FakeQuarkBridge(alist)
+            materializer = FixedTierAutomaticMaterializer(
+                quark_share=QuarkFastSaveAutomaticMaterializer(
+                    bridge=bridge,
+                    session_factory=lambda _alist, _staging: object(),
+                ),
+                local_torrent=UnexpectedLocalTorrent(),
+            )
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=ShareFirstSearch(), materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(outcome["unresolved_gaps"], [])
+        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(len(bridge.calls), 1)
+        self.assertEqual(engine.executed, ["engine-child-1"])
+        self.assertTrue(engine.planned[0]["source_path"].startswith(
+            "/quark/影视/ScrapeFlow/补源/engine-quark-share-root/attempt-",
+        ))
 
     def test_partial_child_output_does_not_resolve_unwritten_episode(self) -> None:
         plan = {
