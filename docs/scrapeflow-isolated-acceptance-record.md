@@ -22,6 +22,7 @@
 ## 预检查
 
 - [ ] `python3 scripts/scrapeflow_release_check.py` 通过。
+- [ ] `python3 scripts/scrapeflow_isolated_preflight.py declaration.json` 通过。
 - [ ] 离线备份 `verify` 通过。
 - [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。
 - [ ] `/api/health` 显示预期 commit 或 build version。

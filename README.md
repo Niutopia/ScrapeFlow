@@ -97,6 +97,8 @@ GET  /api/browse?path=...
   [部署与开启顺序](docs/scrapeflow-deployment-open-order.md)。
 - 本机验收包草稿可用 `python3 scripts/scrapeflow_acceptance_package.py --output /tmp/scrapeflow-acceptance-package.md`
   生成；真实样本仍必须在独立环境中手工补证。
+- 隔离环境声明可用 `python3 scripts/scrapeflow_isolated_preflight.py --template` 生成模板，
+  再用 `python3 scripts/scrapeflow_isolated_preflight.py declaration.json` 做阶段 10 前置检查。
 
 当前的产品规则、启动门状态机、实施阶段和发布检查见[用户选择目标货架后启动实施计划](docs/scrapeflow-target-shelf-start-gate-plan.md)与[架构说明](ARCHITECTURE.md)。在该计划的完成门通过前，不应因本文档解除全局暂停或开放自动执行。
 
