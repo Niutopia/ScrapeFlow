@@ -14,6 +14,7 @@ from local.scrapeflow_api.acceptance_package import (
     compose_evidence,
     git_evidence,
     isolated_preflight_evidence,
+    runtime_readiness_evidence,
 )
 
 
@@ -83,6 +84,45 @@ def valid_isolated_declaration(root: Path) -> dict[str, object]:
         "old_backlog_restored": False,
         "bulk_retry": False,
         "bulk_cleanup": False,
+    }
+
+
+def valid_runtime_readiness_report() -> dict[str, object]:
+    return {
+        "status": "通过",
+        "api_url": "http://127.0.0.1:8765",
+        "expected_commit": "abc1234",
+        "allow_existing_jobs": False,
+        "issues": [],
+        "health": {
+            "build_commit": "abc1234",
+            "connected": True,
+            "tmdb_configured": True,
+            "engine_configured": True,
+            "provider_capabilities": {
+                "quark_share": {"status": "ready"},
+                "quark_magnet": {"status": "ready"},
+                "magnet": {"status": "ready"},
+            },
+            "lane_gates": {
+                "provider_auto_repair_enabled": False,
+                "audit_auto_repair_enabled": False,
+            },
+            "intake": {"enabled": False},
+            "operations": {
+                "jobs_total": 0,
+                "jobs_active": 0,
+                "formal_write_workers": 0,
+                "provider_workers": 0,
+                "provider_active": 0,
+                "audit_running": False,
+            },
+        },
+        "control": {
+            "paused": True,
+            "scheduler_paused": True,
+            "persistent": True,
+        },
     }
 
 
@@ -162,7 +202,9 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("- Git commit: abc1234", package)
         self.assertIn("- 静态部署合同: 通过", package)
         self.assertIn("- 隔离 preflight: 未提供", package)
+        self.assertIn("- Runtime readiness: 未提供", package)
         self.assertIn("- [ ] 隔离 preflight 通过", package)
+        self.assertIn("- [ ] Runtime readiness 通过", package)
         self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
         self.assertIn("| 有效夸克分享 |  | 第一阶完成，后二阶未调用 | 未执行 |  |", package)
         self.assertIn("- [ ] 三条获取线路全部真实可执行。", package)
@@ -234,6 +276,57 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("preflight 问题:", package)
         self.assertIn("provider_workers must be 1", package)
         self.assertIn("formal library shelves", package)
+        self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
+
+    def test_runtime_readiness_evidence_reports_valid_summary(self) -> None:
+        evidence = runtime_readiness_evidence(valid_runtime_readiness_report())
+
+        self.assertEqual(evidence["status"], "通过")
+        self.assertEqual(evidence["issues"], [])
+        self.assertEqual(evidence["summary"]["api_url"], "http://127.0.0.1:8765")
+        self.assertEqual(evidence["summary"]["control_paused"], True)
+        self.assertEqual(
+            evidence["summary"]["provider_lanes"],
+            "magnet, quark_magnet, quark_share",
+        )
+
+    def test_package_draft_includes_runtime_readiness_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_contract_files(root)
+
+            package = build_acceptance_package(
+                root=root,
+                generated_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+                runtime_readiness=valid_runtime_readiness_report(),
+                runner=fake_runner,
+            )
+
+        self.assertIn("- Runtime readiness: 通过", package)
+        self.assertIn("## Runtime Readiness", package)
+        self.assertIn("| api_url | http://127.0.0.1:8765 |", package)
+        self.assertIn("| build_commit | abc1234 |", package)
+        self.assertIn("| control_paused | True |", package)
+        self.assertIn("当前记录: 通过", package)
+
+    def test_package_draft_records_failed_runtime_readiness_without_passing_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_contract_files(root)
+            readiness = valid_runtime_readiness_report()
+            readiness["status"] = "失败"
+            readiness["issues"] = ["operations.jobs_total must be 0 before opening acceptance"]
+
+            package = build_acceptance_package(
+                root=root,
+                generated_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+                runtime_readiness=readiness,
+                runner=fake_runner,
+            )
+
+        self.assertIn("- Runtime readiness: 失败", package)
+        self.assertIn("readiness 问题:", package)
+        self.assertIn("operations.jobs_total must be 0 before opening acceptance", package)
         self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
 
 

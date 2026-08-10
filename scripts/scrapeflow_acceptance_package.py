@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -42,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="include stage-10 isolated preflight declaration status in the package",
     )
+    parser.add_argument(
+        "--runtime-readiness-report",
+        type=Path,
+        help="include JSON from scripts/scrapeflow_runtime_readiness.py --json",
+    )
     args = parser.parse_args(argv)
     declaration = None
     if args.preflight_declaration is not None:
@@ -50,11 +56,22 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             print(f"preflight declaration error: {exc}", file=sys.stderr)
             return 2
+    readiness = None
+    if args.runtime_readiness_report is not None:
+        try:
+            readiness = json.loads(args.runtime_readiness_report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"runtime readiness report error: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(readiness, dict):
+            print("runtime readiness report error: report must be a JSON object", file=sys.stderr)
+            return 2
     package = build_acceptance_package(
         release_check_status=args.release_check_status,
         backup_manifest=args.backup_manifest,
         media_recovery_point=args.media_recovery_point,
         isolated_declaration=declaration,
+        runtime_readiness=readiness,
     )
     if args.output is None:
         print(package)

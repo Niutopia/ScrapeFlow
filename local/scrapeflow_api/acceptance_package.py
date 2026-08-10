@@ -191,6 +191,55 @@ def isolated_preflight_evidence(
     }
 
 
+def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str, object]:
+    """Return status and key startup facts from a runtime readiness report."""
+    if report is None:
+        return {"status": "未提供", "issues": [], "summary": {}}
+    payload = dict(report)
+    issues = payload.get("issues")
+    normalized_issues = [
+        str(issue)
+        for issue in issues
+        if isinstance(issue, str) and issue.strip()
+    ] if isinstance(issues, list) else []
+    health = payload.get("health")
+    control = payload.get("control")
+    health_map = dict(health) if isinstance(health, Mapping) else {}
+    control_map = dict(control) if isinstance(control, Mapping) else {}
+    gates = health_map.get("lane_gates")
+    gate_map = dict(gates) if isinstance(gates, Mapping) else {}
+    operations = health_map.get("operations")
+    operation_map = dict(operations) if isinstance(operations, Mapping) else {}
+    intake = health_map.get("intake")
+    intake_map = dict(intake) if isinstance(intake, Mapping) else {}
+    lanes = health_map.get("provider_capabilities")
+    lane_names = sorted(key for key in lanes if isinstance(key, str)) if isinstance(lanes, Mapping) else []
+    return {
+        "status": str(payload.get("status") or ("失败" if normalized_issues else "通过")),
+        "issues": normalized_issues,
+        "summary": {
+            "api_url": payload.get("api_url", ""),
+            "expected_commit": payload.get("expected_commit", ""),
+            "build_commit": health_map.get("build_commit", ""),
+            "connected": health_map.get("connected", ""),
+            "tmdb_configured": health_map.get("tmdb_configured", ""),
+            "engine_configured": health_map.get("engine_configured", ""),
+            "control_paused": control_map.get("paused", ""),
+            "scheduler_paused": control_map.get("scheduler_paused", ""),
+            "provider_gate": gate_map.get("provider_auto_repair_enabled", ""),
+            "audit_gate": gate_map.get("audit_auto_repair_enabled", ""),
+            "intake_enabled": intake_map.get("enabled", ""),
+            "jobs_total": operation_map.get("jobs_total", ""),
+            "jobs_active": operation_map.get("jobs_active", ""),
+            "formal_write_workers": operation_map.get("formal_write_workers", ""),
+            "provider_workers": operation_map.get("provider_workers", ""),
+            "provider_active": operation_map.get("provider_active", ""),
+            "audit_running": operation_map.get("audit_running", ""),
+            "provider_lanes": ", ".join(lane_names),
+        },
+    }
+
+
 def _sample_table(rows: tuple[tuple[str, str], ...], input_header: str) -> list[str]:
     output = [
         f"| 样本 | {input_header} | 预期 | 结果 | 证据 |",
@@ -208,6 +257,7 @@ def build_acceptance_package(
     backup_manifest: str = "",
     media_recovery_point: str = "",
     isolated_declaration: Mapping[str, object] | None = None,
+    runtime_readiness: Mapping[str, object] | None = None,
     runner: CommandRunner = _run_command,
 ) -> str:
     """Build a Markdown evidence draft for final isolated acceptance."""
@@ -218,6 +268,7 @@ def build_acceptance_package(
     deployment_issues = local_deployment_contract_issues(base)
     static_status = "通过" if not deployment_issues else "失败"
     preflight = isolated_preflight_evidence(isolated_declaration, root=base)
+    readiness = runtime_readiness_evidence(runtime_readiness)
     preflight_summary = preflight["summary"]
     if isinstance(preflight_summary, Mapping):
         backup_manifest = backup_manifest or str(preflight_summary.get("offline_backup_manifest") or "")
@@ -242,6 +293,7 @@ def build_acceptance_package(
         f"- 发布检查: {release_check_status}",
         f"- 静态部署合同: {static_status}",
         f"- 隔离 preflight: {preflight['status']}",
+        f"- Runtime readiness: {readiness['status']}",
         f"- 离线备份 manifest: {backup_manifest or '未提供'}",
         f"- 正式媒体库外部恢复点: {media_recovery_point or '未提供'}",
         "",
@@ -293,11 +345,36 @@ def build_acceptance_package(
             lines.extend(f"- {issue}" for issue in issues)
             lines.append("")
 
+    lines.extend(["## Runtime Readiness", ""])
+    readiness_summary = readiness["summary"]
+    if readiness["status"] == "未提供":
+        lines.extend([
+            "- 状态: 未提供",
+            "- 生成命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`",
+            "",
+        ])
+    elif isinstance(readiness_summary, Mapping):
+        lines.extend([
+            f"- 状态: {readiness['status']}",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+        ])
+        for key, value in readiness_summary.items():
+            lines.append(f"| {key} | {value} |")
+        lines.append("")
+        readiness_issues = readiness["issues"]
+        if isinstance(readiness_issues, list) and readiness_issues:
+            lines.extend(["readiness 问题:", ""])
+            lines.extend(f"- {issue}" for issue in readiness_issues)
+            lines.append("")
+
     lines.extend([
         "## 预检查",
         "",
         f"- [ ] 发布检查通过，命令: `python3 scripts/scrapeflow_release_check.py`，当前记录: {release_check_status}",
         f"- [ ] 隔离 preflight 通过，命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`，当前记录: {preflight['status']}",
+        f"- [ ] Runtime readiness 通过，命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`，当前记录: {readiness['status']}",
         "- [ ] 离线备份 `verify` 通过。",
         "- [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。",
         "- [ ] `/api/health` 显示预期 commit 或 build version。",
@@ -342,4 +419,5 @@ __all__ = [
     "compose_evidence",
     "git_evidence",
     "isolated_preflight_evidence",
+    "runtime_readiness_evidence",
 ]
