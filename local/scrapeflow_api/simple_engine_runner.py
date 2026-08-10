@@ -4660,14 +4660,35 @@ class SimpleEngineRunner:
                 raise EngineExecutionError(f"归档 staging 路径不是目录: {path}")
             return True
 
+        def directory_missing(path: str) -> bool:
+            for delay in (0.0, 0.25, 0.5, 1.0):
+                if delay:
+                    time.sleep(delay)
+                if not directory_exists(path):
+                    return True
+            return False
+
         def remove_empty_checked(path: str) -> None:
+            parent, name = posixpath.split(path.rstrip("/"))
+            if not parent or not name:
+                raise EngineExecutionError(f"归档 staging 路径无效: {path}")
             try:
                 deleted = remove_empty(path)
             except Exception as exc:
                 raise EngineExecutionError(f"无法清理空归档 staging 目录: {path}: {exc}") from exc
             if deleted is False:
                 raise EngineExecutionError(f"归档 staging 目录仍非空，拒绝删除: {path}")
-            if directory_exists(path):
+            if directory_missing(path):
+                return
+            # AList's remove_empty_directory cleans empty descendants for some
+            # drivers but can leave the requested directory itself visible.
+            # The directory was just proven empty, so delete that exact
+            # basename through the ordinary remove endpoint and read it back.
+            try:
+                remove(parent, [name])
+            except Exception as exc:
+                raise EngineExecutionError(f"无法删除空归档 staging 目录: {path}: {exc}") from exc
+            if not directory_missing(path):
                 raise EngineExecutionError(f"归档 staging 清理后目录仍存在: {path}")
 
         removed: list[str] = []

@@ -116,11 +116,12 @@ class Fixture7zRunner:
 class FixtureAList:
     """Minimal remote tree plus the ports used by preprocessing and writer."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, remove_empty_deletes_self: bool = True) -> None:
         self.files: dict[str, bytes] = {}
         self.directories: set[str] = {"/", "/incoming", "/library"}
         self.moves: list[tuple[str, str, tuple[str, ...]]] = []
         self.remove_empty_calls: list[str] = []
+        self.remove_empty_deletes_self = remove_empty_deletes_self
 
     def add_file(self, path: str, payload: bytes) -> None:
         self.files[path] = bytes(payload)
@@ -223,7 +224,8 @@ class FixtureAList:
             raise AssertionError(f"missing directory: {normalized}")
         if self.list(normalized):
             raise AssertionError(f"directory is not empty: {normalized}")
-        self.directories.remove(normalized)
+        if self.remove_empty_deletes_self:
+            self.directories.remove(normalized)
 
 
 class RecordingArchiveAdapter:
@@ -327,8 +329,9 @@ class Phase4GoldenPathTests(unittest.TestCase):
         members: tuple[Member, ...],
         *,
         preserve_archive_staging: bool = False,
+        remove_empty_deletes_self: bool = True,
     ):
-        alist = FixtureAList()
+        alist = FixtureAList(remove_empty_deletes_self=remove_empty_deletes_self)
         source = f"/library/待刮削/{name}"
         if archive_name is None:
             alist.add_file(f"{source}/movie.mkv", VIDEO)
@@ -491,6 +494,7 @@ class Phase4GoldenPathTests(unittest.TestCase):
             "movie.zip",
             (Member("Movie/movie.mkv"),),
             preserve_archive_staging=True,
+            remove_empty_deletes_self=False,
         )
         self.assertEqual(events, ["preprocess", "identity", "planning", "writer"])
         self.assertEqual(record["phase"], "executed")
