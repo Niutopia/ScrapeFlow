@@ -31,6 +31,9 @@ python3 scripts/scrapeflow_release_check.py
 ## 启动后核对
 
 ```sh
+python3 scripts/scrapeflow_runtime_readiness.py \
+  --api-url http://127.0.0.1:8765 \
+  --expected-commit <git-commit>
 curl -fsS http://127.0.0.1:8765/api/health
 curl -fsS http://127.0.0.1:8765/api/control
 ```
