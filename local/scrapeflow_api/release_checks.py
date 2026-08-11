@@ -18,6 +18,24 @@ REQUIRED_ENV_TEMPLATE_VALUES = {
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+    # Keep a concrete host-side helper endpoint in the copied template while
+    # leaving Compose fail-closed when a user has not supplied `.env.local`.
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:8766",
+    "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
+        "replace-with-a-random-helper-token-at-least-24-characters"
+    ),
+    # A first-tier share source must be explicitly enabled and configured;
+    # the copied template never reaches a random network endpoint by default.
+    "SCRAPEFLOW_PANSOU_ENABLED": "0",
+    "SCRAPEFLOW_PANSOU_URL": "",
+    "SCRAPEFLOW_PANSOU_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+    "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+    "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+    # A pilot has no implicit target.  Both selectors must nevertheless be
+    # wired so a real acceptance run does not rely on undocumented host env.
+    "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+    "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 REQUIRED_COMPOSE_DEFAULTS = {
     **REQUIRED_ENV_TEMPLATE_VALUES,
@@ -28,6 +46,16 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "",
+    "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_ENABLED": "0",
+    "SCRAPEFLOW_PANSOU_URL": "",
+    "SCRAPEFLOW_PANSOU_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+    "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+    "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+    "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+    "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 REQUIRED_LOOPBACK_PORTS = {
     "alist": ["127.0.0.1:5244:5244"],
@@ -207,6 +235,7 @@ def release_commands(*, include_docker: bool = True) -> list[ReleaseCommand]:
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         ),
+        ReleaseCommand("git-worktree-clean", ("git", "status", "--porcelain")),
         ReleaseCommand("git-diff-check", ("git", "diff", "--check")),
     ]
     if include_docker:
@@ -371,14 +400,28 @@ def run_release_checks(
         return 1
     for command in release_commands(include_docker=include_docker):
         print("$ " + " ".join(command.args), file=output)
+        status_kwargs: dict[str, object] = {}
+        if command.name == "git-worktree-clean":
+            status_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+            }
         completed = subprocess.run(
             command.args,
             cwd=root,
             env=command.subprocess_env(),
             check=False,
+            **status_kwargs,
         )
         if completed.returncode != 0:
             return completed.returncode
+        if command.name == "git-worktree-clean":
+            status = str(completed.stdout or "").strip()
+            if status:
+                print("working tree is not clean:", file=output)
+                print(status, file=output)
+                return 1
     return 0
 
 

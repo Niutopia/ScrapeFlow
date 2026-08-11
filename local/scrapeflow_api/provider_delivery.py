@@ -20,6 +20,10 @@ ALLOWED_DELIVERY_LANES = frozenset({
     TIER_LOCAL_MAGNET,
 })
 ALLOWED_DELIVERY_KINDS = frozenset({"video", "subtitle"})
+ALLOWED_DELIVERY_KEYS = frozenset({
+    "lane", "attempt_id", "staging_root", "files", "external_task_id",
+})
+ALLOWED_DELIVERY_FILE_KEYS = frozenset({"path", "size", "kind", "gap_ids"})
 FORBIDDEN_DELIVERY_KEYS = frozenset({
     "formal_path",
     "target_root",
@@ -88,6 +92,11 @@ def validate_provider_delivery(
     if not isinstance(delivery, Mapping):
         raise ProviderDeliveryError("delivery 必须是对象")
     _reject_forbidden_keys(delivery)
+    unexpected = sorted(str(key) for key in set(delivery) - ALLOWED_DELIVERY_KEYS)
+    if unexpected:
+        raise ProviderDeliveryError(
+            f"delivery 包含合同外字段: {', '.join(unexpected)}"
+        )
     lane = delivery.get("lane")
     if lane not in ALLOWED_DELIVERY_LANES:
         raise ProviderDeliveryError("delivery lane 无效")
@@ -106,12 +115,23 @@ def validate_provider_delivery(
         raise ProviderDeliveryError("delivery files 不能为空")
 
     normalized_files: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
     for index, raw in enumerate(rows):
         if not isinstance(raw, Mapping):
             raise ProviderDeliveryError("delivery files 项必须是对象")
+        unexpected_file = sorted(
+            str(key) for key in set(raw) - ALLOWED_DELIVERY_FILE_KEYS
+        )
+        if unexpected_file:
+            raise ProviderDeliveryError(
+                f"files[{index}] 包含合同外字段: {', '.join(unexpected_file)}"
+            )
         path = _safe_remote_path(raw.get("path"), label=f"files[{index}].path")
         if not path.startswith(staging_root + "/"):
             raise ProviderDeliveryError("delivery 文件超出当前 staging_root")
+        if path in seen_paths:
+            raise ProviderDeliveryError("delivery 文件路径重复")
+        seen_paths.add(path)
         size = raw.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise ProviderDeliveryError("delivery 文件大小无效")
@@ -130,6 +150,8 @@ def validate_provider_delivery(
             _safe_token(gap_id, label="gap_id")
             for gap_id in gap_ids
         ]
+        if len(normalized_gap_ids) != len(set(normalized_gap_ids)):
+            raise ProviderDeliveryError("delivery 文件 gap_ids 重复")
         normalized_files.append({
             "path": path,
             "size": size,
@@ -143,14 +165,17 @@ def validate_provider_delivery(
         "staging_root": staging_root,
         "files": normalized_files,
     }
-    external = delivery.get("external_task_id")
-    if isinstance(external, str) and external:
-        result["external_task_id"] = _safe_token(external, label="external_task_id")
+    if "external_task_id" in delivery:
+        result["external_task_id"] = _safe_token(
+            delivery.get("external_task_id"), label="external_task_id",
+        )
     return result
 
 
 __all__ = [
     "ALLOWED_DELIVERY_LANES",
+    "ALLOWED_DELIVERY_KEYS",
+    "ALLOWED_DELIVERY_FILE_KEYS",
     "DEFAULT_DELIVERY_PARENT",
     "FORBIDDEN_DELIVERY_KEYS",
     "ProviderDeliveryError",

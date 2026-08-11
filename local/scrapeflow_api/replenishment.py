@@ -1672,21 +1672,51 @@ def _candidate_infohash_aliases(candidate: Mapping[str, Any]) -> set[str]:
     return aliases
 
 
+def _selection_tier(
+    request: Mapping[str, Any],
+    current_tier: str | None,
+) -> str | None:
+    """Return the explicit lane the runtime is allowed to select.
+
+    The historical selector was intentionally useful as a standalone ranking
+    helper and therefore chose the lowest provider present in a result.  The
+    automatic coordinator must not use that behaviour: its durable tier state
+    is the authority.  Keep the optional argument for existing read-only
+    callers, but make a supplied request/argument tier a strict filter.
+    """
+    raw = current_tier if current_tier is not None else request.get("tier")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("补源当前 tier 无效")
+    tier = raw.strip().casefold()
+    if tier not in STRICT_TIER_ORDER or tier not in PROVIDER_ORDER:
+        raise ValueError("补源当前 tier 无效")
+    return tier
+
+
 def select_replenishment_candidates(
-    request: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
+    request: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    current_tier: str | None = None,
 ) -> dict[str, Any]:
     """Select a provider-neutral, per-gap bundle.
 
     Unsupported provider artifacts are untrusted input and are rejected before
     any selection can be persisted or resumed.  A runnable row must be one of
     the fixed acquisition pairs rather than a historical cloud-share or HTTP
-    claim.
+    claim.  When ``current_tier`` (or ``request.tier``) is supplied, candidates
+    from every other lane remain diagnostic evidence only and cannot enter the
+    selected bundle.
     """
+    selection_tier = _selection_tier(request, current_tier)
     gap_ids, gap_lookup = _request_gap_ids(request)
     if not gap_ids:
         return {
             "status": "empty", "selections": [],
             "covered_gap_ids": [], "uncovered_gap_ids": [],
+            **({"tier": selection_tier} if selection_tier is not None else {}),
         }
 
     raw_excluded = request.get("excluded_candidates")
@@ -1789,17 +1819,27 @@ def select_replenishment_candidates(
         valid_by_identity[identity] = preferred
 
     valid = list(valid_by_identity.values())
+    selectable = [
+        row for row in valid
+        if selection_tier is None or str(row["provider"]) == selection_tier
+    ]
     eligible_counts = Counter(str(row["provider"]) for row in valid)
     selected_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     for gap_id in sorted(gap_ids):
-        covering = [row for row in valid if gap_id in row["coverage"]]
+        covering = [row for row in selectable if gap_id in row["coverage"]]
         if not covering:
             continue
-        provider_rank = min(PROVIDER_ORDER[str(row["provider"])] for row in covering)
-        pool = [
-            row for row in covering
-            if PROVIDER_ORDER[str(row["provider"])] == provider_rank
-        ]
+        # A tier-constrained selection is intentionally one-provider only.
+        # Preserve the historical provider ranking for read-only callers that
+        # have not supplied durable tier state.
+        if selection_tier is None:
+            provider_rank = min(PROVIDER_ORDER[str(row["provider"])] for row in covering)
+            pool = [
+                row for row in covering
+                if PROVIDER_ORDER[str(row["provider"])] == provider_rank
+            ]
+        else:
+            pool = covering
         high = [
             row for row in pool
             if QUALITY_ORDER[str(row["resolution"])] >= QUALITY_ORDER["1080p"]
@@ -1835,6 +1875,7 @@ def select_replenishment_candidates(
             else "unknown"
         )
 
+    chain_candidates = selectable if selection_tier is not None else valid
     provider_chain_by_gap = {
         gap_id: [
             {
@@ -1843,7 +1884,7 @@ def select_replenishment_candidates(
                 "acquisition_kind": acquisition_kind(row),
             }
             for row in sorted(
-                (item for item in valid if gap_id in item["coverage"]),
+                (item for item in chain_candidates if gap_id in item["coverage"]),
                 key=lambda item: (
                     PROVIDER_ORDER[str(item["provider"])],
                     tuple(-value for value in _swarm_preference(item)),
@@ -1860,6 +1901,22 @@ def select_replenishment_candidates(
         for gap_id in selection["selected_gap_ids"]
     }
     uncovered = gap_ids - covered
+    selected_identities = set(selected_by_identity)
+    unchecked_current_tier = (
+        sum(
+            1 for row in selectable
+            if (str(row["provider"]), str(row["locator"])) not in selected_identities
+        )
+        if selection_tier is not None else 0
+    )
+    current_tier_candidate_count = (
+        sum(
+            1 for row in candidates
+            if isinstance(row, Mapping)
+            and str(row.get("provider") or "").strip().casefold() == selection_tier
+        )
+        if selection_tier is not None else 0
+    )
     return {
         "status": "complete" if not uncovered else ("partial" if covered else "no_match"),
         "selections": selections,
@@ -1880,4 +1937,10 @@ def select_replenishment_candidates(
             }
             for provider in PROVIDER_DIAGNOSTIC_NAMES
         },
+        **({
+            "tier": selection_tier,
+            "current_tier_candidate_count": current_tier_candidate_count,
+            "eligible_current_tier_candidate_count": len(selectable),
+            "unchecked_current_tier_candidate_count": unchecked_current_tier,
+        } if selection_tier is not None else {}),
     }

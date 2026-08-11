@@ -89,6 +89,47 @@ class ProviderDeliveryContractTests(unittest.TestCase):
         result = validate_provider_delivery(subtitle, root_job_id=ROOT, attempt_id=ATTEMPT)
         self.assertEqual(result["files"][0]["kind"], "subtitle")
 
+    def test_contract_rejects_status_roots_manifest_and_row_provenance(self) -> None:
+        for key, value in (
+            ("status", "ready"),
+            ("media_staging_root", f"{STAGING}/media"),
+            ("subtitle_staging_root", f"{STAGING}/subtitles"),
+            ("manifest", {"files": []}),
+        ):
+            delivery = _delivery(TIER_LOCAL_MAGNET)
+            delivery[key] = value
+            with self.subTest(key=key), self.assertRaises(ProviderDeliveryError):
+                validate_provider_delivery(
+                    delivery, root_job_id=ROOT, attempt_id=ATTEMPT,
+                )
+
+        for key, value in (
+            ("manifest_index", 1),
+            ("provider_path", "Example.S01E01.mkv"),
+            ("source_name", "Example.S01E01.mkv"),
+        ):
+            delivery = _delivery(TIER_LOCAL_MAGNET)
+            delivery["files"][0][key] = value
+            with self.subTest(row_key=key), self.assertRaises(ProviderDeliveryError):
+                validate_provider_delivery(
+                    delivery, root_job_id=ROOT, attempt_id=ATTEMPT,
+                )
+
+    def test_duplicate_paths_and_gap_bindings_are_rejected(self) -> None:
+        duplicate_path = _delivery(TIER_QUARK_SHARE)
+        duplicate_path["files"].append(dict(duplicate_path["files"][0]))
+        with self.assertRaises(ProviderDeliveryError):
+            validate_provider_delivery(
+                duplicate_path, root_job_id=ROOT, attempt_id=ATTEMPT,
+            )
+
+        duplicate_gap = _delivery(TIER_QUARK_MAGNET)
+        duplicate_gap["files"][0]["gap_ids"] = ["S01E01", "S01E01"]
+        with self.assertRaises(ProviderDeliveryError):
+            validate_provider_delivery(
+                duplicate_gap, root_job_id=ROOT, attempt_id=ATTEMPT,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

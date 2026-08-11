@@ -22,6 +22,7 @@ from engine.scrapeflow.replenishment_matching import (
     coverage_tokens,
     expanded_episode_ids,
 )
+from engine.scrapeflow.quark_fast_save_bridge import QuarkShareInDoubtError
 from local.scrapeflow_api.replenishment import (
     _identity_matches,
     _coverage_tokens,
@@ -33,9 +34,13 @@ from local.scrapeflow_api.replenishment import (
 )
 from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRunner
 from local.scrapeflow_api.replenishment_tiers import (
+    EXHAUSTION_MIN_DISTINCT_LOCATORS,
     FAILURE_INFRASTRUCTURE,
     FAILURE_IN_DOUBT,
+    MAGNET_REQUIRED_SOURCES,
     TIER_LOCAL_MAGNET,
+    TIER_QUARK_MAGNET,
+    TIER_QUARK_SHARE,
 )
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
@@ -101,15 +106,24 @@ class FakeSearch:
 
     def run(self, request):
         self.requests.append(dict(request))
+        tier = str(request.get("tier") or TIER_QUARK_SHARE).strip().casefold()
+        acquisition_kind = {
+            TIER_QUARK_SHARE: "quark_fast_save",
+            TIER_QUARK_MAGNET: "quark_magnet_offline",
+            TIER_LOCAL_MAGNET: "torrent",
+        }.get(tier, "quark_fast_save")
         return {
             "candidates": [{
-                "provider": "magnet",
-                "locator": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                "provider": tier,
+                "locator": (
+                    "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+                    if tier == TIER_LOCAL_MAGNET else f"{tier}:fixture"
+                ),
                 "release_name": "Example Show S01E01 1080p",
                 "title": "Example Show",
                 "year": "2020",
                 "files": ["Example.Show.S01E01.mkv"],
-                "acquisition": {"kind": "torrent"},
+                "acquisition": {"kind": acquisition_kind},
             }],
         }
 
@@ -119,17 +133,46 @@ def _ready_delivery(
     files: list[dict[str, object]],
     **extra: object,
 ) -> dict[str, object]:
+    # Test doubles emulate the public Delivery boundary, not the private
+    # torrent/bridge manifest they used to consume.  Runtime must derive all
+    # later behavior from these four file fields alone.
+    del extra
     return {
-        "status": "ready",
         "lane": TIER_LOCAL_MAGNET,
         "attempt_id": posixpath.basename(staging_root.rstrip("/")),
         "staging_root": staging_root,
-        "files": files,
-        **extra,
+        "files": [{
+            "path": row.get("path"),
+            "size": row.get("size"),
+            "kind": row.get("kind"),
+            "gap_ids": row.get("gap_ids"),
+        } for row in files],
     }
 
 
+def _seed_runtime_tier(
+    runtime: AutomaticReplenishmentRuntime,
+    *,
+    job_id: str,
+    gap_ids: list[str],
+    tier: str,
+) -> None:
+    """Set up a legacy persisted state for tests focused below tier one."""
+    for gap_id in gap_ids:
+        runtime._write_gap(  # noqa: SLF001 - targeted durable-state fixture
+            {"id": gap_id, "job_id": job_id, "tier": tier},
+            runtime._gap_path(job_id=job_id, gap_id=gap_id),  # noqa: SLF001
+        )
+
+
 class FakeMaterializer:
+    # This test double creates its single video directly in the in-memory
+    # staging tree.  It is deliberately marked as already admitted so the
+    # production coordinator does not try to run ffprobe against a synthetic
+    # AList endpoint.  Real cloud materializers never expose this flag and
+    # therefore always go through the shared remote admission path.
+    pre_admits_local_video = True
+
     def __init__(self, alist: MemoryAList) -> None:
         self.alist = alist
         self.calls: list[str] = []
@@ -1211,6 +1254,10 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {"candidates": [candidate]}
 
         class ActualAdapterMaterializer:
+            # The exercised adapter calls the shared local ffprobe before it
+            # uploads; the test patches that helper at the transport boundary.
+            pre_admits_local_video = True
+
             def __init__(self) -> None:
                 self.result: dict[str, object] | None = None
 
@@ -1292,6 +1339,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     search=SelectedSearch(), materializer=materializer,
                     staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
                 )
+                _seed_runtime_tier(
+                    runtime,
+                    job_id=root_job.id,
+                    gap_ids=["S01E01"],
+                    tier=TIER_LOCAL_MAGNET,
+                )
                 outcome = runtime.run_for_job(root_job)
 
         result = materializer.result
@@ -1300,10 +1353,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(result["lane"], TIER_LOCAL_MAGNET)
         self.assertTrue(str(result["attempt_id"]).startswith("attempt-"))
         self.assertEqual(
-            result["companion_subtitle_index_by_media_gap"], {"S01E01": [2]},
-        )
-        self.assertEqual(
-            result["file_index_by_gap"], {"S01E01": [1]},
+            set(result), {"lane", "attempt_id", "staging_root", "files"},
         )
         self.assertEqual(
             [row["kind"] for row in result["files"]], ["video", "subtitle"],
@@ -2032,8 +2082,9 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     client=Client(),
                 )
 
-        self.assertEqual(result["media_staging_root"], staging + "/media")
-        self.assertEqual(result["subtitle_staging_root"], staging + "/subtitles")
+        self.assertEqual(
+            set(result), {"lane", "attempt_id", "staging_root", "files"},
+        )
         self.assertEqual(
             [root for root, _name in uploads],
             [staging + "/media", staging + "/subtitles"],
@@ -2125,19 +2176,18 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     client=Client(),
                 )
 
-        self.assertEqual(result["companion_subtitle_index_by_media_gap"], {"S01E01": [2]})
-        self.assertEqual(result["file_index_by_gap"], {"S01E01": [1]})
-        self.assertEqual(result["file_path_by_index"]["2"], "Example.Show.S01E01.CHS.ass")
-        self.assertEqual(result["file_size_by_index"]["2"], 321)
+        self.assertEqual(
+            set(result), {"lane", "attempt_id", "staging_root", "files"},
+        )
         rows = result["files"]
         self.assertEqual(rows[0]["kind"], "video")
-        self.assertEqual(rows[0]["manifest_index"], 1)
         self.assertEqual(rows[0]["gap_ids"], ["S01E01"])
         self.assertEqual(rows[1]["kind"], "subtitle")
-        self.assertEqual(rows[1]["manifest_index"], 2)
         self.assertEqual(rows[1]["gap_ids"], ["S01E01"])
-        self.assertEqual(rows[1]["companion_for_gap_ids"], ["S01E01"])
-        self.assertEqual(rows[1]["subtitle_language"], "zh")
+        self.assertTrue(all(
+            set(row) == {"path", "size", "kind", "gap_ids"}
+            for row in rows
+        ))
 
     def test_task_staging_parent_is_created_before_attempt(self) -> None:
         class FakeClient:
@@ -2725,26 +2775,64 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 [
                     "gap_discovering", "provider_searching", "acquiring",
                     "staging_verifying", "child_planning", "child_executing",
-                    "final_verifying", "cleaning",
+                    "final_verifying",
                 ],
             )
             self.assertTrue(engine.planned[0]["source_path"].startswith(
                 "/quark/影视/ScrapeFlow/补源/engine-root/attempt-",
             ))
-            # The attempt and its empty per-job parent are gone; the shared
-            # staging root itself is never removed.
-            self.assertEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            # A successful child is not permission to delete its provider
+            # staging.  It remains task-owned until a later, scoped audit
+            # proves this exact gap is absent.
+            self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
             state_files = list((Path(temporary) / "gaps").rglob("*.json"))
             self.assertEqual(len(state_files), 1)
             state = json.loads(state_files[0].read_text(encoding="utf-8"))
-            self.assertEqual(state["phase"], "resolved")
+            self.assertEqual(state["phase"], "waiting_reaudit")
+            marker = state["post_acquisition_reaudit"]
+            self.assertEqual(marker["status"], "pending")
+            self.assertEqual(marker["selected_gap_ids"], ["S01E01"])
 
-            # A provider retry updates the same state instead of creating a
-            # second random gap record.
+            # A provider retry must not create a second attempt while the
+            # targeted audit owns the first attempt's staging.
             again = runtime.run_for_job(root_job)
-            self.assertEqual(again["already_resolved_gap_ids"], ["S01E01"])
+            self.assertEqual(again["pending_reaudit_gap_ids"], ["S01E01"])
             self.assertEqual(len(list((Path(temporary) / "gaps").rglob("*.json"))), 1)
             self.assertEqual(len(search.requests), 1)
+
+            # A stale/equal timestamp or a report that still contains the
+            # selected gap cannot free staging.
+            same_time = runtime.reconcile_post_acquisition_reaudit(
+                root_job.id,
+                audit_started_at=marker["requested_at"],
+                audit_complete=True,
+                actionable_gap_ids=[],
+                audit_uncertain=False,
+            )
+            self.assertEqual(same_time["pending_attempt_ids"], [marker["attempt_id"]])
+            self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            still_missing = runtime.reconcile_post_acquisition_reaudit(
+                root_job.id,
+                audit_started_at="2099-01-01T00:00:00.000000Z",
+                audit_complete=True,
+                actionable_gap_ids=["S01E01"],
+                audit_uncertain=False,
+            )
+            self.assertEqual(still_missing["pending_attempt_ids"], [marker["attempt_id"]])
+            self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+
+            cleaned = runtime.reconcile_post_acquisition_reaudit(
+                root_job.id,
+                audit_started_at="2099-01-01T00:00:01.000000Z",
+                audit_complete=True,
+                actionable_gap_ids=[],
+                audit_uncertain=False,
+            )
+            self.assertEqual(cleaned["cleaned_attempt_ids"], [marker["attempt_id"]])
+            self.assertEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            state = json.loads(state_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "resolved")
+            self.assertEqual(state["post_acquisition_reaudit"]["status"], "cleaned")
 
             audit_plan = {
                 **plan,
@@ -2757,7 +2845,255 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             runtime.run_for_job(audit_job)
             audit_again = runtime.run_for_job(audit_job)
             self.assertEqual(audit_again["already_resolved_gap_ids"], [])
-            self.assertEqual(len(search.requests), 3)
+            self.assertEqual(audit_again["pending_reaudit_gap_ids"], ["S01E01"])
+            self.assertEqual(len(search.requests), 2)
+
+    def test_runtime_does_not_select_a_later_provider_without_tier_proof(self) -> None:
+        """A first-tier miss is not permission to use a visible magnet row."""
+        root_job = _example_root_job("engine-strict-tier-filter")
+
+        class LocalOnlySearch:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+
+            def run(self, request):
+                self.requests.append(dict(request))
+                return {"candidates": [{
+                    "provider": TIER_LOCAL_MAGNET,
+                    "locator": (
+                        "magnet:?xt=urn:btih:"
+                        "0123456789012345678901234567890123456789"
+                    ),
+                    "release_name": "Example Show S01E01 1080p",
+                    "title": "Example Show",
+                    "year": "2020",
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "acquisition": {"kind": "torrent"},
+                }]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            search = LocalOnlySearch()
+            materializer = FakeMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=alist,
+                search=search, materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            outcome = runtime.run_for_job(root_job)
+            state = json.loads(
+                (Path(temporary) / "gaps" / root_job.id / "S01E01.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+
+        self.assertEqual(search.requests[0]["tier"], TIER_QUARK_SHARE)
+        self.assertEqual(materializer.calls, [])
+        self.assertEqual(state["tier"], TIER_QUARK_SHARE)
+        self.assertEqual(state["tier_status"], "candidate_failed")
+        self.assertTrue(outcome["outcomes"][0]["error"])
+
+    def test_runtime_advances_share_only_after_complete_no_candidate_proof(self) -> None:
+        """A PanSou-complete first tier may advance exactly to Quark magnet."""
+        root_job = _example_root_job("engine-share-proof-advance")
+
+        class Search:
+            def __init__(self) -> None:
+                self.tiers: list[str] = []
+
+            def run(self, request):
+                tier = str(request["tier"])
+                self.tiers.append(tier)
+                if tier == TIER_QUARK_SHARE:
+                    return {
+                        "candidates": [],
+                        "search_complete_no_candidates": True,
+                        "completed_sources": ["pansou"],
+                        "unchecked_secondary_candidates": 0,
+                    }
+                if tier == TIER_QUARK_MAGNET:
+                    return {"candidates": [{
+                        "provider": TIER_QUARK_MAGNET,
+                        "locator": "quark_magnet:fixture",
+                        "release_name": "Example Show S01E01 1080p",
+                        "title": "Example Show",
+                        "year": "2020",
+                        "files": ["Example.Show.S01E01.mkv"],
+                        "acquisition": {"kind": "quark_magnet_offline"},
+                    }]}
+                raise AssertionError(f"unexpected tier: {tier}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            search = Search()
+            materializer = FakeMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=alist,
+                search=search, materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=2,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(search.tiers, [TIER_QUARK_SHARE, TIER_QUARK_MAGNET])
+        self.assertEqual(len(materializer.calls), 1)
+        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+
+    def test_runtime_requires_all_second_tier_sources_before_local_magnet(self) -> None:
+        """Partial Quark-magnet source telemetry cannot reach local Torrent."""
+        root_job = _example_root_job("engine-magnet-proof-advance")
+
+        class Search:
+            def __init__(self) -> None:
+                self.tiers: list[str] = []
+
+            def run(self, request):
+                tier = str(request["tier"])
+                self.tiers.append(tier)
+                if tier == TIER_QUARK_MAGNET:
+                    return {
+                        "candidates": [],
+                        "search_complete_no_candidates": True,
+                        "completed_sources": sorted(MAGNET_REQUIRED_SOURCES),
+                        "unchecked_secondary_candidates": 0,
+                    }
+                if tier == TIER_LOCAL_MAGNET:
+                    return {"candidates": [{
+                        "provider": TIER_LOCAL_MAGNET,
+                        "locator": (
+                            "magnet:?xt=urn:btih:"
+                            "0123456789012345678901234567890123456789"
+                        ),
+                        "release_name": "Example Show S01E01 1080p",
+                        "title": "Example Show",
+                        "year": "2020",
+                        "files": ["Example.Show.S01E01.mkv"],
+                        "acquisition": {"kind": "torrent"},
+                    }]}
+                raise AssertionError(f"unexpected tier: {tier}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            search = Search()
+            materializer = FakeMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=alist,
+                search=search, materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=2,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_QUARK_MAGNET,
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(search.tiers, [TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET])
+        self.assertEqual(len(materializer.calls), 1)
+        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+
+    def test_runtime_keeps_second_tier_when_source_proof_is_incomplete(self) -> None:
+        root_job = _example_root_job("engine-magnet-incomplete-proof")
+
+        class IncompleteSearch:
+            def run(self, _request):
+                return {
+                    "candidates": [],
+                    "search_complete_no_candidates": True,
+                    "completed_sources": ["animetosho"],
+                    "unchecked_secondary_candidates": 0,
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            materializer = FakeMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=alist,
+                search=IncompleteSearch(), materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_QUARK_MAGNET,
+            )
+            outcome = runtime.run_for_job(root_job)
+            state = json.loads(
+                (Path(temporary) / "gaps" / root_job.id / "S01E01.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+
+        self.assertEqual(materializer.calls, [])
+        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier_status"], "candidate_failed")
+        self.assertTrue(outcome["outcomes"][0]["error"])
+
+    def test_runtime_candidate_round_limit_preserves_advanced_tier_state(self) -> None:
+        """The bounded invocation must not relabel its 30th bad release infra."""
+        root_job = _example_root_job("engine-candidate-limit-state")
+
+        candidate = {
+            "provider": TIER_QUARK_SHARE,
+            "locator": "quark_share:fixture-30",
+            "release_name": "Example Show S01E01 1080p",
+            "title": "Example Show",
+            "year": "2020",
+            "files": ["Example.Show.S01E01.mkv"],
+            "acquisition": {"kind": "quark_fast_save"},
+        }
+
+        class Search:
+            def run(self, _request):
+                return {"candidates": [dict(candidate)]}
+
+        class CandidateFailure:
+            def acquire(self, _request, selections, *, staging_root, workspace, alist):
+                del staging_root, workspace, alist
+                raise ReplenishmentCandidateError(
+                    "share is no longer available", candidate=selections[0],
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=FakeEngine(),
+                alist=MemoryAList(),
+                search=Search(),
+                materializer=CandidateFailure(),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+            )
+            runtime._write_gap(  # noqa: SLF001 - durable 29-failure fixture
+                {
+                    "id": "S01E01",
+                    "job_id": root_job.id,
+                    "tier": TIER_QUARK_SHARE,
+                    "candidate_failures_by_provider": {
+                        TIER_QUARK_SHARE: [
+                            f"quark_share:fixture-{index}"
+                            for index in range(EXHAUSTION_MIN_DISTINCT_LOCATORS - 1)
+                        ],
+                    },
+                },
+                runtime._gap_path(  # noqa: SLF001 - durable fixture path
+                    job_id=root_job.id, gap_id="S01E01",
+                ),
+            )
+
+            outcome = runtime.run_for_job(root_job)
+            state = json.loads(
+                (state_root / "gaps" / root_job.id / "S01E01.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+
+        self.assertTrue(outcome["outcomes"][0]["error"])
+        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier_status"], "advanced")
+        self.assertEqual(state["last_error_scope"], "candidate")
 
     def test_local_torrent_runtime_workspace_is_state_staging_attempt(self) -> None:
         root_job = _example_root_job("engine-local-torrent-workspace")
@@ -2810,6 +3146,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 materializer=LocalTorrentAutomaticMaterializer(delegate=delegate),
                 staging_root="/quark/影视/ScrapeFlow/补源",
                 max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_LOCAL_MAGNET,
             )
             outcome = runtime.run_for_job(root_job)
 
@@ -2919,7 +3261,19 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist = alist
                 self.calls: list[tuple[str, object]] = []
 
-            def execute(self, selection, destination, session):
+            def execute(
+                self,
+                selection,
+                destination,
+                session,
+                *,
+                task_id=None,
+                on_task_id=None,
+            ):
+                if task_id is not None:
+                    raise AssertionError("first Quark save must not reuse a task id")
+                if on_task_id is not None:
+                    on_task_id("quark-task-1")
                 self.calls.append((destination, session))
                 self.alist.tree[destination] = [{
                     "name": "Example.Show.S01E01.mkv",
@@ -2955,6 +3309,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=ShareFirstSearch(), materializer=materializer,
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
             )
             outcome = runtime.run_for_job(root_job)
 
@@ -2965,6 +3320,173 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertTrue(engine.planned[0]["source_path"].startswith(
             "/quark/影视/ScrapeFlow/补源/engine-quark-share-root/attempt-",
         ))
+
+    def test_quark_share_materializer_persists_and_reuses_task_id(self) -> None:
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "release_name": "Example Show S01E01 1080p",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+            },
+        }
+
+        class ReusingBridge:
+            def __init__(self, state_path: Path) -> None:
+                self.state_path = state_path
+                self.task_ids: list[str | None] = []
+                self.callback_states: list[dict[str, object]] = []
+
+            def execute(
+                self,
+                _selection,
+                _destination,
+                _session,
+                *,
+                task_id=None,
+                on_task_id=None,
+            ):
+                self.task_ids.append(task_id)
+                if task_id is None:
+                    task_id = "quark-share-task-1"
+                    if on_task_id is not None:
+                        on_task_id(task_id)
+                    # The task id must be durable before the bridge can poll
+                    # or return from the original save call.
+                    self.callback_states.append(json.loads(
+                        self.state_path.read_text(encoding="utf-8")
+                    ))
+                elif on_task_id is not None:
+                    raise AssertionError(
+                        "a restored task must be queried without a callback"
+                    )
+                return {
+                    "status": "submitted",
+                    "task_id": task_id,
+                    "expected_files": [{
+                        "name": "Example.Show.S01E01.mkv",
+                        "size": 123,
+                        "gap_ids": ["S01E01"],
+                    }],
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            state_path = workspace / "quark_share_attempt.json"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reuse"
+            bridge = ReusingBridge(state_path)
+            materializer = QuarkFastSaveAutomaticMaterializer(
+                bridge=bridge,
+                session_factory=lambda _alist, _staging: object(),
+            )
+            alist = MemoryAList()
+
+            first = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+            second = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(bridge.task_ids, [None, "quark-share-task-1"])
+        self.assertEqual(first["external_task_id"], "quark-share-task-1")
+        self.assertEqual(second["external_task_id"], "quark-share-task-1")
+        self.assertEqual(set(state), {
+            "provider", "attempt_id", "staging_root", "task_id",
+            "locator", "selected_gap_ids", "updated_at",
+        })
+        self.assertEqual(state["provider"], TIER_QUARK_SHARE)
+        self.assertEqual(state["attempt_id"], "attempt-reuse")
+        self.assertEqual(state["staging_root"], staging)
+        self.assertEqual(state["task_id"], "quark-share-task-1")
+        self.assertEqual(state["locator"], "quark_share:fixture-share")
+        self.assertEqual(state["selected_gap_ids"], ["S01E01"])
+        self.assertTrue(str(state["updated_at"]).endswith("Z"))
+        self.assertEqual(
+            bridge.callback_states[0]["task_id"],
+            "quark-share-task-1",
+        )
+
+    def test_quark_share_materializer_rejects_corrupt_or_wrong_attempt_state(self) -> None:
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {"kind": "quark_fast_save", "share_id": "fixture-share"},
+        }
+
+        class UnexpectedBridge:
+            def execute(self, *_args, **_kwargs):
+                raise AssertionError("invalid attempt state must fail before Quark access")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            state_path = workspace / "quark_share_attempt.json"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-owned"
+            materializer = QuarkFastSaveAutomaticMaterializer(
+                bridge=UnexpectedBridge(),
+                session_factory=lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("invalid state must fail before session creation")
+                ),
+            )
+            alist = MemoryAList()
+
+            state_path.write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(Exception, "attempt 状态不可读"):
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+            state_path.write_text(json.dumps({
+                "provider": TIER_QUARK_SHARE,
+                "attempt_id": "attempt-other",
+                "staging_root": staging,
+                "task_id": "quark-share-task-1",
+                "locator": "quark_share:fixture-share",
+                "selected_gap_ids": ["S01E01"],
+                "updated_at": "2026-08-10T00:00:00Z",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(Exception, "不属于当前候选与 staging"):
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+    def test_quark_share_materializer_preserves_in_doubt_failure_scope(self) -> None:
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {"kind": "quark_fast_save", "share_id": "fixture-share"},
+        }
+
+        class UnknownSubmissionBridge:
+            def execute(self, *_args, **_kwargs):
+                raise QuarkShareInDoubtError("save outcome is unknown")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            materializer = QuarkFastSaveAutomaticMaterializer(
+                bridge=UnknownSubmissionBridge(),
+                session_factory=lambda *_args: object(),
+            )
+            with self.assertRaises(QuarkShareInDoubtError) as raised:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root=(
+                        "/quark/影视/ScrapeFlow/补源/root/attempt-unknown"
+                    ),
+                    workspace=Path(temporary) / "workspace",
+                    alist=MemoryAList(),
+                )
+
+        self.assertEqual(raised.exception.failure_scope, FAILURE_IN_DOUBT)
 
     def test_quark_magnet_offline_wins_before_local_torrent(self) -> None:
         root_job = _example_root_job("engine-quark-magnet-root")
@@ -3046,6 +3568,13 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=MagnetFirstSearch(), materializer=materializer,
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_QUARK_MAGNET,
             )
             outcome = runtime.run_for_job(root_job)
 
@@ -3165,6 +3694,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 search=PartialSearch(), materializer=FakeMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
             )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01", "S01E02"],
+                tier=TIER_LOCAL_MAGNET,
+            )
             outcome = runtime.run_for_job(root_job)
             states = {
                 path.stem: json.loads(path.read_text(encoding="utf-8"))
@@ -3172,7 +3707,13 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             }
 
         self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
-        self.assertEqual(states["S01E01"]["phase"], "resolved")
+        # The written episode is held until a later scoped audit confirms it
+        # is visible in the formal library; only the unwritten sibling is
+        # eligible for another provider attempt now.
+        self.assertEqual(states["S01E01"]["phase"], "waiting_reaudit")
+        self.assertEqual(
+            states["S01E01"]["post_acquisition_reaudit"]["status"], "pending",
+        )
         self.assertEqual(states["S01E02"]["phase"], "retry_wait")
         self.assertIsNone(states["S01E02"]["active_attempt"])
 
@@ -3239,6 +3780,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=MovieSearch(), materializer=MovieMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["missing_media:8:Example Movie"],
+                tier=TIER_LOCAL_MAGNET,
             )
             outcome = runtime.run_for_job(root_job)
 
@@ -3326,6 +3873,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
                 progress=lambda _job, phase, _details: progress.append(phase),
             )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=[subtitle_gap_id],
+                tier=TIER_LOCAL_MAGNET,
+            )
 
             outcome = runtime.run_for_job(root_job)
 
@@ -3349,10 +3902,10 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 progress,
                 [
                     "gap_discovering", "provider_searching", "acquiring",
-                    "staging_verifying", "subtitle_installing", "final_verifying", "cleaning",
+                    "staging_verifying", "subtitle_installing", "final_verifying",
                 ],
             )
-            self.assertEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
 
     def test_mixed_media_request_installs_only_its_explicit_subtitle_gap(self) -> None:
         """A video child may reuse an exact subtitle companion after its move."""
@@ -3466,6 +4019,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=MixedSearch(), materializer=MixedMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01", subtitle_id],
+                tier=TIER_LOCAL_MAGNET,
             )
             outcome = runtime.run_for_job(root_job)
 
@@ -3617,6 +4176,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=CompanionSearch(), materializer=CompanionMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_LOCAL_MAGNET,
             )
             outcome = runtime.run_for_job(root_job)
         return outcome, engine
@@ -3837,6 +4402,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 search=MixedSearch(), materializer=IsolatedMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
             )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01", subtitle_id],
+                tier=TIER_LOCAL_MAGNET,
+            )
             outcome = runtime.run_for_job(root_job)
 
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01", subtitle_id])
@@ -3998,6 +4569,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 materializer=NoPeerMaterializer(),
                 staging_root="/quark/影视/ScrapeFlow/补源",
                 max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                first,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_LOCAL_MAGNET,
             )
 
             failed = first.run_for_job(root_job)
@@ -4180,7 +4757,10 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(successful_materializer.calls, [staging])
         self.assertEqual(successful_materializer.workspaces, [workspace])
         self.assertEqual(succeeded["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(resolved_state["phase"], "resolved")
+        self.assertEqual(resolved_state["phase"], "waiting_reaudit")
+        self.assertEqual(
+            resolved_state["post_acquisition_reaudit"]["status"], "pending",
+        )
         self.assertIsNone(resolved_state["active_attempt"])
 
     def test_in_doubt_failure_preserves_attempt_without_candidate_exclusion(self) -> None:
@@ -4224,14 +4804,20 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             state_path = state_root / "gaps" / root_job.id / "S01E01.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
             staging = materializer.calls[0]
+            retry = runtime.run_for_job(root_job)
+            retried_state = json.loads(state_path.read_text(encoding="utf-8"))
 
         self.assertTrue(any(row.get("error") for row in outcome["outcomes"]))
         self.assertEqual(len(search.requests), 1)
         self.assertEqual(len(materializer.calls), 1)
         self.assertEqual(state["last_error_scope"], FAILURE_IN_DOUBT)
+        self.assertEqual(state["phase"], "waiting_reconcile")
+        self.assertEqual(state["tier_status"], "waiting_reconcile")
         self.assertEqual(state["external_task_id"], "quark-task-in-doubt")
         self.assertNotIn("excluded_candidates", state)
         self.assertEqual(state["active_attempt"]["staging_root"], staging)
+        self.assertTrue(retry["outcomes"][0]["error"])
+        self.assertEqual(retried_state["phase"], "waiting_reconcile")
         self.assertEqual(
             alist.tree[staging],
             [{"name": "waiting.mkv", "is_dir": False, "size": 123}],
@@ -4244,15 +4830,15 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 "locator": f"torrent:https://example.invalid/{index}.torrent",
                 "infohash": f"{index:040x}",
             }
-            for index in range(25)
+            for index in range(31)
         ]
         rows.append({"provider": "magnet", "locator": "x" * 4097})
 
         exclusions = AutomaticReplenishmentRuntime._merge_excluded_candidates(rows)
 
-        self.assertEqual(len(exclusions), 24)
+        self.assertEqual(len(exclusions), 30)
         self.assertEqual(exclusions[0]["infohash"], f"{1:040x}")
-        self.assertEqual(exclusions[-1]["infohash"], f"{24:040x}")
+        self.assertEqual(exclusions[-1]["infohash"], f"{30:040x}")
 
 
 if __name__ == "__main__":

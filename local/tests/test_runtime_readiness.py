@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from engine.scrapeflow.provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 from local.scrapeflow_api.runtime_readiness import runtime_readiness_report
 
 
@@ -19,6 +20,16 @@ def healthy_payload(*, commit: str = "abc1234", jobs_total: int = 0) -> dict[str
             "quark_share": {"status": "ready"},
             "quark_magnet": {"status": "ready"},
             "magnet": {"status": "ready"},
+        },
+        "helper_readiness": {
+            "quark": {
+                "configured": True,
+                "reachable": True,
+                "authenticated": True,
+                "status": "ready",
+                "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+                "actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+            },
         },
         "lane_gates": {
             "provider_auto_repair_enabled": False,
@@ -148,6 +159,47 @@ class RuntimeReadinessTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "失败")
         self.assertTrue(any("jobs_total" in issue for issue in blocked["issues"]))
         self.assertEqual(allowed["status"], "通过")
+
+    def test_static_lane_status_cannot_substitute_for_helper_readiness(self) -> None:
+        health = healthy_payload()
+        del health["helper_readiness"]
+
+        report = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            fetch_json=fake_fetcher(health=health),
+        )
+
+        self.assertEqual(report["status"], "失败")
+        self.assertIn(
+            "health.helper_readiness must be an object",
+            report["issues"],
+        )
+
+    def test_helper_requires_authenticated_fixed_action_contract(self) -> None:
+        health = healthy_payload()
+        helper = health["helper_readiness"]["quark"]
+        helper["authenticated"] = False
+        helper["actions"] = ["health", "magnet-submit"]
+
+        report = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            fetch_json=fake_fetcher(health=health),
+        )
+
+        self.assertEqual(report["status"], "失败")
+        self.assertTrue(any("authenticated" in issue for issue in report["issues"]))
+        self.assertTrue(any("actions" in issue for issue in report["issues"]))
+
+    def test_lane_status_is_only_a_capability_declaration(self) -> None:
+        health = healthy_payload()
+        health["provider_capabilities"]["quark_magnet"]["status"] = "unavailable"
+
+        report = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            fetch_json=fake_fetcher(health=health),
+        )
+
+        self.assertEqual(report["status"], "通过")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
+from engine.scrapeflow.provider_capabilities import (
+    QUARK_HELPER_NAME,
+    QUARK_HELPER_REQUIRED_ACTIONS,
+)
+
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "quark_magnet", "magnet"})
@@ -74,6 +79,58 @@ def _commit_matches(actual: object, expected: str | None) -> bool:
     return left == right or left.startswith(right) or right.startswith(left)
 
 
+def _check_quark_helper_readiness(
+    health: Mapping[str, object],
+    issues: list[str],
+) -> None:
+    """Require a live, authenticated helper proof rather than lane metadata.
+
+    ``provider_capabilities`` intentionally remains a backwards-compatible
+    declaration of the materializer contract.  Its static ``status=ready``
+    must never be interpreted as evidence that the host-side Quark Helper is
+    available for a real pilot.
+    """
+    helpers = health.get("helper_readiness")
+    if not isinstance(helpers, Mapping):
+        issues.append("health.helper_readiness must be an object")
+        return
+    helper = helpers.get(QUARK_HELPER_NAME)
+    if not isinstance(helper, Mapping):
+        issues.append("health.helper_readiness.quark must be an object")
+        return
+    for key in ("configured", "reachable", "authenticated"):
+        if helper.get(key) is not True:
+            issues.append(f"helper quark.{key} must be true")
+    if helper.get("status") != "ready":
+        issues.append("helper quark.status must be ready")
+    def fixed_action_list(value: object, *, field: str) -> list[str] | None:
+        if not isinstance(value, list) or any(
+            not isinstance(action, str) or not action.strip()
+            for action in value
+        ):
+            issues.append(f"helper quark.{field} must be a string list")
+            return None
+        normalized = [action.strip() for action in value]
+        if len(normalized) != len(set(normalized)):
+            issues.append(f"helper quark.{field} must not contain duplicates")
+            return None
+        if set(normalized) != set(QUARK_HELPER_REQUIRED_ACTIONS):
+            issues.append(f"helper quark.{field} must match the fixed helper contract")
+            return None
+        return normalized
+
+    required_actions = fixed_action_list(
+        helper.get("required_actions"), field="required_actions",
+    )
+    actions = fixed_action_list(helper.get("actions"), field="actions")
+    if required_actions is None or actions is None:
+        return
+    if set(required_actions) != set(actions):
+        # This is intentionally redundant with the fixed-contract checks: it
+        # leaves a clear diagnostic if a future schema relaxes one side.
+        issues.append("helper quark.required_actions must equal actions")
+
+
 def _check_health(
     health: Mapping[str, object],
     *,
@@ -99,8 +156,10 @@ def _check_health(
             issues.append("health.provider_capabilities must expose exactly the fixed three lanes")
         for lane in EXPECTED_PROVIDER_LANES:
             row = lanes.get(lane)
-            if not isinstance(row, Mapping) or row.get("status") != "ready":
-                issues.append(f"provider lane {lane} must be ready")
+            if not isinstance(row, Mapping):
+                issues.append(f"provider lane {lane} must be an object")
+
+    _check_quark_helper_readiness(health, issues)
 
     gates = health.get("lane_gates")
     if not isinstance(gates, Mapping):

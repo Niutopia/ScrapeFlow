@@ -109,7 +109,9 @@ class HttpQuarkHelperClient:
                     message = str(error_value.get("error") or error_value.get("message") or "")
             except (UnicodeError, json.JSONDecodeError):
                 pass
-            if exc.code == 409 and in_doubt:
+            if path == "/v1/magnet-submit" and (
+                (exc.code == 409 and in_doubt) or exc.code >= 500
+            ):
                 raise QuarkMagnetInDoubtError(
                     "Quark magnet submit is in doubt; reconcile the task destination"
                 ) from exc
@@ -117,10 +119,18 @@ class HttpQuarkHelperClient:
                 f"Quark helper HTTP error: status={exc.code}, message={message[:200]!r}"
             ) from exc
         except Exception as exc:
+            if path == "/v1/magnet-submit":
+                raise QuarkMagnetInDoubtError(
+                    "Quark magnet submit response is unknown; reconcile before retrying"
+                ) from exc
             raise QuarkMagnetBridgeError(
                 f"Quark helper unavailable: {type(exc).__name__}"
             ) from exc
         if not isinstance(value, Mapping):
+            if path == "/v1/magnet-submit":
+                raise QuarkMagnetInDoubtError(
+                    "Quark magnet submit returned an invalid response; reconcile before retrying"
+                )
             raise QuarkMagnetBridgeError("Quark helper returned a non-object response")
         return value
 
@@ -249,7 +259,9 @@ class QuarkMagnetOfflineBridge:
             })
             task_id = submitted.get("task_id")
             if not isinstance(task_id, str) or not task_id:
-                raise QuarkMagnetBridgeError("Quark helper did not return task_id")
+                raise QuarkMagnetInDoubtError(
+                    "Quark helper did not return task_id; reconcile before retrying"
+                )
             if on_task_id is not None:
                 try:
                     on_task_id(task_id)

@@ -13,6 +13,7 @@ from engine.scrapeflow.quark_fast_save_bridge import (
     QUARK_SHARE_API,
     QuarkFastSaveBridge,
     QuarkSession,
+    QuarkShareInDoubtError,
     QuarkShareExpiredError,
     UrlLibQuarkTransport,
     delegated_quark_session,
@@ -136,6 +137,64 @@ class QuarkFastSaveBridgeTests(unittest.TestCase):
         self.assertEqual(transport.calls[-2]["body"]["fid_list"], ["share-fid"])
         self.assertEqual(transport.calls[-2]["body"]["to_pdir_fid"], "attempt")
         self.assertNotIn("SECRET_COOKIE", json.dumps(result))
+
+    def test_existing_share_task_only_queries_status_without_saving_again(self) -> None:
+        transport = FixtureTransport([
+            {"status": 200, "code": 0, "data": {"status": 2}},
+        ])
+        bridge = QuarkFastSaveBridge(transport, sleep=mock.Mock())
+
+        result = bridge.execute(
+            _selection(),
+            "/quark/影视/ScrapeFlow/补源/root/attempt",
+            QuarkSession("/quark", "mount-root", "SECRET_COOKIE"),
+            task_id="task-fixture",
+        )
+
+        self.assertEqual(result["task_id"], "task-fixture")
+        self.assertEqual(
+            [call["endpoint"] for call in transport.calls],
+            [QUARK_SHARE_API + "/task"],
+        )
+
+    def test_unsaved_share_task_id_is_in_doubt(self) -> None:
+        transport = FixtureTransport([
+            {"status": 200, "code": 0, "data": {"stoken": "fixture-stoken"}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "season", "file_name": "Season 01", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "share-fid", "share_fid_token": "fixture-fid-token",
+                "file_name": "Example.Show.S01E01.mkv", "file": True, "size": 123,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "movies", "file_name": "影视", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "sf", "file_name": "ScrapeFlow", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "repl", "file_name": "补源", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "root", "file_name": "root", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"list": [{
+                "fid": "attempt", "file_name": "attempt", "file": False,
+            }]}},
+            {"status": 200, "code": 0, "data": {"task_id": "task-fixture"}},
+        ])
+        bridge = QuarkFastSaveBridge(transport, sleep=mock.Mock())
+
+        with self.assertRaises(QuarkShareInDoubtError) as raised:
+            bridge.execute(
+                _selection(),
+                "/quark/影视/ScrapeFlow/补源/root/attempt",
+                QuarkSession("/quark", "mount-root", "SECRET_COOKIE"),
+                on_task_id=lambda _task_id: (_ for _ in ()).throw(OSError("state disk full")),
+            )
+
+        self.assertEqual(raised.exception.failure_scope, "in_doubt")
 
     def test_cancelled_share_http_error_is_candidate_failure(self) -> None:
         response = urllib.error.HTTPError(

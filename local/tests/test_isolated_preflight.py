@@ -6,22 +6,60 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.isolated_preflight import (
     isolated_preflight_issues,
     isolated_preflight_template,
     load_declaration,
 )
+from local.scrapeflow_api.offline_backup import MANIFEST_NAME, create_offline_backup
+
+
+def _verified_backup_manifest(root: Path) -> Path:
+    source = root / "backup-source"
+    alist_source = source / "alist-data"
+    scrapeflow_source = source / "scrapeflow-data"
+    alist_source.mkdir(parents=True)
+    scrapeflow_source.mkdir(parents=True)
+    atomic_write_json(alist_source / "config.json", {"version": 1}, allow_nan=False)
+    atomic_write_json(
+        scrapeflow_source / "global-control.json",
+        {
+            "version": 1,
+            "paused": True,
+            "scheduler_paused": True,
+            "persistent": True,
+            "updated_at": "2026-08-10T00:00:00Z",
+            "reason": "test pause",
+        },
+        allow_nan=False,
+    )
+    output = root / "backup"
+    output.mkdir()
+    create_offline_backup(
+        alist_data=alist_source,
+        scrapeflow_data=scrapeflow_source,
+        output_dir=output,
+        media_snapshot_note="test media recovery point",
+        label="backup-one",
+    )
+    return output / "backup-one" / MANIFEST_NAME
 
 
 def valid_declaration(root: Path) -> dict[str, object]:
+    state_dir = root / "isolated-runtime" / "scrapeflow-data"
+    alist_dir = root / "isolated-runtime" / "alist-data"
+    state_dir.mkdir(parents=True)
+    alist_dir.mkdir(parents=True)
     payload = isolated_preflight_template()
     payload.update({
-        "scrapeflow_state_dir": str(root / "state" / "scrapeflow-data"),
-        "alist_data_dir": str(root / "state" / "alist-data"),
+        "scrapeflow_state_dir": str(state_dir),
+        "alist_data_dir": str(alist_dir),
         "media_root": "/quark/影视/ScrapeFlow/验收/run-20260810",
         "storage_label": "isolated-quark-storage-20260810",
-        "offline_backup_manifest": str(root / "backup" / "scrapeflow-offline-backup.json"),
+        "offline_backup_manifest": str(_verified_backup_manifest(root)),
         "media_recovery_point": "snapshot:isolated-media-before-acceptance",
     })
     return payload
@@ -80,7 +118,7 @@ class IsolatedPreflightTests(unittest.TestCase):
             issues = isolated_preflight_issues(declaration, root=root / "repo")
 
         self.assertTrue(any("must not be nested" in issue for issue in issues))
-        self.assertTrue(any("formal library shelves" in issue for issue in issues))
+        self.assertTrue(any("formal library shelf" in issue for issue in issues))
 
     def test_rejects_gate_worker_and_recovery_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -105,6 +143,46 @@ class IsolatedPreflightTests(unittest.TestCase):
         self.assertTrue(any("offline_backup_manifest" in issue for issue in issues))
         self.assertTrue(any("media_recovery_point" in issue for issue in issues))
         self.assertTrue(any("bulk cleanup" in issue for issue in issues))
+
+    def test_requires_existing_empty_writable_runtime_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            declaration = valid_declaration(root)
+            state_dir = Path(str(declaration["scrapeflow_state_dir"]))
+            state_dir.joinpath("old-state.json").write_text("{}", encoding="utf-8")
+            declaration["alist_data_dir"] = str(root / "missing-alist-data")
+
+            issues = isolated_preflight_issues(declaration, root=root / "repo")
+
+        self.assertTrue(any("scrapeflow_state_dir must be empty" in issue for issue in issues))
+        self.assertTrue(any("alist_data_dir must exist" in issue for issue in issues))
+
+    def test_reports_non_writable_isolated_runtime_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            declaration = valid_declaration(root)
+            with patch(
+                "local.scrapeflow_api.isolated_preflight._directory_write_issue",
+                return_value="alist_data_dir must be writable: test denial",
+            ):
+                issues = isolated_preflight_issues(declaration, root=root / "repo")
+
+        self.assertTrue(any("must be writable" in issue for issue in issues))
+
+    def test_rejects_formal_media_descendant_and_tampered_backup_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            declaration = valid_declaration(root)
+            declaration["media_root"] = "/quark/影视/电影/验收/run-20260810"
+            manifest_path = Path(str(declaration["offline_backup_manifest"]))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["checks"]["copied_stats"]["alist_data"]["files"] += 1
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            issues = isolated_preflight_issues(declaration, root=root / "repo")
+
+        self.assertTrue(any("formal library shelf" in issue for issue in issues))
+        self.assertTrue(any("valid verified backup" in issue for issue in issues))
 
     def test_load_declaration_requires_json_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

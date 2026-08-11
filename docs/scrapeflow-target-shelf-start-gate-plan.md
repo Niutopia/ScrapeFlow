@@ -1,6 +1,6 @@
 # ScrapeFlow 目标货架启动门收敛计划
 
-> 状态：当前唯一产品合同；阶段 0–6 已形成本地 RC；尚未部署，真实隔离样本未执行。
+> 状态：历史单模块快照，已被[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)取代；不得作为当前产品合同或完成声明。
 >
 > 日期：2026-08-09
 >
@@ -8,7 +8,7 @@
 >
 > 运行约束：保持全局暂停；Provider 自动补源和自动审计默认关闭；本计划不授权操作真实媒体、AList、旧任务或 staging。
 
-本文取代此前普通入站的自动启动描述。历史收敛计划、发布审计、运行态审计和旧 WIP 分区只保留为证据或参考，不能声明当前 WIP 已完成，也不能改变本文件规定的流程。
+本文记录当时普通入站启动门的设计快照。历史收敛计划、发布审计、运行态审计和旧 WIP 分区只保留为证据或参考；它们均不能声明当前 WIP 已完成，也不能改变最终合同规定的流程。
 
 ## 1. 冻结产品路线
 
@@ -64,7 +64,7 @@
 
 | 阶段 | 当前文件 | 责任边界 |
 | --- | --- | --- |
-| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、docs/scrapeflow-convergence-decisions.md、docs/scrapeflow-convergence-release-audit.md、docs/scrapeflow-convergence-wip-partition.md、docs/scrapeflow-phase-checkpoints.md、docs/scrapeflow-runtime-audit-2026-08-09.md、docs/scrapeflow-phase-0-baseline.md、docs/scrapeflow-phase-1-safety.md、docs/scrapeflow-phase-2-domain.md、docs/scrapeflow-phase-3-archive.md、docs/scrapeflow-single-user-local-convergence-plan.md、docs/scrapeflow-target-shelf-start-gate-plan.md、已删除的 docs/scrapeflow-unified-workflow-remediation-plan.md | 产品说明、历史标识与唯一合同 |
+| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、相关历史审计和本计划 | 当时的产品说明与历史标识；当前唯一合同见 `scrapeflow-final-convergence-plan-v1.md` |
 | 1 启动门 | engine/scrapeflow/target_shelf.py、local/tests/test_target_shelf_start_gate.py、local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py* | 枚举、登记、选择和 /start |
 | 2 已选主链 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_engine_runner.py* | 预处理→身份→规划及货架约束 |
 | 3 恢复与取消 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_server.py*、local/tests/test_simple_engine_runner.py* | restart、retry、cancel、legacy 边界 |
@@ -81,7 +81,7 @@
 
 允许改动文档，不改业务逻辑、测试、Docker、运行态或真实媒体。
 
-- 把本文作为唯一当前流程；README、架构和 Engine README 仅保留产品说明和链接。
+- 当时曾把本文作为唯一当前流程；该历史要求现已由最终收敛计划取代。
 - 把旧 release audit、runtime audit、checkpoint 与旧 WIP 分区明确标记为历史快照。
 - 旧状态报告不混入功能提交；旁路 AList 认证和归档名称实验只作参考。
 

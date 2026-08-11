@@ -17,6 +17,7 @@ never appear in a result or serialized projection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import posixpath
 from pathlib import Path
 import re
@@ -204,6 +205,45 @@ def _read_local_prefix(path: Path, max_bytes: int) -> bytes:
             return handle.read(max_bytes)
     except OSError as exc:
         raise ArchivePreprocessingError("archive source cannot be read") from exc
+
+
+def _local_tree_regular_files(root: Path) -> list[Path]:
+    """Enumerate local source files while rejecting every child symlink.
+
+    ``Path.rglob`` makes it tempting to filter symbolic links out of the
+    result.  That is not safe for an intake boundary: a link hidden under a
+    source tree is itself an ambiguous source object, whether it targets a file
+    or a directory.  Scan with ``scandir`` and fail before any planner or
+    archive operation can follow it.
+    """
+
+    output: list[Path] = []
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            if current.is_symlink():
+                raise ArchivePreprocessingError("archive source tree contains a symbolic link")
+            with os.scandir(current) as iterator:
+                entries = list(iterator)
+        except ArchivePreprocessingError:
+            raise
+        except OSError as exc:
+            raise ArchivePreprocessingError("archive source tree cannot be read") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    raise ArchivePreprocessingError("archive source tree contains a symbolic link")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    output.append(path)
+            except ArchivePreprocessingError:
+                raise
+            except OSError as exc:
+                raise ArchivePreprocessingError("archive source tree entry cannot be inspected") from exc
+    return sorted(output, key=lambda item: item.as_posix())
 
 
 def _safe_slug(value: str, *, fallback: str = "archive") -> str:
@@ -601,7 +641,13 @@ class ArchivePreprocessingAdapter:
                 if detection.is_archive or is_archive_filename(name):
                     archives.append(full)
                     continue
-                if _kind_for_path(name) is not None and detection.kind == "media":
+                if detection.kind == "executable":
+                    raise ArchiveMagicError("来源目录包含可执行文件")
+                # The canonical media policy classifies names, while magic is
+                # a separate archive/executable safety boundary.  Requiring
+                # MKV/MP4-only magic here made AVI/TS/M2TS silently disappear
+                # from the archive-vs-direct-media ambiguity check.
+                if _kind_for_path(name) is not None:
                     direct_media.append(full)
                 if _PASSWORD_NAME_HINT_RE.search(name):
                     size = _entry_size(raw)
@@ -878,7 +924,7 @@ class ArchivePreprocessingAdapter:
             files=files,
             archives=(str(source_path.resolve()),),
             changed=True,
-            password_sources=(listing.password_source,),
+            password_sources=(extracted.password_source,),
             _password_values=candidate_values,
         )
 
@@ -898,15 +944,17 @@ class ArchivePreprocessingAdapter:
             raise ArchivePreprocessingError("archive source root is not a directory")
         staging = _ensure_local_staging(Path(task_staging).resolve())
         self._validate_local_staging_root(staging, root.resolve())
-        files = sorted(
-            (item for item in root.rglob("*") if item.is_file() and not item.is_symlink()),
-            key=lambda item: item.as_posix(),
-        )
+        files = _local_tree_regular_files(root)
         if len(files) > self.limits.max_members:
             raise ArchivePreprocessingError("source tree file count exceeds archive limit")
         archive_candidates: list[Path] = []
         direct: list[PreparedArchiveFile] = []
         for item in files:
+            if item.is_symlink():
+                # Re-check at the use boundary in case the source tree changed
+                # after the directory scan.  Never silently skip an injected
+                # link and continue with a partial view of the source tree.
+                raise ArchivePreprocessingError("archive source tree contains a symbolic link")
             try:
                 prefix = _read_local_prefix(item, self.limits.max_magic_scan_bytes)
             except ArchivePreprocessingError:
@@ -1082,7 +1130,7 @@ class ArchivePreprocessingAdapter:
             files=tuple(uploaded),
             archives=(remote,),
             changed=True,
-            password_sources=(listing.password_source,),
+            password_sources=(extracted.password_source,),
             _password_values=candidate_values,
         )
 

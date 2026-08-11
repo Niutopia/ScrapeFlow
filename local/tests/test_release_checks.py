@@ -22,6 +22,18 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:8766",
+        "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
+            "replace-with-a-random-helper-token-at-least-24-characters"
+        ),
+        "SCRAPEFLOW_PANSOU_ENABLED": "0",
+        "SCRAPEFLOW_PANSOU_URL": "",
+        "SCRAPEFLOW_PANSOU_TOKEN": "",
+        "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+        "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+        "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+        "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+        "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
     }
     COMPOSE_DEFAULTS = {
         **ENV_TEMPLATE_DEFAULTS,
@@ -32,6 +44,16 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "",
+        "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
+        "SCRAPEFLOW_PANSOU_ENABLED": "0",
+        "SCRAPEFLOW_PANSOU_URL": "",
+        "SCRAPEFLOW_PANSOU_TOKEN": "",
+        "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+        "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+        "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+        "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+        "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
     }
 
     def _write_deployment_contract_files(
@@ -77,6 +99,7 @@ class ReleaseCheckTests(unittest.TestCase):
             [command.name for command in commands],
             [
                 "python-unittest",
+                "git-worktree-clean",
                 "git-diff-check",
                 "docker-compose-config",
                 "docker-build-api",
@@ -91,15 +114,16 @@ class ReleaseCheckTests(unittest.TestCase):
         )
         self.assertEqual(commands[0].env["SCRAPEFLOW_IGNORE_LOCAL_ENV"], "1")
         self.assertEqual(commands[0].env["PYTHONDONTWRITEBYTECODE"], "1")
-        self.assertEqual(commands[1].args, ("git", "diff", "--check"))
-        self.assertEqual(commands[2].args, ("docker", "compose", "config"))
-        self.assertTrue(commands[2].isolated_env)
+        self.assertEqual(commands[1].args, ("git", "status", "--porcelain"))
+        self.assertEqual(commands[2].args, ("git", "diff", "--check"))
+        self.assertEqual(commands[3].args, ("docker", "compose", "config"))
+        self.assertTrue(commands[3].isolated_env)
         self.assertEqual(
-            commands[2].env["SCRAPEFLOW_HOST_STATE_ROOT"],
+            commands[3].env["SCRAPEFLOW_HOST_STATE_ROOT"],
             "/tmp/scrapeflow-state",
         )
         self.assertEqual(
-            commands[3].args,
+            commands[4].args,
             ("docker", "build", "-f", "Dockerfile.api", "."),
         )
 
@@ -108,7 +132,7 @@ class ReleaseCheckTests(unittest.TestCase):
 
         self.assertEqual(
             [command.name for command in commands],
-            ["python-unittest", "git-diff-check"],
+            ["python-unittest", "git-worktree-clean", "git-diff-check"],
         )
 
     def test_active_path_scan_excludes_tests_and_caches(self) -> None:
@@ -154,6 +178,34 @@ class ReleaseCheckTests(unittest.TestCase):
 
         self.assertTrue(any("SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED" in issue for issue in issues))
         self.assertTrue(any("api.ports" in issue for issue in issues))
+
+    def test_deployment_contract_requires_helper_pansou_and_pilot_wiring(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            env_path = root / ".env.local.example"
+            env_path.write_text(
+                "\n".join(
+                    line for line in env_path.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith("SCRAPEFLOW_QUARK_HELPER_TOKEN=")
+                ) + "\n",
+                encoding="utf-8",
+            )
+            compose_path = root / "docker-compose.yml"
+            compose_path.write_text(
+                "\n".join(
+                    line for line in compose_path.read_text(encoding="utf-8").splitlines()
+                    if "SCRAPEFLOW_PROVIDER_PILOT_GAP" not in line
+                    and "SCRAPEFLOW_PANSOU_MAX_LINKS" not in line
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("SCRAPEFLOW_QUARK_HELPER_TOKEN" in issue for issue in issues))
+        self.assertTrue(any("SCRAPEFLOW_PROVIDER_PILOT_GAP" in issue for issue in issues))
+        self.assertTrue(any("SCRAPEFLOW_PANSOU_MAX_LINKS" in issue for issue in issues))
 
     def test_active_code_has_no_banned_media_fingerprint_calls(self) -> None:
         self.assertEqual(active_media_fingerprint_call_hits(), [])

@@ -52,7 +52,16 @@ from local.scrapeflow_api.automatic_replenishment import (
     reconcile_interrupted_gap_states,
 )
 from local.scrapeflow_api.control_state import PersistentControlState
+from local.scrapeflow_api.quark_helper_readiness import (
+    quark_helper_readiness_from_env,
+)
 from local.scrapeflow_api.redaction import redact_error, redact_value
+from local.scrapeflow_api.replenishment_tiers import (
+    FAILURE_CANDIDATE,
+    FAILURE_INFRASTRUCTURE,
+    FAILURE_IN_DOUBT,
+    TIER_LOCAL_MAGNET,
+)
 
 
 # These findings enter the automatic provider queue. Media gaps become Engine
@@ -180,7 +189,12 @@ class SimpleApplication:
         self._retry_archive_passwords: dict[str, str] = {}
         self._audit_lock = threading.RLock()
         self._audit_executor: ThreadPoolExecutor | None = None
+        # Automatic projection and an operator's report-only audit share one
+        # single-worker executor, but they must never share a Future.  Joining
+        # an automatic Future from the public endpoint made a manual request
+        # inherit its provider/cleanup side effects.
         self._audit_future: Future[object] | None = None
+        self._manual_audit_future: Future[object] | None = None
         self._pending_audit_roots: set[str] = set()
         # A provider child can finish while a read-only full-library audit is
         # still traversing the old inventory.  Keep one coalesced follow-up
@@ -270,12 +284,40 @@ class SimpleApplication:
             and os.getenv("TMDB_API_KEY", "").strip()
         )
 
+    @staticmethod
+    def _provider_worker_configuration() -> dict[str, object]:
+        """Report whether the runtime still honours the one-worker contract."""
+        raw = os.getenv("SCRAPEFLOW_PROVIDER_WORKERS", "1").strip() or "1"
+        try:
+            configured = int(raw)
+        except ValueError:
+            configured = None
+        return {
+            "configured": configured,
+            "expected": 1,
+            "valid": configured == 1,
+        }
+
+    @classmethod
+    def _require_single_provider_worker(cls) -> None:
+        configuration = cls._provider_worker_configuration()
+        if configuration["valid"] is not True:
+            configured = configuration["configured"]
+            rendered = str(configured) if configured is not None else "无效值"
+            raise ApplicationError(
+                "SCRAPEFLOW_PROVIDER_WORKERS 必须严格为 1；"
+                f"当前为 {rendered}，拒绝启动 Provider"
+            )
+
     def health(self) -> dict[str, object]:
         operations = self._operations_summary()
+        provider_workers = self._provider_worker_configuration()
         with self._automatic_lock:
             intake = dict(self._intake_status)
         return {
-            "ok": True,
+            # A widened Provider pool violates the single-writer runtime
+            # contract even if the HTTP process itself is still reachable.
+            "ok": provider_workers["valid"] is True,
             "mode": "automatic",
             "connected": self.remote_configured,
             "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
@@ -284,9 +326,14 @@ class SimpleApplication:
             "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or None,
             "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or None,
             "provider_capabilities": provider_capability_snapshot(),
+            # Provider capability declarations describe which adapters are
+            # installed.  They are deliberately not substituted for an
+            # authenticated health probe of the out-of-process Quark Helper.
+            "helper_readiness": {"quark": quark_helper_readiness_from_env()},
             "lane_gates": {
                 "provider_auto_repair_enabled": self._provider_auto_repair_enabled(),
                 "audit_auto_repair_enabled": self._audit_auto_repair_enabled(),
+                "provider_workers": provider_workers,
             },
             "intake_monitoring": self._intake_monitor_enabled(),
             "intake": {
@@ -333,7 +380,10 @@ class SimpleApplication:
                 1 for future in self._provider_futures.values() if not future.done()
             )
         with self._audit_lock:
-            audit_running = bool(self._audit_future is not None and not self._audit_future.done())
+            audit_running = any(
+                future is not None and not future.done()
+                for future in (self._audit_future, self._manual_audit_future)
+            )
         public_phases = []
         for job in engine_jobs:
             try:
@@ -1294,6 +1344,29 @@ class SimpleApplication:
         ):
             return True
 
+        # Callers can hold an earlier in-memory root while the audit worker
+        # has just persisted a new gap. Re-read before making any cleanup
+        # decision so an old no-gap snapshot cannot race that durable fact.
+        try:
+            runner = self._get_engine_runner()
+            job = runner.get_job(job.id)
+        except Exception:
+            return True
+        if (
+            self._is_internal_child(job)
+            or self._is_audit_owned_root(job)
+            or job.summary.get("automatic") is not True
+            or job.phase not in {"executed", "completed"}
+        ):
+            return True
+
+        # Disabling either optional lane is never permission to consume a
+        # source that still has a durable formal-library gap.  A later explicit
+        # repair/audit decision may resolve it, but this short-circuit must not
+        # manufacture a cleanup-ready result in the meantime.
+        if self._job_resource_gaps(job):
+            return True
+
         lifecycle_raw = job.summary.get("lifecycle")
         lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
         cleanup = lifecycle.get("cleanup") if isinstance(lifecycle.get("cleanup"), Mapping) else {}
@@ -1319,7 +1392,6 @@ class SimpleApplication:
             if future is not None and not future.done():
                 return True
         try:
-            runner = self._get_engine_runner()
             decided = runner.record_automatic_lifecycle_decision(
                 job.id,
                 audit_status="deferred",
@@ -1374,7 +1446,11 @@ class SimpleApplication:
             return
 
         def submit() -> None:
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or self._provider_worker_configuration()["valid"] is not True
+            ):
                 return
             with self._automatic_lock:
                 existing = self._automatic_futures.get(job_id)
@@ -1869,14 +1945,13 @@ class SimpleApplication:
 
     def _provider_pool(self) -> ThreadPoolExecutor:
         with self._automatic_lock:
+            # Read the environment on every dispatch boundary.  A live
+            # ``>1`` edit is a configuration-integrity failure, not permission
+            # to continue with a wider provider pool.
+            self._require_single_provider_worker()
             if self._provider_executor is None:
-                workers_raw = os.getenv("SCRAPEFLOW_PROVIDER_WORKERS", "1").strip()
-                try:
-                    workers = max(1, min(8, int(workers_raw)))
-                except ValueError:
-                    workers = 1
                 self._provider_executor = ThreadPoolExecutor(
-                    max_workers=workers,
+                    max_workers=1,
                     thread_name_prefix="scrapeflow-provider",
                 )
             return self._provider_executor
@@ -1893,18 +1968,30 @@ class SimpleApplication:
             client = self._alist_client or getattr(runner, "alist", None)
             if client is None:
                 raise ApplicationError("未配置 AList 客户端，无法自动补源")
+            from engine.tools.replenishment_adapter.pansou import (
+                PanSouDiscovery,
+                quark_share_inspector,
+            )
             from engine.tools.replenishment_adapter.search import ReplenishmentSearchService
+            replenishment_staging = f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源"
             runtime = AutomaticReplenishmentRuntime(
                 self.state_root,
                 engine_runner=runner,
                 alist=client,
-                search=ReplenishmentSearchService(),
+                search=ReplenishmentSearchService(
+                    pansou=PanSouDiscovery.from_env(
+                        inspector=quark_share_inspector(
+                            client,
+                            replenishment_staging,
+                        ),
+                    ),
+                ),
                 materializer=FixedTierAutomaticMaterializer(
                     local_torrent=LocalTorrentAutomaticMaterializer(
                         archive_preprocessor=self._archive_preprocessor,
                     ),
                 ),
-                staging_root=f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源",
+                staging_root=replenishment_staging,
                 progress=self._record_replenishment_progress,
                 cancel_requested=self._provider_runtime_cancel_requested,
             )
@@ -1916,6 +2003,7 @@ class SimpleApplication:
             self._closed.is_set()
             or self.control().get("paused") is True
             or not self._provider_auto_repair_enabled()
+            or self._provider_worker_configuration()["valid"] is not True
         ):
             return
 
@@ -2007,6 +2095,7 @@ class SimpleApplication:
                 self._closed.is_set()
                 or self.control().get("paused") is True
                 or not self._provider_auto_repair_enabled()
+                or self._provider_worker_configuration()["valid"] is not True
             ):
                 return
             with self._automatic_lock:
@@ -2141,6 +2230,55 @@ class SimpleApplication:
         except Exception:
             return
 
+    @staticmethod
+    def _replenishment_failure_scopes(
+        outcome: Mapping[str, object],
+    ) -> set[str]:
+        """Return explicit runtime failure classes without guessing from text."""
+        scopes: set[str] = set()
+        rows = outcome.get("outcomes")
+        if not isinstance(rows, list):
+            return scopes
+        for row in rows:
+            if not isinstance(row, Mapping) or not row.get("error"):
+                continue
+            scope = str(row.get("failure_scope") or "").strip().casefold()
+            if scope in {
+                FAILURE_CANDIDATE,
+                FAILURE_INFRASTRUCTURE,
+                FAILURE_IN_DOUBT,
+                "delivery",
+            }:
+                scopes.add(scope)
+            if str(row.get("tier_status") or "").casefold() == "waiting_reconcile":
+                scopes.add(FAILURE_IN_DOUBT)
+        return scopes
+
+    def _candidate_chain_is_exhausted(self, job_id: str) -> bool:
+        """Return whether every live gap has exhausted the final local tier."""
+        directory = self.state_root / "gaps" / job_id
+        try:
+            paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+        except OSError:
+            return False
+        terminal_rows = 0
+        for path in paths:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            if not isinstance(raw, Mapping):
+                return False
+            if str(raw.get("phase") or "").casefold() == "resolved":
+                continue
+            terminal_rows += 1
+            if (
+                str(raw.get("tier") or "").casefold() != TIER_LOCAL_MAGNET
+                or str(raw.get("tier_status") or "").casefold() != "exhausted"
+            ):
+                return False
+        return terminal_rows > 0
+
     def _run_automatic_replenishment(self, job_id: str) -> None:
         # A resume can submit more futures than the provider worker count. A
         # queued future may therefore start after a pause or after the pilot
@@ -2151,6 +2289,7 @@ class SimpleApplication:
             self._closed.is_set()
             or self.control().get("paused") is True
             or not self._provider_auto_repair_enabled()
+            or self._provider_worker_configuration()["valid"] is not True
         ):
             return
         try:
@@ -2168,18 +2307,30 @@ class SimpleApplication:
             if not self._provider_job_allowed(job):
                 return
             provider_job = self._provider_pilot_job(job)
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or self._provider_worker_configuration()["valid"] is not True
+            ):
                 return
             runtime = self._get_automatic_replenishment()
             # Runtime construction can perform lazy dependency setup. Check
             # once more before publishing a searching phase or invoking the
             # provider, so a pause during that setup cannot start a queued root.
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or self._provider_worker_configuration()["valid"] is not True
+            ):
                 return
             if not self._provider_job_allowed(job):
                 return
             self._record_replenishment_progress(job, "provider_searching", {})
-            if self._closed.is_set() or self.control().get("paused") is True:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or self._provider_worker_configuration()["valid"] is not True
+            ):
                 return
             if not self._provider_job_allowed(job):
                 return
@@ -2190,14 +2341,12 @@ class SimpleApplication:
                 isinstance(row, Mapping) and row.get("cancelled") is True
                 for row in outcome.get("outcomes", [])
             )
-            # An operator pause/pilot narrowing is not a failed provider
-            # attempt.  It must remain retryable and must not consume the
-            # bounded candidate budget merely because a live worker observed
-            # the control change at its next cooperative boundary.
+            # Only infrastructure failures consume the five-attempt automatic
+            # retry budget. Candidate exclusions have their own durable
+            # per-tier limit (30), while pause and in-doubt submissions must
+            # never be converted into a delayed resubmit.
+            failure_scopes = self._replenishment_failure_scopes(outcome)
             provider_attempts = int(summary_before.get("replenishment_attempts") or 0)
-            if not cancelled:
-                provider_attempts += 1
-            outcome["attempts"] = provider_attempts
             provider_limit_raw = os.getenv("SCRAPEFLOW_PROVIDER_RETRY_LIMIT", "5").strip()
             try:
                 provider_limit = max(0, min(30, int(provider_limit_raw)))
@@ -2207,6 +2356,18 @@ class SimpleApplication:
                 any(isinstance(row, Mapping) and row.get("error") for row in outcome.get("outcomes", []))
                 or bool(outcome.get("unresolved_gaps"))
             )
+            in_doubt = FAILURE_IN_DOUBT in failure_scopes
+            infrastructure_failure = FAILURE_INFRASTRUCTURE in failure_scopes
+            candidate_exhausted = (
+                has_error
+                and failure_scopes == {FAILURE_CANDIDATE}
+                and self._candidate_chain_is_exhausted(job_id)
+            )
+            if infrastructure_failure and not cancelled and not in_doubt:
+                provider_attempts += 1
+            elif not has_error:
+                provider_attempts = 0
+            outcome["attempts"] = provider_attempts
             if cancelled:
                 outcome["terminal"] = False
                 outcome["status"] = "retry_wait"
@@ -2214,12 +2375,33 @@ class SimpleApplication:
             elif not has_error:
                 outcome["terminal"] = True
                 outcome["status"] = "completed"
-            elif provider_attempts >= provider_limit:
+            elif in_doubt:
+                outcome["terminal"] = False
+                outcome["status"] = "waiting_reconcile"
+                outcome["next_retry_seconds"] = None
+            elif candidate_exhausted:
                 outcome["terminal"] = True
                 outcome["status"] = "failed"
+                outcome["next_retry_seconds"] = None
+            elif infrastructure_failure and provider_attempts >= provider_limit:
+                outcome["terminal"] = True
+                outcome["status"] = "failed"
+                outcome["next_retry_seconds"] = None
+            elif not failure_scopes and has_error:
+                # An unclassified or unsupported outcome cannot safely enter
+                # any automatic retry policy. Keep it visible for an operator
+                # instead of silently treating it as infrastructure.
+                outcome["terminal"] = True
+                outcome["status"] = "failed"
+                outcome["next_retry_seconds"] = None
             else:
+                outcome["terminal"] = False
                 outcome["status"] = "retry_wait"
-                outcome["next_retry_seconds"] = 30
+                outcome["next_retry_seconds"] = (
+                    30
+                    if failure_scopes <= {FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE}
+                    else None
+                )
             self._record_replenishment_summary(job, outcome)
             if outcome.get("terminal") is True:
                 self._cancel_job_timers(job_id)
@@ -2239,7 +2421,11 @@ class SimpleApplication:
                 )
             # Missing root coordinates fail closed; never widen a provider
             # completion callback into a formal-library scan.
-            if has_error and outcome.get("terminal") is not True:
+            if (
+                has_error
+                and outcome.get("terminal") is not True
+                and outcome.get("next_retry_seconds") == 30
+            ):
                 # Provider failures are isolated.  Requeue the gap work after a
                 # bounded delay while ordinary jobs continue flowing.
                 self._queue_provider_job(job_id, delay=30.0)
@@ -2353,6 +2539,29 @@ class SimpleApplication:
         future.add_done_callback(clear)
         return future
 
+    def _start_manual_library_audit_locked(self) -> Future[object]:
+        """Start one report-only audit while holding ``_audit_lock``.
+
+        The public audit route must not join an automatic projection worker:
+        that worker is allowed to create provider ownership and final-cleanup
+        decisions after it has scanned.  Both lanes still use the same
+        single-worker executor, so AList enumeration and the local subtitle
+        evidence ledger remain serialized.
+        """
+        future = self._audit_pool().submit(
+            self._run_library_audit_background,
+            project_gaps=False,
+        )
+        self._manual_audit_future = future
+
+        def clear(done: Future[object]) -> None:
+            with self._audit_lock:
+                if self._manual_audit_future is done:
+                    self._manual_audit_future = None
+
+        future.add_done_callback(clear)
+        return future
+
     def _queue_library_audit(
         self, *, delay: float = 0.0, rerun_if_busy: bool = False,
     ) -> None:
@@ -2410,15 +2619,21 @@ class SimpleApplication:
         self._queue_library_audit(delay=delay, rerun_if_busy=rerun_if_busy)
 
     def _run_library_audit_background(
-        self, *, scope_roots: Sequence[str] | None = None,
+        self,
+        *,
+        scope_roots: Sequence[str] | None = None,
+        project_gaps: bool = True,
     ) -> dict[str, object] | None:
         try:
             # Keep the no-scope call shape compatible with small injected
             # audit fakes and older test/application adapters.  The scoped
             # keyword is only part of the new bounded-audit contract.
-            if scope_roots is None:
+            if scope_roots is None and project_gaps:
                 return self._run_library_audit_once()
-            return self._run_library_audit_once(scope_roots=scope_roots)
+            return self._run_library_audit_once(
+                scope_roots=scope_roots,
+                project_gaps=project_gaps,
+            )
         except Exception:
             # An unavailable TMDB/AList scan is represented by the next
             # explicit/automatic attempt; it must not terminate the write or
@@ -2727,6 +2942,7 @@ class SimpleApplication:
             )
 
         audit_retry_needed = False
+        post_acquisition_cleanup_retry_needed = False
         # Several historical/root records can describe the same TMDB work.
         # They may all receive the fresh audit projection, but one semantic
         # gap must produce only one provider queue entry.  Keep the first
@@ -3006,6 +3222,78 @@ class SimpleApplication:
                     allow_nan=False,
                 )
 
+            # A provider child has its own task-owned remote/local attempt
+            # staging.  It cannot be deleted merely because the child Engine
+            # reported a move: this *new*, bounded audit must start after the
+            # attempt's durable marker and prove its selected gap absent.
+            # Full/startup scans intentionally do not qualify here; the
+            # provider completion path queues an exact work-root re-audit.
+            post_acquisition_reaudit_pending = False
+            post_acquisition_cleanup: Mapping[str, object] | None = None
+            target_for_reaudit = self._job_audit_target(job)
+            if (
+                scope_roots is not None
+                and self._audit_scope_matches(target_for_reaudit, scope_roots)
+            ):
+                client = self._alist_client or getattr(runner, "alist", None)
+                if client is not None:
+                    actionable_ids = {
+                        str(row.get("id"))
+                        for row in provider_relevant
+                        if isinstance(row.get("id"), str) and row.get("id")
+                    }
+                    unidentified_actionable = any(
+                        not isinstance(row.get("id"), str) or not row.get("id")
+                        for row in provider_relevant
+                    )
+                    try:
+                        result = AutomaticReplenishmentRuntime.cleanup_post_acquisition_reaudit(
+                            self.state_root,
+                            job_id=job.id,
+                            alist=client,
+                            staging_root=f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源",
+                            audit_started_at=report.get("started_at"),
+                            audit_complete=(
+                                report.get("status") == "completed"
+                                and report.get("complete") is True
+                            ),
+                            actionable_gap_ids=actionable_ids,
+                            audit_uncertain=bool(relevant_unknowns),
+                            unidentified_actionable_gap=unidentified_actionable,
+                        )
+                        post_acquisition_cleanup = (
+                            dict(result) if isinstance(result, Mapping) else None
+                        )
+                    except Exception as exc:
+                        # The runner's independent marker fence below keeps
+                        # root cleanup closed.  Do not reinterpret a failed
+                        # staging cleanup as a resolved provider gap.
+                        post_acquisition_cleanup = {
+                            "pending_attempt_ids": ["unknown"],
+                            "cleanup_errors": [{"error": redact_error(exc)}],
+                            "retryable": False,
+                        }
+            revalidation_pending = getattr(
+                runner, "has_pending_replenishment_reaudit", None,
+            )
+            if callable(revalidation_pending):
+                try:
+                    post_acquisition_reaudit_pending = bool(
+                        revalidation_pending(job.id)
+                    )
+                except Exception:
+                    post_acquisition_reaudit_pending = True
+            elif isinstance(post_acquisition_cleanup, Mapping):
+                post_acquisition_reaudit_pending = bool(
+                    post_acquisition_cleanup.get("pending_attempt_ids")
+                )
+            if (
+                isinstance(post_acquisition_cleanup, Mapping)
+                and post_acquisition_cleanup.get("retryable") is True
+                and scope_roots is not None
+            ):
+                post_acquisition_cleanup_retry_needed = True
+
             # Ordinary roots keep ingress/archive cleanup pending until this
             # fresh scoped audit has produced a durable provider decision.
             # Provider-owned audit roots have no user ingress and therefore do
@@ -3034,12 +3322,20 @@ class SimpleApplication:
                     lifecycle_audit = "trusted"
                     if isinstance(prior_provider, Mapping) and prior_provider.get("terminal") is True:
                         lifecycle_provider = "terminal"
-                        lifecycle_ready = True
-                        lifecycle_reason = "provider_terminal_decision"
+                        # Retry exhaustion is a durable provider result, not
+                        # proof that the observed formal-library gap vanished.
+                        # Keep task-owned ingress/staging intact until a later
+                        # targeted audit observes no gap.
+                        lifecycle_ready = False
+                        lifecycle_reason = "provider_terminal_with_remaining_gap"
                     elif not self._provider_auto_repair_enabled():
                         lifecycle_provider = "deferred"
-                        lifecycle_ready = True
-                        lifecycle_reason = "provider_auto_repair_disabled"
+                        # An opt-out provider lane must leave the unresolved
+                        # gap and cleanup boundary visible; it cannot convert
+                        # a missing media/subtitle fact into permission to
+                        # delete the ordinary source.
+                        lifecycle_ready = False
+                        lifecycle_reason = "provider_auto_repair_disabled_with_remaining_gap"
                     else:
                         lifecycle_provider = "pending"
                         lifecycle_ready = False
@@ -3049,6 +3345,11 @@ class SimpleApplication:
                     lifecycle_provider = "deferred"
                     lifecycle_ready = False
                     lifecycle_reason = "metadata_repair_pending"
+                elif post_acquisition_reaudit_pending:
+                    lifecycle_audit = "trusted"
+                    lifecycle_provider = "staging_reaudit_pending"
+                    lifecycle_ready = False
+                    lifecycle_reason = "post_acquisition_reaudit_or_staging_cleanup_pending"
                 else:
                     lifecycle_audit = "trusted"
                     lifecycle_provider = "no_gap"
@@ -3098,7 +3399,7 @@ class SimpleApplication:
         if self.control().get("paused") is not True:
             for job_id in dict.fromkeys(provider_gap_owners.values()):
                 self._queue_provider_job(job_id)
-        if audit_retry_needed:
+        if audit_retry_needed or post_acquisition_cleanup_retry_needed:
             # A new read-only audit is the automatic retry for unknown,
             # unsupported, or failed-sidecar evidence. It is deliberately
             # delayed so one bad work cannot spin the audit thread.
@@ -3246,22 +3547,20 @@ class SimpleApplication:
         return {"audit": dict(raw)}
 
     def run_library_audit(self) -> dict[str, object]:
-        """Run or join the one serialized full-library audit worker.
+        """Run or join a serialized, strictly report-only full audit.
 
-        The public ``POST /api/library-audit/run`` endpoint remains
-        synchronous, but it must not execute a second scan beside a queued
-        background audit.  Joining the shared future keeps ``audit_running``
-        truthful for direct requests and leaves a queued coalesced rerun for
-        the worker completion callback to honour.
+        ``POST /api/library-audit/run`` may read AList and persist its local
+        audit report/evidence, but it never projects gaps into jobs, queues a
+        Provider worker, writes the formal library, or starts cleanup.  It has
+        its own Future so a request cannot join an automatic audit that is
+        allowed to perform those later orchestration steps.
         """
         with self._audit_lock:
-            future = self._audit_future
+            future = self._manual_audit_future
             if future is None or future.done():
-                # A user-triggered audit is intentionally global; it is the
-                # low-frequency escape hatch for identities outside a recent
-                # task's affected root.
-                self._pending_audit_roots.clear()
-                future = self._start_library_audit_locked()
+                # A manual audit is intentionally global, but must not consume
+                # pending automatic scope state or inherit its projection.
+                future = self._start_manual_library_audit_locked()
         result = future.result()
         if not isinstance(result, Mapping):
             raise ApplicationError("媒体库审计未返回报告")
@@ -3286,9 +3585,17 @@ class SimpleApplication:
         return target
 
     def _run_library_audit_once(
-        self, *, scope_roots: Sequence[str] | None = None,
+        self,
+        *,
+        scope_roots: Sequence[str] | None = None,
+        project_gaps: bool = True,
     ) -> dict[str, object]:
-        """Run one read-only full or affected-work audit and project its gaps."""
+        """Run one audit, optionally projecting gaps for the automatic lane.
+
+        The scanner itself is remote read-only.  Only the automatic scheduler
+        may opt into ``project_gaps``; the public API always receives a local
+        report without creating provider work or a lifecycle/cleanup decision.
+        """
         all_roots = tuple(
             f"{self.remote_root.rstrip('/')}/{category}"
             for category in ("电影", "番剧", "美剧")
@@ -3340,7 +3647,8 @@ class SimpleApplication:
                 required_subtitle_language=required_subtitle_language,
                 subtitle_checker=subtitle_checker,
             )
-        self._apply_audit_gaps(report, runner, scope_roots=scope_roots)
+        if project_gaps:
+            self._apply_audit_gaps(report, runner, scope_roots=scope_roots)
         return {"audit": report}
 
     def _engine_job_or_none(self, job_id: str) -> EngineJob | None:
@@ -3455,6 +3763,25 @@ class SimpleApplication:
                 # durable record no longer exists.  The fence protects only
                 # the critical section above.
                 self._cleanup_fences.discard(engine_job.id)
+
+    def repair_public_job_artifacts(
+        self,
+        job_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Explicitly repair deterministic NFO/poster artifacts for one root.
+
+        This is intentionally a narrowly scoped operator action, not an
+        audit side effect: the persisted plan remains the source of truth and
+        no discovery, provider search, or media cleanup is started here.
+        """
+        if not isinstance(payload, Mapping) or payload:
+            raise EngineRequestError("元数据修复请求必须是空 JSON 对象")
+        engine_job = self._engine_job_or_none(job_id)
+        if engine_job is None:
+            raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        repaired = self._get_engine_runner().repair_automatic_artifacts(job_id)
+        return self.public_engine_job(repaired)
 
     def retry_public_job(self, job_id: str, payload: Mapping[str, object]) -> dict[str, object]:
         engine_job = self._engine_job_or_none(job_id)
@@ -4036,6 +4363,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(
                         200,
                         {"cleanup": self.application.cleanup_public_job(job_id)},
+                    )
+                    return
+                if operation == "repair-artifacts":
+                    self._send(
+                        200,
+                        {"job": self.application.repair_public_job_artifacts(job_id, payload)},
                     )
                     return
                 self._send(404, {"error": "not found"})

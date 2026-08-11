@@ -29,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
         help="record the release-check evidence status, for example: 通过",
     )
     parser.add_argument(
+        "--release-evidence",
+        type=Path,
+        help="include JSON from scripts/scrapeflow_release_evidence.py --output-dir ...",
+    )
+    parser.add_argument(
         "--backup-manifest",
         default="",
         help="record the offline backup manifest path after a real backup verify",
@@ -66,10 +71,22 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(readiness, dict):
             print("runtime readiness report error: report must be a JSON object", file=sys.stderr)
             return 2
+    release_evidence = None
+    if args.release_evidence is not None:
+        try:
+            release_evidence = json.loads(args.release_evidence.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"release evidence error: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(release_evidence, dict):
+            print("release evidence error: report must be a JSON object", file=sys.stderr)
+            return 2
     package = build_acceptance_package(
         release_check_status=args.release_check_status,
         backup_manifest=args.backup_manifest,
         media_recovery_point=args.media_recovery_point,
+        release_evidence=release_evidence,
+        release_evidence_path=args.release_evidence,
         isolated_declaration=declaration,
         runtime_readiness=readiness,
     )

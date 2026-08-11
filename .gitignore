@@ -7,6 +7,7 @@
 !.env.local.example
 
 /outputs/
+/artifacts/
 /work/
 /state/
 /backups/

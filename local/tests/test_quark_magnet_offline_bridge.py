@@ -145,6 +145,40 @@ class QuarkMagnetOfflineBridgeTests(unittest.TestCase):
             client.magnet_submit({"destination": "/task/staging"})
         self.assertEqual(raised.exception.failure_scope, "in_doubt")
 
+    def test_submit_timeout_is_in_doubt_and_not_safe_to_retry(self) -> None:
+        def opener(_request, timeout):
+            del timeout
+            raise TimeoutError("response lost after submit")
+
+        client = HttpQuarkHelperClient(
+            "http://127.0.0.1:8765",
+            "abcdefghijklmnopqrstuvwxyz",
+            opener=opener,
+        )
+
+        with self.assertRaises(QuarkMagnetInDoubtError) as raised:
+            client.magnet_submit({"destination": "/task/staging"})
+
+        self.assertEqual(raised.exception.failure_scope, "in_doubt")
+
+    def test_submit_without_task_id_is_in_doubt(self) -> None:
+        class Helper:
+            def health(self):
+                return {"status": "ready"}
+
+            def magnet_submit(self, _plan):
+                return {"accepted": True}
+
+            def magnet_status(self, _task_id):
+                raise AssertionError("task status is unavailable without task_id")
+
+        bridge = QuarkMagnetOfflineBridge(Helper(), sleep=lambda _seconds: None)
+
+        with self.assertRaises(QuarkMagnetInDoubtError) as raised:
+            bridge.execute(_selection(), "/task/staging")
+
+        self.assertEqual(raised.exception.failure_scope, "in_doubt")
+
 
 if __name__ == "__main__":
     unittest.main()

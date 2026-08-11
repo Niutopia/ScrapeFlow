@@ -18,7 +18,7 @@
 
 | 阶段 | 结论 | 证据 |
 | --- | --- | --- |
-| 0 合同与边界 | 通过 | `docs/scrapeflow-target-shelf-start-gate-plan.md` 是唯一当前流程；README、ARCHITECTURE、Engine README 指向该合同；旧 release/runtime/checkpoint 文档均标记为历史快照。 |
+| 0 合同与边界 | 历史通过 | 这是目标货架 RC 当时的结论；当前唯一合同是 `docs/scrapeflow-final-convergence-plan-v1.md`，本表不得作为全项目完成声明。 |
 | 1 登记与 `/start` | 通过 | `engine/scrapeflow/target_shelf.py` 提供唯一映射；`local/tests/test_target_shelf_start_gate.py` 覆盖 waiting 零正式副作用、非法枚举、重复 `/start`、paused start 和 waiting restart；`local/tests/test_simple_server.py` 覆盖 HTTP `/start`。 |
 | 2 已选主链 | 通过 | `local/scrapeflow_api/simple_engine_runner.py` 在 worker/plan/execute/recovery 前校验 shelf；归档后缀身份查询、类型兼容矩阵、target root containment 和 problem gate 由 `test_target_shelf_start_gate.py` 与 `test_simple_engine_runner.py` 覆盖。 |
 | 3 恢复、重试与取消 | 通过 | `test_simple_server.py` 覆盖 queued cancel、legacy retry 拒绝、target conflict 重选、cleanup-only retry 不落回 writer；`test_recovery_matrix.py` 与 runner 测试覆盖重启边界。 |

@@ -4,7 +4,7 @@
 
 > 文档性质：这是 2026-08-09 的历史 release-candidate 审计快照，记录当时 fake 环境、分支与阶段检查的证据。它不证明当前工作树、当前运行时或“用户选择目标货架后启动”主线已经实施完成，也不授权解除暂停。
 >
-> 当前普通入站合同以[用户选择目标货架后启动实施计划](./scrapeflow-target-shelf-start-gate-plan.md)为准：发现来源只登记 `awaiting_target_shelf`，用户选择固定一级货架并通过 `/start` 后才正式执行。
+> 当前普通入站合同以[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)为准；本文件是历史发布审计快照。
 
 本审计所记录的 release candidate 当时位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号应由当时部署的 `/api/health.build_commit` 和 Git 共同记录，本文不硬编码。
 

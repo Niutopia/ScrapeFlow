@@ -4,8 +4,8 @@
 Search is read-only and returns only candidates bound to the request TMDB ID.
 Acquisition downloads the selected torrent files into an isolated workspace,
 verifies exact file indices and sizes, uploads canonical episode names into the
-unscraped AList root, verifies the remote rows, and removes successful local
-staging data.
+unscraped AList root, and verifies the remote rows.  Successful local staging
+is retained until the coordinator proves formal-library convergence.
 """
 
 from __future__ import annotations
@@ -53,6 +53,10 @@ from engine.scrapeflow.provider_capabilities import (
     provider_capability_snapshot,
 )
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.video_admission import (
+    VideoAdmissionError,
+    probe_local_video_stream,
+)
 
 
 class ReplenishmentDeliveryError(RuntimeError):
@@ -3749,42 +3753,19 @@ def _preflight_dispatch(
 
 
 def _ffprobe_archive_video(path: Path) -> dict[str, Any]:
-    """Verify a retained local media payload contains a video stream."""
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        raise ReplenishmentInfrastructureError(
-            "运行环境缺少 ffprobe", stage="local_dependency",
-        )
+    """Verify one retained payload through the shared bounded admission."""
     try:
-        completed = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
-             "-show_entries", "format=duration", "-of", "json", str(path)],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=120, check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
+        return probe_local_video_stream(path)
+    except VideoAdmissionError as exc:
+        if exc.infrastructure:
+            raise ReplenishmentInfrastructureError(
+                f"视频准入环境不可用: {exc.reason}",
+                stage="local_dependency",
+            ) from exc
         raise ReplenishmentCandidateError(
-            f"ffprobe 核验超时: {path.name}", stage="candidate_payload",
+            f"视频流准入失败: {path.name}: {exc.reason}",
+            stage="candidate_payload",
         ) from exc
-    if completed.returncode != 0:
-        raise ReplenishmentCandidateError(
-            f"ffprobe 无法读取视频: {path.name}", stage="candidate_payload",
-        )
-    try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise ReplenishmentCandidateError(
-            f"ffprobe 输出无效: {path.name}", stage="candidate_payload",
-        ) from exc
-    streams = value.get("streams") if isinstance(value, Mapping) else None
-    if not isinstance(streams, list) or not any(
-        isinstance(row, Mapping) and row.get("codec_type") == "video"
-        for row in streams
-    ):
-        raise ReplenishmentCandidateError(
-            f"文件不含视频流: {path.name}", stage="candidate_payload",
-        )
-    return dict(value)
 
 
 def _verify_video_payload(
@@ -4230,79 +4211,21 @@ def _acquire(
             _verify_remote_uploads(client, delivery_root, rows)
         delivery_files: list[dict[str, Any]] = []
         for row in uploaded:
-            file_row: dict[str, Any] = {
+            delivery_files.append({
                 "path": join_remote(str(row["delivery_root"]), str(row["remote_name"])),
                 "size": int(row["size"]),
                 "gap_ids": list(row["gap_ids"]),
                 "kind": str(row["kind"]),
-                "manifest_index": int(row["manifest_index"]),
-                "source_name": str(row["source_name"]),
-                "provider_path": str(row["provider_path"]),
-            }
-            for key in (
-                "companion_for_gap_ids", "paired_video_index",
-                "paired_video_source_name", "subtitle_language",
-            ):
-                if key in row:
-                    file_row[key] = row[key]
-            delivery_files.append(file_row)
-        shutil.rmtree(workspace)
-        result: dict[str, Any] = {
-            "status": "ready",
+            })
+        # Both local bytes and the remote task tree remain retry/reconcile
+        # evidence.  The coordinator owns their eventual cleanup after a
+        # formal readback and targeted audit prove the gap disappeared.
+        return {
             "lane": "magnet",
             "attempt_id": posixpath.basename(remote_root.rstrip("/")),
-            "delivery_kind": "torrent_delivery",
-            "materializer": "torrent",
             "staging_root": remote_root,
-            "source_paths": [remote_root],
             "files": delivery_files,
-            "uploaded_files": len(uploaded),
-            "uploaded_bytes": sum(int(row["size"]) for row in uploaded),
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            **({
-                "media_staging_root": media_staging_root,
-                "subtitle_staging_root": subtitle_staging_root,
-            } if mixed_delivery else {}),
         }
-        # The automatic runtime receives the materializer result rather than
-        # the original selected-candidate JSON.  Carry the exact manifest
-        # witnesses through only for a single selected torrent: raw torrent
-        # indices are local to one manifest, so merging them across a bundle
-        # would make a companion proof ambiguous.  With more than one
-        # selection, leave companions staged and let the next audit open the
-        # ordinary subtitle lane instead of guessing an index namespace.
-        selections = bundle.get("selections") if isinstance(bundle, Mapping) else []
-        if isinstance(selections, list) and len(selections) == 1 and isinstance(selections[0], Mapping):
-            selected = selections[0]
-            selected_ids = {
-                str(value) for value in selected.get("selected_gap_ids") or []
-            }
-            selected_companions = _selected_companion_indices(
-                selected, selected_gap_ids=selected_ids,
-            )
-            if selected_companions:
-                selected_acquisition = selected.get("acquisition")
-                if not isinstance(selected_acquisition, Mapping):
-                    raise ReplenishmentCandidateError(
-                        "伴随字幕缺少已验证 acquisition 映射",
-                        stage="candidate_payload_validation", candidate=selected,
-                    )
-                companion_map = {
-                    gap_id: [index]
-                    for index, gap_ids in selected_companions.items()
-                    for gap_id in gap_ids
-                }
-                result.update({
-                    "companion_subtitle_index_by_media_gap": companion_map,
-                    "file_index_by_gap": {
-                        str(gap_id): list(indices)
-                        for gap_id, indices in selected_acquisition["file_index_by_gap"].items()
-                        if isinstance(indices, list)
-                    },
-                    "file_size_by_index": dict(selected_acquisition["file_size_by_index"]),
-                    "file_path_by_index": dict(selected_acquisition["file_path_by_index"]),
-                })
-        return result
     except BaseException as exc:
         delivery_failure = payload_verified and isinstance(exc, Exception)
         # Never recursively remove the deterministic remote delivery root on

@@ -21,11 +21,16 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
 )
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
-from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
+from local.scrapeflow_api.replenishment_tiers import (
+    TIER_LOCAL_MAGNET,
+    TIER_QUARK_MAGNET,
+)
 from engine.scrapeflow.provider_capabilities import (
     ACQUISITION_QUARK_FAST_SAVE,
     ACQUISITION_QUARK_MAGNET_OFFLINE,
     ACQUISITION_TORRENT,
+    QUARK_HELPER_NAME,
+    QUARK_HELPER_REQUIRED_ACTIONS,
     provider_capability_snapshot,
 )
 from engine.tools._replenishment_local_adapter_impl import _locator_infohash_aliases
@@ -120,6 +125,17 @@ class ProviderCapabilityTests(unittest.TestCase):
         self.assertEqual(
             snapshot["quark_magnet"]["acquisition_kinds"],
             [ACQUISITION_QUARK_MAGNET_OFFLINE],
+        )
+        self.assertEqual(
+            snapshot["quark_magnet"]["status_scope"],
+            "declared_materializer",
+        )
+        self.assertEqual(
+            snapshot["quark_magnet"]["runtime_dependency"],
+            {
+                "helper": QUARK_HELPER_NAME,
+                "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+            },
         )
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
@@ -308,9 +324,60 @@ class ProviderCapabilityTests(unittest.TestCase):
             {"provider_acquisition_mismatch": 1},
         )
 
+    def test_selector_current_tier_never_falls_through_to_another_provider(self) -> None:
+        request = {
+            "tier": TIER_QUARK_MAGNET,
+            "media": {
+                "tmdb_id": 1,
+                "title": "Example Show",
+                "aliases": ["Example Show"],
+            },
+            "gaps": [{
+                "id": "S01E01", "kind": "missing_episode", "season": 1,
+                "episodes": [1], "label": "Example Show S01E01",
+            }],
+        }
+        gap_lookup = {"S01E01": request["gaps"][0]}
+        with patch(
+            "local.scrapeflow_api.replenishment._request_gap_ids",
+            return_value=({"S01E01"}, gap_lookup),
+        ), patch(
+            "local.scrapeflow_api.replenishment._name_coverage",
+            return_value={"S01E01"},
+        ):
+            result = select_replenishment_candidates(
+                request,
+                [
+                    _quark_share_candidate(),
+                    _quark_magnet_candidate(),
+                    _torrent_candidate(),
+                ],
+            )
+
+        self.assertEqual(result["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(
+            [row["provider"] for row in result["selections"]],
+            [TIER_QUARK_MAGNET],
+        )
+        self.assertEqual(
+            [row["provider"] for row in result["provider_chain_by_gap"]["S01E01"]],
+            [TIER_QUARK_MAGNET],
+        )
+        self.assertEqual(result["unchecked_current_tier_candidate_count"], 0)
+
     def test_local_automatic_materializer_does_not_delegate_unsupported_provider(self) -> None:
         delegate = Mock()
-        delegate.acquire.return_value = {"status": "ready"}
+        delegate.acquire.return_value = {
+            "lane": TIER_LOCAL_MAGNET,
+            "attempt_id": "attempt",
+            "staging_root": "/library/ScrapeFlow/补源/job/attempt",
+            "files": [{
+                "path": "/library/ScrapeFlow/补源/job/attempt/Example.Show.S01E01.mkv",
+                "size": 123,
+                "kind": "video",
+                "gap_ids": ["S01E01"],
+            }],
+        }
         materializer = LocalTorrentAutomaticMaterializer(delegate=delegate)
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(AutomaticReplenishmentError):
@@ -347,18 +414,35 @@ class ProviderCapabilityTests(unittest.TestCase):
                 alist=object(),
             )
         self.assertEqual(result, {
-            "status": "ready",
             "lane": TIER_LOCAL_MAGNET,
             "attempt_id": "attempt",
+            "staging_root": "/library/ScrapeFlow/补源/job/attempt",
+            "files": [{
+                "path": "/library/ScrapeFlow/补源/job/attempt/Example.Show.S01E01.mkv",
+                "size": 123,
+                "kind": "video",
+                "gap_ids": ["S01E01"],
+            }],
         })
         delegate.acquire.assert_called_once()
 
     def test_local_automatic_materializer_calls_shared_archive_preprocessor(self) -> None:
         delegate = Mock()
-        delegate.acquire.return_value = {"status": "ready", "files": []}
+        delivery = {
+            "lane": TIER_LOCAL_MAGNET,
+            "attempt_id": "attempt",
+            "staging_root": "/library/ScrapeFlow/补源/job/attempt",
+            "files": [{
+                "path": "/library/ScrapeFlow/补源/job/attempt/Example.Show.S01E01.mkv",
+                "size": 123,
+                "kind": "video",
+                "gap_ids": ["S01E01"],
+            }],
+        }
+        delegate.acquire.return_value = delivery
         archive_adapter = Mock()
         archive_adapter.prepare_provider_delivery.return_value = {
-            "status": "ready", "files": [], "archive_preprocessed": True,
+            **delivery, "archive_preprocessed": True,
         }
         materializer = LocalTorrentAutomaticMaterializer(
             delegate=delegate,
@@ -372,9 +456,7 @@ class ProviderCapabilityTests(unittest.TestCase):
                 workspace=Path(directory),
                 alist=object(),
             )
-        self.assertTrue(result["archive_preprocessed"])
-        self.assertEqual(result["lane"], TIER_LOCAL_MAGNET)
-        self.assertEqual(result["attempt_id"], "attempt")
+        self.assertEqual(result, delivery)
         archive_adapter.prepare_provider_delivery.assert_called_once()
         kwargs = archive_adapter.prepare_provider_delivery.call_args.kwargs
         self.assertEqual(kwargs["staging_root"], "/library/ScrapeFlow/补源/job/attempt")

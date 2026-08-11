@@ -8,14 +8,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 from local.scrapeflow_api.acceptance_package import (
     CommandResult,
     build_acceptance_package,
     compose_evidence,
     git_evidence,
     isolated_preflight_evidence,
+    release_evidence_summary,
     runtime_readiness_evidence,
 )
+from local.scrapeflow_api.offline_backup import MANIFEST_NAME, create_offline_backup
 
 
 ENV_TEMPLATE_DEFAULTS = {
@@ -25,6 +29,18 @@ ENV_TEMPLATE_DEFAULTS = {
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:8766",
+    "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
+        "replace-with-a-random-helper-token-at-least-24-characters"
+    ),
+    "SCRAPEFLOW_PANSOU_ENABLED": "0",
+    "SCRAPEFLOW_PANSOU_URL": "",
+    "SCRAPEFLOW_PANSOU_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+    "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+    "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+    "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+    "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 COMPOSE_DEFAULTS = {
     **ENV_TEMPLATE_DEFAULTS,
@@ -35,6 +51,16 @@ COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "",
+    "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_ENABLED": "0",
+    "SCRAPEFLOW_PANSOU_URL": "",
+    "SCRAPEFLOW_PANSOU_TOKEN": "",
+    "SCRAPEFLOW_PANSOU_TIMEOUT": "12",
+    "SCRAPEFLOW_PANSOU_MAX_QUERIES": "4",
+    "SCRAPEFLOW_PANSOU_MAX_LINKS": "64",
+    "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "",
+    "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 
 
@@ -65,14 +91,44 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
 
 
 def valid_isolated_declaration(root: Path) -> dict[str, object]:
+    state_dir = root / "isolated" / "scrapeflow-data"
+    alist_dir = root / "isolated" / "alist-data"
+    state_dir.mkdir(parents=True)
+    alist_dir.mkdir(parents=True)
+    source_alist = root / "backup-source" / "alist-data"
+    source_scrapeflow = root / "backup-source" / "scrapeflow-data"
+    source_alist.mkdir(parents=True)
+    source_scrapeflow.mkdir(parents=True)
+    atomic_write_json(source_alist / "config.json", {"version": 1}, allow_nan=False)
+    atomic_write_json(
+        source_scrapeflow / "global-control.json",
+        {
+            "version": 1,
+            "paused": True,
+            "scheduler_paused": True,
+            "persistent": True,
+            "updated_at": "2026-08-10T00:00:00Z",
+            "reason": "test pause",
+        },
+        allow_nan=False,
+    )
+    backup_output = root / "backup"
+    backup_output.mkdir()
+    create_offline_backup(
+        alist_data=source_alist,
+        scrapeflow_data=source_scrapeflow,
+        output_dir=backup_output,
+        media_snapshot_note="test media recovery point",
+        label="backup-one",
+    )
     return {
         "api_url": "http://127.0.0.1:8765",
         "alist_url": "http://127.0.0.1:5244",
-        "scrapeflow_state_dir": str(root / "isolated" / "scrapeflow-data"),
-        "alist_data_dir": str(root / "isolated" / "alist-data"),
+        "scrapeflow_state_dir": str(state_dir),
+        "alist_data_dir": str(alist_dir),
         "media_root": "/quark/影视/ScrapeFlow/验收/run-20260810",
         "storage_label": "isolated-quark-storage-20260810",
-        "offline_backup_manifest": str(root / "backup" / "scrapeflow-offline-backup.json"),
+        "offline_backup_manifest": str(backup_output / "backup-one" / MANIFEST_NAME),
         "media_recovery_point": "snapshot:isolated-media-before-acceptance",
         "provider_workers": 1,
         "start_paused": True,
@@ -103,6 +159,16 @@ def valid_runtime_readiness_report() -> dict[str, object]:
                 "quark_share": {"status": "ready"},
                 "quark_magnet": {"status": "ready"},
                 "magnet": {"status": "ready"},
+            },
+            "helper_readiness": {
+                "quark": {
+                    "configured": True,
+                    "reachable": True,
+                    "authenticated": True,
+                    "status": "ready",
+                    "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+                    "actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+                },
             },
             "lane_gates": {
                 "provider_auto_repair_enabled": False,
@@ -168,6 +234,47 @@ def fake_runner(args: tuple[str, ...], cwd: Path, env: dict[str, str] | None) ->
 
 
 class AcceptancePackageTests(unittest.TestCase):
+    def test_release_evidence_requires_full_gate_and_bound_raw_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_path = root / "scrapeflow-release-evidence.json"
+            log_path = root / "scrapeflow-release-check.log"
+            log_path.write_text("$ python3 -m unittest\nOK\n", encoding="utf-8")
+            report = {
+                "status": "通过",
+                "command": ["python3", "scripts/scrapeflow_release_check.py"],
+                "returncode": 0,
+                "include_docker": True,
+                "started_at": "2026-08-10T01:00:00+00:00",
+                "finished_at": "2026-08-10T01:01:00+00:00",
+                "log_path": str(log_path),
+                "report_path": str(evidence_path),
+            }
+            evidence_path.write_text(json.dumps(report), encoding="utf-8")
+
+            summary = release_evidence_summary(report, evidence_path=evidence_path)
+
+        self.assertEqual(summary["status"], "通过")
+        self.assertEqual(summary["issues"], [])
+
+    def test_release_evidence_rejects_skipped_or_unbound_success_claim(self) -> None:
+        report = {
+            "returncode": 0,
+            "command": ["python3", "scripts/scrapeflow_release_check.py", "--skip-docker"],
+            "include_docker": False,
+            "started_at": "2026-08-10T01:01:00+00:00",
+            "finished_at": "2026-08-10T01:00:00+00:00",
+            "log_path": "",
+            "report_path": "",
+        }
+
+        summary = release_evidence_summary(report)
+
+        self.assertEqual(summary["status"], "无效")
+        self.assertIn("command must run the full release gate without --skip-docker", summary["issues"])
+        self.assertIn("include_docker must be true", summary["issues"])
+        self.assertIn("finished_at must not precede started_at", summary["issues"])
+
     def test_git_evidence_reports_clean_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             evidence = git_evidence(Path(temporary), fake_runner)
@@ -275,7 +382,7 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("- 隔离 preflight: 失败", package)
         self.assertIn("preflight 问题:", package)
         self.assertIn("provider_workers must be 1", package)
-        self.assertIn("formal library shelves", package)
+        self.assertIn("formal library shelf", package)
         self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
 
     def test_runtime_readiness_evidence_reports_valid_summary(self) -> None:
@@ -288,6 +395,11 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(
             evidence["summary"]["provider_lanes"],
             "magnet, quark_magnet, quark_share",
+        )
+        self.assertEqual(evidence["summary"]["quark_helper_status"], "ready")
+        self.assertEqual(
+            evidence["summary"]["quark_helper_actions"],
+            "health, share-save, magnet-submit, magnet-status",
         )
 
     def test_package_draft_includes_runtime_readiness_report(self) -> None:
@@ -307,6 +419,7 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("| api_url | http://127.0.0.1:8765 |", package)
         self.assertIn("| build_commit | abc1234 |", package)
         self.assertIn("| control_paused | True |", package)
+        self.assertIn("| quark_helper_status | ready |", package)
         self.assertIn("当前记录: 通过", package)
 
     def test_package_draft_records_failed_runtime_readiness_without_passing_samples(self) -> None:

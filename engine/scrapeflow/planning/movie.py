@@ -22,7 +22,6 @@ _IMPLEMENTATION_NAMES = (
     "_burned_subtitle_cleanup_reason",
     "_collision_key",
     "_compose_filename",
-    "_entry_hash_value",
     "_entry_modified_value",
     "_entry_size_value",
     "_extract_year",
@@ -288,7 +287,6 @@ def build_movie_plan(
                 reason=reason,
                 source_size=_entry_size_value(item),
                 source_modified=_entry_modified_value(item),
-                source_hash=_entry_hash_value(item),
             )
         )
 

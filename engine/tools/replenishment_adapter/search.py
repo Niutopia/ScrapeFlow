@@ -8,9 +8,12 @@ from typing import Any
 import engine.tools._replenishment_local_adapter_impl as _impl
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
+    PROVIDER_QUARK_SHARE,
     candidate_capability_error,
     provider_capability_snapshot,
 )
+
+from .pansou import PanSouDiscovery
 
 
 def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -51,9 +54,21 @@ def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
     return output
 
 
+def _default_search(
+    request: Mapping[str, Any],
+    *,
+    pansou: PanSouDiscovery | None = None,
+) -> Mapping[str, Any]:
+    """Route discovery by the durable tier without querying lower lanes."""
+    tier = str(request.get("tier") or "").strip().casefold()
+    if tier == PROVIDER_QUARK_SHARE:
+        return (pansou or PanSouDiscovery.from_env()).run(request)
+    return _impl._search(request)
+
+
 def search(request: Mapping[str, Any]) -> dict[str, Any]:
     """Run the read-only provider-neutral search boundary."""
-    result = _impl._search(request)
+    result = _default_search(request)
     if not isinstance(result, Mapping):
         raise TypeError("补源搜索结果必须是对象")
     return _provider_neutral(result)
@@ -65,11 +80,18 @@ class ReplenishmentSearchService:
     def __init__(
         self,
         runner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        *,
+        pansou: PanSouDiscovery | None = None,
     ) -> None:
-        self._runner = runner or search
+        self._runner = runner
+        self._pansou = pansou
 
     def run(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        result = self._runner(request)
+        result = (
+            self._runner(request)
+            if self._runner is not None
+            else _default_search(request, pansou=self._pansou)
+        )
         if not isinstance(result, Mapping):
             raise TypeError("补源搜索结果必须是对象")
         return _provider_neutral(result)

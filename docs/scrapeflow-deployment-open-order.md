@@ -8,11 +8,12 @@
 2. 运行：
 
 ```sh
-python3 scripts/scrapeflow_release_check.py
+python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release
 ```
 
-3. 记录 Git commit 和构建时间。
-4. 不把 `.env.local`、状态目录、备份目录或媒体文件加入提交。
+3. 保存 `artifacts/release/scrapeflow-release-evidence.json` 与同目录原始日志；验收包必须通过 `--release-evidence` 引用该 JSON。
+4. 记录 Git commit 和构建时间。
+5. 不把 `.env.local`、状态目录、备份目录或媒体文件加入提交。
 
 ## 启动
 

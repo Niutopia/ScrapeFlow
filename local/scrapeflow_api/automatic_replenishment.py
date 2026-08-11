@@ -6,6 +6,7 @@ import inspect
 import json
 import posixpath
 import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,10 @@ from engine.scrapeflow.subtitle_content import (
     DEFAULT_MAX_PREFIX_BYTES,
     classify_subtitle_content,
 )
+from engine.scrapeflow.video_admission import (
+    VideoAdmissionError,
+    probe_remote_video_stream,
+)
 
 from .replenishment import (
     build_replenishment_requests,
@@ -35,12 +40,18 @@ from .replenishment import (
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
 from .redaction import redact_error, redact_value
 from .replenishment_tiers import (
+    EXHAUSTION_MIN_DISTINCT_LOCATORS,
     FAILURE_CANDIDATE,
     FAILURE_INFRASTRUCTURE,
     FAILURE_IN_DOUBT,
+    ReplenishmentTierError,
+    STRICT_TIER_ORDER,
     TIER_LOCAL_MAGNET,
     TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
+    apply_tier_outcome,
+    initial_tier_state,
+    required_sources_for_tier,
 )
 from .simple_engine_runner import EngineJob, SimpleEngineRunner
 
@@ -55,16 +66,24 @@ _INTERRUPTED_GAP_PHASES = frozenset({
     "subtitle_installing", "child_planning", "child_executing",
     "final_verifying", "cleaning", "child_failed",
 })
-_DURABLE_CANDIDATE_EXCLUSION_LIMIT = 24
+_DURABLE_CANDIDATE_EXCLUSION_LIMIT = EXHAUSTION_MIN_DISTINCT_LOCATORS
 _DURABLE_CANDIDATE_LOCATOR_LIMIT = 4096
 _DURABLE_CANDIDATE_PROVIDER_LIMIT = 64
 _DURABLE_CANDIDATE_RELEASE_NAME_LIMIT = 512
 _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
 _ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
+_JOB_ID_TOKEN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 _FAILURE_DELIVERY = "delivery"
 _FAILURE_CANCELLED = "cancelled"
-_STRICT_TIER_ORDER = (TIER_QUARK_SHARE, TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET)
+_POST_ACQUISITION_REAUDIT_KEY = "post_acquisition_reaudit"
+_POST_ACQUISITION_REAUDIT_PENDING_STATUSES = frozenset({
+    "pending",
+    "audit_uncertain",
+    "gap_still_actionable",
+    "cleanup_failed",
+})
+_POST_ACQUISITION_REAUDIT_MAX_GAPS = 256
 _KNOWN_FAILURE_SCOPES = frozenset({
     FAILURE_CANDIDATE,
     FAILURE_INFRASTRUCTURE,
@@ -72,27 +91,13 @@ _KNOWN_FAILURE_SCOPES = frozenset({
     _FAILURE_DELIVERY,
 })
 _DURABLE_GAP_STATE_DEFAULTS: dict[str, object] = {
-    "tier": TIER_QUARK_SHARE,
+    **initial_tier_state(),
     "active_attempt": None,
-    "candidate_failures_by_provider": {},
-    "exhaustion_proof_by_provider": {},
     "external_task_id": None,
     "next_retry_at": None,
-    "last_error_scope": None,
+    "tier_status": None,
 }
 
-# A provider candidate may optionally deliver a subtitle next to a *new*
-# media member.  This is deliberately a separate acquisition contract from
-# ``missing_subtitle``: the latter points at an already-existing formal video,
-# while this map points at one selected media-gap coordinate and one manifest
-# subtitle index.  Keeping the field names narrow makes it impossible for a
-# bare subtitle member to silently become a sidecar claim.
-_COMPANION_INDEX_MAP_KEY = "companion_subtitle_index_by_media_gap"
-_COMPANION_GAP_KEYS = (
-    "companion_for_gap_ids",
-    "companion_for_gap_id",
-    "paired_gap_id",
-)
 _COMPANION_LANGUAGE_MARKER_RE = re.compile(
     r"(?i)(?<![a-z0-9])(?:zh|zho|chi|chs|cht|中文|简中|簡中|简体|繁体|繁體|"
     r"chinese)(?![a-z0-9])"
@@ -108,6 +113,175 @@ class AutomaticReplenishmentError(RuntimeError):
 
 class AutomaticReplenishmentCancelled(AutomaticReplenishmentError):
     """A cooperative control boundary stopped an in-flight provider run."""
+
+
+class _CandidateRoundLimitError(AutomaticReplenishmentError):
+    """The current invocation exhausted its bounded candidate work slice."""
+
+    failure_scope = FAILURE_CANDIDATE
+
+
+class _ProviderVideoAdmissionError(AutomaticReplenishmentError):
+    """Preserve whether a failed probe is candidate, delivery, or runtime."""
+
+    def __init__(
+        self,
+        error: VideoAdmissionError,
+        *,
+        candidate: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(f"视频流准入失败: {error.reason}")
+        self.failure_scope = (
+            FAILURE_CANDIDATE
+            if error.candidate_invalid
+            else FAILURE_INFRASTRUCTURE
+            if error.infrastructure
+            else _FAILURE_DELIVERY
+        )
+        self.exclude_candidate = error.candidate_invalid
+        self.reusable_candidate = not error.candidate_invalid
+        if candidate is not None:
+            self.candidate = {
+                key: candidate.get(key)
+                for key in ("provider", "release_name", "locator", "infohash")
+                if candidate.get(key) is not None
+            }
+
+
+def _contract_delivery_shape(
+    delivery: Mapping[str, object],
+    *,
+    lane: str,
+    staging_root: str,
+) -> dict[str, object]:
+    """Return only the public provider Delivery fields.
+
+    Provider-specific manifests and convenience roots are intentionally
+    consumed before this boundary.  Runtime code therefore has one shape for
+    every lane and cannot accidentally regain a private provider contract.
+    """
+
+    delivered_lane = delivery.get("lane", lane)
+    if delivered_lane != lane:
+        raise AutomaticReplenishmentError("materializer 返回了错误 lane")
+    delivered_root = delivery.get("staging_root", staging_root)
+    if delivered_root != staging_root:
+        raise AutomaticReplenishmentError("materializer 返回了错误 staging_root")
+    attempt_id = posixpath.basename(staging_root.rstrip("/"))
+    delivered_attempt = delivery.get("attempt_id", attempt_id)
+    if delivered_attempt != attempt_id:
+        raise AutomaticReplenishmentError("materializer 返回了错误 attempt_id")
+    raw_files = delivery.get("files")
+    if not isinstance(raw_files, list):
+        raise AutomaticReplenishmentError("materializer 返回的 files 无效")
+    files: list[dict[str, object]] = []
+    for raw in raw_files:
+        if not isinstance(raw, Mapping):
+            raise AutomaticReplenishmentError("materializer 返回的 files 项无效")
+        files.append({
+            "path": raw.get("path"),
+            "size": raw.get("size"),
+            "kind": raw.get("kind"),
+            "gap_ids": raw.get("gap_ids"),
+        })
+    result: dict[str, object] = {
+        "lane": lane,
+        "attempt_id": attempt_id,
+        "staging_root": staging_root,
+        "files": files,
+    }
+    if "external_task_id" in delivery:
+        result["external_task_id"] = delivery.get("external_task_id")
+    return result
+
+
+def _remote_file_size(alist: object, path: str) -> int | None:
+    exact = getattr(alist, "exact_file_info", None)
+    if callable(exact):
+        try:
+            row = exact(path)
+        except Exception:
+            row = None
+        size = row.get("size") if isinstance(row, Mapping) else None
+        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            return size
+    listing = getattr(alist, "list", None)
+    if not callable(listing):
+        return None
+    parent = posixpath.dirname(path) or "/"
+    name = posixpath.basename(path)
+    try:
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            rows = listing(parent)
+    except Exception:
+        return None
+    matches = [
+        row for row in rows
+        if isinstance(row, Mapping) and row.get("name") == name
+        and row.get("is_dir") is not True
+    ] if isinstance(rows, list) else []
+    if len(matches) != 1:
+        return None
+    size = matches[0].get("size")
+    return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
+
+
+def _isolate_cloud_delivery_videos(
+    files: Sequence[Mapping[str, object]],
+    *,
+    staging_root: str,
+    alist: object,
+) -> list[dict[str, object]]:
+    """Move only mixed cloud videos to a task-owned planner subroot.
+
+    Subtitle movement is deliberately unnecessary.  If subtitle pairing or
+    isolation cannot later be proven from the normalized file rows, runtime
+    ignores those sidecars while the isolated video still proceeds.
+    """
+
+    output = [dict(row) for row in files]
+    videos = [row for row in output if row.get("kind") == "video"]
+    subtitles = [row for row in output if row.get("kind") == "subtitle"]
+    if not videos or not subtitles:
+        return output
+    mkdir = getattr(alist, "mkdir", None)
+    move = getattr(alist, "move", None)
+    if not callable(mkdir) or not callable(move):
+        raise AutomaticReplenishmentError(
+            "AList 客户端缺少混合交付视频隔离能力"
+        )
+    media_root = f"{staging_root}/__scrapeflow_media__"
+    if any(
+        isinstance(row.get("path"), str)
+        and str(row["path"]).startswith(media_root + "/")
+        for row in subtitles
+    ):
+        raise AutomaticReplenishmentError("云端混合交付占用了保留的媒体隔离根")
+    basenames = [posixpath.basename(str(row.get("path") or "")) for row in videos]
+    if any(not name for name in basenames) or len(basenames) != len(set(basenames)):
+        raise AutomaticReplenishmentError("云端混合交付视频文件名冲突")
+    mkdir(media_root)
+    for row, name in zip(videos, basenames, strict=True):
+        source = row.get("path")
+        size = row.get("size")
+        if not isinstance(source, str) or type(size) is not int or size <= 0:
+            raise AutomaticReplenishmentError("云端混合交付视频映射无效")
+        destination = f"{media_root}/{name}"
+        if source != destination:
+            source_size = _remote_file_size(alist, source)
+            destination_size = _remote_file_size(alist, destination)
+            if destination_size == size and source_size is None:
+                row["path"] = destination
+                continue
+            if source_size != size or destination_size is not None:
+                raise AutomaticReplenishmentError("云端混合交付视频隔离前回读不一致")
+            move(posixpath.dirname(source), media_root, [name])
+            if _remote_file_size(alist, destination) != size:
+                raise AutomaticReplenishmentError("云端混合交付视频隔离后回读不一致")
+            row["path"] = destination
+    return output
 
 
 class AutomaticProviderSearch(Protocol):
@@ -135,6 +309,7 @@ class LocalTorrentAutomaticMaterializer:
         *,
         archive_preprocessor: object | None = None,
     ) -> None:
+        self.pre_admits_local_video = delegate is None
         if delegate is None:
             from engine.tools.replenishment_adapter.materialize import LocalTorrentMaterializer
             delegate = LocalTorrentMaterializer()
@@ -151,14 +326,9 @@ class LocalTorrentAutomaticMaterializer:
         *,
         staging_root: str,
     ) -> dict[str, object]:
-        result = dict(delivery)
-        lane = result.get("lane", TIER_LOCAL_MAGNET)
-        if lane != TIER_LOCAL_MAGNET:
-            raise AutomaticReplenishmentError("本地 Torrent materializer 返回了错误 lane")
-        result["lane"] = TIER_LOCAL_MAGNET
-        if "attempt_id" not in result:
-            result["attempt_id"] = posixpath.basename(staging_root.rstrip("/"))
-        return result
+        return _contract_delivery_shape(
+            delivery, lane=TIER_LOCAL_MAGNET, staging_root=staging_root,
+        )
 
     def acquire(
         self,
@@ -225,6 +395,17 @@ class LocalTorrentAutomaticMaterializer:
 class QuarkFastSaveAutomaticMaterializer:
     """Use Quark share fast-save to place reviewed files in task staging."""
 
+    _STATE_FILE = "quark_share_attempt.json"
+    _STATE_FIELDS = frozenset({
+        "provider",
+        "attempt_id",
+        "staging_root",
+        "task_id",
+        "locator",
+        "selected_gap_ids",
+        "updated_at",
+    })
+
     def __init__(
         self,
         bridge: object | None = None,
@@ -252,6 +433,144 @@ class QuarkFastSaveAutomaticMaterializer:
             return "subtitle"
         raise AutomaticReplenishmentError("夸克分享快转返回了不支持的文件类型")
 
+    @classmethod
+    def _state_path(cls, workspace: Path) -> Path:
+        return workspace / cls._STATE_FILE
+
+    @staticmethod
+    def _safe_task_id(value: object) -> str | None:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 256
+            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
+        ):
+            return value
+        return None
+
+    @staticmethod
+    def _selection_locator(selection: Mapping[str, object]) -> str:
+        value = selection.get("locator")
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > _DURABLE_CANDIDATE_LOCATOR_LIMIT
+            or any(char in value for char in ("\x00", "\n", "\r"))
+        ):
+            raise AutomaticReplenishmentError("夸克分享候选 locator 无效")
+        return value
+
+    @staticmethod
+    def _selection_gap_ids(selection: Mapping[str, object]) -> list[str]:
+        raw = selection.get("selected_gap_ids")
+        if not isinstance(raw, list) or not raw:
+            raise AutomaticReplenishmentError("夸克分享候选缺少 selected_gap_ids")
+        gap_ids = [
+            value for value in raw
+            if isinstance(value, str) and value and len(value) <= 256
+        ]
+        if len(gap_ids) != len(raw) or len(set(gap_ids)) != len(gap_ids):
+            raise AutomaticReplenishmentError("夸克分享候选 selected_gap_ids 无效")
+        return gap_ids
+
+    @staticmethod
+    def _attempt_id(staging_root: str) -> str:
+        value = posixpath.basename(staging_root.rstrip("/"))
+        if not _ATTEMPT_ID_TOKEN.fullmatch(value):
+            raise AutomaticReplenishmentError("夸克分享 staging attempt_id 无效")
+        return value
+
+    @staticmethod
+    def _valid_updated_at(value: object) -> bool:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            return False
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return False
+        return parsed.tzinfo is not None
+
+    @classmethod
+    def _read_attempt_state(
+        cls,
+        workspace: Path,
+        *,
+        staging_root: str,
+        selection: Mapping[str, object],
+    ) -> dict[str, object]:
+        path = cls._state_path(workspace)
+        if path.is_symlink():
+            raise AutomaticReplenishmentError("夸克分享 attempt 状态不得为软链接")
+        if not path.exists():
+            return {}
+        try:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size <= 0 or stat.st_size > 16_384:
+                raise AutomaticReplenishmentError("夸克分享 attempt 状态大小无效")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except AutomaticReplenishmentError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AutomaticReplenishmentError("夸克分享 attempt 状态不可读") from exc
+        if not isinstance(raw, Mapping) or set(raw) != cls._STATE_FIELDS:
+            raise AutomaticReplenishmentError("夸克分享 attempt 状态结构无效")
+        state = dict(raw)
+        expected_attempt_id = cls._attempt_id(staging_root)
+        expected_locator = cls._selection_locator(selection)
+        expected_gap_ids = cls._selection_gap_ids(selection)
+        task_id = cls._safe_task_id(state.get("task_id"))
+        if (
+            state.get("provider") != TIER_QUARK_SHARE
+            or state.get("attempt_id") != expected_attempt_id
+            or state.get("staging_root") != staging_root
+            or state.get("locator") != expected_locator
+            or state.get("selected_gap_ids") != expected_gap_ids
+            or task_id is None
+            or not cls._valid_updated_at(state.get("updated_at"))
+        ):
+            raise AutomaticReplenishmentError(
+                "夸克分享 attempt 状态不属于当前候选与 staging"
+            )
+        state["task_id"] = task_id
+        return state
+
+    @classmethod
+    def _write_attempt_state(
+        cls,
+        workspace: Path,
+        *,
+        staging_root: str,
+        selection: Mapping[str, object],
+        task_id: str,
+    ) -> None:
+        safe_task_id = cls._safe_task_id(task_id)
+        if safe_task_id is None:
+            raise AutomaticReplenishmentError("夸克分享 task_id 无效")
+        payload = {
+            "provider": TIER_QUARK_SHARE,
+            "attempt_id": cls._attempt_id(staging_root),
+            "staging_root": staging_root,
+            "task_id": safe_task_id,
+            "locator": cls._selection_locator(selection),
+            "selected_gap_ids": cls._selection_gap_ids(selection),
+            "updated_at": _now(),
+        }
+        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_json(
+            cls._state_path(workspace),
+            payload,
+            allow_nan=False,
+        )
+
+    @staticmethod
+    def _in_doubt_error(message: str, *, task_id: str | None = None) -> Exception:
+        from engine.scrapeflow.quark_fast_save_bridge import QuarkShareInDoubtError
+
+        error = QuarkShareInDoubtError(message)
+        if task_id is not None:
+            error.task_id = task_id
+        return error
+
     def acquire(
         self,
         request: Mapping[str, object],
@@ -261,7 +580,7 @@ class QuarkFastSaveAutomaticMaterializer:
         workspace: Path,
         alist: object,
     ) -> Mapping[str, object]:
-        del request, workspace
+        del request
         if len(selections) != 1:
             raise AutomaticReplenishmentError("夸克分享快转一次只接受一个候选")
         selection = selections[0]
@@ -276,6 +595,12 @@ class QuarkFastSaveAutomaticMaterializer:
             raise AutomaticReplenishmentError(
                 "夸克分享 materializer 只接受 quark_share/quark_fast_save 候选"
             )
+        state = self._read_attempt_state(
+            workspace,
+            staging_root=staging_root,
+            selection=selection,
+        )
+        existing_task_id = self._safe_task_id(state.get("task_id"))
         mkdir = getattr(alist, "mkdir", None)
         if not callable(mkdir):
             raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
@@ -285,9 +610,51 @@ class QuarkFastSaveAutomaticMaterializer:
         execute = getattr(self.bridge, "execute", None)
         if not callable(execute):
             raise AutomaticReplenishmentError("夸克分享 materializer 缺少 execute")
-        save_result = execute(selection, staging_root, session)
+
+        persisted_task_id = existing_task_id
+
+        def save_task_id(task_id: str) -> None:
+            nonlocal persisted_task_id
+            safe_task_id = self._safe_task_id(task_id)
+            if safe_task_id is None:
+                raise AutomaticReplenishmentError("夸克分享 task_id 无效")
+            if persisted_task_id is not None and persisted_task_id != safe_task_id:
+                raise self._in_doubt_error(
+                    "夸克分享返回了与已持久 attempt 不同的 task_id",
+                    task_id=persisted_task_id,
+                )
+            self._write_attempt_state(
+                workspace,
+                staging_root=staging_root,
+                selection=selection,
+                task_id=safe_task_id,
+            )
+            persisted_task_id = safe_task_id
+
+        save_result = execute(
+            selection,
+            staging_root,
+            session,
+            task_id=existing_task_id,
+            on_task_id=None if existing_task_id is not None else save_task_id,
+        )
         if not isinstance(save_result, Mapping):
             raise AutomaticReplenishmentError("夸克分享快转返回无效")
+        result_task_id = self._safe_task_id(save_result.get("task_id"))
+        if result_task_id is None:
+            raise self._in_doubt_error(
+                "夸克分享结果缺少 task_id，必须先核对再重试",
+                task_id=persisted_task_id,
+            )
+        if persisted_task_id is not None and persisted_task_id != result_task_id:
+            raise self._in_doubt_error(
+                "夸克分享结果 task_id 与 attempt 状态不一致",
+                task_id=persisted_task_id,
+            )
+        # Production persists through ``on_task_id`` immediately after save.
+        # Persisting once more also closes the contract for a completed query
+        # and for narrow bridge test doubles that only return their task id.
+        save_task_id(result_task_id)
         rows = save_result.get("expected_files")
         if not isinstance(rows, list) or not rows:
             raise AutomaticReplenishmentError("夸克分享快转缺少 expected_files")
@@ -313,16 +680,16 @@ class QuarkFastSaveAutomaticMaterializer:
             })
         if any(not row["gap_ids"] for row in files):
             raise AutomaticReplenishmentError("夸克分享文件 gap_ids 无效")
+        files = _isolate_cloud_delivery_videos(
+            files, staging_root=staging_root, alist=alist,
+        )
         result: dict[str, object] = {
-            "status": "ready",
             "lane": TIER_QUARK_SHARE,
             "attempt_id": posixpath.basename(staging_root.rstrip("/")),
             "staging_root": staging_root,
             "files": files,
         }
-        task_id = save_result.get("task_id")
-        if isinstance(task_id, str) and task_id:
-            result["external_task_id"] = task_id
+        result["external_task_id"] = result_task_id
         return result
 
 
@@ -507,8 +874,10 @@ class QuarkMagnetAutomaticMaterializer:
             })
         if any(not row["gap_ids"] for row in files):
             raise AutomaticReplenishmentError("夸克磁力文件 gap_ids 无效")
+        files = _isolate_cloud_delivery_videos(
+            files, staging_root=staging_root, alist=alist,
+        )
         delivery: dict[str, object] = {
-            "status": "ready",
             "lane": TIER_QUARK_MAGNET,
             "attempt_id": posixpath.basename(staging_root.rstrip("/")),
             "staging_root": staging_root,
@@ -547,6 +916,13 @@ class FixedTierAutomaticMaterializer:
             str(row.get("provider") or "").strip().casefold()
             for row in selections if isinstance(row, Mapping)
         }
+        requested_tier = request.get("tier")
+        if isinstance(requested_tier, str):
+            tier = requested_tier.strip().casefold()
+            if tier in STRICT_TIER_ORDER and providers != {tier}:
+                raise AutomaticReplenishmentError(
+                    "补源 bundle 必须只包含当前 tier 的候选"
+                )
         if providers == {TIER_QUARK_SHARE}:
             return self.quark_share.acquire(
                 request, selections, staging_root=staging_root,
@@ -670,6 +1046,7 @@ class AutomaticReplenishmentRuntime:
         max_candidate_rounds: int = 3,
         progress: Callable[[EngineJob, str, Mapping[str, object]], None] | None = None,
         cancel_requested: Callable[[EngineJob], bool] | None = None,
+        remote_video_probe: Callable[[object, str], Mapping[str, object]] | None = None,
     ) -> None:
         self.state_root = Path(state_root).resolve()
         self.engine_runner = engine_runner
@@ -677,8 +1054,15 @@ class AutomaticReplenishmentRuntime:
         self.search = search
         self.materializer = materializer
         self.staging_root = _safe_path(staging_root, label="staging_root")
-        self.max_candidate_rounds = max(1, min(12, int(max_candidate_rounds)))
+        # The strict policy advances only after thirty distinct
+        # candidate-local failures.  A caller may choose a smaller execution
+        # slice, but the runtime must not silently cap a configured thirty
+        # candidate proof at the historical twelve-round limit.
+        self.max_candidate_rounds = max(
+            1, min(EXHAUSTION_MIN_DISTINCT_LOCATORS, int(max_candidate_rounds)),
+        )
         self.progress = progress
+        self.remote_video_probe = remote_video_probe or probe_remote_video_stream
         # This intentionally remains a cooperative boundary.  It cannot
         # safely interrupt an already-running downloader, but it prevents a
         # stopped pilot from starting another provider round or formal write.
@@ -857,6 +1241,122 @@ class AutomaticReplenishmentRuntime:
         return None
 
     @staticmethod
+    def _safe_replenishment_job_id(value: object) -> str | None:
+        """Return a job id safe to bind to one provider staging subtree."""
+        if isinstance(value, str) and _JOB_ID_TOKEN.fullmatch(value):
+            return value
+        return None
+
+    @staticmethod
+    def _parse_utc_timestamp(value: object) -> datetime | None:
+        """Parse the existing audit/state UTC timestamp representation."""
+        if not isinstance(value, str) or not value.endswith("Z"):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC)
+
+    @classmethod
+    def _post_acquisition_reaudit_is_pending(cls, state: Mapping[str, object]) -> bool:
+        """Whether one gap still owns staging pending a post-write audit.
+
+        A malformed marker is deliberately pending as well.  Treating an
+        unreadable/unknown lifecycle marker as permission to delete the
+        attempt would make a damaged JSON record a cleanup bypass.
+        """
+        if _POST_ACQUISITION_REAUDIT_KEY not in state:
+            return False
+        raw = state.get(_POST_ACQUISITION_REAUDIT_KEY)
+        if not isinstance(raw, Mapping):
+            return True
+        return str(raw.get("status") or "").casefold() != "cleaned"
+
+    def _coerce_post_acquisition_reaudit(
+        self,
+        value: object,
+        *,
+        job_id: str,
+        gap_id: str,
+    ) -> dict[str, object] | None:
+        """Validate one durable post-acquisition re-audit marker.
+
+        The marker is the only authority that permits removal of a provider
+        attempt after a successful child.  Keep its parser deliberately
+        narrow: a corrupted marker remains pending, but can never choose an
+        arbitrary AList path for cleanup.
+        """
+        if not isinstance(value, Mapping):
+            return None
+        status = str(value.get("status") or "").casefold()
+        if status not in _POST_ACQUISITION_REAUDIT_PENDING_STATUSES | {"cleaned"}:
+            return None
+        attempt_id = self._safe_attempt_id(value.get("attempt_id"))
+        if attempt_id is None:
+            return None
+        try:
+            staging_root = _safe_path(
+                value.get("staging_root"), label="post-acquisition staging",
+            )
+        except AutomaticReplenishmentError:
+            return None
+        expected_prefix = f"{self.staging_root}/{job_id}/"
+        if (
+            not staging_root.startswith(expected_prefix)
+            or posixpath.basename(staging_root) != attempt_id
+        ):
+            return None
+        raw_gap_ids = value.get("selected_gap_ids")
+        if (
+            not isinstance(raw_gap_ids, list)
+            or not raw_gap_ids
+            or len(raw_gap_ids) > _POST_ACQUISITION_REAUDIT_MAX_GAPS
+        ):
+            return None
+        selected_gap_ids: list[str] = []
+        for raw_gap_id in raw_gap_ids:
+            if (
+                not isinstance(raw_gap_id, str)
+                or not raw_gap_id
+                or len(raw_gap_id) > 256
+                or any(char in raw_gap_id for char in ("/", "\\", "\x00", "\n", "\r"))
+            ):
+                return None
+            selected_gap_ids.append(raw_gap_id)
+        if len(selected_gap_ids) != len(set(selected_gap_ids)) or gap_id not in selected_gap_ids:
+            return None
+        requested_at = self._parse_utc_timestamp(value.get("requested_at"))
+        if requested_at is None:
+            return None
+        record: dict[str, object] = {
+            "status": status,
+            "attempt_id": attempt_id,
+            "staging_root": staging_root,
+            "selected_gap_ids": sorted(selected_gap_ids),
+            "requested_at": str(value["requested_at"]),
+        }
+        child_job_id = self._safe_replenishment_job_id(value.get("child_job_id"))
+        if child_job_id is not None:
+            record["child_job_id"] = child_job_id
+        cleanup_attempts = value.get("cleanup_attempts")
+        if (
+            isinstance(cleanup_attempts, int)
+            and not isinstance(cleanup_attempts, bool)
+            and 0 <= cleanup_attempts <= 5
+        ):
+            record["cleanup_attempts"] = cleanup_attempts
+        for key in ("last_audit_started_at", "cleaned_at"):
+            if self._parse_utc_timestamp(value.get(key)) is not None:
+                record[key] = str(value[key])
+        error = value.get("error")
+        if isinstance(error, str) and error:
+            record["error"] = redact_error(error)
+        return record
+
+    @staticmethod
     def _copy_durable_defaults() -> dict[str, object]:
         defaults: dict[str, object] = {}
         for key, value in _DURABLE_GAP_STATE_DEFAULTS.items():
@@ -869,7 +1369,7 @@ class AutomaticReplenishmentRuntime:
         if not isinstance(value, Mapping):
             return output
         for provider, rows in value.items():
-            if provider not in _STRICT_TIER_ORDER or not isinstance(rows, list):
+            if provider not in STRICT_TIER_ORDER or not isinstance(rows, list):
                 continue
             locators = [
                 item for item in rows
@@ -887,9 +1387,203 @@ class AutomaticReplenishmentRuntime:
         if not isinstance(value, Mapping):
             return output
         for provider, proof in value.items():
-            if provider in _STRICT_TIER_ORDER and isinstance(proof, Mapping):
+            if provider in STRICT_TIER_ORDER and isinstance(proof, Mapping):
                 output[str(provider)] = dict(proof)
         return output
+
+    @staticmethod
+    def _tier_from_state(state: Mapping[str, object]) -> str:
+        """Read one durable tier without deriving it from a candidate.
+
+        A damaged/legacy gap record falls back to the policy's initial state,
+        never to the lowest provider returned by search.  This keeps recovery
+        conservative while the pure policy remains the only transition rule.
+        """
+        raw = state.get("tier")
+        if isinstance(raw, str):
+            tier = raw.strip().casefold()
+            if tier in STRICT_TIER_ORDER:
+                return tier
+        return str(initial_tier_state()["tier"])
+
+    def _current_tier_for_gap_states(
+        self,
+        gap_state_paths: Mapping[str, Path],
+    ) -> str:
+        """Return the earliest durable tier shared by this root attempt.
+
+        A request may contain several gaps.  They must never be materialized
+        by a mixed tier bundle.  New states are aligned by every policy update;
+        if an interrupted legacy run left them divergent, choose the earliest
+        lane so no gap can skip a required upstream tier.
+        """
+        tiers: list[str] = []
+        for path in dict.fromkeys(gap_state_paths.values()):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AutomaticReplenishmentError("补源 gap 状态不可读") from exc
+            if isinstance(raw, Mapping):
+                tiers.append(self._tier_from_state(raw))
+        if not tiers:
+            return str(initial_tier_state()["tier"])
+        return min(tiers, key=STRICT_TIER_ORDER.index)
+
+    @staticmethod
+    def _waiting_reconcile_gap_states(
+        gap_state_paths: Mapping[str, Path],
+    ) -> bool:
+        """Do not resubmit an external task whose outcome is ambiguous."""
+        for path in dict.fromkeys(gap_state_paths.values()):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # The ordinary state loader will fail closed with a useful
+                # message below; a damaged file cannot prove a safe resubmit.
+                return True
+            if not isinstance(raw, Mapping):
+                return True
+            if (
+                raw.get("tier_status") == "waiting_reconcile"
+                or raw.get("last_error_scope") == FAILURE_IN_DOUBT
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _copy_tier_policy_fields(
+        state: dict[str, object],
+        policy_state: Mapping[str, object],
+    ) -> None:
+        """Project the pure tier result into one durable gap record."""
+        for key in (
+            "tier",
+            "candidate_failures_by_provider",
+            "exhaustion_proof_by_provider",
+            "last_error_scope",
+            "external_task_id",
+        ):
+            if key in policy_state:
+                state[key] = policy_state[key]
+        status = policy_state.get("status")
+        if isinstance(status, str) and status:
+            state["tier_status"] = status
+
+    def _apply_tier_outcome_to_gap_states(
+        self,
+        gap_state_paths: Mapping[str, Path],
+        *,
+        outcome: Mapping[str, object],
+        updates: Mapping[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        """Apply one pure transition to every gap in the current bundle.
+
+        The caller has already constrained selection to one current tier.  A
+        shared outcome therefore updates every participating gap identically,
+        preserving one tier for the whole materialization attempt.
+        """
+        results: list[dict[str, object]] = []
+        for path in dict.fromkeys(gap_state_paths.values()):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AutomaticReplenishmentError("补源 gap 状态不可读") from exc
+            if not isinstance(raw, Mapping):
+                raise AutomaticReplenishmentError("补源 gap 状态格式无效")
+            state = dict(raw)
+            try:
+                policy_state = apply_tier_outcome(state, outcome)
+            except ReplenishmentTierError as exc:
+                raise AutomaticReplenishmentError("补源 tier 状态无效") from exc
+            self._copy_tier_policy_fields(state, policy_state)
+            if updates:
+                state.update(dict(updates))
+            if "updated_at" not in (updates or {}):
+                state["updated_at"] = _now()
+            self._write_gap(state, path)
+            results.append(policy_state)
+        return results
+
+    @staticmethod
+    def _source_name(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    def _search_tier_outcome(
+        self,
+        result: Mapping[str, object],
+        selection_bundle: Mapping[str, object],
+        *,
+        tier: str,
+    ) -> dict[str, object]:
+        """Translate read-only search evidence into the pure policy schema."""
+        required = required_sources_for_tier(tier)
+        completed = {
+            self._source_name(value)
+            for value in result.get("completed_sources", [])
+            if self._source_name(value)
+        } if isinstance(result.get("completed_sources"), list) else set()
+        infrastructure_failure = (
+            str(result.get("failure_scope") or "").strip().casefold()
+            == FAILURE_INFRASTRUCTURE
+        )
+        telemetry = result.get("source_telemetry")
+        if isinstance(telemetry, Mapping):
+            for source, evidence in telemetry.items():
+                name = self._source_name(source)
+                if name not in required:
+                    continue
+                if not isinstance(evidence, Mapping):
+                    continue
+                raw_failures = evidence.get("infrastructure_failures", 0)
+                failures = (
+                    raw_failures if isinstance(raw_failures, int)
+                    and not isinstance(raw_failures, bool) else 0
+                )
+                if failures > 0:
+                    infrastructure_failure = True
+                    continue
+                if evidence.get("source_exhausted") is True:
+                    completed.add(name)
+
+        raw_unchecked = selection_bundle.get(
+            "unchecked_current_tier_candidate_count", 0,
+        )
+        unchecked = (
+            raw_unchecked if isinstance(raw_unchecked, int)
+            and not isinstance(raw_unchecked, bool) and raw_unchecked >= 0 else 1
+        )
+        explicit_unchecked = result.get("unchecked_secondary_candidates")
+        if (
+            isinstance(explicit_unchecked, int)
+            and not isinstance(explicit_unchecked, bool)
+            and explicit_unchecked >= 0
+        ):
+            unchecked = max(unchecked, explicit_unchecked)
+        raw_eligible = selection_bundle.get(
+            "eligible_current_tier_candidate_count", 0,
+        )
+        eligible = (
+            raw_eligible if isinstance(raw_eligible, int)
+            and not isinstance(raw_eligible, bool) and raw_eligible >= 0 else 1
+        )
+        search_complete = (
+            result.get("search_complete_no_candidates") is True
+            or result.get("search_complete") is True
+        )
+        no_candidates = eligible == 0 and unchecked == 0
+        return {
+            "scope": (
+                FAILURE_INFRASTRUCTURE
+                if infrastructure_failure else FAILURE_CANDIDATE
+            ),
+            "search_complete_no_candidates": bool(
+                search_complete and no_candidates and not infrastructure_failure
+            ),
+            "completed_sources": sorted(completed),
+            "unchecked_secondary_candidates": unchecked,
+        }
 
     def _active_attempt_record(
         self,
@@ -1092,7 +1786,7 @@ class AutomaticReplenishmentRuntime:
         if not isinstance(prior_state, Mapping):
             return fields
         tier = prior_state.get("tier")
-        if tier in _STRICT_TIER_ORDER:
+        if tier in STRICT_TIER_ORDER:
             fields["tier"] = str(tier)
         active_attempt = self._coerce_active_attempt(
             prior_state.get("active_attempt"), job_id=job_id,
@@ -1114,6 +1808,19 @@ class AutomaticReplenishmentRuntime:
         last_scope = prior_state.get("last_error_scope")
         if last_scope in {*_KNOWN_FAILURE_SCOPES, _FAILURE_CANCELLED}:
             fields["last_error_scope"] = str(last_scope)
+        tier_status = prior_state.get("tier_status")
+        if isinstance(tier_status, str) and 0 < len(tier_status) <= 64:
+            fields["tier_status"] = tier_status
+        # A successful provider child is not reusable provider input.  It is
+        # nevertheless still task-owned staging until a *later* scoped audit
+        # proves the selected gap disappeared.  Preserve even a malformed
+        # marker so a damaged gap JSON cannot turn into a cleanup bypass when
+        # the next audit re-projects the same row.
+        if self._post_acquisition_reaudit_is_pending(prior_state):
+            raw_reaudit = prior_state.get(_POST_ACQUISITION_REAUDIT_KEY)
+            fields[_POST_ACQUISITION_REAUDIT_KEY] = (
+                dict(raw_reaudit) if isinstance(raw_reaudit, Mapping) else raw_reaudit
+            )
         return fields
 
     @staticmethod
@@ -1147,11 +1854,6 @@ class AutomaticReplenishmentRuntime:
         for raw in rows:
             if not isinstance(raw, Mapping):
                 raise AutomaticReplenishmentError("字幕获取 files 项无效")
-            # A mixed media candidate may carry a new-video companion.  It is
-            # intentionally not an audited ``missing_subtitle`` member and
-            # therefore has no ordinary gap_ids binding.
-            if cls._companion_row_gap_ids(raw):
-                continue
             gap_ids = raw.get("gap_ids")
             if not isinstance(gap_ids, list) or len(gap_ids) != 1:
                 raise AutomaticReplenishmentError("字幕获取结果未绑定唯一 gap")
@@ -1164,144 +1866,55 @@ class AutomaticReplenishmentRuntime:
 
     @staticmethod
     def _media_child_staging_root(
-        acquisition: Mapping[str, object],
         staging_root: str,
         staging_files: Sequence[StagingFile],
     ) -> str:
-        """Return the isolated media subroot for a mixed provider attempt.
-
-        Subtitle companions for existing formal videos must never be passed to
-        the Engine child planner.  A local materializer that delivers both
-        kinds therefore declares ``media_staging_root``; all videos must be
-        inside it and no subtitle may be inside it.  Older/simple test
-        materializers remain usable for video-only attempts, but a mixed flat
-        staging layout is rejected rather than guessed.
-        """
+        """Derive, rather than accept, the exact video-only planner root."""
         root = _safe_path(staging_root, label="staging path")
         videos = [item.path for item in staging_files if item.kind == "video"]
         subtitles = [item.path for item in staging_files if item.kind == "subtitle"]
         if not videos:
             raise AutomaticReplenishmentError("媒体 child staging 没有视频文件")
-        declared = acquisition.get("media_staging_root")
-        if not subtitles and declared is None:
+        if not subtitles:
             return root
-        if not isinstance(declared, str):
-            raise AutomaticReplenishmentError("混合补源缺少隔离的媒体 staging 根")
-        media_root = _safe_path(declared, label="media staging path")
-        if media_root == root or not media_root.startswith(root + "/"):
-            raise AutomaticReplenishmentError("媒体 staging 根超出当前补源任务")
+        relative = [path[len(root) + 1:] for path in videos]
+        first_parts = {
+            value.split("/", 1)[0]
+            for value in relative if "/" in value
+        }
+        if len(first_parts) != 1 or any("/" not in value for value in relative):
+            raise AutomaticReplenishmentError("混合补源无法从 files 证明视频隔离根")
+        media_root = f"{root}/{next(iter(first_parts))}"
         prefix = media_root + "/"
-        if any(not path.startswith(prefix) for path in videos):
-            raise AutomaticReplenishmentError("媒体 staging 根未覆盖所有视频文件")
         if any(path.startswith(prefix) for path in subtitles):
             raise AutomaticReplenishmentError("字幕不得进入媒体 child staging 根")
         return media_root
 
     @staticmethod
     def _subtitle_staging_root(
-        acquisition: Mapping[str, object],
         staging_root: str,
         staging_files: Sequence[StagingFile],
-    ) -> str:
-        """Return the exact task-owned root containing subtitle payloads.
-
-        A mixed candidate is delivered as two sibling subroots.  The subtitle
-        installer must consume the declared ``subtitles`` root, never the
-        parent that also contains media.  For a pure subtitle attempt we keep
-        accepting the historical flat root (there is no media child planner),
-        while still validating any explicit root supplied by a materializer.
-        """
+    ) -> str | None:
+        """Derive a subtitle-only root, or decline the best-effort sidecar."""
         root = _safe_path(staging_root, label="staging path")
         subtitles = [item.path for item in staging_files if item.kind == "subtitle"]
         videos = [item.path for item in staging_files if item.kind == "video"]
         if not subtitles:
             raise AutomaticReplenishmentError("字幕 staging 没有字幕文件")
-
-        declared = acquisition.get("subtitle_staging_root")
-        if declared is None:
-            # A pure subtitle materializer may legitimately use the attempt
-            # root directly.  A mixed attempt without an explicit isolated
-            # root is unsafe and is rejected rather than guessed.
-            if videos:
-                raise AutomaticReplenishmentError("混合补源缺少隔离的字幕 staging 根")
+        if not videos:
             return root
-        if not isinstance(declared, str):
-            raise AutomaticReplenishmentError("字幕 staging 根无效")
-        subtitle_root = _safe_path(declared, label="subtitle staging path")
-        if subtitle_root == root:
-            if videos:
-                raise AutomaticReplenishmentError("混合补源字幕 staging 根未隔离")
-            return root
-        if not subtitle_root.startswith(root + "/"):
-            raise AutomaticReplenishmentError("字幕 staging 根超出当前补源任务")
+        relative = [path[len(root) + 1:] for path in subtitles]
+        first_parts = {
+            value.split("/", 1)[0]
+            for value in relative if "/" in value
+        }
+        if len(first_parts) != 1 or any("/" not in value for value in relative):
+            return None
+        subtitle_root = f"{root}/{next(iter(first_parts))}"
         prefix = subtitle_root + "/"
-        if any(not path.startswith(prefix) for path in subtitles):
-            raise AutomaticReplenishmentError("字幕 staging 根未覆盖所有字幕文件")
         if any(path.startswith(prefix) for path in videos):
-            raise AutomaticReplenishmentError("视频不得进入字幕 staging 根")
+            return None
         return subtitle_root
-
-    @staticmethod
-    def _companion_manifest_index(row: Mapping[str, object]) -> int | None:
-        """Read the optional manifest index carried through materialization.
-
-        The local Torrent materializer keeps this small piece of provenance on
-        each delivered row.  Older test/materializer doubles may omit it, so
-        callers can still use the explicit ``companion_for_gap_ids`` marker;
-        an unmarked subtitle is never guessed from directory order.
-        """
-        for key in ("manifest_index", "file_index", "index"):
-            value = row.get(key)
-            if type(value) is int and value > 0:
-                return value
-        return None
-
-    @classmethod
-    def _companion_row_gap_ids(cls, row: Mapping[str, object]) -> set[str]:
-        """Return explicitly declared media-gap coordinates for one row."""
-        result: set[str] = set()
-        for key in _COMPANION_GAP_KEYS:
-            value = row.get(key)
-            if isinstance(value, str) and value:
-                result.add(value)
-            elif isinstance(value, list):
-                result.update(
-                    item for item in value
-                    if isinstance(item, str) and item
-                )
-        return result
-
-    @staticmethod
-    def _companion_manifest_path(
-        acquisition: Mapping[str, object], index: int,
-    ) -> str | None:
-        path_map = acquisition.get("file_path_by_index")
-        if not isinstance(path_map, Mapping):
-            return None
-        value = path_map.get(str(index), path_map.get(index))
-        if not isinstance(value, str) or not value or value.startswith("/"):
-            return None
-        # A provider path is a manifest identity witness, not a path to be
-        # opened locally.  Reject traversal and platform separators before it
-        # participates in basename/episode pairing.
-        normalized = value.replace("\\", "/")
-        if normalized.startswith("/") or any(
-            part in {"", ".", ".."} for part in normalized.split("/")
-        ):
-            return None
-        return normalized
-
-    @staticmethod
-    def _companion_manifest_size(
-        acquisition: Mapping[str, object], index: int,
-    ) -> int | None:
-        size_map = acquisition.get("file_size_by_index")
-        if not isinstance(size_map, Mapping):
-            return None
-        value = size_map.get(str(index), size_map.get(index))
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            return None
-        return value
 
     @staticmethod
     def _companion_core(path: str) -> str:
@@ -1440,15 +2053,13 @@ class AutomaticReplenishmentRuntime:
         staging_files: Sequence[StagingFile],
         selected_gap_ids: set[str],
     ) -> list[dict[str, object]]:
-        """Return only defensible media/subtitle companion pairs.
+        """Derive exact companions solely from normalized Delivery rows.
 
-        Invalid or ambiguous companion evidence is ignored rather than made a
-        media failure: the newly selected video can still complete normally,
-        and the next library audit will create the ordinary subtitle-only gap.
+        One video and one subtitle must each bind only the same selected media
+        gap, and their actual staged names must pass the strict work/episode/
+        language matcher.  Any ambiguity drops only the optional subtitle;
+        the video remains eligible for the child transaction.
         """
-        raw_map = acquisition.get(_COMPANION_INDEX_MAP_KEY)
-        if not isinstance(raw_map, Mapping):
-            return []
         media_gaps = {
             str(gap.get("id")): dict(gap)
             for gap in cls._request_gaps(request)
@@ -1458,108 +2069,58 @@ class AutomaticReplenishmentRuntime:
         }
         if not media_gaps:
             return []
-        media_map = acquisition.get("file_index_by_gap")
         rows = acquisition.get("files")
-        if not isinstance(media_map, Mapping) or not isinstance(rows, list):
+        if not isinstance(rows, list):
             return []
-        staging_by_path = {
-            item.path: item for item in staging_files
-        }
+        staging_by_path = {item.path: item for item in staging_files}
         output: list[dict[str, object]] = []
-        used_subtitle_indices: set[int] = set()
-        for raw_gap_id, raw_indices in raw_map.items():
-            gap_id = str(raw_gap_id)
-            gap = media_gaps.get(gap_id)
-            if gap is None or not isinstance(raw_indices, list) or len(raw_indices) != 1:
-                continue
-            subtitle_index = raw_indices[0]
-            if type(subtitle_index) is not int or subtitle_index <= 0:
-                continue
-            raw_video_indices = media_map.get(gap_id)
-            if not isinstance(raw_video_indices, list) or len(raw_video_indices) != 1:
-                continue
-            video_index = raw_video_indices[0]
-            if type(video_index) is not int or video_index <= 0 or video_index == subtitle_index:
-                continue
-            if subtitle_index in used_subtitle_indices:
-                continue
-            subtitle_manifest_path = cls._companion_manifest_path(acquisition, subtitle_index)
-            video_manifest_path = cls._companion_manifest_path(acquisition, video_index)
-            subtitle_size = cls._companion_manifest_size(acquisition, subtitle_index)
-            video_size = cls._companion_manifest_size(acquisition, video_index)
-            if (
-                subtitle_manifest_path is None or video_manifest_path is None
-                or subtitle_size is None or video_size is None
-                or Path(subtitle_manifest_path).suffix.casefold() not in _SUBTITLE_EXTENSIONS
-                or Path(video_manifest_path).suffix.casefold() not in _VIDEO_EXTENSIONS
-            ):
-                continue
-            subtitle_rows: list[Mapping[str, object]] = []
-            video_rows: list[Mapping[str, object]] = []
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    continue
-                kind = str(row.get("kind") or "").casefold()
-                index = cls._companion_manifest_index(row)
-                companion_ids = cls._companion_row_gap_ids(row)
-                gap_ids = row.get("gap_ids")
-                ordinary_ids = {
-                    value for value in gap_ids if isinstance(value, str) and value
-                } if isinstance(gap_ids, list) else set()
-                if kind == "subtitle" and (
-                    gap_id in companion_ids or index == subtitle_index
-                ):
-                    subtitle_rows.append(row)
-                if kind == "video" and (
-                    gap_id in ordinary_ids or index == video_index
-                ):
-                    video_rows.append(row)
+        used_subtitles: set[str] = set()
+        for gap_id, gap in media_gaps.items():
+            bound = [
+                row for row in rows
+                if isinstance(row, Mapping) and row.get("gap_ids") == [gap_id]
+            ]
+            video_rows = [row for row in bound if row.get("kind") == "video"]
+            subtitle_rows = [row for row in bound if row.get("kind") == "subtitle"]
             if len(subtitle_rows) != 1 or len(video_rows) != 1:
                 continue
             subtitle_row = subtitle_rows[0]
             video_row = video_rows[0]
             subtitle_source = subtitle_row.get("path")
             video_source = video_row.get("path")
-            subtitle_row_size = subtitle_row.get("size")
-            video_row_size = video_row.get("size")
+            subtitle_size = subtitle_row.get("size")
+            video_size = video_row.get("size")
             if (
                 not isinstance(subtitle_source, str)
                 or not isinstance(video_source, str)
-                or not subtitle_source.startswith("/")
-                or not video_source.startswith("/")
-                or type(subtitle_row_size) is not int
-                or type(video_row_size) is not int
-                or subtitle_row_size != subtitle_size
-                or video_row_size != video_size
+                or subtitle_source in used_subtitles
+                or type(subtitle_size) is not int
+                or type(video_size) is not int
                 or subtitle_source not in staging_by_path
                 or video_source not in staging_by_path
                 or staging_by_path[subtitle_source].kind != "subtitle"
                 or staging_by_path[video_source].kind != "video"
             ):
                 continue
-            declared_language = subtitle_row.get("subtitle_language") or subtitle_row.get("language")
             if not cls._companion_pair_is_exact(
                 request=request,
                 gap=gap,
-                video_path=video_manifest_path,
-                subtitle_path=subtitle_manifest_path,
+                video_path=posixpath.basename(video_source),
+                subtitle_path=posixpath.basename(subtitle_source),
                 subtitle_language=gap.get("subtitle_language") or "zh",
-                declared_language=declared_language,
             ):
                 continue
             output.append({
                 "gap_id": gap_id,
-                "video_index": video_index,
-                "subtitle_index": subtitle_index,
                 "video_source": video_source,
                 "subtitle_source": subtitle_source,
                 "video_size": video_size,
                 "subtitle_size": subtitle_size,
-                "video_manifest_path": video_manifest_path,
-                "subtitle_manifest_path": subtitle_manifest_path,
+                "video_manifest_path": posixpath.basename(video_source),
+                "subtitle_manifest_path": posixpath.basename(subtitle_source),
                 "subtitle_language": gap.get("subtitle_language") or "zh",
             })
-            used_subtitle_indices.add(subtitle_index)
+            used_subtitles.add(subtitle_source)
         return output
 
     @staticmethod
@@ -1817,15 +2378,40 @@ class AutomaticReplenishmentRuntime:
         gap_id = gap.get("id")
         if not isinstance(gap_id, str) or not gap_id:
             raise AutomaticReplenishmentError("Engine gap 缺少 id")
+        # Re-projecting an existing gap normally starts a new provider-search
+        # round.  An ambiguous external submit is the exception: preserve its
+        # reconciliation barrier so this write cannot make a later run look
+        # safe to resubmit.
+        waiting_reconcile = bool(
+            isinstance(prior_state, Mapping)
+            and (
+                prior_state.get("tier_status") == "waiting_reconcile"
+                or prior_state.get("last_error_scope") == FAILURE_IN_DOUBT
+            )
+        )
+        waiting_reaudit = bool(
+            isinstance(prior_state, Mapping)
+            and self._post_acquisition_reaudit_is_pending(prior_state)
+        )
+        prior_error = (
+            prior_state.get("error")
+            if isinstance(prior_state, Mapping)
+            and isinstance(prior_state.get("error"), str)
+            else None
+        )
         state: dict[str, object] = {
             "id": gap_id,
             "job_id": job_id,
             "gap": dict(gap),
-            "phase": "provider_searching",
+            "phase": (
+                "waiting_reconcile" if waiting_reconcile
+                else "waiting_reaudit" if waiting_reaudit
+                else "provider_searching"
+            ),
             "attempts": 0,
             "created_at": _now(),
             "updated_at": _now(),
-            "error": None,
+            "error": prior_error if waiting_reconcile else None,
             **self._durable_gap_fields(prior_state, job_id=job_id),
         }
         # Candidate failures are local, task-owned evidence.  Carry only the
@@ -1946,6 +2532,70 @@ class AutomaticReplenishmentRuntime:
             raise AutomaticReplenishmentError("delivery 声明与 AList 回读不一致")
         return normalized
 
+    def _local_video_is_pre_admitted(self) -> bool:
+        materializer = self.materializer
+        if isinstance(materializer, LocalTorrentAutomaticMaterializer):
+            return materializer.pre_admits_local_video
+        if isinstance(materializer, FixedTierAutomaticMaterializer):
+            local = materializer.local_torrent
+            return bool(
+                isinstance(local, LocalTorrentAutomaticMaterializer)
+                and local.pre_admits_local_video
+            )
+        # A deployment may provide a local-only materializer through the
+        # narrow ``AutomaticMaterializer`` protocol rather than the bundled
+        # class.  It can opt into the same once-only admission only by making
+        # this explicit on the trusted in-process adapter; provider payloads
+        # cannot set it because Delivery has no such field.  Unknown adapters
+        # remain subject to remote probing below.
+        return bool(getattr(materializer, "pre_admits_local_video", False))
+
+    def _admit_delivery_videos(
+        self,
+        delivery: Mapping[str, object],
+        staging_files: Sequence[StagingFile],
+        selections: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Probe each delivered video exactly once before child planning.
+
+        The bundled local Torrent materializer already uses the same shared
+        probe before upload, so its trusted lane is not probed a second time.
+        Cloud lanes (and injected/unknown local materializers) are admitted
+        from their exact remote staging objects here.
+        """
+
+        videos = [item for item in staging_files if item.kind == "video"]
+        if not videos:
+            return
+        if (
+            delivery.get("lane") == TIER_LOCAL_MAGNET
+            and self._local_video_is_pre_admitted()
+        ):
+            return
+        candidate = selections[0] if len(selections) == 1 else None
+        for video in videos:
+            try:
+                verdict = self.remote_video_probe(self.alist, video.path)
+            except VideoAdmissionError as exc:
+                raise _ProviderVideoAdmissionError(
+                    exc, candidate=candidate,
+                ) from exc
+            except Exception as exc:
+                wrapped = VideoAdmissionError(
+                    "remote_video_probe_error", infrastructure=True,
+                )
+                raise _ProviderVideoAdmissionError(
+                    wrapped, candidate=candidate,
+                ) from exc
+            if (
+                not isinstance(verdict, Mapping)
+                or str(verdict.get("status") or "").casefold() != "satisfied"
+            ):
+                raise _ProviderVideoAdmissionError(
+                    VideoAdmissionError("video_stream_unproven"),
+                    candidate=candidate,
+                )
+
     @staticmethod
     def _subtitle_marker(value: object) -> str:
         text = str(value or "zh").casefold()
@@ -2006,8 +2656,6 @@ class AutomaticReplenishmentRuntime:
         for raw in rows:
             if not isinstance(raw, Mapping):
                 raise AutomaticReplenishmentError("字幕获取 files 项无效")
-            if self._companion_row_gap_ids(raw):
-                continue
             gap_ids = raw.get("gap_ids")
             if not isinstance(gap_ids, list) or len(gap_ids) != 1:
                 raise AutomaticReplenishmentError("字幕获取结果未绑定唯一 gap")
@@ -2025,8 +2673,6 @@ class AutomaticReplenishmentRuntime:
         installed: list[dict[str, object]] = []
         installed_ids: set[str] = set()
         for raw in rows:
-            if self._companion_row_gap_ids(raw):
-                continue
             source, size, gap_ids = raw.get("path"), raw.get("size"), raw.get("gap_ids")
             gap_id = str(gap_ids[0])
             if gap_id not in required:
@@ -2191,6 +2837,394 @@ class AutomaticReplenishmentRuntime:
                 break
             current = current_parent
 
+    def _remove_local_attempt_workspace(self, *, job_id: str, attempt_id: str) -> None:
+        """Delete exactly one post-audit local provider workspace.
+
+        The workspace can contain a persisted Quark task id needed for
+        restart/reconciliation, so it follows the same post-audit boundary as
+        its remote attempt.  Do not fold this into root terminal cleanup:
+        a successful gap can be re-audited while another root gap remains
+        active, and only this exact attempt is eligible here.
+        """
+        safe_job_id = self._safe_replenishment_job_id(job_id)
+        safe_attempt_id = self._safe_attempt_id(attempt_id)
+        if safe_job_id is None or safe_attempt_id is None:
+            raise AutomaticReplenishmentError("本地补源 staging 标识无效")
+        if self.workspace_root.is_symlink():
+            raise AutomaticReplenishmentError("本地补源 staging 根不允许符号链接")
+        job_root = self.workspace_root / safe_job_id
+        if job_root.is_symlink():
+            raise AutomaticReplenishmentError("本地补源任务根不允许符号链接")
+        attempt_root = job_root / safe_attempt_id
+        if attempt_root.parent != job_root or attempt_root.is_symlink():
+            raise AutomaticReplenishmentError("本地补源 attempt 路径无效")
+        if not attempt_root.exists():
+            return
+        if not attempt_root.is_dir():
+            raise AutomaticReplenishmentError("本地补源 attempt 不是目录")
+        shutil.rmtree(attempt_root)
+        if attempt_root.exists():
+            raise AutomaticReplenishmentError("本地补源 attempt 清理后仍存在")
+        try:
+            job_root.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError:
+            # A sibling attempt remains.  It has separate durable ownership
+            # and must never be removed as a convenience cleanup.
+            return
+
+    def _mark_post_acquisition_reaudit(
+        self,
+        gap_state_paths: Mapping[str, Path],
+        *,
+        job_id: str,
+        attempt_id: str,
+        staging_root: str,
+        selected_gap_ids: set[str],
+        child_job_id: str | None = None,
+    ) -> dict[str, object]:
+        """Hold a successful attempt until its selected gaps are re-audited."""
+        safe_job_id = self._safe_replenishment_job_id(job_id)
+        safe_attempt_id = self._safe_attempt_id(attempt_id)
+        if safe_job_id is None or safe_attempt_id is None:
+            raise AutomaticReplenishmentError("补源重审状态缺少安全任务标识")
+        try:
+            safe_staging_root = _safe_path(
+                staging_root, label="post-acquisition staging",
+            )
+        except AutomaticReplenishmentError:
+            raise
+        if (
+            not safe_staging_root.startswith(f"{self.staging_root}/{safe_job_id}/")
+            or posixpath.basename(safe_staging_root) != safe_attempt_id
+        ):
+            raise AutomaticReplenishmentError("补源重审状态不属于当前 attempt")
+        selected = sorted({
+            gap_id for gap_id in selected_gap_ids
+            if isinstance(gap_id, str)
+            and gap_id
+            and len(gap_id) <= 256
+            and not any(char in gap_id for char in ("/", "\\", "\x00", "\n", "\r"))
+        })
+        if not selected or len(selected) != len(selected_gap_ids):
+            raise AutomaticReplenishmentError("补源重审状态缺少有效 selected gap")
+        if len(selected) > _POST_ACQUISITION_REAUDIT_MAX_GAPS:
+            raise AutomaticReplenishmentError("补源重审 selected gap 数量超限")
+        marker: dict[str, object] = {
+            "status": "pending",
+            "attempt_id": safe_attempt_id,
+            "staging_root": safe_staging_root,
+            "selected_gap_ids": selected,
+            "requested_at": _now(),
+        }
+        safe_child_id = self._safe_replenishment_job_id(child_job_id)
+        if safe_child_id is not None:
+            marker["child_job_id"] = safe_child_id
+        for gap_id in selected:
+            path = gap_state_paths.get(gap_id)
+            if path is None:
+                raise AutomaticReplenishmentError("补源重审状态找不到 selected gap")
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AutomaticReplenishmentError("补源 gap 状态不可读") from exc
+            if not isinstance(raw, Mapping) or raw.get("id") != gap_id:
+                raise AutomaticReplenishmentError("补源 gap 状态与 selected gap 不一致")
+            state = dict(raw)
+            state.update({
+                "phase": "waiting_reaudit",
+                "updated_at": _now(),
+                "error": None,
+                "active_attempt": None,
+                "last_error_scope": None,
+                "next_retry_at": None,
+                _POST_ACQUISITION_REAUDIT_KEY: dict(marker),
+            })
+            self._write_gap(state, path)
+        return marker
+
+    def _post_acquisition_reaudit_entries(
+        self,
+        job_id: str,
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """Load pending re-audit records without trusting arbitrary JSON paths."""
+        safe_job_id = self._safe_replenishment_job_id(job_id)
+        if safe_job_id is None:
+            raise AutomaticReplenishmentError("补源重审 job id 无效")
+        state_directory = self.gaps_root / _GAP_SLUG.sub("-", safe_job_id).strip(".-")[:96]
+        if not state_directory.exists():
+            return [], []
+        if state_directory.is_symlink() or not state_directory.is_dir():
+            return [], ["gap_state_directory_invalid"]
+        entries: list[dict[str, object]] = []
+        invalid: list[str] = []
+        try:
+            paths = sorted(path for path in state_directory.glob("*.json") if path.is_file())
+        except OSError:
+            return [], ["gap_state_directory_unreadable"]
+        for path in paths:
+            if path.is_symlink():
+                invalid.append(path.name)
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # A malformed unrelated historical row is not a new cleanup
+                # authority.  It is only relevant when it declares this
+                # lifecycle marker, which cannot be known after a parse
+                # failure; fail closed for the root's own task-state folder.
+                invalid.append(path.name)
+                continue
+            if not isinstance(raw, Mapping):
+                invalid.append(path.name)
+                continue
+            state = dict(raw)
+            if not self._post_acquisition_reaudit_is_pending(state):
+                continue
+            gap_id = state.get("id")
+            if not isinstance(gap_id, str) or not gap_id:
+                invalid.append(path.name)
+                continue
+            marker = self._coerce_post_acquisition_reaudit(
+                state.get(_POST_ACQUISITION_REAUDIT_KEY),
+                job_id=safe_job_id,
+                gap_id=gap_id,
+            )
+            if marker is None:
+                invalid.append(path.name)
+                continue
+            entries.append({
+                "path": path,
+                "state": state,
+                "gap_id": gap_id,
+                "marker": marker,
+            })
+        return entries, invalid
+
+    def _update_post_acquisition_reaudit_group(
+        self,
+        entries: Sequence[Mapping[str, object]],
+        *,
+        marker_updates: Mapping[str, object],
+        phase: str,
+    ) -> None:
+        """Atomically replace only the current attempt marker on its gaps."""
+        for entry in entries:
+            path = entry.get("path")
+            raw_state = entry.get("state")
+            raw_marker = entry.get("marker")
+            if not isinstance(path, Path) or not isinstance(raw_state, Mapping) or not isinstance(raw_marker, Mapping):
+                raise AutomaticReplenishmentError("补源重审状态条目无效")
+            state = dict(raw_state)
+            marker = dict(raw_marker)
+            marker.update(dict(marker_updates))
+            state.update({
+                "phase": phase,
+                "updated_at": _now(),
+                "active_attempt": None,
+                "next_retry_at": None,
+                _POST_ACQUISITION_REAUDIT_KEY: marker,
+            })
+            self._write_gap(state, path)
+
+    def reconcile_post_acquisition_reaudit(
+        self,
+        job_id: str,
+        *,
+        audit_started_at: object,
+        audit_complete: bool,
+        actionable_gap_ids: Sequence[str] | set[str],
+        audit_uncertain: bool,
+        unidentified_actionable_gap: bool = False,
+    ) -> dict[str, object]:
+        """Clean successful attempt staging only after a later scoped audit.
+
+        This is intentionally a narrow state transition, not a second
+        provider pass.  An incomplete/unknown audit, a selected gap still in
+        the report, or a cleanup error leaves both local and remote attempt
+        state intact for inspection or a later bounded retry.
+        """
+        safe_job_id = self._safe_replenishment_job_id(job_id)
+        if safe_job_id is None:
+            raise AutomaticReplenishmentError("补源重审 job id 无效")
+        entries, invalid_entries = self._post_acquisition_reaudit_entries(safe_job_id)
+        cleaned: list[str] = []
+        pending: set[str] = set()
+        blocked: list[dict[str, object]] = []
+        cleanup_errors: list[dict[str, object]] = []
+        if invalid_entries:
+            pending.update(invalid_entries)
+            blocked.extend({"attempt_id": item, "reason": "state_invalid"} for item in invalid_entries)
+        if not entries:
+            return {
+                "job_id": safe_job_id,
+                "cleaned_attempt_ids": cleaned,
+                "pending_attempt_ids": sorted(pending),
+                "blocked_attempts": blocked,
+                "cleanup_errors": cleanup_errors,
+                "retryable": False,
+            }
+
+        groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for entry in entries:
+            marker = entry["marker"]
+            if not isinstance(marker, Mapping):  # guarded above; keep mypy honest.
+                continue
+            key = (str(marker["attempt_id"]), str(marker["staging_root"]))
+            groups.setdefault(key, []).append(entry)
+        audit_started = self._parse_utc_timestamp(audit_started_at)
+        observed = {
+            value for value in actionable_gap_ids
+            if isinstance(value, str) and value
+        }
+        for (attempt_id, staging_root), group in groups.items():
+            pending.add(attempt_id)
+            markers = [entry["marker"] for entry in group if isinstance(entry.get("marker"), Mapping)]
+            selected_sets = {
+                tuple(marker.get("selected_gap_ids") or [])
+                for marker in markers
+            }
+            requested_times = {
+                str(marker.get("requested_at") or "")
+                for marker in markers
+            }
+            if len(selected_sets) != 1 or len(requested_times) != 1:
+                blocked.append({"attempt_id": attempt_id, "reason": "state_conflict"})
+                continue
+            marker = dict(markers[0])
+            requested_at = self._parse_utc_timestamp(marker.get("requested_at"))
+            if (
+                audit_complete is not True
+                or audit_uncertain
+                or unidentified_actionable_gap
+                or audit_started is None
+                or requested_at is None
+                # The scoped audit has to begin strictly after the durable
+                # marker.  Equal timestamps are not evidence of ordering and
+                # must not permit cleanup (for example after a coarse clock
+                # or a forged report fixture).
+                or audit_started <= requested_at
+            ):
+                reason = (
+                    "audit_uncertain" if audit_uncertain or audit_complete is not True
+                    else "audit_scope_or_time_unproven"
+                )
+                blocked.append({"attempt_id": attempt_id, "reason": reason})
+                continue
+            selected_gap_ids = set(marker.get("selected_gap_ids") or [])
+            if selected_gap_ids & observed:
+                try:
+                    self._update_post_acquisition_reaudit_group(
+                        group,
+                        marker_updates={
+                            "status": "gap_still_actionable",
+                            "last_audit_started_at": str(audit_started_at),
+                        },
+                        phase="waiting_reaudit",
+                    )
+                except Exception as exc:
+                    cleanup_errors.append({
+                        "attempt_id": attempt_id,
+                        "error": redact_error(exc),
+                    })
+                blocked.append({"attempt_id": attempt_id, "reason": "selected_gap_still_actionable"})
+                continue
+            try:
+                self._remove_staging(staging_root)
+                self._remove_local_attempt_workspace(
+                    job_id=safe_job_id, attempt_id=attempt_id,
+                )
+                self._update_post_acquisition_reaudit_group(
+                    group,
+                    marker_updates={
+                        "status": "cleaned",
+                        "last_audit_started_at": str(audit_started_at),
+                        "cleaned_at": _now(),
+                        "error": None,
+                    },
+                    phase="resolved",
+                )
+            except Exception as exc:
+                cleanup_attempts = marker.get("cleanup_attempts")
+                attempts = (
+                    cleanup_attempts if isinstance(cleanup_attempts, int)
+                    and not isinstance(cleanup_attempts, bool) else 0
+                ) + 1
+                attempts = min(5, attempts)
+                try:
+                    self._update_post_acquisition_reaudit_group(
+                        group,
+                        marker_updates={
+                            "status": "cleanup_failed",
+                            "cleanup_attempts": attempts,
+                            "last_audit_started_at": str(audit_started_at),
+                            "error": redact_error(exc),
+                        },
+                        phase="waiting_reaudit",
+                    )
+                except Exception:
+                    pass
+                cleanup_errors.append({
+                    "attempt_id": attempt_id,
+                    "error": redact_error(exc),
+                    "attempts": attempts,
+                })
+                continue
+            pending.discard(attempt_id)
+            cleaned.append(attempt_id)
+        retryable = any(
+            isinstance(row.get("attempts"), int) and row["attempts"] < 5
+            for row in cleanup_errors
+        )
+        return {
+            "job_id": safe_job_id,
+            "cleaned_attempt_ids": sorted(cleaned),
+            "pending_attempt_ids": sorted(pending),
+            "blocked_attempts": blocked,
+            "cleanup_errors": cleanup_errors,
+            "retryable": retryable,
+        }
+
+    @classmethod
+    def cleanup_post_acquisition_reaudit(
+        cls,
+        state_root: str | Path,
+        *,
+        job_id: str,
+        alist: object,
+        staging_root: str,
+        audit_started_at: object,
+        audit_complete: bool,
+        actionable_gap_ids: Sequence[str] | set[str],
+        audit_uncertain: bool,
+        unidentified_actionable_gap: bool = False,
+    ) -> dict[str, object]:
+        """Run the state-only post-audit cleanup without provider setup.
+
+        An audit callback after API restart must not instantiate a search
+        adapter or a Quark helper merely to remove a previously successful
+        task-owned attempt.  The runtime constructor has no external side
+        effects, so a tiny cleanup-only instance keeps this path shared with
+        the normal in-process provider runtime.
+        """
+        runtime = cls(
+            state_root,
+            engine_runner=object(),
+            alist=alist,
+            search=object(),
+            materializer=object(),
+            staging_root=staging_root,
+        )
+        return runtime.reconcile_post_acquisition_reaudit(
+            job_id,
+            audit_started_at=audit_started_at,
+            audit_complete=audit_complete,
+            actionable_gap_ids=actionable_gap_ids,
+            audit_uncertain=audit_uncertain,
+            unidentified_actionable_gap=unidentified_actionable_gap,
+        )
+
     @staticmethod
     def _normalized_excluded_selection(
         selection: Mapping[str, object],
@@ -2338,9 +3372,14 @@ class AutomaticReplenishmentRuntime:
         error: Exception | None,
         candidate_exclusions: Sequence[Mapping[str, object]],
     ) -> bool:
-        if error is None:
-            return True
-        return cls._failure_scope(error, candidate_exclusions) == FAILURE_CANDIDATE
+        # A successful child has only proved its direct Engine readback.  Its
+        # task-owned staging must survive until the coordinator's later,
+        # scoped audit confirms the selected gap is gone.  Candidate-local
+        # invalid payloads are the sole early-delete exception.
+        return (
+            error is not None
+            and cls._failure_scope(error, candidate_exclusions) == FAILURE_CANDIDATE
+        )
 
     @classmethod
     def _failure_candidate_exclusions(
@@ -2418,33 +3457,40 @@ class AutomaticReplenishmentRuntime:
         for path in dict.fromkeys(gap_state_paths.values()):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                continue
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AutomaticReplenishmentError("补源 gap 状态不可读") from exc
             if not isinstance(raw, Mapping):
-                continue
+                raise AutomaticReplenishmentError("补源 gap 状态格式无效")
             state = dict(raw)
             merged = self._merge_excluded_candidates(
                 state.get("excluded_candidates"), additions,
             )
             if not merged:
                 continue
-            failures = self._provider_failure_map(
-                state.get("candidate_failures_by_provider"),
-            )
+            policy_state: Mapping[str, object] | None = None
             for candidate in additions:
                 provider = str(candidate.get("provider") or "").strip().casefold()
                 locator = self._candidate_failure_locator(candidate)
-                if provider not in _STRICT_TIER_ORDER or locator is None:
-                    continue
-                failures[provider] = sorted({
-                    *failures.get(provider, []),
-                    locator,
-                })[-_DURABLE_CANDIDATE_EXCLUSION_LIMIT:]
+                if provider != self._tier_from_state(state) or locator is None:
+                    raise AutomaticReplenishmentError(
+                        "候选失败与当前补源 tier 不一致"
+                    )
+                try:
+                    policy_state = apply_tier_outcome(
+                        state,
+                        {"scope": FAILURE_CANDIDATE, "locator": locator},
+                    )
+                except ReplenishmentTierError as exc:
+                    raise AutomaticReplenishmentError("补源 tier 状态无效") from exc
+                self._copy_tier_policy_fields(state, policy_state)
             state["excluded_candidates"] = merged
-            state["candidate_failures_by_provider"] = failures
             state["active_attempt"] = None
-            state["last_error_scope"] = FAILURE_CANDIDATE
             state["next_retry_at"] = None
+            state["phase"] = (
+                "provider_searching"
+                if policy_state is not None and policy_state.get("status") == "advanced"
+                else "retry_wait"
+            )
             state["updated_at"] = _now()
             self._write_gap(state, path)
 
@@ -2553,26 +3599,119 @@ class AutomaticReplenishmentRuntime:
             self._raise_if_cancelled(
                 job, round_number=round_number, boundary="candidate_round",
             )
+            current_tier = self._current_tier_for_gap_states(gap_state_paths)
+            if self._waiting_reconcile_gap_states(gap_state_paths):
+                message = "外部补源任务状态待核对，拒绝重新提交"
+                self._progress(
+                    job,
+                    "waiting_reconcile",
+                    round=round_number,
+                    tier=current_tier,
+                    error=message,
+                )
+                return {
+                    "request": request_body,
+                    "resolved_gap_ids": sorted(resolved_total),
+                    "unresolved_gap_ids": [
+                        str(gap.get("id") or "") for gap in request_gaps
+                        if isinstance(gap.get("id"), str) and gap.get("id")
+                    ],
+                    "tier": current_tier,
+                    "tier_status": "waiting_reconcile",
+                    "error": message,
+                }
             restored_attempt = self._load_active_attempt(job.id, gap_state_paths)
-            self._progress(job, "provider_searching", round=round_number)
+            self._progress(
+                job, "provider_searching", round=round_number, tier=current_tier,
+            )
             request_body["excluded_candidates"] = list(excluded)
             request_body["gaps"] = [dict(gap) for gap in request_gaps]
+            # The policy state, not the first provider visible in this search
+            # result, is the sole authority for selection.
+            request_body["tier"] = current_tier
             for gap in request_gaps:
                 gap_id = str(gap.get("id") or "")
                 state_path = gap_state_paths.get(gap_id)
                 if state_path is None:
                     continue
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state.update({"phase": "provider_searching", "attempts": round_number, "updated_at": _now(), "error": None})
+                state.update({
+                    "phase": "provider_searching",
+                    "attempts": round_number,
+                    "tier": current_tier,
+                    "updated_at": _now(),
+                    "error": None,
+                })
                 self._write_gap(state, state_path)
             result = self.search.run(request_body)
             candidates = result.get("candidates") if isinstance(result, Mapping) else None
             if not isinstance(candidates, list):
                 raise AutomaticReplenishmentError("provider 搜索没有返回 candidates 数组")
-            selection_bundle = select_replenishment_candidates(request_body, candidates)
+            try:
+                selection_bundle = select_replenishment_candidates(
+                    request_body, candidates, current_tier=current_tier,
+                )
+            except ValueError as exc:
+                raise AutomaticReplenishmentError("补源当前 tier 无效") from exc
             selections = selection_bundle.get("selections")
             if not isinstance(selections, list) or not selections:
-                raise AutomaticReplenishmentError("provider 没有找到可用候选")
+                search_outcome = self._search_tier_outcome(
+                    result if isinstance(result, Mapping) else {},
+                    selection_bundle,
+                    tier=current_tier,
+                )
+                tier_results = self._apply_tier_outcome_to_gap_states(
+                    gap_state_paths,
+                    outcome=search_outcome,
+                    updates={
+                        "phase": "provider_searching",
+                        "attempts": round_number,
+                        "error": None,
+                        "next_retry_at": None,
+                        "updated_at": _now(),
+                    },
+                )
+                statuses = {
+                    str(item.get("status") or "") for item in tier_results
+                }
+                if statuses == {"advanced"}:
+                    self._progress(
+                        job,
+                        "provider_searching",
+                        round=round_number,
+                        tier=current_tier,
+                        tier_status="advanced",
+                    )
+                    continue
+                tier_status = next(iter(statuses), "candidate_failed")
+                phase = (
+                    "waiting_reconcile"
+                    if tier_status == "waiting_reconcile" else "retry_wait"
+                )
+                message = "当前补源 tier 没有可执行候选或完整穷尽证明"
+                self._update_gap_states(
+                    gap_state_paths,
+                    updates={
+                        "phase": phase,
+                        "error": message,
+                        "updated_at": _now(),
+                    },
+                )
+                self._progress(
+                    job, phase, round=round_number, tier=current_tier,
+                    tier_status=tier_status, error=message,
+                )
+                return {
+                    "request": request_body,
+                    "resolved_gap_ids": sorted(resolved_total),
+                    "unresolved_gap_ids": [
+                        str(gap.get("id") or "") for gap in request_gaps
+                        if isinstance(gap.get("id"), str) and gap.get("id")
+                    ],
+                    "tier": current_tier,
+                    "tier_status": tier_status,
+                    "error": message,
+                }
             # Selection/search is read-only. Do not turn it into a staging
             # write once a live control change has stopped this root.
             self._raise_if_cancelled(
@@ -2604,12 +3743,10 @@ class AutomaticReplenishmentRuntime:
             selected_providers, _selected_markers = self._selection_markers(
                 [row for row in selections if isinstance(row, Mapping)],
             )
-            selected_tier = (
-                next(iter(selected_providers))
-                if len(selected_providers) == 1
-                and next(iter(selected_providers)) in _STRICT_TIER_ORDER
-                else None
-            )
+            if selected_providers != {current_tier}:
+                raise AutomaticReplenishmentError(
+                    "补源选择包含当前 tier 以外的 provider"
+                )
             for gap in request_gaps:
                 gap_id = str(gap.get("id") or "")
                 state_path = gap_state_paths.get(gap_id)
@@ -2625,8 +3762,9 @@ class AutomaticReplenishmentRuntime:
                     "active_attempt": active_attempt,
                     "next_retry_at": None,
                 })
-                if selected_tier is not None:
-                    state["tier"] = selected_tier
+                # Never overwrite durable tier state from the chosen provider:
+                # the selection was already constrained by ``current_tier``.
+                state["tier"] = current_tier
                 if isinstance(active_attempt.get("external_task_id"), str):
                     state["external_task_id"] = active_attempt["external_task_id"]
                 self._write_gap(state, state_path)
@@ -2662,6 +3800,8 @@ class AutomaticReplenishmentRuntime:
                     workspace=workspace,
                     alist=self.alist,
                 )
+                if not isinstance(acquisition, Mapping):
+                    raise AutomaticReplenishmentError("provider delivery 不是对象")
                 external_task_id = self._safe_external_task_id(
                     acquisition.get("external_task_id")
                     if isinstance(acquisition, Mapping) else None
@@ -2691,26 +3831,29 @@ class AutomaticReplenishmentRuntime:
                 self._raise_if_cancelled(
                     job, round_number=round_number, boundary="post_materialization",
                 )
-                if acquisition.get("status") != "ready":
-                    raise AutomaticReplenishmentError("provider 获取没有返回 ready")
                 self._progress(job, "staging_verifying", round=round_number, staging_root=staging)
                 staging_files = self.verify_staging(staging)
-                self._verify_delivery_contract(
+                acquisition = self._verify_delivery_contract(
                     acquisition,
                     job=job,
                     attempt_id=attempt_id,
                     staging_root=staging,
                     staging_files=staging_files,
                 )
-                # Validate both lane roots before any Engine child or formal
-                # subtitle write.  A malformed mixed delivery must fail
-                # closed while all bytes are still in task-owned staging.
+                self._admit_delivery_videos(
+                    acquisition,
+                    staging_files,
+                    [row for row in selections if isinstance(row, Mapping)],
+                )
+                # Derive both lane roots from normalized files.  A subtitle
+                # without a provable isolated root remains best-effort and is
+                # ignored; it never blocks an already isolated video.
                 subtitle_root: str | None = None
                 if any(item.kind == "subtitle" for item in staging_files):
                     subtitle_root = self._subtitle_staging_root(
-                        acquisition, staging, staging_files,
+                        staging, staging_files,
                     )
-                if not subtitle_lane:
+                if not subtitle_lane and subtitle_root is not None:
                     selected_media_gap_ids = {
                         str(gap_id)
                         for selection in selections
@@ -2758,7 +3901,7 @@ class AutomaticReplenishmentRuntime:
                         )
                         child_request = dict(job.request)
                         child_request["source_path"] = self._media_child_staging_root(
-                            acquisition, staging, staging_files,
+                            staging, staging_files,
                         )
                         if not self._request_inherits_target_shelf(job, child_request):
                             raise AutomaticReplenishmentError(
@@ -2817,9 +3960,7 @@ class AutomaticReplenishmentRuntime:
                         delivered_subtitle_ids = self._delivered_subtitle_gap_ids(
                             acquisition, request_body,
                         )
-                        if delivered_subtitle_ids:
-                            if subtitle_root is None:
-                                raise AutomaticReplenishmentError("字幕补源 staging 缺少字幕根")
+                        if delivered_subtitle_ids and subtitle_root is not None:
                             self._raise_if_cancelled(
                                 job, round_number=round_number, boundary="subtitle_write",
                             )
@@ -2877,14 +4018,17 @@ class AutomaticReplenishmentRuntime:
                             error=redact_error(exc),
                         )
             finally:
-                # Cleanup is allowed only after a proven success or a
-                # candidate-local invalid attempt.  Infrastructure, delivery,
-                # in-doubt and cancellation outcomes keep the task-owned tree
-                # intact for retry/reconcile.
+                # A successful child now retains its task-owned attempt for
+                # the post-acquisition scoped audit below. Candidate-local
+                # invalid payloads alone may be removed here; infrastructure,
+                # delivery, in-doubt and cancellation remain restartable.
                 if self._cleanup_attempt_after_error(attempt_error, candidate_exclusions):
                     try:
                         self._progress(job, "cleaning", round=round_number, staging_root=staging)
                         self._remove_staging(staging)
+                        self._remove_local_attempt_workspace(
+                            job_id=job.id, attempt_id=attempt_id,
+                        )
                     except Exception as cleanup_exc:
                         if attempt_error is None:
                             attempt_error = cleanup_exc
@@ -2925,8 +4069,12 @@ class AutomaticReplenishmentRuntime:
                         ],
                         external_task_id=failure_task_id,
                     )
+                failure_phase = (
+                    "waiting_reconcile"
+                    if scope == FAILURE_IN_DOUBT else "retry_wait"
+                )
                 failure_updates: dict[str, object] = {
-                    "phase": "retry_wait",
+                    "phase": failure_phase,
                     "updated_at": _now(),
                     "error": redact_error(attempt_error),
                     "last_error_scope": scope,
@@ -2937,21 +4085,36 @@ class AutomaticReplenishmentRuntime:
                 }
                 if failure_task_id is not None:
                     failure_updates["external_task_id"] = failure_task_id
-                self._update_gap_states(
-                    gap_state_paths,
-                    gap_ids={
-                        str(gap.get("id") or "") for gap in request_gaps
-                        if isinstance(gap.get("id"), str) and gap.get("id")
-                    },
-                    updates=failure_updates,
-                )
+                if scope in {FAILURE_INFRASTRUCTURE, FAILURE_IN_DOUBT}:
+                    # Network/auth/helper failures and ambiguous external
+                    # submissions are policy outcomes, not candidate evidence.
+                    # The pure state machine keeps their tier unchanged and
+                    # gives in-doubt attempts the durable reconcile state.
+                    self._apply_tier_outcome_to_gap_states(
+                        gap_state_paths,
+                        outcome={
+                            "scope": scope,
+                            **({"external_task_id": failure_task_id}
+                               if failure_task_id is not None else {}),
+                        },
+                        updates=failure_updates,
+                    )
+                else:
+                    self._update_gap_states(
+                        gap_state_paths,
+                        gap_ids={
+                            str(gap.get("id") or "") for gap in request_gaps
+                            if isinstance(gap.get("id"), str) and gap.get("id")
+                        },
+                        updates=failure_updates,
+                    )
                 # Keep the last bounded candidate failure visible while a
                 # later round is running. Without this projection a fresh
                 # search masks whether the failure was manifest, payload,
                 # delivery, cleanup, or child planning.
                 self._progress(
                     job,
-                    "retry_wait",
+                    failure_phase,
                     round=round_number,
                     error=redact_error(attempt_error),
                     failure_scope=scope,
@@ -2981,7 +4144,7 @@ class AutomaticReplenishmentRuntime:
                         error=redact_error(attempt_error),
                         failure_scope=scope,
                     )
-                    raise AutomaticReplenishmentError(
+                    raise _CandidateRoundLimitError(
                         f"补源已尝试 {round_number} 轮仍失败: {attempt_error}"
                     ) from attempt_error
                 continue
@@ -3020,25 +4183,17 @@ class AutomaticReplenishmentRuntime:
                     },
                 )
                 raise AutomaticReplenishmentError("补源 child 实际文件未覆盖当前 gap")
+            post_acquisition_reaudit = self._mark_post_acquisition_reaudit(
+                gap_state_paths,
+                job_id=job.id,
+                attempt_id=attempt_id,
+                staging_root=staging,
+                selected_gap_ids=resolved_now,
+                child_job_id=(
+                    completed_child.id if completed_child is not None else None
+                ),
+            )
             resolved_total.update(resolved_now)
-            resolved = sorted(resolved_now)
-            for gap_id in resolved:
-                state_path = gap_state_paths.get(gap_id)
-                if state_path is None:
-                    continue
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                state.update({
-                    "phase": "resolved",
-                    "updated_at": _now(),
-                    "error": None,
-                    "active_attempt": None,
-                    "last_error_scope": None,
-                    "next_retry_at": None,
-                    "staging_files": [item.as_dict() for item in staging_files],
-                })
-                if completed_child is not None:
-                    state["child_job_id"] = completed_child.id
-                self._write_gap(state, state_path)
             pending = [
                 gap for gap in request_gaps
                 if str(gap.get("id") or "") not in resolved_now
@@ -3071,12 +4226,21 @@ class AutomaticReplenishmentRuntime:
                         error="补源 child 只覆盖了部分 gap",
                     )
                     raise AutomaticReplenishmentError("补源 child 只覆盖了部分 gap")
+                # The successfully written subset now waits for its own
+                # post-acquisition audit.  Do not let later candidate rounds
+                # overwrite those durable re-audit markers.
+                gap_state_paths = {
+                    gap_id: path
+                    for gap_id, path in gap_state_paths.items()
+                    if gap_id in pending_ids
+                }
                 request_gaps = pending
                 continue
             return {
                 "request": request_body,
                 "resolved_gap_ids": sorted(resolved_total),
                 "staging_files": [item.as_dict() for item in staging_files],
+                "post_acquisition_reaudit": post_acquisition_reaudit,
                 **({"child_job_id": completed_child.id} if completed_child is not None else {}),
                 **({"companion_subtitles": installed_companions}
                    if installed_companions else {}),
@@ -3103,6 +4267,7 @@ class AutomaticReplenishmentRuntime:
             raise AutomaticReplenishmentError("Engine gap 请求格式无效")
         outcomes: list[dict[str, object]] = []
         already_resolved: list[str] = []
+        pending_reaudit: list[str] = []
         for request in requests:
             if not isinstance(request, Mapping) or not self._request_gaps(request):
                 continue
@@ -3119,6 +4284,16 @@ class AutomaticReplenishmentRuntime:
                         state = json.loads(path.read_text(encoding="utf-8"))
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         state = None
+                    if (
+                        isinstance(state, Mapping)
+                        and self._post_acquisition_reaudit_is_pending(state)
+                    ):
+                        # A completed child must not become a fresh provider
+                        # request while the targeted audit still owns its
+                        # staging.  This also preserves a cleanup-failed
+                        # attempt for an explicit/later scoped re-audit.
+                        pending_reaudit.append(gap_id)
+                        continue
                     if (
                         isinstance(state, Mapping)
                         and state.get("phase") == "resolved"
@@ -3152,7 +4327,10 @@ class AutomaticReplenishmentRuntime:
                 scope = self._failure_scope(exc, [])
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
-                    if state.get("phase") != "resolved":
+                    if (
+                        state.get("phase") != "resolved"
+                        and not self._post_acquisition_reaudit_is_pending(state)
+                    ):
                         state.update({
                             "phase": "retry_wait",
                             "updated_at": _now(),
@@ -3165,6 +4343,7 @@ class AutomaticReplenishmentRuntime:
                     "request": active_request,
                     "resolved_gap_ids": [],
                     "error": redact_error(exc),
+                    "failure_scope": scope,
                     "cancelled": True,
                 })
                 # Do not create state or invoke a provider for another request
@@ -3173,17 +4352,25 @@ class AutomaticReplenishmentRuntime:
                     "job_id": job.id,
                     "outcomes": outcomes,
                     "already_resolved_gap_ids": sorted(set(already_resolved)),
+                    "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
                     "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
                     "cancelled": True,
                 }
             except Exception as exc:
                 scope = self._failure_scope(exc, [])
                 task_id = self._failure_external_task_id(exc)
+                failure_phase = (
+                    "waiting_reconcile"
+                    if scope == FAILURE_IN_DOUBT else "retry_wait"
+                )
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
-                    if state.get("phase") != "resolved":
+                    if (
+                        state.get("phase") != "resolved"
+                        and not self._post_acquisition_reaudit_is_pending(state)
+                    ):
                         state.update({
-                            "phase": "retry_wait",
+                            "phase": failure_phase,
                             "updated_at": _now(),
                             "error": redact_error(exc),
                             "last_error_scope": scope,
@@ -3196,11 +4383,13 @@ class AutomaticReplenishmentRuntime:
                     "request": active_request,
                     "resolved_gap_ids": [],
                     "error": redact_error(exc),
+                    "failure_scope": scope,
                 })
         return {
             "job_id": job.id,
             "outcomes": outcomes,
             "already_resolved_gap_ids": sorted(set(already_resolved)),
+            "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
             "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
         }
 

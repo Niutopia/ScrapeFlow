@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -207,6 +208,98 @@ class OfflineBackupTests(unittest.TestCase):
         self.assertNotIn("media_file_fingerprints", manifest_text.casefold())
         self.assertNotIn("content_witness", manifest_text.casefold())
         self.assertEqual(manifest["media_library"]["status"], "external_snapshot_required")
+
+    def test_verify_rejects_manifest_copy_path_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alist, scrapeflow, output = _sample_state(root)
+            create_offline_backup(
+                alist_data=alist,
+                scrapeflow_data=scrapeflow,
+                output_dir=output,
+                media_snapshot_note="fake media snapshot",
+                label="backup-one",
+            )
+            manifest_path = output / "backup-one" / MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["copies"]["alist_data"] = "../alist-data"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(OfflineBackupError, "copies"):
+                verify_offline_backup(output / "backup-one")
+
+    def test_verify_rejects_copy_root_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alist, scrapeflow, output = _sample_state(root)
+            create_offline_backup(
+                alist_data=alist,
+                scrapeflow_data=scrapeflow,
+                output_dir=output,
+                media_snapshot_note="fake media snapshot",
+                label="backup-one",
+            )
+            backup_dir = output / "backup-one"
+            escaped = root / "outside-backup"
+            escaped.mkdir()
+            shutil.rmtree(backup_dir / "alist-data")
+            (backup_dir / "alist-data").symlink_to(escaped, target_is_directory=True)
+
+            with self.assertRaisesRegex(OfflineBackupError, "符号链接"):
+                verify_offline_backup(backup_dir)
+
+    def test_verify_rejects_changed_backup_stats_and_manifest_stats_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alist, scrapeflow, output = _sample_state(root)
+            create_offline_backup(
+                alist_data=alist,
+                scrapeflow_data=scrapeflow,
+                output_dir=output,
+                media_snapshot_note="fake media snapshot",
+                label="backup-one",
+            )
+            backup_dir = output / "backup-one"
+            (backup_dir / "scrapeflow-data" / "staging" / "root" / "attempt" / "payload.part").write_bytes(
+                b"changed",
+            )
+
+            with self.assertRaisesRegex(OfflineBackupError, "统计"):
+                verify_offline_backup(backup_dir)
+
+            manifest_path = backup_dir / MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["checks"]["copied_stats"]["alist_data"]["total_bytes"] += 1
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(OfflineBackupError, "统计"):
+                verify_offline_backup(backup_dir)
+
+    def test_restore_refuses_unverified_backup_before_creating_restore_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alist, scrapeflow, output = _sample_state(root)
+            create_offline_backup(
+                alist_data=alist,
+                scrapeflow_data=scrapeflow,
+                output_dir=output,
+                media_snapshot_note="fake media snapshot",
+                label="backup-one",
+            )
+            backup_dir = output / "backup-one"
+            (backup_dir / "alist-data" / "config.json").write_text(
+                '{"version": 2, "driver": "tampered"}',
+                encoding="utf-8",
+            )
+            restore_root = root / "isolated-restore"
+
+            with self.assertRaisesRegex(OfflineBackupError, "统计"):
+                restore_offline_backup(
+                    backup_dir=backup_dir,
+                    restore_dir=restore_root,
+                )
+
+            self.assertFalse(restore_root.exists())
 
 
 if __name__ == "__main__":

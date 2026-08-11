@@ -46,7 +46,7 @@ Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身�
 - `engine/scrapeflow/media_naming.py`：正式目录和文件名规则。
 - `engine/scrapeflow/plan_artifacts.py`：NFO、海报及其他计划产物。
 
-Local 服务负责入站登记、目标货架选择、调度、持久化和 API；Engine 负责启动后的业务判断。两者通过结构化请求和计划交接，任何远端写入都回到 Local 的单写执行路径。启动门的完整合同见[用户选择目标货架后启动实施计划](../docs/scrapeflow-target-shelf-start-gate-plan.md)。
+Local 服务负责入站登记、目标货架选择、调度、持久化和 API；Engine 负责启动后的业务判断。两者通过结构化请求和计划交接，任何远端写入都回到 Local 的单写执行路径。完整的全项目合同见[ScrapeFlow 最终收敛计划 v1](../docs/scrapeflow-final-convergence-plan-v1.md)。
 
 ## 仓库检查
 

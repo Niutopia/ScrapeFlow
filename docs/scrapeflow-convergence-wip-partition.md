@@ -4,7 +4,7 @@
 
 旧分区使用阶段 4–7 编号，并把 server、cleanup 与 Web 混在一起；因此不能再用于“目标货架启动门”实施或提交边界。
 
-当前唯一的产品合同、阶段编号和 dirty/untracked 文件归属见[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md#3-当前-wip-清单与阶段边界)。
+当前唯一的产品合同和阶段编号见[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)。本文件只保留当时 dirty/untracked WIP 的历史归属。
 
 本快照仍可作为以下历史证据使用：
 

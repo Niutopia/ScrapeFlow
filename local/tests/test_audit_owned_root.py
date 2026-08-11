@@ -608,7 +608,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                     )
                 )
 
-    def test_full_audit_bootstraps_nfo_identity_without_history(self) -> None:
+    def test_manual_full_audit_reports_nfo_identity_without_creating_provider_work(self) -> None:
         movie_root = "/library/电影"
         movie = f"{movie_root}/Movie (2020)"
         nfo = f"{movie}/movie.nfo"
@@ -632,19 +632,108 @@ class AuditOwnedRootTests(unittest.TestCase):
             )
             app.set_paused(True, "read-only scan")
             try:
-                result = app.run_library_audit()
+                with patch.object(app, "_apply_audit_gaps") as apply_gaps:
+                    result = app.run_library_audit()
                 self.assertEqual(result["audit"]["semantic"]["gap_count"], 1)
-                jobs = runner.list_jobs()
-                self.assertEqual(len(jobs), 1)
-                self.assertTrue(jobs[0].summary["audit_owned"])
-                self.assertEqual(jobs[0].summary["identity"]["tmdb_id"], 42)
-                self.assertEqual(jobs[0].plan["target_root"], movie)
-                self.assertEqual(
-                    jobs[0].plan["scan_report"]["resource_gaps"][0]["kind"],
-                    "missing_media",
-                )
+                # The public manual route can save its local report, but it
+                # must not project that report into an audit-owned provider
+                # root or lifecycle/cleanup decision.
+                apply_gaps.assert_not_called()
+                self.assertEqual(runner.list_jobs(), [])
             finally:
                 app.close()
+
+    def test_audit_keeps_cleanup_pending_for_terminal_or_disabled_provider_gap(self) -> None:
+        """A retained gap must fence cleanup regardless of Provider policy."""
+        for label, terminal, provider_enabled, expected_status, expected_reason in (
+            (
+                "terminal",
+                True,
+                True,
+                "terminal",
+                "provider_terminal_with_remaining_gap",
+            ),
+            (
+                "disabled",
+                False,
+                False,
+                "deferred",
+                "provider_auto_repair_disabled_with_remaining_gap",
+            ),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                remote = EmptyAList()
+                runner = SimpleEngineRunner(
+                    root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+                )
+                gap = _gap()
+                replenishment: dict[str, object] = {}
+                if terminal:
+                    replenishment = {
+                        "status": "failed",
+                        "terminal": True,
+                        "attempts": 5,
+                        "gap_signature": SimpleApplication._provider_gap_signature([gap]),
+                    }
+                job = EngineJob(
+                    id=f"engine-cleanup-{label}",
+                    phase="executed",
+                    created_at="2026-08-08T00:00:00Z",
+                    updated_at="2026-08-08T00:00:00Z",
+                    request={"source_path": "/library/待刮削/Show"},
+                    plan={
+                        "mode": "tv",
+                        "target_root": "/library/番剧/Show",
+                        "metadata": {
+                            "tmdb_id": 42,
+                            "title": "Show",
+                            "media_type": "tv",
+                            "target_root": "/library/番剧/Show",
+                        },
+                        "scan_report": {"resource_gaps": []},
+                    },
+                    summary={
+                        "automatic": True,
+                        "identity": {
+                            "tmdb_id": 42,
+                            "media_type": "tv",
+                            "target_root": "/library/番剧/Show",
+                        },
+                        "replenishment": replenishment,
+                        "lifecycle": {
+                            "formal_write": {"status": "verified"},
+                            "cleanup": {"status": "pending"},
+                        },
+                    },
+                )
+                atomic_write_json(runner.jobs_root / f"{job.id}.json", job.as_dict(), allow_nan=False)
+                app = SimpleApplication(
+                    state_root=root, remote_root="/library", remote=remote,
+                    engine_runner=runner, enforce_engine_roots=False,
+                )
+                app.set_paused(True, "keep provider queue out of this lifecycle test")
+                try:
+                    with patch.object(
+                        app,
+                        "_provider_auto_repair_enabled",
+                        return_value=provider_enabled,
+                    ), patch.object(runner, "finalize_automatic_lifecycle") as finalizer:
+                        app._apply_audit_gaps(
+                            {"semantic": {
+                                "gaps": [gap], "unknowns": [], "acquisition_projects": [],
+                            }},
+                            runner,
+                        )
+
+                    persisted = runner.get_job(job.id)
+                    lifecycle = persisted.summary["lifecycle"]
+                    self.assertFalse(lifecycle["cleanup_ready"])
+                    self.assertEqual(lifecycle["provider"]["status"], expected_status)
+                    self.assertEqual(lifecycle["provider"]["reason"], expected_reason)
+                    finalizer.assert_not_called()
+                finally:
+                    app.close()
 
     def test_terminal_identity_retry_does_not_start_global_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1136,13 +1225,13 @@ class AuditOwnedRootTests(unittest.TestCase):
                 release_first.set()
                 app.close()
 
-    def test_direct_audit_uses_one_worker_and_keeps_busy_rerun(self) -> None:
-        """The synchronous route must share the queued audit worker lane.
+    def test_direct_audit_is_report_only_and_serializes_automatic_follow_up(self) -> None:
+        """The synchronous route never joins the mutating automatic future.
 
-        A direct audit used to scan on the HTTP thread while a queued audit
-        could write the subtitle ledger at the same time.  It now owns the
-        shared future, reports as running, and leaves one coalesced follow-up
-        when a provider commit arrives during that direct scan.
+        Both audit kinds still use one executor, so a provider-triggered
+        automatic follow-up waits until the manual report has settled.  The
+        first call must be explicitly report-only; the second remains the
+        automatic projection path.
         """
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -1167,16 +1256,16 @@ class AuditOwnedRootTests(unittest.TestCase):
             second_finished = threading.Event()
             manual_finished = threading.Event()
             call_lock = threading.Lock()
-            calls: list[int] = []
             active = 0
             peak_active = 0
             manual_result: list[dict[str, object]] = []
+            calls: list[dict[str, object]] = []
 
-            def fake_once() -> dict[str, object]:
+            def fake_once(**kwargs: object) -> dict[str, object]:
                 nonlocal active, peak_active
                 with call_lock:
                     ordinal = len(calls) + 1
-                    calls.append(ordinal)
+                    calls.append(dict(kwargs))
                     active += 1
                     peak_active = max(peak_active, active)
                 try:
@@ -1204,6 +1293,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                     self.assertTrue(first_started.wait(timeout=2))
                     self.assertTrue(app.health()["operations"]["audit_running"])
                     self.assertTrue(worker.is_alive())
+                    self.assertEqual(calls, [{"scope_roots": None, "project_gaps": False}])
 
                     # This mirrors a provider child committing while the
                     # direct HTTP audit is traversing its earlier inventory.
@@ -1217,7 +1307,13 @@ class AuditOwnedRootTests(unittest.TestCase):
                         [{"audit": {"status": "completed", "ordinal": 1}}],
                     )
                     self.assertTrue(second_finished.wait(timeout=4))
-                    self.assertEqual(calls, [1, 2])
+                    self.assertEqual(
+                        calls,
+                        [
+                            {"scope_roots": None, "project_gaps": False},
+                            {},
+                        ],
+                    )
                     self.assertEqual(peak_active, 1)
             finally:
                 release_first.set()
@@ -1410,6 +1506,220 @@ class AuditOwnedRootTests(unittest.TestCase):
                 self.assertFalse(replenishment["terminal"])
                 self.assertEqual(persisted.summary.get("replenishment_attempts"), 0)
                 audit_queue.assert_not_called()
+                provider_queue.assert_not_called()
+            finally:
+                app.close()
+
+    def test_candidate_failure_uses_tier_budget_not_infrastructure_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42",
+                "SCRAPEFLOW_PROVIDER_RETRY_LIMIT": "1",
+            },
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+
+            class CandidateRuntime:
+                def run_for_job(self, _job: EngineJob) -> dict[str, object]:
+                    return {
+                        "job_id": job.id,
+                        "outcomes": [{
+                            "error": "candidate invalid",
+                            "failure_scope": "candidate",
+                        }],
+                        "unresolved_gaps": [],
+                    }
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                with patch.object(
+                    app, "_get_automatic_replenishment", return_value=CandidateRuntime(),
+                ), patch.object(
+                    app, "_queue_scoped_library_audit",
+                ), patch.object(app, "_queue_provider_job") as provider_queue:
+                    app._run_automatic_replenishment(job.id)
+
+                persisted = runner.get_job(job.id)
+                replenishment = persisted.summary["replenishment"]
+                self.assertEqual(replenishment["status"], "retry_wait")
+                self.assertFalse(replenishment["terminal"])
+                self.assertEqual(persisted.summary.get("replenishment_attempts"), 0)
+                provider_queue.assert_called_once_with(job.id, delay=30.0)
+            finally:
+                app.close()
+
+    def test_in_doubt_provider_outcome_waits_without_resubmit_or_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42",
+                "SCRAPEFLOW_PROVIDER_RETRY_LIMIT": "1",
+            },
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+
+            class InDoubtRuntime:
+                def run_for_job(self, _job: EngineJob) -> dict[str, object]:
+                    return {
+                        "job_id": job.id,
+                        "outcomes": [{
+                            "error": "external submit outcome unknown",
+                            "failure_scope": "in_doubt",
+                            "tier_status": "waiting_reconcile",
+                        }],
+                        "unresolved_gaps": [],
+                    }
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                with patch.object(
+                    app, "_get_automatic_replenishment", return_value=InDoubtRuntime(),
+                ), patch.object(
+                    app, "_queue_scoped_library_audit",
+                ), patch.object(app, "_queue_provider_job") as provider_queue:
+                    app._run_automatic_replenishment(job.id)
+
+                persisted = runner.get_job(job.id)
+                replenishment = persisted.summary["replenishment"]
+                self.assertEqual(replenishment["status"], "waiting_reconcile")
+                self.assertFalse(replenishment["terminal"])
+                self.assertIsNone(replenishment["next_retry_seconds"])
+                self.assertEqual(persisted.summary.get("replenishment_attempts"), 0)
+                provider_queue.assert_not_called()
+            finally:
+                app.close()
+
+    def test_final_tier_candidate_exhaustion_stops_without_infrastructure_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42",
+            },
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            state_path = root / "gaps" / job.id / "audit-row-1.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(state_path, {
+                "id": "audit-row-1",
+                "job_id": job.id,
+                "phase": "retry_wait",
+                "tier": "magnet",
+                "tier_status": "exhausted",
+            }, allow_nan=False)
+
+            class ExhaustedRuntime:
+                def run_for_job(self, _job: EngineJob) -> dict[str, object]:
+                    return {
+                        "job_id": job.id,
+                        "outcomes": [{
+                            "error": "thirtieth local candidate invalid",
+                            "failure_scope": "candidate",
+                        }],
+                        "unresolved_gaps": [],
+                    }
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                with patch.object(
+                    app, "_get_automatic_replenishment", return_value=ExhaustedRuntime(),
+                ), patch.object(
+                    app, "_queue_scoped_library_audit",
+                ), patch.object(app, "_queue_provider_job") as provider_queue:
+                    app._run_automatic_replenishment(job.id)
+
+                persisted = runner.get_job(job.id)
+                replenishment = persisted.summary["replenishment"]
+                self.assertEqual(replenishment["status"], "failed")
+                self.assertTrue(replenishment["terminal"])
+                self.assertEqual(persisted.summary.get("replenishment_attempts"), 0)
+                provider_queue.assert_not_called()
+            finally:
+                app.close()
+
+    def test_only_infrastructure_failure_consumes_five_attempt_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42",
+                "SCRAPEFLOW_PROVIDER_RETRY_LIMIT": "1",
+            },
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+
+            class InfrastructureRuntime:
+                def run_for_job(self, _job: EngineJob) -> dict[str, object]:
+                    return {
+                        "job_id": job.id,
+                        "outcomes": [{
+                            "error": "helper unavailable",
+                            "failure_scope": "infrastructure",
+                        }],
+                        "unresolved_gaps": [],
+                    }
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                with patch.object(
+                    app, "_get_automatic_replenishment", return_value=InfrastructureRuntime(),
+                ), patch.object(
+                    app, "_queue_scoped_library_audit",
+                ), patch.object(app, "_queue_provider_job") as provider_queue:
+                    app._run_automatic_replenishment(job.id)
+
+                persisted = runner.get_job(job.id)
+                replenishment = persisted.summary["replenishment"]
+                self.assertEqual(replenishment["status"], "failed")
+                self.assertTrue(replenishment["terminal"])
+                self.assertEqual(persisted.summary["replenishment_attempts"], 1)
                 provider_queue.assert_not_called()
             finally:
                 app.close()

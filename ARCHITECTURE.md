@@ -21,6 +21,8 @@ AList（待刮削、任务专属 staging、正式媒体库）
 
 本地 API 客户端是状态与控制入口。普通来源提交后，服务仅登记 `awaiting_target_shelf`；用户必须通过 `POST /api/jobs/:id/start` 选择 `movie`、`anime` 或 `us_tv`，后端才将其映射为固定一级目标根并允许调度。用户不提交任意正式库路径；Engine 负责启动后的作品身份、媒体类型、季集、候选、具体作品目录和清理范围。若类型与用户货架冲突，服务 fail-closed，不自动改选货架。
 
+全库审计入口严格 report-only。确定性 NFO/海报补写只能由 `POST /api/jobs/:id/repair-artifacts` 显式触发，且只使用该任务已持久化的计划，不启动 Provider、重新规划或清理。
+
 ## 主流程
 
 ```text
@@ -39,7 +41,7 @@ AList（待刮削、任务专属 staging、正式媒体库）
 
 普通任务只有在用户选择一级货架后才交给 Engine。Local 将固定目标根传入 Engine；Engine 在该根内生成具体的作品工作目录，并读取来源和 AList 事实生成包含身份、目标目录、文件名、NFO、海报、字幕以及清理动作的计划。Local 持久化任务、取得写锁、执行计划并在每次远端操作后重新读取结果。
 
-一级货架固定映射为：`movie → /quark/影视/电影`、`anime → /quark/影视/番剧`、`us_tv → /quark/影视/美剧`。这项用户选择不是通用审批流程；它是普通入站任务唯一的正式启动门。完整状态机以[用户选择目标货架后启动实施计划](docs/scrapeflow-target-shelf-start-gate-plan.md)为准。
+一级货架固定映射为：`movie → /quark/影视/电影`、`anime → /quark/影视/番剧`、`us_tv → /quark/影视/美剧`。这项用户选择不是通用审批流程；它是普通入站任务唯一的正式启动门。完整的全项目状态机与验收门以[ScrapeFlow 最终收敛计划 v1](docs/scrapeflow-final-convergence-plan-v1.md)为准。
 
 ## 自动补源
 
@@ -107,6 +109,7 @@ python3 scripts/scrapeflow_release_check.py
 ```sh
 SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s local/tests -p 'test_*.py'
+git status --porcelain  # 必须为空
 git diff --check
 env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
   docker compose config

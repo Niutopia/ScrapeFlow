@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import posixpath
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .offline_backup import MANIFEST_NAME, OfflineBackupError, verify_offline_backup
 from .provider_delivery import DEFAULT_DELIVERY_PARENT
 from .release_checks import project_root
 
@@ -113,10 +116,13 @@ def _absolute_local_path(value: object) -> Path | None:
     text = _non_empty_text(value)
     if text is None:
         return None
-    path = Path(text).expanduser()
-    if not path.is_absolute():
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            return None
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
         return None
-    return path.resolve(strict=False)
 
 
 def _path_is_within(path: Path, parent: Path) -> bool:
@@ -144,6 +150,102 @@ def _path_issue(
     return path, None
 
 
+def _directory_write_issue(path: Path, *, key: str) -> str | None:
+    """Prove writability with a short-lived file rather than permission bits."""
+    try:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=".scrapeflow-preflight-",
+            dir=path,
+        )
+    except OSError as exc:
+        return f"{key} must be writable: {exc}"
+    probe_path = Path(raw_path)
+    try:
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            return f"{key} preflight probe could not be closed: {exc}"
+        try:
+            probe_path.unlink()
+        except OSError as exc:
+            return f"{key} preflight probe could not be removed: {exc}"
+    finally:
+        if probe_path.exists():
+            try:
+                probe_path.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def _isolated_directory_issue(
+    declaration: dict[str, object],
+    key: str,
+    *,
+    repo_root: Path,
+) -> tuple[Path | None, str | None]:
+    path, issue = _path_issue(declaration, key, repo_root=repo_root)
+    if issue is not None or path is None:
+        return path, issue
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return path, f"{key} must exist and be accessible: {exc}"
+    if not resolved.is_dir():
+        return resolved, f"{key} must be an existing directory"
+    try:
+        if any(resolved.iterdir()):
+            return resolved, f"{key} must be empty before isolated acceptance"
+    except OSError as exc:
+        return resolved, f"{key} could not be listed: {exc}"
+    return resolved, _directory_write_issue(resolved, key=key)
+
+
+def _offline_backup_manifest_issue(
+    declaration: dict[str, object],
+    *,
+    repo_root: Path,
+    runtime_dirs: tuple[Path | None, Path | None],
+) -> str | None:
+    key = "offline_backup_manifest"
+    text = _non_empty_text(declaration.get(key))
+    if text is None:
+        return f"{key} is required"
+    if _looks_like_placeholder(text):
+        return f"{key} must replace the template placeholder"
+    try:
+        raw_path = Path(text).expanduser()
+    except ValueError:
+        return f"{key} must be an absolute local path"
+    if not raw_path.is_absolute():
+        return f"{key} must be an absolute local path"
+    if raw_path.is_symlink():
+        return f"{key} must be a regular manifest file"
+    try:
+        manifest_path = raw_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return f"{key} must exist and be accessible: {exc}"
+    if not manifest_path.is_file() or manifest_path.name != MANIFEST_NAME:
+        return f"{key} must point to {MANIFEST_NAME}"
+    if _path_is_within(manifest_path, repo_root):
+        return f"{key} must be outside the repository"
+    backup_root = manifest_path.parent
+    for runtime_key, runtime_dir in zip(
+        ("scrapeflow_state_dir", "alist_data_dir"),
+        runtime_dirs,
+        strict=True,
+    ):
+        if runtime_dir is None:
+            continue
+        if _path_is_within(backup_root, runtime_dir) or _path_is_within(runtime_dir, backup_root):
+            return f"{key} must be isolated from {runtime_key}"
+    try:
+        verify_offline_backup(backup_root)
+    except OfflineBackupError as exc:
+        return f"{key} is not a valid verified backup: {exc}"
+    return None
+
+
 def _remote_root_issue(value: object) -> str | None:
     text = _non_empty_text(value)
     if text is None:
@@ -157,8 +259,11 @@ def _remote_root_issue(value: object) -> str | None:
         return "media_root must be normalized and not the remote root"
     if any(part in {"", ".", ".."} for part in normalized.split("/")[1:]):
         return "media_root contains an unsafe path segment"
-    if normalized in FORMAL_SHELF_ROOTS:
-        return "media_root must not be one of the formal library shelves"
+    if any(
+        normalized == formal_root or normalized.startswith(formal_root + "/")
+        for formal_root in FORMAL_SHELF_ROOTS
+    ):
+        return "media_root must not be a formal library shelf or its descendant"
     staging_parent = DEFAULT_DELIVERY_PARENT.rstrip("/")
     if normalized == staging_parent or normalized.startswith(staging_parent + "/"):
         return "media_root must not be the provider staging root"
@@ -178,10 +283,10 @@ def isolated_preflight_issues(
         if issue:
             issues.append(issue)
 
-    state_dir, state_issue = _path_issue(
+    state_dir, state_issue = _isolated_directory_issue(
         declaration, "scrapeflow_state_dir", repo_root=repo_root,
     )
-    alist_dir, alist_issue = _path_issue(
+    alist_dir, alist_issue = _isolated_directory_issue(
         declaration, "alist_data_dir", repo_root=repo_root,
     )
     if state_issue:
@@ -198,12 +303,20 @@ def isolated_preflight_issues(
     if media_issue:
         issues.append(media_issue)
 
-    for key in ("storage_label", "offline_backup_manifest", "media_recovery_point"):
+    for key in ("storage_label", "media_recovery_point"):
         text = _non_empty_text(declaration.get(key))
         if text is None:
             issues.append(f"{key} is required")
         elif _looks_like_placeholder(text):
             issues.append(f"{key} must replace the template placeholder")
+
+    manifest_issue = _offline_backup_manifest_issue(
+        declaration,
+        repo_root=repo_root,
+        runtime_dirs=(state_dir, alist_dir),
+    )
+    if manifest_issue:
+        issues.append(manifest_issue)
 
     if _as_int(declaration.get("provider_workers")) != 1:
         issues.append("provider_workers must be 1")

@@ -45,6 +45,14 @@ class QuarkShareExpiredError(QuarkBridgeError):
     exclude_candidate = True
 
 
+class QuarkShareInDoubtError(QuarkBridgeError):
+    """A save may have reached Quark but its durable task id was not known."""
+
+    failure_scope = "in_doubt"
+    failure_stage = "quark_fast_save_submit_in_doubt"
+    reusable_candidate = True
+
+
 @dataclass(frozen=True)
 class QuarkSession:
     mount_path: str
@@ -451,14 +459,62 @@ class QuarkFastSaveBridge:
                 raise QuarkShareExpiredError("share exceeds pagination limit")
         return output
 
+    @staticmethod
+    def _safe_task_id(value: object) -> str | None:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 256
+            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
+        ):
+            return value
+        return None
+
+    def _wait_for_task(
+        self,
+        session: QuarkSession,
+        *,
+        task_id: str,
+        destination: str,
+        expected_files: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        for retry_index in range(60):
+            task = self._call(session, "GET", "/task", params={
+                "task_id": task_id,
+                "retry_index": retry_index,
+            })
+            task_data = task.get("data") if isinstance(task.get("data"), Mapping) else {}
+            if task_data.get("status") == 2:
+                return {
+                    "status": "submitted",
+                    "destination": destination,
+                    "expected_files": [dict(row) for row in expected_files],
+                    "task_id": task_id,
+                }
+            self.sleep(0.5)
+        raise QuarkBridgeError("Quark save task did not finish before timeout")
+
     def execute(
         self,
         selection: Mapping[str, Any],
         destination: str,
         session: QuarkSession,
+        *,
+        task_id: str | None = None,
+        on_task_id: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         selection = normalize_quark_fast_save_selection(selection)
         plan = self.dry_run(selection, destination)
+        existing_task_id = self._safe_task_id(task_id)
+        if task_id is not None and existing_task_id is None:
+            raise QuarkBridgeError("Quark save task_id is invalid")
+        if existing_task_id is not None:
+            return self._wait_for_task(
+                session,
+                task_id=existing_task_id,
+                destination=destination,
+                expected_files=plan["expected_files"],
+            )
         acquisition = selection["acquisition"]
         pwd_id = str(acquisition.get("pwd_id") or acquisition.get("share_id"))
         token = self._call(session, "POST", "/share/sharepage/token", body={
@@ -512,33 +568,40 @@ class QuarkFastSaveBridge:
                     "gap_ids": list(declared["gap_ids"]),
                 })
         target_fid = self._resolve_destination(session, destination)
-        saved = self._call(session, "POST", "/share/sharepage/save", api=QUARK_DRIVE_API, body={
-            "fid_list": fids,
-            "fid_token_list": fid_tokens,
-            "to_pdir_fid": target_fid,
-            "pwd_id": pwd_id,
-            "stoken": stoken,
-            "pdir_fid": "0",
-            "scene": "link",
-        })
-        task_id = (saved.get("data") or {}).get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            raise QuarkBridgeError("Quark save did not return task_id")
-        for retry_index in range(60):
-            task = self._call(session, "GET", "/task", params={
-                "task_id": task_id,
-                "retry_index": retry_index,
+        try:
+            saved = self._call(session, "POST", "/share/sharepage/save", api=QUARK_DRIVE_API, body={
+                "fid_list": fids,
+                "fid_token_list": fid_tokens,
+                "to_pdir_fid": target_fid,
+                "pwd_id": pwd_id,
+                "stoken": stoken,
+                "pdir_fid": "0",
+                "scene": "link",
             })
-            task_data = task.get("data") if isinstance(task.get("data"), Mapping) else {}
-            if task_data.get("status") == 2:
-                return {
-                    "status": "submitted",
-                    "destination": destination,
-                    "expected_files": expected,
-                    "task_id": task_id,
-                }
-            self.sleep(0.5)
-        raise QuarkBridgeError("Quark save task did not finish before timeout")
+        except QuarkShareExpiredError:
+            raise
+        except QuarkBridgeError as exc:
+            raise QuarkShareInDoubtError(
+                "Quark save response is unknown; reconcile before retrying"
+            ) from exc
+        saved_task_id = self._safe_task_id((saved.get("data") or {}).get("task_id"))
+        if saved_task_id is None:
+            raise QuarkShareInDoubtError(
+                "Quark save did not return task_id; reconcile before retrying"
+            )
+        if on_task_id is not None:
+            try:
+                on_task_id(saved_task_id)
+            except Exception as exc:
+                raise QuarkShareInDoubtError(
+                    "Quark save task was submitted but local attempt state was not saved"
+                ) from exc
+        return self._wait_for_task(
+            session,
+            task_id=saved_task_id,
+            destination=destination,
+            expected_files=expected,
+        )
 
 
 __all__ = [
@@ -547,6 +610,7 @@ __all__ = [
     "QuarkBridgeError",
     "QuarkFastSaveBridge",
     "QuarkSession",
+    "QuarkShareInDoubtError",
     "QuarkShareExpiredError",
     "UrlLibQuarkTransport",
     "delegated_quark_session",

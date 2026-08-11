@@ -214,6 +214,18 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
     intake_map = dict(intake) if isinstance(intake, Mapping) else {}
     lanes = health_map.get("provider_capabilities")
     lane_names = sorted(key for key in lanes if isinstance(key, str)) if isinstance(lanes, Mapping) else []
+    helpers = health_map.get("helper_readiness")
+    helper_map = dict(helpers) if isinstance(helpers, Mapping) else {}
+    quark_helper = helper_map.get("quark")
+    quark_helper_map = (
+        dict(quark_helper) if isinstance(quark_helper, Mapping) else {}
+    )
+    helper_actions = quark_helper_map.get("actions")
+    helper_action_names = [
+        action.strip()
+        for action in helper_actions
+        if isinstance(action, str) and action.strip()
+    ] if isinstance(helper_actions, list) else []
     return {
         "status": str(payload.get("status") or ("失败" if normalized_issues else "通过")),
         "issues": normalized_issues,
@@ -236,6 +248,109 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
             "provider_active": operation_map.get("provider_active", ""),
             "audit_running": operation_map.get("audit_running", ""),
             "provider_lanes": ", ".join(lane_names),
+            "quark_helper_status": quark_helper_map.get("status", ""),
+            "quark_helper_configured": quark_helper_map.get("configured", ""),
+            "quark_helper_reachable": quark_helper_map.get("reachable", ""),
+            "quark_helper_authenticated": quark_helper_map.get("authenticated", ""),
+            "quark_helper_actions": ", ".join(helper_action_names),
+        },
+    }
+
+
+def _release_evidence_issues(
+    payload: Mapping[str, object],
+    *,
+    evidence_path: Path | None,
+) -> list[str]:
+    """Reject a success claim that is not bound to a full raw gate artifact."""
+    issues: list[str] = []
+    returncode = payload.get("returncode")
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        issues.append("returncode must be an integer")
+    command = payload.get("command")
+    if command != ["python3", "scripts/scrapeflow_release_check.py"]:
+        issues.append("command must run the full release gate without --skip-docker")
+    if payload.get("include_docker") is not True:
+        issues.append("include_docker must be true")
+
+    parsed_times: list[datetime] = []
+    for key in ("started_at", "finished_at"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            issues.append(f"{key} must be a non-empty ISO-8601 timestamp")
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            issues.append(f"{key} must be a valid ISO-8601 timestamp")
+            continue
+        if parsed.tzinfo is None:
+            issues.append(f"{key} must include a timezone")
+            continue
+        parsed_times.append(parsed)
+    if len(parsed_times) == 2 and parsed_times[1] < parsed_times[0]:
+        issues.append("finished_at must not precede started_at")
+
+    for key in ("log_path", "report_path"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            issues.append(f"{key} must be a non-empty path")
+
+    if evidence_path is not None:
+        expected_report = evidence_path.expanduser().resolve()
+        reported_path = payload.get("report_path")
+        if not isinstance(reported_path, str) or Path(reported_path).expanduser().resolve() != expected_report:
+            issues.append("report_path does not bind this evidence JSON")
+        log_value = payload.get("log_path")
+        if isinstance(log_value, str) and log_value:
+            log_path = Path(log_value).expanduser().resolve()
+            try:
+                if not log_path.is_file() or log_path.stat().st_size == 0:
+                    issues.append("raw release log is missing or empty")
+            except OSError:
+                issues.append("raw release log cannot be read")
+    return issues
+
+
+def release_evidence_summary(
+    report: Mapping[str, object] | None,
+    *,
+    evidence_path: Path | None = None,
+) -> dict[str, object]:
+    """Return only a verifiable full-gate release evidence summary.
+
+    A hand-written ``returncode: 0`` is not acceptance evidence: a passing
+    record must name the full command, include Docker, and (when supplied via
+    the CLI) be bound to a non-empty raw log beside the exact JSON file.
+    """
+    if report is None:
+        return {"status": "未提供", "summary": {}, "issues": []}
+    payload = dict(report)
+    returncode = payload.get("returncode")
+    if isinstance(returncode, bool):
+        returncode = None
+    issues = _release_evidence_issues(payload, evidence_path=evidence_path)
+    if isinstance(returncode, int) and returncode != 0:
+        status = "失败"
+    elif isinstance(returncode, int) and returncode == 0 and not issues:
+        status = "通过"
+    else:
+        status = "无效"
+    command = payload.get("command")
+    command_text = ""
+    if isinstance(command, list):
+        command_text = " ".join(str(part) for part in command)
+    return {
+        "status": status,
+        "issues": issues,
+        "summary": {
+            "command": command_text,
+            "returncode": "" if returncode is None else returncode,
+            "include_docker": payload.get("include_docker", ""),
+            "started_at": payload.get("started_at", ""),
+            "finished_at": payload.get("finished_at", ""),
+            "log_path": payload.get("log_path", ""),
+            "report_path": payload.get("report_path", ""),
         },
     }
 
@@ -256,6 +371,8 @@ def build_acceptance_package(
     release_check_status: str = "未执行",
     backup_manifest: str = "",
     media_recovery_point: str = "",
+    release_evidence: Mapping[str, object] | None = None,
+    release_evidence_path: Path | None = None,
     isolated_declaration: Mapping[str, object] | None = None,
     runtime_readiness: Mapping[str, object] | None = None,
     runner: CommandRunner = _run_command,
@@ -267,6 +384,12 @@ def build_acceptance_package(
     compose = compose_evidence(base, runner)
     deployment_issues = local_deployment_contract_issues(base)
     static_status = "通过" if not deployment_issues else "失败"
+    release = release_evidence_summary(
+        release_evidence,
+        evidence_path=release_evidence_path,
+    )
+    if release["status"] != "未提供":
+        release_check_status = str(release["status"])
     preflight = isolated_preflight_evidence(isolated_declaration, root=base)
     readiness = runtime_readiness_evidence(runtime_readiness)
     preflight_summary = preflight["summary"]
@@ -291,6 +414,7 @@ def build_acceptance_package(
         f"- 工作树: {'干净' if git['worktree_clean'] else '有未提交改动'}",
         f"- Git status: {git['status']}",
         f"- 发布检查: {release_check_status}",
+        f"- 发布证据: {release['status']}",
         f"- 静态部署合同: {static_status}",
         f"- 隔离 preflight: {preflight['status']}",
         f"- Runtime readiness: {readiness['status']}",
@@ -302,6 +426,31 @@ def build_acceptance_package(
         lines.extend(["静态部署合同问题:", ""])
         lines.extend(f"- {issue}" for issue in deployment_issues)
         lines.append("")
+
+    lines.extend(["## 发布检查证据", ""])
+    release_summary = release["summary"]
+    if release["status"] == "未提供":
+        lines.extend([
+            "- 状态: 未提供",
+            "- 生成命令: `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release`",
+            "",
+        ])
+    elif isinstance(release_summary, Mapping):
+        lines.extend([
+            f"- 状态: {release['status']}",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+        ])
+        for key, value in release_summary.items():
+            lines.append(f"| {key} | {value} |")
+        lines.append("")
+        release_issues = release.get("issues")
+        if isinstance(release_issues, list) and release_issues:
+            lines.append("发布证据问题:")
+            lines.append("")
+            lines.extend(f"- {issue}" for issue in release_issues)
+            lines.append("")
 
     lines.extend(["## Compose 服务", ""])
     if compose["status"] != "可读":
@@ -372,7 +521,8 @@ def build_acceptance_package(
     lines.extend([
         "## 预检查",
         "",
-        f"- [ ] 发布检查通过，命令: `python3 scripts/scrapeflow_release_check.py`，当前记录: {release_check_status}",
+        f"- [ ] 发布检查通过，命令: `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release`，当前记录: {release_check_status}",
+        f"- [ ] 发布检查原始日志已归档，当前记录: {release['status']}",
         f"- [ ] 隔离 preflight 通过，命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`，当前记录: {preflight['status']}",
         f"- [ ] Runtime readiness 通过，命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`，当前记录: {readiness['status']}",
         "- [ ] 离线备份 `verify` 通过。",
@@ -419,5 +569,6 @@ __all__ = [
     "compose_evidence",
     "git_evidence",
     "isolated_preflight_evidence",
+    "release_evidence_summary",
     "runtime_readiness_evidence",
 ]

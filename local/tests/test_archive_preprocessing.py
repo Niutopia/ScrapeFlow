@@ -7,11 +7,12 @@ from engine.scrapeflow.archive import ArchiveLimits
 from engine.scrapeflow.archive_preprocessing import (
     ArchivePreprocessingAdapter,
     ArchivePreprocessingError,
+    ArchiveMultiplicityError,
     prepare_ordinary_archive,
     prepare_provider_archive,
 )
 
-from local.tests.test_archive_domain import FakeRunner
+from local.tests.test_archive_domain import FakeRunner, PasswordFallbackRunner
 
 
 class RemoteArchivePort:
@@ -56,6 +57,36 @@ class RemoteArchivePort:
     def exact_file_info(self, path: str):
         payload = self.remote.get(path)
         return None if payload is None else {"size": len(payload), "version": "fake"}
+
+
+class RemoteTreePort:
+    """Remote source double for ambiguity checks that must not download."""
+
+    def __init__(self, direct_name: str):
+        self.direct_name = direct_name
+        self.download_calls: list[str] = []
+
+    def list(self, path: str):
+        if path == "/incoming":
+            return [
+                {"name": "movie.7z", "is_dir": False, "size": 64},
+                {"name": self.direct_name, "is_dir": False, "size": 64},
+            ]
+        return []
+
+    def read_prefix(self, path: str, *, max_bytes: int):
+        del max_bytes
+        if path.endswith(".7z"):
+            return b"7z\xbc\xaf'\x1cfixture"
+        # AVI/TS/M2TS have no single magic handled by the archive detector.
+        # Their canonical extension must still participate in the tree-level
+        # archive-vs-direct-media ambiguity check.
+        return b"unclassified direct-media fixture"
+
+    def download(self, path: str, destination: Path, *, expected_size: int):
+        del destination, expected_size
+        self.download_calls.append(path)
+        raise AssertionError("ambiguous source tree must not download")
 
 
 class ArchivePreprocessingTests(unittest.TestCase):
@@ -149,6 +180,52 @@ class ArchivePreprocessingTests(unittest.TestCase):
             self.assertEqual(ordinary.files, ())
             with self.assertRaises(Exception):
                 self._adapter().prepare_provider_local(unknown, Path(temp) / "provider-task")
+
+    def test_remote_tree_detects_all_canonical_direct_media_extensions_alongside_archive(self):
+        adapter = self._adapter(staging_root_validator=lambda path: path.startswith("/tasks/"))
+        for direct_name in ("bonus.avi", "bonus.ts", "bonus.m2ts"):
+            with self.subTest(direct_name=direct_name), tempfile.TemporaryDirectory() as temp:
+                port = RemoteTreePort(direct_name)
+                with self.assertRaises(ArchiveMultiplicityError):
+                    adapter.prepare_ordinary_remote_tree(
+                        "/incoming",
+                        port,
+                        Path(temp) / "task",
+                        remote_staging_root="/tasks/job/attempt",
+                    )
+                self.assertEqual(port.download_calls, [])
+
+    def test_local_tree_rejects_child_file_and_directory_links(self):
+        adapter = self._adapter()
+        for is_directory in (False, True):
+            with self.subTest(is_directory=is_directory), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "source"
+                root.mkdir()
+                target = Path(temp) / ("outside-dir" if is_directory else "outside.mkv")
+                if is_directory:
+                    target.mkdir()
+                    link = root / "linked-directory"
+                else:
+                    target.write_bytes(b"outside")
+                    link = root / "linked-file.mkv"
+                link.symlink_to(target, target_is_directory=is_directory)
+                with self.assertRaises(ArchivePreprocessingError):
+                    adapter.prepare_ordinary_tree(root, Path(temp) / "task")
+
+    def test_preprocessing_reports_the_candidate_that_actually_extracted(self):
+        runner = PasswordFallbackRunner()
+        adapter = self._adapter(runner)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            source = self._archive(root)
+            (root / "password.txt").write_text("password: correct", encoding="utf-8")
+            result = adapter.prepare_ordinary_local(
+                source,
+                Path(temp) / "task",
+                retry_password="wrong",
+            )
+        self.assertEqual(result.password_sources, ("source-tree-marker",))
 
 
 if __name__ == "__main__":

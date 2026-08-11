@@ -28,7 +28,7 @@ from engine.scrapeflow.residual_policy import (
     classify_residual,
     cleanup_allowlist_reason,
 )
-from engine.scraper import planned_artwork, planned_nfos
+from engine.scraper import build_movie_plan, planned_artwork, planned_nfos
 from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
@@ -410,6 +410,46 @@ class OrderedArchivePreprocessor(RecordingArchivePreprocessor):
 
 
 class SimpleEngineRunnerTests(unittest.TestCase):
+    def test_movie_plan_quality_dedup_does_not_depend_on_removed_hash_field(self) -> None:
+        class MovieTMDB:
+            def get(self, path: str) -> dict[str, object]:
+                if path != "/movie/42":
+                    raise AssertionError(path)
+                return {
+                    "title": "Example Film",
+                    "release_date": "2020-01-01",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                }
+
+        source_files = [
+            {
+                "name": "Example.Film.1080p.mkv",
+                "full_path": "/incoming/Example Film/Example.Film.1080p.mkv",
+                "size": 100,
+            },
+            {
+                "name": "Example.Film.2160p.mkv",
+                "full_path": "/incoming/Example Film/Example.Film.2160p.mkv",
+                "size": 200,
+            },
+        ]
+
+        plan = build_movie_plan(
+            ValidationAList(),
+            MovieTMDB(),
+            src_path="/incoming/Example Film",
+            parent_path="/library",
+            tmdb_id=42,
+            source_files=source_files,
+            defer_validation=True,
+        )
+
+        self.assertEqual([item.original_name for item in plan.files], ["Example.Film.2160p.mkv"])
+        self.assertEqual(len(plan.cleanup_files), 1)
+        self.assertEqual(plan.cleanup_files[0].original_name, "Example.Film.1080p.mkv")
+        self.assertEqual(plan.cleanup_files[0].source_size, 100)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

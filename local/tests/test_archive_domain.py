@@ -8,6 +8,7 @@ from unittest import mock
 from engine.scrapeflow.archive import (
     ArchiveBudgetError,
     ArchiveCollisionError,
+    ArchiveCorruptionError,
     ArchiveExtractor,
     ArchiveLinkError,
     ArchiveMagicError,
@@ -54,6 +55,8 @@ Attributes = A....
 Encrypted = -
 """
 
+ENCRYPTED_LISTING = LISTING.replace("Encrypted = -", "Encrypted = +")
+
 
 class FakeRunner:
     def __init__(self, listing: str = LISTING):
@@ -78,6 +81,26 @@ class FakeRunner:
                 )
             return RunnerResult(0, "", "")
         return RunnerResult(2, "", "failure")
+
+
+class PasswordFallbackRunner(FakeRunner):
+    """A 7-Zip double whose listing succeeds before payload password proof."""
+
+    def __init__(self, *, corruption: bool = False, ambiguous_password_failure: bool = False):
+        super().__init__(ENCRYPTED_LISTING)
+        self.corruption = corruption
+        self.ambiguous_password_failure = ambiguous_password_failure
+
+    def run(self, args, *, password="", cwd=None, timeout=0):
+        if args[0] == "x" and (self.corruption or password != "correct"):
+            del cwd, timeout
+            self.calls.append((tuple(args), password))
+            if self.corruption:
+                return RunnerResult(2, "", "ERROR: Headers Error")
+            if self.ambiguous_password_failure:
+                return RunnerResult(2, "", "ERROR: Data Error in encrypted file")
+            return RunnerResult(2, "", "ERROR: Wrong password")
+        return super().run(args, password=password, cwd=cwd, timeout=timeout)
 
 
 class FakeRemoteSource:
@@ -257,6 +280,61 @@ class ArchiveDomainTests(unittest.TestCase):
             self.assertNotIn("secret", extract_call)
             self.assertIn("Movie/movie.mkv", extract_call)
             self.assertFalse((staging / "Movie" / "readme.txt").exists())
+
+    def test_extractor_falls_through_untried_password_candidates(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = PasswordFallbackRunner(ambiguous_password_failure=True)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / "movie.7z"
+            archive.write_bytes(b"7z\xbc\xaf'\x1cfixture")
+            listing = ArchiveInspector(runner, limits=ArchiveLimits(min_free_bytes=0)).inspect(
+                archive,
+                password_candidates=(
+                    PasswordCandidate("wrong", "retry"),
+                    PasswordCandidate("correct", "source-tree-marker"),
+                ),
+            )
+            result = ArchiveExtractor(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+                video_validator=lambda *_args: True,
+            ).extract(listing, root / "staging")
+        self.assertEqual(result.password_source, "source-tree-marker")
+        self.assertEqual(
+            [password for args, password in runner.calls if args[0] == "x"],
+            ["wrong", "correct"],
+        )
+        safe_listing = json.dumps(listing.to_dict(), ensure_ascii=False)
+        self.assertNotIn("wrong", safe_listing)
+        self.assertNotIn("correct", safe_listing)
+
+    def test_extractor_reports_structural_corruption_without_trying_more_passwords(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = PasswordFallbackRunner(corruption=True)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / "movie.7z"
+            archive.write_bytes(b"7z\xbc\xaf'\x1cfixture")
+            listing = ArchiveInspector(runner, limits=ArchiveLimits(min_free_bytes=0)).inspect(
+                archive,
+                password_candidates=(
+                    PasswordCandidate("wrong", "retry"),
+                    PasswordCandidate("correct", "source-tree-marker"),
+                ),
+            )
+            with self.assertRaises(ArchiveCorruptionError):
+                ArchiveExtractor(
+                    runner,
+                    limits=ArchiveLimits(min_free_bytes=0),
+                    video_validator=lambda *_args: True,
+                ).extract(listing, root / "staging")
+        self.assertEqual(
+            [password for args, password in runner.calls if args[0] == "x"],
+            ["wrong"],
+        )
 
     def test_unexpected_output_and_existing_staging_are_rejected(self):
         runner = FakeRunner()

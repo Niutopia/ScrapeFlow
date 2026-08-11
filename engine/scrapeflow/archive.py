@@ -113,6 +113,12 @@ class ArchiveExtractionError(ArchiveError):
     code = "archive_extraction_failed"
 
 
+class ArchiveCorruptionError(ArchiveExtractionError):
+    """7-Zip reported a structural archive failure, not a password failure."""
+
+    code = "archive_corrupt"
+
+
 class NestedArchiveUnsupported(ArchiveExtractionError):
     code = "nested_archive_unsupported"
 
@@ -195,6 +201,16 @@ _PASSWORD_MARKER_RE = re.compile(
 _MAX_PASSWORD_LENGTH = 128
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_PASSWORD_FAILURE_RE = re.compile(
+    r"(?:wrong|incorrect)\s+password|password\s+(?:is\s+)?(?:wrong|incorrect|invalid)"
+    r"|can(?:not|'t)\s+open\s+(?:the\s+)?encrypted\s+archive",
+    re.IGNORECASE,
+)
+_CORRUPTION_FAILURE_RE = re.compile(
+    r"(?:headers?\s+error|unexpected\s+end|data\s+error|crc\s+failed|"
+    r"not\s+(?:an|a)\s+archive|cannot\s+open\s+(?:the\s+)?archive)",
+    re.IGNORECASE,
+)
 _RESERVED_WINDOWS_NAMES = {
     "con",
     "prn",
@@ -1021,6 +1037,7 @@ class ArchiveListing:
     encrypted: bool = False
     password_source: str = "none"
     _password: str = field(default="", repr=False, compare=False)
+    _password_candidates: tuple[PasswordCandidate, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def format(self) -> str:
@@ -1034,6 +1051,11 @@ class ArchiveListing:
         """A safe projection suitable for a job JSON/UI response."""
 
         secrets = [self._password] if self._password else []
+        secrets.extend(
+            candidate.value
+            for candidate in self._password_candidates
+            if isinstance(candidate, PasswordCandidate) and candidate.value
+        )
 
         def safe_path(value: Path) -> str:
             text = str(value)
@@ -1168,7 +1190,7 @@ class ArchiveInspector:
             str(volumes[0]),
         )
         last_result: RunnerResult | None = None
-        for candidate in candidates[: self.limits.max_password_candidates]:
+        for candidate_index, candidate in enumerate(candidates[: self.limits.max_password_candidates]):
             result = _run_archive_tool(
                 self.runner,
                 args,
@@ -1191,6 +1213,11 @@ class ArchiveInspector:
                 encrypted=encrypted,
                 password_source=candidate.source,
                 _password=candidate.value,
+                # 7-Zip can list an archive before it has proven the password
+                # against every encrypted payload.  Keep only the successful
+                # listing candidate and its bounded, untried successors in
+                # memory so extraction can safely continue if needed.
+                _password_candidates=tuple(candidates[candidate_index:self.limits.max_password_candidates]),
             )
         # Never include stderr/stdout: both may contain a password or a
         # command line echoed by an external 7z wrapper.
@@ -1434,6 +1461,77 @@ class ArchiveExtractionResult:
         }
 
 
+def _extraction_password_candidates(
+    listing: ArchiveListing,
+    password: str | None,
+    *,
+    max_candidates: int,
+) -> tuple[PasswordCandidate, ...]:
+    """Return the bounded candidate tail that still needs extraction proof.
+
+    An explicit ``extract(..., password=...)`` is deliberately one attempt:
+    it overrides the inspector's in-memory discovery sequence.  Otherwise an
+    inspected listing carries the candidate that listed successfully plus only
+    candidates that have not yet been tried.  This avoids retrying known-bad
+    values while allowing a header-visible encrypted archive to fall through
+    to the next bounded candidate.
+    """
+
+    if password is not None:
+        return (PasswordCandidate(password, "explicit"),)
+    candidates: list[PasswordCandidate] = []
+    seen: set[str] = set()
+    for candidate in listing._password_candidates:
+        if not isinstance(candidate, PasswordCandidate) or candidate.value in seen:
+            continue
+        candidates.append(candidate)
+        seen.add(candidate.value)
+        if len(candidates) >= max_candidates:
+            break
+    if candidates:
+        return tuple(candidates)
+    source = listing.password_source if isinstance(listing.password_source, str) and listing.password_source else "none"
+    return (PasswordCandidate(listing._password, source),)
+
+
+def _extraction_failure_kind(result: RunnerResult, *, encrypted: bool) -> str:
+    """Classify 7-Zip output without surfacing it in diagnostics or logs."""
+
+    text = "\n".join((result.stdout, result.stderr))
+    if _PASSWORD_FAILURE_RE.search(text):
+        return "password"
+    # Several 7-Zip builds report only ``Data Error in encrypted file`` for a
+    # wrong candidate.  That wording is not enough to call the archive corrupt
+    # while later bounded candidates remain, so leave it retryable/unknown.
+    if (
+        encrypted
+        and "encrypted" in text.casefold()
+        and re.search(r"(?:data\s+error|crc\s+failed)", text, re.I)
+    ):
+        return "unknown"
+    if _CORRUPTION_FAILURE_RE.search(text):
+        return "corrupt"
+    return "unknown"
+
+
+def _require_empty_staging_for_password_retry(staging: Path) -> None:
+    """Refuse retries when a failed tool invocation left any output behind.
+
+    The extractor never deletes failed output in order to make room for a
+    second password.  Leaving task-owned staging intact is both safer for
+    investigation and prevents a crafted first attempt from influencing a
+    later ``-aos`` extraction through partial files or links.
+    """
+
+    try:
+        if staging.is_symlink() or not staging.is_dir():
+            raise ArchiveExtractionError("failed extraction changed task staging root")
+        if any(staging.iterdir()):
+            raise ArchiveExtractionError("failed extraction left task staging non-empty")
+    except OSError as exc:
+        raise ArchiveExtractionError("cannot inspect task staging after failed extraction") from exc
+
+
 class ArchiveExtractor:
     """Extract selected media into a fresh task staging directory."""
 
@@ -1520,37 +1618,49 @@ class ArchiveExtractor:
             str(volumes[0].resolve(strict=False)),
             *selected_paths,
         )
-        effective_password = password if password is not None else listing._password
-        if (
-            not isinstance(effective_password, str)
-            or len(effective_password) > _MAX_PASSWORD_LENGTH
-            or "\x00" in effective_password
-        ):
-            raise ArchivePasswordError("archive password is invalid")
-        result = _run_archive_tool(
-            self.runner,
-            args,
-            password=effective_password,
-            cwd=staging,
-            timeout=self.limits.command_timeout_seconds,
+        candidates = _extraction_password_candidates(
+            listing,
+            password,
+            max_candidates=self.limits.max_password_candidates,
         )
-        if result.returncode != 0:
+        for candidate_index, candidate in enumerate(candidates):
+            result = _run_archive_tool(
+                self.runner,
+                args,
+                password=candidate.value,
+                cwd=staging,
+                timeout=self.limits.command_timeout_seconds,
+            )
+            if result.returncode == 0:
+                output_paths = _verify_extraction_outputs(staging, chosen)
+                for member, output in zip(chosen, output_paths):
+                    if member.media_kind == "video":
+                        if not _call_validator(self.video_validator, output, member):
+                            raise ArchiveExtractionError("extracted video failed ffprobe validation")
+                    elif member.media_kind == "subtitle":
+                        if not _call_validator(self.subtitle_validator, output, member):
+                            raise ArchiveExtractionError("extracted subtitle failed content validation")
+                return ArchiveExtractionResult(
+                    staging_root=staging,
+                    files=tuple(output_paths),
+                    members=chosen,
+                    password_source=candidate.source,
+                )
+
+            failure_kind = _extraction_failure_kind(result, encrypted=listing.encrypted)
+            if failure_kind == "corrupt":
+                raise ArchiveCorruptionError("7-Zip reported a corrupted archive")
+            if candidate_index + 1 < len(candidates):
+                _require_empty_staging_for_password_retry(staging)
+                continue
+            if failure_kind == "password":
+                raise ArchivePasswordError("archive extraction failed; password candidates exhausted")
             raise ArchiveExtractionError("7-Zip extraction failed")
 
-        output_paths = _verify_extraction_outputs(staging, chosen)
-        for member, output in zip(chosen, output_paths):
-            if member.media_kind == "video":
-                if not _call_validator(self.video_validator, output, member):
-                    raise ArchiveExtractionError("extracted video failed ffprobe validation")
-            elif member.media_kind == "subtitle":
-                if not _call_validator(self.subtitle_validator, output, member):
-                    raise ArchiveExtractionError("extracted subtitle failed content validation")
-        return ArchiveExtractionResult(
-            staging_root=staging,
-            files=tuple(output_paths),
-            members=chosen,
-            password_source=listing.password_source,
-        )
+        # ``_extraction_password_candidates`` always returns at least one
+        # validated value.  Keep a stable failure in case a malformed public
+        # ``ArchiveListing`` is supplied by a third-party caller.
+        raise ArchivePasswordError("archive has no usable password candidate")
 
     def inspect_and_extract(
         self,
@@ -1669,6 +1779,7 @@ def extract_selected(
 __all__ = [
     "AListArchiveSource",
     "ArchiveCollisionError",
+    "ArchiveCorruptionError",
     "ArchiveError",
     "ArchiveExtractionError",
     "ArchiveExtractionResult",

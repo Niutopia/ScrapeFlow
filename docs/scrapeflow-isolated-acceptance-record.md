@@ -21,7 +21,7 @@
 
 ## 预检查
 
-- [ ] `python3 scripts/scrapeflow_release_check.py` 通过。
+- [ ] 从干净 commit 运行 `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release` 通过，并归档 JSON 与原始日志。
 - [ ] `python3 scripts/scrapeflow_isolated_preflight.py declaration.json` 通过。
 - [ ] 离线备份 `verify` 通过。
 - [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。

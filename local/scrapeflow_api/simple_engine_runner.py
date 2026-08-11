@@ -44,6 +44,7 @@ from engine.scrapeflow.target_shelf import (
     target_shelf_allows_media_type,
     target_shelf_for_root,
 )
+from local.scrapeflow_api.replenishment import ACTIONABLE_GAP_KINDS
 from local.scrapeflow_api.redaction import redact_error
 
 
@@ -266,6 +267,12 @@ _CLEANUP_RETRYABLE_AUDIT_STATUSES = frozenset({
     "pending", "repairing", "retry_wait", "unknown", "blocked", "failed",
     "failed_provider",
 })
+# Provider attempt staging is held in one gap JSON marker after a successful
+# child until a later scoped audit proves the selected gap disappeared.  Keep
+# this literal local to the runner to avoid importing the provider runtime
+# (which intentionally imports this module) and creating a circular cleanup
+# dependency.
+_POST_ACQUISITION_REAUDIT_KEY = "post_acquisition_reaudit"
 
 # Provider replenishment children are deliberately narrower than ordinary
 # Engine roots: they only carry the missing media member into the formal
@@ -2818,6 +2825,55 @@ class SimpleEngineRunner:
             and candidate.summary.get("root_job_id") == root.id
         ]
 
+    def _pending_replenishment_reaudit_states(self, job_id: str) -> list[str]:
+        """Return task-state markers that still own provider staging.
+
+        The finalizer cannot remove a provider attempt itself: it lacks the
+        selected-gap/audit evidence and must not turn into a second Provider
+        coordinator.  It can, however, refuse to consume the ordinary root's
+        source or erase local JSON while that evidence is still pending.
+        """
+        safe_id = _safe_job_id(job_id)
+        state_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", safe_id).strip(".-")[:96] or "job"
+        directory = self.state_root / "gaps" / state_id
+        if not directory.exists():
+            return []
+        if directory.is_symlink() or not directory.is_dir():
+            return ["gap-state-directory-invalid"]
+        pending: list[str] = []
+        try:
+            paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+        except OSError:
+            return ["gap-state-directory-unreadable"]
+        for path in paths:
+            if path.is_symlink():
+                pending.append(path.name)
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # A damaged task-state record could be the only durable
+                # indication of a held staging attempt.  Failing closed is
+                # preferable to erasing it along with the root record.
+                pending.append(path.name)
+                continue
+            if not isinstance(raw, Mapping):
+                pending.append(path.name)
+                continue
+            if _POST_ACQUISITION_REAUDIT_KEY not in raw:
+                continue
+            marker = raw.get(_POST_ACQUISITION_REAUDIT_KEY)
+            if (
+                not isinstance(marker, Mapping)
+                or str(marker.get("status") or "").casefold() != "cleaned"
+            ):
+                pending.append(path.name)
+        return pending
+
+    def has_pending_replenishment_reaudit(self, job_id: str) -> bool:
+        """Publicly expose the finalizer's narrow provider-staging fence."""
+        return bool(self._pending_replenishment_reaudit_states(job_id))
+
     def _validate_cleanup_root(self, root: EngineJob) -> list[EngineJob]:
         """Return terminal children after proving the root is safe to forget."""
         if self._is_internal_job(root):
@@ -2841,6 +2897,10 @@ class SimpleEngineRunner:
             and summary.get("automatic_terminal") is not True
         ):
             raise EngineWorkerBusyError("任务仍会自动重试，不能清理记录")
+        if self._pending_replenishment_reaudit_states(root.id):
+            raise EngineWorkerBusyError(
+                "任务仍有待定向重审/清理的补源 staging，不能删除记录"
+            )
         replenishment = summary.get("replenishment")
         if isinstance(replenishment, Mapping):
             status = str(replenishment.get("status") or "").casefold()
@@ -4773,6 +4833,50 @@ class SimpleEngineRunner:
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return updated
 
+    @staticmethod
+    def _actionable_root_resource_gaps(job: EngineJob) -> list[dict[str, object]]:
+        """Return every durable resource gap that still needs a Provider lane.
+
+        The plan is the durable root contract, while ``summary.resource_gaps``
+        is the latest audit projection.  Either can be newer after a restart
+        or a delayed coordinator callback, so final cleanup must treat them as
+        one fail-closed set.  Only the shared Provider-actionable kinds fence
+        cleanup; informational planner notices such as an unpaired subtitle do
+        not turn into an unrelated source-retention deadlock.
+        """
+        sources: list[object] = []
+        summary_rows = job.summary.get("resource_gaps")
+        if isinstance(summary_rows, list):
+            sources.extend(summary_rows)
+        scan = job.plan.get("scan_report")
+        if isinstance(scan, Mapping):
+            plan_rows = scan.get("resource_gaps")
+            if isinstance(plan_rows, list):
+                sources.extend(plan_rows)
+
+        gaps: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for raw in sources:
+            if not isinstance(raw, Mapping):
+                continue
+            kind = str(raw.get("kind") or "").strip().casefold()
+            if kind not in ACTIONABLE_GAP_KINDS:
+                continue
+            # The same audit row is usually persisted in both the plan and
+            # summary.  Deduplicate only for stable diagnostics; either copy
+            # remains sufficient to fence final cleanup.
+            key = (
+                kind,
+                str(raw.get("id") or ""),
+                str(raw.get("label") or ""),
+                str(raw.get("path") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            gaps.append(dict(raw))
+        return gaps
+
     def finalize_automatic_lifecycle(self, job_id: str) -> EngineJob:
         """Finish task-owned source/staging cleanup after audit/provider gates.
 
@@ -4794,6 +4898,65 @@ class SimpleEngineRunner:
             lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
             cleanup_raw = lifecycle.get("cleanup")
             cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
+            actionable_gaps = self._actionable_root_resource_gaps(job)
+            if actionable_gaps:
+                # ``cleanup_ready`` is coordinator input, not permission to
+                # override an observed missing resource.  In particular,
+                # historical JSON or a late external callback may still carry
+                # ``true`` after a fresh audit has recorded a gap.  Correct
+                # that stale bit before returning so a subsequent caller
+                # cannot make source/staging cleanup appear authorized.
+                state_changed = lifecycle.get("cleanup_ready") is not False
+                lifecycle["cleanup_ready"] = False
+                # A historical coordinator might also have persisted a
+                # completed cleanup before the gap observation reached this
+                # root.  Never let that idempotent marker bypass the fence on
+                # the next call.  Keep any completed-step evidence so, once a
+                # later targeted audit proves the gap gone, retry remains
+                # idempotent and does not replay a remote deletion.
+                if cleanup.get("status") == "completed":
+                    cleanup["status"] = "pending"
+                    cleanup["invalidated_by_resource_gaps_at"] = _now()
+                    lifecycle["cleanup"] = cleanup
+                    state_changed = True
+                if state_changed:
+                    summary = dict(job.summary)
+                    summary["lifecycle"] = lifecycle
+                    job = replace(job, summary=summary, updated_at=_now())
+                    atomic_write_json(
+                        self._job_path(job.id), job.as_dict(), allow_nan=False,
+                    )
+                kinds = ", ".join(sorted({
+                    str(gap.get("kind") or "").strip().casefold()
+                    for gap in actionable_gaps
+                }))
+                raise EngineWorkerBusyError(
+                    "资源缺口尚未消失，拒绝最终清理"
+                    + (f": {kinds}" if kinds else "")
+                )
+            pending_reaudit = self._pending_replenishment_reaudit_states(job.id)
+            if pending_reaudit:
+                # The formal child may have completed, but its provider
+                # staging still belongs to the selected-gap re-audit.  A
+                # coordinator callback cannot use ``cleanup_ready`` to skip
+                # that independently durable state boundary.
+                state_changed = lifecycle.get("cleanup_ready") is not False
+                lifecycle["cleanup_ready"] = False
+                if cleanup.get("status") == "completed":
+                    cleanup["status"] = "pending"
+                    cleanup["invalidated_by_post_acquisition_reaudit_at"] = _now()
+                    lifecycle["cleanup"] = cleanup
+                    state_changed = True
+                if state_changed:
+                    summary = dict(job.summary)
+                    summary["lifecycle"] = lifecycle
+                    job = replace(job, summary=summary, updated_at=_now())
+                    atomic_write_json(
+                        self._job_path(job.id), job.as_dict(), allow_nan=False,
+                    )
+                raise EngineWorkerBusyError(
+                    "补源 staging 尚待定向重审/清理，拒绝最终清理"
+                )
             if cleanup.get("status") == "completed":
                 # Earlier drafts could leave a successfully retried cleanup
                 # in ``failed_cleanup``.  Normalize that public projection on

@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine.scrapeflow.serialization import atomic_write_json
-from local.simple_server import SimpleApplication, make_server
+from local.simple_server import ApplicationError, SimpleApplication, make_server
 from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRunner
 
 
@@ -105,7 +105,15 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         return payload["job"]
 
     def test_health_control_and_path_submission_expose_one_automatic_root_job(self) -> None:
-        status, health = self.request("GET", "/api/health")
+        with patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_QUARK_HELPER_URL": "",
+                "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
+            },
+            clear=False,
+        ):
+            status, health = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["mode"], "automatic")
         self.assertTrue(health["connected"])
@@ -116,6 +124,8 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["provider_capabilities"]["quark_share"]["status"], "ready")
         self.assertEqual(health["provider_capabilities"]["quark_magnet"]["status"], "ready")
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
+        self.assertEqual(health["helper_readiness"]["quark"]["status"], "not_configured")
+        self.assertFalse(health["helper_readiness"]["quark"]["configured"])
         self.assertEqual(
             set(health["provider_capabilities"]),
             {"quark_share", "quark_magnet", "magnet"},
@@ -141,6 +151,25 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         status, detail = self.request("GET", f"/api/jobs/{job_id}")
         self.assertEqual(status, 200)
         self.assertEqual(detail["job"]["id"], job_id)
+
+    def test_provider_worker_configuration_is_strictly_single_worker(self) -> None:
+        for value in ("2", "0", "not-a-number"):
+            with self.subTest(configured=value), patch.dict(
+                os.environ,
+                {"SCRAPEFLOW_PROVIDER_WORKERS": value},
+                clear=False,
+            ):
+                health = self.application.health()
+                self.assertFalse(health["ok"])
+                configuration = health["lane_gates"]["provider_workers"]
+                self.assertEqual(configuration["expected"], 1)
+                self.assertFalse(configuration["valid"])
+                with self.assertRaisesRegex(ApplicationError, "必须严格为 1"):
+                    self.application._provider_pool()  # noqa: SLF001 - runtime gate
+
+        with patch.dict(os.environ, {"SCRAPEFLOW_PROVIDER_WORKERS": "1"}, clear=False):
+            pool = self.application._provider_pool()  # noqa: SLF001 - runtime gate
+        self.assertEqual(pool._max_workers, 1)  # noqa: SLF001 - executor contract
 
     def test_real_root_lane_gates_fail_closed_until_explicitly_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -347,6 +376,41 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertTrue(result["removed"])
         self.assertNotIn(job.id, self.application._cleanup_fences)  # noqa: SLF001
 
+    def test_artifact_repair_is_an_explicit_empty_request_only(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        executed = replace(
+            selected,
+            phase="executed",
+            plan={"mode": "movie", "scan_report": {"resource_gaps": []}},
+            summary={**selected.summary, "automatic": True},
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{selected.id}.json",
+            executed.as_dict(),
+            allow_nan=False,
+        )
+
+        with patch.object(
+            self.runner,
+            "repair_automatic_artifacts",
+            return_value=executed,
+        ) as repair:
+            status, payload = self.request(
+                "POST", f"/api/jobs/{selected.id}/repair-artifacts", {},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["id"], selected.id)
+        repair.assert_called_once_with(selected.id)
+
+        status, payload = self.request(
+            "POST",
+            f"/api/jobs/{selected.id}/repair-artifacts",
+            {"automatic": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("空 JSON", payload["error"])
+
     def test_failed_cleanup_retry_dispatches_only_the_finalizer(self) -> None:
         pending = self.runner.create_pending_job("/library/待刮削/Example")
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
@@ -550,9 +614,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual([row["name"] for row in browse["directories"]], ["待刮削", "电影"])
 
-        status, report = self.request("POST", "/api/library-audit/run", {})
+        with patch.object(self.application, "_apply_audit_gaps") as apply_gaps:
+            status, report = self.request("POST", "/api/library-audit/run", {})
         self.assertEqual(status, 200)
         self.assertEqual(report["audit"]["status"], "completed")
+        apply_gaps.assert_not_called()
         status, latest = self.request("GET", "/api/library-audit/latest")
         self.assertEqual(status, 200)
         self.assertEqual(latest["audit"], report["audit"])
@@ -756,6 +822,47 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(persisted.summary["lifecycle"]["audit"]["status"], "deferred")
         self.assertEqual(persisted.summary["lifecycle"]["provider"]["status"], "deferred")
         self.assertTrue(persisted.summary["lifecycle"]["cleanup_ready"])
+
+    def test_disabled_lanes_never_settle_a_verified_root_with_known_gaps(self) -> None:
+        """A disabled provider is not evidence that a missing work is safe to delete."""
+        self.application.set_paused(False, "test")
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
+        gap = {
+            "id": "missing-media",
+            "kind": "missing_media",
+            "label": "Movie (2024)",
+            "reason": "not present",
+        }
+        lifecycle = {
+            "formal_write": {"status": "verified", "updated_at": "fixture"},
+            "cleanup": {"status": "pending", "updated_at": "fixture"},
+        }
+        executed = replace(
+            selected,
+            phase="executed",
+            plan={"scan_report": {"resource_gaps": [gap]}},
+            summary={**selected.summary, "lifecycle": lifecycle},
+        )
+        atomic_write_json(self.runner.jobs_root / f"{selected.id}.json", executed.as_dict(), allow_nan=False)
+        # Simulate the automatic worker holding the pre-audit snapshot while
+        # the audit coordinator has already persisted the missing-media row.
+        stale_without_gap = replace(
+            executed,
+            plan={"scan_report": {"resource_gaps": []}},
+        )
+
+        with patch.object(self.application, "_audit_auto_repair_enabled", return_value=False), patch.object(
+            self.application, "_provider_auto_repair_enabled", return_value=False,
+        ), patch.object(self.runner, "finalize_automatic_lifecycle") as finalizer:
+            handled = self.application._settle_disabled_automatic_lifecycle(stale_without_gap)  # noqa: SLF001
+
+        self.assertTrue(handled)
+        finalizer.assert_not_called()
+        persisted = self.runner.get_job(selected.id)
+        self.assertNotIn("audit", persisted.summary["lifecycle"])
+        self.assertNotIn("provider", persisted.summary["lifecycle"])
+        self.assertIsNot(persisted.summary["lifecycle"].get("cleanup_ready"), True)
 
     def test_completed_with_gaps_is_terminal_attention_projection(self) -> None:
         pending = self.runner.create_pending_job("/library/待刮削/Example")

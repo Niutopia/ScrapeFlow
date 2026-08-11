@@ -20,6 +20,18 @@ ACQUISITION_QUARK_FAST_SAVE = "quark_fast_save"
 ACQUISITION_QUARK_MAGNET_OFFLINE = "quark_magnet_offline"
 ACQUISITION_TORRENT = "torrent"
 
+# ``provider_capability_snapshot`` is a declaration of the fixed materializer
+# contract, not a liveness probe.  Keep the helper dependency names and action
+# set here so the API health projection and the independent readiness command
+# cannot silently drift apart.
+QUARK_HELPER_NAME = "quark"
+QUARK_HELPER_REQUIRED_ACTIONS = (
+    "health",
+    "share-save",
+    "magnet-submit",
+    "magnet-status",
+)
+
 # Backwards-compatible names for the one local Torrent executor.
 EXECUTABLE_PROVIDER = PROVIDER_LOCAL_MAGNET
 EXECUTABLE_ACQUISITION_KIND = ACQUISITION_TORRENT
@@ -37,23 +49,33 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
 
     A new mapping is returned on every call so an API consumer cannot mutate
     the process-wide capability declaration.  ``ready`` is reserved for fixed
-    lanes whose candidate kind the current materializer chain accepts.
+    lanes whose candidate kind the current materializer chain accepts.  It is
+    deliberately *not* evidence that an external helper is reachable or
+    authenticated: consumers that need runtime truth must inspect the
+    structured ``health.helper_readiness`` projection instead.
     """
     return {
         PROVIDER_QUARK_SHARE: {
             "status": "ready",
+            "status_scope": "declared_materializer",
             "acquisition_kinds": [ACQUISITION_QUARK_FAST_SAVE],
             "materializer": "QuarkFastSaveMaterializer",
             "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
         },
         PROVIDER_QUARK_MAGNET: {
             "status": "ready",
+            "status_scope": "declared_materializer",
             "acquisition_kinds": [ACQUISITION_QUARK_MAGNET_OFFLINE],
             "materializer": "QuarkMagnetOfflineMaterializer",
+            "runtime_dependency": {
+                "helper": QUARK_HELPER_NAME,
+                "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+            },
             "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
         },
         PROVIDER_LOCAL_MAGNET: {
             "status": "ready",
+            "status_scope": "declared_materializer",
             "acquisition_kinds": [ACQUISITION_TORRENT],
             "materializer": "LocalTorrentMaterializer",
             # The current real materializer returns media-only deliveries;
@@ -98,6 +120,8 @@ __all__ = [
     "PROVIDER_LOCAL_MAGNET",
     "PROVIDER_QUARK_MAGNET",
     "PROVIDER_QUARK_SHARE",
+    "QUARK_HELPER_NAME",
+    "QUARK_HELPER_REQUIRED_ACTIONS",
     "candidate_capability_error",
     "is_executable_candidate",
     "provider_capability_snapshot",

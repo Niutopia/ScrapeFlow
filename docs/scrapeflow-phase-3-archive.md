@@ -2,7 +2,7 @@
 
 > 文档性质：2026-08-08 的历史归档内核说明，不是当前目标货架启动门的阶段 3，也不证明当前 WIP 已完成。
 >
-> 当前阶段定义见[目标货架启动门收敛计划](./scrapeflow-target-shelf-start-gate-plan.md)。
+> 当前阶段定义见[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)。本文件是历史阶段快照。
 
 本阶段把归档处理收敛为 `engine/scrapeflow/archive.py` 的两个边界：
 `ArchiveInspector` 负责有界魔数、分卷、密码候选、7-Zip `-slt` listing、成员路径和展开预算；

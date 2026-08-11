@@ -6,7 +6,7 @@
 >
 > 适用范围：单用户、单机、单实例、单 AList 媒体库
 >
-> 当前产品入口与实施来源：[ScrapeFlow 用户选择目标货架后启动实施计划](./scrapeflow-target-shelf-start-gate-plan.md)
+> 当前产品入口与实施来源：[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)。本文件是历史单用户收敛快照。
 
 ## 1. 计划目的
 

@@ -72,12 +72,15 @@ GET  /api/jobs/:id
 POST /api/jobs/:id/start          {"target_shelf":"movie|anime|us_tv"}
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
+POST /api/jobs/:id/repair-artifacts {}
 GET  /api/library-audit/latest
 POST /api/library-audit/run
 GET  /api/browse?path=...
 ```
 
-`POST /api/jobs` 只接收来源目录路径，只会登记待选择任务。`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。选择前不会调用 Engine；选择后，Engine 才根据远端事实决定作品身份、类型、季集、具体作品路径、候选和清理动作。若识别出的媒体类型与用户选择的货架不兼容，任务进入冲突状态而不会静默改选货架。Provider/audit lane 默认关闭；显式开启时，补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，内部 child 只投影到所属根任务。
+`POST /api/jobs` 只接收来源目录路径，只会登记待选择任务。`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。选择前不会调用 Engine；选择后，Engine 才根据远端事实决定作品身份、类型、季集、具体作品路径、候选和清理动作。若识别出的媒体类型与用户选择的货架不兼容，任务进入冲突状态而不会静默改选货架。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；显式开启时，补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，内部 child 只投影到所属根任务。
+
+严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
 
 ## 可靠性边界
 
@@ -95,7 +98,9 @@ GET  /api/browse?path=...
 - 隔离真实验收按
   [验收记录模板](docs/scrapeflow-isolated-acceptance-record.md) 填写；部署与开启顺序见
   [部署与开启顺序](docs/scrapeflow-deployment-open-order.md)。
-- 本机验收包草稿可用 `python3 scripts/scrapeflow_acceptance_package.py --output /tmp/scrapeflow-acceptance-package.md`
+- 从干净 commit 生成完整发布原始证据：
+  `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release`。
+  本机验收包草稿可用 `python3 scripts/scrapeflow_acceptance_package.py --output /tmp/scrapeflow-acceptance-package.md --release-evidence artifacts/release/scrapeflow-release-evidence.json`
   生成；已有隔离声明和启动核对报告时可追加 `--preflight-declaration declaration.json`
   与 `--runtime-readiness-report readiness.json`。真实样本仍必须在独立环境中手工补证。
 - 隔离环境声明可用 `python3 scripts/scrapeflow_isolated_preflight.py --template` 生成模板，
@@ -103,7 +108,7 @@ GET  /api/browse?path=...
 - 隔离 API 启动后的只读核对可用
   `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:8765 --expected-commit <git-commit>`。
 
-当前的产品规则、启动门状态机、实施阶段和发布检查见[用户选择目标货架后启动实施计划](docs/scrapeflow-target-shelf-start-gate-plan.md)与[架构说明](ARCHITECTURE.md)。在该计划的完成门通过前，不应因本文档解除全局暂停或开放自动执行。
+当前唯一的全项目产品合同、实施阶段与最终验收定义见[ScrapeFlow 最终收敛计划 v1](docs/scrapeflow-final-convergence-plan-v1.md)与[架构说明](ARCHITECTURE.md)。旧的目标货架计划只保留为历史快照；在最终合同的完成门通过前，不应因本文档解除全局暂停或开放自动执行。
 
 ## 检查
 
@@ -116,6 +121,7 @@ python3 scripts/scrapeflow_release_check.py
 ```sh
 SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s local/tests -p 'test_*.py'
+git status --porcelain  # 必须为空
 git diff --check
 env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
   docker compose config
