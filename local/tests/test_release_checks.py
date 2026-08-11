@@ -22,7 +22,7 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_WORKERS": "1",
-        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:8766",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
             "replace-with-a-random-helper-token-at-least-24-characters"
         ),
@@ -44,7 +44,7 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-        "SCRAPEFLOW_QUARK_HELPER_URL": "",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
         "SCRAPEFLOW_PANSOU_ENABLED": "0",
         "SCRAPEFLOW_PANSOU_URL": "",

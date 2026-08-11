@@ -82,7 +82,13 @@ GET  /api/browse?path=...
 
 严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
 
-分享快转和夸克磁力离线统一依赖宿主机的四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只绑定 loopback，只接受 Bearer 认证和固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，不会启动、重启、激活或点击夸克，也不会安装 LaunchAgent。宿主环境先安装 `requirements.quark-helper.txt`，再以 `python3 scripts/scrapeflow_quark_helper.py --cdp-url http://127.0.0.1:<已知端口>/json/list` 显式附着已经存在的 CDP；token 通过 `SCRAPEFLOW_QUARK_HELPER_TOKEN` 或权限为 `0600` 的 token 文件提供。没有明确的既有 CDP/WSG 通道时 Helper 会 fail-closed，不能改用 AppleScript、deep link、私有端口扫描或带参数重启桌面端。
+分享快转和夸克磁力离线统一依赖宿主机的四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只绑定 loopback，只接受 Bearer 认证和固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。宿主环境安装 `requirements.quark-helper.txt` 后，只有操作者显式执行以下命令才会安装并启动这个四动作后台 Helper：
+
+```sh
+python3 scripts/scrapeflow_quark_helper.py --install-launch-agent
+```
+
+该命令沿用历史默认：Helper 监听 `127.0.0.1:18765`，只等待并附着已存在的 `http://127.0.0.1:19222/json/list` CDP，token 保存在权限为 `0600` 的独立文件中。API 容器未设置 `SCRAPEFLOW_QUARK_HELPER_URL` 时使用 `http://host.docker.internal:18765`，但 Bearer token 仍必须显式配置且至少 24 个字符。启动 API 绝不会自动安装 Helper；Helper 也绝不会启动、重启、激活或点击夸克。既有 CDP/WSG 通道不可用时 Helper 会 fail-closed，不能改用 AppleScript、deep link、私有端口扫描或带参数重启桌面端。
 
 ## 可靠性边界
 

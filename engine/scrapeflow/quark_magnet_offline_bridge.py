@@ -22,6 +22,9 @@ import urllib.request
 from .provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 
 
+DEFAULT_QUARK_HELPER_URL = "http://host.docker.internal:18765"
+
+
 class QuarkMagnetBridgeError(RuntimeError):
     failure_scope = "infrastructure"
     failure_stage = "quark_magnet_submit"
@@ -158,7 +161,8 @@ class HttpQuarkHelperClient:
     @classmethod
     def from_env(cls) -> "HttpQuarkHelperClient":
         return cls(
-            os.getenv("SCRAPEFLOW_QUARK_HELPER_URL", "").strip(),
+            os.getenv("SCRAPEFLOW_QUARK_HELPER_URL", "").strip()
+            or DEFAULT_QUARK_HELPER_URL,
             os.getenv("SCRAPEFLOW_QUARK_HELPER_TOKEN", "").strip(),
         )
 
@@ -448,6 +452,7 @@ class QuarkMagnetOfflineBridge:
 
 
 __all__ = [
+    "DEFAULT_QUARK_HELPER_URL",
     "HttpQuarkHelperClient",
     "QuarkHelper",
     "QuarkMagnetBridgeError",

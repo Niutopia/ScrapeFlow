@@ -342,7 +342,12 @@ def _cdp_discovery_url(value: object) -> str:
     return value.rstrip("/")
 
 
-def _cdp_websocket_url(value: object) -> str:
+def _cdp_websocket_url(
+    value: object,
+    *,
+    discovery_host: str,
+    discovery_port: int,
+) -> str:
     if not isinstance(value, str) or not value:
         raise QuarkHelperNotReady("renderer did not expose a DevTools socket")
     parsed = urllib.parse.urlsplit(value)
@@ -351,11 +356,15 @@ def _cdp_websocket_url(value: object) -> str:
         or not _is_loopback_host(parsed.hostname)
         or parsed.port is None
         or parsed.port == _FORBIDDEN_CDP_PORT
+        or parsed.hostname.casefold() != discovery_host.casefold()
+        or parsed.port != discovery_port
         or parsed.username
         or parsed.password
         or not parsed.path.startswith("/devtools/")
     ):
-        raise QuarkHelperNotReady("renderer DevTools socket is not an approved loopback target")
+        raise QuarkHelperNotReady(
+            "renderer DevTools socket is not the approved discovery target"
+        )
     return value
 
 
@@ -401,6 +410,11 @@ class PassiveQuarkCdp:
         self.mount_path = _safe_absolute_cloud_path(mount_path, label="Quark mount path")
         self.root_fid = _safe_identifier(root_fid, label="Quark root_fid")
         self.timeout_seconds = float(timeout_seconds)
+        discovery = urllib.parse.urlsplit(self.cdp_url)
+        if discovery.hostname is None or discovery.port is None:  # pragma: no cover - validated above.
+            raise QuarkHelperValidationError("CDP discovery target is invalid")
+        self._cdp_host = discovery.hostname
+        self._cdp_port = discovery.port
         if not (
             self.staging_root == self.mount_path
             or self.staging_root.startswith(self.mount_path.rstrip("/") + "/")
@@ -441,7 +455,11 @@ class PassiveQuarkCdp:
             if "quark" not in marker and "ucpro" not in marker:
                 continue
             try:
-                socket_url = _cdp_websocket_url(row.get("webSocketDebuggerUrl"))
+                socket_url = _cdp_websocket_url(
+                    row.get("webSocketDebuggerUrl"),
+                    discovery_host=self._cdp_host,
+                    discovery_port=self._cdp_port,
+                )
             except QuarkHelperNotReady:
                 continue
             score = (

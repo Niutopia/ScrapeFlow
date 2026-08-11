@@ -253,15 +253,97 @@ class HelperHttpTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
+    async def _select_from_discovery_rows(self, rows_factory):
+        async def targets(_request):
+            return web.json_response(rows_factory(port))
+
+        app = web.Application()
+        app.router.add_get("/json/list", targets)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        server = site._server
+        assert server is not None
+        port = server.sockets[0].getsockname()[1]
+        session = PassiveQuarkCdp(
+            cdp_url=f"http://127.0.0.1:{port}/json/list",
+            staging_root=DEFAULT_STAGING_ROOT,
+            mount_path="/quark",
+            root_fid="0",
+        )
+        return runner, session, port
+
+    async def test_cdp_renderer_socket_matches_discovery_host_and_port(self) -> None:
+        runner, session, port = await self._select_from_discovery_rows(
+            lambda discovery_port: [{
+                "type": "page",
+                "title": "Quark Cloud Drive",
+                "url": "https://pan.quark.cn/clouddrive/renderer/index.html?name=main",
+                "webSocketDebuggerUrl": (
+                    f"ws://127.0.0.1:{discovery_port}/devtools/page/quark-main"
+                ),
+            }],
+        )
+        try:
+            self.assertEqual(
+                await session._select_renderer_socket(),
+                f"ws://127.0.0.1:{port}/devtools/page/quark-main",
+            )
+        finally:
+            await runner.cleanup()
+
+    async def test_cdp_renderer_socket_cannot_switch_to_another_loopback_port(self) -> None:
+        runner, session, _port = await self._select_from_discovery_rows(
+            lambda discovery_port: [{
+                "type": "page",
+                "title": "Quark Cloud Drive",
+                "url": "https://pan.quark.cn/clouddrive/renderer/index.html?name=main",
+                "webSocketDebuggerUrl": (
+                    f"ws://127.0.0.1:{discovery_port + 1}/devtools/page/quark-main"
+                ),
+            }],
+        )
+        try:
+            with self.assertRaisesRegex(QuarkHelperNotReady, "no Quark renderer"):
+                await session._select_renderer_socket()
+        finally:
+            await runner.cleanup()
+
+    async def test_cdp_renderer_socket_cannot_switch_loopback_host_aliases(self) -> None:
+        runner, session, _port = await self._select_from_discovery_rows(
+            lambda discovery_port: [{
+                "type": "page",
+                "title": "Quark Cloud Drive",
+                "url": "https://pan.quark.cn/clouddrive/renderer/index.html?name=main",
+                "webSocketDebuggerUrl": (
+                    f"ws://localhost:{discovery_port}/devtools/page/quark-main"
+                ),
+            }],
+        )
+        try:
+            with self.assertRaisesRegex(QuarkHelperNotReady, "no Quark renderer"):
+                await session._select_renderer_socket()
+        finally:
+            await runner.cleanup()
+
     async def test_cdp_discovery_redirect_is_refused_without_following(self) -> None:
+        redirected_endpoint_called = False
+
         async def redirect(_request):
             return web.Response(
                 status=302,
-                headers={"Location": "https://example.invalid/json/list"},
+                headers={"Location": "/redirected-json/list"},
             )
+
+        async def redirected_endpoint(_request):
+            nonlocal redirected_endpoint_called
+            redirected_endpoint_called = True
+            return web.json_response([])
 
         app = web.Application()
         app.router.add_get("/json/list", redirect)
+        app.router.add_get("/redirected-json/list", redirected_endpoint)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -280,6 +362,7 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
                 await session._select_renderer_socket()
         finally:
             await runner.cleanup()
+        self.assertFalse(redirected_endpoint_called)
 
     async def test_share_reentry_requires_task_and_staging_reconciliation(self) -> None:
         session = PassiveQuarkCdp(

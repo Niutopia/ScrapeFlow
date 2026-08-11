@@ -18,9 +18,10 @@ REQUIRED_ENV_TEMPLATE_VALUES = {
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_WORKERS": "1",
-    # Keep a concrete host-side helper endpoint in the copied template while
-    # leaving Compose fail-closed when a user has not supplied `.env.local`.
-    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:8766",
+    # Keep the historical host-side endpoint in the copied template.  The
+    # blank token, rather than an invented URL, keeps Compose fail-closed when
+    # a user has not supplied `.env.local`.
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
         "replace-with-a-random-helper-token-at-least-24-characters"
     ),
@@ -46,7 +47,7 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-    "SCRAPEFLOW_QUARK_HELPER_URL": "",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
     "SCRAPEFLOW_PANSOU_URL": "",

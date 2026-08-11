@@ -17,7 +17,10 @@ from engine.scrapeflow.provider_capabilities import (
     QUARK_HELPER_NAME,
     QUARK_HELPER_REQUIRED_ACTIONS,
 )
-from engine.scrapeflow.quark_magnet_offline_bridge import HttpQuarkHelperClient
+from engine.scrapeflow.quark_magnet_offline_bridge import (
+    DEFAULT_QUARK_HELPER_URL,
+    HttpQuarkHelperClient,
+)
 
 
 DEFAULT_HELPER_HEALTH_TIMEOUT_SECONDS = 3.0
@@ -100,11 +103,14 @@ def quark_helper_readiness_from_env(
     value intentionally contains no helper URL, token, or raw exception text.
     """
     source: Mapping[str, object] = os.environ if environ is None else environ
-    url = _environment_text(source, "SCRAPEFLOW_QUARK_HELPER_URL")
+    url = (
+        _environment_text(source, "SCRAPEFLOW_QUARK_HELPER_URL")
+        or DEFAULT_QUARK_HELPER_URL
+    )
     token = _environment_text(source, "SCRAPEFLOW_QUARK_HELPER_TOKEN")
     url_configured = bool(url)
     token_configured = bool(token)
-    configured = url_configured and token_configured
+    configured = token_configured
     if not configured:
         return _snapshot(
             configured=False,
@@ -113,7 +119,7 @@ def quark_helper_readiness_from_env(
             status="not_configured",
             reachable=False,
             authenticated=False,
-            reason="helper URL and token must both be configured",
+            reason="helper token must be configured",
         )
 
     try:

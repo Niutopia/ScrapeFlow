@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 from engine.scrapeflow.quark_fast_save_bridge import (
     QuarkShareExpiredError,
@@ -11,6 +13,7 @@ from engine.scrapeflow.quark_fast_save_bridge import (
 )
 from engine.scrapeflow.provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 from engine.scrapeflow.quark_magnet_offline_bridge import (
+    DEFAULT_QUARK_HELPER_URL,
     HttpQuarkHelperClient,
     QuarkMagnetBridgeError,
     QuarkMagnetCandidateError,
@@ -52,6 +55,23 @@ def _selection() -> dict[str, object]:
 
 
 class QuarkMagnetOfflineBridgeTests(unittest.TestCase):
+    def test_http_client_from_env_uses_historical_default_with_token(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz"},
+            clear=True,
+        ):
+            client = HttpQuarkHelperClient.from_env()
+
+        self.assertEqual(client.base_url, DEFAULT_QUARK_HELPER_URL)
+        self.assertEqual(client.token, "abcdefghijklmnopqrstuvwxyz")
+
+    def test_http_client_from_env_still_requires_token(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+            QuarkMagnetBridgeError, "token is missing or too short",
+        ):
+            HttpQuarkHelperClient.from_env()
+
     def test_http_client_rejects_external_helper_hosts_for_every_scheme(self) -> None:
         token = "abcdefghijklmnopqrstuvwxyz"
 

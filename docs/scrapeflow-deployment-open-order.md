@@ -25,9 +25,11 @@ python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release
 6. 保持 `SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED=0`。
 7. 保持 `SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED=0`。
 8. 保持 `SCRAPEFLOW_PROVIDER_WORKERS=1`。
-9. 不恢复旧 backlog。
-10. 不批量 retry。
-11. 不批量 cleanup。
+9. 如需安装宿主 Helper，由操作者显式执行 `python3 scripts/scrapeflow_quark_helper.py --install-launch-agent`。该命令只安装四动作后台 Helper，历史默认为 `127.0.0.1:18765` 和既有 CDP `127.0.0.1:19222/json/list`。
+10. 为 Quark Helper 显式配置 Bearer token；URL 未配置时 API 只被动使用 `http://host.docker.internal:18765`。启动 API 不会自动安装 Helper，Helper 也不会启动、重启、激活或点击夸克。
+11. 不恢复旧 backlog。
+12. 不批量 retry。
+13. 不批量 cleanup。
 
 ## 启动后核对
 
