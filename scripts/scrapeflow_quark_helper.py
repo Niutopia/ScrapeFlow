@@ -3,8 +3,10 @@
 
 The process may run directly against an explicit loopback CDP endpoint or as
 a Docker Compose sidecar against the one fixed Docker Desktop host bridge.
-It only starts the narrow four-action HTTP service: it never manages the Quark
-process, its windows, or desktop UI.
+Both modes require the local AList credentials because typed actions resolve a
+short-lived Quark Cookie/root per request.  It only starts the narrow
+four-action HTTP service: it never manages the Quark process, its windows, or
+desktop UI.
 """
 
 from __future__ import annotations
@@ -124,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             token=token,
             cdp_url=_configured_cdp_url(args),
+            alist_url=os.getenv("ALIST_URL", "").strip(),
+            alist_username=os.getenv("ALIST_USERNAME", "").strip(),
+            # Preserve the password byte-for-byte and leave all validation and
+            # redaction inside the typed config/session resolver.  In
+            # particular, never place it in argparse values or diagnostics.
+            alist_password=os.getenv("ALIST_PASSWORD", ""),
             staging_root=args.staging_root,
             mount_path=args.mount_path,
             root_fid=args.root_fid,

@@ -44,7 +44,7 @@ curl -fsS http://127.0.0.1:8765/api/health
 ```
 
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
-同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
+同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Sidecar 使用同一组 `ALIST_USERNAME`/`ALIST_PASSWORD` 访问 Compose 内部 AList，每次从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和 `root_id`，并只在该次固定 Quark HTTPS/WSG 操作期间保存在内存；两者不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
 显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。发现来源时只创建 `awaiting_target_shelf` 记录，不会自动执行归档预处理、TMDB、规划或写入。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径；任务同样必须由用户选择货架并调用 `/start` 后才会进入队列。
 
@@ -85,7 +85,7 @@ GET  /api/browse?path=...
 
 分享快转和夸克磁力离线统一依赖四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只接受 Bearer 认证和固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。Helper 不再作为 macOS 登录项或宿主 Python 后台进程运行；Compose 直接使用 API 同一镜像启动 typed sidecar。API 默认通过共享 loopback `http://127.0.0.1:18765` 访问它，Bearer token 必须在本机 `.env.local` 中显式配置且至少 24 个字符。
 
-AList Quark storage 中的 cookie 只在分享发现和只读清单核验时临时取得，不复制到 Compose 模板，也不传给 Helper。当前真正的 `share-save` 和磁力离线都由桌面夸克的已登录 renderer 执行，因此都需要 CDP/WSG。sidecar 只被动附着固定 `http://host.docker.internal:19222/json/list`；它绝不启动、重启、激活或点击夸克。CDP/WSG 通道不可用时 Helper 会 fail-closed，不会扫描其他端口或降级到其他写入通道。
+AList Quark storage 中的 cookie 由 sidecar 在每个 typed action 开始时临时解析，不复制到 Compose 模板、API 请求或持久状态；它不会出现在 health 响应、日志或验收证据中。sidecar 通过固定 HTTPS API 发出 `share-save` 和磁力离线请求，桌面夸克 renderer 只提供被动的 CDP/WSG 能力（加解密与能力探针），不接收 cookie，也不执行这些网络请求。sidecar 仍只被动附着固定 `http://host.docker.internal:19222/json/list`；它绝不启动、重启、激活或点击夸克。CDP/WSG 通道不可用时 Helper 会 fail-closed，不会扫描其他端口或降级到其他写入通道。
 
 这一 Compose sidecar 拓扑是用户在 2026-08-11 明确批准的部署修订：它取代最终收敛计划中“宿主 Helper”的物理放置，但不改变四动作、任务 staging、故障不降阶和 Helper 禁止控制 Quark 的不变合同。
 

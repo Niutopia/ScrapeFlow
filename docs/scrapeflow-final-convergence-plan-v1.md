@@ -331,7 +331,7 @@ tv_root
 - 只读递归文件清单。
 - 精确 `file_id/path/size → gap_ids`。
 - 从匹配的 AList Quark storage 临时取得会话，只用于分享发现和只读清单核验。
-- 将已核验的 file ID 交给 typed `share-save`，由桌面夸克已登录 renderer 快转到当前 attempt staging；AList cookie 不进入 Helper。
+- 将已核验的 file ID 交给 typed `share-save`；当前 Compose sidecar 按 action 从匹配 AList storage 临时取得 Cookie/root，桌面夸克已登录 renderer 只提供被动 WSG 能力并不接收 Cookie。该条取代本历史计划中“由 renderer 直接快转、AList cookie 不进入 Helper”的旧部署假设。
 - AList 到达回读。
 
 不恢复 SHA request ID、receipt、回滚副本或通用分享平台。

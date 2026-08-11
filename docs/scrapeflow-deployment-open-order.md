@@ -27,9 +27,9 @@ python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release
 8. 保持 `SCRAPEFLOW_PROVIDER_WORKERS=1`。
 9. 若本机夸克尚未纳入固定 CDP 生命周期，先确认已有 API 为 paused 且活动操作归零，再由操作者执行 `python3 scripts/scrapeflow_quark_lifecycle.py --install-launch-agent --replace-running`。它通过 AppKit 正常退出当前的单一夸克主进程，然后由 Aqua LaunchAgent 直接以固定 `127.0.0.1:19222` 参数启动夸克。
 10. 用 `python3 scripts/scrapeflow_quark_lifecycle.py --status` 和只读 CDP 核验确认只有一个夸克主进程，且 `127.0.0.1:19222` 的 listener 归属该 PID。
-11. 在本机 `.env.local` 中为 API 和 `quark-helper` sidecar 配置同一个至少 24 个字符的 Bearer token；不记录或提交真实值。
+11. 在本机 `.env.local` 中配置 AList 管理员账号，并为 API 和 `quark-helper` sidecar 配置同一个至少 24 个字符的 Bearer token；不记录或提交真实值。Sidecar 只通过 Compose 内部 `http://alist:5244` 读取匹配 `/quark` 的 storage，`addition.cookie` 与 `root_id` 仅在每个 typed action 期间保存在内存，不进入 env、health 响应、日志或验收证据。
 12. 使用 `docker compose --env-file .env.local up -d alist api quark-helper` 启动。Helper 与 API 共享网络命名空间，只监听共享 `127.0.0.1:18765`，不发布宿主端口；API 不等待 Helper ready 才启动。Compose 显式重建 API 时必须同步重建 sidecar，不允许它留在旧 network namespace。
-13. Helper 只被动连接宿主已存在的 `host.docker.internal:19222/json/list` CDP，不启动、重启、激活或点击夸克；CDP/WSG 不可用时必须 fail-closed。
+13. Helper 只被动连接宿主已存在的 `host.docker.internal:19222/json/list` CDP；renderer 仅提供 WSG 能力，sidecar 用 AList 临时 Cookie 向固定 Quark HTTPS API 发出四动作，不启动、重启、激活或点击夸克；CDP/WSG 不可用时必须 fail-closed。
 14. 不恢复旧 backlog。
 15. 不批量 retry。
 16. 不批量 cleanup。

@@ -18,9 +18,15 @@ TOKEN = "t" * 32
 
 class QuarkHelperCliTest(unittest.TestCase):
     def _run(self, arguments: list[str], *, environment: dict[str, str] | None = None):
+        configured_environment = {
+            "ALIST_URL": "http://127.0.0.1:5244",
+            "ALIST_USERNAME": "admin",
+            "ALIST_PASSWORD": "fixture-alist-password",
+        }
+        configured_environment.update(environment or {})
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
             os.environ,
-            environment or {},
+            configured_environment,
             clear=True,
         ), mock.patch.object(
             cli.Path,
@@ -46,6 +52,9 @@ class QuarkHelperCliTest(unittest.TestCase):
         self.assertEqual(config.port, 18765)
         self.assertEqual(config.cdp_url, "http://127.0.0.1:19222/json/list")
         self.assertFalse(config.docker_sidecar)
+        self.assertEqual(config.alist_url, "http://127.0.0.1:5244")
+        self.assertEqual(config.alist_username, "admin")
+        self.assertEqual(config.alist_password, "fixture-alist-password")
         token_file = load_token.call_args.kwargs["token_file"]
         self.assertEqual(token_file.name, "token")
         self.assertEqual(token_file.parent.name, ".scrapeflow-quark-helper")
@@ -59,6 +68,7 @@ class QuarkHelperCliTest(unittest.TestCase):
         self.assertEqual(config.port, 18765)
         self.assertEqual(config.cdp_url, cli.DOCKER_SIDECAR_CDP_URL)
         self.assertTrue(config.docker_sidecar)
+        self.assertEqual(config.alist_url, "http://127.0.0.1:5244")
 
     def test_docker_sidecar_rejects_every_nonfixed_cdp_override(self) -> None:
         for url in (

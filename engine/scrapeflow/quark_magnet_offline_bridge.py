@@ -1,9 +1,10 @@
 """Typed client and bridge for the fixed loopback Quark Helper actions.
 
 The Helper sidecar shares the API container's network namespace and is the
-only component that may operate the logged-in Quark session.  The API sends it
-a reviewed, task-scoped manifest over loopback; it never drives a GUI or
-forwards an AList cookie.
+only component that may operate the typed Quark action.  The API sends it a
+reviewed, task-scoped manifest over loopback; it never drives a GUI or
+forwards an AList cookie.  The sidecar resolves that short-lived Cookie
+internally and uses the desktop renderer only for passive WSG transforms.
 """
 
 from __future__ import annotations

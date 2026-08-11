@@ -16,6 +16,9 @@ from local.scrapeflow_api.release_checks import (
 
 class ReleaseCheckTests(unittest.TestCase):
     ENV_TEMPLATE_DEFAULTS = {
+        "ALIST_URL": "http://127.0.0.1:5244",
+        "ALIST_USERNAME": "admin",
+        "ALIST_PASSWORD": "replace-with-your-alist-password",
         "SCRAPEFLOW_START_PAUSED": "1",
         "SCRAPEFLOW_INTAKE_MONITOR": "0",
         "SCRAPEFLOW_AUTOMATIC_AUDIT": "0",
@@ -97,6 +100,10 @@ class ReleaseCheckTests(unittest.TestCase):
             "    restart: unless-stopped\n"
             "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
             "    environment:\n"
+            "      ALIST_URL: http://alist:5244\n"
+            "      ALIST_USERNAME: ${ALIST_USERNAME:-}\n"
+            "      ALIST_PASSWORD: ${ALIST_PASSWORD:-}\n"
+            "      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}\n"
             "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
             "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
             "    depends_on:\n"

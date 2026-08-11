@@ -10,7 +10,9 @@ from unittest import mock
 from aiohttp import ClientSession, web
 
 from local.scrapeflow_api.quark_host_helper import (
+    AListQuarkSessionResolver,
     DEFAULT_STAGING_ROOT,
+    DelegatedQuarkSession,
     DOCKER_SIDECAR_CDP_HOST,
     DOCKER_SIDECAR_CDP_PORT,
     DOCKER_SIDECAR_CDP_URL,
@@ -35,6 +37,11 @@ from local.scrapeflow_api.quark_host_helper import (
 TOKEN = "t" * 32
 DESTINATION = "/quark/影视/ScrapeFlow/补源/root-1/attempt-1"
 INFOHASH = "a" * 40
+ALIST_CONFIG = {
+    "alist_url": "http://127.0.0.1:5244",
+    "alist_username": "admin",
+    "alist_password": "fixture-alist-password",
+}
 
 
 def share_payload(**changes: object) -> dict[str, object]:
@@ -157,14 +164,19 @@ class HelperValidationTests(unittest.TestCase):
             QuarkHelperConfig(
                 host="0.0.0.0", port=8766, token=TOKEN,
                 cdp_url="http://127.0.0.1:9222/json/list",
+                **ALIST_CONFIG,
             )
         with self.assertRaises(QuarkHelperValidationError):
             QuarkHelperConfig(
                 host="127.0.0.1", port=8766, token=TOKEN,
                 cdp_url="http://127.0.0.1:9125/json/list",
+                **ALIST_CONFIG,
             )
         with self.assertRaises(QuarkHelperValidationError):
-            QuarkHelperConfig(host="127.0.0.1", port=8766, token=TOKEN, cdp_url="")
+            QuarkHelperConfig(
+                host="127.0.0.1", port=8766, token=TOKEN, cdp_url="",
+                **ALIST_CONFIG,
+            )
 
     def test_docker_sidecar_requires_the_one_fixed_discovery_endpoint(self) -> None:
         config = QuarkHelperConfig(
@@ -173,6 +185,7 @@ class HelperValidationTests(unittest.TestCase):
             token=TOKEN,
             cdp_url=DOCKER_SIDECAR_CDP_URL,
             docker_sidecar=True,
+            **ALIST_CONFIG,
         )
         self.assertTrue(config.docker_sidecar)
         session = PassiveQuarkCdp(
@@ -205,6 +218,7 @@ class HelperValidationTests(unittest.TestCase):
                     token=TOKEN,
                     cdp_url=cdp_url,
                     docker_sidecar=True,
+                    **ALIST_CONFIG,
                 )
 
     def test_default_mode_cannot_use_docker_host_bridge(self) -> None:
@@ -214,6 +228,7 @@ class HelperValidationTests(unittest.TestCase):
                 port=18765,
                 token=TOKEN,
                 cdp_url=DOCKER_SIDECAR_CDP_URL,
+                **ALIST_CONFIG,
             )
 
     def test_docker_sidecar_rewrites_only_fixed_loopback_renderer_sockets(self) -> None:
@@ -268,6 +283,170 @@ class HelperValidationTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
         self.assertNotIn("/v1/", source.replace("/v1/share-save", "").replace("/v1/magnet-submit", "").replace("/v1/magnet-status", ""))
+
+
+class AListDelegationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolver_selects_the_longest_enabled_quark_storage_per_request(self) -> None:
+        class Client:
+            token: str | None = None
+
+            def __init__(self) -> None:
+                self.logins = 0
+                self.storage_reads = 0
+
+            def login(self) -> None:
+                self.logins += 1
+                self.token = "alist-token"
+
+            def admin_storages(self) -> list[dict[str, object]]:
+                self.storage_reads += 1
+                return [
+                    {
+                        "driver": "Quark",
+                        "mount_path": "/quark",
+                        "addition": json.dumps({"cookie": "base-cookie", "root_id": "0"}),
+                    },
+                    {
+                        "driver": "Quark",
+                        "mount_path": "/quark/影视",
+                        "addition": json.dumps({"cookie": "nested-cookie", "root_id": "nested-root"}),
+                    },
+                    {
+                        "driver": "Quark",
+                        "mount_path": "/quark/影视/ScrapeFlow",
+                        "disabled": True,
+                        "addition": json.dumps({"cookie": "disabled-cookie", "root_id": "wrong"}),
+                    },
+                ]
+
+        client = Client()
+        resolver = AListQuarkSessionResolver(
+            "http://127.0.0.1:5244",
+            "admin",
+            "fixture-alist-password",
+            client=client,
+        )
+
+        delegated = await resolver.resolve(DESTINATION)
+
+        self.assertEqual(delegated.mount_path, "/quark/影视")
+        self.assertEqual(delegated.root_fid, "nested-root")
+        self.assertEqual(client.logins, 1)
+        self.assertEqual(client.storage_reads, 1)
+        self.assertNotIn("nested-cookie", repr(delegated))
+
+    async def test_health_uses_a_fresh_delegated_cookie_and_root_not_renderer_fetch(self) -> None:
+        delegated = DelegatedQuarkSession(
+            mount_path="/quark/影视",
+            root_fid="delegated-root",
+            cookie="fixture-cookie",
+        )
+        resolver = mock.Mock()
+        resolver.resolve = mock.AsyncMock(return_value=delegated)
+        session = PassiveQuarkCdp(
+            cdp_url="http://127.0.0.1:19222/json/list",
+            staging_root=DEFAULT_STAGING_ROOT,
+            mount_path="/quark",
+            root_fid="0",
+            session_resolver=resolver,
+        )
+        response = {"kind": "response", "status": 200, "text": '{"code":0,"data":{}}'}
+        with mock.patch.object(session, "_probe_wsg_capabilities", new=mock.AsyncMock()), \
+             mock.patch.object(
+                 session, "_delegated_fixed_request", new=mock.AsyncMock(return_value=response)
+             ) as delegated_request, \
+             mock.patch.object(session, "_evaluate_json", new=mock.AsyncMock()) as renderer:
+            await session.assert_authenticated()
+
+        resolver.resolve.assert_awaited_once_with(DEFAULT_STAGING_ROOT)
+        delegated_request.assert_awaited_once_with(
+            delegated,
+            origin=QUARK_DRIVE_API,
+            path="/file/sort",
+            method="GET",
+            query={"pdir_fid": "delegated-root", "_page": 1, "_size": 1, "_fetch_total": 0},
+            body=None,
+        )
+        renderer.assert_not_awaited()
+        self.assertIsNone(session._delegated_session.get())
+
+    async def test_delegated_https_read_keeps_cookie_in_memory_and_fixed_origin(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Content:
+            async def read(self, _limit: int) -> bytes:
+                return b'{"code":0,"data":{}}'
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+            content = Content()
+
+            class Url:
+                scheme = "https"
+                host = "drive.quark.cn"
+                path = "/1/clouddrive/file/sort"
+
+            url = Url()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Session:
+            def __init__(self, **kwargs: object) -> None:
+                captured["session"] = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def request(self, method: str, endpoint: str, **kwargs: object) -> Response:
+                captured["method"] = method
+                captured["endpoint"] = endpoint
+                captured["request"] = kwargs
+                return Response()
+
+        session = PassiveQuarkCdp(
+            cdp_url="http://127.0.0.1:19222/json/list",
+            staging_root=DEFAULT_STAGING_ROOT,
+            mount_path="/quark",
+            root_fid="0",
+        )
+        delegated = DelegatedQuarkSession("/quark", "0", "fixture-cookie")
+        with mock.patch("local.scrapeflow_api.quark_host_helper.ClientSession", Session):
+            result = await session._delegated_fixed_request(
+                delegated,
+                origin=QUARK_DRIVE_API,
+                path="/file/sort",
+                method="GET",
+                query={"pdir_fid": "0", "_page": 1},
+                body=None,
+            )
+
+        self.assertEqual(result, {"kind": "response", "status": 200, "text": '{"code":0,"data":{}}'})
+        self.assertEqual(captured["method"], "GET")
+        self.assertEqual(
+            captured["endpoint"], "https://drive.quark.cn/1/clouddrive/file/sort"
+        )
+        request = captured["request"]
+        assert isinstance(request, dict)
+        self.assertEqual(request["headers"], {
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": "fixture-cookie",
+            "Origin": "https://pan.quark.cn",
+            "Referer": "https://pan.quark.cn/",
+            "User-Agent": mock.ANY,
+        })
+        self.assertEqual(request["params"], {"pr": "ucpro", "fr": "pc", "pdir_fid": "0", "_page": 1})
+        self.assertFalse(request["allow_redirects"])
+        client_options = captured["session"]
+        assert isinstance(client_options, dict)
+        self.assertFalse(client_options["trust_env"])
 
 
 class HelperHttpTests(unittest.IsolatedAsyncioTestCase):

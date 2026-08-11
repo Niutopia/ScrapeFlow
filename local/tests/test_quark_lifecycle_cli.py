@@ -179,8 +179,31 @@ class QuarkLifecycleServiceTest(unittest.TestCase):
                 service_snapshot(Path("/tmp/other.plist")), expected
             )
 
+    def test_smd_submitted_service_must_expand_to_the_fixed_program_and_argv(self) -> None:
+        target = Path("/tmp/expected.plist")
+        snapshot = completed(
+            stdout=(
+                "state = running\n"
+                "path = (submitted by smd.338)\n"
+                "program = /Applications/QuarkCloudDrive.app/Contents/MacOS/QuarkCloudDrive\n"
+                "arguments = {\n"
+                "    /Applications/QuarkCloudDrive.app/Contents/MacOS/QuarkCloudDrive\n"
+                "    --remote-debugging-address=127.0.0.1\n"
+                "    --remote-debugging-port=19222\n"
+                "}\n"
+            )
+        )
+        cli._assert_service_origin(snapshot, target)
+        polluted = completed(stdout=snapshot.stdout.replace(
+            "--remote-debugging-port=19222", "--other=1"
+        ))
+        with self.assertRaisesRegex(cli.QuarkLifecycleError, "unexpected program"):
+            cli._assert_service_origin(polluted, target)
+
     def test_kickstart_uses_documented_pid_output_and_force_is_explicit(self) -> None:
         with mock.patch.object(
+            cli, "_assert_loaded_managed_launch_agent"
+        ), mock.patch.object(
             cli, "_run_launchctl", return_value=completed(stdout="321\n")
         ) as launchctl:
             self.assertEqual(cli._kickstart(force=False), 321)
@@ -188,6 +211,8 @@ class QuarkLifecycleServiceTest(unittest.TestCase):
                 "kickstart", "-p", cli._launchctl_service()
             )
         with mock.patch.object(
+            cli, "_assert_loaded_managed_launch_agent"
+        ), mock.patch.object(
             cli, "_run_launchctl", return_value=completed(stdout="322\n")
         ) as launchctl:
             self.assertEqual(cli._kickstart(force=True), 322)
@@ -195,10 +220,39 @@ class QuarkLifecycleServiceTest(unittest.TestCase):
                 "kickstart", "-kp", cli._launchctl_service()
             )
         with mock.patch.object(
+            cli, "_assert_loaded_managed_launch_agent"
+        ), mock.patch.object(
             cli, "_run_launchctl", return_value=completed(stdout="not-a-pid")
         ):
             with self.assertRaisesRegex(cli.QuarkLifecycleError, "valid PID"):
                 cli._kickstart(force=False)
+
+    def test_control_commands_require_the_exact_managed_plist_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "agent.plist"
+            target.write_bytes(plistlib.dumps({"Label": cli.LAUNCH_AGENT_LABEL}))
+            with mock.patch.object(cli, "_launch_agent_path", return_value=target), \
+                 mock.patch.object(
+                     cli, "_service_snapshot", return_value=service_snapshot(target)
+                 ), mock.patch.object(cli, "_run_launchctl") as launchctl:
+                with self.assertRaisesRegex(cli.QuarkLifecycleError, "fixed lifecycle"):
+                    cli._force_restart_launch_agent()
+            launchctl.assert_not_called()
+
+    def test_readiness_accepts_a_revalidated_launchd_respawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "agent.plist"
+            target.write_bytes(plistlib.dumps(cli._launch_agent_payload()))
+            snapshot = service_snapshot(target)
+            with mock.patch.object(cli, "_launch_agent_path", return_value=target), \
+                 mock.patch.object(cli, "_service_snapshot", return_value=snapshot), \
+                 mock.patch.object(cli, "_managed_quark_pid", return_value=202), \
+                 mock.patch.object(cli, "_cdp_ready", return_value=True) as ready:
+                self.assertEqual(
+                    cli._wait_for_managed_quark_ready(expected_pid=101, timeout=1),
+                    202,
+                )
+            ready.assert_called_once_with(202)
 
 
 class FakeResponse:
@@ -450,6 +504,7 @@ class QuarkLifecycleOperationTest(unittest.TestCase):
             snapshot = service_snapshot(target)
             with mock.patch.object(cli, "_launch_agent_path", return_value=target), \
                  mock.patch.object(cli, "_service_snapshot", return_value=snapshot), \
+                 mock.patch.object(cli, "_managed_quark_pid", return_value=None), \
                  mock.patch.object(
                      cli,
                      "_bootout_launch_agent",
@@ -458,6 +513,29 @@ class QuarkLifecycleOperationTest(unittest.TestCase):
                 with self.assertRaisesRegex(cli.QuarkLifecycleError, "bootout failed"):
                     cli._uninstall_launch_agent()
             self.assertTrue(target.exists())
+
+    def test_uninstall_normally_quits_managed_quark_before_bootout(self) -> None:
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "agent.plist"
+            target.write_bytes(plistlib.dumps(cli._launch_agent_payload()))
+            snapshot = service_snapshot(target)
+            with mock.patch.object(cli, "_launch_agent_path", return_value=target), \
+                 mock.patch.object(cli, "_service_snapshot", return_value=snapshot), \
+                 mock.patch.object(cli, "_managed_quark_pid", return_value=100), \
+                 mock.patch.object(
+                     cli,
+                     "_terminate_exact_quark_pid",
+                     side_effect=lambda _pid: events.append("normal-quit"),
+                 ), mock.patch.object(
+                     cli,
+                     "_bootout_launch_agent",
+                     side_effect=lambda: events.append("bootout") or True,
+                 ):
+                cli._uninstall_launch_agent()
+
+            self.assertEqual(events, ["normal-quit", "bootout"])
+            self.assertFalse(target.exists())
 
     def test_status_prints_loaded_service_without_mutation(self) -> None:
         target = cli._launch_agent_path()

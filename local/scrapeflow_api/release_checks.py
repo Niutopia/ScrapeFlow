@@ -12,6 +12,11 @@ from typing import TextIO
 
 
 REQUIRED_ENV_TEMPLATE_VALUES = {
+    # The sidecar resolves a fresh Quark Cookie/root from local AList storage
+    # for every typed action.
+    "ALIST_URL": "http://127.0.0.1:5244",
+    "ALIST_USERNAME": "admin",
+    "ALIST_PASSWORD": "replace-with-your-alist-password",
     "SCRAPEFLOW_START_PAUSED": "1",
     "SCRAPEFLOW_INTAKE_MONITOR": "0",
     "SCRAPEFLOW_AUTOMATIC_AUDIT": "0",
@@ -39,7 +44,14 @@ REQUIRED_ENV_TEMPLATE_VALUES = {
     "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 REQUIRED_COMPOSE_DEFAULTS = {
-    **REQUIRED_ENV_TEMPLATE_VALUES,
+    # AList credentials are intentionally not interpolated into the API
+    # service's internal network URL; the helper block below checks their
+    # dedicated sidecar wiring separately.
+    **{
+        key: value
+        for key, value in REQUIRED_ENV_TEMPLATE_VALUES.items()
+        if not key.startswith("ALIST_")
+    },
     "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH": "0",
@@ -65,6 +77,10 @@ REQUIRED_LOOPBACK_PORTS = {
     "quark-helper": [],
 }
 REQUIRED_HELPER_ENVIRONMENT = {
+    "ALIST_URL": "http://alist:5244",
+    "ALIST_USERNAME": "${ALIST_USERNAME:-}",
+    "ALIST_PASSWORD": "${ALIST_PASSWORD:-}",
+    "NO_PROXY": "${NO_PROXY:-alist,localhost,127.0.0.1}",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}",
     "SCRAPEFLOW_QUARK_HELPER_CDP_URL": (
         "http://host.docker.internal:19222/json/list"

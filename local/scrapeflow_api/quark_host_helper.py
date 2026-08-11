@@ -16,8 +16,10 @@ rather than attempting recovery.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import asyncio
 import hmac
 import ipaddress
@@ -30,7 +32,7 @@ from typing import Any, Protocol
 import urllib.parse
 
 try:  # Helper-runtime dependency; see requirements.quark-helper.txt.
-    from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+    from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, WSMsgType, web
 except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency path.
     raise RuntimeError(
         "ScrapeFlow Quark Helper requires aiohttp; install "
@@ -107,6 +109,38 @@ class QuarkSessionPort(Protocol):
     async def magnet_status(self, task_id: str) -> Mapping[str, object]: ...
 
 
+@dataclass(frozen=True)
+class DelegatedQuarkSession:
+    """One dynamically selected AList Quark storage login.
+
+    The Cookie is intentionally excluded from ``repr`` and is never returned by
+    the Helper HTTP service.  A fresh value is resolved at the start of each
+    typed action so AList storage edits and Cookie refreshes do not require a
+    Helper restart.
+    """
+
+    mount_path: str
+    root_fid: str
+    cookie: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "mount_path",
+            _safe_absolute_cloud_path(self.mount_path, label="delegated Quark mount path"),
+        )
+        object.__setattr__(
+            self,
+            "root_fid",
+            _safe_identifier(self.root_fid, label="delegated Quark root_fid"),
+        )
+        object.__setattr__(self, "cookie", _safe_cookie_header(self.cookie))
+
+
+class QuarkSessionResolver(Protocol):
+    async def resolve(self, destination: str) -> DelegatedQuarkSession: ...
+
+
 def _is_loopback_host(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -153,6 +187,20 @@ def _safe_identifier(value: object, *, label: str) -> str:
 def _safe_text(value: object, *, label: str, maximum: int = MAX_TEXT) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
         raise QuarkHelperValidationError(f"{label} is invalid")
+    return value
+
+
+def _safe_cookie_header(value: object) -> str:
+    """Accept one bounded printable ASCII Cookie without exposing its value."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 32_768
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+    ):
+        raise QuarkHelperValidationError("delegated Quark Cookie is invalid")
     return value
 
 
@@ -427,12 +475,136 @@ def _cdp_websocket_url(
     return value
 
 
+def _validate_alist_url(value: object) -> str:
+    """Validate the sidecar's private AList origin without logging secrets."""
+
+    if not isinstance(value, str) or not value:
+        raise QuarkHelperValidationError("AList URL is required")
+    try:
+        parsed = urllib.parse.urlsplit(value.rstrip("/"))
+        port = parsed.port
+    except ValueError as exc:
+        raise QuarkHelperValidationError("AList URL is invalid") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise QuarkHelperValidationError("AList URL is invalid")
+    if parsed.scheme == "http":
+        # Docker's service name and local loopback are the only plain-HTTP
+        # origins accepted by the sidecar.  HTTPS may use a configured host.
+        host = parsed.hostname.casefold()
+        if host not in {"alist", "localhost"} and not _is_loopback_host(host):
+            raise QuarkHelperValidationError(
+                "plain HTTP AList URL must be the local Docker service"
+            )
+    return value.rstrip("/")
+
+
+def _validate_alist_text(value: object, *, label: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
+        raise QuarkHelperValidationError(f"{label} is invalid")
+    return value
+
+
+class AListQuarkSessionResolver:
+    """Resolve the current Quark Cookie/root from AList admin storage rows.
+
+    AList's synchronous client is kept behind ``to_thread`` so the aiohttp
+    Helper event loop never blocks on login or storage enumeration.  The client
+    is reused and its own authentication retry handles an expired AList token;
+    the Quark storage ``addition`` is read on every call to pick up a refreshed
+    Cookie or a changed mount/root without restarting the sidecar.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        *,
+        timeout_seconds: float = 20.0,
+        client: object | None = None,
+    ) -> None:
+        self.base_url = _validate_alist_url(base_url)
+        self.username = _validate_alist_text(username, label="AList username", maximum=256)
+        self.password = _validate_alist_text(password, label="AList password", maximum=4096)
+        if type(timeout_seconds) not in {int, float} or not 1 <= float(timeout_seconds) <= 120:
+            raise QuarkHelperValidationError("AList timeout is invalid")
+        self.timeout_seconds = float(timeout_seconds)
+        self._client = client
+        self._client_lock = asyncio.Lock()
+
+    def _build_client(self) -> object:
+        if self._client is not None:
+            return self._client
+        try:
+            from engine.scrapeflow.core import AListClient
+        except Exception as exc:  # pragma: no cover - image packaging failure.
+            raise QuarkHelperNotReady("AList client is unavailable") from exc
+        parsed = urllib.parse.urlsplit(self.base_url)
+        allow_http = parsed.scheme == "http"
+        self._client = AListClient(
+            self.base_url,
+            self.username,
+            self.password,
+            timeout=self.timeout_seconds,
+            retries=2,
+            allow_insecure_http=allow_http,
+        )
+        return self._client
+
+    def _resolve_sync(self, destination: str) -> DelegatedQuarkSession:
+        client = self._build_client()
+        try:
+            # AListClient requires an explicit login before admin_storages and
+            # safely re-authenticates only after an authenticated request fails.
+            if not getattr(client, "token", None):
+                login = getattr(client, "login", None)
+                if not callable(login):
+                    raise QuarkHelperNotReady("AList client cannot authenticate")
+                login()
+            from engine.scrapeflow.quark_fast_save_bridge import delegated_quark_session
+
+            selected = delegated_quark_session(client, destination)
+        except QuarkHelperError:
+            raise
+        except Exception as exc:
+            # Do not expose AList response text, storage additions, or Cookie
+            # material through the Helper's public error boundary.
+            raise QuarkHelperNotReady("AList Quark storage is unavailable") from exc
+        mount_path = getattr(selected, "mount_path", None)
+        root_fid = getattr(selected, "root_id", None)
+        cookie = getattr(selected, "cookie", None)
+        try:
+            return DelegatedQuarkSession(mount_path, root_fid, cookie)
+        except QuarkHelperValidationError as exc:
+            raise QuarkHelperNotReady(
+                "AList Quark storage login state is invalid"
+            ) from exc
+
+    async def resolve(self, destination: str) -> DelegatedQuarkSession:
+        # The caller already validates the destination, but re-check its shape
+        # here because this resolver is also a private capability boundary.
+        _safe_absolute_cloud_path(destination, label="destination")
+        async with self._client_lock:
+            return await asyncio.to_thread(self._resolve_sync, destination)
+
+
 @dataclass(frozen=True)
 class QuarkHelperConfig:
     host: str
     port: int
     token: str
     cdp_url: str
+    alist_url: str
+    alist_username: str
+    alist_password: str = field(repr=False)
     staging_root: str = DEFAULT_STAGING_ROOT
     mount_path: str = DEFAULT_MOUNT_PATH
     root_fid: str = "0"
@@ -445,6 +617,9 @@ class QuarkHelperConfig:
             raise QuarkHelperValidationError("helper port is invalid")
         if not isinstance(self.token, str) or len(self.token) < 24:
             raise QuarkHelperValidationError("helper bearer token is too short")
+        _validate_alist_url(self.alist_url)
+        _validate_alist_text(self.alist_username, label="AList username", maximum=256)
+        _validate_alist_text(self.alist_password, label="AList password", maximum=4096)
         if type(self.docker_sidecar) is not bool:
             raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
         _cdp_discovery_url(self.cdp_url, docker_sidecar=self.docker_sidecar)
@@ -467,6 +642,7 @@ class PassiveQuarkCdp:
         root_fid: str,
         timeout_seconds: float = 20.0,
         docker_sidecar: bool = False,
+        session_resolver: QuarkSessionResolver | None = None,
     ) -> None:
         if type(docker_sidecar) is not bool:
             raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
@@ -479,6 +655,7 @@ class PassiveQuarkCdp:
         self.mount_path = _safe_absolute_cloud_path(mount_path, label="Quark mount path")
         self.root_fid = _safe_identifier(root_fid, label="Quark root_fid")
         self.timeout_seconds = float(timeout_seconds)
+        self.session_resolver = session_resolver
         discovery = urllib.parse.urlsplit(self.cdp_url)
         if discovery.hostname is None or discovery.port is None:  # pragma: no cover - validated above.
             raise QuarkHelperValidationError("CDP discovery target is invalid")
@@ -491,6 +668,40 @@ class PassiveQuarkCdp:
             raise QuarkHelperValidationError("staging root is outside the configured Quark mount")
         self._sequence = 0
         self._lock = asyncio.Lock()
+        self._delegated_session: ContextVar[DelegatedQuarkSession | None] = (
+            ContextVar(f"scrapeflow_quark_session_{id(self)}", default=None)
+        )
+
+    @asynccontextmanager
+    async def _session_scope(self, destination: str) -> AsyncIterator[None]:
+        """Bind one freshly resolved login to one typed action."""
+
+        if self.session_resolver is None:
+            # Kept for the isolated renderer-transport unit tests.  Production
+            # construction always supplies the AList resolver below.
+            yield
+            return
+        delegated = await self.session_resolver.resolve(destination)
+        if not (
+            destination == delegated.mount_path
+            or destination.startswith(delegated.mount_path.rstrip("/") + "/")
+        ):
+            raise QuarkHelperNotReady(
+                "delegated Quark storage does not cover the task destination"
+            )
+        token = self._delegated_session.set(delegated)
+        try:
+            yield
+        finally:
+            self._delegated_session.reset(token)
+
+    def _active_mount(self) -> tuple[str, str]:
+        """Return the mount/root selected for the current typed action."""
+
+        delegated = self._delegated_session.get()
+        if delegated is None:
+            return self.mount_path, self.root_fid
+        return delegated.mount_path, delegated.root_fid
 
     async def _select_renderer_socket(self) -> str:
         timeout = ClientTimeout(total=self.timeout_seconds)
@@ -631,6 +842,162 @@ class PassiveQuarkCdp:
             raise QuarkHelperNotReady("Quark renderer lacks the required WSG capabilities")
 
     @staticmethod
+    def _wsg_transform_expression(*, operation: str, value: object) -> str:
+        """Build a fixed WSG-only renderer expression with no network effect."""
+
+        if operation not in {"encrypt", "decrypt"}:
+            raise QuarkHelperValidationError("internal WSG operation is invalid")
+        encoded = json.dumps(
+            {"operation": operation, "value": value},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return """(() => {
+const input = %s;
+const finish = value => JSON.stringify({kind: "wsg-transform", value});
+if (input.operation === "encrypt") {
+  const wsg = globalThis.quantum && globalThis.quantum.wsg;
+  if (!wsg || typeof wsg.encrypt !== "function") return finish(null);
+  try {
+    const encrypted = wsg.encrypt({number: 13801, plain: input.value});
+    return finish(encrypted && (encrypted.cipher_b64 || encrypted.cipherB64 || encrypted.cipher));
+  } catch (error) {
+    return finish(null);
+  }
+}
+const decrypt = () => new Promise((resolve, reject) => {
+  const bridge = globalThis.chrome && globalThis.chrome.quarkBizPrivate;
+  if (bridge && typeof bridge.encryptOrDecrypt === "function") {
+    bridge.encryptOrDecrypt(
+      {encrypt: false, data: input.value, wsgNum: 13801},
+      value => resolve(typeof value === "string" ? value : (value && value.data))
+    );
+    return;
+  }
+  const wsg = globalThis.quantum && globalThis.quantum.wsg;
+  try {
+    const result = wsg && wsg.decrypt({number: 13801, cipher_b64: input.value});
+    resolve(result && (result.plain || result.plain_text || result.text));
+  } catch (error) {
+    reject(error);
+  }
+});
+return decrypt().then(finish, () => finish(null));
+})()""" % encoded
+
+    async def _wsg_transform(self, *, operation: str, value: str) -> str:
+        result = await self._evaluate_json(
+            self._wsg_transform_expression(operation=operation, value=value)
+        )
+        transformed = result.get("value")
+        if (
+            result.get("kind") != "wsg-transform"
+            or not isinstance(transformed, str)
+            or not transformed
+            or len(transformed.encode("utf-8")) > MAX_RENDERER_RESPONSE_BYTES
+        ):
+            raise QuarkHelperNotReady("Quark renderer WSG transform failed")
+        return transformed
+
+    @staticmethod
+    def _fixed_request_target(
+        *, origin: str, path: str, method: str,
+    ) -> str:
+        allowed_paths = {
+            "/file/sort", "/share/sharepage/token", "/share/sharepage/save",
+            "/share/sharepage/detail", "/task", "/offline/download/parse",
+            "/offline/download/submit", "/offline/save_to/progress",
+        }
+        if (
+            origin not in {QUARK_DRIVE_API, QUARK_SHARE_API}
+            or path not in allowed_paths
+            or method not in {"GET", "POST"}
+        ):
+            raise QuarkHelperValidationError("internal Quark operation is invalid")
+        return origin + path
+
+    async def _delegated_fixed_request(
+        self,
+        delegated: DelegatedQuarkSession,
+        *,
+        origin: str,
+        path: str,
+        method: str,
+        query: Mapping[str, object] | None,
+        body: Mapping[str, object] | None,
+    ) -> Mapping[str, object]:
+        """Send one fixed-origin request with an in-memory AList Cookie.
+
+        The renderer performs only WSG transforms.  The sidecar owns HTTPS so
+        it can attach the delegated Cookie without changing browser state.
+        """
+
+        endpoint = self._fixed_request_target(origin=origin, path=path, method=method)
+        parameters = {"pr": "ucpro", "fr": "pc", **dict(query or {})}
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": delegated.cookie,
+            "Origin": "https://pan.quark.cn",
+            "Referer": "https://pan.quark.cn/",
+            "User-Agent": QUARK_UA,
+        }
+        request_body: str | None = None
+        if body is not None:
+            plain = json.dumps(
+                dict(body), ensure_ascii=False, separators=(",", ":")
+            )
+            request_body = await self._wsg_transform(
+                operation="encrypt", value=plain
+            )
+            headers["Content-Type"] = "application/json"
+            headers["X-U-Content-Encoding"] = "wg"
+
+        timeout = ClientTimeout(total=self.timeout_seconds)
+        request_sent = False
+        try:
+            async with ClientSession(
+                timeout=timeout,
+                trust_env=False,
+                cookie_jar=DummyCookieJar(),
+            ) as session:
+                request_sent = True
+                async with session.request(
+                    method,
+                    endpoint,
+                    params=parameters,
+                    data=request_body,
+                    headers=headers,
+                    allow_redirects=False,
+                ) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        raise QuarkHelperNotReady("Quark redirect refused")
+                    if (
+                        response.url.scheme != "https"
+                        or response.url.host != urllib.parse.urlsplit(origin).hostname
+                        or response.url.path != urllib.parse.urlsplit(endpoint).path
+                    ):
+                        raise QuarkHelperNotReady("Quark response origin changed")
+                    raw = await response.content.read(MAX_RENDERER_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_RENDERER_RESPONSE_BYTES:
+                        raise QuarkHelperNotReady("Quark response is too large")
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise QuarkHelperNotReady("Quark response encoding is invalid") from exc
+                    if response.headers.get("X-U-Content-Encoding", "").casefold() == "wg":
+                        text = await self._wsg_transform(operation="decrypt", value=text)
+                    result: Mapping[str, object] = {
+                        "kind": "response", "status": response.status, "text": text,
+                    }
+        except QuarkHelperError:
+            raise
+        except Exception as exc:
+            if request_sent:
+                raise QuarkHelperLostResponse("Quark HTTPS response was lost") from exc
+            raise QuarkHelperNotReady("Quark HTTPS request is unavailable") from exc
+        return result
+
+    @staticmethod
     def _fixed_fetch_expression(
         *,
         origin: str,
@@ -707,9 +1074,23 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         query: Mapping[str, object] | None = None,
         body: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
-        result = await self._evaluate_json(self._fixed_fetch_expression(
-            origin=origin, path=path, method=method, query=query, body=body,
-        ))
+        delegated = self._delegated_session.get()
+        if delegated is None:
+            # This fallback keeps the renderer transport independently
+            # testable.  Production construction always binds an AList
+            # resolver, so live actions use the delegated Cookie path below.
+            result = await self._evaluate_json(self._fixed_fetch_expression(
+                origin=origin, path=path, method=method, query=query, body=body,
+            ))
+        else:
+            result = await self._delegated_fixed_request(
+                delegated,
+                origin=origin,
+                path=path,
+                method=method,
+                query=query,
+                body=body,
+            )
         if result.get("kind") == "transport_error":
             raise QuarkHelperLostResponse("Quark renderer response was lost")
         if result.get("kind") != "response" or type(result.get("status")) is not int:
@@ -748,8 +1129,15 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         return dict(payload)
 
     async def _destination_fid(self, destination: str) -> str:
-        relative = destination[len(self.mount_path):].strip("/")
-        parent = self.root_fid
+        mount_path, parent = self._active_mount()
+        if destination == mount_path:
+            return parent
+        prefix = mount_path.rstrip("/") + "/"
+        if not destination.startswith(prefix):
+            raise QuarkHelperNotReady(
+                "delegated Quark storage does not cover the task destination"
+            )
+        relative = destination[len(prefix):]
         for component in relative.split("/"):
             listing = await self._call_fixed(
                 origin=QUARK_DRIVE_API,
@@ -774,16 +1162,26 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
 
     async def assert_authenticated(self) -> None:
         # A read-only root listing proves both a renderer and its current Quark
-        # session.  No credentials are read from the renderer or returned.
-        await self._probe_wsg_capabilities()
-        await self._call_fixed(
-            origin=QUARK_DRIVE_API,
-            path="/file/sort",
-            method="GET",
-            query={"pdir_fid": self.root_fid, "_page": 1, "_size": 1, "_fetch_total": 0},
-        )
+        # session.  The Cookie comes from AList only for this request, is never
+        # read from the renderer, and is never returned.
+        async with self._session_scope(self.staging_root):
+            await self._probe_wsg_capabilities()
+            _mount_path, root_fid = self._active_mount()
+            await self._call_fixed(
+                origin=QUARK_DRIVE_API,
+                path="/file/sort",
+                method="GET",
+                query={"pdir_fid": root_fid, "_page": 1, "_size": 1, "_fetch_total": 0},
+            )
 
     async def share_save(self, payload: Mapping[str, object]) -> Mapping[str, object]:
+        destination = str(payload["destination"])
+        async with self._session_scope(destination):
+            return await self._share_save_in_session(payload)
+
+    async def _share_save_in_session(
+        self, payload: Mapping[str, object]
+    ) -> Mapping[str, object]:
         existing = payload.get("task_id")
         if isinstance(existing, str) and existing:
             try:
@@ -994,6 +1392,13 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         return tokens
 
     async def magnet_submit(self, payload: Mapping[str, object]) -> Mapping[str, object]:
+        destination = str(payload["destination"])
+        async with self._session_scope(destination):
+            return await self._magnet_submit_in_session(payload)
+
+    async def _magnet_submit_in_session(
+        self, payload: Mapping[str, object]
+    ) -> Mapping[str, object]:
         try:
             destination = str(payload["destination"])
             target_fid = await self._destination_fid(destination)
@@ -1052,6 +1457,12 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         return {"status": "submitted", "task_id": _safe_task_id(task_id)}
 
     async def magnet_status(self, task_id: str) -> Mapping[str, object]:
+        # A task id has no mount component.  Provider tasks are fixed below the
+        # staging root, which supplies the narrow storage-selection anchor.
+        async with self._session_scope(self.staging_root):
+            return await self._magnet_status_in_session(task_id)
+
+    async def _magnet_status_in_session(self, task_id: str) -> Mapping[str, object]:
         response = await self._call_fixed(
             origin=QUARK_DRIVE_API,
             path="/offline/save_to/progress",
@@ -1222,6 +1633,12 @@ def create_quark_helper_app(service: QuarkHostHelperService, *, token: str) -> w
 def serve_quark_helper(config: QuarkHelperConfig) -> None:
     """Run the host-only service without process/UI management side effects."""
 
+    resolver = AListQuarkSessionResolver(
+        config.alist_url,
+        config.alist_username,
+        config.alist_password,
+        timeout_seconds=config.timeout_seconds,
+    )
     session = PassiveQuarkCdp(
         cdp_url=config.cdp_url,
         staging_root=config.staging_root,
@@ -1229,6 +1646,7 @@ def serve_quark_helper(config: QuarkHelperConfig) -> None:
         root_fid=config.root_fid,
         timeout_seconds=config.timeout_seconds,
         docker_sidecar=config.docker_sidecar,
+        session_resolver=resolver,
     )
     service = QuarkHostHelperService(session, staging_root=config.staging_root)
     web.run_app(
@@ -1264,6 +1682,8 @@ __all__ = [
     "DOCKER_SIDECAR_CDP_HOST",
     "DOCKER_SIDECAR_CDP_PORT",
     "DOCKER_SIDECAR_CDP_URL",
+    "AListQuarkSessionResolver",
+    "DelegatedQuarkSession",
     "HELPER_ACTIONS",
     "PassiveQuarkCdp",
     "QuarkHelperConfig",

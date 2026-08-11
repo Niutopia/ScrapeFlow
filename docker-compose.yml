@@ -110,6 +110,10 @@ services:
     init: true
     command: ["python3", "scripts/scrapeflow_quark_helper.py", "--docker-sidecar"]
     environment:
+      ALIST_URL: http://alist:5244
+      ALIST_USERNAME: ${ALIST_USERNAME:-}
+      ALIST_PASSWORD: ${ALIST_PASSWORD:-}
+      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}
       SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}
       SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list
       TZ: ${TZ:-Asia/Shanghai}

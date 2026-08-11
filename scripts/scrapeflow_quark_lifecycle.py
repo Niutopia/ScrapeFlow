@@ -401,30 +401,111 @@ def _service_origin_path(
             "cannot prove the loaded Quark LaunchAgent plist origin"
         )
     raw = matches[0].strip().strip('"')
-    if not raw.startswith("/"):
-        raise QuarkLifecycleError("loaded Quark LaunchAgent origin is not absolute")
+    if not raw.startswith("/") and not re.fullmatch(
+        r"\(submitted by smd\.[A-Za-z0-9._-]+\)", raw
+    ):
+        raise QuarkLifecycleError("loaded Quark LaunchAgent origin is not trusted")
     return Path(raw)
 
 
 def _assert_service_origin(
     snapshot: subprocess.CompletedProcess[str], target: Path,
 ) -> None:
+    origin = _service_origin_path(snapshot)
+    if str(origin).startswith("/"):
+        try:
+            actual = origin.resolve(strict=False)
+            expected = target.resolve(strict=False)
+        except OSError as exc:
+            raise QuarkLifecycleError(
+                f"cannot resolve Quark LaunchAgent origin: {exc}"
+            ) from exc
+        if actual != expected:
+            raise QuarkLifecycleError(
+                f"loaded label {LAUNCH_AGENT_LABEL} belongs to {actual}, not {expected}"
+            )
+        return
+
+    # Recent macOS versions may re-submit a user LaunchAgent through
+    # ServiceManagement and expose a synthetic origin such as
+    # ``(submitted by smd.338)``.  In that form launchd omits the source path;
+    # require its fully expanded program/arguments to match the validated
+    # plist before allowing any control operation.
+    if not re.fullmatch(r"\(submitted by smd\.[A-Za-z0-9._-]+\)", str(origin)):
+        raise QuarkLifecycleError("loaded Quark LaunchAgent origin is not trusted")
+    program = re.findall(r"(?m)^\s*program\s*=\s*(\S+)\s*$", snapshot.stdout)
+    argument_block = re.search(
+        r"(?ms)^\s*arguments\s*=\s*\{\n(.*?)^\s*\}\s*$",
+        snapshot.stdout,
+    )
+    arguments = (
+        [line.strip() for line in argument_block.group(1).splitlines() if line.strip()]
+        if argument_block is not None
+        else []
+    )
+    expected = [str(QUARK_EXECUTABLE), *CDP_ARGUMENTS]
+    if program != [str(QUARK_EXECUTABLE)] or arguments != expected:
+        raise QuarkLifecycleError(
+            "synthetic Quark LaunchAgent origin has an unexpected program or arguments"
+        )
+
+
+def _validate_managed_launch_agent_file(target: Path) -> None:
+    """Prove that a same-path plist still belongs to this lifecycle contract."""
+
+    _inspect_launch_agent_target(target)
+    if not target.exists():
+        raise QuarkLifecycleError("Quark LaunchAgent plist does not exist")
     try:
-        actual = _service_origin_path(snapshot).resolve(strict=False)
-        expected = target.resolve(strict=False)
+        content = target.read_bytes()
     except OSError as exc:
         raise QuarkLifecycleError(
-            f"cannot resolve Quark LaunchAgent origin: {exc}"
+            f"cannot read Quark LaunchAgent plist {target}: {exc}"
         ) from exc
-    if actual != expected:
-        raise QuarkLifecycleError(
-            f"loaded label {LAUNCH_AGENT_LABEL} belongs to {actual}, not {expected}"
-        )
+    # Check the path again after reading so a swapped path cannot be trusted
+    # for a later kickstart, bootout, or unlink operation.
+    _inspect_launch_agent_target(target)
+    _validate_previous_launch_agent(content)
+
+
+def _assert_loaded_managed_launch_agent() -> tuple[Path, subprocess.CompletedProcess[str]]:
+    """Return the loaded service only when its plist is our exact contract."""
+
+    target = _launch_agent_path()
+    _validate_managed_launch_agent_file(target)
+    snapshot = _service_snapshot()
+    if snapshot is None:
+        raise QuarkLifecycleError("Quark LaunchAgent is not loaded")
+    _assert_service_origin(snapshot, target)
+    return target, snapshot
+
+
+def _launch_agent_is_disabled() -> bool:
+    """Read the label's persistent launchctl enablement without changing it."""
+
+    result = _run_launchctl("print-disabled", _launchctl_domain())
+    pattern = re.compile(
+        rf'(?m)^\s*"{re.escape(LAUNCH_AGENT_LABEL)}"\s*=>\s*(enabled|disabled)\s*$'
+    )
+    matches = pattern.findall(result.stdout)
+    if len(matches) > 1:
+        raise QuarkLifecycleError("LaunchAgent enablement is ambiguous")
+    # launchctl omits labels that have no explicit persisted preference; that
+    # is its ordinary enabled default.
+    return matches == ["disabled"]
+
+
+def _restore_launch_agent_enablement(*, disabled: bool) -> None:
+    _run_launchctl(
+        "disable" if disabled else "enable",
+        _launchctl_service(),
+    )
 
 
 def _bootout_launch_agent() -> bool:
     if _service_snapshot() is None:
         return False
+    _assert_loaded_managed_launch_agent()
     _run_launchctl("bootout", _launchctl_service())
     return True
 
@@ -533,6 +614,10 @@ def _managed_quark_pid() -> int | None:
 
 
 def _kickstart(*, force: bool) -> int:
+    # Re-check the path and contract immediately before launchctl can start or
+    # force-replace anything.  This closes the same-label/same-path collision
+    # window for all operational commands, including rollback.
+    _assert_loaded_managed_launch_agent()
     option = "-kp" if force else "-p"
     result = _run_launchctl("kickstart", option, _launchctl_service())
     output = result.stdout.strip()
@@ -555,13 +640,22 @@ def _wait_for_managed_quark_ready(
             last = str(exc)
         if pid is not None:
             if expected_pid is not None and pid != expected_pid:
-                last = (
-                    f"managed Quark PID changed from {expected_pid} to {pid} "
-                    "during readiness"
-                )
-            elif _cdp_ready(pid):
+                # launchd may respawn a process between kickstart and the CDP
+                # probe.  Revalidate the loaded contract before accepting the
+                # replacement PID; never accept an arbitrary same-name process.
+                try:
+                    _assert_loaded_managed_launch_agent()
+                except QuarkLifecycleError as exc:
+                    last = str(exc)
+                    pid = None
+                else:
+                    last = (
+                        f"managed Quark PID changed from {expected_pid} to {pid} "
+                        "during readiness"
+                    )
+            if pid is not None and _cdp_ready(pid):
                 return pid
-            else:
+            if pid is not None:
                 last = "fixed Quark CDP endpoint is not ready"
         if time.monotonic() >= deadline:
             raise QuarkLifecycleError(
@@ -690,6 +784,7 @@ def _install_launch_agent(*, replace_running: bool) -> Path:
         _validate_previous_launch_agent(previous)
     previous_snapshot = _service_snapshot()
     was_loaded = previous_snapshot is not None
+    previous_disabled = _launch_agent_is_disabled()
     if previous_snapshot is not None:
         if previous is None:
             raise QuarkLifecycleError(
@@ -751,6 +846,10 @@ def _install_launch_agent(*, replace_running: bool) -> Path:
                 _restore_unmanaged_quark()
             except QuarkLifecycleError as rollback_exc:
                 rollback_errors.append(f"unmanaged Quark restore failed: {rollback_exc}")
+        try:
+            _restore_launch_agent_enablement(disabled=previous_disabled)
+        except QuarkLifecycleError as rollback_exc:
+            rollback_errors.append(f"LaunchAgent enablement restore failed: {rollback_exc}")
         detail = "; ".join(rollback_errors)
         raise QuarkLifecycleError(
             str(exc)
@@ -764,46 +863,40 @@ def _install_launch_agent(*, replace_running: bool) -> Path:
 
 
 def _restart_launch_agent() -> None:
-    snapshot = _service_snapshot()
-    if snapshot is None:
-        raise QuarkLifecycleError("Quark LaunchAgent is not loaded")
-    _assert_service_origin(snapshot, _launch_agent_path())
+    _assert_loaded_managed_launch_agent()
     pid = _managed_quark_pid()
     if pid is not None:
         _terminate_exact_quark_pid(pid)
+    _assert_loaded_managed_launch_agent()
     started_pid = _kickstart(force=False)
     _wait_for_managed_quark_ready(started_pid)
 
 
 def _start_launch_agent() -> None:
-    snapshot = _service_snapshot()
-    if snapshot is None:
-        raise QuarkLifecycleError("Quark LaunchAgent is not loaded")
-    _assert_service_origin(snapshot, _launch_agent_path())
+    _assert_loaded_managed_launch_agent()
     current = _managed_quark_pid()
     if current is not None:
         _wait_for_managed_quark_ready(current)
         return
+    _assert_loaded_managed_launch_agent()
     started_pid = _kickstart(force=False)
     _wait_for_managed_quark_ready(started_pid)
 
 
 def _force_restart_launch_agent() -> None:
-    snapshot = _service_snapshot()
-    if snapshot is None:
-        raise QuarkLifecycleError("Quark LaunchAgent is not loaded")
-    _assert_service_origin(snapshot, _launch_agent_path())
+    _assert_loaded_managed_launch_agent()
     started_pid = _kickstart(force=True)
     _wait_for_managed_quark_ready(started_pid)
 
 
 def _uninstall_launch_agent() -> None:
-    target = _launch_agent_path()
-    _inspect_launch_agent_target(target)
-    snapshot = _service_snapshot()
-    if snapshot is not None:
-        _assert_service_origin(snapshot, target)
+    target, _snapshot = _assert_loaded_managed_launch_agent()
+    pid = _managed_quark_pid()
+    if pid is not None:
+        _terminate_exact_quark_pid(pid)
+        _assert_loaded_managed_launch_agent()
     _bootout_launch_agent()
+    _validate_managed_launch_agent_file(target)
     if target.exists():
         try:
             target.unlink()

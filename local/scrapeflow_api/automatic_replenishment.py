@@ -411,10 +411,11 @@ class QuarkFastSaveAutomaticMaterializer:
         self,
         helper: object | None = None,
     ) -> None:
-        # The loopback sidecar Helper owns the logged-in Quark renderer
-        # session.  Keeping this dependency injectable makes the materializer
-        # deterministic in unit tests while the default remains a lazy HTTP
-        # client in the API process.
+        # The loopback sidecar Helper owns the typed Quark operation.  It
+        # resolves the AList Cookie internally and uses the logged-in renderer
+        # only for passive WSG transforms.  Keeping this dependency injectable
+        # makes the materializer deterministic in unit tests while the default
+        # remains a lazy HTTP client in the API process.
         self.helper = helper
 
     def _helper(self) -> object:
