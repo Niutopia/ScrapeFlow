@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from io import StringIO
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from local.scrapeflow_api.release_checks import (
     active_media_fingerprint_call_hits,
     active_python_paths,
     local_deployment_contract_issues,
     release_commands,
+    run_release_checks,
 )
 
 
@@ -86,8 +90,12 @@ class ReleaseCheckTests(unittest.TestCase):
             "services:\n"
             "  alist:\n"
             "    ports:\n"
-            '      - "127.0.0.1:5244:5244"\n'
+            '      - "127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"\n'
+            "    volumes:\n"
+            "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data\n"
+            "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
             "  api:\n"
+            "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
             "    environment:\n"
             f"{api_env}\n"
             "    depends_on:\n"
@@ -95,14 +103,18 @@ class ReleaseCheckTests(unittest.TestCase):
             "        condition: service_healthy\n"
             "    ports:\n"
             f"{api_ports_yaml}\n"
+            "    volumes:\n"
+            "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
+            "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
             "  quark-helper:\n"
-            "    image: scrapeflow-api:local\n"
+            "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
             "    restart: unless-stopped\n"
             "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
             "    environment:\n"
             "      ALIST_URL: http://alist:5244\n"
             "      ALIST_USERNAME: ${ALIST_USERNAME:-}\n"
             "      ALIST_PASSWORD: ${ALIST_PASSWORD:-}\n"
+            "      SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}\n"
             "      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}\n"
             "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
             "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
@@ -197,6 +209,60 @@ class ReleaseCheckTests(unittest.TestCase):
             ["python-unittest", "git-worktree-clean", "git-diff-check"],
         )
 
+    def test_compose_config_output_is_withheld_from_release_stream(self) -> None:
+        secret = "compose-resolved-secret-must-not-reach-evidence"
+        for compose_returncode, expected_status in ((0, "passed"), (17, "failed")):
+            with self.subTest(compose_returncode=compose_returncode):
+                output = StringIO()
+                compose_calls: list[dict[str, object]] = []
+
+                def fake_run(
+                    args: tuple[str, ...],
+                    *,
+                    cwd: Path,
+                    env: dict[str, str] | None = None,
+                    check: bool,
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    del cwd, env, check
+                    if args == ("docker", "compose", "config"):
+                        compose_calls.append(kwargs)
+                        return subprocess.CompletedProcess(
+                            args,
+                            compose_returncode,
+                            stdout=f"environment:\n  TOKEN: {secret}\n",
+                        )
+                    if args == ("git", "status", "--porcelain"):
+                        return subprocess.CompletedProcess(args, 0, stdout="")
+                    return subprocess.CompletedProcess(args, 0)
+
+                with patch(
+                    "local.scrapeflow_api.release_checks.local_deployment_contract_issues",
+                    return_value=[],
+                ), patch(
+                    "local.scrapeflow_api.release_checks.active_media_fingerprint_call_hits",
+                    return_value=[],
+                ), patch(
+                    "local.scrapeflow_api.release_checks.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    returncode = run_release_checks(stream=output)
+
+                log_text = output.getvalue()
+                self.assertEqual(returncode, compose_returncode)
+                self.assertEqual(compose_calls, [{
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                }])
+                self.assertIn("$ docker compose config", log_text)
+                self.assertIn(
+                    f"docker compose config {expected_status}; "
+                    "resolved configuration output withheld",
+                    log_text,
+                )
+                self.assertNotIn(secret, log_text)
+
     def test_active_path_scan_excludes_tests_and_caches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -240,6 +306,35 @@ class ReleaseCheckTests(unittest.TestCase):
 
         self.assertTrue(any("SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED" in issue for issue in issues))
         self.assertTrue(any("api.ports" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_isolation_boundary_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            compose_path = root / "docker-compose.yml"
+            compose_path.write_text(
+                compose_path.read_text(encoding="utf-8")
+                .replace(
+                    "SCRAPEFLOW_ALIST_PORT:-5244",
+                    "SCRAPEFLOW_ALIST_PORT:-15244",
+                )
+                .replace(
+                    "image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
+                    "image: scrapeflow-api:legacy",
+                )
+                .replace(
+                    "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow",
+                    "./.runtime/api-temp:/var/tmp/scrapeflow",
+                ),
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("alist.ports" in issue for issue in issues))
+        self.assertTrue(any("api.image" in issue for issue in issues))
+        self.assertTrue(any("quark-helper.image" in issue for issue in issues))
+        self.assertTrue(any("api.volumes" in issue for issue in issues))
 
     def test_deployment_contract_requires_helper_pansou_and_pilot_wiring(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

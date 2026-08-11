@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from .isolated_preflight import (
@@ -57,6 +58,13 @@ FINAL_CHECKS = (
     "所有自动 gate 初始关闭",
     "最终是否开启自动审计和自动补源已由用户单独授权",
 )
+
+
+# Git currently uses SHA-1 by default, but repositories initialized with the
+# SHA-256 object format have a 64-character full object ID.  Evidence must use
+# a full ID, never the display-oriented short hash shown in package headings.
+_FULL_GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SHA512_RE = re.compile(r"[0-9a-f]{128}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,8 +387,10 @@ def _release_evidence_issues(
     payload: Mapping[str, object],
     *,
     evidence_path: Path | None,
+    root: Path | None,
+    runner: CommandRunner,
 ) -> list[str]:
-    """Reject a success claim that is not bound to a full raw gate artifact."""
+    """Reject a success claim that is not bound to a current raw gate artifact."""
     issues: list[str] = []
     returncode = payload.get("returncode")
     if isinstance(returncode, bool) or not isinstance(returncode, int):
@@ -390,6 +400,29 @@ def _release_evidence_issues(
         issues.append("command must run the full release gate without --skip-docker")
     if payload.get("include_docker") is not True:
         issues.append("include_docker must be true")
+
+    commit = payload.get("commit")
+    if not isinstance(commit, str) or _FULL_GIT_COMMIT_RE.fullmatch(commit) is None:
+        issues.append("commit must be a full lowercase Git object ID")
+    if payload.get("worktree_clean_before_gate") is not True:
+        issues.append("worktree_clean_before_gate must be true")
+    raw_log_sha512 = payload.get("raw_log_sha512")
+    if (
+        not isinstance(raw_log_sha512, str)
+        or _SHA512_RE.fullmatch(raw_log_sha512) is None
+    ):
+        issues.append("raw_log_sha512 must be a lowercase SHA-512 digest")
+
+    # The package is evaluated against its current checkout, so a passing
+    # report from an earlier candidate cannot be presented as release evidence
+    # for the current one.  Callers without a checkout can still inspect an
+    # artifact, but the package builder always supplies one.
+    if root is not None:
+        current_commit = _git_value(root, runner, ("rev-parse", "HEAD"))
+        if _FULL_GIT_COMMIT_RE.fullmatch(current_commit) is None:
+            issues.append("current Git HEAD cannot be resolved as a full commit")
+        elif isinstance(commit, str) and commit != current_commit:
+            issues.append("evidence commit does not match current Git HEAD")
 
     parsed_times: list[datetime] = []
     for key in ("started_at", "finished_at"):
@@ -425,6 +458,18 @@ def _release_evidence_issues(
             try:
                 if not log_path.is_file() or log_path.stat().st_size == 0:
                     issues.append("raw release log is missing or empty")
+                else:
+                    raw_log = log_path.read_bytes()
+                    actual_digest = hashlib.sha512(raw_log).hexdigest()
+                    if not isinstance(raw_log_sha512, str) or raw_log_sha512 != actual_digest:
+                        issues.append("raw release log does not match raw_log_sha512")
+                    try:
+                        raw_log_text = raw_log.decode("utf-8")
+                    except UnicodeDecodeError:
+                        issues.append("raw release log is not UTF-8 text")
+                    else:
+                        if "$ git status --porcelain" not in raw_log_text:
+                            issues.append("raw release log does not show the worktree gate")
             except OSError:
                 issues.append("raw release log cannot be read")
     return issues
@@ -434,12 +479,15 @@ def release_evidence_summary(
     report: Mapping[str, object] | None,
     *,
     evidence_path: Path | None = None,
+    root: Path | None = None,
+    runner: CommandRunner = _run_command,
 ) -> dict[str, object]:
     """Return only a verifiable full-gate release evidence summary.
 
     A hand-written ``returncode: 0`` is not acceptance evidence: a passing
-    record must name the full command, include Docker, and (when supplied via
-    the CLI) be bound to a non-empty raw log beside the exact JSON file.
+    record must name the full command, include Docker, bind a full current Git
+    commit and clean pre-gate worktree, and (when supplied via the CLI) bind
+    the exact raw log by SHA-512.
     """
     if report is None:
         return {"status": "未提供", "summary": {}, "issues": []}
@@ -447,7 +495,12 @@ def release_evidence_summary(
     returncode = payload.get("returncode")
     if isinstance(returncode, bool):
         returncode = None
-    issues = _release_evidence_issues(payload, evidence_path=evidence_path)
+    issues = _release_evidence_issues(
+        payload,
+        evidence_path=evidence_path,
+        root=root,
+        runner=runner,
+    )
     if isinstance(returncode, int) and returncode != 0:
         status = "失败"
     elif isinstance(returncode, int) and returncode == 0 and not issues:
@@ -465,9 +518,14 @@ def release_evidence_summary(
             "command": command_text,
             "returncode": "" if returncode is None else returncode,
             "include_docker": payload.get("include_docker", ""),
+            "commit": payload.get("commit", ""),
+            "worktree_clean_before_gate": payload.get(
+                "worktree_clean_before_gate", "",
+            ),
             "started_at": payload.get("started_at", ""),
             "finished_at": payload.get("finished_at", ""),
             "log_path": payload.get("log_path", ""),
+            "raw_log_sha512": payload.get("raw_log_sha512", ""),
             "report_path": payload.get("report_path", ""),
         },
     }
@@ -507,6 +565,8 @@ def build_acceptance_package(
     release = release_evidence_summary(
         release_evidence,
         evidence_path=release_evidence_path,
+        root=base,
+        runner=runner,
     )
     if release["status"] != "未提供":
         release_check_status = str(release["status"])

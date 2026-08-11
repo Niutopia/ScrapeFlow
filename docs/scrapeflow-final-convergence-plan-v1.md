@@ -90,7 +90,9 @@
 
 ## 四、当前基线
 
-目前可复用：
+> 历史快照说明：以下“当前基线”保留 2026-08-09 的收敛起点，不能用来描述当前代码或验收状态。当前实现已具备分享快转、Quark 磁力、严格 report-only 审计、无应用级 SHA-256 的代码路径；本地测试/发布门状态应以当前 commit 的 release evidence 为准。尚未完成的仍是独立 AList/状态/媒体根、备份恢复演练和真实隔离样本，且自动 gate 必须保持关闭。
+
+历史基线中可复用：
 
 - `awaiting_target_shelf → /start` 启动门。
 - 电影、番剧、美剧固定货架。
@@ -101,7 +103,7 @@
 - 本地 Torrent 搜索、aria2、ffprobe 和上传。
 - 346 项现有后端测试。
 
-明确缺口：
+历史基线中的明确缺口（其中已实现项见上方快照说明）：
 
 - 补源目前只有第三阶真正可执行。
 - 第一阶夸克分享快转已被裁掉。
@@ -331,7 +333,7 @@ tv_root
 - 只读递归文件清单。
 - 精确 `file_id/path/size → gap_ids`。
 - 从匹配的 AList Quark storage 临时取得会话，只用于分享发现和只读清单核验。
-- 将已核验的 file ID 交给 typed `share-save`；当前 Compose sidecar 按 action 从匹配 AList storage 临时取得 Cookie/root，桌面夸克已登录 renderer 只提供被动 WSG 能力并不接收 Cookie。该条取代本历史计划中“由 renderer 直接快转、AList cookie 不进入 Helper”的旧部署假设。
+- 将已核验的 file ID 交给 typed `share-save`；当前 Compose sidecar 按 action 从匹配 AList storage 临时取得 Cookie 与 AList v3.62 的 `root_folder_id`（兼容旧 `root_id`），桌面夸克已登录 renderer 只提供被动 WSG 能力并不接收 Cookie。该条取代本历史计划中“由 renderer 直接快转、AList cookie 不进入 Helper”的旧部署假设。
 - AList 到达回读。
 
 不恢复 SHA request ID、receipt、回滚副本或通用分享平台。

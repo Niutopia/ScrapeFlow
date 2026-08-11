@@ -67,7 +67,7 @@ class QuarkFastSaveBridgeTests(unittest.TestCase):
         self.assertEqual(plan["file_names"], ["Example.Show.S01E01.mkv"])
         self.assertNotIn("passcode", json.dumps(plan))
 
-    def test_delegates_matching_alist_quark_cookie_without_returning_it(self) -> None:
+    def test_delegates_legacy_alist_quark_root_id_without_returning_cookie(self) -> None:
         client = mock.Mock()
         client.admin_storages.return_value = [{
             "driver": "Quark",
@@ -81,6 +81,49 @@ class QuarkFastSaveBridgeTests(unittest.TestCase):
         )
         self.assertEqual(session.cookie, "SECRET_COOKIE")
         self.assertEqual(session.root_id, "root")
+
+    def test_delegates_current_alist_root_folder_id(self) -> None:
+        client = mock.Mock()
+        client.admin_storages.return_value = [{
+            "driver": "Quark",
+            "mount_path": "/quark",
+            "disabled": False,
+            "addition": json.dumps({
+                "cookie": "SECRET_COOKIE",
+                "root_folder_id": "isolated-root",
+            }),
+        }]
+
+        session = delegated_quark_session(
+            client,
+            "/quark/影视/ScrapeFlow/补源/root/attempt",
+        )
+
+        self.assertEqual(session.root_id, "isolated-root")
+
+    def test_rejects_missing_invalid_or_conflicting_alist_root_folder(self) -> None:
+        for addition in (
+            {"cookie": "SECRET_COOKIE"},
+            {"cookie": "SECRET_COOKIE", "root_folder_id": ""},
+            {
+                "cookie": "SECRET_COOKIE",
+                "root_folder_id": "isolated-root",
+                "root_id": "other-root",
+            },
+        ):
+            with self.subTest(addition=addition):
+                client = mock.Mock()
+                client.admin_storages.return_value = [{
+                    "driver": "Quark",
+                    "mount_path": "/quark",
+                    "disabled": False,
+                    "addition": json.dumps(addition),
+                }]
+                with self.assertRaisesRegex(QuarkBridgeError, "root folder"):
+                    delegated_quark_session(
+                        client,
+                        "/quark/影视/ScrapeFlow/补源/root/attempt",
+                    )
 
     def test_executes_token_detail_destination_save_and_task(self) -> None:
         transport = FixtureTransport([

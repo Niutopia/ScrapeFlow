@@ -290,11 +290,11 @@ def _example_root_job(job_id: str = "engine-cancel-root") -> EngineJob:
 
 
 class AutomaticReplenishmentTests(unittest.TestCase):
-    def test_runtime_rejects_noncanonical_provider_staging_root(self) -> None:
+    def test_runtime_rejects_arbitrary_provider_staging_root_but_allows_one_acceptance_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(
                 AutomaticReplenishmentError,
-                "staging_root 必须是 /quark/影视/ScrapeFlow/补源",
+                "staging_root 必须是生产根或受限验收根派生的补源目录",
             ):
                 AutomaticReplenishmentRuntime(
                     Path(temporary),
@@ -304,6 +304,19 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     materializer=object(),
                     staging_root="/library/ScrapeFlow/补源",
                 )
+            acceptance_root = (
+                "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8/"
+                "ScrapeFlow/补源"
+            )
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary) / "acceptance",
+                engine_runner=object(),
+                alist=object(),
+                search=object(),
+                materializer=object(),
+                staging_root=acceptance_root,
+            )
+            self.assertEqual(runtime.staging_root, acceptance_root)
 
     def test_exact_episode_terms_survive_many_tmdb_aliases(self) -> None:
         request = {

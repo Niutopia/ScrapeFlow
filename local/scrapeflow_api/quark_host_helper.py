@@ -31,6 +31,15 @@ import re
 from typing import Any, Protocol
 import urllib.parse
 
+from .provider_staging import (
+    CANONICAL_REPLENISHMENT_STAGING_ROOT,
+    PRODUCTION_MEDIA_ROOT,
+    ProviderStagingPathError,
+    replenishment_staging_root_for_media_root,
+    validate_provider_media_root,
+    validate_provider_staging_root,
+)
+
 try:  # Helper-runtime dependency; see requirements.quark-helper.txt.
     from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, WSMsgType, web
 except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency path.
@@ -41,7 +50,7 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency
 
 
 HELPER_ACTIONS = ("health", "share-save", "magnet-submit", "magnet-status")
-DEFAULT_STAGING_ROOT = "/quark/影视/ScrapeFlow/补源"
+DEFAULT_STAGING_ROOT = CANONICAL_REPLENISHMENT_STAGING_ROOT
 DEFAULT_MOUNT_PATH = "/quark"
 MAX_BODY_BYTES = 256 * 1024
 MAX_EXPECTED_FILES = 128
@@ -205,17 +214,20 @@ def _safe_cookie_header(value: object) -> str:
 
 
 def validate_staging_root(value: object) -> str:
-    """Accept only the frozen ScrapeFlow provider staging root.
+    """Accept only a production or exact isolated-provider staging root.
 
-    The CLI/environment cannot turn this Helper into a writer for another
+    The CLI/environment cannot turn this Helper into a writer for an arbitrary
     cloud root.  A task request may only select a root-job/attempt child below
-    this canonical provider staging prefix.
+    the production staging prefix or one staging prefix derived from an exact
+    isolated acceptance media root.
     """
 
-    root = _safe_absolute_cloud_path(value, label="staging root")
-    if root != DEFAULT_STAGING_ROOT:
-        raise QuarkHelperValidationError("staging root must equal the frozen provider staging root")
-    return root
+    try:
+        return validate_provider_staging_root(value)
+    except ProviderStagingPathError as exc:
+        raise QuarkHelperValidationError(
+            "staging root must be a production or exact isolated provider root"
+        ) from exc
 
 
 def _validate_attempt_destination(
@@ -610,6 +622,9 @@ class QuarkHelperConfig:
     root_fid: str = "0"
     timeout_seconds: float = 20.0
     docker_sidecar: bool = False
+    # Kept last so the pre-existing optional positional configuration shape
+    # remains stable for direct local callers.
+    media_root: str = PRODUCTION_MEDIA_ROOT
 
     def __post_init__(self) -> None:
         _require_loopback_bind(self.host)
@@ -623,7 +638,20 @@ class QuarkHelperConfig:
         if type(self.docker_sidecar) is not bool:
             raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
         _cdp_discovery_url(self.cdp_url, docker_sidecar=self.docker_sidecar)
-        validate_staging_root(self.staging_root)
+        try:
+            media_root = validate_provider_media_root(self.media_root)
+            staging_root = validate_staging_root(self.staging_root)
+            expected_staging_root = replenishment_staging_root_for_media_root(
+                media_root
+            )
+        except ProviderStagingPathError as exc:  # pragma: no cover - translated above.
+            raise QuarkHelperValidationError("helper media root is invalid") from exc
+        if staging_root != expected_staging_root:
+            raise QuarkHelperValidationError(
+                "staging root must exactly match the configured media root"
+            )
+        object.__setattr__(self, "media_root", media_root)
+        object.__setattr__(self, "staging_root", staging_root)
         _safe_absolute_cloud_path(self.mount_path, label="Quark mount path")
         _safe_identifier(self.root_fid, label="Quark root_fid")
         if type(self.timeout_seconds) not in {float, int} or not (1 <= float(self.timeout_seconds) <= 120):

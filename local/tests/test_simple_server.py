@@ -171,6 +171,10 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             pool = self.application._provider_pool()  # noqa: SLF001 - runtime gate
         self.assertEqual(pool._max_workers, 1)  # noqa: SLF001 - executor contract
 
+    def test_provider_does_not_adopt_an_arbitrary_application_media_root(self) -> None:
+        with self.assertRaisesRegex(ApplicationError, "自动补源只允许"):
+            self.application._provider_staging_root()  # noqa: SLF001 - safety boundary
+
     def test_real_root_lane_gates_fail_closed_until_explicitly_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,

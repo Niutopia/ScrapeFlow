@@ -10,10 +10,10 @@ services:
       PGID: "1000"
       UMASK: "022"
     ports:
-      - "127.0.0.1:5244:5244"
+      - "127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data
-      - ./.runtime/alist-temp:/opt/alist/data/temp
+      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5244/api/public/settings"]
       interval: 10s
@@ -26,7 +26,7 @@ services:
         max-file: "3"
 
   api:
-    image: scrapeflow-api:local
+    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
     build:
       context: .
       dockerfile: Dockerfile.api
@@ -89,7 +89,7 @@ services:
         condition: service_healthy
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data
-      - ./.runtime/api-temp:/var/tmp/scrapeflow
+      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -105,7 +105,7 @@ services:
         max-file: "3"
 
   quark-helper:
-    image: scrapeflow-api:local
+    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
     restart: unless-stopped
     init: true
     command: ["python3", "scripts/scrapeflow_quark_helper.py", "--docker-sidecar"]
@@ -113,6 +113,9 @@ services:
       ALIST_URL: http://alist:5244
       ALIST_USERNAME: ${ALIST_USERNAME:-}
       ALIST_PASSWORD: ${ALIST_PASSWORD:-}
+      # The Helper derives its only writable staging parent from the exact
+      # same media root as the API; it never receives an arbitrary root.
+      SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
       NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}
       SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}
       SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list

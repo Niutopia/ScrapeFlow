@@ -7,6 +7,11 @@ from collections.abc import Mapping
 
 from engine.scrapeflow.media_policy import SUBTITLE_EXTENSIONS, VIDEO_EXTENSIONS
 
+from .provider_staging import (
+    CANONICAL_REPLENISHMENT_STAGING_ROOT,
+    ProviderStagingPathError,
+    validate_provider_staging_root,
+)
 from .replenishment_tiers import (
     TIER_LOCAL_MAGNET,
     TIER_QUARK_MAGNET,
@@ -31,7 +36,9 @@ FORBIDDEN_DELIVERY_KEYS = frozenset({
     "movie_root",
     "tv_root",
 })
-DEFAULT_DELIVERY_PARENT = "/quark/影视/ScrapeFlow/补源"
+# Retain the public constant for callers and persisted-contract tests.  Its
+# value is deliberately the unchanged production staging parent.
+DEFAULT_DELIVERY_PARENT = CANONICAL_REPLENISHMENT_STAGING_ROOT
 
 
 class ProviderDeliveryError(ValueError):
@@ -105,7 +112,10 @@ def validate_provider_delivery(
     if delivered_attempt != expected_attempt:
         raise ProviderDeliveryError("delivery attempt_id 不匹配")
     safe_root_job = _safe_token(root_job_id, label="root_job_id")
-    parent = _safe_remote_path(staging_parent.rstrip("/") or "/", label="staging_parent")
+    try:
+        parent = validate_provider_staging_root(staging_parent)
+    except ProviderStagingPathError as exc:
+        raise ProviderDeliveryError("staging_parent 不属于受管 Provider staging 根") from exc
     expected_root = _expected_staging_root(parent, safe_root_job, expected_attempt)
     staging_root = _safe_remote_path(delivery.get("staging_root"), label="staging_root")
     if staging_root != expected_root:

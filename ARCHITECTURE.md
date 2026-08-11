@@ -58,6 +58,8 @@ AList（待刮削、任务专属 staging、正式媒体库）
 
 Provider 只能写入当前任务专属 staging，不能决定正式库位置或作品身份。视频、集数和季缺口使用内部补源阶段；该 child 只回投媒体，不生成每集 NFO/海报。字幕缺口使用绑定到已审计视频的侧挂流程：先检查同目录侧车和内嵌目标语言，确认缺失后才获取。Provider/audit 自动 lane 当前默认关闭；只有显式开启并通过当前计划验收后，补源才会按配置有界重试。
 
+生产根的 Provider staging 固定为 `/quark/影视/ScrapeFlow/补源`。隔离验收不得借由任意环境路径扩大该写入面：仅精确的 `/quark/影视/ScrapeFlow/验收/<run-id>` 可以作为验收媒体根，且其 staging 必须由同一根派生为 `<media-root>/ScrapeFlow/补源`。API、delivery 验证、Helper 与 preflight 共同执行该映射。
+
 ## 状态与目录
 
 API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久化。活动状态布局为：
@@ -116,4 +118,4 @@ env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-stat
 docker build -f Dockerfile.api .
 ```
 
-当前工作树尚未达到发布门。阶段 0–6 全部通过且用户再次明确授权后，才可在隔离目录运行一个受控样本；不得用本文件授权真实来源整理或缺口补齐。
+代码与本地发布门是受控 pilot 的必要条件，不是生产自动化授权。当前真实隔离验收、备份恢复演练和外部媒体恢复点仍必须逐项留证；在这些证据完成且用户单独授权前，必须保持全局 pause、所有自动 gate 关闭，且不得恢复旧 backlog、批量 retry 或 cleanup。

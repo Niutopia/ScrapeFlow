@@ -278,12 +278,41 @@ def delegated_quark_session(alist_client: Any, destination: str) -> QuarkSession
             addition = json.loads(str(row.get("addition") or "{}"))
         except json.JSONDecodeError as exc:
             raise QuarkBridgeError("AList Quark storage addition is invalid") from exc
+        if not isinstance(addition, Mapping):
+            raise QuarkBridgeError("AList Quark storage addition is invalid")
         cookie = addition.get("cookie")
-        root_id = addition.get("root_id", "0")
         if not isinstance(cookie, str) or not cookie.strip():
             raise QuarkBridgeError("AList Quark storage has no delegated login state")
-        if not isinstance(root_id, str) or not root_id:
-            raise QuarkBridgeError("AList Quark storage root_id is invalid")
+        # AList v3.62 names this field ``root_folder_id``.  Older storage
+        # rows used ``root_id``.  A missing or malformed modern field must
+        # never silently fall back to account root ("0"), because that could
+        # turn a dedicated acceptance mount into a writer for the whole Quark
+        # account.  When both schema variants appear, require them to agree.
+        if "root_folder_id" in addition:
+            root_id = addition["root_folder_id"]
+            legacy_root_id = addition.get("root_id")
+            if (
+                not isinstance(root_id, str)
+                or not root_id
+                or root_id != root_id.strip()
+                or (
+                    "root_id" in addition
+                    and (
+                        not isinstance(legacy_root_id, str)
+                        or not legacy_root_id
+                        or legacy_root_id != root_id
+                    )
+                )
+            ):
+                raise QuarkBridgeError("AList Quark storage root folder is invalid")
+        else:
+            root_id = addition.get("root_id")
+            if (
+                not isinstance(root_id, str)
+                or not root_id
+                or root_id != root_id.strip()
+            ):
+                raise QuarkBridgeError("AList Quark storage root folder is invalid")
         matches.append((len(mount), QuarkSession(mount, root_id, cookie)))
     if not matches:
         raise QuarkBridgeError("no enabled AList Quark storage covers destination")

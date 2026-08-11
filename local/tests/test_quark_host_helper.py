@@ -159,6 +159,33 @@ class HelperValidationTests(unittest.TestCase):
             with self.subTest(root=root), self.assertRaises(QuarkHelperValidationError):
                 validate_staging_root(root)
 
+    def test_helper_accepts_only_media_root_derived_acceptance_staging(self) -> None:
+        media_root = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8"
+        staging_root = f"{media_root}/ScrapeFlow/补源"
+        self.assertEqual(validate_staging_root(staging_root), staging_root)
+        config = QuarkHelperConfig(
+            host="127.0.0.1",
+            port=18765,
+            token=TOKEN,
+            cdp_url="http://127.0.0.1:19222/json/list",
+            media_root=media_root,
+            staging_root=staging_root,
+            **ALIST_CONFIG,
+        )
+        self.assertEqual(config.media_root, media_root)
+        self.assertEqual(config.staging_root, staging_root)
+
+        with self.assertRaises(QuarkHelperValidationError):
+            QuarkHelperConfig(
+                host="127.0.0.1",
+                port=18765,
+                token=TOKEN,
+                cdp_url="http://127.0.0.1:19222/json/list",
+                media_root=media_root,
+                staging_root=DEFAULT_STAGING_ROOT,
+                **ALIST_CONFIG,
+            )
+
     def test_config_requires_explicit_safe_cdp_and_loopback_bind(self) -> None:
         with self.assertRaises(QuarkHelperValidationError):
             QuarkHelperConfig(

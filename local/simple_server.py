@@ -47,7 +47,6 @@ from local.scrapeflow_api.simple_library_audit import (
 )
 from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentRuntime,
-    CANONICAL_REPLENISHMENT_STAGING_ROOT,
     FixedTierAutomaticMaterializer,
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
@@ -55,6 +54,10 @@ from local.scrapeflow_api.automatic_replenishment import (
 from local.scrapeflow_api.control_state import PersistentControlState
 from local.scrapeflow_api.quark_helper_readiness import (
     quark_helper_readiness_from_env,
+)
+from local.scrapeflow_api.provider_staging import (
+    ProviderStagingPathError,
+    replenishment_staging_root_for_media_root,
 )
 from local.scrapeflow_api.redaction import redact_error, redact_value
 from local.scrapeflow_api.replenishment_tiers import (
@@ -1957,6 +1960,22 @@ class SimpleApplication:
                 )
             return self._provider_executor
 
+    def _provider_staging_root(self) -> str:
+        """Return the one staging parent coupled to this media root.
+
+        Normal test mounts may still use the public API for ordinary intake,
+        but Provider must not turn any such alternate root into a writer.  It
+        can operate only at the production media root or one exact isolated
+        acceptance run root.
+        """
+
+        try:
+            return replenishment_staging_root_for_media_root(self.remote_root)
+        except ProviderStagingPathError as exc:
+            raise ApplicationError(
+                "自动补源只允许 /quark/影视 或受限验收媒体根"
+            ) from exc
+
     def _get_automatic_replenishment(self) -> AutomaticReplenishmentRuntime:
         runtime = self._automatic_replenishment
         if runtime is not None:
@@ -1974,11 +1993,7 @@ class SimpleApplication:
                 quark_share_inspector,
             )
             from engine.tools.replenishment_adapter.search import ReplenishmentSearchService
-            if self.remote_root != "/quark/影视":
-                raise ApplicationError(
-                    "自动补源要求 SCRAPEFLOW_MEDIA_ROOT=/quark/影视"
-                )
-            replenishment_staging = CANONICAL_REPLENISHMENT_STAGING_ROOT
+            replenishment_staging = self._provider_staging_root()
             runtime = AutomaticReplenishmentRuntime(
                 self.state_root,
                 engine_runner=runner,
@@ -3256,7 +3271,7 @@ class SimpleApplication:
                             self.state_root,
                             job_id=job.id,
                             alist=client,
-                            staging_root=CANONICAL_REPLENISHMENT_STAGING_ROOT,
+                            staging_root=self._provider_staging_root(),
                             audit_started_at=report.get("started_at"),
                             audit_complete=(
                                 report.get("status") == "completed"

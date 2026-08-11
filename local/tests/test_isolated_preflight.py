@@ -128,6 +128,21 @@ class IsolatedPreflightTests(unittest.TestCase):
         self.assertTrue(any("must not be nested" in issue for issue in issues))
         self.assertTrue(any("formal library shelf" in issue for issue in issues))
 
+    def test_rejects_nonformal_media_roots_outside_the_fixed_acceptance_namespace(self) -> None:
+        for media_root in (
+            "/quark/影视/ScrapeFlow/验收",
+            "/quark/影视/ScrapeFlow/验收/run-20260811/child",
+            "/quark/影视/ScrapeFlow/scratch/run-20260811",
+        ):
+            with self.subTest(media_root=media_root), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                declaration = valid_declaration(root)
+                declaration["media_root"] = media_root
+
+                issues = isolated_preflight_issues(declaration, root=root / "repo")
+
+            self.assertTrue(any("must be exactly" in issue for issue in issues))
+
     def test_rejects_gate_worker_and_recovery_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -23,12 +23,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from local.scrapeflow_api.quark_host_helper import (
     DEFAULT_MOUNT_PATH,
-    DEFAULT_STAGING_ROOT,
     DOCKER_SIDECAR_CDP_URL,
     QuarkHelperConfig,
     QuarkHelperValidationError,
     load_helper_token,
     serve_quark_helper,
+)
+from local.scrapeflow_api.provider_staging import (
+    PRODUCTION_MEDIA_ROOT,
+    ProviderStagingPathError,
+    replenishment_staging_root_for_media_root,
 )
 
 
@@ -77,7 +81,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--staging-root",
-        default=os.getenv("SCRAPEFLOW_QUARK_HELPER_STAGING_ROOT", DEFAULT_STAGING_ROOT),
+        default=None,
+        help=(
+            "explicit Provider staging root; it must exactly match the "
+            "configured media root's derived staging path"
+        ),
+    )
+    parser.add_argument(
+        "--media-root",
+        default=None,
+        help=(
+            "Provider media root; defaults to SCRAPEFLOW_MEDIA_ROOT or the "
+            "production media root"
+        ),
     )
     parser.add_argument(
         "--mount-path",
@@ -109,6 +125,22 @@ def _configured_cdp_url(args: argparse.Namespace) -> str:
     return DOCKER_SIDECAR_CDP_URL if args.docker_sidecar else DEFAULT_CDP_URL
 
 
+def _configured_media_root(value: object) -> str:
+    if isinstance(value, str) and value:
+        return value
+    configured = os.getenv("SCRAPEFLOW_MEDIA_ROOT", "").strip()
+    return configured or PRODUCTION_MEDIA_ROOT
+
+
+def _configured_staging_root(value: object, *, media_root: str) -> str:
+    if isinstance(value, str) and value:
+        return value
+    configured = os.getenv("SCRAPEFLOW_QUARK_HELPER_STAGING_ROOT", "").strip()
+    if configured:
+        return configured
+    return replenishment_staging_root_for_media_root(media_root)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -120,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.host not in {"127.0.0.1", "::1"}:
         parser.error("helper may bind only to 127.0.0.1 or ::1")
     try:
+        media_root = _configured_media_root(args.media_root)
         token = load_helper_token(token_file=args.token_file)
         config = QuarkHelperConfig(
             host=args.host,
@@ -132,12 +165,16 @@ def main(argv: list[str] | None = None) -> int:
             # redaction inside the typed config/session resolver.  In
             # particular, never place it in argparse values or diagnostics.
             alist_password=os.getenv("ALIST_PASSWORD", ""),
-            staging_root=args.staging_root,
+            staging_root=_configured_staging_root(
+                args.staging_root,
+                media_root=media_root,
+            ),
+            media_root=media_root,
             mount_path=args.mount_path,
             root_fid=args.root_fid,
             docker_sidecar=args.docker_sidecar,
         )
-    except QuarkHelperValidationError as exc:
+    except (ProviderStagingPathError, QuarkHelperValidationError) as exc:
         parser.error(str(exc))
     serve_quark_helper(config)
     return 0

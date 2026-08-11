@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+import hashlib
 from io import StringIO
 import json
 import tempfile
@@ -87,8 +88,12 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "services:\n"
         "  alist:\n"
         "    ports:\n"
-        '      - "127.0.0.1:5244:5244"\n'
+        '      - "127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"\n'
+        "    volumes:\n"
+        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data\n"
+        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
         "  api:\n"
+        "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
         "    environment:\n"
         f"{api_env}\n"
         "    depends_on:\n"
@@ -96,14 +101,18 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "        condition: service_healthy\n"
         "    ports:\n"
         '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"\n'
+        "    volumes:\n"
+        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
+        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
         "  quark-helper:\n"
-        "    image: scrapeflow-api:local\n"
+        "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
         "    restart: unless-stopped\n"
         "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
         "    environment:\n"
         "      ALIST_URL: http://alist:5244\n"
         "      ALIST_USERNAME: ${ALIST_USERNAME:-}\n"
         "      ALIST_PASSWORD: ${ALIST_PASSWORD:-}\n"
+        "      SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}\n"
         "      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}\n"
         "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
         "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
@@ -263,6 +272,8 @@ def fake_runner(args: tuple[str, ...], cwd: Path, env: dict[str, str] | None) ->
         return CommandResult(0, "codex/test\n")
     if args == ("git", "rev-parse", "--short", "HEAD"):
         return CommandResult(0, "abc1234\n")
+    if args == ("git", "rev-parse", "HEAD"):
+        return CommandResult(0, "a" * 40 + "\n")
     if args == ("git", "status", "--short"):
         return CommandResult(0, "")
     if args == ("docker", "compose", "config", "--format", "json"):
@@ -319,15 +330,19 @@ class AcceptancePackageTests(unittest.TestCase):
             root = Path(temporary)
             evidence_path = root / "scrapeflow-release-evidence.json"
             log_path = root / "scrapeflow-release-check.log"
-            log_path.write_text("$ python3 -m unittest\nOK\n", encoding="utf-8")
+            raw_log = "$ python3 -m unittest\nOK\n$ git status --porcelain\n"
+            log_path.write_text(raw_log, encoding="utf-8")
             report = {
                 "status": "通过",
                 "command": ["python3", "scripts/scrapeflow_release_check.py"],
                 "returncode": 0,
                 "include_docker": True,
+                "commit": "a" * 40,
+                "worktree_clean_before_gate": True,
                 "started_at": "2026-08-10T01:00:00+00:00",
                 "finished_at": "2026-08-10T01:01:00+00:00",
                 "log_path": str(log_path),
+                "raw_log_sha512": hashlib.sha512(raw_log.encode("utf-8")).hexdigest(),
                 "report_path": str(evidence_path),
             }
             evidence_path.write_text(json.dumps(report), encoding="utf-8")
@@ -336,6 +351,39 @@ class AcceptancePackageTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "通过")
         self.assertEqual(summary["issues"], [])
+
+    def test_release_evidence_rejects_stale_commit_and_tampered_raw_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_path = root / "scrapeflow-release-evidence.json"
+            log_path = root / "scrapeflow-release-check.log"
+            raw_log = "$ git status --porcelain\n"
+            log_path.write_text(raw_log + "tampered\n", encoding="utf-8")
+            report = {
+                "status": "通过",
+                "command": ["python3", "scripts/scrapeflow_release_check.py"],
+                "returncode": 0,
+                "include_docker": True,
+                "commit": "b" * 40,
+                "worktree_clean_before_gate": True,
+                "started_at": "2026-08-10T01:00:00+00:00",
+                "finished_at": "2026-08-10T01:01:00+00:00",
+                "log_path": str(log_path),
+                "raw_log_sha512": hashlib.sha512(raw_log.encode("utf-8")).hexdigest(),
+                "report_path": str(evidence_path),
+            }
+            evidence_path.write_text(json.dumps(report), encoding="utf-8")
+
+            summary = release_evidence_summary(
+                report,
+                evidence_path=evidence_path,
+                root=root,
+                runner=fake_runner,
+            )
+
+        self.assertEqual(summary["status"], "无效")
+        self.assertIn("evidence commit does not match current Git HEAD", summary["issues"])
+        self.assertIn("raw release log does not match raw_log_sha512", summary["issues"])
 
     def test_release_evidence_rejects_skipped_or_unbound_success_claim(self) -> None:
         report = {
@@ -353,6 +401,8 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(summary["status"], "无效")
         self.assertIn("command must run the full release gate without --skip-docker", summary["issues"])
         self.assertIn("include_docker must be true", summary["issues"])
+        self.assertIn("commit must be a full lowercase Git object ID", summary["issues"])
+        self.assertIn("worktree_clean_before_gate must be true", summary["issues"])
         self.assertIn("finished_at must not precede started_at", summary["issues"])
 
     def test_git_evidence_reports_clean_worktree(self) -> None:

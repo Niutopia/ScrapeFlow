@@ -16,6 +16,8 @@ from local.scrapeflow_api.replenishment_tiers import (
 ROOT = "root-job"
 ATTEMPT = "attempt-1"
 STAGING = f"/quark/影视/ScrapeFlow/补源/{ROOT}/{ATTEMPT}"
+ACCEPTANCE_PARENT = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8/ScrapeFlow/补源"
+ACCEPTANCE_STAGING = f"{ACCEPTANCE_PARENT}/{ROOT}/{ATTEMPT}"
 
 
 def _delivery(lane: str) -> dict[str, object]:
@@ -44,6 +46,26 @@ class ProviderDeliveryContractTests(unittest.TestCase):
                 self.assertEqual(result["lane"], lane)
                 self.assertEqual(result["staging_root"], STAGING)
                 self.assertEqual(result["files"][0]["gap_ids"], ["S01E01"])
+
+    def test_acceptance_parent_must_be_the_exact_derived_provider_root(self) -> None:
+        delivery = _delivery(TIER_QUARK_SHARE)
+        delivery["staging_root"] = ACCEPTANCE_STAGING
+        delivery["files"][0]["path"] = f"{ACCEPTANCE_STAGING}/Example.S01E01.mkv"
+        result = validate_provider_delivery(
+            delivery,
+            root_job_id=ROOT,
+            attempt_id=ATTEMPT,
+            staging_parent=ACCEPTANCE_PARENT,
+        )
+        self.assertEqual(result["staging_root"], ACCEPTANCE_STAGING)
+
+        with self.assertRaises(ProviderDeliveryError):
+            validate_provider_delivery(
+                delivery,
+                root_job_id=ROOT,
+                attempt_id=ATTEMPT,
+                staging_parent="/library/ScrapeFlow/补源",
+            )
 
     def test_formal_library_fields_are_rejected_anywhere(self) -> None:
         for key in ("formal_path", "target_root", "destination_parent", "movie_root", "tv_root"):

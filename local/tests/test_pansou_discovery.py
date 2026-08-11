@@ -333,6 +333,39 @@ class PanSouDiscoveryTests(unittest.TestCase):
             self.assertIsInstance(runtime.search._pansou, PanSouDiscovery)  # noqa: SLF001
             self.assertIsNotNone(runtime.search._pansou.inspector)  # noqa: SLF001
 
+    def test_application_derives_provider_staging_from_one_acceptance_root(self) -> None:
+        class MinimalAList:
+            def list(self, _path, refresh=False):
+                del refresh
+                return []
+
+        media_root = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8"
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = MinimalAList()
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=object(),
+                validate=False,
+                library_root=media_root,
+            )
+            with patch.object(SimpleApplication, "_start_startup_thread"):
+                application = SimpleApplication(
+                    state_root=state_root,
+                    remote_root=media_root,
+                    remote=alist,
+                    engine_runner=runner,
+                )
+            self.addCleanup(application.close)
+
+            runtime = application._get_automatic_replenishment()  # noqa: SLF001
+
+            self.assertEqual(
+                runtime.staging_root,
+                f"{media_root}/ScrapeFlow/补源",
+            )
+
     def test_infrastructure_failure_during_manifest_inspection_is_not_a_miss(self) -> None:
         def unavailable(_pwd_id, _passcode):
             raise OSError("fixture Quark unavailable")

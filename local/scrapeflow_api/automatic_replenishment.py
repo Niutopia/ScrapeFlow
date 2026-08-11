@@ -38,6 +38,11 @@ from .replenishment import (
     select_replenishment_candidates,
 )
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
+from .provider_staging import (
+    CANONICAL_REPLENISHMENT_STAGING_ROOT,
+    ProviderStagingPathError,
+    validate_provider_staging_root,
+)
 from .redaction import redact_error, redact_value
 from .replenishment_tiers import (
     EXHAUSTION_MIN_DISTINCT_LOCATORS,
@@ -70,7 +75,6 @@ _DURABLE_CANDIDATE_EXCLUSION_LIMIT = EXHAUSTION_MIN_DISTINCT_LOCATORS
 _DURABLE_CANDIDATE_LOCATOR_LIMIT = 4096
 _DURABLE_CANDIDATE_PROVIDER_LIMIT = 64
 _DURABLE_CANDIDATE_RELEASE_NAME_LIMIT = 512
-CANONICAL_REPLENISHMENT_STAGING_ROOT = "/quark/影视/ScrapeFlow/补源"
 _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
 _ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
@@ -1218,11 +1222,12 @@ class AutomaticReplenishmentRuntime:
         self.alist = alist
         self.search = search
         self.materializer = materializer
-        self.staging_root = _safe_path(staging_root, label="staging_root")
-        if self.staging_root != CANONICAL_REPLENISHMENT_STAGING_ROOT:
+        try:
+            self.staging_root = validate_provider_staging_root(staging_root)
+        except ProviderStagingPathError as exc:
             raise AutomaticReplenishmentError(
-                "自动补源 staging_root 必须是 /quark/影视/ScrapeFlow/补源"
-            )
+                "自动补源 staging_root 必须是生产根或受限验收根派生的补源目录"
+            ) from exc
         # The strict policy advances only after thirty distinct
         # candidate-local failures.  A caller may choose a smaller execution
         # slice, but the runtime must not silently cap a configured thirty

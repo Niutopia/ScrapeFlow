@@ -13,7 +13,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .offline_backup import MANIFEST_NAME, OfflineBackupError, verify_offline_backup
-from .provider_delivery import DEFAULT_DELIVERY_PARENT
+from .provider_staging import (
+    CANONICAL_REPLENISHMENT_STAGING_ROOT,
+    ProviderStagingPathError,
+    validate_acceptance_media_root,
+)
 from .release_checks import project_root
 
 
@@ -318,9 +322,16 @@ def _remote_root_issue(value: object) -> str | None:
         for formal_root in FORMAL_SHELF_ROOTS
     ):
         return "media_root must not be a formal library shelf or its descendant"
-    staging_parent = DEFAULT_DELIVERY_PARENT.rstrip("/")
+    staging_parent = CANONICAL_REPLENISHMENT_STAGING_ROOT
     if normalized == staging_parent or normalized.startswith(staging_parent + "/"):
         return "media_root must not be the provider staging root"
+    try:
+        validate_acceptance_media_root(normalized)
+    except ProviderStagingPathError:
+        return (
+            "media_root must be exactly "
+            "/quark/影视/ScrapeFlow/验收/<safe-run-id>"
+        )
     return None
 
 

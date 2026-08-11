@@ -71,15 +71,30 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 REQUIRED_LOOPBACK_PORTS = {
-    "alist": ["127.0.0.1:5244:5244"],
+    "alist": ["127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"],
     "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"],
     # The Helper is reachable only through the API network namespace.
     "quark-helper": [],
+}
+REQUIRED_SERVICE_IMAGES = {
+    "api": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
+    "quark-helper": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
+}
+REQUIRED_VOLUME_BINDINGS = {
+    "alist": [
+        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data",
+        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp",
+    ],
+    "api": [
+        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data",
+        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow",
+    ],
 }
 REQUIRED_HELPER_ENVIRONMENT = {
     "ALIST_URL": "http://alist:5244",
     "ALIST_USERNAME": "${ALIST_USERNAME:-}",
     "ALIST_PASSWORD": "${ALIST_PASSWORD:-}",
+    "SCRAPEFLOW_MEDIA_ROOT": "${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}",
     "NO_PROXY": "${NO_PROXY:-alist,localhost,127.0.0.1}",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}",
     "SCRAPEFLOW_QUARK_HELPER_CDP_URL": (
@@ -311,6 +326,28 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
     api_block = _service_block(compose_text, "api")
     if not api_block:
         issues.append("docker-compose.yml: missing api service")
+    for service, expected in REQUIRED_SERVICE_IMAGES.items():
+        block = _service_block(compose_text, service)
+        if not block:
+            issues.append(f"docker-compose.yml: missing {service} service")
+            continue
+        actual = _service_scalar(block, "image")
+        if actual != expected:
+            issues.append(
+                f"docker-compose.yml {service}.image must be {expected!r}, got {actual!r}"
+            )
+
+    for service, expected_volumes in REQUIRED_VOLUME_BINDINGS.items():
+        block = _service_block(compose_text, service)
+        if not block:
+            issues.append(f"docker-compose.yml: missing {service} service")
+            continue
+        volumes = _list_block_values(block, "volumes")
+        if volumes != expected_volumes:
+            issues.append(
+                f"docker-compose.yml {service}.volumes must be {expected_volumes!r}, got {volumes!r}"
+            )
+
     api_env = _mapping_block_values(api_block, "environment")
     for key, expected in REQUIRED_COMPOSE_DEFAULTS.items():
         actual = api_env.get(key)
@@ -334,7 +371,7 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
     helper_block = _service_block(compose_text, "quark-helper")
     if helper_block:
         helper_scalars = {
-            "image": "scrapeflow-api:local",
+            "image": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
             "restart": "unless-stopped",
             "network_mode": "service:api",
             "command": REQUIRED_HELPER_COMMAND,
@@ -647,7 +684,7 @@ def run_release_checks(
     for command in release_commands(include_docker=include_docker):
         print("$ " + " ".join(command.args), file=output)
         status_kwargs: dict[str, object] = {}
-        if command.name == "git-worktree-clean":
+        if command.name in {"git-worktree-clean", "docker-compose-config"}:
             status_kwargs = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
@@ -661,7 +698,22 @@ def run_release_checks(
             **status_kwargs,
         )
         if completed.returncode != 0:
+            if command.name == "docker-compose-config":
+                # ``docker compose config`` resolves every interpolation,
+                # including operator credentials.  The surrounding release
+                # evidence runner captures this program's stdout/stderr, so
+                # never relay Compose's diagnostic or resolved configuration
+                # into the durable raw evidence log.
+                print(
+                    "docker compose config failed; resolved configuration output withheld",
+                    file=output,
+                )
             return completed.returncode
+        if command.name == "docker-compose-config":
+            print(
+                "docker compose config passed; resolved configuration output withheld",
+                file=output,
+            )
         if command.name == "git-worktree-clean":
             status = str(completed.stdout or "").strip()
             if status:
