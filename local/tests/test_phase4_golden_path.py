@@ -573,7 +573,10 @@ class Phase4GoldenPathTests(unittest.TestCase):
                 self.assertEqual(record["formal"], [])
                 self.assertEqual(record["source_fate"], "preserved")
                 self.assertEqual(record["writer_calls"], 0)
-                self.assertIn(record["phase"], {"archive_preprocessing", "failed"})
+                if name == "password":
+                    self.assertEqual(record["phase"], "failed_archive")
+                else:
+                    self.assertIn(record["phase"], {"archive_preprocessing", "failed"})
 
 
 if __name__ == "__main__":

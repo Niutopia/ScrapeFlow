@@ -5,6 +5,7 @@ from __future__ import annotations
 from .scrapeflow.core import (
     AListClient,
     ApiError,
+    FormalTargetConflictError,
     PlanError,
     ScraperError,
     TMDBClient,
@@ -42,6 +43,7 @@ __all__ = [
     "ApiError",
     "AutoMatch",
     "EpisodeKey",
+    "FormalTargetConflictError",
     "Plan",
     "PlanError",
     "PlanNotice",

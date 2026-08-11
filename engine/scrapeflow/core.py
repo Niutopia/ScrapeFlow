@@ -46,7 +46,7 @@ from .clients.http import (
     redact_url as _redact_url,
 )
 from .current_plan import load_json_text as _load_json_text
-from .errors import ApiError, PlanError, ScraperError
+from .errors import ApiError, FormalTargetConflictError, PlanError, ScraperError
 from .identity_matching import (
     AUTO_MATCH_MIN_MARGIN,
     _alternative_tmdb_titles,
@@ -10265,7 +10265,9 @@ def validate_plan(
                 ):
                     continue
                 kind = "目录" if entry.get("is_dir") else "文件"
-                raise PlanError(f"目标目录已存在同名{kind}: {current_final_path}")
+                raise FormalTargetConflictError(
+                    f"目标目录已存在同名{kind}: {current_final_path}"
+                )
             if item.media_kind != "video":
                 continue
             for entry in existing_videos_by_companion.get(
@@ -10282,7 +10284,7 @@ def validate_plan(
                 occupying_item = source_items.get(_collision_key(current_path))
                 if occupying_item is not None and occupying_item.requires_rename:
                     continue
-                raise PlanError(
+                raise FormalTargetConflictError(
                     "目标目录已存在同集不同扩展名视频，未完成跨库质量校验，"
                     f"拒绝生成重复版本: {current_path} 与 "
                     f"{join_remote(target_dir, item.final_name)}"
@@ -10327,6 +10329,7 @@ del _core_module
 __all__ = [
     "AListClient",
     "ApiError",
+    "FormalTargetConflictError",
     "PlanError",
     "ScraperError",
     "TMDBClient",

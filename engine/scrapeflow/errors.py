@@ -21,10 +21,19 @@ class PlanError(ScraperError):
     """A generated or loaded operation plan is unsafe or incomplete."""
 
 
+class FormalTargetConflictError(PlanError):
+    """A formal-library destination is occupied by an existing object.
+
+    This is a deterministic remote-state fact: retrying the same plan cannot
+    make the occupied destination safe.  Transport/listing failures and
+    conflicts internal to a proposed plan remain ordinary ``PlanError``
+    instances so their callers can retain the normal retry policy.
+    """
+
+
 class PartialMoveError(ApiError):
     """A remote move only completed for part of the requested names."""
 
     def __init__(self, message: str, moved_names: Sequence[str]) -> None:
         super().__init__(message)
         self.moved_names = list(moved_names)
-

@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
+from engine.scrapeflow.archive import ArchivePasswordError
+from engine.scrapeflow.errors import FormalTargetConflictError
 from engine.scrapeflow.media_quality import (
     is_production_test_media_path,
     is_video_filename,
@@ -3812,7 +3814,7 @@ class SimpleEngineRunner:
                 cancelled = self._consume_cancel_request(archiving)
                 if cancelled is not None:
                     return cancelled
-            except EngineRequestError as exc:
+            except (EngineRequestError, ArchivePasswordError) as exc:
                 summary = dict(archiving.summary)
                 summary.update({
                     "automatic_terminal": True,
@@ -3898,7 +3900,41 @@ class SimpleEngineRunner:
             cancelled = self._consume_cancel_request(planning)
             if cancelled is not None:
                 return cancelled
-            plan = self._build_plan(request)
+            try:
+                plan = self._build_plan(request)
+            except FormalTargetConflictError as exc:
+                summary = dict(planning.summary)
+                summary.update({
+                    "identity": identity.as_dict(),
+                    "automatic": True,
+                    "automatic_stage": "failed_planning",
+                    "target_shelf": selected_shelf.value,
+                    "selected_target_root": selected_root,
+                    "target_work_path": None,
+                    "automatic_terminal": True,
+                    "next_retry_seconds": None,
+                })
+                if isinstance(correction, Mapping):
+                    summary["manual_identity"] = dict(correction)
+                if request.source_path != original_source:
+                    summary["ingress_source_path"] = original_source
+                if archive_projection is not None:
+                    summary["archive_preprocessed"] = dict(archive_projection)
+                summary = self._without_active_operation(summary)
+                failed = replace(
+                    planning,
+                    phase="failed_planning",
+                    updated_at=_now(),
+                    request=asdict(request),
+                    plan={},
+                    summary=summary,
+                    error=redact_error(exc),
+                    execution=None,
+                )
+                atomic_write_json(
+                    self._job_path(job_id), failed.as_dict(), allow_nan=False,
+                )
+                return failed
             cancelled = self._consume_cancel_request(planning)
             if cancelled is not None:
                 return cancelled

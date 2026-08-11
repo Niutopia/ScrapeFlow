@@ -14,9 +14,10 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
+from engine.scrapeflow.archive import ArchivePasswordError, ArchiveToolError
 from engine.scrapeflow.core import build_tv_plan, parse_ep_files, validate_plan
 from engine.scrapeflow.current_plan import finalize_plan, plan_from_dict, plan_to_dict
-from engine.scrapeflow.errors import PlanError
+from engine.scrapeflow.errors import FormalTargetConflictError, PlanError
 from engine.scrapeflow.media_quality import (
     ABSOLUTE_MINIMUM_VIDEO_BYTES,
     is_production_test_media_path,
@@ -135,6 +136,13 @@ class ValidationAList:
     def try_list(self, _path: str, refresh: bool = False) -> list[dict[str, object]]:
         del refresh
         return []
+
+
+class TargetConflictAList(FakeAList):
+    """Expose the same deterministic listings to runner and plan validation."""
+
+    def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        return self.list(path, refresh=refresh)
 
 
 class DelayedRenameAList(FakeAList):
@@ -409,6 +417,17 @@ class OrderedArchivePreprocessor(RecordingArchivePreprocessor):
         return {**request, "source_path": "/task-staging/archive"}
 
 
+class FailingArchivePreprocessor:
+    def __init__(self, error: Exception, events: list[str]) -> None:
+        self.error = error
+        self.events = events
+
+    def prepare_ordinary_request(self, request, **_kwargs):
+        del request
+        self.events.append("archive_preprocess")
+        raise self.error
+
+
 class SimpleEngineRunnerTests(unittest.TestCase):
     def test_movie_plan_quality_dedup_does_not_depend_on_removed_hash_field(self) -> None:
         class MovieTMDB:
@@ -539,6 +558,220 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertNotIn("resolve_identity", events)
         self.assertNotIn("writer", events)
         self.assertEqual(runner._read(queued.id).phase, "archive_preprocessing")
+
+    def test_existing_formal_target_is_terminal_planning_conflict_without_retry(self) -> None:
+        alist = TargetConflictAList()
+        source_root = "/library/待刮削/movie"
+        source = f"{source_root}/source.mkv"
+        target = "/library/电影/Movie (2020)/Movie (2020).mkv"
+        alist.files[source] = FAKE_VIDEO_BYTES
+        alist.files[target] = b"existing formal object"
+        writer_calls: list[str] = []
+
+        def selected_shelf_plan(request: EngineRequest, *_args: object) -> Plan:
+            target_root = f"{request.parent_path.rstrip('/')}/Movie (2020)"
+            return Plan(
+                mode="movie",
+                source_root=source_root,
+                target_root=target_root,
+                files=[PlannedFile(
+                    source_path=source,
+                    source_dir=source_root,
+                    original_name="source.mkv",
+                    final_name="Movie (2020).mkv",
+                    target_dir=target_root,
+                    media_kind="video",
+                    source_size=FAKE_VIDEO_SIZE,
+                )],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 1,
+                    "title": "Movie",
+                    "original_title": "Movie",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=alist,
+            tmdb=object(),
+            planner=selected_shelf_plan,
+            validate=True,
+            executor=lambda _plan: writer_calls.append("writer") or {"ok": True},
+            library_root="/library",
+        )
+        identity = AutomaticIdentity(
+            media_type="movie",
+            tmdb_id=1,
+            title="Movie",
+            year="2020",
+            confidence=0.99,
+            target_parent="/library/电影",
+            season=None,
+            trace={},
+            target_shelf="movie",
+            target_shelf_root="/library/电影",
+        )
+        runner.resolve_automatic_request = lambda _source, **_kwargs: (  # type: ignore[method-assign]
+            replace(
+                self.request,
+                source_path=source_root,
+                parent_path="/library/电影",
+                target_shelf="movie",
+            ),
+            identity,
+        )
+        waiting = runner.create_automatic_job(
+            source_root, job_id="auto-existing-formal-target",
+        )
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+
+        failed = runner.plan_automatic_job(queued.id)
+
+        self.assertEqual(failed.phase, "failed_planning")
+        self.assertTrue(failed.summary["automatic_terminal"])
+        self.assertEqual(failed.summary["automatic_stage"], "failed_planning")
+        self.assertEqual(failed.summary["automatic_attempts"], 0)
+        self.assertIsNone(failed.summary["next_retry_seconds"])
+        self.assertEqual(failed.plan, {})
+        self.assertIsNone(failed.execution)
+        self.assertNotIn("active_operation", failed.summary)
+        self.assertIn("目标目录已存在同名文件", failed.error or "")
+        self.assertEqual(writer_calls, [])
+        self.assertIn(source, alist.files)
+        self.assertEqual(alist.files[target], b"existing formal object")
+        self.assertEqual(alist.moves, [])
+
+    def test_non_target_planning_error_remains_retryable(self) -> None:
+        alist = TargetConflictAList()
+        alist.files["/incoming/movie/source.mkv"] = FAKE_VIDEO_BYTES
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=True,
+        )
+        identity = AutomaticIdentity(
+            media_type="movie",
+            tmdb_id=1,
+            title="Movie",
+            year="2020",
+            confidence=0.99,
+            target_parent="/quark/影视/电影",
+            season=None,
+            trace={},
+            target_shelf="movie",
+            target_shelf_root="/quark/影视/电影",
+        )
+        runner.resolve_automatic_request = lambda _source, **_kwargs: (  # type: ignore[method-assign]
+            replace(
+                self.request,
+                parent_path="/quark/影视/电影",
+                target_shelf="movie",
+            ),
+            identity,
+        )
+        waiting = runner.create_automatic_job(
+            "/incoming/movie", job_id="auto-retryable-planning-error",
+        )
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+
+        with patch(
+            "engine.scraper.validate_plan",
+            side_effect=PlanError("目标目录暂时无法读取"),
+        ), self.assertRaisesRegex(PlanError, "暂时无法读取"):
+            runner.plan_automatic_job(queued.id)
+
+        retryable = runner.get_job(queued.id)
+        self.assertEqual(retryable.phase, "planning")
+        self.assertFalse(retryable.summary["automatic_terminal"])
+        self.assertEqual(retryable.summary["automatic_attempts"], 0)
+        self.assertEqual(retryable.plan, {})
+        self.assertIsNone(retryable.execution)
+
+    def test_validate_plan_uses_typed_error_only_for_existing_formal_target(self) -> None:
+        alist = TargetConflictAList()
+        plan = fake_plan(self.request, alist, object())
+        alist.files["/incoming/movie/source.mkv"] = FAKE_VIDEO_BYTES
+        alist.files["/library/Movie (2020)/Movie (2020).mkv"] = b"existing"
+
+        with self.assertRaises(FormalTargetConflictError):
+            validate_plan(alist, plan)
+
+    def test_wrong_archive_password_is_immediately_terminal_and_preserves_source(self) -> None:
+        events: list[str] = []
+        source_file = "/incoming/archive/payload.7z"
+        self.alist.files[source_file] = b"7z\xbc\xaf'\x1c"
+
+        def planner(*_args):
+            events.append("planning")
+            return fake_plan(self.request, self.alist, object())
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=planner,
+            validate=False,
+            executor=lambda _plan: events.append("writer") or {"ok": True},
+            archive_preprocessor=FailingArchivePreprocessor(
+                ArchivePasswordError(
+                    "archive extraction failed; password candidates exhausted"
+                ),
+                events,
+            ),
+        )
+        waiting = runner.create_automatic_job(
+            "/incoming/archive", job_id="auto-archive-wrong-password"
+        )
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+
+        with patch("engine.scraper.auto_match_tmdb") as identity, self.assertRaises(
+            ArchivePasswordError
+        ):
+            runner.plan_automatic_job(queued.id, retry_password="wrong")
+
+        failed = runner.get_job(queued.id)
+        self.assertEqual(failed.phase, "failed_archive")
+        self.assertTrue(failed.summary["automatic_terminal"])
+        self.assertEqual(failed.summary["automatic_stage"], "failed_archive")
+        self.assertEqual(failed.summary["automatic_attempts"], 0)
+        self.assertEqual(events, ["archive_preprocess"])
+        identity.assert_not_called()
+        self.assertIn(source_file, self.alist.files)
+
+    def test_archive_tool_failure_remains_retryable_at_scheduler_boundary(self) -> None:
+        events: list[str] = []
+        source_file = "/incoming/archive/payload.7z"
+        self.alist.files[source_file] = b"7z\xbc\xaf'\x1c"
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: events.append("writer") or {"ok": True},
+            archive_preprocessor=FailingArchivePreprocessor(
+                ArchiveToolError("7-Zip executable is unavailable"), events
+            ),
+        )
+        waiting = runner.create_automatic_job(
+            "/incoming/archive", job_id="auto-archive-tool-unavailable"
+        )
+        queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
+
+        with self.assertRaises(ArchiveToolError):
+            runner.plan_automatic_job(queued.id)
+
+        retryable = runner.get_job(queued.id)
+        self.assertEqual(retryable.phase, "archive_preprocessing")
+        self.assertIsNot(retryable.summary.get("automatic_terminal"), True)
+        self.assertEqual(events, ["archive_preprocess"])
+        self.assertIn(source_file, self.alist.files)
 
     def test_successful_archive_source_is_moved_to_task_owned_processed_area(self) -> None:
         alist = ArchiveLifecycleAList()
