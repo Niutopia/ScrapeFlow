@@ -103,10 +103,17 @@ GET  /api/browse?path=...
 - 从干净 commit 生成完整发布原始证据：
   `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release`。
   本机验收包草稿可用 `python3 scripts/scrapeflow_acceptance_package.py --output /tmp/scrapeflow-acceptance-package.md --release-evidence artifacts/release/scrapeflow-release-evidence.json`
-  生成；已有隔离声明和启动核对报告时可追加 `--preflight-declaration declaration.json`
-  与 `--runtime-readiness-report readiness.json`。真实样本仍必须在独立环境中手工补证。
+  生成；启动后应追加 `--preflight-report preflight-report.json`
+  与 `--runtime-readiness-report readiness.json`。如同时提供
+  `--preflight-declaration declaration.json`，验收包会要求它与报告内固化的声明完全一致。
+  只提供 `--preflight-declaration` 是兼容模式，会对当前目录执行 live recheck。
+  真实样本仍必须在独立环境中手工补证。
 - 隔离环境声明可用 `python3 scripts/scrapeflow_isolated_preflight.py --template` 生成模板，
-  再用 `python3 scripts/scrapeflow_isolated_preflight.py declaration.json` 做阶段 10 前置检查。
+  并在独立 runtime 首次启动前执行
+  `python3 scripts/scrapeflow_isolated_preflight.py declaration.json --report preflight-report.json`。
+  该报告原子固化当时的空目录检查；启动后目录非空不会把已固化的通过误判为失败。
+  报告属于本机 self-attested evidence：验收包会校验目录身份、备份 manifest
+  完整性并记录报告 SHA-512，但它不是外部签名或密码学不可伪造证明。
 - 隔离 API 启动后的只读核对可用
   `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:8765 --expected-commit <git-commit>`。
 

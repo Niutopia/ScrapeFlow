@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+from io import StringIO
 import json
 import tempfile
 import unittest
@@ -20,6 +22,8 @@ from local.scrapeflow_api.acceptance_package import (
     runtime_readiness_evidence,
 )
 from local.scrapeflow_api.offline_backup import MANIFEST_NAME, create_offline_backup
+from local.scrapeflow_api.isolated_preflight import capture_isolated_preflight_report
+from scripts.scrapeflow_acceptance_package import main as acceptance_package_main
 
 
 ENV_TEMPLATE_DEFAULTS = {
@@ -384,6 +388,194 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("provider_workers must be 1", package)
         self.assertIn("formal library shelf", package)
         self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
+
+    def test_package_uses_captured_pass_after_runtime_directories_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            write_contract_files(repo)
+            declaration = valid_isolated_declaration(root)
+            report = capture_isolated_preflight_report(
+                declaration,
+                root=repo,
+                checked_at=datetime(2026, 8, 11, 2, 3, tzinfo=UTC),
+            )
+            Path(str(declaration["scrapeflow_state_dir"])).joinpath(
+                "runtime-state.json"
+            ).write_text("{}", encoding="utf-8")
+            Path(str(declaration["alist_data_dir"])).joinpath(
+                "data.db"
+            ).write_bytes(b"runtime")
+
+            evidence = isolated_preflight_evidence(
+                declaration,
+                report=report,
+                root=repo,
+            )
+            package = build_acceptance_package(
+                root=repo,
+                generated_at=datetime(2026, 8, 11, 3, 0, tzinfo=UTC),
+                isolated_declaration=declaration,
+                isolated_preflight_report=report,
+                runner=fake_runner,
+            )
+
+        self.assertEqual(evidence["status"], "通过")
+        self.assertEqual(evidence["mode"], "captured_report")
+        self.assertEqual(evidence["issues"], [])
+        self.assertIn("- 隔离 preflight: 通过", package)
+        self.assertIn("- Preflight 证据模式: captured_report", package)
+        self.assertIn("- Preflight 固化时间: 2026-08-11T02:03:00+00:00", package)
+        self.assertIn("| audit_repair | False |", package)
+
+    def test_package_rejects_failed_malformed_and_mismatched_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            declaration = valid_isolated_declaration(root)
+            passed = capture_isolated_preflight_report(declaration, root=repo)
+
+            failed_declaration = dict(declaration)
+            failed_declaration["provider_workers"] = 2
+            failed = capture_isolated_preflight_report(failed_declaration, root=repo)
+            malformed = dict(passed)
+            malformed["status"] = "trusted"
+            mismatched = dict(declaration)
+            mismatched["storage_label"] = "different-storage"
+
+            failed_evidence = isolated_preflight_evidence(
+                None,
+                report=failed,
+                root=repo,
+            )
+            malformed_evidence = isolated_preflight_evidence(
+                None,
+                report=malformed,
+                root=repo,
+            )
+            mismatch_evidence = isolated_preflight_evidence(
+                mismatched,
+                report=passed,
+                root=repo,
+            )
+
+        for evidence in (failed_evidence, malformed_evidence, mismatch_evidence):
+            self.assertEqual(evidence["status"], "拒绝")
+            self.assertTrue(evidence["issues"])
+
+    def test_cli_reads_captured_report_and_rejects_declaration_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            declaration = valid_isolated_declaration(root)
+            report = capture_isolated_preflight_report(declaration)
+            report_path = root / "preflight-report.json"
+            failed_report_path = root / "failed-preflight-report.json"
+            malformed_report_path = root / "malformed-preflight-report.json"
+            declaration_path = root / "declaration.json"
+            drifted_path = root / "drifted-declaration.json"
+            output_path = root / "acceptance.md"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            failed_declaration = dict(declaration)
+            failed_declaration["provider_workers"] = 2
+            failed_report_path.write_text(
+                json.dumps(capture_isolated_preflight_report(failed_declaration)),
+                encoding="utf-8",
+            )
+            malformed_report = dict(report)
+            malformed_report["status"] = "trusted"
+            malformed_report_path.write_text(
+                json.dumps(malformed_report),
+                encoding="utf-8",
+            )
+            declaration_path.write_text(json.dumps(declaration), encoding="utf-8")
+            drifted = dict(declaration)
+            drifted["storage_label"] = "different-storage"
+            drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
+            Path(str(declaration["scrapeflow_state_dir"])).joinpath(
+                "runtime-state.json"
+            ).write_text("{}", encoding="utf-8")
+            Path(str(declaration["alist_data_dir"])).joinpath(
+                "data.db"
+            ).write_bytes(b"runtime")
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                accepted = acceptance_package_main([
+                    "--preflight-report",
+                    str(report_path),
+                    "--preflight-declaration",
+                    str(declaration_path),
+                    "--output",
+                    str(output_path),
+                ])
+            output = output_path.read_text(encoding="utf-8")
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                rejected = acceptance_package_main([
+                    "--preflight-report",
+                    str(report_path),
+                    "--preflight-declaration",
+                    str(drifted_path),
+                    "--output",
+                    str(root / "rejected.md"),
+                ])
+            rejected_reports: list[int] = []
+            for invalid_path in (failed_report_path, malformed_report_path):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    rejected_reports.append(acceptance_package_main([
+                        "--preflight-report",
+                        str(invalid_path),
+                        "--output",
+                        str(root / f"{invalid_path.stem}.md"),
+                    ]))
+
+        self.assertEqual(accepted, 0)
+        self.assertIn("- 隔离 preflight: 通过", output)
+        self.assertIn("- Preflight 证据模式: captured_report", output)
+        self.assertIn(f"- Preflight 报告路径: {report_path.resolve()}", output)
+        self.assertRegex(output, r"- Preflight 报告 SHA-512: [0-9a-f]{128}")
+        self.assertEqual(rejected, 2)
+        self.assertEqual(rejected_reports, [2, 2])
+
+    def test_cli_refuses_output_collision_and_captured_recovery_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            declaration = valid_isolated_declaration(root)
+            report = capture_isolated_preflight_report(declaration)
+            report_path = root / "preflight-report.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            manifest = Path(str(declaration["offline_backup_manifest"]))
+            report_before = report_path.read_bytes()
+            manifest_before = manifest.read_bytes()
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                report_collision = acceptance_package_main([
+                    "--preflight-report", str(report_path),
+                    "--output", str(report_path),
+                ])
+                manifest_collision = acceptance_package_main([
+                    "--preflight-report", str(report_path),
+                    "--output", str(manifest),
+                ])
+                backup_drift = acceptance_package_main([
+                    "--preflight-report", str(report_path),
+                    "--backup-manifest", str(root / "different-manifest.json"),
+                    "--output", str(root / "drift.md"),
+                ])
+                media_drift = acceptance_package_main([
+                    "--preflight-report", str(report_path),
+                    "--media-recovery-point", "different:recovery",
+                    "--output", str(root / "media-drift.md"),
+                ])
+            report_after = report_path.read_bytes()
+            manifest_after = manifest.read_bytes()
+
+        self.assertEqual(
+            (report_collision, manifest_collision, backup_drift, media_drift),
+            (2, 2, 2, 2),
+        )
+        self.assertEqual(report_after, report_before)
+        self.assertEqual(manifest_after, manifest_before)
 
     def test_runtime_readiness_evidence_reports_valid_summary(self) -> None:
         evidence = runtime_readiness_evidence(valid_runtime_readiness_report())

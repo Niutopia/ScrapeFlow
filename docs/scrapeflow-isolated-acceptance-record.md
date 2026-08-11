@@ -22,7 +22,11 @@
 ## 预检查
 
 - [ ] 从干净 commit 运行 `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release` 通过，并归档 JSON 与原始日志。
-- [ ] `python3 scripts/scrapeflow_isolated_preflight.py declaration.json` 通过。
+- [ ] 在 runtime 首次启动前执行
+  `python3 scripts/scrapeflow_isolated_preflight.py declaration.json --report preflight-report.json`
+  通过，并归档报告。验收包使用 `--preflight-report preflight-report.json`
+  读取该固化结果，不在启动后重跑“目录必须为空”的瞬时检查。
+  记录报告路径与 SHA-512；该报告是本机 self-attested evidence，不宣称具备外部签名。
 - [ ] 离线备份 `verify` 通过。
 - [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。
 - [ ] `/api/health` 显示预期 commit 或 build version。

@@ -5,12 +5,16 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 
-from .isolated_preflight import isolated_preflight_issues
+from .isolated_preflight import (
+    isolated_preflight_issues,
+    validate_isolated_preflight_report,
+)
 from .release_checks import local_deployment_contract_issues, project_root
 
 
@@ -152,17 +156,127 @@ def compose_evidence(root: Path | None = None, runner: CommandRunner = _run_comm
 
 
 def isolated_preflight_evidence(
-    declaration: Mapping[str, object] | None,
+    declaration: Mapping[str, object] | None = None,
     *,
+    report: Mapping[str, object] | None = None,
+    report_path: Path | None = None,
     root: Path | None = None,
 ) -> dict[str, object]:
-    """Return status and safe summary fields from a stage-10 declaration."""
+    """Return stage-10 evidence without confusing captured and live checks.
+
+    A supplied report is the preferred path after startup: it is validated
+    against its embedded declaration and its captured pass is not invalidated
+    merely because the runtime directories are now populated.  Supplying only
+    the legacy declaration intentionally performs a live recheck for backwards
+    compatibility.
+    """
+    if report is not None:
+        try:
+            captured = validate_isolated_preflight_report(
+                report,
+                expected_declaration=declaration,
+                root=root,
+                require_passed=True,
+            )
+            captured_path, captured_digest = _captured_preflight_report_source(
+                report,
+                report_path,
+            )
+        except ValueError as exc:
+            return {
+                "status": "拒绝",
+                "mode": "captured_report",
+                "checked_at": "",
+                "issues": [str(exc)],
+                "summary": {},
+                "report_path": "",
+                "report_sha512": "",
+            }
+        captured_declaration = captured["declaration"]
+        payload = dict(captured_declaration)
+        summary = _isolated_preflight_summary(payload)
+        return {
+            "status": "通过",
+            "mode": "captured_report",
+            "checked_at": captured["checked_at"],
+            "issues": [],
+            "summary": summary,
+            "report_path": captured_path,
+            "report_sha512": captured_digest,
+        }
+    if report_path is not None:
+        return {
+            "status": "拒绝",
+            "mode": "captured_report",
+            "checked_at": "",
+            "issues": ["preflight report path was provided without a report"],
+            "summary": {},
+            "report_path": "",
+            "report_sha512": "",
+        }
     if declaration is None:
-        return {"status": "未提供", "issues": [], "summary": {}}
+        return {
+            "status": "未提供", "mode": "none", "checked_at": "", "issues": [],
+            "summary": {}, "report_path": "", "report_sha512": "",
+        }
     base = project_root() if root is None else Path(root)
     payload = dict(declaration)
     issues = isolated_preflight_issues(payload, root=base)
-    summary_keys = (
+    return {
+        "status": "通过" if not issues else "失败",
+        "mode": "live_recheck",
+        "checked_at": "",
+        "issues": issues,
+        "summary": _isolated_preflight_summary(payload),
+        "report_path": "",
+        "report_sha512": "",
+    }
+
+
+def _captured_preflight_report_source(
+    report: Mapping[str, object],
+    report_path: Path | None,
+) -> tuple[str, str]:
+    if report_path is None:
+        return "", ""
+    raw_path = Path(report_path).expanduser()
+    if raw_path.is_symlink():
+        raise ValueError("preflight report path must not be a symlink")
+    try:
+        resolved = raw_path.resolve(strict=True)
+        raw = resolved.read_bytes()
+        loaded = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"preflight report source is unreadable: {exc}") from exc
+    if not resolved.is_file() or not isinstance(loaded, dict):
+        raise ValueError("preflight report source must be one JSON object")
+    if loaded != dict(report):
+        raise ValueError("preflight report source no longer matches the loaded report")
+    declaration = report.get("declaration")
+    if isinstance(declaration, Mapping):
+        protected_roots: list[Path] = []
+        for key in ("scrapeflow_state_dir", "alist_data_dir"):
+            value = declaration.get(key)
+            if isinstance(value, str) and value.strip():
+                protected_roots.append(Path(value).expanduser().resolve(strict=False))
+        manifest = declaration.get("offline_backup_manifest")
+        if isinstance(manifest, str) and manifest.strip():
+            protected_roots.append(Path(manifest).expanduser().resolve(strict=False).parent)
+        for protected in protected_roots:
+            try:
+                resolved.relative_to(protected)
+            except ValueError:
+                continue
+            raise ValueError("preflight report source is inside a protected runtime or backup root")
+    return str(resolved), hashlib.sha512(raw).hexdigest()
+
+
+def _isolated_preflight_summary(
+    payload: Mapping[str, object],
+    *,
+    keys: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    summary_keys = keys or (
         "api_url",
         "alist_url",
         "scrapeflow_state_dir",
@@ -175,20 +289,24 @@ def isolated_preflight_evidence(
         "start_paused",
         "intake_monitor",
         "automatic_audit",
+        "audit_repair",
         "provider_auto_repair",
         "one_task_at_a_time",
         "old_backlog_restored",
         "bulk_retry",
         "bulk_cleanup",
     )
-    return {
-        "status": "通过" if not issues else "失败",
-        "issues": issues,
-        "summary": {
-            key: payload.get(key, "")
-            for key in summary_keys
-        },
-    }
+    return {key: payload.get(key, "") for key in summary_keys}
+
+
+def _preflight_mode_label(mode: object) -> str:
+    if mode == "captured_report":
+        return "captured_report（已固化，不重跑启动前空目录检查）"
+    if mode == "live_recheck":
+        return "live_recheck（兼容模式，重跑当前目录检查）"
+    if mode == "none":
+        return "未提供"
+    return str(mode or "unknown")
 
 
 def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str, object]:
@@ -374,6 +492,8 @@ def build_acceptance_package(
     release_evidence: Mapping[str, object] | None = None,
     release_evidence_path: Path | None = None,
     isolated_declaration: Mapping[str, object] | None = None,
+    isolated_preflight_report: Mapping[str, object] | None = None,
+    isolated_preflight_report_path: Path | None = None,
     runtime_readiness: Mapping[str, object] | None = None,
     runner: CommandRunner = _run_command,
 ) -> str:
@@ -390,14 +510,28 @@ def build_acceptance_package(
     )
     if release["status"] != "未提供":
         release_check_status = str(release["status"])
-    preflight = isolated_preflight_evidence(isolated_declaration, root=base)
+    preflight = isolated_preflight_evidence(
+        isolated_declaration,
+        report=isolated_preflight_report,
+        report_path=isolated_preflight_report_path,
+        root=base,
+    )
     readiness = runtime_readiness_evidence(runtime_readiness)
     preflight_summary = preflight["summary"]
+    preflight_mode = _preflight_mode_label(preflight.get("mode"))
     if isinstance(preflight_summary, Mapping):
-        backup_manifest = backup_manifest or str(preflight_summary.get("offline_backup_manifest") or "")
-        media_recovery_point = (
-            media_recovery_point or str(preflight_summary.get("media_recovery_point") or "")
-        )
+        captured_backup = str(preflight_summary.get("offline_backup_manifest") or "")
+        captured_media = str(preflight_summary.get("media_recovery_point") or "")
+        if isolated_preflight_report is not None:
+            if backup_manifest and captured_backup and backup_manifest != captured_backup:
+                raise ValueError("backup manifest conflicts with the captured preflight report")
+            if media_recovery_point and captured_media and media_recovery_point != captured_media:
+                raise ValueError("media recovery point conflicts with the captured preflight report")
+            backup_manifest = captured_backup
+            media_recovery_point = captured_media
+        else:
+            backup_manifest = backup_manifest or captured_backup
+            media_recovery_point = media_recovery_point or captured_media
 
     lines = [
         "# ScrapeFlow 验收包草稿",
@@ -417,6 +551,10 @@ def build_acceptance_package(
         f"- 发布证据: {release['status']}",
         f"- 静态部署合同: {static_status}",
         f"- 隔离 preflight: {preflight['status']}",
+        f"- Preflight 证据模式: {preflight_mode}",
+        f"- Preflight 固化时间: {preflight.get('checked_at') or '未提供'}",
+        f"- Preflight 报告路径: {preflight.get('report_path') or '未提供'}",
+        f"- Preflight 报告 SHA-512: {preflight.get('report_sha512') or '未提供'}",
         f"- Runtime readiness: {readiness['status']}",
         f"- 离线备份 manifest: {backup_manifest or '未提供'}",
         f"- 正式媒体库外部恢复点: {media_recovery_point or '未提供'}",
@@ -475,12 +613,19 @@ def build_acceptance_package(
         lines.extend([
             "- 状态: 未提供",
             "- 生成模板: `python3 scripts/scrapeflow_isolated_preflight.py --template`",
-            "- 校验命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`",
+            "- 首次 live 检查并固化: "
+            "`python3 scripts/scrapeflow_isolated_preflight.py declaration.json "
+            "--report preflight-report.json`",
+            "- 兼容 live 重检: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`",
             "",
         ])
     elif isinstance(preflight_summary, Mapping):
         lines.extend([
             f"- 状态: {preflight['status']}",
+            f"- 证据模式: {preflight_mode}",
+            f"- 固化时间: {preflight.get('checked_at') or '未提供'}",
+            f"- 报告路径: {preflight.get('report_path') or '未提供'}",
+            f"- 报告 SHA-512: {preflight.get('report_sha512') or '未提供'}",
             "",
             "| 字段 | 值 |",
             "| --- | --- |",
@@ -523,7 +668,10 @@ def build_acceptance_package(
         "",
         f"- [ ] 发布检查通过，命令: `python3 scripts/scrapeflow_release_evidence.py --output-dir artifacts/release`，当前记录: {release_check_status}",
         f"- [ ] 发布检查原始日志已归档，当前记录: {release['status']}",
-        f"- [ ] 隔离 preflight 通过，命令: `python3 scripts/scrapeflow_isolated_preflight.py declaration.json`，当前记录: {preflight['status']}",
+        "- [ ] 隔离 preflight 通过，首次命令: "
+        "`python3 scripts/scrapeflow_isolated_preflight.py declaration.json "
+        f"--report preflight-report.json`，当前记录: {preflight['status']} "
+        f"({preflight_mode})",
         f"- [ ] Runtime readiness 通过，命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`，当前记录: {readiness['status']}",
         "- [ ] 离线备份 `verify` 通过。",
         "- [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。",
