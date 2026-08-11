@@ -1,4 +1,4 @@
-"""Tests for the redacted host-side Quark Helper health projection."""
+"""Tests for the redacted loopback-sidecar Quark Helper projection."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class QuarkHelperReadinessTests(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", str(report))
         self.assertNotIn("host.docker.internal:18765", str(report))
 
-    def test_token_only_configuration_uses_historical_default(self) -> None:
+    def test_token_only_configuration_uses_loopback_sidecar_default(self) -> None:
         calls: list[tuple[str, str, float]] = []
 
         def factory(url: str, token: str, timeout: float):
@@ -73,12 +73,43 @@ class QuarkHelperReadinessTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [(
-                "http://host.docker.internal:18765",
+                "http://127.0.0.1:18765",
                 "abcdefghijklmnopqrstuvwxyz012345",
                 3.0,
             )],
         )
-        self.assertNotIn("host.docker.internal:18765", str(report))
+        self.assertNotIn("127.0.0.1:18765", str(report))
+
+    def test_short_token_is_invalid_and_never_builds_a_client(self) -> None:
+        factory_called = False
+
+        def forbidden_factory(_url: str, _token: str, _timeout: float):
+            nonlocal factory_called
+            factory_called = True
+            raise AssertionError("short token must stop before health")
+
+        report = quark_helper_readiness_from_env(
+            {"SCRAPEFLOW_QUARK_HELPER_TOKEN": "too-short"},
+            client_factory=forbidden_factory,
+        )
+
+        self.assertEqual(report["status"], "invalid_configuration")
+        self.assertTrue(report["configured"])
+        self.assertTrue(report["token_configured"])
+        self.assertFalse(report["reachable"])
+        self.assertFalse(factory_called)
+        self.assertNotIn("too-short", str(report))
+
+    def test_explicit_external_url_is_rejected_and_redacted(self) -> None:
+        report = quark_helper_readiness_from_env({
+            "SCRAPEFLOW_QUARK_HELPER_URL": "http://example.com:18765",
+            "SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz012345",
+        })
+
+        self.assertEqual(report["status"], "invalid_configuration")
+        self.assertFalse(report["reachable"])
+        self.assertNotIn("example.com", str(report))
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", str(report))
 
     def test_ready_requires_authenticated_exact_fixed_actions(self) -> None:
         report = quark_helper_readiness_from_env(

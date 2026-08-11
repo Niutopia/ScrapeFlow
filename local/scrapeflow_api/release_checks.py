@@ -18,10 +18,10 @@ REQUIRED_ENV_TEMPLATE_VALUES = {
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_WORKERS": "1",
-    # Keep the historical host-side endpoint in the copied template.  The
-    # blank token, rather than an invented URL, keeps Compose fail-closed when
-    # a user has not supplied `.env.local`.
-    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+    # The typed sidecar shares the API network namespace and listens only on
+    # that namespace's loopback.  The blank token, rather than an invented
+    # credential, keeps Compose fail-closed without `.env.local`.
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
         "replace-with-a-random-helper-token-at-least-24-characters"
     ),
@@ -47,7 +47,7 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
     "SCRAPEFLOW_PANSOU_URL": "",
@@ -61,7 +61,22 @@ REQUIRED_COMPOSE_DEFAULTS = {
 REQUIRED_LOOPBACK_PORTS = {
     "alist": ["127.0.0.1:5244:5244"],
     "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"],
+    # The Helper is reachable only through the API network namespace.
+    "quark-helper": [],
 }
+REQUIRED_HELPER_ENVIRONMENT = {
+    "SCRAPEFLOW_QUARK_HELPER_TOKEN": "${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}",
+    "SCRAPEFLOW_QUARK_HELPER_CDP_URL": (
+        "http://host.docker.internal:19222/json/list"
+    ),
+}
+REQUIRED_HELPER_COMMAND = (
+    '["python3", "scripts/scrapeflow_quark_helper.py", "--docker-sidecar"]'
+)
+FORBIDDEN_HELPER_DEPLOYMENT_MARKERS = (
+    "scrapeflow_quark_helper.py --install-launch-agent",
+    "com.scrapeflow.quark-native-helper",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,12 +191,98 @@ def _list_block_values(block: list[str], header: str) -> list[str]:
     return values
 
 
+def _service_scalar(block: list[str], key: str) -> str | None:
+    """Return one scalar declared directly below a Compose service."""
+
+    marker = f"{key}:"
+    for line in block:
+        if len(line) - len(line.lstrip()) != 4:
+            continue
+        stripped = line.strip()
+        if stripped == marker:
+            return ""
+        if stripped.startswith(marker):
+            return _strip_scalar(stripped[len(marker):])
+    return None
+
+
+def _dependency_conditions(block: list[str]) -> dict[str, str]:
+    """Return long-form Compose dependency conditions for one service."""
+
+    output: dict[str, str] = {}
+    start: int | None = None
+    for index, line in enumerate(block):
+        if len(line) - len(line.lstrip()) == 4 and line.strip() == "depends_on:":
+            start = index + 1
+            break
+    if start is None:
+        return output
+    dependency: str | None = None
+    for line in block[start:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 4:
+            break
+        stripped = line.strip()
+        if indent == 6 and stripped.endswith(":"):
+            dependency = stripped[:-1]
+            output[dependency] = ""
+        elif indent == 8 and dependency is not None and stripped.startswith("condition:"):
+            output[dependency] = _strip_scalar(stripped.split(":", 1)[1])
+    return output
+
+
+def _dependency_restart_flags(block: list[str]) -> dict[str, str]:
+    """Return explicit Compose restart coupling for service dependencies."""
+
+    output: dict[str, str] = {}
+    start: int | None = None
+    for index, line in enumerate(block):
+        if len(line) - len(line.lstrip()) == 4 and line.strip() == "depends_on:":
+            start = index + 1
+            break
+    if start is None:
+        return output
+    dependency: str | None = None
+    for line in block[start:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 4:
+            break
+        stripped = line.strip()
+        if indent == 6 and stripped.endswith(":"):
+            dependency = stripped[:-1]
+        elif (
+            indent == 8
+            and dependency is not None
+            and stripped.startswith("restart:")
+        ):
+            output[dependency] = _strip_scalar(stripped.split(":", 1)[1])
+    return output
+
+
 def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
     """Return static release/deployment default drift from the frozen contract."""
     base = project_root() if root is None else Path(root)
     issues: list[str] = []
     env_text = _read_project_text(base, ".env.local.example", issues)
     compose_text = _read_project_text(base, "docker-compose.yml", issues)
+    dockerfile_text = _read_project_text(base, "Dockerfile.api", issues)
+    helper_requirements = _read_project_text(
+        base, "requirements.quark-helper.txt", issues,
+    )
+    readme_text = _read_project_text(base, "README.md", issues)
+    deployment_text = _read_project_text(
+        base, "docs/scrapeflow-deployment-open-order.md", issues,
+    )
+    helper_cli_text = _read_project_text(
+        base, "scripts/scrapeflow_quark_helper.py", issues,
+    )
+    lifecycle_cli_text = _read_project_text(
+        base, "scripts/scrapeflow_quark_lifecycle.py", issues,
+    )
 
     env_values = _env_values(env_text)
     for key, expected in REQUIRED_ENV_TEMPLATE_VALUES.items():
@@ -213,6 +314,134 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
             issues.append(
                 f"docker-compose.yml {service}.ports must be {expected_ports!r}, got {ports!r}"
             )
+
+    helper_block = _service_block(compose_text, "quark-helper")
+    if helper_block:
+        helper_scalars = {
+            "image": "scrapeflow-api:local",
+            "restart": "unless-stopped",
+            "network_mode": "service:api",
+            "command": REQUIRED_HELPER_COMMAND,
+        }
+        for key, expected in helper_scalars.items():
+            actual = _service_scalar(helper_block, key)
+            if actual != expected:
+                issues.append(
+                    f"docker-compose.yml quark-helper.{key} must be "
+                    f"{expected!r}, got {actual!r}"
+                )
+        helper_env = _mapping_block_values(helper_block, "environment")
+        for key, expected in REQUIRED_HELPER_ENVIRONMENT.items():
+            actual = helper_env.get(key)
+            if actual != expected:
+                issues.append(
+                    f"docker-compose.yml quark-helper.environment: {key} must be "
+                    f"{expected!r}, got {actual!r}"
+                )
+        dependencies = _dependency_conditions(helper_block)
+        if dependencies != {"api": "service_started"}:
+            issues.append(
+                "docker-compose.yml quark-helper.depends_on must be "
+                "{'api': 'service_started'}"
+            )
+        restart_flags = _dependency_restart_flags(helper_block)
+        if restart_flags != {"api": "true"}:
+            issues.append(
+                "docker-compose.yml quark-helper.depends_on.api.restart must be true"
+            )
+        extra_hosts = _list_block_values(helper_block, "extra_hosts")
+        if extra_hosts:
+            issues.append(
+                "docker-compose.yml quark-helper must not declare extra_hosts "
+                "while sharing the API network namespace"
+            )
+
+    if "quark-helper" in _dependency_conditions(api_block):
+        issues.append(
+            "docker-compose.yml api must not wait for Quark Helper readiness"
+        )
+
+    required_image_snippets = (
+        "COPY requirements.quark-helper.txt ./requirements.quark-helper.txt",
+        "python3 -m pip install --requirement requirements.quark-helper.txt",
+        (
+            "COPY scripts/scrapeflow_quark_helper.py "
+            "./scripts/scrapeflow_quark_helper.py"
+        ),
+    )
+    for snippet in required_image_snippets:
+        if snippet not in dockerfile_text:
+            issues.append(f"Dockerfile.api must include {snippet!r}")
+    allowed_scripts_copy = (
+        "COPY scripts/scrapeflow_quark_helper.py "
+        "./scripts/scrapeflow_quark_helper.py"
+    )
+    for line in dockerfile_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("COPY scripts") and stripped != allowed_scripts_copy:
+            issues.append(
+                "Dockerfile.api must copy only the passive Quark Helper CLI, "
+                f"got {stripped!r}"
+            )
+    if "scrapeflow_quark_lifecycle.py" in dockerfile_text:
+        issues.append("Dockerfile.api must not contain the macOS Quark lifecycle CLI")
+    if not any(
+        line.strip().startswith("aiohttp")
+        for line in helper_requirements.splitlines()
+    ):
+        issues.append("requirements.quark-helper.txt must install aiohttp")
+
+    lifecycle_markers = (
+        'LAUNCH_AGENT_LABEL = "com.scrapeflow.quark-cdp"',
+        '"--remote-debugging-address=127.0.0.1"',
+        '"--remote-debugging-port=19222"',
+        '"LimitLoadToSessionType": "Aqua"',
+        '"ProcessType": "Interactive"',
+        '"KeepAlive": {"SuccessfulExit": False}',
+        'actions.add_argument("--start"',
+        'actions.add_argument("--restart"',
+        '"--force-restart"',
+    )
+    for marker in lifecycle_markers:
+        if marker not in lifecycle_cli_text:
+            issues.append(
+                "scripts/scrapeflow_quark_lifecycle.py must retain "
+                f"{marker!r}"
+            )
+    if "forceTerminate" in lifecycle_cli_text:
+        issues.append(
+            "scripts/scrapeflow_quark_lifecycle.py must not force-terminate "
+            "Quark from its normal lifecycle path"
+        )
+    for marker in ("launchctl", "osascript", "QuarkCloudDrive"):
+        if marker in helper_cli_text:
+            issues.append(
+                "scripts/scrapeflow_quark_helper.py must remain passive and "
+                f"must not contain {marker!r}"
+            )
+    lifecycle_command = (
+        "python3 scripts/scrapeflow_quark_lifecycle.py "
+        "--install-launch-agent --replace-running"
+    )
+    for relative, text in (
+        ("README.md", readme_text),
+        ("docs/scrapeflow-deployment-open-order.md", deployment_text),
+    ):
+        if lifecycle_command not in text:
+            issues.append(
+                f"{relative} must document the fixed Quark lifecycle install command"
+            )
+
+    for command in FORBIDDEN_HELPER_DEPLOYMENT_MARKERS:
+        for relative, text in (
+            ("docker-compose.yml", compose_text),
+            ("README.md", readme_text),
+            ("docs/scrapeflow-deployment-open-order.md", deployment_text),
+        ):
+            if command in text:
+                issues.append(
+                    f"{relative} must not retain host Helper lifecycle {command!r}"
+                )
     return issues
 
 

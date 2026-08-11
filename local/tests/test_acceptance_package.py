@@ -33,7 +33,7 @@ ENV_TEMPLATE_DEFAULTS = {
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
     "SCRAPEFLOW_PROVIDER_WORKERS": "1",
-    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
         "replace-with-a-random-helper-token-at-least-24-characters"
     ),
@@ -55,7 +55,7 @@ COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-    "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+    "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
     "SCRAPEFLOW_PANSOU_URL": "",
@@ -88,8 +88,63 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "  api:\n"
         "    environment:\n"
         f"{api_env}\n"
+        "    depends_on:\n"
+        "      alist:\n"
+        "        condition: service_healthy\n"
         "    ports:\n"
-        '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"\n',
+        '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"\n'
+        "  quark-helper:\n"
+        "    image: scrapeflow-api:local\n"
+        "    restart: unless-stopped\n"
+        "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
+        "    environment:\n"
+        "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
+        "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
+        "    depends_on:\n"
+        "      api:\n"
+        "        condition: service_started\n"
+        "        restart: true\n"
+        "    network_mode: service:api\n",
+        encoding="utf-8",
+    )
+    (root / "Dockerfile.api").write_text(
+        "FROM python:3.12-slim-bookworm\n"
+        "COPY requirements.quark-helper.txt ./requirements.quark-helper.txt\n"
+        "RUN python3 -m pip install --requirement requirements.quark-helper.txt\n"
+        "COPY scripts/scrapeflow_quark_helper.py "
+        "./scripts/scrapeflow_quark_helper.py\n",
+        encoding="utf-8",
+    )
+    (root / "requirements.quark-helper.txt").write_text(
+        "aiohttp>=3.9,<4\n", encoding="utf-8",
+    )
+    lifecycle_command = (
+        "python3 scripts/scrapeflow_quark_lifecycle.py "
+        "--install-launch-agent --replace-running\n"
+    )
+    (root / "README.md").write_text(
+        "Compose sidecar deployment.\n" + lifecycle_command,
+        encoding="utf-8",
+    )
+    (root / "docs").mkdir()
+    (root / "docs" / "scrapeflow-deployment-open-order.md").write_text(
+        "Compose sidecar startup order.\n" + lifecycle_command,
+        encoding="utf-8",
+    )
+    (root / "scripts").mkdir()
+    (root / "scripts" / "scrapeflow_quark_helper.py").write_text(
+        "# passive typed helper sidecar\n", encoding="utf-8",
+    )
+    (root / "scripts" / "scrapeflow_quark_lifecycle.py").write_text(
+        'LAUNCH_AGENT_LABEL = "com.scrapeflow.quark-cdp"\n'
+        'CDP_ARGUMENTS = ("--remote-debugging-address=127.0.0.1", '
+        '"--remote-debugging-port=19222")\n'
+        'PAYLOAD = {"LimitLoadToSessionType": "Aqua", '
+        '"ProcessType": "Interactive", '
+        '"KeepAlive": {"SuccessfulExit": False}}\n'
+        'actions.add_argument("--start", action="store_true")\n'
+        'actions.add_argument("--restart", action="store_true")\n'
+        'actions.add_argument("--force-restart", action="store_true")\n',
         encoding="utf-8",
     )
 
@@ -231,6 +286,16 @@ def fake_runner(args: tuple[str, ...], cwd: Path, env: dict[str, str] | None) ->
                         "protocol": "tcp",
                     }],
                 },
+                "quark-helper": {
+                    "image": "scrapeflow-api:local",
+                    "network_mode": "service:api",
+                    "environment": {
+                        "SCRAPEFLOW_QUARK_HELPER_CDP_URL": (
+                            "http://host.docker.internal:19222/json/list"
+                        ),
+                    },
+                    "ports": [],
+                },
             },
         }
         return CommandResult(0, json.dumps(payload))
@@ -287,7 +352,7 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(evidence["commit"], "abc1234")
         self.assertTrue(evidence["worktree_clean"])
 
-    def test_compose_evidence_summarizes_loopback_services(self) -> None:
+    def test_compose_evidence_summarizes_api_and_private_helper_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             evidence = compose_evidence(Path(temporary), fake_runner)
 
@@ -296,6 +361,12 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(api["ports"], ["127.0.0.1:8765->8765/tcp"])
         self.assertEqual(api["start_paused"], "1")
         self.assertEqual(api["provider_workers"], "1")
+        helper = next(
+            service for service in evidence["services"]
+            if service["name"] == "quark-helper"
+        )
+        self.assertEqual(helper["image"], "scrapeflow-api:local")
+        self.assertEqual(helper["ports"], [])
 
     def test_package_draft_keeps_real_samples_unexecuted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

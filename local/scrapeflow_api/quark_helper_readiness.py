@@ -1,7 +1,7 @@
-"""Small, redacted Quark Helper liveness projection for ``/api/health``.
+"""Small, redacted Quark Helper sidecar projection for ``/api/health``.
 
 The fixed provider-capability table describes which materializer shapes the
-runtime understands.  It cannot prove that the host-side helper is reachable,
+runtime understands.  It cannot prove that the loopback sidecar is reachable,
 authenticated, or implements the narrow action contract.  This module makes
 that distinction explicit without exposing the helper token or invoking any
 provider write action.
@@ -120,6 +120,16 @@ def quark_helper_readiness_from_env(
             reachable=False,
             authenticated=False,
             reason="helper token must be configured",
+        )
+    if len(token) < 24:
+        return _snapshot(
+            configured=True,
+            url_configured=url_configured,
+            token_configured=True,
+            status="invalid_configuration",
+            reachable=False,
+            authenticated=False,
+            reason="helper token configuration is invalid",
         )
 
     try:

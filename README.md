@@ -39,11 +39,12 @@ cp .env.local.example .env.local
 
 ```sh
 docker compose --env-file .env.local build api
-docker compose --env-file .env.local up -d alist api
+docker compose --env-file .env.local up -d alist api quark-helper
 curl -fsS http://127.0.0.1:8765/api/health
 ```
 
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
+同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
 显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。发现来源时只创建 `awaiting_target_shelf` 记录，不会自动执行归档预处理、TMDB、规划或写入。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径；任务同样必须由用户选择货架并调用 `/start` 后才会进入队列。
 
@@ -82,13 +83,29 @@ GET  /api/browse?path=...
 
 严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
 
-分享快转和夸克磁力离线统一依赖宿主机的四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只绑定 loopback，只接受 Bearer 认证和固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。宿主环境安装 `requirements.quark-helper.txt` 后，只有操作者显式执行以下命令才会安装并启动这个四动作后台 Helper：
+分享快转和夸克磁力离线统一依赖四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只接受 Bearer 认证和固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。Helper 不再作为 macOS 登录项或宿主 Python 后台进程运行；Compose 直接使用 API 同一镜像启动 typed sidecar。API 默认通过共享 loopback `http://127.0.0.1:18765` 访问它，Bearer token 必须在本机 `.env.local` 中显式配置且至少 24 个字符。
+
+AList Quark storage 中的 cookie 只在分享发现和只读清单核验时临时取得，不复制到 Compose 模板，也不传给 Helper。当前真正的 `share-save` 和磁力离线都由桌面夸克的已登录 renderer 执行，因此都需要 CDP/WSG。sidecar 只被动附着固定 `http://host.docker.internal:19222/json/list`；它绝不启动、重启、激活或点击夸克。CDP/WSG 通道不可用时 Helper 会 fail-closed，不会扫描其他端口或降级到其他写入通道。
+
+这一 Compose sidecar 拓扑是用户在 2026-08-11 明确批准的部署修订：它取代最终收敛计划中“宿主 Helper”的物理放置，但不改变四动作、任务 staging、故障不降阶和 Helper 禁止控制 Quark 的不变合同。
+
+桌面夸克本身的启动与重启是另一个宿主生命周期边界，不属于 Helper 四动作。为了使 CDP 参数每次一致，操作者可在 API paused 且活动操作归零后，安装一个直接运行 `QuarkCloudDrive` 的 macOS LaunchAgent：
 
 ```sh
-python3 scripts/scrapeflow_quark_helper.py --install-launch-agent
+python3 scripts/scrapeflow_quark_lifecycle.py --install-launch-agent --replace-running
+python3 scripts/scrapeflow_quark_lifecycle.py --status
 ```
 
-该命令沿用历史默认：Helper 监听 `127.0.0.1:18765`，只等待并附着已存在的 `http://127.0.0.1:19222/json/list` CDP，token 保存在权限为 `0600` 的独立文件中。API 容器未设置 `SCRAPEFLOW_QUARK_HELPER_URL` 时使用 `http://host.docker.internal:18765`，但 Bearer token 仍必须显式配置且至少 24 个字符。启动 API 绝不会自动安装 Helper；Helper 也绝不会启动、重启、激活或点击夸克。既有 CDP/WSG 通道不可用时 Helper 会 fail-closed，不能改用 AppleScript、deep link、私有端口扫描或带参数重启桌面端。
+该 job 的参数只有夸克可执行文件、`--remote-debugging-address=127.0.0.1` 和 `--remote-debugging-port=19222`；后台进程是夸克本身，不是 Python Helper。安装替换已运行实例时，脚本通过 AppKit 发出正常退出请求，超时则停止并拒绝强杀。LaunchAgent 会在登录时启动、异常退出后重拉；用户正常退出夸克后会保持停止。可按需执行：
+
+```sh
+python3 scripts/scrapeflow_quark_lifecycle.py --start
+python3 scripts/scrapeflow_quark_lifecycle.py --restart
+# 只在 paused、操作归零且正常退出无法完成时：
+python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
+```
+
+`--restart` 仍是 AppKit 正常退出后重启；只有明确的 `--force-restart` 会让 launchd 强制替换它自己跟踪的那一个 job。sidecar 不会调用这些命令，CDP health 变为 503 也不会自动重启夸克。
 
 ## 可靠性边界
 

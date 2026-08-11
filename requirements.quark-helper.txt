@@ -1,4 +1,4 @@
-# Host-only dependency for scripts/scrapeflow_quark_helper.py.
-# It supplies the maintained WebSocket client used for an existing local CDP
-# connection.  It is intentionally not installed in the API Docker image.
+# Runtime dependency for the typed Quark Helper Compose sidecar.
+# It supplies the maintained HTTP/WebSocket client used for the explicitly
+# configured, already-existing Quark CDP connection.
 aiohttp>=3.9,<4

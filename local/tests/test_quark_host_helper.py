@@ -11,6 +11,9 @@ from aiohttp import ClientSession, web
 
 from local.scrapeflow_api.quark_host_helper import (
     DEFAULT_STAGING_ROOT,
+    DOCKER_SIDECAR_CDP_HOST,
+    DOCKER_SIDECAR_CDP_PORT,
+    DOCKER_SIDECAR_CDP_URL,
     HELPER_ACTIONS,
     PassiveQuarkCdp,
     QUARK_DRIVE_API,
@@ -21,6 +24,7 @@ from local.scrapeflow_api.quark_host_helper import (
     QuarkHelperRemoteRejected,
     QuarkHelperValidationError,
     QuarkHostHelperService,
+    _cdp_websocket_url,
     create_quark_helper_app,
     validate_magnet_submit_payload,
     validate_share_save_payload,
@@ -162,6 +166,99 @@ class HelperValidationTests(unittest.TestCase):
         with self.assertRaises(QuarkHelperValidationError):
             QuarkHelperConfig(host="127.0.0.1", port=8766, token=TOKEN, cdp_url="")
 
+    def test_docker_sidecar_requires_the_one_fixed_discovery_endpoint(self) -> None:
+        config = QuarkHelperConfig(
+            host="127.0.0.1",
+            port=18765,
+            token=TOKEN,
+            cdp_url=DOCKER_SIDECAR_CDP_URL,
+            docker_sidecar=True,
+        )
+        self.assertTrue(config.docker_sidecar)
+        session = PassiveQuarkCdp(
+            cdp_url=config.cdp_url,
+            staging_root=config.staging_root,
+            mount_path=config.mount_path,
+            root_fid=config.root_fid,
+            docker_sidecar=config.docker_sidecar,
+        )
+        self.assertEqual(session.cdp_url, DOCKER_SIDECAR_CDP_URL)
+        self.assertTrue(session.docker_sidecar)
+
+        invalid_urls = (
+            "http://127.0.0.1:19222/json/list",
+            "http://localhost:19222/json/list",
+            "http://host.docker.internal:19223/json/list",
+            "http://host.docker.internal:19222/json",
+            "http://host.docker.internal:19222/json/list/",
+            "http://user@host.docker.internal:19222/json/list",
+            "http://host.docker.internal:19222/json/list?target=quark",
+            "http://host.docker.internal:19222/json/list#fragment",
+        )
+        for cdp_url in invalid_urls:
+            with self.subTest(cdp_url=cdp_url), self.assertRaises(
+                QuarkHelperValidationError
+            ):
+                QuarkHelperConfig(
+                    host="127.0.0.1",
+                    port=18765,
+                    token=TOKEN,
+                    cdp_url=cdp_url,
+                    docker_sidecar=True,
+                )
+
+    def test_default_mode_cannot_use_docker_host_bridge(self) -> None:
+        with self.assertRaises(QuarkHelperValidationError):
+            QuarkHelperConfig(
+                host="127.0.0.1",
+                port=18765,
+                token=TOKEN,
+                cdp_url=DOCKER_SIDECAR_CDP_URL,
+            )
+
+    def test_docker_sidecar_rewrites_only_fixed_loopback_renderer_sockets(self) -> None:
+        for source_host in ("127.0.0.1", "localhost"):
+            with self.subTest(source_host=source_host):
+                source = (
+                    f"ws://{source_host}:{DOCKER_SIDECAR_CDP_PORT}"
+                    "/devtools/page/quark-main"
+                )
+                self.assertEqual(
+                    _cdp_websocket_url(
+                        source,
+                        discovery_host=DOCKER_SIDECAR_CDP_HOST,
+                        discovery_port=DOCKER_SIDECAR_CDP_PORT,
+                        docker_sidecar=True,
+                    ),
+                    (
+                        f"ws://{DOCKER_SIDECAR_CDP_HOST}:{DOCKER_SIDECAR_CDP_PORT}"
+                        "/devtools/page/quark-main"
+                    ),
+                )
+
+    def test_docker_sidecar_renderer_socket_rejects_every_target_drift(self) -> None:
+        invalid_urls = (
+            "ws://host.docker.internal:19222/devtools/page/quark-main",
+            "ws://127.0.0.2:19222/devtools/page/quark-main",
+            "ws://127.0.0.1:19223/devtools/page/quark-main",
+            "ws://127.0.0.1:19222/other/page/quark-main",
+            "ws://127.0.0.1:19222/devtools/page/../quark-main",
+            "ws://user@127.0.0.1:19222/devtools/page/quark-main",
+            "ws://127.0.0.1:19222/devtools/page/quark-main?target=other",
+            "ws://127.0.0.1:19222/devtools/page/quark-main#fragment",
+            "wss://127.0.0.1:19222/devtools/page/quark-main",
+        )
+        for socket_url in invalid_urls:
+            with self.subTest(socket_url=socket_url), self.assertRaises(
+                QuarkHelperNotReady
+            ):
+                _cdp_websocket_url(
+                    socket_url,
+                    discovery_host=DOCKER_SIDECAR_CDP_HOST,
+                    discovery_port=DOCKER_SIDECAR_CDP_PORT,
+                    docker_sidecar=True,
+                )
+
     def test_new_helper_does_not_import_legacy_control_or_generic_proxy_tools(self) -> None:
         source = Path("local/scrapeflow_api/quark_host_helper.py").read_text(encoding="utf-8")
         for forbidden in (
@@ -253,8 +350,10 @@ class HelperHttpTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
-    async def _select_from_discovery_rows(self, rows_factory):
-        async def targets(_request):
+    async def _select_from_discovery_rows(self, rows_factory, observed_headers=None):
+        async def targets(request):
+            if observed_headers is not None:
+                observed_headers.append(dict(request.headers))
             return web.json_response(rows_factory(port))
 
         app = web.Application()
@@ -275,6 +374,7 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
         return runner, session, port
 
     async def test_cdp_renderer_socket_matches_discovery_host_and_port(self) -> None:
+        observed_headers: list[dict[str, str]] = []
         runner, session, port = await self._select_from_discovery_rows(
             lambda discovery_port: [{
                 "type": "page",
@@ -284,6 +384,7 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
                     f"ws://127.0.0.1:{discovery_port}/devtools/page/quark-main"
                 ),
             }],
+            observed_headers,
         )
         try:
             self.assertEqual(
@@ -292,6 +393,124 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await runner.cleanup()
+        self.assertEqual(observed_headers[0]["Host"], f"127.0.0.1:{port}")
+        self.assertNotIn("Origin", observed_headers[0])
+
+    async def test_docker_sidecar_discovery_uses_bridge_with_fixed_loopback_host(self) -> None:
+        captured: dict[str, object] = {}
+        rows = [{
+            "type": "page",
+            "title": "Quark Cloud Drive",
+            # This is the actual main-renderer URL shape shipped in the Quark
+            # 7.0.6.771 app.asar, rather than a browser-page approximation.
+            "url": "uccd://cloud.quark/clouddrive/renderer/index.html?name=main",
+            "webSocketDebuggerUrl": (
+                f"ws://127.0.0.1:{DOCKER_SIDECAR_CDP_PORT}"
+                "/devtools/page/quark-main"
+            ),
+        }]
+
+        class Response:
+            status = 200
+            url = DOCKER_SIDECAR_CDP_URL
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self, *, content_type=None):
+                self.content_type = content_type
+                return rows
+
+        class Session:
+            def __init__(self, **kwargs):
+                captured["session"] = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, url, **kwargs):
+                captured["get_url"] = url
+                captured["get"] = kwargs
+                return Response()
+
+        session = PassiveQuarkCdp(
+            cdp_url=DOCKER_SIDECAR_CDP_URL,
+            staging_root=DEFAULT_STAGING_ROOT,
+            mount_path="/quark",
+            root_fid="0",
+            docker_sidecar=True,
+        )
+        with mock.patch(
+            "local.scrapeflow_api.quark_host_helper.ClientSession", Session,
+        ):
+            socket_url = await session._select_renderer_socket()
+
+        self.assertEqual(captured["get_url"], DOCKER_SIDECAR_CDP_URL)
+        self.assertEqual(captured["session"]["trust_env"], False)
+        self.assertEqual(captured["get"]["headers"], {
+            "Accept": "application/json",
+            "Host": f"127.0.0.1:{DOCKER_SIDECAR_CDP_PORT}",
+        })
+        self.assertNotIn("Origin", captured["get"]["headers"])
+        self.assertIs(captured["get"]["allow_redirects"], False)
+        self.assertEqual(
+            socket_url,
+            f"ws://{DOCKER_SIDECAR_CDP_HOST}:{DOCKER_SIDECAR_CDP_PORT}"
+            "/devtools/page/quark-main",
+        )
+
+    async def test_docker_sidecar_websocket_uses_bridge_with_fixed_loopback_host(self) -> None:
+        captured: dict[str, object] = {}
+        socket_url = (
+            f"ws://{DOCKER_SIDECAR_CDP_HOST}:{DOCKER_SIDECAR_CDP_PORT}"
+            "/devtools/page/quark-main"
+        )
+
+        class Session:
+            def __init__(self, **kwargs):
+                captured["session"] = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def ws_connect(self, url, **kwargs):
+                captured["ws_url"] = url
+                captured["ws"] = kwargs
+                raise RuntimeError("stop after transport capture")
+
+        session = PassiveQuarkCdp(
+            cdp_url=DOCKER_SIDECAR_CDP_URL,
+            staging_root=DEFAULT_STAGING_ROOT,
+            mount_path="/quark",
+            root_fid="0",
+            docker_sidecar=True,
+        )
+        with mock.patch.object(
+            session,
+            "_select_renderer_socket",
+            new=mock.AsyncMock(return_value=socket_url),
+        ), mock.patch(
+            "local.scrapeflow_api.quark_host_helper.ClientSession", Session,
+        ):
+            with self.assertRaisesRegex(QuarkHelperNotReady, "renderer is unavailable"):
+                await session._evaluate_json("JSON.stringify({status: 'probe'})")
+
+        self.assertEqual(captured["session"]["trust_env"], False)
+        self.assertEqual(captured["ws_url"], socket_url)
+        self.assertEqual(captured["ws"]["headers"], {
+            "Host": f"127.0.0.1:{DOCKER_SIDECAR_CDP_PORT}",
+        })
+        self.assertIsNone(captured["ws"]["origin"])
+        self.assertIs(captured["ws"]["autoping"], True)
 
     async def test_cdp_renderer_socket_cannot_switch_to_another_loopback_port(self) -> None:
         runner, session, _port = await self._select_from_discovery_rows(

@@ -330,8 +330,8 @@ tv_root
 - 分享实时有效性检查。
 - 只读递归文件清单。
 - 精确 `file_id/path/size → gap_ids`。
-- 从匹配的 AList Quark storage 临时取得会话。
-- 将选中的 file ID 快转到当前 attempt staging。
+- 从匹配的 AList Quark storage 临时取得会话，只用于分享发现和只读清单核验。
+- 将已核验的 file ID 交给 typed `share-save`，由桌面夸克已登录 renderer 快转到当前 attempt staging；AList cookie 不进入 Helper。
 - AList 到达回读。
 
 不恢复 SHA request ID、receipt、回滚副本或通用分享平台。
@@ -352,7 +352,7 @@ tv_root
 
 - 复用当前 Torrent 搜索和 manifest 解析。
 - 精确选择文件 index。
-- 通过最小宿主 Quark Helper 提交离线任务。
+- 通过与 API 共享 loopback 的 Compose Quark Helper sidecar 提交离线任务。
 - 保存 `attempt_id → Quark task_id`。
 - 重启后继续查询相同 task ID。
 - 离线目标只能是当前 attempt staging。
@@ -372,8 +372,8 @@ magnet-status
 - 手写 WebSocket。
 - SHA 请求 ID/build ID。
 - SubmitJournal 平台。
-- LaunchAgent 自动安装。
-- 主动启动、重启、激活或点击 Quark。
+- Python Helper LaunchAgent 或 Helper 自动安装。
+- Helper 主动启动、重启、激活或点击 Quark。
 
 只用一个小型 attempt JSON 保存 task ID。提交超时且不知道是否成功时进入 `waiting_reconcile`。
 
@@ -387,6 +387,14 @@ Quark 离线 → staging → 受限 Engine → 隔离正式根
 
 - 本地 aria2 未调用。
 - API/Helper 重启不产生第二个离线任务。
+
+2026-08-11 部署修订（用户明确批准）：
+
+- typed 四动作 Helper 改为 Compose sidecar，与 API 共享网络命名空间和 `127.0.0.1:18765`，不再安装 Python LaunchAgent。
+- sidecar 只连接固定 `host.docker.internal:19222/json/list`，不扫描端口，不具备宿主进程或 UI 控制能力。
+- 桌面夸克生命周期是与 Helper 分离的操作者边界：独立 Aqua LaunchAgent 直接运行 QuarkCloudDrive，argv 仅为可执行文件加固定 `127.0.0.1:19222` CDP 参数。
+- 安装和普通重启只通过 AppKit 请求单一、精确 PID 正常退出；超时不自动强杀。只有操作者显式选择的紧急 force-restart 可让 launchd 替换它自己跟踪的 job。
+- 该修订不扩展 Helper HTTP 面，不恢复通用 Quark proxy、Cookie 转发、手写 WebSocket 或 SubmitJournal。
 
 #### 6C：本地 Torrent
 

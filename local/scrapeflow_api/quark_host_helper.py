@@ -1,14 +1,17 @@
-"""Passive, loopback-only host helper for the existing Quark desktop session.
+"""Passive typed helper for the existing Quark desktop session.
 
 This is deliberately not a Quark proxy.  Its HTTP surface is the four fixed
 actions in ``HELPER_ACTIONS`` and every cloud operation is constructed here
 from a reviewed task payload.  The helper never accepts cookies, arbitrary
 URLs, arbitrary Quark paths, or DevTools commands from its HTTP caller.
 
-The helper only attaches to an *explicitly configured* existing loopback CDP
-endpoint.  It has no desktop-process or window-management capability and no
-DOM-click capability.  A missing renderer or unauthenticated Quark session
-therefore makes the helper not ready rather than attempting recovery.
+By default the helper only attaches to an explicitly configured loopback CDP
+endpoint.  Its explicit Docker-sidecar mode may instead cross Docker Desktop's
+fixed host bridge to the historical Quark CDP port, while the Helper HTTP
+server itself remains loopback-only inside the API's network namespace.  It
+has no desktop-process, window-management, or DOM-click capability.  A missing
+renderer or unauthenticated Quark session therefore makes the helper not ready
+rather than attempting recovery.
 """
 
 from __future__ import annotations
@@ -26,12 +29,12 @@ import re
 from typing import Any, Protocol
 import urllib.parse
 
-try:  # Host-only dependency; see requirements.quark-helper.txt.
+try:  # Helper-runtime dependency; see requirements.quark-helper.txt.
     from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
-except ImportError as exc:  # pragma: no cover - exercised by the CLI install path.
+except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency path.
     raise RuntimeError(
         "ScrapeFlow Quark Helper requires aiohttp; install "
-        "requirements.quark-helper.txt in the host Python environment"
+        "requirements.quark-helper.txt in the Helper environment"
     ) from exc
 
 
@@ -50,9 +53,18 @@ QUARK_UA = (
     "KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 _FORBIDDEN_CDP_PORT = 9125
+DOCKER_SIDECAR_CDP_HOST = "host.docker.internal"
+DOCKER_SIDECAR_CDP_PORT = 19222
+DOCKER_SIDECAR_CDP_URL = (
+    f"http://{DOCKER_SIDECAR_CDP_HOST}:{DOCKER_SIDECAR_CDP_PORT}/json/list"
+)
+_DOCKER_SIDECAR_CDP_HOST_HEADER = f"127.0.0.1:{DOCKER_SIDECAR_CDP_PORT}"
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
 _INFOHASH_RE = re.compile(r"^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
+_CDP_WEBSOCKET_PATH_RE = re.compile(
+    r"^/devtools/[A-Za-z0-9._:-]+/[A-Za-z0-9._:-]+$"
+)
 _FORMAL_LIBRARY_COMPONENTS = frozenset({
     "电影", "番剧", "美剧", "待刮削", "movie", "movies", "anime", "tv",
     "library", "media",
@@ -321,19 +333,37 @@ def _safe_task_id(value: object) -> str:
     return _safe_identifier(value, label="task_id")
 
 
-def _cdp_discovery_url(value: object) -> str:
+def _cdp_discovery_url(value: object, *, docker_sidecar: bool = False) -> str:
     if not isinstance(value, str) or not value:
         raise QuarkHelperValidationError("an explicit CDP discovery URL is required")
+    if type(docker_sidecar) is not bool:
+        raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
     parsed = urllib.parse.urlsplit(value)
-    if (
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise QuarkHelperValidationError(
+            "CDP discovery URL has an invalid port"
+        ) from exc
+    common_invalid = (
         parsed.scheme != "http"
-        or not _is_loopback_host(parsed.hostname)
-        or parsed.port is None
-        or parsed.port == _FORBIDDEN_CDP_PORT
-        or parsed.username
-        or parsed.password
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or port is None
+        or port == _FORBIDDEN_CDP_PORT
+    )
+    if docker_sidecar:
+        if common_invalid or value != DOCKER_SIDECAR_CDP_URL:
+            raise QuarkHelperValidationError(
+                "Docker sidecar CDP discovery must be exactly "
+                + DOCKER_SIDECAR_CDP_URL
+            )
+        return value
+    if (
+        common_invalid
+        or not _is_loopback_host(parsed.hostname)
         or parsed.path.rstrip("/") not in {"/json", "/json/list"}
     ):
         raise QuarkHelperValidationError(
@@ -347,20 +377,49 @@ def _cdp_websocket_url(
     *,
     discovery_host: str,
     discovery_port: int,
+    docker_sidecar: bool = False,
 ) -> str:
     if not isinstance(value, str) or not value:
         raise QuarkHelperNotReady("renderer did not expose a DevTools socket")
     parsed = urllib.parse.urlsplit(value)
-    if (
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise QuarkHelperNotReady("renderer DevTools socket port is invalid") from exc
+    common_invalid = (
         parsed.scheme != "ws"
-        or not _is_loopback_host(parsed.hostname)
-        or parsed.port is None
-        or parsed.port == _FORBIDDEN_CDP_PORT
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or port == _FORBIDDEN_CDP_PORT
+        or port != discovery_port
+        or _CDP_WEBSOCKET_PATH_RE.fullmatch(parsed.path) is None
+    )
+    if common_invalid:
+        raise QuarkHelperNotReady(
+            "renderer DevTools socket is not the approved discovery target"
+        )
+    if docker_sidecar:
+        if (
+            discovery_host != DOCKER_SIDECAR_CDP_HOST
+            or discovery_port != DOCKER_SIDECAR_CDP_PORT
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+        ):
+            raise QuarkHelperNotReady(
+                "renderer DevTools socket is not the approved Docker bridge target"
+            )
+        return urllib.parse.urlunsplit((
+            "ws",
+            f"{DOCKER_SIDECAR_CDP_HOST}:{DOCKER_SIDECAR_CDP_PORT}",
+            parsed.path,
+            "",
+            "",
+        ))
+    if (
+        not _is_loopback_host(parsed.hostname)
         or parsed.hostname.casefold() != discovery_host.casefold()
-        or parsed.port != discovery_port
-        or parsed.username
-        or parsed.password
-        or not parsed.path.startswith("/devtools/")
     ):
         raise QuarkHelperNotReady(
             "renderer DevTools socket is not the approved discovery target"
@@ -378,6 +437,7 @@ class QuarkHelperConfig:
     mount_path: str = DEFAULT_MOUNT_PATH
     root_fid: str = "0"
     timeout_seconds: float = 20.0
+    docker_sidecar: bool = False
 
     def __post_init__(self) -> None:
         _require_loopback_bind(self.host)
@@ -385,7 +445,9 @@ class QuarkHelperConfig:
             raise QuarkHelperValidationError("helper port is invalid")
         if not isinstance(self.token, str) or len(self.token) < 24:
             raise QuarkHelperValidationError("helper bearer token is too short")
-        _cdp_discovery_url(self.cdp_url)
+        if type(self.docker_sidecar) is not bool:
+            raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
+        _cdp_discovery_url(self.cdp_url, docker_sidecar=self.docker_sidecar)
         validate_staging_root(self.staging_root)
         _safe_absolute_cloud_path(self.mount_path, label="Quark mount path")
         _safe_identifier(self.root_fid, label="Quark root_fid")
@@ -404,8 +466,15 @@ class PassiveQuarkCdp:
         mount_path: str,
         root_fid: str,
         timeout_seconds: float = 20.0,
+        docker_sidecar: bool = False,
     ) -> None:
-        self.cdp_url = _cdp_discovery_url(cdp_url)
+        if type(docker_sidecar) is not bool:
+            raise QuarkHelperValidationError("Docker sidecar mode must be explicit")
+        self.docker_sidecar = docker_sidecar
+        self.cdp_url = _cdp_discovery_url(
+            cdp_url,
+            docker_sidecar=docker_sidecar,
+        )
         self.staging_root = validate_staging_root(staging_root)
         self.mount_path = _safe_absolute_cloud_path(mount_path, label="Quark mount path")
         self.root_fid = _safe_identifier(root_fid, label="Quark root_fid")
@@ -425,11 +494,18 @@ class PassiveQuarkCdp:
 
     async def _select_renderer_socket(self) -> str:
         timeout = ClientTimeout(total=self.timeout_seconds)
+        discovery_headers = {"Accept": "application/json"}
+        if self.docker_sidecar:
+            # Chromium rejects DevTools requests whose HTTP Host is neither an
+            # IP literal nor localhost.  Keep the TCP destination on Docker
+            # Desktop's fixed host bridge, but present the fixed loopback
+            # authority owned by the host-side CDP listener.
+            discovery_headers["Host"] = _DOCKER_SIDECAR_CDP_HOST_HEADER
         try:
             async with ClientSession(timeout=timeout, trust_env=False) as session:
                 async with session.get(
                     self.cdp_url,
-                    headers={"Accept": "application/json"},
+                    headers=discovery_headers,
                     allow_redirects=False,
                 ) as response:
                     if response.status in {301, 302, 303, 307, 308}:
@@ -459,6 +535,7 @@ class PassiveQuarkCdp:
                     row.get("webSocketDebuggerUrl"),
                     discovery_host=self._cdp_host,
                     discovery_port=self._cdp_port,
+                    docker_sidecar=self.docker_sidecar,
                 )
             except QuarkHelperNotReady:
                 continue
@@ -476,13 +553,25 @@ class PassiveQuarkCdp:
     async def _evaluate_json(self, expression: str) -> Mapping[str, object]:
         socket_url = await self._select_renderer_socket()
         timeout = ClientTimeout(total=self.timeout_seconds)
+        websocket_headers = (
+            {"Host": _DOCKER_SIDECAR_CDP_HOST_HEADER}
+            if self.docker_sidecar else None
+        )
         async with self._lock:
             self._sequence += 1
             request_id = self._sequence
             request_sent = False
             try:
                 async with ClientSession(timeout=timeout, trust_env=False) as session:
-                    async with session.ws_connect(socket_url, autoping=True) as socket:
+                    async with session.ws_connect(
+                        socket_url,
+                        autoping=True,
+                        headers=websocket_headers,
+                        # Do not synthesize a browser Origin.  The fixed Bearer
+                        # boundary is on the Helper HTTP surface; this private
+                        # CDP transport relies only on its fixed target/Host.
+                        origin=None,
+                    ) as socket:
                         await socket.send_json({
                             "id": request_id,
                             "method": "Runtime.evaluate",
@@ -1139,6 +1228,7 @@ def serve_quark_helper(config: QuarkHelperConfig) -> None:
         mount_path=config.mount_path,
         root_fid=config.root_fid,
         timeout_seconds=config.timeout_seconds,
+        docker_sidecar=config.docker_sidecar,
     )
     service = QuarkHostHelperService(session, staging_root=config.staging_root)
     web.run_app(
@@ -1171,6 +1261,9 @@ def load_helper_token(*, token_file: Path | None = None, environ: Mapping[str, s
 __all__ = [
     "DEFAULT_MOUNT_PATH",
     "DEFAULT_STAGING_ROOT",
+    "DOCKER_SIDECAR_CDP_HOST",
+    "DOCKER_SIDECAR_CDP_PORT",
+    "DOCKER_SIDECAR_CDP_URL",
     "HELPER_ACTIONS",
     "PassiveQuarkCdp",
     "QuarkHelperConfig",

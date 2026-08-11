@@ -55,7 +55,7 @@ def _selection() -> dict[str, object]:
 
 
 class QuarkMagnetOfflineBridgeTests(unittest.TestCase):
-    def test_http_client_from_env_uses_historical_default_with_token(self) -> None:
+    def test_http_client_from_env_uses_loopback_sidecar_default_with_token(self) -> None:
         with patch.dict(
             os.environ,
             {"SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz"},
@@ -64,12 +64,36 @@ class QuarkMagnetOfflineBridgeTests(unittest.TestCase):
             client = HttpQuarkHelperClient.from_env()
 
         self.assertEqual(client.base_url, DEFAULT_QUARK_HELPER_URL)
+        self.assertEqual(client.base_url, "http://127.0.0.1:18765")
         self.assertEqual(client.token, "abcdefghijklmnopqrstuvwxyz")
 
     def test_http_client_from_env_still_requires_token(self) -> None:
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
             QuarkMagnetBridgeError, "token is missing or too short",
         ):
+            HttpQuarkHelperClient.from_env()
+
+    def test_http_client_from_env_honors_a_strict_explicit_url(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_QUARK_HELPER_URL": "http://localhost:28765",
+                "SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz",
+            },
+            clear=True,
+        ):
+            client = HttpQuarkHelperClient.from_env()
+
+        self.assertEqual(client.base_url, "http://localhost:28765")
+
+        with patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_QUARK_HELPER_URL": "http://example.com:18765",
+                "SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz",
+            },
+            clear=True,
+        ), self.assertRaises(QuarkMagnetBridgeError):
             HttpQuarkHelperClient.from_env()
 
     def test_http_client_rejects_external_helper_hosts_for_every_scheme(self) -> None:

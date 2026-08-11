@@ -1,8 +1,9 @@
-"""Typed client and bridge for the fixed host-side Quark Helper actions.
+"""Typed client and bridge for the fixed loopback Quark Helper actions.
 
-The Helper is deliberately the only component that may operate the host's
-logged-in Quark session.  The API/container sends it a reviewed, task-scoped
-manifest over loopback; it never drives a GUI or forwards an AList cookie.
+The Helper sidecar shares the API container's network namespace and is the
+only component that may operate the logged-in Quark session.  The API sends it
+a reviewed, task-scoped manifest over loopback; it never drives a GUI or
+forwards an AList cookie.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import urllib.request
 from .provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 
 
-DEFAULT_QUARK_HELPER_URL = "http://host.docker.internal:18765"
+DEFAULT_QUARK_HELPER_URL = "http://127.0.0.1:18765"
 
 
 class QuarkMagnetBridgeError(RuntimeError):
@@ -120,7 +121,7 @@ QuarkMagnetHelper = QuarkHelper
 
 
 class HttpQuarkHelperClient:
-    """HTTP client for the fixed host-side Quark helper actions."""
+    """HTTP client for the fixed loopback sidecar Helper actions."""
 
     def __init__(
         self,
@@ -383,7 +384,7 @@ def normalize_quark_magnet_selection(
 
 
 class QuarkMagnetOfflineBridge:
-    """Submit a reviewed magnet to a fixed host-side Quark helper."""
+    """Submit a reviewed magnet through the fixed loopback sidecar Helper."""
 
     def __init__(
         self,

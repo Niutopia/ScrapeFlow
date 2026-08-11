@@ -22,7 +22,7 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_WORKERS": "1",
-        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
             "replace-with-a-random-helper-token-at-least-24-characters"
         ),
@@ -44,7 +44,7 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-        "SCRAPEFLOW_QUARK_HELPER_URL": "http://host.docker.internal:18765",
+        "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
         "SCRAPEFLOW_PANSOU_ENABLED": "0",
         "SCRAPEFLOW_PANSOU_URL": "",
@@ -87,8 +87,63 @@ class ReleaseCheckTests(unittest.TestCase):
             "  api:\n"
             "    environment:\n"
             f"{api_env}\n"
+            "    depends_on:\n"
+            "      alist:\n"
+            "        condition: service_healthy\n"
             "    ports:\n"
-            f"{api_ports_yaml}\n",
+            f"{api_ports_yaml}\n"
+            "  quark-helper:\n"
+            "    image: scrapeflow-api:local\n"
+            "    restart: unless-stopped\n"
+            "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
+            "    environment:\n"
+            "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
+            "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
+            "    depends_on:\n"
+            "      api:\n"
+            "        condition: service_started\n"
+            "        restart: true\n"
+            "    network_mode: service:api\n",
+            encoding="utf-8",
+        )
+        (root / "Dockerfile.api").write_text(
+            "FROM python:3.12-slim-bookworm\n"
+            "COPY requirements.quark-helper.txt ./requirements.quark-helper.txt\n"
+            "RUN python3 -m pip install --requirement requirements.quark-helper.txt\n"
+            "COPY scripts/scrapeflow_quark_helper.py "
+            "./scripts/scrapeflow_quark_helper.py\n",
+            encoding="utf-8",
+        )
+        (root / "requirements.quark-helper.txt").write_text(
+            "aiohttp>=3.9,<4\n", encoding="utf-8",
+        )
+        lifecycle_command = (
+            "python3 scripts/scrapeflow_quark_lifecycle.py "
+            "--install-launch-agent --replace-running\n"
+        )
+        (root / "README.md").write_text(
+            "Compose sidecar deployment.\n" + lifecycle_command,
+            encoding="utf-8",
+        )
+        (root / "docs").mkdir()
+        (root / "docs" / "scrapeflow-deployment-open-order.md").write_text(
+            "Compose sidecar startup order.\n" + lifecycle_command,
+            encoding="utf-8",
+        )
+        (root / "scripts").mkdir()
+        (root / "scripts" / "scrapeflow_quark_helper.py").write_text(
+            "# passive typed helper sidecar\n", encoding="utf-8",
+        )
+        (root / "scripts" / "scrapeflow_quark_lifecycle.py").write_text(
+            'LAUNCH_AGENT_LABEL = "com.scrapeflow.quark-cdp"\n'
+            'CDP_ARGUMENTS = ("--remote-debugging-address=127.0.0.1", '
+            '"--remote-debugging-port=19222")\n'
+            'PAYLOAD = {"LimitLoadToSessionType": "Aqua", '
+            '"ProcessType": "Interactive", '
+            '"KeepAlive": {"SuccessfulExit": False}}\n'
+            'actions.add_argument("--start", action="store_true")\n'
+            'actions.add_argument("--restart", action="store_true")\n'
+            'actions.add_argument("--force-restart", action="store_true")\n',
             encoding="utf-8",
         )
 
@@ -206,6 +261,61 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertTrue(any("SCRAPEFLOW_QUARK_HELPER_TOKEN" in issue for issue in issues))
         self.assertTrue(any("SCRAPEFLOW_PROVIDER_PILOT_GAP" in issue for issue in issues))
         self.assertTrue(any("SCRAPEFLOW_PANSOU_MAX_LINKS" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_sidecar_topology_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            compose_path = root / "docker-compose.yml"
+            compose_path.write_text(
+                compose_path.read_text(encoding="utf-8")
+                .replace("network_mode: service:api", "network_mode: bridge")
+                .replace("restart: true", "restart: false")
+                .replace("--docker-sidecar", "--legacy-helper")
+                .replace(
+                    "http://host.docker.internal:19222/json/list",
+                    "http://127.0.0.1:19222/json/list",
+                ),
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("network_mode" in issue for issue in issues))
+        self.assertTrue(any("depends_on.api.restart" in issue for issue in issues))
+        self.assertTrue(any("command" in issue for issue in issues))
+        self.assertTrue(any("SCRAPEFLOW_QUARK_HELPER_CDP_URL" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_host_helper_install_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            (root / "README.md").write_text(
+                "python3 scripts/scrapeflow_quark_helper.py "
+                "--install-launch-agent\n",
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("--install-launch-agent" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_lifecycle_code_in_helper_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            dockerfile = root / "Dockerfile.api"
+            dockerfile.write_text(
+                dockerfile.read_text(encoding="utf-8")
+                + "COPY scripts ./scripts\n"
+                + "COPY scripts/scrapeflow_quark_lifecycle.py ./scripts/\n",
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("copy only the passive" in issue for issue in issues))
+        self.assertTrue(any("must not contain the macOS" in issue for issue in issues))
 
     def test_active_code_has_no_banned_media_fingerprint_calls(self) -> None:
         self.assertEqual(active_media_fingerprint_call_hits(), [])

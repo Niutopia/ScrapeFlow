@@ -411,9 +411,10 @@ class QuarkFastSaveAutomaticMaterializer:
         self,
         helper: object | None = None,
     ) -> None:
-        # The host Helper owns the logged-in Quark session.  Keeping this
-        # dependency injectable makes the materializer deterministic in unit
-        # tests while the default remains a lazy, background HTTP client.
+        # The loopback sidecar Helper owns the logged-in Quark renderer
+        # session.  Keeping this dependency injectable makes the materializer
+        # deterministic in unit tests while the default remains a lazy HTTP
+        # client in the API process.
         self.helper = helper
 
     def _helper(self) -> object:
