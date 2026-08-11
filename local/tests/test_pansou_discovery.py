@@ -321,7 +321,7 @@ class PanSouDiscoveryTests(unittest.TestCase):
             with patch.object(SimpleApplication, "_start_startup_thread"):
                 application = SimpleApplication(
                     state_root=state_root,
-                    remote_root="/library",
+                    remote_root="/quark/影视",
                     remote=alist,
                     engine_runner=runner,
                 )

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from local.scrapeflow_api.automatic_replenishment import (
+    AutomaticReplenishmentError,
     AutomaticReplenishmentRuntime,
     FixedTierAutomaticMaterializer,
     LocalTorrentAutomaticMaterializer,
@@ -289,6 +290,21 @@ def _example_root_job(job_id: str = "engine-cancel-root") -> EngineJob:
 
 
 class AutomaticReplenishmentTests(unittest.TestCase):
+    def test_runtime_rejects_noncanonical_provider_staging_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                AutomaticReplenishmentError,
+                "staging_root 必须是 /quark/影视/ScrapeFlow/补源",
+            ):
+                AutomaticReplenishmentRuntime(
+                    Path(temporary),
+                    engine_runner=object(),
+                    alist=object(),
+                    search=object(),
+                    materializer=object(),
+                    staging_root="/library/ScrapeFlow/补源",
+                )
+
     def test_exact_episode_terms_survive_many_tmdb_aliases(self) -> None:
         request = {
             "media": {
@@ -3256,38 +3272,33 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     "acquisition": {"kind": "torrent"},
                 }]}
 
-        class FakeQuarkBridge:
+        class FakeQuarkHelper:
             def __init__(self, alist: MemoryAList) -> None:
                 self.alist = alist
-                self.calls: list[tuple[str, object]] = []
+                self.calls: list[dict[str, object]] = []
 
-            def execute(
-                self,
-                selection,
-                destination,
-                session,
-                *,
-                task_id=None,
-                on_task_id=None,
-            ):
-                if task_id is not None:
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": [
+                        "health", "share-save", "magnet-submit", "magnet-status",
+                    ],
+                }
+
+            def share_save(self, plan):
+                if "task_id" in plan:
                     raise AssertionError("first Quark save must not reuse a task id")
-                if on_task_id is not None:
-                    on_task_id("quark-task-1")
-                self.calls.append((destination, session))
+                self.calls.append(dict(plan))
+                destination = str(plan["destination"])
                 self.alist.tree[destination] = [{
                     "name": "Example.Show.S01E01.mkv",
                     "is_dir": False,
                     "size": 123,
                 }]
                 return {
-                    "status": "submitted",
+                    "status": "finished",
                     "task_id": "quark-task-1",
-                    "expected_files": [{
-                        "name": "Example.Show.S01E01.mkv",
-                        "size": 123,
-                        "gap_ids": ["S01E01"],
-                    }],
                 }
 
         class UnexpectedLocalTorrent:
@@ -3297,11 +3308,10 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
             engine = FakeEngine()
-            bridge = FakeQuarkBridge(alist)
+            helper = FakeQuarkHelper(alist)
             materializer = FixedTierAutomaticMaterializer(
                 quark_share=QuarkFastSaveAutomaticMaterializer(
-                    bridge=bridge,
-                    session_factory=lambda _alist, _staging: object(),
+                    helper=helper,
                 ),
                 local_torrent=UnexpectedLocalTorrent(),
             )
@@ -3315,7 +3325,15 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(outcome["unresolved_gaps"], [])
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(len(bridge.calls), 1)
+        self.assertEqual(len(helper.calls), 1)
+        self.assertEqual(
+            set(helper.calls[0]),
+            {
+                "attempt_id", "destination", "share_id", "passcode",
+                "selected_gap_ids", "expected_files", "title",
+            },
+        )
+        self.assertNotIn("session", helper.calls[0])
         self.assertEqual(engine.executed, ["engine-child-1"])
         self.assertTrue(engine.planned[0]["source_path"].startswith(
             "/quark/影视/ScrapeFlow/补源/engine-quark-share-root/attempt-",
@@ -3330,57 +3348,43 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "acquisition": {
                 "kind": "quark_fast_save",
                 "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
             },
         }
 
-        class ReusingBridge:
-            def __init__(self, state_path: Path) -> None:
-                self.state_path = state_path
+        class ReusingHelper:
+            def __init__(self) -> None:
                 self.task_ids: list[str | None] = []
-                self.callback_states: list[dict[str, object]] = []
+                self.plans: list[dict[str, object]] = []
 
-            def execute(
-                self,
-                _selection,
-                _destination,
-                _session,
-                *,
-                task_id=None,
-                on_task_id=None,
-            ):
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": [
+                        "health", "share-save", "magnet-submit", "magnet-status",
+                    ],
+                }
+
+            def share_save(self, plan):
+                task_id = plan.get("task_id")
+                self.plans.append(dict(plan))
                 self.task_ids.append(task_id)
                 if task_id is None:
                     task_id = "quark-share-task-1"
-                    if on_task_id is not None:
-                        on_task_id(task_id)
-                    # The task id must be durable before the bridge can poll
-                    # or return from the original save call.
-                    self.callback_states.append(json.loads(
-                        self.state_path.read_text(encoding="utf-8")
-                    ))
-                elif on_task_id is not None:
-                    raise AssertionError(
-                        "a restored task must be queried without a callback"
-                    )
                 return {
-                    "status": "submitted",
+                    "status": "finished",
                     "task_id": task_id,
-                    "expected_files": [{
-                        "name": "Example.Show.S01E01.mkv",
-                        "size": 123,
-                        "gap_ids": ["S01E01"],
-                    }],
                 }
 
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary) / "workspace"
             state_path = workspace / "quark_share_attempt.json"
             staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reuse"
-            bridge = ReusingBridge(state_path)
-            materializer = QuarkFastSaveAutomaticMaterializer(
-                bridge=bridge,
-                session_factory=lambda _alist, _staging: object(),
-            )
+            helper = ReusingHelper()
+            materializer = QuarkFastSaveAutomaticMaterializer(helper=helper)
             alist = MemoryAList()
 
             first = materializer.acquire(
@@ -3393,7 +3397,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(bridge.task_ids, [None, "quark-share-task-1"])
+        self.assertEqual(helper.task_ids, [None, "quark-share-task-1"])
         self.assertEqual(first["external_task_id"], "quark-share-task-1")
         self.assertEqual(second["external_task_id"], "quark-share-task-1")
         self.assertEqual(set(state), {
@@ -3408,7 +3412,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(state["selected_gap_ids"], ["S01E01"])
         self.assertTrue(str(state["updated_at"]).endswith("Z"))
         self.assertEqual(
-            bridge.callback_states[0]["task_id"],
+            helper.plans[1]["task_id"],
             "quark-share-task-1",
         )
 
@@ -3417,11 +3421,17 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "provider": "quark_share",
             "locator": "quark_share:fixture-share",
             "selected_gap_ids": ["S01E01"],
-            "acquisition": {"kind": "quark_fast_save", "share_id": "fixture-share"},
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
         }
 
-        class UnexpectedBridge:
-            def execute(self, *_args, **_kwargs):
+        class UnexpectedHelper:
+            def share_save(self, *_args, **_kwargs):
                 raise AssertionError("invalid attempt state must fail before Quark access")
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -3429,12 +3439,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             workspace.mkdir()
             state_path = workspace / "quark_share_attempt.json"
             staging = "/quark/影视/ScrapeFlow/补源/root/attempt-owned"
-            materializer = QuarkFastSaveAutomaticMaterializer(
-                bridge=UnexpectedBridge(),
-                session_factory=lambda *_args: (_ for _ in ()).throw(
-                    AssertionError("invalid state must fail before session creation")
-                ),
-            )
+            materializer = QuarkFastSaveAutomaticMaterializer(helper=UnexpectedHelper())
             alist = MemoryAList()
 
             state_path.write_text("{broken", encoding="utf-8")
@@ -3464,17 +3469,31 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "provider": "quark_share",
             "locator": "quark_share:fixture-share",
             "selected_gap_ids": ["S01E01"],
-            "acquisition": {"kind": "quark_fast_save", "share_id": "fixture-share"},
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
         }
 
-        class UnknownSubmissionBridge:
-            def execute(self, *_args, **_kwargs):
+        class UnknownSubmissionHelper:
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": [
+                        "health", "share-save", "magnet-submit", "magnet-status",
+                    ],
+                }
+
+            def share_save(self, *_args, **_kwargs):
                 raise QuarkShareInDoubtError("save outcome is unknown")
 
         with tempfile.TemporaryDirectory() as temporary:
             materializer = QuarkFastSaveAutomaticMaterializer(
-                bridge=UnknownSubmissionBridge(),
-                session_factory=lambda *_args: object(),
+                helper=UnknownSubmissionHelper(),
             )
             with self.assertRaises(QuarkShareInDoubtError) as raised:
                 materializer.acquire(
@@ -3487,6 +3506,105 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.failure_scope, FAILURE_IN_DOUBT)
+
+    def test_quark_share_materializer_fails_closed_for_partial_helper(self) -> None:
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
+        }
+
+        class PartialHelper:
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": ["health", "magnet-submit", "magnet-status"],
+                }
+
+            def share_save(self, _plan):
+                raise AssertionError("partial Helper must not receive share-save")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            materializer = QuarkFastSaveAutomaticMaterializer(helper=PartialHelper())
+            with self.assertRaisesRegex(Exception, "actions 不符合固定合同"):
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-partial",
+                    workspace=Path(temporary) / "workspace",
+                    alist=MemoryAList(),
+                )
+
+    def test_quark_share_default_path_uses_only_typed_helper(self) -> None:
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
+        }
+
+        class TypedHelper:
+            def __init__(self, alist: MemoryAList) -> None:
+                self.alist = alist
+
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": [
+                        "health", "share-save", "magnet-submit", "magnet-status",
+                    ],
+                }
+
+            def share_save(self, plan):
+                destination = str(plan["destination"])
+                self.alist.tree[destination] = [{
+                    "name": "Example.Show.S01E01.mkv",
+                    "is_dir": False,
+                    "size": 123,
+                }]
+                return {"status": "finished", "task_id": "share-task-1"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            helper = TypedHelper(alist)
+            with patch(
+                "engine.scrapeflow.quark_magnet_offline_bridge."
+                "HttpQuarkHelperClient.from_env",
+                return_value=helper,
+            ) as helper_factory, patch(
+                "engine.scrapeflow.quark_fast_save_bridge."
+                "delegated_quark_session",
+                side_effect=AssertionError("direct delegated session is forbidden"),
+            ) as delegated_session, patch(
+                "engine.scrapeflow.quark_fast_save_bridge."
+                "UrlLibQuarkTransport",
+                side_effect=AssertionError("direct Quark transport is forbidden"),
+            ) as direct_transport:
+                delivery = QuarkFastSaveAutomaticMaterializer().acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-default",
+                    workspace=Path(temporary) / "workspace",
+                    alist=alist,
+                )
+
+        helper_factory.assert_called_once_with()
+        delegated_session.assert_not_called()
+        direct_transport.assert_not_called()
+        self.assertEqual(delivery["external_task_id"], "share-task-1")
 
     def test_quark_magnet_offline_wins_before_local_torrent(self) -> None:
         root_job = _example_root_job("engine-quark-magnet-root")

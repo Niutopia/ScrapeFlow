@@ -47,6 +47,7 @@ from local.scrapeflow_api.simple_library_audit import (
 )
 from local.scrapeflow_api.automatic_replenishment import (
     AutomaticReplenishmentRuntime,
+    CANONICAL_REPLENISHMENT_STAGING_ROOT,
     FixedTierAutomaticMaterializer,
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
@@ -1973,7 +1974,11 @@ class SimpleApplication:
                 quark_share_inspector,
             )
             from engine.tools.replenishment_adapter.search import ReplenishmentSearchService
-            replenishment_staging = f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源"
+            if self.remote_root != "/quark/影视":
+                raise ApplicationError(
+                    "自动补源要求 SCRAPEFLOW_MEDIA_ROOT=/quark/影视"
+                )
+            replenishment_staging = CANONICAL_REPLENISHMENT_STAGING_ROOT
             runtime = AutomaticReplenishmentRuntime(
                 self.state_root,
                 engine_runner=runner,
@@ -3251,7 +3256,7 @@ class SimpleApplication:
                             self.state_root,
                             job_id=job.id,
                             alist=client,
-                            staging_root=f"{self.remote_root.rstrip('/')}/ScrapeFlow/补源",
+                            staging_root=CANONICAL_REPLENISHMENT_STAGING_ROOT,
                             audit_started_at=report.get("started_at"),
                             audit_complete=(
                                 report.get("status") == "completed"

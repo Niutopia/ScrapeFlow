@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 from unittest import mock
 import urllib.error
+import urllib.request
 
 from engine.scrapeflow.quark_fast_save_bridge import (
     QUARK_DRIVE_API,
     QUARK_SHARE_API,
     QuarkFastSaveBridge,
+    QuarkBridgeError,
     QuarkSession,
     QuarkShareInDoubtError,
     QuarkShareExpiredError,
     UrlLibQuarkTransport,
+    _build_quark_opener,
     delegated_quark_session,
 )
 
@@ -207,19 +211,124 @@ class QuarkFastSaveBridgeTests(unittest.TestCase):
                 "message": "分享地址已失效",
             }).encode("utf-8")),
         )
-        with mock.patch(
-            "engine.scrapeflow.quark_fast_save_bridge.urllib.request.urlopen",
-            side_effect=response,
+        with self.assertRaises(QuarkShareExpiredError) as raised:
+            UrlLibQuarkTransport(opener=mock.Mock(side_effect=response)).request(
+                "POST",
+                QUARK_SHARE_API + "/share/sharepage/token",
+                params={},
+                body={"pwd_id": "cancelled"},
+                cookie="SECRET_COOKIE",
+            )
+        self.assertEqual(raised.exception.failure_scope, "candidate")
+
+    def test_transport_ignores_environment_proxies(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTPS_PROXY": "http://198.51.100.7:8080",
+                "https_proxy": "http://198.51.100.8:8080",
+            },
+            clear=False,
+        ), mock.patch(
+            "engine.scrapeflow.quark_fast_save_bridge.urllib.request.getproxies",
+            side_effect=AssertionError("environment proxies must not be read"),
         ):
-            with self.assertRaises(QuarkShareExpiredError) as raised:
-                UrlLibQuarkTransport().request(
-                    "POST",
-                    QUARK_SHARE_API + "/share/sharepage/token",
-                    params={},
-                    body={"pwd_id": "cancelled"},
+            opener = _build_quark_opener()
+
+        proxy_handlers = [
+            handler for handler in opener.handlers
+            if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        # CPython omits an empty ProxyHandler from the final opener; if a
+        # version retains it, it must still carry no proxy entries.
+        self.assertLessEqual(len(proxy_handlers), 1)
+        self.assertTrue(all(not handler.proxies for handler in proxy_handlers))
+
+    def test_transport_refuses_redirect_without_replaying_cookie(self) -> None:
+        calls = []
+
+        def opener(request, *, timeout):
+            calls.append((request.full_url, request.get_header("Cookie"), timeout))
+            raise urllib.error.HTTPError(
+                request.full_url,
+                302,
+                "Found",
+                {"Location": "https://example.com/steal"},
+                io.BytesIO(b""),
+            )
+
+        with self.assertRaisesRegex(QuarkBridgeError, "redirect refused"):
+            UrlLibQuarkTransport(opener=opener).request(
+                "POST",
+                QUARK_SHARE_API + "/share/sharepage/token",
+                params={},
+                body={"pwd_id": "fixture-share"},
+                cookie="SECRET_COOKIE",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "SECRET_COOKIE")
+
+    def test_transport_rejects_response_from_any_other_final_url(self) -> None:
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+            def geturl(self):
+                return "https://example.com/stolen"
+
+        with self.assertRaisesRegex(QuarkBridgeError, "response URL escaped"):
+            UrlLibQuarkTransport(opener=lambda _request, *, timeout: Response(b"{}"))\
+                .request(
+                    "GET",
+                    QUARK_SHARE_API + "/task",
+                    params={"task_id": "fixture"},
+                    body=None,
                     cookie="SECRET_COOKIE",
                 )
-        self.assertEqual(raised.exception.failure_scope, "candidate")
+
+    def test_business_error_does_not_echo_sensitive_server_text(self) -> None:
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+            def geturl(self):
+                return QUARK_SHARE_API + "/share/sharepage/token"
+
+        transport = UrlLibQuarkTransport(
+            opener=lambda _request, _timeout: Response(json.dumps({
+                "code": 99999,
+                "message": "cookie=SECRET_COOKIE token=SECRET_TOKEN",
+            }).encode())
+        )
+        with self.assertRaises(QuarkBridgeError) as raised:
+            transport.request(
+                "POST",
+                QUARK_SHARE_API + "/share/sharepage/token",
+                params={},
+                body={"pwd_id": "fixture"},
+                cookie="SECRET_COOKIE",
+            )
+        self.assertNotIn("SECRET_COOKIE", str(raised.exception))
+        self.assertNotIn("SECRET_TOKEN", str(raised.exception))
+
+    def test_transport_rejects_external_request_endpoint_before_network(self) -> None:
+        opener = mock.Mock()
+        with self.assertRaisesRegex(QuarkBridgeError, "escaped the fixed API origin"):
+            UrlLibQuarkTransport(opener=opener).request(
+                "POST",
+                "https://example.com/1/clouddrive/share/sharepage/token",
+                params={},
+                body={"pwd_id": "fixture-share"},
+                cookie="SECRET_COOKIE",
+            )
+        opener.assert_not_called()
 
 
 if __name__ == "__main__":

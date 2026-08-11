@@ -70,6 +70,7 @@ _DURABLE_CANDIDATE_EXCLUSION_LIMIT = EXHAUSTION_MIN_DISTINCT_LOCATORS
 _DURABLE_CANDIDATE_LOCATOR_LIMIT = 4096
 _DURABLE_CANDIDATE_PROVIDER_LIMIT = 64
 _DURABLE_CANDIDATE_RELEASE_NAME_LIMIT = 512
+CANONICAL_REPLENISHMENT_STAGING_ROOT = "/quark/影视/ScrapeFlow/补源"
 _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
 _ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
@@ -408,21 +409,180 @@ class QuarkFastSaveAutomaticMaterializer:
 
     def __init__(
         self,
-        bridge: object | None = None,
-        *,
-        session_factory: Callable[[object, str], object] | None = None,
+        helper: object | None = None,
     ) -> None:
-        if bridge is None:
-            from engine.scrapeflow.quark_fast_save_bridge import (
-                QuarkFastSaveBridge,
-                UrlLibQuarkTransport,
+        # The host Helper owns the logged-in Quark session.  Keeping this
+        # dependency injectable makes the materializer deterministic in unit
+        # tests while the default remains a lazy, background HTTP client.
+        self.helper = helper
+
+    def _helper(self) -> object:
+        if self.helper is None:
+            from engine.scrapeflow.quark_magnet_offline_bridge import (
+                HttpQuarkHelperClient,
             )
-            bridge = QuarkFastSaveBridge(UrlLibQuarkTransport())
-        if session_factory is None:
-            from engine.scrapeflow.quark_fast_save_bridge import delegated_quark_session
-            session_factory = delegated_quark_session
-        self.bridge = bridge
-        self.session_factory = session_factory
+
+            self.helper = HttpQuarkHelperClient.from_env()
+        return self.helper
+
+    @staticmethod
+    def _require_helper_ready(helper: object) -> None:
+        health = getattr(helper, "health", None)
+        if not callable(health):
+            raise AutomaticReplenishmentError("夸克 Helper 缺少 health")
+        try:
+            payload = health()
+        except Exception as exc:
+            raise AutomaticReplenishmentError("夸克 Helper health 不可用") from exc
+        if not isinstance(payload, Mapping):
+            raise AutomaticReplenishmentError("夸克 Helper health 返回无效")
+        status = str(payload.get("status") or "").strip().casefold()
+        if status not in {"ok", "ready"}:
+            raise AutomaticReplenishmentError("夸克 Helper 未就绪")
+        # Readiness already validates the exact action set before a pilot.  A
+        # materializer also fails closed when a host helper advertises a
+        # partial contract, so a magnet-only endpoint cannot silently become a
+        # share-save implementation.
+        actions = payload.get("actions")
+        if actions is not None:
+            if (
+                not isinstance(actions, list)
+                or any(not isinstance(action, str) for action in actions)
+                or len(actions) != len(set(actions))
+                or set(actions) != {
+                    "health", "share-save", "magnet-submit", "magnet-status",
+                }
+            ):
+                raise AutomaticReplenishmentError("夸克 Helper actions 不符合固定合同")
+        else:
+            raise AutomaticReplenishmentError("夸克 Helper health 缺少 actions")
+        if payload.get("authenticated") is not True:
+            raise AutomaticReplenishmentError("夸克 Helper 未认证")
+
+    @staticmethod
+    def _safe_share_path(value: object) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value.startswith("/")
+            or "\\" in value
+            or posixpath.normpath(value) != value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or any(ord(char) < 32 for char in value)
+        ):
+            raise AutomaticReplenishmentError("夸克分享文件路径不安全")
+        return value
+
+    @classmethod
+    def _share_save_plan(
+        cls,
+        selection: Mapping[str, object],
+        *,
+        destination: str,
+        task_id: str | None,
+    ) -> dict[str, object]:
+        """Build the complete typed ``/v1/share-save`` request.
+
+        Only reviewed file IDs, their exact source paths/sizes, selected gap
+        IDs and the task staging root cross the process boundary.  AList
+        cookies, delegated sessions, arbitrary destinations and the old
+        Quark API transport are intentionally absent.
+        """
+        from engine.scrapeflow.quark_fast_save_bridge import (
+            QuarkBridgeError,
+            normalize_quark_fast_save_selection,
+        )
+
+        try:
+            normalized = normalize_quark_fast_save_selection(selection)
+        except QuarkBridgeError as exc:
+            raise AutomaticReplenishmentError("夸克分享候选 manifest 无效") from exc
+        acquisition = normalized.get("acquisition")
+        if not isinstance(acquisition, Mapping):
+            raise AutomaticReplenishmentError("夸克分享候选 acquisition 无效")
+        selected = normalized.get("selected_gap_ids")
+        if not isinstance(selected, list) or not selected:
+            raise AutomaticReplenishmentError("夸克分享候选缺少 selected_gap_ids")
+        share_id = acquisition.get("pwd_id") or acquisition.get("share_id")
+        if (
+            not isinstance(share_id, str)
+            or not share_id
+            or len(share_id) > 512
+            or any(ord(char) < 32 or char in {"/", "\\"} for char in share_id)
+        ):
+            raise AutomaticReplenishmentError("夸克分享候选 share_id 无效")
+        passcode = acquisition.get("passcode") or ""
+        if (
+            not isinstance(passcode, str)
+            or len(passcode) > 128
+            or any(ord(char) < 32 for char in passcode)
+        ):
+            raise AutomaticReplenishmentError("夸克分享候选 passcode 无效")
+        path_map = acquisition.get("file_path_by_id")
+        if not isinstance(path_map, Mapping):
+            raise AutomaticReplenishmentError("夸克分享候选缺少 file_path_by_id")
+        expected_raw = acquisition.get("expected_files")
+        if not isinstance(expected_raw, list) or not expected_raw:
+            raise AutomaticReplenishmentError("夸克分享候选缺少 expected_files")
+        expected: list[dict[str, object]] = []
+        for row in expected_raw:
+            if not isinstance(row, Mapping):
+                raise AutomaticReplenishmentError("夸克分享 expected_files 项无效")
+            file_id = row.get("file_id")
+            path = path_map.get(file_id) if isinstance(file_id, str) else None
+            name = row.get("name")
+            size = row.get("size")
+            gap_ids = row.get("gap_ids")
+            if (
+                not isinstance(file_id, str)
+                or not file_id
+                or len(file_id) > 512
+                or any(ord(char) < 32 or char in {"/", "\\"} for char in file_id)
+                or not isinstance(name, str)
+                or not name
+                or name != posixpath.basename(str(path).replace("\\", "/"))
+                or not isinstance(path, str)
+                or cls._safe_share_path(path) != path
+                or type(size) is not int
+                or size <= 0
+                or not isinstance(gap_ids, list)
+                or not gap_ids
+                or any(not isinstance(gap, str) or not gap for gap in gap_ids)
+                or len(set(gap_ids)) != len(gap_ids)
+            ):
+                raise AutomaticReplenishmentError("夸克分享 expected_files manifest 无效")
+            expected.append({
+                "file_id": file_id,
+                "path": path,
+                "name": name,
+                "size": size,
+                "gap_ids": list(gap_ids),
+            })
+        selected_set = set(selected)
+        covered = {
+            gap
+            for row in expected
+            for gap in row["gap_ids"]
+            if isinstance(gap, str)
+        }
+        if covered != selected_set:
+            raise AutomaticReplenishmentError(
+                "夸克分享 expected_files 未精确覆盖 selected_gap_ids"
+            )
+        output: dict[str, object] = {
+            "attempt_id": cls._attempt_id(destination),
+            "destination": destination,
+            "share_id": share_id,
+            "passcode": passcode,
+            "selected_gap_ids": list(selected),
+            "expected_files": expected,
+        }
+        title = selection.get("release_name")
+        if isinstance(title, str) and title and len(title) <= 512:
+            output["title"] = title
+        if task_id is not None:
+            output["task_id"] = task_id
+        return output
 
     @staticmethod
     def _delivery_kind(name: str) -> str:
@@ -606,40 +766,25 @@ class QuarkFastSaveAutomaticMaterializer:
             raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
         mkdir(posixpath.dirname(staging_root))
         mkdir(staging_root)
-        session = self.session_factory(alist, staging_root)
-        execute = getattr(self.bridge, "execute", None)
-        if not callable(execute):
-            raise AutomaticReplenishmentError("夸克分享 materializer 缺少 execute")
-
+        helper = self._helper()
+        self._require_helper_ready(helper)
         persisted_task_id = existing_task_id
-
-        def save_task_id(task_id: str) -> None:
-            nonlocal persisted_task_id
-            safe_task_id = self._safe_task_id(task_id)
-            if safe_task_id is None:
-                raise AutomaticReplenishmentError("夸克分享 task_id 无效")
-            if persisted_task_id is not None and persisted_task_id != safe_task_id:
-                raise self._in_doubt_error(
-                    "夸克分享返回了与已持久 attempt 不同的 task_id",
-                    task_id=persisted_task_id,
-                )
-            self._write_attempt_state(
-                workspace,
-                staging_root=staging_root,
-                selection=selection,
-                task_id=safe_task_id,
-            )
-            persisted_task_id = safe_task_id
-
-        save_result = execute(
+        share_save = getattr(helper, "share_save", None)
+        if not callable(share_save):
+            raise AutomaticReplenishmentError("夸克 Helper 缺少 typed share-save")
+        plan = self._share_save_plan(
             selection,
-            staging_root,
-            session,
+            destination=staging_root,
             task_id=existing_task_id,
-            on_task_id=None if existing_task_id is not None else save_task_id,
         )
+        save_result = share_save(plan)
         if not isinstance(save_result, Mapping):
             raise AutomaticReplenishmentError("夸克分享快转返回无效")
+        state = str(save_result.get("status") or "").strip().casefold()
+        if state in {"candidate_failed", "rejected", "invalid", "expired"}:
+            from engine.scrapeflow.quark_fast_save_bridge import QuarkShareExpiredError
+
+            raise QuarkShareExpiredError("Quark Helper rejected the reviewed share candidate")
         result_task_id = self._safe_task_id(save_result.get("task_id"))
         if result_task_id is None:
             raise self._in_doubt_error(
@@ -651,13 +796,31 @@ class QuarkFastSaveAutomaticMaterializer:
                 "夸克分享结果 task_id 与 attempt 状态不一致",
                 task_id=persisted_task_id,
             )
-        # Production persists through ``on_task_id`` immediately after save.
-        # Persisting once more also closes the contract for a completed query
-        # and for narrow bridge test doubles that only return their task id.
-        save_task_id(result_task_id)
-        rows = save_result.get("expected_files")
+        try:
+            self._write_attempt_state(
+                workspace,
+                staging_root=staging_root,
+                selection=selection,
+                task_id=result_task_id,
+            )
+        except Exception as exc:
+            error = self._in_doubt_error(
+                "夸克分享任务已提交但 attempt 状态未保存",
+                task_id=result_task_id,
+            )
+            raise error from exc
+        persisted_task_id = result_task_id
+        if state not in {
+            "submitted", "finished", "success", "done", "ready", "completed",
+        }:
+            error = self._in_doubt_error(
+                "Quark Helper share-save returned a non-terminal task state",
+                task_id=persisted_task_id,
+            )
+            raise error
+        rows = plan["expected_files"]
         if not isinstance(rows, list) or not rows:
-            raise AutomaticReplenishmentError("夸克分享快转缺少 expected_files")
+            raise AutomaticReplenishmentError("夸克分享 typed manifest 为空")
         files: list[dict[str, object]] = []
         for raw in rows:
             if not isinstance(raw, Mapping):
@@ -1042,7 +1205,7 @@ class AutomaticReplenishmentRuntime:
         alist: object,
         search: AutomaticProviderSearch,
         materializer: AutomaticMaterializer,
-        staging_root: str = "/quark/影视/ScrapeFlow/补源",
+        staging_root: str = CANONICAL_REPLENISHMENT_STAGING_ROOT,
         max_candidate_rounds: int = 3,
         progress: Callable[[EngineJob, str, Mapping[str, object]], None] | None = None,
         cancel_requested: Callable[[EngineJob], bool] | None = None,
@@ -1054,6 +1217,10 @@ class AutomaticReplenishmentRuntime:
         self.search = search
         self.materializer = materializer
         self.staging_root = _safe_path(staging_root, label="staging_root")
+        if self.staging_root != CANONICAL_REPLENISHMENT_STAGING_ROOT:
+            raise AutomaticReplenishmentError(
+                "自动补源 staging_root 必须是 /quark/影视/ScrapeFlow/补源"
+            )
         # The strict policy advances only after thirty distinct
         # candidate-local failures.  A caller may choose a smaller execution
         # slice, but the runtime must not silently cap a configured thirty
@@ -4400,6 +4567,7 @@ __all__ = [
     "AutomaticReplenishmentCancelled",
     "AutomaticReplenishmentError",
     "AutomaticReplenishmentRuntime",
+    "CANONICAL_REPLENISHMENT_STAGING_ROOT",
     "FixedTierAutomaticMaterializer",
     "LocalTorrentAutomaticMaterializer",
     "QuarkFastSaveAutomaticMaterializer",

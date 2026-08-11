@@ -1,8 +1,14 @@
-"""Minimal Quark magnet-offline bridge using fixed helper actions."""
+"""Typed client and bridge for the fixed host-side Quark Helper actions.
+
+The Helper is deliberately the only component that may operate the host's
+logged-in Quark session.  The API/container sends it a reviewed, task-scoped
+manifest over loopback; it never drives a GUI or forwards an AList cookie.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import ipaddress
 import json
 import os
 from pathlib import PurePosixPath
@@ -12,6 +18,8 @@ from typing import Any, Protocol
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from .provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 
 
 class QuarkMagnetBridgeError(RuntimeError):
@@ -39,12 +47,73 @@ class QuarkMagnetInDoubtError(QuarkMagnetBridgeError):
     reusable_candidate = True
 
 
-class QuarkMagnetHelper(Protocol):
+class _QuarkHelperRedirectError(QuarkMagnetBridgeError):
+    """The fixed Helper client never follows an HTTP redirect."""
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every 3xx response into an error before a second request exists."""
+
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+# The helper bearer token and reviewed manifests must never traverse an
+# environment proxy, and urllib's normal redirect behavior is unsafe for a
+# fixed local control boundary.  This opener is deliberately process-local and
+# has no cookie jar.
+_HELPER_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _RejectRedirectHandler(),
+)
+
+
+def _open_helper_request(request: Any, timeout: float) -> Any:
+    return _HELPER_OPENER.open(request, timeout=timeout)
+
+
+def _approved_helper_host(value: str) -> bool:
+    """Allow only numeric loopback addresses or the Docker host bridge name."""
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return value.casefold() in {"localhost", "host.docker.internal"}
+
+
+def _require_helper_health(value: object) -> Mapping[str, Any]:
+    """Validate the complete fixed Helper contract before any mutation."""
+    if not isinstance(value, Mapping):
+        raise QuarkMagnetBridgeError("Quark helper health returned an invalid object")
+    status = str(value.get("status") or "").strip().casefold()
+    if status not in {"ok", "ready"}:
+        raise QuarkMagnetBridgeError("Quark helper is not ready")
+    if value.get("authenticated") is not True:
+        raise QuarkMagnetBridgeError("Quark helper is not authenticated")
+    actions = value.get("actions")
+    if (
+        not isinstance(actions, list)
+        or any(not isinstance(action, str) for action in actions)
+        or len(actions) != len(set(actions))
+        or set(actions) != set(QUARK_HELPER_REQUIRED_ACTIONS)
+    ):
+        raise QuarkMagnetBridgeError("Quark helper actions do not match the fixed contract")
+    return value
+
+
+class QuarkHelper(Protocol):
     def health(self) -> Mapping[str, Any]: ...
+
+    def share_save(self, plan: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
     def magnet_submit(self, plan: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
     def magnet_status(self, task_id: str) -> Mapping[str, Any]: ...
+
+
+# Keep the old protocol name for source compatibility with the magnet bridge.
+# It is intentionally an alias of the complete fixed-action contract: a real
+# Helper cannot implement a magnet-only subset and still claim readiness.
+QuarkMagnetHelper = QuarkHelper
 
 
 class HttpQuarkHelperClient:
@@ -56,17 +125,29 @@ class HttpQuarkHelperClient:
         token: str,
         *,
         timeout: float = 90.0,
-        opener: Callable[..., Any] = urllib.request.urlopen,
+        opener: Callable[..., Any] = _open_helper_request,
     ) -> None:
         parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise QuarkMagnetBridgeError("Quark helper URL is invalid")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
             raise QuarkMagnetBridgeError("Quark helper URL must not contain credentials")
-        if parsed.scheme == "http" and parsed.hostname not in {
-            "127.0.0.1", "localhost", "::1", "host.docker.internal",
-        }:
-            raise QuarkMagnetBridgeError("plain HTTP Quark helper must be local")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise QuarkMagnetBridgeError("Quark helper URL port is invalid") from exc
+        if port is not None and not 1 <= port <= 65535:
+            raise QuarkMagnetBridgeError("Quark helper URL port is invalid")
+        if not _approved_helper_host(parsed.hostname):
+            raise QuarkMagnetBridgeError(
+                "Quark helper host must be loopback or Docker host bridge"
+            )
         if not token or len(token) < 24:
             raise QuarkMagnetBridgeError("Quark helper token is missing or too short")
         self.base_url = base_url.rstrip("/")
@@ -82,7 +163,12 @@ class HttpQuarkHelperClient:
         )
 
     def _request(self, path: str, body: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
-        if path not in {"/health", "/v1/magnet-submit", "/v1/magnet-status"}:
+        if path not in {
+            "/health",
+            "/v1/share-save",
+            "/v1/magnet-submit",
+            "/v1/magnet-status",
+        }:
             raise QuarkMagnetBridgeError("unsupported Quark helper action")
         payload = None if body is None else json.dumps(body, ensure_ascii=False).encode()
         request = urllib.request.Request(
@@ -97,29 +183,85 @@ class HttpQuarkHelperClient:
         )
         try:
             with self.opener(request, timeout=self.timeout) as response:
+                response_status = getattr(response, "status", None)
+                if response_status is None:
+                    getcode = getattr(response, "getcode", None)
+                    response_status = getcode() if callable(getcode) else None
+                if (
+                    isinstance(response_status, int)
+                    and 300 <= response_status < 400
+                ):
+                    raise _QuarkHelperRedirectError("Quark helper redirect refused")
+                geturl = getattr(response, "geturl", None)
+                response_url = geturl() if callable(geturl) else request.full_url
+                if response_url != request.full_url:
+                    raise _QuarkHelperRedirectError("Quark helper redirect refused")
                 value = json.load(response)
+        except _QuarkHelperRedirectError:
+            raise
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise QuarkMagnetBridgeError("Quark helper redirect refused") from exc
             raw = exc.read(16_384)
             in_doubt = False
-            message = ""
+            failure_scope = ""
             try:
                 error_value = json.loads(raw.decode("utf-8", "replace"))
                 if isinstance(error_value, Mapping):
                     in_doubt = error_value.get("in_doubt") is True
-                    message = str(error_value.get("error") or error_value.get("message") or "")
+                    raw_scope = error_value.get("failure_scope")
+                    failure_scope = (
+                        raw_scope.strip().casefold()
+                        if isinstance(raw_scope, str) else ""
+                    )
             except (UnicodeError, json.JSONDecodeError):
                 pass
-            if path == "/v1/magnet-submit" and (
-                (exc.code == 409 and in_doubt) or exc.code >= 500
+            # A received HTTP error proves that the Helper answered.  In
+            # particular, ``503 not_ready`` is a retryable infrastructure
+            # outage, not a possibly-created Quark task.  Only the Helper's
+            # explicit reconciliation response (409 + in_doubt) is ambiguous
+            # at this boundary; lost transport responses are handled below.
+            if path in {"/v1/share-save", "/v1/magnet-submit"} and (
+                exc.code == 409 and in_doubt
             ):
+                if path == "/v1/share-save":
+                    from engine.scrapeflow.quark_fast_save_bridge import QuarkShareInDoubtError
+
+                    raise QuarkShareInDoubtError(
+                        "Quark share-save is in doubt; reconcile the task destination"
+                    ) from exc
                 raise QuarkMagnetInDoubtError(
                     "Quark magnet submit is in doubt; reconcile the task destination"
                 ) from exc
+            if path == "/v1/share-save" and (
+                failure_scope == "candidate" or exc.code == 422
+            ):
+                from engine.scrapeflow.quark_fast_save_bridge import QuarkShareExpiredError
+
+                raise QuarkShareExpiredError(
+                    "Quark share-save rejected the reviewed share candidate"
+                ) from exc
+            if path == "/v1/magnet-submit" and (
+                failure_scope == "candidate" or exc.code == 422
+            ):
+                # This is an explicit, received rejection of the reviewed
+                # magnet payload.  It is neither a Helper outage nor an
+                # ambiguous post-submit result, so normal candidate exclusion
+                # rules may safely take over.
+                raise QuarkMagnetCandidateError(
+                    "Quark helper rejected the reviewed magnet candidate"
+                ) from exc
             raise QuarkMagnetBridgeError(
-                f"Quark helper HTTP error: status={exc.code}, message={message[:200]!r}"
+                f"Quark helper HTTP error: status={exc.code}"
             ) from exc
         except Exception as exc:
-            if path == "/v1/magnet-submit":
+            if path in {"/v1/share-save", "/v1/magnet-submit"}:
+                if path == "/v1/share-save":
+                    from engine.scrapeflow.quark_fast_save_bridge import QuarkShareInDoubtError
+
+                    raise QuarkShareInDoubtError(
+                        "Quark share-save response is unknown; reconcile before retrying"
+                    ) from exc
                 raise QuarkMagnetInDoubtError(
                     "Quark magnet submit response is unknown; reconcile before retrying"
                 ) from exc
@@ -127,7 +269,13 @@ class HttpQuarkHelperClient:
                 f"Quark helper unavailable: {type(exc).__name__}"
             ) from exc
         if not isinstance(value, Mapping):
-            if path == "/v1/magnet-submit":
+            if path in {"/v1/share-save", "/v1/magnet-submit"}:
+                if path == "/v1/share-save":
+                    from engine.scrapeflow.quark_fast_save_bridge import QuarkShareInDoubtError
+
+                    raise QuarkShareInDoubtError(
+                        "Quark share-save returned an invalid response; reconcile before retrying"
+                    )
                 raise QuarkMagnetInDoubtError(
                     "Quark magnet submit returned an invalid response; reconcile before retrying"
                 )
@@ -136,6 +284,16 @@ class HttpQuarkHelperClient:
 
     def health(self) -> Mapping[str, Any]:
         return self._request("/health")
+
+    def share_save(self, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Save/reconcile one reviewed share into its exact task staging root.
+
+        ``plan`` is intentionally opaque to this transport.  It is constructed
+        and validated by the materializer; the Helper must treat it as the
+        complete authority boundary and return only after the task is
+        reconcilable.  A lost submit response is classified as ``in_doubt``.
+        """
+        return self._request("/v1/share-save", plan)
 
     def magnet_submit(self, plan: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._request("/v1/magnet-submit", plan)
@@ -216,7 +374,7 @@ def normalize_quark_magnet_selection(
         "infohash": match.group(1).lower(),
         "selected_gap_ids": list(selected),
         "expected_files": expected,
-        "helper_actions": ["health", "magnet-submit", "magnet-status"],
+        "helper_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
     }
 
 
@@ -245,9 +403,7 @@ class QuarkMagnetOfflineBridge:
         on_task_id: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         plan = normalize_quark_magnet_selection(selection, destination)
-        health = self.helper.health()
-        if health.get("status") not in {"ok", "ready"}:
-            raise QuarkMagnetBridgeError("Quark helper is not ready")
+        _require_helper_health(self.helper.health())
         if not isinstance(task_id, str) or not task_id:
             submitted = self.helper.magnet_submit({
                 "destination": destination,
@@ -293,6 +449,7 @@ class QuarkMagnetOfflineBridge:
 
 __all__ = [
     "HttpQuarkHelperClient",
+    "QuarkHelper",
     "QuarkMagnetBridgeError",
     "QuarkMagnetCandidateError",
     "QuarkMagnetDeliveryError",

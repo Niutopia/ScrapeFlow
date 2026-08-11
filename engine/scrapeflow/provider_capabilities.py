@@ -44,6 +44,14 @@ ACTIVE_PROVIDER_ACQUISITION_KINDS = {
 ACTIVE_PROVIDERS = frozenset(ACTIVE_PROVIDER_ACQUISITION_KINDS)
 
 
+def _quark_helper_runtime_dependency() -> dict[str, Any]:
+    """Return a fresh declaration of the complete typed Helper contract."""
+    return {
+        "helper": QUARK_HELPER_NAME,
+        "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+    }
+
+
 def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
     """Return a fresh JSON-safe snapshot for health/search projections.
 
@@ -60,6 +68,7 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
             "status_scope": "declared_materializer",
             "acquisition_kinds": [ACQUISITION_QUARK_FAST_SAVE],
             "materializer": "QuarkFastSaveMaterializer",
+            "runtime_dependency": _quark_helper_runtime_dependency(),
             "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
         },
         PROVIDER_QUARK_MAGNET: {
@@ -67,10 +76,7 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
             "status_scope": "declared_materializer",
             "acquisition_kinds": [ACQUISITION_QUARK_MAGNET_OFFLINE],
             "materializer": "QuarkMagnetOfflineMaterializer",
-            "runtime_dependency": {
-                "helper": QUARK_HELPER_NAME,
-                "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
-            },
+            "runtime_dependency": _quark_helper_runtime_dependency(),
             "sfx": {"status": "deferred", "reason": "provider_v1_media_and_subtitles_only"},
         },
         PROVIDER_LOCAL_MAGNET: {

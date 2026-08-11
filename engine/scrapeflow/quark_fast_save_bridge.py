@@ -72,11 +72,71 @@ class JsonTransport(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before urllib can replay the delegated Cookie."""
+
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+def _build_quark_opener() -> urllib.request.OpenerDirector:
+    """Build a transport opener without consulting ambient proxy settings."""
+    # A delegated AList Cookie is valid only at the reviewed Quark API
+    # boundary.  Passing an explicit empty mapping is important: ProxyHandler
+    # otherwise reads HTTP(S)_PROXY/NO_PROXY from the process environment.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _RejectRedirectHandler(),
+    )
+
+
+# Keep this opener process-local, proxy-free, redirect-free, and without a
+# cookie jar so ambient host configuration cannot widen that boundary.
+_QUARK_OPENER = _build_quark_opener()
+
+
+def _open_quark_request(request: Any, timeout: float) -> Any:
+    return _QUARK_OPENER.open(request, timeout=timeout)
+
+
+def _approved_quark_endpoint(endpoint: str) -> bool:
+    """Require an unadorned URL below one of the two fixed Quark API bases."""
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    for base in (QUARK_SHARE_API, QUARK_DRIVE_API):
+        allowed = urllib.parse.urlsplit(base)
+        if (
+            parsed.hostname == allowed.hostname
+            and parsed.netloc == allowed.netloc
+            and parsed.path.startswith(allowed.path + "/")
+        ):
+            return True
+    return False
+
+
 class UrlLibQuarkTransport:
     """Fixed-origin JSON transport which never exposes the cookie in errors."""
 
-    def __init__(self, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 60.0,
+        opener: Callable[..., Any] = _open_quark_request,
+    ) -> None:
         self.timeout = timeout
+        self.opener = opener
 
     def request(
         self,
@@ -87,7 +147,7 @@ class UrlLibQuarkTransport:
         body: Mapping[str, Any] | None,
         cookie: str,
     ) -> Mapping[str, Any]:
-        if not any(endpoint.startswith(base + "/") for base in (QUARK_SHARE_API, QUARK_DRIVE_API)):
+        if not _approved_quark_endpoint(endpoint):
             raise QuarkBridgeError("Quark endpoint escaped the fixed API origin")
         query = urllib.parse.urlencode({key: str(value) for key, value in params.items()})
         url = endpoint + ("?" + query if query else "")
@@ -101,9 +161,19 @@ class UrlLibQuarkTransport:
             "User-Agent": QUARK_UA,
         })
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self.opener(request, timeout=self.timeout) as response:
+                geturl = getattr(response, "geturl", None)
+                final_url = geturl() if callable(geturl) else None
+                if final_url != url:
+                    raise QuarkBridgeError(
+                        "Quark response URL escaped the fixed API endpoint"
+                    )
                 value = json.load(response)
+        except QuarkBridgeError:
+            raise
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise QuarkBridgeError("Quark redirect refused") from exc
             raw = exc.read(16_384)
             code: Any = None
             message = ""
@@ -275,9 +345,12 @@ class QuarkFastSaveBridge:
         )
         if value.get("code") not in {0, None} or value.get("status") not in {200, None}:
             code = value.get("code")
-            message = str(value.get("message") or "Quark operation failed")
             error = QuarkShareExpiredError if code in QUARK_SHARE_INVALID_CODES else QuarkBridgeError
-            raise error(f"Quark operation failed: code={code}, message={message[:160]}")
+            # Quark business-error text is server-controlled and may echo a
+            # cookie, token, or signed locator.  Keep it out of the exception
+            # entirely; callers persist/log the exception at several state
+            # boundaries and cannot safely assume the text is redacted.
+            raise error(f"Quark operation failed: code={code}")
         return value
 
     def _resolve_destination(self, session: QuarkSession, destination: str) -> str:

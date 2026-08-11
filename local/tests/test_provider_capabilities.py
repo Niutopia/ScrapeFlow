@@ -130,12 +130,21 @@ class ProviderCapabilityTests(unittest.TestCase):
             snapshot["quark_magnet"]["status_scope"],
             "declared_materializer",
         )
+        expected_helper_dependency = {
+            "helper": QUARK_HELPER_NAME,
+            "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+        }
+        self.assertEqual(
+            snapshot["quark_share"]["runtime_dependency"],
+            expected_helper_dependency,
+        )
         self.assertEqual(
             snapshot["quark_magnet"]["runtime_dependency"],
-            {
-                "helper": QUARK_HELPER_NAME,
-                "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
-            },
+            expected_helper_dependency,
+        )
+        self.assertIsNot(
+            snapshot["quark_share"]["runtime_dependency"],
+            snapshot["quark_magnet"]["runtime_dependency"],
         )
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
