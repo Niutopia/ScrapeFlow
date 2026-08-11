@@ -3345,7 +3345,7 @@ class SimpleEngineRunner:
         if callable(context_fn):
             contextual_type, prefer_animation = context_fn(
                 source,
-                str(body.get("parent_path") or self.library_root),
+                selected_root,
             )
             if requested_type is None:
                 requested_type = contextual_type

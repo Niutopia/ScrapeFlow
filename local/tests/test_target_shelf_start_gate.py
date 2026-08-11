@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from engine.scrapeflow.current_plan import plan_to_dict
 from engine.scrapeflow.identity_matching import _query_from_source
@@ -134,6 +136,35 @@ class TargetShelfStartGateTests(unittest.TestCase):
                 )
                 self.assertNotIn(suffix, query.casefold())
                 self.assertIn("Movie", query)
+
+    def test_archive_identity_uses_canonical_query_and_selected_shelf_context(self) -> None:
+        match = SimpleNamespace(
+            media_type="tv",
+            tmdb_id=209867,
+            title="葬送的芙莉莲",
+            year="2023",
+            confidence=1.0,
+            decision_trace={},
+        )
+        source = (
+            "/library/ScrapeFlow/归档/job/archive/"
+            "Frieren.Beyond.Journeys.End.2023.zip"
+        )
+        with patch(
+            "engine.scraper.auto_match_tmdb",
+            return_value=(match, []),
+        ) as matcher:
+            request, identity = self.runner.resolve_automatic_request(
+                source,
+                target_shelf="anime",
+            )
+
+        query = matcher.call_args.args[1]
+        self.assertNotIn("zip", query.casefold())
+        self.assertEqual(matcher.call_args.kwargs["media_type"], "tv")
+        self.assertTrue(matcher.call_args.kwargs["prefer_animation"])
+        self.assertEqual(request.query, query)
+        self.assertEqual(identity.target_shelf_root, "/library/番剧")
 
     def test_pending_registration_has_zero_formal_calls_then_start_is_idempotent(self) -> None:
         pending = self.runner.create_pending_job("/library/待刮削/Source")
