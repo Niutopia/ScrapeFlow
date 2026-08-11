@@ -72,6 +72,33 @@ def _sample_state(root: Path) -> tuple[Path, Path, Path]:
 
 
 class OfflineBackupTests(unittest.TestCase):
+    def test_wal_mode_quick_check_does_not_mutate_backup_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alist, scrapeflow, output = _sample_state(root)
+            with sqlite3.connect(alist / "data.db") as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+            source_names = {
+                path.name for path in alist.iterdir() if path.is_file()
+            }
+
+            create_offline_backup(
+                alist_data=alist,
+                scrapeflow_data=scrapeflow,
+                output_dir=output,
+                media_snapshot_note="fake media snapshot",
+                label="wal-backup",
+            )
+            copied = output / "wal-backup" / "alist-data"
+            copied_names = {
+                path.name for path in copied.iterdir() if path.is_file()
+            }
+            verify_offline_backup(output / "wal-backup")
+
+        self.assertEqual(copied_names, source_names)
+        self.assertNotIn("data.db-shm", copied_names - source_names)
+        self.assertNotIn("data.db-wal", copied_names - source_names)
+
     def test_create_verify_and_restore_preserve_paused_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

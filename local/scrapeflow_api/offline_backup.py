@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -129,9 +130,24 @@ def _sqlite_quick_check(root: Path) -> list[dict[str, object]]:
         if not path.is_file() or path.suffix.casefold() not in suffixes:
             continue
         try:
-            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-                rows = [row[0] for row in connection.execute("PRAGMA quick_check")]
-        except sqlite3.Error as exc:
+            # Opening a WAL-mode database with SQLite's regular read-only URI
+            # can still create ``-wal``/``-shm`` companions beside the file.
+            # Verification must never mutate the backup it is measuring, so
+            # run quick_check on a disposable copy.  Preserve a durable WAL or
+            # rollback journal when one exists; ``-shm`` is process-local and
+            # is deliberately regenerated only inside the scratch directory.
+            with tempfile.TemporaryDirectory(
+                prefix="scrapeflow-sqlite-check-",
+            ) as temporary:
+                scratch = Path(temporary) / path.name
+                shutil.copy2(path, scratch)
+                for suffix in ("-wal", "-journal"):
+                    companion = Path(str(path) + suffix)
+                    if companion.is_file():
+                        shutil.copy2(companion, Path(str(scratch) + suffix))
+                with sqlite3.connect(scratch) as connection:
+                    rows = [row[0] for row in connection.execute("PRAGMA quick_check")]
+        except (OSError, sqlite3.Error) as exc:
             raise OfflineBackupError(f"SQLite quick_check 无法执行: {path}") from exc
         if rows != ["ok"]:
             raise OfflineBackupError(f"SQLite quick_check 未通过: {path}: {rows}")
