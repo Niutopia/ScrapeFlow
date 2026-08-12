@@ -186,7 +186,9 @@ class AutomaticIdentity:
     title: str
     year: str
     confidence: float
-    target_parent: str
+    # Read-only reconciliation deliberately has no destination yet.  The
+    # post-selection planning adapter fills this field after /start.
+    target_parent: str | None
     season: int | None
     trace: Mapping[str, object]
     target_shelf: str | None = None
@@ -245,6 +247,7 @@ def _cancellation_checkpoint() -> None:
 
 
 _ENGINE_PHASES = frozenset({
+    "reconciling", "reconciled", "reconciliation_uncertain",
     "awaiting_target_shelf", "queued", "analyzing", "archive_preprocessing", "identity_matching",
     "target_policy_conflict", "planning", "planned",
     "executing", "verifying", "cleaning", "executed", "completed",
@@ -1831,7 +1834,7 @@ class SimpleEngineRunner:
         """Record a passive intake observation without deleting/retrying a job."""
         with self.worker_lock():
             job = self._read(job_id)
-            if job.phase != "awaiting_target_shelf":
+            if job.phase not in {"awaiting_target_shelf", "reconciling"}:
                 return job
             summary = dict(job.summary)
             if summary.get("waiting_source_state") == "missing" and job.error:
@@ -1870,20 +1873,24 @@ class SimpleEngineRunner:
             now = _now()
             job = EngineJob(
                 id=identifier,
-                phase="awaiting_target_shelf",
+                phase="reconciling",
                 created_at=now,
                 updated_at=now,
                 request={"source_path": source},
                 plan={},
                 summary={
                     "automatic": True,
-                    "automatic_stage": "awaiting_target_shelf",
+                    "automatic_stage": "reconciling",
                     "source_root": source,
                     "ingress_source_path": source,
                     "mode": "auto",
                     "automatic_attempts": 0,
                     "automatic_terminal": False,
                     "next_retry_seconds": None,
+                    "reconciliation": {
+                        "status": "pending",
+                        "outcome": None,
+                    },
                 },
                 target_shelf=None,
                 target_root=None,
@@ -1923,6 +1930,32 @@ class SimpleEngineRunner:
             job = self._read(job_id)
             if job.summary.get("internal_child") is True or job.summary.get("audit_owned") is True:
                 raise EngineJobConflictError("内部任务不能通过用户目标货架启动")
+            has_reconciliation = "reconciliation" in job.summary
+            reconciliation = (
+                job.summary.get("reconciliation")
+                if isinstance(job.summary.get("reconciliation"), Mapping)
+                else {}
+            )
+            reconciliation_outcome = str(reconciliation.get("outcome") or "")
+            if job.phase == "reconciling":
+                raise EngineJobConflictError("只读对账尚未完成，不能选择目标货架")
+            if job.phase == "reconciliation_uncertain":
+                raise EngineJobConflictError("身份/正式库对账不确定，请先处理 needs_attention")
+            if job.phase == "reconciled":
+                raise EngineJobConflictError("已匹配现有作品，不需要重新选择目标货架")
+            # Legacy records have no reconciliation key and retain their
+            # historical /start compatibility. A record claiming a
+            # reconciliation result must name ``new_work`` exactly; an empty
+            # or malformed projection cannot reopen formal processing.
+            if has_reconciliation and reconciliation_outcome != "new_work":
+                raise EngineJobConflictError("只有确认 new_work 后才能选择目标货架")
+            if has_reconciliation and reconciliation_outcome == "new_work":
+                try:
+                    self._reconciled_identity(reconciliation.get("identity"))
+                except EngineRequestError as exc:
+                    raise EngineJobConflictError(
+                        "new_work 对账身份记录无效，请先处理 needs_attention"
+                    ) from exc
             if job.phase not in {"awaiting_target_shelf", "target_policy_conflict"}:
                 # A duplicate start is idempotent only while the selected
                 # root is still in the pre-terminal workflow.  Once the job
@@ -1987,6 +2020,405 @@ class SimpleEngineRunner:
             )
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return updated
+
+    @staticmethod
+    def _reconciliation_formal_roots(library_root: str) -> tuple[str, str, str]:
+        """Return the three closed formal shelves for a configured library root."""
+        return tuple(
+            target_root_for_shelf(library_root, shelf)
+            for shelf in (TargetShelf.MOVIE, TargetShelf.ANIME, TargetShelf.US_TV)
+        )
+
+    @staticmethod
+    def _reconciliation_identity_key(identity: AutomaticIdentity) -> tuple[int, str] | None:
+        if identity.media_type not in {"movie", "tv"} or identity.tmdb_id <= 0:
+            return None
+        return identity.tmdb_id, identity.media_type
+
+    @staticmethod
+    def _reconciliation_work_metadata(work: Mapping[str, object]) -> Mapping[str, object]:
+        metadata = work.get("metadata")
+        return metadata if isinstance(metadata, Mapping) else work
+
+    @classmethod
+    def _reconciliation_work_key(cls, work: Mapping[str, object]) -> tuple[int, str] | None:
+        metadata = cls._reconciliation_work_metadata(work)
+        raw_tmdb_id = metadata.get("tmdb_id")
+        if isinstance(raw_tmdb_id, str) and raw_tmdb_id.isdecimal():
+            raw_tmdb_id = int(raw_tmdb_id)
+        media_type = str(metadata.get("media_type") or metadata.get("type") or "").casefold()
+        if type(raw_tmdb_id) is not int or raw_tmdb_id <= 0 or media_type not in {"movie", "tv"}:
+            return None
+        return raw_tmdb_id, media_type
+
+    @classmethod
+    def _reconciliation_target_root(cls, work: Mapping[str, object]) -> str | None:
+        metadata = cls._reconciliation_work_metadata(work)
+        value = metadata.get("target_root") or metadata.get("series_root")
+        if not isinstance(value, str) or not value.startswith("/"):
+            return None
+        try:
+            return _safe_remote_path(value, field="formal target_root", allow_root=False)
+        except EngineRequestError:
+            return None
+
+    @staticmethod
+    def _reconciliation_scope_is_ambiguous(work: Mapping[str, object]) -> bool:
+        metadata = SimpleEngineRunner._reconciliation_work_metadata(work)
+        scope = metadata.get("identity_scope")
+        if not isinstance(scope, Mapping):
+            # Completed legacy job records are a weaker but still durable
+            # identity projection. They can only classify a work when no
+            # competing formal identity exists; we do not invent a scope.
+            return False
+        return str(scope.get("kind") or "").casefold().startswith("ambiguous_")
+
+    def _reconciliation_shelf_for_work(self, target_root: str) -> str | None:
+        parent = posixpath.dirname(target_root)
+        shelf = target_shelf_for_root(self.library_root, parent)
+        return shelf.value if shelf is not None else None
+
+    @staticmethod
+    def _reconciliation_public_work(work: Mapping[str, object]) -> dict[str, object]:
+        metadata = SimpleEngineRunner._reconciliation_work_metadata(work)
+        return {
+            "tmdb_id": metadata.get("tmdb_id"),
+            "title": metadata.get("title"),
+            "year": metadata.get("year"),
+            "media_type": metadata.get("media_type") or metadata.get("type"),
+            "target_root": metadata.get("target_root") or metadata.get("series_root"),
+            "identity_source": metadata.get("identity_source"),
+            "identity_scope": dict(metadata.get("identity_scope"))
+            if isinstance(metadata.get("identity_scope"), Mapping)
+            else None,
+        }
+
+    @staticmethod
+    def _reconciliation_reason(exc: Exception) -> str:
+        message = redact_error(exc).strip()
+        return message[:320] if message else type(exc).__name__
+
+    @staticmethod
+    def _reconciled_identity(value: object) -> AutomaticIdentity:
+        """Validate the compact identity persisted by read-only reconciliation."""
+        if not isinstance(value, Mapping):
+            raise EngineRequestError("new_work 对账缺少已确认身份")
+        media_type = value.get("media_type")
+        raw_tmdb_id = value.get("tmdb_id")
+        if (
+            not isinstance(media_type, str)
+            or media_type not in {"movie", "tv"}
+            or isinstance(raw_tmdb_id, bool)
+            or not isinstance(raw_tmdb_id, int)
+            or raw_tmdb_id <= 0
+        ):
+            raise EngineRequestError("new_work 对账身份记录无效")
+        title = value.get("title")
+        year = value.get("year")
+        season = value.get("season")
+        trace = value.get("trace")
+        if not isinstance(title, str) or not title.strip():
+            raise EngineRequestError("new_work 对账身份缺少标题")
+        if not isinstance(year, str) or not year.strip():
+            raise EngineRequestError("new_work 对账身份缺少年份")
+        if media_type == "tv":
+            if isinstance(season, bool) or not isinstance(season, int) or season < 0:
+                raise EngineRequestError("new_work 对账身份季号无效")
+        elif season is not None:
+            raise EngineRequestError("电影 new_work 对账身份不应包含季号")
+        if not isinstance(trace, Mapping):
+            trace = {}
+        raw_confidence = value.get("confidence", 1.0)
+        if (
+            isinstance(raw_confidence, bool)
+            or not isinstance(raw_confidence, (int, float))
+            or not 0.0 <= float(raw_confidence) <= 1.0
+        ):
+            raise EngineRequestError("new_work 对账身份置信度无效")
+        return AutomaticIdentity(
+            media_type=media_type,
+            tmdb_id=raw_tmdb_id,
+            title=title.strip(),
+            year=year.strip(),
+            # Preserve the existing Engine's bounded evidence value.  It is
+            # not re-scored here, but malformed persisted evidence must fail
+            # closed instead of silently becoming a perfect match.
+            confidence=float(raw_confidence),
+            target_parent=None,
+            season=season if media_type == "tv" else None,
+            trace=dict(trace),
+        )
+
+    def _reconciliation_source_video_paths(self, source: str) -> set[str] | None:
+        """Return only real intake videos from an existing read-only walk."""
+        walker = getattr(self.alist, "walk", None)
+        if not callable(walker):
+            return None
+        try:
+            rows = walker(source, ignore_orphan_temp=True)
+        except TypeError:
+            try:
+                rows = walker(source)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if not isinstance(rows, list):
+            return None
+        paths: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            path = row.get("full_path") or row.get("path") or row.get("name")
+            if isinstance(path, str) and is_video_filename(path):
+                paths.add(path)
+        return paths
+
+    def _reconciliation_source_episode_tokens(
+        self,
+        source: str,
+        *,
+        default_season: int | None,
+    ) -> set[tuple[int, int]] | None:
+        """Reuse the shared episode parser over real intake videos only."""
+        paths = self._reconciliation_source_video_paths(source)
+        if paths is None:
+            return None
+        from engine.scrapeflow.replenishment_matching import audit_episode_tokens
+
+        tokens: set[tuple[int, int]] = set()
+        for path in paths:
+            tokens.update(audit_episode_tokens(path, default_season=default_season))
+        return tokens
+
+    def _reconciliation_outcome(
+        self,
+        *,
+        source: str,
+        identity: AutomaticIdentity,
+        report: Mapping[str, object],
+        works: list[dict[str, object]],
+        semantic: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object] | None, str | None]:
+        """Classify one known identity without authorising any side effect."""
+        identity_key = self._reconciliation_identity_key(identity)
+        if identity_key is None:
+            return "uncertain", "Engine identity lacks a supported media type or TMDB id", None, None
+        if report.get("complete") is not True or report.get("status") != "completed":
+            return "uncertain", "正式库只读清单不完整", None, None
+        matches = [
+            work for work in works
+            if self._reconciliation_work_key(work) == identity_key
+        ]
+        if not matches:
+            # Any formal media without a projected identity makes absence
+            # inconclusive. The audit exposes these directly as unknowns;
+            # do not infer a new work merely from a missing NFO match.
+            semantic_unknowns = semantic.get("unknowns")
+            if isinstance(semantic_unknowns, list) and semantic_unknowns:
+                return "uncertain", "正式库存在未能由 NFO/完成任务确认身份的媒体", None, None
+            return "new_work", "三库中没有已确认的同一 TMDB 作品", None, None
+        unique_roots = {
+            target for work in matches
+            if (target := self._reconciliation_target_root(work)) is not None
+        }
+        if len(matches) != 1 or len(unique_roots) != 1:
+            return "uncertain", "多个正式作品身份匹配，不能安全选择工作根", None, None
+        work = matches[0]
+        target_root = next(iter(unique_roots))
+        shelf = self._reconciliation_shelf_for_work(target_root)
+        if shelf is None or self._reconciliation_scope_is_ambiguous(work):
+            return "uncertain", "正式作品身份范围或一级货架不明确", work, shelf
+        work_gaps = semantic.get("gaps") if isinstance(semantic.get("gaps"), list) else []
+        work_unknowns = semantic.get("unknowns") if isinstance(semantic.get("unknowns"), list) else []
+        matching_gaps = [
+            row for row in work_gaps
+            if isinstance(row, Mapping)
+            and isinstance(row.get("media"), Mapping)
+            and row["media"].get("tmdb_id") == identity.tmdb_id
+            and row["media"].get("target_root") == target_root
+        ]
+        matching_unknowns = [
+            row for row in work_unknowns
+            if isinstance(row, Mapping)
+            and (
+                row.get("target_root") == target_root
+                or row.get("work") == f"tmdb:{identity.tmdb_id}"
+                or (
+                    isinstance(row.get("path"), str)
+                    and (
+                        row["path"] == target_root
+                        or row["path"].startswith(target_root.rstrip("/") + "/")
+                    )
+                )
+                or any(
+                    isinstance(path, str)
+                    and (
+                        path == target_root
+                        or path.startswith(target_root.rstrip("/") + "/")
+                    )
+                    for path in (
+                        row.get("uncovered_video_paths")
+                        if isinstance(row.get("uncovered_video_paths"), list)
+                        else []
+                    )
+                )
+            )
+        ]
+        media_gap_kinds = {"missing_media", "missing_episode", "missing_season"}
+        matching_media_gaps = [
+            row for row in matching_gaps
+            if str(row.get("kind") or "") in media_gap_kinds
+        ]
+        if identity.media_type == "movie" and matching_media_gaps:
+            source_videos = self._reconciliation_source_video_paths(source)
+            if source_videos is None:
+                return "uncertain", "无法只读确认输入电影媒体", work, shelf
+            if source_videos:
+                return "merge_existing", "输入包含可补入既有正式电影的视频", work, shelf
+        if identity.media_type == "tv":
+            source_tokens = self._reconciliation_source_episode_tokens(
+                source,
+                default_season=identity.season,
+            )
+            if source_tokens is None:
+                return "uncertain", "无法只读确认输入剧集范围", work, shelf
+            inventory = report.get("inventory") if isinstance(report.get("inventory"), list) else []
+            formal_tokens: set[tuple[int, int]] = set()
+            from engine.scrapeflow.replenishment_matching import audit_episode_tokens
+
+            for row in inventory:
+                if not isinstance(row, Mapping) or row.get("type") != "file":
+                    continue
+                path = row.get("path")
+                if (
+                    isinstance(path, str)
+                    and is_video_filename(path)
+                    and (path == target_root or path.startswith(target_root.rstrip("/") + "/"))
+                ):
+                    formal_tokens.update(audit_episode_tokens(path, default_season=identity.season))
+            if not source_tokens:
+                return "uncertain", "输入剧集没有可验证的季集坐标", work, shelf
+            if source_tokens - formal_tokens:
+                return "merge_existing", "输入包含正式作品尚未覆盖的明确剧集", work, shelf
+        if matching_unknowns:
+            return "uncertain", "正式作品完整性证据不足", work, shelf
+        if matching_media_gaps:
+            return "existing_gap", "已确认正式作品存在媒体缺口", work, shelf
+        return "duplicate_complete", "正式作品身份与媒体范围已充分匹配", work, shelf
+
+    def reconcile_automatic_job(self, job_id: str) -> EngineJob:
+        """Persist a bounded, read-only intake reconciliation result.
+
+        This method deliberately calls only existing Engine identity code and
+        the existing library audit projections. It never invokes archive
+        preprocessing, a planner, executor, Provider, cleanup, or any formal
+        writer. The sole mutation is the task's local JSON record.
+        """
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.phase != "reconciling":
+                return job
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
+            identity: AutomaticIdentity | None = None
+            matched_work: Mapping[str, object] | None = None
+            matched_shelf: str | None = None
+            try:
+                source = self._job_ingress_source(job)
+                if not self.source_directory_exists(source):
+                    raise EngineRequestError("待刮削来源目录不存在或不可读取")
+                identity = self.resolve_automatic_identity(source)
+                from local.scrapeflow_api.simple_library_audit import (
+                    SimpleLibraryAuditor,
+                    TmdbEpisodeCatalog,
+                    _merge_library_and_job_works,
+                    automatic_works_from_engine_jobs,
+                    bootstrap_automatic_works_from_library,
+                    build_automatic_library_gaps,
+                )
+
+                formal_roots = self._reconciliation_formal_roots(self.library_root)
+                report = SimpleLibraryAuditor(
+                    self.alist,
+                    formal_roots=formal_roots,
+                ).scan()
+                library_works = bootstrap_automatic_works_from_library(
+                    report,
+                    self.alist,
+                    formal_roots=formal_roots,
+                )
+                job_works = automatic_works_from_engine_jobs(self.list_jobs())
+                works, _unowned = _merge_library_and_job_works(library_works, job_works)
+                # Reuse the audit's bounded, read-only published-episode
+                # evidence for TV work. A TMDB failure stays unknown and is
+                # classified fail-closed rather than treating a partial TV
+                # directory as complete.
+                catalog = TmdbEpisodeCatalog(self.tmdb)
+                try:
+                    catalog.prefetch(works)
+                except Exception:
+                    pass
+                semantic = build_automatic_library_gaps(
+                    report,
+                    works,
+                    episode_catalog=catalog,
+                )
+                outcome, reason, matched_work, matched_shelf = self._reconciliation_outcome(
+                    source=source,
+                    identity=identity,
+                    report=report,
+                    works=works,
+                    semantic=semantic,
+                )
+            except Exception as exc:
+                outcome = "uncertain"
+                reason = self._reconciliation_reason(exc)
+            summary = dict(job.summary)
+            reconciliation: dict[str, object] = {
+                "status": "completed" if outcome != "uncertain" else "needs_attention",
+                "outcome": outcome,
+                "reason": reason,
+            }
+            if identity is not None:
+                reconciliation["identity"] = identity.as_dict()
+            if matched_work is not None:
+                reconciliation["matched_formal_work"] = self._reconciliation_public_work(matched_work)
+            if matched_shelf is not None:
+                reconciliation["matched_shelf"] = matched_shelf
+            summary.update({
+                "automatic": True,
+                "automatic_stage": (
+                    "awaiting_target_shelf" if outcome == "new_work"
+                    else "reconciliation_needs_attention" if outcome == "uncertain"
+                    else "reconciled"
+                ),
+                "reconciliation": reconciliation,
+                "reconciliation_outcome": outcome,
+                "automatic_terminal": outcome != "new_work",
+                "next_retry_seconds": None,
+            })
+            phase = (
+                "awaiting_target_shelf" if outcome == "new_work"
+                else "reconciliation_uncertain" if outcome == "uncertain"
+                else "reconciled"
+            )
+            updated = replace(
+                job,
+                phase=phase,
+                updated_at=_now(),
+                summary=summary,
+                error=(reason if outcome == "uncertain" else None),
+            )
+            latest = self._read(job_id)
+            cancelled = self._consume_cancel_request(latest)
+            if cancelled is not None:
+                return cancelled
+            if latest.phase != "reconciling" or latest.updated_at != job.updated_at:
+                return latest
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return self._read(job_id)
 
     @staticmethod
     def _audit_text(value: object, *, field: str, required: bool = False) -> str:
@@ -3316,41 +3748,44 @@ class SimpleEngineRunner:
         )
         return result
 
-    def resolve_automatic_request(
+    def _resolve_automatic_identity(
         self,
         source_path: str,
-        payload: Mapping[str, object] | None = None,
         *,
-        target_shelf: object | None = None,
-    ) -> tuple[EngineRequest, AutomaticIdentity]:
-        """Infer identity after the caller has durably selected a shelf."""
-        # The automatic contract has one user-controlled input in addition to
-        # the source: a closed target-shelf enum.  It is deliberately *not*
-        # passed as a TMDB media-type filter, so a real movie selected for an
-        # incompatible TV shelf becomes a policy conflict rather than a
-        # silently different match.
-        del payload
-        body: dict[str, object] = {}
+        target_parent: str | None = None,
+    ) -> tuple[str, AutomaticIdentity]:
+        """Use the existing Engine matcher without requiring a destination.
+
+        A confirmed shelf remains a planning/write policy.  It can provide a
+        helpful source-context fallback *after* selection, but no destination
+        is needed for the harmless query, TMDB match, or season inspection
+        used by read-only intake reconciliation.
+        """
         source = _safe_remote_path(source_path, field="source_path", allow_root=False)
-        if target_shelf is None:
-            raise EngineRequestError("自动任务尚未选择目标货架")
-        selected_shelf, selected_root = self._target_root_for_confirmed_shelf(target_shelf)
+        parent = (
+            _safe_remote_path(target_parent, field="target_parent", allow_root=False)
+            if target_parent is not None
+            else None
+        )
         self._ensure_authenticated(self.alist)
         engine = __import__("engine.scraper", fromlist=["auto_match_tmdb"])
-        raw_type = "auto"
         query_fn = getattr(engine, "_query_from_source", None)
         query = query_fn(source) if callable(query_fn) else posixpath.basename(source)
         query = str(query).strip()
-        requested_type = None if raw_type == "auto" else str(raw_type)
-        context_fn = getattr(engine, "_media_context_from_source_and_target", None)
+        requested_type: str | None = None
         prefer_animation = False
-        if callable(context_fn):
-            contextual_type, prefer_animation = context_fn(
-                source,
-                selected_root,
-            )
-            if requested_type is None:
-                requested_type = contextual_type
+        if parent is not None:
+            context_fn = getattr(engine, "_media_context_from_source_and_target", None)
+            if callable(context_fn):
+                requested_type, prefer_animation = context_fn(source, parent)
+        else:
+            source_type = getattr(engine, "_media_type_from_source_context", None)
+            source_animation = getattr(engine, "_source_is_animation_library", None)
+            if callable(source_type):
+                candidate_type = source_type(source)
+                requested_type = candidate_type if candidate_type in {"movie", "tv"} else None
+            if callable(source_animation):
+                prefer_animation = bool(source_animation(source))
         expected_episode_count: int | None = None
         if requested_type == "tv":
             try:
@@ -3360,7 +3795,6 @@ class SimpleEngineRunner:
                     expected_episode_count = expected_fn(rows)
             except Exception:
                 expected_episode_count = None
-        match = None
         matcher = getattr(engine, "auto_match_tmdb", None)
         if not callable(matcher):
             raise EngineRequestError("当前 Engine 没有自动匹配能力")
@@ -3372,26 +3806,24 @@ class SimpleEngineRunner:
             prefer_animation=prefer_animation,
             expected_episode_count=expected_episode_count,
         )
-        trace = getattr(match, "decision_trace", None)
-        if isinstance(trace, dict):
-            trace["top_candidates"] = [
-                {
-                    "media_type": candidate.media_type,
-                    "tmdb_id": candidate.tmdb_id,
-                    "title": candidate.title,
-                    "year": candidate.year,
-                    "confidence": candidate.confidence,
-                    "status": candidate.status,
-                }
-                for candidate in list(candidates)[:5]
-            ]
+        trace = dict(getattr(match, "decision_trace", {}) or {})
+        trace["top_candidates"] = [
+            {
+                "media_type": candidate.media_type,
+                "tmdb_id": candidate.tmdb_id,
+                "title": candidate.title,
+                "year": candidate.year,
+                "confidence": candidate.confidence,
+                "status": candidate.status,
+            }
+            for candidate in list(candidates)[:5]
+        ]
         season_fn = getattr(engine, "_season_from_source", None)
         season = season_fn(source) if callable(season_fn) else None
         media_type = str(getattr(match, "media_type", ""))
         if media_type == "tv" and not isinstance(season, int):
             season = 1
-        parent = selected_root
-        identity = AutomaticIdentity(
+        return query, AutomaticIdentity(
             media_type=media_type,
             tmdb_id=int(getattr(match, "tmdb_id")),
             title=str(getattr(match, "title", "")),
@@ -3399,25 +3831,51 @@ class SimpleEngineRunner:
             confidence=float(getattr(match, "confidence", 0.0)),
             target_parent=parent,
             season=season if isinstance(season, int) else None,
-            trace=dict(getattr(match, "decision_trace", {}) or {}),
+            trace=trace,
+        )
+
+    def resolve_automatic_identity(self, source_path: str) -> AutomaticIdentity:
+        """Resolve intake identity for reconciliation without selecting a shelf."""
+        _query, identity = self._resolve_automatic_identity(source_path)
+        return identity
+
+    def resolve_automatic_request(
+        self,
+        source_path: str,
+        payload: Mapping[str, object] | None = None,
+        *,
+        target_shelf: object | None = None,
+    ) -> tuple[EngineRequest, AutomaticIdentity]:
+        """Adapt the shared identity result to a post-selection plan request."""
+        del payload
+        if target_shelf is None:
+            raise EngineRequestError("自动任务尚未选择目标货架")
+        selected_shelf, selected_root = self._target_root_for_confirmed_shelf(target_shelf)
+        source = _safe_remote_path(source_path, field="source_path", allow_root=False)
+        query, resolved = self._resolve_automatic_identity(
+            source,
+            target_parent=selected_root,
+        )
+        identity = replace(
+            resolved,
+            target_parent=selected_root,
             target_shelf=selected_shelf.value,
             target_shelf_root=selected_root,
         )
-        if not target_shelf_allows_media_type(selected_shelf, media_type):
+        if not target_shelf_allows_media_type(selected_shelf, identity.media_type):
             raise TargetShelfPolicyConflictError(
                 target_shelf=selected_shelf,
-                media_type=media_type,
+                media_type=identity.media_type,
                 identity=identity,
             )
         request = EngineRequest.from_mapping({
-            **body,
             "source_path": source,
-            "parent_path": parent,
-            "media_type": media_type,
+            "parent_path": selected_root,
+            "media_type": identity.media_type,
             "target_shelf": selected_shelf.value,
-            "tmdb_id": int(getattr(match, "tmdb_id")),
+            "tmdb_id": identity.tmdb_id,
             "query": query,
-            "season": season if isinstance(season, int) else 1,
+            "season": identity.season if isinstance(identity.season, int) else 1,
         })
         return request, identity
 
@@ -5254,6 +5712,7 @@ class SimpleEngineRunner:
         """
         normalized_reason = reason.strip() or "cancelled by operator"
         immediate_phases = {
+            "reconciling", "reconciled", "reconciliation_uncertain",
             "awaiting_target_shelf", "target_policy_conflict", "queued",
             "archive_preprocessing", "identity_matching", "planning", "planned",
             "retry_wait", "failed", "failed_archive", "failed_identity",
@@ -5283,6 +5742,8 @@ class SimpleEngineRunner:
             # safe AList/planning boundary.
             job = self._read(job_id)
             inactive_phases = {
+                "reconciling",
+                "reconciled", "reconciliation_uncertain",
                 "awaiting_target_shelf", "target_policy_conflict", "queued",
                 "planned", "retry_wait", "failed", "failed_archive",
                 "failed_identity", "failed_planning", "failed_provider",

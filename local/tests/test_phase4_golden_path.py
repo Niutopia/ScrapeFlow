@@ -322,6 +322,28 @@ class Phase4GoldenPathTests(unittest.TestCase):
             ), []
         return match
 
+    @staticmethod
+    def _new_work_waiting(runner, source: str, *, job_id: str):
+        """Keep archive fixtures as legacy downstream plan-boundary records."""
+        waiting = runner.create_pending_job(source, job_id=job_id)
+        summary = dict(waiting.summary)
+        summary.pop("reconciliation", None)
+        summary.pop("reconciliation_outcome", None)
+        waiting = replace(
+            waiting,
+            phase="awaiting_target_shelf",
+            summary={
+                **summary,
+                "automatic_stage": "awaiting_target_shelf",
+            },
+        )
+        atomic_write_json(
+            runner.jobs_root / f"{waiting.id}.json",
+            waiting.as_dict(),
+            allow_nan=False,
+        )
+        return waiting
+
     def _positive(
         self,
         name: str,
@@ -343,7 +365,7 @@ class Phase4GoldenPathTests(unittest.TestCase):
             archive_format=_listing_format(archive_name),
         )
         runner, executor = self._runner(alist, archive_runner, events)
-        waiting = runner.create_automatic_job(source, job_id=f"golden-{name}")
+        waiting = self._new_work_waiting(runner, source, job_id=f"golden-{name}")
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         with patch("engine.scraper.auto_match_tmdb", side_effect=self._identity(events)):
             planned = runner.plan_automatic_job(queued.id)
@@ -521,7 +543,7 @@ class Phase4GoldenPathTests(unittest.TestCase):
             ),
             events, limits=limits, problem=problem,
         )
-        waiting = runner.create_automatic_job(source, job_id=f"negative-{name}")
+        waiting = self._new_work_waiting(runner, source, job_id=f"negative-{name}")
         job = runner.start_automatic_job(waiting.id, target_shelf="movie")
         try:
             with patch("engine.scraper.auto_match_tmdb", side_effect=self._identity(events)):

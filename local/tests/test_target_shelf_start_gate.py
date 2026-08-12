@@ -116,6 +116,32 @@ class TargetShelfStartGateTests(unittest.TestCase):
             metadata={"tmdb_id": 1, "title": "Escaped", "year": "2020"},
         )
 
+    def _new_work_waiting(self, source: str = "/library/待刮削/Source"):
+        """Create a legacy downstream fixture for post-selection plan tests.
+
+        The read-only reconciliation suite supplies the real ``new_work``
+        identity projection.  These older planner-boundary tests intentionally
+        model records written before that projection existed.
+        """
+        pending = self.runner.create_pending_job(source)
+        summary = dict(pending.summary)
+        summary.pop("reconciliation", None)
+        summary.pop("reconciliation_outcome", None)
+        waiting = replace(
+            pending,
+            phase="awaiting_target_shelf",
+            summary={
+                **summary,
+                "automatic_stage": "awaiting_target_shelf",
+            },
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{pending.id}.json",
+            waiting.as_dict(),
+            allow_nan=False,
+        )
+        return waiting
+
     def test_shelf_mapping_and_type_matrix_are_closed(self) -> None:
         self.assertEqual(target_root_for_shelf("/library", "movie"), "/library/电影")
         self.assertEqual(target_root_for_shelf("/library", "anime"), "/library/番剧")
@@ -166,18 +192,21 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(request.query, query)
         self.assertEqual(identity.target_shelf_root, "/library/番剧")
 
-    def test_pending_registration_has_zero_formal_calls_then_start_is_idempotent(self) -> None:
+    def test_pending_registration_enters_read_only_reconciliation_then_new_work_starts(self) -> None:
         pending = self.runner.create_pending_job("/library/待刮削/Source")
 
-        self.assertEqual(pending.phase, "awaiting_target_shelf")
+        self.assertEqual(pending.phase, "reconciling")
         self.assertEqual(pending.plan, {})
         self.assertEqual(pending.summary["ingress_source_path"], "/library/待刮削/Source")
         self.assertIsNone(pending.target_shelf)
         self.assertEqual(self.events, [])
         self.assertEqual(self.alist.login_calls, 0)
+        with self.assertRaisesRegex(EngineJobConflictError, "对账尚未完成"):
+            self.runner.start_automatic_job(pending.id, target_shelf="anime")
 
-        started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
-        repeated = self.runner.start_automatic_job(pending.id, target_shelf="anime")
+        waiting = self._new_work_waiting()
+        started = self.runner.start_automatic_job(waiting.id, target_shelf="anime")
+        repeated = self.runner.start_automatic_job(waiting.id, target_shelf="anime")
 
         self.assertEqual(started.phase, "queued")
         self.assertEqual(started.target_shelf, "anime")
@@ -208,7 +237,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         )
 
     def test_missing_source_or_invalid_shelf_leaves_waiting_record_unchanged(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         with self.assertRaises(EngineRequestError):
             self.runner.start_automatic_job(pending.id, target_shelf="/library/电影")
         self.alist.entries["/library/待刮削"] = []
@@ -224,8 +253,8 @@ class TargetShelfStartGateTests(unittest.TestCase):
 
         recovered = self.runner.recover_job(pending.id)
 
-        self.assertEqual(recovered.phase, "awaiting_target_shelf")
-        self.assertEqual(self.runner.get_job(pending.id).phase, "awaiting_target_shelf")
+        self.assertEqual(recovered.phase, "reconciling")
+        self.assertEqual(self.runner.get_job(pending.id).phase, "reconciling")
         self.assertEqual(self.events, [])
 
     def test_legacy_automatic_root_cannot_execute_without_a_selection(self) -> None:
@@ -246,7 +275,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(self.events, [])
 
     def test_type_conflict_stops_before_planner_and_can_be_explicitly_reselected(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         identity = AutomaticIdentity(
             media_type="movie",
@@ -285,7 +314,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
     def test_conflict_reselection_reuses_verified_archive_projection(self) -> None:
         preprocessor = ReusableArchivePreprocessor()
         self.runner.archive_preprocessor = preprocessor
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         conflict_identity = AutomaticIdentity(
             media_type="movie",
@@ -369,7 +398,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
     def test_foreign_archive_projection_fails_closed_without_reprocessing(self) -> None:
         preprocessor = ReusableArchivePreprocessor()
         self.runner.archive_preprocessor = preprocessor
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         forged = replace(
             started,
@@ -411,7 +440,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
     def test_identity_interruption_reuses_persisted_archive_projection(self) -> None:
         preprocessor = ReusableArchivePreprocessor()
         self.runner.archive_preprocessor = preprocessor
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         identity_calls = 0
 
@@ -478,7 +507,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(identity_calls, 2)
 
     def test_terminal_job_cannot_be_reopened_by_start(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         terminal = replace(started, phase="cancelled", error="operator stop")
         atomic_write_json(
@@ -492,7 +521,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(self.runner.get_job(started.id).phase, "cancelled")
 
     def test_planning_and_execution_reject_targets_outside_confirmed_shelf(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         escaped = self._escaped_plan("/library/待刮削/Source")
         identity = AutomaticIdentity(
@@ -600,7 +629,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
             )
 
     def test_metadata_artifact_escape_is_blocked_at_every_replay_boundary(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         artifact_escape = Plan(
             mode="batch",
@@ -652,7 +681,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         )
 
     def test_terminal_job_cannot_reenter_automatic_planning(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Source")
+        pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         terminal = replace(started, phase="cancelled", error="operator stop")
         atomic_write_json(

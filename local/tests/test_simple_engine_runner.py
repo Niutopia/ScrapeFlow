@@ -484,6 +484,33 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             }
         )
 
+    @staticmethod
+    def _new_work_waiting(
+        runner: SimpleEngineRunner,
+        source: str,
+        *,
+        job_id: str | None = None,
+    ):
+        """Construct a legacy downstream fixture for plan-boundary tests."""
+        pending = runner.create_pending_job(source, job_id=job_id)
+        summary = dict(pending.summary)
+        summary.pop("reconciliation", None)
+        summary.pop("reconciliation_outcome", None)
+        waiting = replace(
+            pending,
+            phase="awaiting_target_shelf",
+            summary={
+                **summary,
+                "automatic_stage": "awaiting_target_shelf",
+            },
+        )
+        atomic_write_json(
+            runner.jobs_root / f"{waiting.id}.json",
+            waiting.as_dict(),
+            allow_nan=False,
+        )
+        return waiting
+
     def test_plan_is_dry_run_and_execution_is_automatic(self) -> None:
         runner = SimpleEngineRunner(
             self.root,
@@ -550,7 +577,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             archive_preprocessor=OrderedArchivePreprocessor(events, fail=True),
         )
         self.alist.directories.add("/incoming/archive")
-        waiting = runner.create_automatic_job("/incoming/archive", job_id="auto-archive-fail")
+        waiting = self._new_work_waiting(runner, "/incoming/archive", job_id="auto-archive-fail")
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         with self.assertRaises(RuntimeError):
             runner.plan_automatic_job(queued.id)
@@ -624,8 +651,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             ),
             identity,
         )
-        waiting = runner.create_automatic_job(
-            source_root, job_id="auto-existing-formal-target",
+        waiting = self._new_work_waiting(
+            runner, source_root, job_id="auto-existing-formal-target",
         )
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
 
@@ -675,8 +702,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             ),
             identity,
         )
-        waiting = runner.create_automatic_job(
-            "/incoming/movie", job_id="auto-retryable-planning-error",
+        waiting = self._new_work_waiting(
+            runner, "/incoming/movie", job_id="auto-retryable-planning-error",
         )
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
 
@@ -725,8 +752,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 events,
             ),
         )
-        waiting = runner.create_automatic_job(
-            "/incoming/archive", job_id="auto-archive-wrong-password"
+        waiting = self._new_work_waiting(
+            runner, "/incoming/archive", job_id="auto-archive-wrong-password"
         )
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
 
@@ -759,8 +786,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 ArchiveToolError("7-Zip executable is unavailable"), events
             ),
         )
-        waiting = runner.create_automatic_job(
-            "/incoming/archive", job_id="auto-archive-tool-unavailable"
+        waiting = self._new_work_waiting(
+            runner, "/incoming/archive", job_id="auto-archive-tool-unavailable"
         )
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
 
@@ -1848,7 +1875,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             validate=False,
             archive_preprocessor=object(),
         )
-        waiting = runner.create_automatic_job("/incoming/archive", job_id="engine-planning-cancel")
+        waiting = self._new_work_waiting(runner, "/incoming/archive", job_id="engine-planning-cancel")
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         result: list[object] = []
 
@@ -1880,7 +1907,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             planner=fake_plan,
             validate=False,
         )
-        waiting = runner.create_pending_job("/incoming/queued", job_id="engine-queued-cancel")
+        waiting = self._new_work_waiting(runner, "/incoming/queued", job_id="engine-queued-cancel")
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         entered = threading.Event()
         release = threading.Event()
@@ -2066,7 +2093,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             validate=False,
             executor=lambda _plan: {"ok": True},
         )
-        waiting = runner.create_automatic_job("/incoming/movie")
+        waiting = self._new_work_waiting(runner, "/incoming/movie")
         queued = runner.start_automatic_job(waiting.id, target_shelf="movie")
         self.assertEqual(queued.phase, "queued")
         identity = AutomaticIdentity(

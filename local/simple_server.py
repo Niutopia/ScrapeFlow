@@ -364,7 +364,7 @@ class SimpleApplication:
         except Exception:
             engine_jobs = []
         active_engine_phases = {
-            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
+            "reconciling", "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
             "executing", "verifying", "cleaning", "retry_wait",
         }
         failed_engine_phases = {
@@ -376,9 +376,14 @@ class SimpleApplication:
             "staging_verifying", "subtitle_installing", "child_planning", "child_executing",
             "final_verifying", "cleaning", "child_failed", "retry_wait",
         }
+        reconciling_ids = {
+            job.id for job in engine_jobs if job.phase == "reconciling"
+        }
         with self._automatic_lock:
             formal_writes = sum(
-                1 for future in self._automatic_futures.values() if not future.done()
+                1
+                for job_id, future in self._automatic_futures.items()
+                if not future.done() and job_id not in reconciling_ids
             )
             provider_workers = sum(
                 1 for future in self._provider_futures.values() if not future.done()
@@ -497,19 +502,19 @@ class SimpleApplication:
         monitor into an endless duplicate-job generator.
         """
         return job.phase in {
-            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
+            "reconciling", "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
             "executing", "verifying", "cleaning", "retry_wait", "failed",
         }
 
     def _scan_inbound_once(self) -> list[str]:
-        """Register each direct child of ``/待刮削`` as a waiting root.
+        """Register each direct child of ``/待刮削`` for read-only reconciliation.
 
         Only directories are accepted.  Treating loose files at the intake
         root as one job could accidentally combine unrelated titles, so they
         are left untouched until placed in their own source directory.  This
         method reads AList with ``refresh=True`` and only writes a small local
-        ownership record.  It intentionally runs while globally paused: pause
-        blocks formal work, not passive discovery of a user-visible choice.
+        ownership record. It intentionally runs while globally paused: pause
+        blocks automatic work, not passive discovery of user-visible intake.
         """
         if not self.engine_configured:
             return []
@@ -547,6 +552,7 @@ class SimpleApplication:
         except Exception:
             existing = {}
         registered: list[str] = []
+        scheduled: list[str] = []
         seen_sources: set[str] = set()
         create = getattr(runner, "create_pending_job", None)
         if not callable(create):
@@ -574,6 +580,13 @@ class SimpleApplication:
             if job is None:
                 job = create(source)
                 registered.append(job.id)
+                # Registration owns no formal side effect. The existing
+                # automatic lane may now run the bounded read-only
+                # reconciliation phase; only a later new_work result exposes
+                # the existing /start shelf confirmation.
+                if job.phase == "reconciling" and self.control().get("paused") is not True:
+                    self._queue_automatic_job(job.id)
+                    scheduled.append(job.id)
         # A missing waiting source is an observation, not an instruction to
         # delete/retry/recreate it. Persist a clear error only after a
         # successful narrow listing of the intake root.
@@ -581,7 +594,7 @@ class SimpleApplication:
         if callable(marker):
             for source, job in existing.items():
                 if (
-                    job.phase == "awaiting_target_shelf"
+                    job.phase in {"awaiting_target_shelf", "reconciling"}
                     and source.startswith(root.rstrip("/") + "/")
                     and source not in seen_sources
                 ):
@@ -593,7 +606,7 @@ class SimpleApplication:
             self._intake_status.update({
                 "last_scan_at": _now(),
                 "last_error": None,
-                "last_scheduled_count": 0,
+                "last_scheduled_count": len(scheduled),
                 "last_registered_count": len(registered),
             })
         return registered
@@ -1446,14 +1459,18 @@ class SimpleApplication:
             queued_job = self._get_engine_runner().get_job(job_id)
         except (EngineJobNotFoundError, SimpleEngineError):
             return
-        if not self._ordinary_job_has_confirmed_selection(queued_job):
+        read_only_reconciliation = queued_job.phase == "reconciling"
+        if not read_only_reconciliation and not self._ordinary_job_has_confirmed_selection(queued_job):
             return
 
         def submit() -> None:
             if (
                 self._closed.is_set()
                 or self.control().get("paused") is True
-                or self._provider_worker_configuration()["valid"] is not True
+                or (
+                    not read_only_reconciliation
+                    and self._provider_worker_configuration()["valid"] is not True
+                )
             ):
                 return
             with self._automatic_lock:
@@ -1793,6 +1810,13 @@ class SimpleApplication:
             job = runner.get_job(job_id)
             if self._is_internal_child(job):
                 return
+            if job.phase == "reconciling":
+                # The runner's reconciliation boundary is strictly read-only
+                # with respect to AList/formal media. It only persists the
+                # bounded local outcome and never falls through to planning,
+                # the writer, cleanup, or Provider scheduling.
+                runner.reconcile_automatic_job(job_id)
+                return
             if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
                 return
             # A pre-gate legacy record must never become a formal operation
@@ -1895,6 +1919,10 @@ class SimpleApplication:
             paused = self.control().get("paused") is True
             for job in runner.list_jobs():
                 if self._is_internal_child(job):
+                    continue
+                if job.phase == "reconciling":
+                    if not paused:
+                        self._queue_automatic_job(job.id)
                     continue
                 if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
                     continue
@@ -3466,7 +3494,10 @@ class SimpleApplication:
             create = getattr(runner, "create_automatic_job", None)
         if not callable(create):
             raise EngineRequestError("Engine 缺少待处理任务登记入口")
-        return create(normalized_source)
+        created = create(normalized_source)
+        if created.phase == "reconciling" and self.control().get("paused") is not True:
+            self._queue_automatic_job(created.id)
+        return created
 
     def engine_jobs(self) -> list[EngineJob]:
         if self._engine_runner is not None or self.engine_configured:
@@ -3730,7 +3761,8 @@ class SimpleApplication:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         public_phase = str(self.public_engine_job(engine_job).get("phase") or "")
         active_phases = {
-            "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "executing_media",
+            "queued", "analyzing",
+            "archive_preprocessing", "identity_matching", "planning", "executing_media",
             "verifying", "cleaning", "retry_wait", "gap_discovering", "provider_searching",
             "acquiring", "staging_verifying", "subtitle_installing", "child_planning",
             "child_executing", "final_verifying",
@@ -3809,6 +3841,12 @@ class SimpleApplication:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         if not isinstance(payload, Mapping):
             raise EngineRequestError("重试请求必须是 JSON 对象")
+        if engine_job.phase == "reconciling":
+            raise EngineRequestError("任务正在只读对账；请等待对账结果")
+        if engine_job.phase == "reconciled":
+            raise EngineRequestError("已匹配正式作品；本轮不会从 retry 启动正式处理")
+        if engine_job.phase == "reconciliation_uncertain":
+            raise EngineRequestError("对账结果不确定；请先处理 needs_attention")
         if engine_job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
             raise EngineRequestError("任务尚未通过目标货架启动门；请使用 /start 选择目标货架")
         if not self._ordinary_job_has_confirmed_selection(engine_job):
@@ -3965,6 +4003,9 @@ class SimpleApplication:
             else {}
         )
         display_phase = {
+            "reconciling": "reconciling",
+            "reconciled": "reconciled",
+            "reconciliation_uncertain": "needs_attention",
             "awaiting_target_shelf": "awaiting_target_shelf",
             "queued": "queued",
             "analyzing": "analyzing",
@@ -4032,7 +4073,28 @@ class SimpleApplication:
             or None
         )
         payload["selected_at"] = job.selected_at
-        payload["allowed_target_shelves"] = list(target_shelf_values())
+        reconciliation = summary.get("reconciliation")
+        has_reconciliation = "reconciliation" in summary
+        reconciliation_outcome = (
+            str(reconciliation.get("outcome") or "")
+            if isinstance(reconciliation, Mapping)
+            else ""
+        )
+        # Only a reconciled new work (or a pre-reconciliation legacy record)
+        # may be offered the closed shelf enum. Keep target-policy conflict
+        # reselection available for that same new-work record.
+        may_select_shelf = (
+            job.phase in {"awaiting_target_shelf", "target_policy_conflict"}
+            and (reconciliation_outcome == "new_work" or not has_reconciliation)
+        )
+        payload["allowed_target_shelves"] = (
+            list(target_shelf_values()) if may_select_shelf else []
+        )
+        payload["reconciliation"] = (
+            dict(reconciliation)
+            if isinstance(reconciliation, Mapping)
+            else None
+        )
         payload["lifecycle"] = dict(lifecycle)
         payload["source"] = (
             "全库审计"

@@ -104,6 +104,27 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         return payload["job"]
 
+    def new_work_waiting(self, source: str = "/library/待刮削/Example"):
+        """Build a legacy downstream fixture for post-selection API tests."""
+        pending = self.runner.create_pending_job(source)
+        summary = dict(pending.summary)
+        summary.pop("reconciliation", None)
+        summary.pop("reconciliation_outcome", None)
+        waiting = replace(
+            pending,
+            phase="awaiting_target_shelf",
+            summary={
+                **summary,
+                "automatic_stage": "awaiting_target_shelf",
+            },
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{pending.id}.json",
+            waiting.as_dict(),
+            allow_nan=False,
+        )
+        return waiting
+
     def test_health_control_and_path_submission_expose_one_automatic_root_job(self) -> None:
         with patch.dict(
             os.environ,
@@ -137,11 +158,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
         created = self.create_job()
         job_id = created["id"]
-        self.assertEqual(created["phase"], "awaiting_target_shelf")
+        self.assertEqual(created["phase"], "reconciling")
         self.assertEqual(created["source"], "/library/待刮削/Example")
         self.assertIsNone(created["target_shelf"])
         self.assertIsNone(created["target_root"])
-        self.assertEqual(created["allowed_target_shelves"], ["movie", "anime", "us_tv"])
+        self.assertEqual(created["reconciliation"]["status"], "pending")
+        self.assertEqual(created["allowed_target_shelves"], [])
         self.assertNotIn("identity_override", created["plan"])
         persisted = self.runner.get_job(job_id)
         self.assertEqual(persisted.request, {"source_path": "/library/待刮削/Example"})
@@ -237,19 +259,19 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(queued, [])
         created = self.runner.get_job(scheduled[0])
         self.assertEqual(created.request["source_path"], "/library/待刮削/Real Release")
-        self.assertEqual(created.phase, "awaiting_target_shelf")
+        self.assertEqual(created.phase, "reconciling")
 
     def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
         self.remote.entries["/library/待刮削"] = [
             {"name": "Example", "is_dir": True},
         ]
-        created = self.create_job()
+        waiting = self.new_work_waiting()
         queued: list[str] = []
         original_queue = self.application._queue_automatic_job  # noqa: SLF001 - start gate assertion
         self.application._queue_automatic_job = queued.append  # type: ignore[method-assign]
         try:
             status, payload = self.request(
-                "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "anime"},
+                "POST", f"/api/jobs/{waiting.id}/start", {"target_shelf": "anime"},
             )
         finally:
             self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
@@ -261,12 +283,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(queued, [])
         selected_at = started["selected_at"]
         status, repeated = self.request(
-            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "anime"},
+            "POST", f"/api/jobs/{waiting.id}/start", {"target_shelf": "anime"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(repeated["job"]["selected_at"], selected_at)
         status, conflict = self.request(
-            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "movie"},
+            "POST", f"/api/jobs/{waiting.id}/start", {"target_shelf": "movie"},
         )
         self.assertEqual(status, 409)
         self.assertIn("不能更改", conflict["error"])
@@ -277,9 +299,9 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertIn("来源目录不存在", rejected["error"])
         self.assertEqual(self.runner.list_jobs(), [])
 
-        created = self.create_job()
+        waiting = self.new_work_waiting()
         status, invalid = self.request(
-            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "/library/电影"},
+            "POST", f"/api/jobs/{waiting.id}/start", {"target_shelf": "/library/电影"},
         )
         self.assertEqual(status, 400)
         self.assertIn("target_shelf", invalid["error"])
@@ -288,11 +310,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         # selected.  That must leave the waiting record untouched.
         self.remote.entries["/library/待刮削"] = []
         status, missing = self.request(
-            "POST", f"/api/jobs/{created['id']}/start", {"target_shelf": "movie"},
+            "POST", f"/api/jobs/{waiting.id}/start", {"target_shelf": "movie"},
         )
         self.assertEqual(status, 409)
         self.assertIn("不存在", missing["error"])
-        self.assertEqual(self.runner.get_job(created["id"]).phase, "awaiting_target_shelf")
+        self.assertEqual(self.runner.get_job(waiting.id).phase, "awaiting_target_shelf")
 
     def test_submission_requires_a_direct_existing_source_directory(self) -> None:
         for source in (
@@ -307,7 +329,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
                 self.assertEqual(self.runner.list_jobs(), [])
 
     def test_retry_reopens_a_terminal_automatic_failure(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         job = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         failed = replace(
             job,
@@ -381,7 +403,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertNotIn(job.id, self.application._cleanup_fences)  # noqa: SLF001
 
     def test_artifact_repair_is_an_explicit_empty_request_only(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         executed = replace(
             selected,
@@ -416,7 +438,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertIn("空 JSON", payload["error"])
 
     def test_failed_cleanup_retry_dispatches_only_the_finalizer(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         failed = replace(
             selected,
@@ -455,7 +477,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         provider_queue.assert_not_called()
 
     def test_cleanup_only_retry_cannot_fall_through_to_formal_writer(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         retry_wait = replace(
             selected,
@@ -488,7 +510,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
     def test_retry_identity_correction_rejects_client_controlled_metadata_and_parent(self) -> None:
         """Web retry exposes only the bounded identity/password contract."""
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         job = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         failed = replace(
             job,
@@ -535,7 +557,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(self.runner.get_job(job.id).phase, "cancelled")
 
     def test_cancel_stops_a_queued_selected_job_without_touching_its_source(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         queued = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         self.assertEqual(queued.phase, "queued")
 
@@ -801,7 +823,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
     def test_disabled_lanes_settle_verified_executed_root_without_queueing(self) -> None:
         self.application.set_paused(False, "test")
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         lifecycle = {
             "formal_write": {"status": "verified", "updated_at": "fixture"},
@@ -830,7 +852,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
     def test_disabled_lanes_never_settle_a_verified_root_with_known_gaps(self) -> None:
         """A disabled provider is not evidence that a missing work is safe to delete."""
         self.application.set_paused(False, "test")
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         gap = {
             "id": "missing-media",
@@ -869,7 +891,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertIsNot(persisted.summary["lifecycle"].get("cleanup_ready"), True)
 
     def test_completed_with_gaps_is_terminal_attention_projection(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         gap = {"id": "missing-episode", "kind": "missing_media", "label": "S01E02"}
         lifecycle = {
@@ -895,7 +917,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertIn("1 项资源缺口", public["progress"]["message"])
 
     def test_public_gap_projection_keeps_active_and_failed_provider_states(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         gap = {"id": "missing-episode", "kind": "missing_media"}
         for status, terminal, expected in (
@@ -921,7 +943,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
                 self.assertEqual(self.application.public_engine_job(job)["phase"], expected)
 
     def test_unknown_audit_never_projects_as_completed_with_gaps(self) -> None:
-        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         job = replace(
             selected,
