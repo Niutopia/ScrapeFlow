@@ -2,7 +2,7 @@
 
 > 文档性质：2026-08-08 的历史安全收敛快照，不是当前目标货架启动门的阶段 1，也不证明当前 WIP 已完成。
 >
-> 当前阶段定义见[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)。本文件是历史阶段快照。
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。本文件是历史阶段快照。
 
 > 记录时间：2026-08-08
 >

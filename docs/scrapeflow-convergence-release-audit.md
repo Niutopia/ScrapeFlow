@@ -4,7 +4,7 @@
 
 > 文档性质：这是 2026-08-09 的历史 release-candidate 审计快照，记录当时 fake 环境、分支与阶段检查的证据。它不证明当前工作树、当前运行时或“用户选择目标货架后启动”主线已经实施完成，也不授权解除暂停。
 >
-> 当前普通入站合同以[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)为准；本文件是历史发布审计快照。
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)；本文件是历史发布审计快照。
 
 本审计所记录的 release candidate 当时位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号应由当时部署的 `/api/health.build_commit` 和 Git 共同记录，本文不硬编码。
 
@@ -12,12 +12,12 @@
 
 - 阶段 3 基线当时固定为 `8f54568`；保护分支为 `codex/wip-convergence-20260809`。
 - 当时的 diff 分区及“WIP 不代表验收”声明见 `scrapeflow-convergence-wip-partition.md`。
-- 当时的六项收敛语义决定见 `scrapeflow-convergence-decisions.md`；其中旧的“automatic”入站描述已被当前启动门合同取代。
+- 当时的六项收敛语义决定见 `scrapeflow-convergence-decisions.md`；其中旧的“automatic”入站描述仅作历史参考，已被当前 reconciliation-first 合同取代。
 - 未执行 destructive reset，未触碰真实媒体库或真实 AList 入站数据。
 
 ## T2–T5：历史阶段 4 主链证据
 
-- 当时 automatic 顺序为 `archive_preprocess → identity → planning → writer`；预处理失败不调用 identity/writer。该顺序现仅适用于用户选择货架并经 `/start` 启动后的任务。
+- 当时 automatic 顺序为 `archive_preprocess → identity → planning → writer`；预处理失败不调用 identity/writer。这是历史 target-shelf-first 顺序，不是现行入口合同。
 - 普通视频、ZIP、7z、RAR、伪装 EXE/BIN/DAT 与字幕 sidecar 进入同一 planner/problem gate/`SimplePlanExecutor`。
 - 成功 automatic source 移到 task-owned processed；失败/密码错误保留 source。
 - golden fixture 在 terminal cleanup 后执行新 intake scan，断言不会重建 job；重启也不会第二次调用 writer。
@@ -27,7 +27,7 @@
 
 - 生产 root 默认：`provider_auto_repair_enabled=false`、`audit_auto_repair_enabled=false`。
 - 显式环境变量 `SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED=1` 和 `SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED=1` 才能分别开放。
-- 当时普通入站仍受全局 pause 控制；缺少或损坏 `global-control.json` 时 fail-closed 为 paused。当前合同还要求暂停或恢复均不得绕过等待选择状态。
+- 当时普通入站仍受全局 pause 控制；缺少或损坏 `global-control.json` 时 fail-closed 为 paused。当前暂停/恢复合同以根 `AGENTS.md` 为准。
 - disabled lane 不创建 provider/audit timer；Web health 返回当前门禁状态。
 
 ## T7–T8：retry 与 Provider

@@ -1,6 +1,8 @@
-# ScrapeFlow 目标货架启动门收敛计划
+# ScrapeFlow 目标货架启动门收敛计划（历史参考）
 
-> 状态：历史单模块快照，已被[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)取代；不得作为当前产品合同或完成声明。
+> 状态：历史单模块快照，记录当时的 target-shelf-first 启动门；不得作为当前产品合同、实现要求或完成声明。
+>
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。本文件中的入口顺序已被 reconciliation-first 长期合同取代。
 >
 > 日期：2026-08-09
 >
@@ -8,11 +10,11 @@
 >
 > 运行约束：保持全局暂停；Provider 自动补源和自动审计默认关闭；本计划不授权操作真实媒体、AList、旧任务或 staging。
 
-本文记录当时普通入站启动门的设计快照。历史收敛计划、发布审计、运行态审计和旧 WIP 分区只保留为证据或参考；它们均不能声明当前 WIP 已完成，也不能改变最终合同规定的流程。
+本文记录当时普通入站启动门的设计快照。历史收敛计划、发布审计、运行态审计和旧 WIP 分区只保留为证据或参考；它们均不能声明当前 WIP 已完成，也不能改变根 `AGENTS.md` 规定的流程。
 
-## 1. 冻结产品路线
+## 1. 当时的冻结产品路线
 
-以下规则是实施合同，不得自行改变。
+以下规则只记录当时的实施方案，不构成当前合同。
 
 ~~~text
 /待刮削发现来源
@@ -60,11 +62,11 @@
 
 ## 3. 当前 WIP 清单与阶段边界
 
-所有现有改动保留，不 reset、不还原。下表是本轮唯一的阶段归属；带星号的热点只可在所属阶段以最小变更推进。
+所有现有改动保留，不 reset、不还原。下表是当时的阶段归属；带星号的热点当时只可在所属阶段以最小变更推进。
 
 | 阶段 | 当前文件 | 责任边界 |
 | --- | --- | --- |
-| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、相关历史审计和本计划 | 当时的产品说明与历史标识；当前唯一合同见 `scrapeflow-final-convergence-plan-v1.md` |
+| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、相关历史审计和本计划 | 当时的产品说明与历史标识；当前长期合同见 `../AGENTS.md`，当前实现事实见 `CURRENT-STATE.md` |
 | 1 启动门 | engine/scrapeflow/target_shelf.py、local/tests/test_target_shelf_start_gate.py、local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py* | 枚举、登记、选择和 /start |
 | 2 已选主链 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_engine_runner.py* | 预处理→身份→规划及货架约束 |
 | 3 恢复与取消 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_server.py*、local/tests/test_simple_engine_runner.py* | restart、retry、cancel、legacy 边界 |
@@ -81,7 +83,7 @@
 
 允许改动文档，不改业务逻辑、测试、Docker、运行态或真实媒体。
 
-- 当时曾把本文作为唯一当前流程；该历史要求现已由最终收敛计划取代。
+- 当时曾把本文作为唯一当前流程；该历史要求现已由根 `AGENTS.md` 的 reconciliation-first 合同取代。
 - 把旧 release audit、runtime audit、checkpoint 与旧 WIP 分区明确标记为历史快照。
 - 旧状态报告不混入功能提交；旁路 AList 认证和归档名称实验只作参考。
 

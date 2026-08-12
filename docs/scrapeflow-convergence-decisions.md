@@ -1,6 +1,6 @@
 # 收敛语义决定（历史阶段 4–7 边界）
 
-本文保留 2026-08-09 之前收敛工作的安全与恢复决定；它不再是普通入站入口规则的唯一来源，也不声明这些规则已经在当前工作树完成实现。普通来源必须先登记为 `awaiting_target_shelf`，由用户选择固定一级货架并通过 `/start` 启动；当前权威状态机、实施顺序和完成门见[ScrapeFlow 最终收敛计划 v1](./scrapeflow-final-convergence-plan-v1.md)。
+本文保留 2026-08-09 之前收敛工作的安全与恢复决定。下列规则只描述当时的 target-shelf-first 行为，不声明这些规则已经在当前工作树完成实现，也不构成当前入口规则。长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。
 
 1. **普通任务启动与顺序**：`source intake registration → awaiting_target_shelf → 用户选择 target_shelf 并调用 /start → archive preprocessing → staging → identity → planning → problem-file gate → single writer`。选择前不调用 archive、TMDB、planner、writer 或 Provider；启动后的归档失败停在 archive 阶段，不调用身份解析或 writer。
 2. **原始归档消费**：source 在正式写入、回读、元数据、定向审计和 Provider 终态之前保持原位；只在最后的任务自有 cleanup 中处理已确认可清理的 source 与 staging。失败、密码错误和取消保留 source；terminal cleanup 只删除任务记录及任务自有 staging。source 仍在入站时，扫描必须通过 source/任务指纹去重，不能重建同一任务。

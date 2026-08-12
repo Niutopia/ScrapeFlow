@@ -1,25 +1,30 @@
 # ScrapeFlow
 
-ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。普通入站来源会先登记为待处理项；只有用户选择固定的一级目标货架并确认启动后，任务才进入自动整理主链。
+ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。长期产品与工程合同见
+[`AGENTS.md`](AGENTS.md)，当前 HEAD 的实现事实与已知差距见
+[`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。
 
-把作品目录放入 `/quark/影视/待刮削/`，或通过 API 提交目录路径后，服务只记录来源和等待状态。用户随后选择 `/quark/影视/电影`、`/quark/影视/番剧` 或 `/quark/影视/美剧`（分别对应 `movie`、`anime`、`us_tv`）并调用启动接口；此后系统才会识别作品、匹配 TMDB、判断媒体类型、安排季集和具体作品目录，并完成文件整理、元数据写入以及最终 source/staging 处理。当前 WIP 中 Provider 自动补源和自动审计保持默认关闭。
+目标普通入站流程先对来源做只读身份识别，并与电影、番剧、美剧正式库对账；结果只能是
+`duplicate_complete`、`existing_gap`、`merge_existing`、`new_work` 或 `uncertain`。已有
+正式作品继承其货架和作品根；只有确认为 `new_work` 且需要首次一级货架确认时，用户才选择
+`movie`、`anime` 或 `us_tv`。身份不确定时安全停止，不猜测身份、货架、目标路径、删除或
+Provider 降级。Provider 自动补源和自动审计保持默认关闭。
 
 ```text
 待刮削作品目录
-  → awaiting_target_shelf（只登记）
-  → 用户选择电影 / 番剧 / 美剧并确认启动
-  → queued
-  → 归档/媒体预处理、自动身份匹配与计划
-  → 写入正式媒体库
-  → AList 刷新与精确回读
-  → NFO、海报、字幕处理
-  → 显式开启时运行正式库审计
-  → 显式开启时自动搜索并获取可判定缺口
-  → 显式开启时由内部补源阶段写入正式库
-  → 清理任务拥有的来源与 staging
+  → 只读身份识别 + 对电影 / 番剧 / 美剧正式库对账
+  → duplicate_complete | existing_gap | merge_existing | new_work | uncertain
+  → duplicate_complete：在身份与完整性充分确定后，仅清理任务拥有的输入
+  → existing_gap：沿用匹配正式作品的货架/作品根，只补已确认缺口
+  → merge_existing：经既有 Engine 和同一 writer 合并，不创建重复作品
+  → new_work：必要时确认电影 / 番剧 / 美剧，再由既有 Engine 规划并写入
+  → uncertain：停在 blocked / needs_attention
+  → 正式写入后 AList 精确回读、NFO/海报/字幕处理与当前作品检查
 ```
 
-日常使用需要配置服务、放入来源、通过 API 选择目标货架并启动任务，再查询结果。系统会在短暂的网络、TMDB 或 AList 延迟后按规则重试；最终失败的任务可重新尝试或取消。
+当前 HEAD 尚未完全实现上述对账优先流程；其仍存在的 `awaiting_target_shelf` 启动门属于实现
+事实，不是最终产品合同，详见 `docs/CURRENT-STATE.md`。系统会在短暂的网络、TMDB 或 AList
+延迟后按规则重试；最终失败的任务可重新尝试或取消。
 
 ## 最少配置
 
@@ -46,14 +51,14 @@ curl -fsS http://127.0.0.1:8765/api/health
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
 同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Sidecar 使用同一组 `ALIST_USERNAME`/`ALIST_PASSWORD` 访问 Compose 内部 AList，每次从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和当前 AList 的 `root_folder_id`（兼容旧 `root_id`），并只在该次固定 Quark HTTPS/WSG 操作期间保存在内存；两者不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
-显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。发现来源时只创建 `awaiting_target_shelf` 记录，不会自动执行归档预处理、TMDB、规划或写入。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径；任务同样必须由用户选择货架并调用 `/start` 后才会进入队列。
+显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。当前 HEAD 发现来源时只创建 `awaiting_target_shelf` 记录，尚不会在选择前执行身份识别或对账；这是待收敛的实现事实，不是长期产品合同，详见 [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径。
 
 ## 使用方式
 
 1. 创建作品目录，例如 `/quark/影视/待刮削/作品名.年份/`。
 2. 放入视频、字幕或已有元数据。
 3. 等待入站监控发现目录，或通过 `POST /api/jobs` 提交路径。
-4. 通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv` 启动。
+4. 目标流程会先只读识别并对账；仅确认是新的正式作品时，才通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv` 确认一级货架。当前 API 的 target-shelf-first 限制见 `docs/CURRENT-STATE.md`。
 5. 通过 `GET /api/jobs` 查看身份、阶段、重试次数、AList 回读和补源结果。
 
 系统只清理本任务从入站目录移动的内容、任务创建的 staging 和明确归类的临时残留；已有正式媒体不会因名称推测而被删除。
@@ -79,7 +84,7 @@ POST /api/library-audit/run
 GET  /api/browse?path=...
 ```
 
-`POST /api/jobs` 只接收来源目录路径，只会登记待选择任务。`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。选择前不会调用 Engine；选择后，Engine 才根据远端事实决定作品身份、类型、季集、具体作品路径、候选和清理动作。若识别出的媒体类型与用户选择的货架不兼容，任务进入冲突状态而不会静默改选货架。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
+`POST /api/jobs` 只接收来源目录路径，`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。长期合同中，`target_shelf` 是新作品首次正式入库时的受限确认枚举，不是普通输入进行只读 Engine 身份识别或正式库对账的前置门；已匹配的正式作品沿用其既有货架/作品根，身份不确定时安全停止。当前 HEAD 的登记与 `/start` 实现仍先要求货架选择，属于待收敛差距，详见 [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
 
 严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
 
@@ -87,7 +92,7 @@ GET  /api/browse?path=...
 
 AList Quark storage 中的 cookie 由 sidecar 在每个 typed action 开始时临时解析，不复制到 Compose 模板、API 请求或持久状态；它不会出现在 health 响应、日志或验收证据中。sidecar 通过固定 HTTPS API 发出 `share-save` 和磁力离线请求，桌面夸克 renderer 只提供被动的 CDP/WSG 能力（加解密与能力探针），不接收 cookie，也不执行这些网络请求。sidecar 仍只被动附着固定 `http://host.docker.internal:19222/json/list`；它绝不启动、重启、激活或点击夸克。CDP/WSG 通道不可用时 Helper 会 fail-closed，不会扫描其他端口或降级到其他写入通道。
 
-这一 Compose sidecar 拓扑是用户在 2026-08-11 明确批准的部署修订：它取代最终收敛计划中“宿主 Helper”的物理放置，但不改变四动作、任务 staging、故障不降阶和 Helper 禁止控制 Quark 的不变合同。
+这一 Compose sidecar 拓扑是用户在 2026-08-11 明确批准的部署修订：它取代 2026-08-09 历史收敛计划中“宿主 Helper”的物理放置，但不改变四动作、任务 staging、故障不降阶和 Helper 禁止控制 Quark 的长期合同。
 
 桌面夸克本身的启动与重启是另一个宿主生命周期边界，不属于 Helper 四动作。为了使 CDP 参数每次一致，操作者可在 API paused 且活动操作归零后，安装一个直接运行 `QuarkCloudDrive` 的 macOS LaunchAgent：
 
@@ -140,7 +145,7 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 - 隔离 API 启动后的只读核对可用
   `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:8765 --expected-commit <git-commit>`。
 
-当前唯一的全项目产品合同、实施阶段与最终验收定义见[ScrapeFlow 最终收敛计划 v1](docs/scrapeflow-final-convergence-plan-v1.md)与[架构说明](ARCHITECTURE.md)。旧的目标货架计划只保留为历史快照；在最终合同的完成门通过前，不应因本文档解除全局暂停或开放自动执行。
+文档权威层级如下：[`AGENTS.md`](AGENTS.md) 是长期产品与工程合同；[`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md) 是当前 HEAD 的实现事实和已知差距；[`ARCHITECTURE.md`](ARCHITECTURE.md) 描述目标架构，并与长期合同保持一致。`docs/scrapeflow-final-convergence-plan-v1.md`、旧目标货架计划、RC 和验收文档均仅作历史参考，不覆盖前述权威。它们不授权解除全局暂停或开放自动执行。
 
 ## 检查
 

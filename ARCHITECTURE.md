@@ -1,25 +1,25 @@
-# ScrapeFlow 架构：用户选择目标货架后启动的单用户版
+# ScrapeFlow 架构：先对账、仅新作品确认目标货架的单用户版
 
 ## 运行总览
 
 ```text
-本地 API 客户端（目标货架选择与状态控制）
+本地 API 客户端（任务状态与控制）
                     │
                     ▼
 local.simple_server
-  ├─ 待刮削目录发现、待选择登记与已确认任务调度
+  ├─ 待刮削目录发现、只读身份识别与三库对账、已确认任务调度
   ├─ 正式库审计与缺口分派
   ├─ provider 搜索、获取与 staging 校验
   └─ 一个正式媒体库写入 worker
                     │
                     ▼
-Engine（启动后：TMDB、身份、媒体树、命名、NFO/海报、执行计划）
+Engine（身份、媒体树、命名、NFO/海报、执行计划；仅真正新作品需要一级货架确认）
                     │
                     ▼
 AList（待刮削、任务专属 staging、正式媒体库）
 ```
 
-本地 API 客户端是状态与控制入口。普通来源提交后，服务仅登记 `awaiting_target_shelf`；用户必须通过 `POST /api/jobs/:id/start` 选择 `movie`、`anime` 或 `us_tv`，后端才将其映射为固定一级目标根并允许调度。用户不提交任意正式库路径；Engine 负责启动后的作品身份、媒体类型、季集、候选、具体作品目录和清理范围。若类型与用户货架冲突，服务 fail-closed，不自动改选货架。
+本地 API 客户端是状态与控制入口。普通来源提交后，服务先进行只读身份识别，并对电影、番剧和美剧正式库做对账，得到 `duplicate_complete`、`existing_gap`、`merge_existing`、`new_work` 或 `uncertain`。已有作品从匹配的正式作品继承货架/工作根；仅当 `new_work` 确实需要一级货架确认时，用户才通过 `POST /api/jobs/:id/start` 选择 `movie`、`anime` 或 `us_tv`。用户不提交任意正式库路径；Engine 负责身份、媒体类型、季集、候选、具体作品目录和清理范围。类型与已确认货架冲突时，服务 fail-closed，不自动改选货架。
 
 全库审计入口严格 report-only。确定性 NFO/海报补写只能由 `POST /api/jobs/:id/repair-artifacts` 显式触发，且只使用该任务已持久化的计划，不启动 Provider、重新规划或清理。
 
@@ -27,21 +27,18 @@ AList（待刮削、任务专属 staging、正式媒体库）
 
 ```text
 /quark/影视/待刮削/<作品目录>
-  → awaiting_target_shelf（只登记，不调用 Engine）
-  → 用户选择 电影 / 番剧 / 美剧 并调用 /start
-  → queued
-  → archive_preprocessing
-  → identity_matching
-  → planning
-  → executing
-  → verifying
-  → cleaning
-  → completed
+  → 只读身份识别 + 对电影 / 番剧 / 美剧正式库的对账
+  → duplicate_complete | existing_gap | merge_existing | new_work | uncertain
+  → duplicate_complete：身份与完整性充分确定时，仅清理任务所属输入
+  → existing_gap：匹配正式作品确定货架/工作根，只补已确认缺口
+  → merge_existing：经既有 Engine 和同一 writer 合并，不创建重复作品
+  → new_work：必要时由用户确认 movie / anime / us_tv，随后由既有 Engine 规划并由同一 writer 写入
+  → uncertain：停在 blocked / needs_attention，不猜测身份、货架、路径、删除或 Provider fallback
 ```
 
-普通任务只有在用户选择一级货架后才交给 Engine。Local 将固定目标根传入 Engine；Engine 在该根内生成具体的作品工作目录，并读取来源和 AList 事实生成包含身份、目标目录、文件名、NFO、海报、字幕以及清理动作的计划。Local 持久化任务、取得写锁、执行计划并在每次远端操作后重新读取结果。
+只读识别/对账不产生正式库写入，也不提交 Provider。正式写入由现有 Engine 规划并经同一 writer 执行；Local 持久化任务、取得写锁、执行计划并在每次远端操作后重新读取结果。
 
-一级货架固定映射为：`movie → /quark/影视/电影`、`anime → /quark/影视/番剧`、`us_tv → /quark/影视/美剧`。这项用户选择不是通用审批流程；它是普通入站任务唯一的正式启动门。完整的全项目状态机与验收门以[ScrapeFlow 最终收敛计划 v1](docs/scrapeflow-final-convergence-plan-v1.md)为准。
+一级货架固定映射为：`movie → /quark/影视/电影`、`anime → /quark/影视/番剧`、`us_tv → /quark/影视/美剧`。这项用户选择只用于真正新作品的一级货架确认，不是普通入站任务的通用启动门。长期产品与工程合同以 [`AGENTS.md`](AGENTS.md) 为准，当前实现事实以 [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md) 为准；历史收敛计划仅作参考。
 
 ## 自动补源
 
@@ -76,7 +73,7 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 
 远端目录边界为：
 
-- `/quark/影视/待刮削`：入站发现与待选择登记目录；只接受直接子目录，登记本身不启动正式任务。
+- `/quark/影视/待刮削`：入站发现与只读身份识别/对账目录；只接受直接子目录，登记本身不启动正式写入或 Provider 提交。
 - `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`：任务专属补源 staging。
 - `/quark/影视/电影`、`/quark/影视/番剧`、`/quark/影视/美剧`：正式媒体库。
 
@@ -84,8 +81,8 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 
 ## 模块职责
 
-- `local/simple_server.py`：HTTP 入口、入站监控、待选择登记、`/start` 调度、控制状态、单写 worker 和公共任务视图。
-- `local/scrapeflow_api/simple_engine_runner.py`：Engine 任务持久化、目标货架选择、身份匹配、规划、执行、回读和重启协调。
+- `local/simple_server.py`：HTTP 入口、入站监控、只读对账、仅新作品的 `/start` 确认、控制状态、单写 worker 和公共任务视图。
+- `local/scrapeflow_api/simple_engine_runner.py`：Engine 任务持久化、身份匹配、规划、执行、回读和重启协调；仅真正新作品接受目标货架确认。
 - `local/scrapeflow_api/automatic_replenishment.py`：审计缺口到 provider、staging、内部补源阶段和清理的自动编排。
 - `local/scrapeflow_api/simple_library_audit.py`：正式媒体库结构与语义审计，输出机器可处理的缺口。
 - `engine/scraper.py` 与 `engine/scrapeflow/`：TMDB 访问、作品树、文件命名、元数据和 AList 计划。
@@ -96,7 +93,7 @@ API 容器中的 `/data` 由 `SCRAPEFLOW_HOST_STATE_ROOT/scrapeflow-data` 持久
 2. move、rename、upload、delete 后都执行 AList fresh listing 与 exact readback。
 3. 路径、对象类型、字节数、来源归属和 staging 归属必须满足计划，才会推进任务。
 4. 不确定的已有正式媒体不自动删除；无法稳定识别的来源进入可重试或最终失败状态。
-5. 服务重启会保留 `awaiting_target_shelf` 状态而不把它排队；只恢复已经满足启动条件的可继续任务，并在恢复前核对远端现状，避免重复写入。
+5. 服务或 API 进程重启后保持有效暂停；任务记录可以恢复，但此前持久化的 resumed 状态不授权新的正式工作。用户显式恢复后，才在下一外部副作用边界前重新核对远端现状。
 
 ## 对外操作
 
