@@ -158,8 +158,19 @@ flowchart TD
 
 ## 6. 部署拓扑
 
-Compose 恒为三个服务:`alist`、`api`、`quark-helper`,宿主暴露仅 loopback。API 是
-模块化单体;对账、Engine、归档、writer、审计、Provider、状态都是代码模块,不是新容器。
+Compose 恒为四个服务:`alist`、`api`、`quark-helper`、`pansou`,宿主暴露仅 loopback。
+API 是模块化单体;对账、Engine、归档、writer、审计、Provider、状态都是代码模块,不是
+新容器。这四个之外不得再加服务。
+
+`pansou` 是三阶补源第一阶(`quark_share`)唯一的搜索源,2026-08-13 由外部依赖收入
+Compose:它此前作为"用户自备服务"缺席,导致 tier-1 恒定判为 infrastructure 故障、
+整条补源链从第一阶就停在 `retry_wait`。它是**只读索引**,不发布宿主端口(仅
+`http://pansou:8888` 在内部网络可达)、看不到媒体根、不写任何东西;它返回的行在被
+委派的夸克会话真实列出分享清单之前,永远不是可写候选。
+
+容器出口代理必须用 `SCRAPEFLOW_HTTP_PROXY`/`SCRAPEFLOW_HTTPS_PROXY` 配置。不得让
+Compose 继承宿主环境的 `HTTP_PROXY`:宿主值通常指向宿主回环,在容器内解析为容器
+自身,会静默切断 TMDB 与磁力索引的全部出口,而 health 仍报告 "configured"。
 
 Quark Helper 是窄 sidecar:HTTP 面只有 `health / share-save / magnet-submit /
 magnet-status` 四动作,Bearer 认证,cookie 每次从 AList storage 临时解析、只存内存、

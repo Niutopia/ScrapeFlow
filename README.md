@@ -44,7 +44,7 @@ cp .env.local.example .env.local
 
 ```sh
 docker compose --env-file .env.local build api
-docker compose --env-file .env.local up -d alist api quark-helper
+docker compose --env-file .env.local up -d alist api quark-helper pansou
 curl -fsS http://127.0.0.1:8765/api/health
 ```
 
@@ -88,7 +88,9 @@ GET  /api/browse?path=...
 
 对账结果为 `uncertain` 的任务会停在 `needs_attention`，同时 `GET /api/jobs/:id` 的 `reconciliation.identity_candidates` 列出系统计算的候选身份（类型 / TMDB id / 片名 / 年份 / 置信度，最多 5 条）。用户唯一的回流动作是从候选中确认身份后，向 `POST /api/jobs/:id/retry` 提交 `{"tmdb_id": 123, "media_type": "movie|tv", "season": 1}`（电影不带 `season`），系统随即重新执行同一只读对账；该入口不接受货架、路径、链接或 Provider 指令。
 
-严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
+严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。PanSou 现在是 Compose 的第四个服务，不发布宿主端口，只在内部网络以 `http://pansou:8888` 可达；模板默认仍是 `SCRAPEFLOW_PANSOU_ENABLED=0`，本机启用时在 `.env.local` 设 `SCRAPEFLOW_PANSOU_ENABLED=1` 与 `SCRAPEFLOW_PANSOU_URL=http://pansou:8888`。配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层——因此第一阶缺席时整条补源链不会推进。
+
+容器出口代理用 `SCRAPEFLOW_HTTP_PROXY` / `SCRAPEFLOW_HTTPS_PROXY` 配置，不继承宿主的 `HTTP_PROXY`：宿主值通常是 `http://127.0.0.1:<port>`，在容器内指向容器自身，会静默切断 TMDB 与磁力索引的全部出口，而 `/api/health` 仍报告 `tmdb_configured: true`。需要代理时填 `http://host.docker.internal:<port>`。
 
 分享快转和夸克磁力离线统一依赖四动作 Helper：`health`、`share-save`、`magnet-submit`、`magnet-status`。它只接受 Bearer 认证及与 API `SCRAPEFLOW_MEDIA_ROOT` 精确对应的任务 staging：生产为固定 `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`，隔离验收为受限 run-id 根派生路径。Helper 不再作为 macOS 登录项或宿主 Python 后台进程运行；Compose 直接使用 API 同一镜像启动 typed sidecar。API 默认通过共享 loopback `http://127.0.0.1:18765` 访问它，Bearer token 必须在本机 `.env.local` 中显式配置且至少 24 个字符。
 

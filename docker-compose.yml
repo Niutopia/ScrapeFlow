@@ -39,9 +39,13 @@ services:
       ALIST_PASSWORD: ${ALIST_PASSWORD:-}
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       TMDB_LANGUAGE: ${TMDB_LANGUAGE:-zh-CN}
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      NO_PROXY: "alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
+      # Namespaced on purpose: an ambient host HTTP_PROXY almost always points
+      # at host loopback, which resolves to the container itself and silently
+      # breaks every egress call (TMDB, magnet indexes) while health still
+      # reports "configured".  Only an explicit SCRAPEFLOW_* value is used.
+      HTTP_PROXY: ${SCRAPEFLOW_HTTP_PROXY:-}
+      HTTPS_PROXY: ${SCRAPEFLOW_HTTPS_PROXY:-}
+      NO_PROXY: "alist,pansou,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
       SCRAPEFLOW_API_HOST: 0.0.0.0
       SCRAPEFLOW_STATE_DIR: /data
       SCRAPEFLOW_MIN_VIDEO_BYTES: ${SCRAPEFLOW_MIN_VIDEO_BYTES:-1048576}
@@ -72,6 +76,7 @@ services:
       SCRAPEFLOW_SUBTITLE_PROBE_BUDGET_SECONDS: ${SCRAPEFLOW_SUBTITLE_PROBE_BUDGET_SECONDS:-120}
       SCRAPEFLOW_SUBTITLE_PROBE_WORKERS: ${SCRAPEFLOW_SUBTITLE_PROBE_WORKERS:-4}
       SCRAPEFLOW_SUBTITLE_PROBE_MAX_FILES: ${SCRAPEFLOW_SUBTITLE_PROBE_MAX_FILES:-2048}
+      SCRAPEFLOW_SUBTITLE_PROBE_BATCH_SIZE: ${SCRAPEFLOW_SUBTITLE_PROBE_BATCH_SIZE:-75}
       SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH:-0}
       SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH:-0}
       SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH:-0}
@@ -100,6 +105,26 @@ services:
       interval: 10s
       timeout: 4s
       retries: 10
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # First-tier share index.  It is a read-only search source only: it never
+  # sees the media root, never writes anything, and the API still refuses to
+  # trust a row until the delegated Quark session has listed the real share.
+  # No published port — the API reaches it on the Compose network alone.
+  pansou:
+    image: ghcr.io/fish2018/pansou:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      HTTP_PROXY: ${SCRAPEFLOW_HTTP_PROXY:-}
+      HTTPS_PROXY: ${SCRAPEFLOW_HTTPS_PROXY:-}
+      NO_PROXY: "alist,api,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging:
       options:
         max-size: "10m"
