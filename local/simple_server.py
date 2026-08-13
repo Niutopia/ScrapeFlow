@@ -149,6 +149,16 @@ _SETTLED_LIFECYCLE_PROVIDER_STATUSES = frozenset({
 _RESTART_UNSAFE_PROVIDER_STATUSES = frozenset({
     "waiting_reconcile", "needs_attention", "in_doubt",
 })
+# ``child_failed`` is the one member of the orphaned-progress set that cannot
+# have external work in flight: it records a child Engine job which already
+# reached a terminal failed phase.  The relaxed restart check reaches the
+# status string only after it has proven this root owns no live worker, no
+# live timer, no orphaned child and no non-terminal child, so treating the
+# label as activity gave a persisted child failure no exit at all — the L
+# audit that would re-drive it could never start, and retry/cancel/cleanup are
+# all refused while the projection survives.  The strict barrier and every
+# ordinary root keep blocking on it.
+_RESTART_RELAXABLE_AUDIT_PROVIDER_STATUSES = frozenset({"child_failed"})
 # Ordinary-root Provider projections that the relaxed restart check refuses
 # to ignore: only audit-owned retry state may be relaxed, never an ordinary
 # root's persisted Provider work.
@@ -1083,10 +1093,15 @@ class SimpleApplication:
                 replenishment = summary.get("replenishment")
                 if isinstance(replenishment, Mapping):
                     status = str(replenishment.get("status") or "").casefold()
-                    # retry_wait/failed/completed are safe to re-audit; an
-                    # in-doubt or active task is not safe to supersede.
+                    # retry_wait/child_failed/failed/completed are safe to
+                    # re-audit; an in-doubt or genuinely active task is not
+                    # safe to supersede.
                     if (
-                        status in _ORPHANED_PROVIDER_PROGRESS_PHASES
+                        (
+                            status in _ORPHANED_PROVIDER_PROGRESS_PHASES
+                            and status
+                            not in _RESTART_RELAXABLE_AUDIT_PROVIDER_STATUSES
+                        )
                         or status in _RESTART_UNSAFE_PROVIDER_STATUSES
                     ):
                         return False

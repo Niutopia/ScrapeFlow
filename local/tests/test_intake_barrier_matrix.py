@@ -271,6 +271,18 @@ class IntakeBarrierMatrixTests(unittest.TestCase):
                 }},
                 False, False,
             ),
+            # A child failure is terminal child state, not work in flight.
+            # The relaxed check reaches it only after proving this root owns
+            # no live worker/timer and no non-terminal child, so it must be
+            # re-auditable: blocking it left retry/cancel/cleanup with no
+            # exit while the L audit that would clear it could never start.
+            (
+                "provider_child_failed",
+                {"extra_summary": {
+                    "replenishment": {"status": "child_failed", "terminal": False},
+                }},
+                False, True,
+            ),
             (
                 "provider_terminal_failure_projection",
                 {"extra_summary": {
