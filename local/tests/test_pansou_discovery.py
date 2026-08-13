@@ -169,6 +169,57 @@ class PanSouDiscoveryTests(unittest.TestCase):
             "quark_share:fixtureShare01",
         )
 
+    def test_absent_merged_map_is_an_empty_result_not_a_protocol_failure(self) -> None:
+        # Upstream drops ``merged_by_type`` when the cloud-type filter matched
+        # nothing.  Treating that as malformed made every zero-Quark query an
+        # infrastructure failure, which no exhaustion proof can survive, so
+        # the whole first tier could never advance.
+        payload = _response("https://pan.quark.cn/s/fixtureShare01")
+        payload["data"].pop("merged_by_type")
+        discovery, _calls = self._discovery(payload)
+
+        result = discovery.run(_request())
+
+        self.assertNotIn("failure_scope", result)
+        self.assertEqual(
+            result["source_telemetry"]["PanSou"]["infrastructure_failures"], 0,
+        )
+        self.assertTrue(result["search_complete"])
+        self.assertEqual(len(result["candidates"]), 1)
+
+    def test_result_row_without_links_is_skipped_rather_than_fatal(self) -> None:
+        # A matched post carrying no link of the requested type is ordinary
+        # filtered output; it must not poison the query it appears in.
+        payload = _response("https://pan.quark.cn/s/fixtureShare01")
+        payload["data"]["results"].append({
+            "message_id": "99",
+            "unique_id": "fixture-99",
+            "channel": "fixture-channel",
+            "datetime": "2026-08-10T00:00:00Z",
+            "title": "求助 有没有这部",
+            "content": "",
+            "links": None,
+        })
+        payload["data"]["total"] = len(payload["data"]["results"])
+        discovery, _calls = self._discovery(payload)
+
+        result = discovery.run(_request())
+
+        self.assertNotIn("failure_scope", result)
+        self.assertEqual(result["unchecked_secondary_candidates"], 0)
+        self.assertTrue(result["search_complete"])
+        self.assertEqual(len(result["candidates"]), 1)
+
+    def test_wrongly_typed_links_remain_a_protocol_failure(self) -> None:
+        payload = _response("https://pan.quark.cn/s/fixtureShare01")
+        payload["data"]["results"][0]["links"] = "not-a-list"
+        discovery, _calls = self._discovery(payload)
+
+        result = discovery.run(_request())
+
+        self.assertEqual(result["failure_scope"], "infrastructure")
+        self.assertFalse(result["search_complete"])
+
     def test_disabled_source_is_explicitly_incomplete(self) -> None:
         discovery = PanSouDiscovery(enabled=False, url="", inspector=None)
 

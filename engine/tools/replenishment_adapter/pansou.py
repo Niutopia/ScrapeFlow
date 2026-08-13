@@ -273,6 +273,12 @@ def _response_links(value: Mapping[str, Any]) -> tuple[list[dict[str, str]], int
     """Return normalized Quark links and response rows not proven inspected."""
     result_rows = value.get("results")
     merged = value.get("merged_by_type")
+    if merged is None:
+        # Upstream omits the merged map entirely when the requested cloud
+        # type matched nothing.  That is an empty result, not a protocol
+        # violation, and rejecting it turned an ordinary zero-Quark query
+        # into an infrastructure failure that no exhaustion proof survives.
+        merged = {}
     if not isinstance(result_rows, list) or not isinstance(merged, Mapping):
         raise PanSouDiscoveryError(
             "PanSou res=all response lacks results/merged_by_type"
@@ -286,6 +292,11 @@ def _response_links(value: Mapping[str, Any]) -> tuple[list[dict[str, str]], int
         if not isinstance(result, Mapping):
             raise PanSouDiscoveryError("PanSou result row is invalid")
         raw_links = result.get("links")
+        if raw_links is None:
+            # A matched post that carries no link of the requested cloud type
+            # is ordinary filtered output.  It contributes no candidate and
+            # nothing left unchecked, so it must not fail the whole query.
+            raw_links = []
         if not isinstance(raw_links, list):
             raise PanSouDiscoveryError("PanSou result links are invalid")
         result_title = _safe_text(result.get("title"))
