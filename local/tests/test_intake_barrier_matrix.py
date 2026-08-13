@@ -456,5 +456,128 @@ class IntakeBarrierMatrixTests(unittest.TestCase):
         self.assertFalse(relaxed)
 
 
+class OneDirectoryAList:
+    """A read-only intake root with one direct child directory."""
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        if path.rstrip("/").endswith("待刮削"):
+            return [{"name": "Incoming", "is_dir": True}]
+        return []
+
+
+class IntakeVisibilityProjectionTests(unittest.TestCase):
+    """Report-only Q-gate visibility; projections must never gate anything."""
+
+    def _application(self, root: Path, *, remote: object | None = None):
+        client = remote if remote is not None else EmptyAList()
+        runner = SimpleEngineRunner(
+            root, alist=client, tmdb=object(), validate=False,
+            library_root="/library",
+        )
+        with patch.object(SimpleApplication, "_start_startup_thread"):
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=client,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+        return app, runner
+
+    def test_waiting_barrier_projects_blockers_and_deferred_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, runner = self._application(Path(directory))
+            try:
+                _write_job(runner, "u1", "reconciliation_uncertain")
+                _write_job(runner, "a1", "executing")
+                _write_job(runner, "f1", "failed")
+                _write_job(runner, "r1", "retry_wait")
+                _write_job(
+                    runner, "c1", "executing",
+                    summary={"internal_child": True},
+                )
+                _write_job(
+                    runner, "e1", "completed",
+                    summary={"reconciliation": {"outcome": "existing_gap"}},
+                )
+                app._intake_status["last_scan_empty"] = False  # noqa: SLF001
+                app._refresh_intake_settlement()  # noqa: SLF001
+                status = dict(app._intake_status)  # noqa: SLF001
+                first_waiting_since = status["barrier_waiting_since"]
+                # The waiting timestamp is sticky across refreshes while the
+                # barrier stays closed; it records since-when, not last-seen.
+                app._refresh_intake_settlement()  # noqa: SLF001
+                second_waiting_since = app._intake_status[  # noqa: SLF001
+                    "barrier_waiting_since"
+                ]
+            finally:
+                app.close()
+        self.assertEqual(status["barrier_blockers"], {
+            "active_roots": 1,
+            "uncertain_roots": 1,
+            "failed_roots": 1,
+            "retry_wait_roots": 1,
+            "active_children": 1,
+        })
+        self.assertEqual(status["deferred_existing_gap_roots"], 1)
+        self.assertIsNotNone(first_waiting_since)
+        self.assertEqual(second_waiting_since, first_waiting_since)
+
+    def test_settled_barrier_clears_waiting_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, runner = self._application(Path(directory))
+            try:
+                _write_job(runner, "u1", "reconciliation_uncertain")
+                app._intake_status["last_scan_empty"] = False  # noqa: SLF001
+                app._refresh_intake_settlement()  # noqa: SLF001
+                self.assertIsNotNone(
+                    app._intake_status["barrier_waiting_since"],  # noqa: SLF001
+                )
+                (runner.jobs_root / "u1.json").unlink()
+                app._intake_status["last_scan_empty"] = True  # noqa: SLF001
+                app._refresh_intake_settlement()  # noqa: SLF001
+                status = dict(app._intake_status)  # noqa: SLF001
+            finally:
+                app.close()
+        self.assertTrue(status["settled"])
+        self.assertIsNone(status["barrier_waiting_since"])
+        self.assertIsNone(status["barrier_blockers"])
+        self.assertEqual(status["deferred_existing_gap_roots"], 0)
+
+    def test_backlog_warning_flags_persistently_nonempty_intake(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, runner = self._application(
+                Path(directory), remote=OneDirectoryAList(),
+            )
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {"SCRAPEFLOW_INTAKE_BACKLOG_WARN_SCANS": "2"},
+                ), patch.object(app, "_queue_automatic_job"):
+                    app._scan_inbound_once()  # noqa: SLF001
+                    self.assertEqual(
+                        app._intake_status["nonempty_scan_streak"], 1,  # noqa: SLF001
+                    )
+                    self.assertFalse(
+                        app._intake_status["intake_backlog_warning"],  # noqa: SLF001
+                    )
+                    app._scan_inbound_once()  # noqa: SLF001
+                    self.assertEqual(
+                        app._intake_status["nonempty_scan_streak"], 2,  # noqa: SLF001
+                    )
+                    self.assertTrue(
+                        app._intake_status["intake_backlog_warning"],  # noqa: SLF001
+                    )
+                    # One empty observation resets the report-only streak.
+                    runner.alist = EmptyAList()
+                    app._scan_inbound_once()  # noqa: SLF001
+                    self.assertEqual(
+                        app._intake_status["nonempty_scan_streak"], 0,  # noqa: SLF001
+                    )
+                    self.assertFalse(
+                        app._intake_status["intake_backlog_warning"],  # noqa: SLF001
+                    )
+            finally:
+                app.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -286,6 +286,13 @@ class SimpleApplication:
             "last_scan_empty": False,
             "settled": False,
             "full_audit_barrier": "waiting_for_intake",
+            # Report-only Q-gate visibility.  None of these fields gates
+            # anything; the settlement predicates stay the single authority.
+            "nonempty_scan_streak": 0,
+            "intake_backlog_warning": False,
+            "barrier_waiting_since": None,
+            "barrier_blockers": None,
+            "deferred_existing_gap_roots": 0,
         }
         self._intake_audit_timer_armed = False
         # Provider is a downstream L→M lane: a successful full report-only
@@ -521,6 +528,21 @@ class SimpleApplication:
             return 0.0
         return max(5.0, min(3600.0, value))
 
+    @staticmethod
+    def _intake_backlog_warn_scans() -> int:
+        """Consecutive non-empty intake scans before the report-only flag.
+
+        The flag never blocks registration or forces the L audit; it only
+        makes a persistently starved settlement barrier visible in /health
+        so the operator knows why the full-library pass has not run yet.
+        """
+        raw = os.getenv("SCRAPEFLOW_INTAKE_BACKLOG_WARN_SCANS", "10").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 10
+        return max(1, min(10000, value))
+
     def _intake_monitor_enabled(self) -> bool:
         # Test/local alternate roots normally submit a path explicitly.  The
         # real compose root is monitored by default, while a custom mount can
@@ -705,12 +727,21 @@ class SimpleApplication:
                 self._provider_admission_epoch += 1
             admitted = self._provider_full_audit_admitted
             prior_barrier = self._intake_status.get("full_audit_barrier")
+            streak = (
+                int(self._intake_status.get("nonempty_scan_streak") or 0) + 1
+                if intake_objects_present
+                else 0
+            )
             self._intake_status.update({
                 "last_scan_at": _now(),
                 "last_error": None,
                 "last_scheduled_count": len(scheduled),
                 "last_registered_count": len(registered),
                 "last_scan_empty": not intake_objects_present,
+                "nonempty_scan_streak": streak,
+                "intake_backlog_warning": (
+                    streak >= self._intake_backlog_warn_scans()
+                ),
                 "settled": False,
                 # A successful L audit remains the admission epoch while its
                 # downstream Provider work is active.  Provider-owned roots
@@ -1144,6 +1175,52 @@ class SimpleApplication:
                 return True
         return False
 
+    def _barrier_wait_projection(self) -> tuple[dict[str, int], int]:
+        """Summarise, report-only, what keeps the settlement barrier closed.
+
+        Returns bounded per-category root/child counts plus the number of
+        finalised existing_gap roots whose registered media debts wait for
+        the next L→M cycle.  This projection never gates anything: the
+        settlement predicates remain the single admission authority, and a
+        read failure here simply reports zero counts.
+        """
+        blockers = {
+            "active_roots": 0,
+            "uncertain_roots": 0,
+            "failed_roots": 0,
+            "retry_wait_roots": 0,
+            "active_children": 0,
+        }
+        deferred_gaps = 0
+        try:
+            all_jobs = self._get_engine_runner().list_jobs()
+        except Exception:
+            return blockers, deferred_gaps
+        for job in all_jobs:
+            if self._is_internal_child(job):
+                if job.phase not in _ENGINE_TERMINAL_PHASES:
+                    blockers["active_children"] += 1
+                continue
+            summary = job.summary if isinstance(job.summary, Mapping) else {}
+            reconciliation = summary.get("reconciliation")
+            outcome = (
+                str(reconciliation.get("outcome") or "")
+                if isinstance(reconciliation, Mapping)
+                else ""
+            )
+            if outcome == "existing_gap" and job.phase in {"executed", "completed"}:
+                deferred_gaps += 1
+                continue
+            if job.phase == "reconciliation_uncertain":
+                blockers["uncertain_roots"] += 1
+            elif job.phase == "retry_wait":
+                blockers["retry_wait_roots"] += 1
+            elif job.phase in _ENGINE_TERMINAL_FAILURE_PHASES:
+                blockers["failed_roots"] += 1
+            elif job.phase in _BARRIER_BLOCKED_ROOT_PHASES:
+                blockers["active_roots"] += 1
+        return blockers, deferred_gaps
+
     def _refresh_intake_settlement(self) -> bool:
         """Update the barrier projection and optionally queue report-only audit."""
         settled = self._intake_is_settled()
@@ -1152,9 +1229,22 @@ class SimpleApplication:
         # by this pre-L predicate so one fresh report-only audit can re-open
         # the in-memory M admission token.
         audit_ready = settled or self._full_audit_ready_for_provider()
+        blockers, deferred_gaps = self._barrier_wait_projection()
         with self._automatic_lock:
             admitted = self._provider_full_audit_admitted
             barrier = self._intake_status.get("full_audit_barrier")
+            # Report-only Q-gate visibility: expose confirmed replenishment
+            # debts always, and while the barrier is genuinely waiting (not
+            # settled and not merely downstream of an already completed L
+            # audit) record since-when plus a bounded blocker summary.
+            self._intake_status["deferred_existing_gap_roots"] = deferred_gaps
+            if settled or (admitted and barrier == "completed"):
+                self._intake_status["barrier_waiting_since"] = None
+                self._intake_status["barrier_blockers"] = None
+            else:
+                if self._intake_status.get("barrier_waiting_since") is None:
+                    self._intake_status["barrier_waiting_since"] = _now()
+                self._intake_status["barrier_blockers"] = blockers
             if settled:
                 if not (admitted and barrier == "completed"):
                     self._intake_status.update({
