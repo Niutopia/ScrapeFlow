@@ -2,7 +2,7 @@
 
 > 状态：历史单模块快照，记录当时的 target-shelf-first 启动门；不得作为当前产品合同、实现要求或完成声明。
 >
-> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。本文件中的入口顺序已被 reconciliation-first 长期合同取代。
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对。本文件中的入口顺序已被 reconciliation-first 长期合同取代。
 >
 > 日期：2026-08-09
 >
@@ -66,7 +66,7 @@
 
 | 阶段 | 当前文件 | 责任边界 |
 | --- | --- | --- |
-| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、相关历史审计和本计划 | 当时的产品说明与历史标识；当前长期合同见 `../AGENTS.md`，当前实现事实见 `CURRENT-STATE.md` |
+| 0 合同与文档 | ARCHITECTURE.md、README.md、engine/README.md、相关历史审计和本计划 | 当时的产品说明与历史标识；当前长期合同见 `../AGENTS.md`，当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对 |
 | 1 启动门 | engine/scrapeflow/target_shelf.py、local/tests/test_target_shelf_start_gate.py、local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py* | 枚举、登记、选择和 /start |
 | 2 已选主链 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_engine_runner.py* | 预处理→身份→规划及货架约束 |
 | 3 恢复与取消 | local/simple_server.py*、local/scrapeflow_api/simple_engine_runner.py*、local/tests/test_simple_server.py*、local/tests/test_simple_engine_runner.py* | restart、retry、cancel、legacy 边界 |

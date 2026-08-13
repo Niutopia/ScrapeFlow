@@ -1,5 +1,7 @@
 # ScrapeFlow 旧状态所有权只读审计（2026-08-09）
 
+> 历史只读状态快照，仅供参考；不构成当前产品或工程合同。当前长期规则见根 `AGENTS.md`，当前实现事实以源码、测试和 Git 工作树核对。
+
 采集时间：2026-08-09 15:03（Asia/Shanghai）。本报告只读取 compose/env、容器挂载、HTTP GET 投影和持久状态文件；未修改、删除、迁移或重放任何 job、gap、staging、AList 或正式媒体库对象，也未调用 pause/resume、retry、cleanup 或 audit run。唯一新增对象是本报告。
 
 ## 结论

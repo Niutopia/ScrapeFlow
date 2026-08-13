@@ -6,7 +6,7 @@
 >
 > 适用范围：单用户、单机、单实例、单 AList 媒体库
 >
-> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。本文件是历史单用户收敛快照。
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对。本文件是历史单用户收敛快照。
 
 ## 1. 计划目的
 
@@ -45,7 +45,7 @@
 - 一个 API 实例。
 - 一个 AList 实例和一套媒体库根。
 - 一个正式库 writer。
-- 这是历史收敛时的 worker 容量记录；Provider/audit 自动 lane 的当前要求以根 `AGENTS.md` 和 `CURRENT-STATE.md` 为准。
+- 这是历史收敛时的 worker 容量记录；Provider/audit 自动 lane 的长期要求以根 `AGENTS.md` 为准，当前实现事实以源码、测试和 Git 工作树证据核对。
 - 用户可以暂停、恢复、重试、取消和处理最终失败。
 
 ### 2.2 不再建设的能力

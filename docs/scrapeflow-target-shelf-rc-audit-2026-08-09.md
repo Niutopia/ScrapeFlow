@@ -3,7 +3,7 @@
 日期：2026-08-09
 
 > 文档性质：这是 2026-08-09 的历史 RC 审计快照，只记录当时 target-shelf-first 实现的证据；不构成当前产品或工程合同。
-> 长期合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 实现事实见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。
+> 长期合同见 [`../AGENTS.md`](../AGENTS.md)；当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对。
 
 分支：`codex/scrapeflow-transactional-convergence`
 
@@ -21,7 +21,7 @@
 
 | 阶段 | 结论 | 证据 |
 | --- | --- | --- |
-| 0 合同与边界 | 历史通过 | 这是目标货架 RC 当时的结论；当前长期合同是 `AGENTS.md`，当前实现事实见 `docs/CURRENT-STATE.md`，本表不得作为全项目完成声明。 |
+| 0 合同与边界 | 历史通过 | 这是目标货架 RC 当时的结论；当前长期合同是 `AGENTS.md`，当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对，本表不得作为全项目完成声明。 |
 | 1 登记与 `/start` | 通过 | `engine/scrapeflow/target_shelf.py` 提供唯一映射；`local/tests/test_target_shelf_start_gate.py` 覆盖 waiting 零正式副作用、非法枚举、重复 `/start`、paused start 和 waiting restart；`local/tests/test_simple_server.py` 覆盖 HTTP `/start`。 |
 | 2 已选主链 | 通过 | `local/scrapeflow_api/simple_engine_runner.py` 在 worker/plan/execute/recovery 前校验 shelf；归档后缀身份查询、类型兼容矩阵、target root containment 和 problem gate 由 `test_target_shelf_start_gate.py` 与 `test_simple_engine_runner.py` 覆盖。 |
 | 3 恢复、重试与取消 | 通过 | `test_simple_server.py` 覆盖 queued cancel、legacy retry 拒绝、target conflict 重选、cleanup-only retry 不落回 writer；`test_recovery_matrix.py` 与 runner 测试覆盖重启边界。 |

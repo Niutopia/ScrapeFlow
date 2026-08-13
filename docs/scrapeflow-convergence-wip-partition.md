@@ -4,7 +4,7 @@
 
 旧分区使用阶段 4–7 编号，并把 server、cleanup 与 Web 混在一起；因此不能再用于“目标货架启动门”实施或提交边界。
 
-长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)。本文件只保留当时 dirty/untracked WIP 的历史归属。
+长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对。本文件只保留当时 dirty/untracked WIP 的历史归属。
 
 本快照仍可作为以下历史证据使用：
 
@@ -12,4 +12,4 @@
 - 当时没有执行 destructive reset，也不应据此恢复、迁移、清理或重跑旧任务。
 - 历史 patch、保护分支与未提交 WIP 都不是发布证明。
 
-当前实施以根 `AGENTS.md` 和 `CURRENT-STATE.md` 为准；旧状态治理独立、只读，不能混入功能 checkpoint。
+当前实施事实以根 `AGENTS.md`、源码、测试和 Git 工作树证据核对；旧状态治理独立、只读，不能混入功能 checkpoint。

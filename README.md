@@ -1,8 +1,8 @@
 # ScrapeFlow
 
-ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。长期产品与工程合同见
-[`AGENTS.md`](AGENTS.md)，当前 HEAD 的实现事实与已知差距见
-[`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。
+ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。长期产品与工程合同(含
+A→O 唯一主流程、门禁与补源纪律)见 [`AGENTS.md`](AGENTS.md)。当前 HEAD
+的实现事实与已知差距以源码、测试和 Git 工作树证据核对。
 
 目标普通入站流程先对来源做只读身份识别，并与电影、番剧、美剧正式库对账；结果只能是
 `duplicate_complete`、`existing_gap`、`merge_existing`、`new_work` 或 `uncertain`。已有
@@ -22,8 +22,8 @@ Provider 降级。Provider 自动补源和自动审计保持默认关闭。
   → 正式写入后 AList 精确回读、NFO/海报/字幕处理与当前作品检查
 ```
 
-当前 HEAD 尚未完全实现上述对账优先流程；其仍存在的 `awaiting_target_shelf` 启动门属于实现
-事实，不是最终产品合同，详见 `docs/CURRENT-STATE.md`。系统会在短暂的网络、TMDB 或 AList
+当前 HEAD 已接入对账优先的入站入口；只有 reconciliation 判定为 `new_work` 的任务才进入
+`awaiting_target_shelf` 货架确认阶段，旧记录仍按兼容规则处理。系统会在短暂的网络、TMDB 或 AList
 延迟后按规则重试；最终失败的任务可重新尝试或取消。
 
 ## 最少配置
@@ -51,14 +51,14 @@ curl -fsS http://127.0.0.1:8765/api/health
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
 同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Sidecar 使用同一组 `ALIST_USERNAME`/`ALIST_PASSWORD` 访问 Compose 内部 AList，每次从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和当前 AList 的 `root_folder_id`（兼容旧 `root_id`），并只在该次固定 Quark HTTPS/WSG 操作期间保存在内存；两者不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
-显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。当前 HEAD 发现来源时只创建 `awaiting_target_shelf` 记录，尚不会在选择前执行身份识别或对账；这是待收敛的实现事实，不是长期产品合同，详见 [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径。
+显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`。当前 HEAD 发现来源时创建 `reconciling` 记录并先执行只读身份识别/正式库对账；只有判定为 `new_work` 时才进入 `awaiting_target_shelf`。默认模板保持关闭，仍可通过 `POST /api/jobs` 提交来源路径。
 
 ## 使用方式
 
 1. 创建作品目录，例如 `/quark/影视/待刮削/作品名.年份/`。
 2. 放入视频、字幕或已有元数据。
 3. 等待入站监控发现目录，或通过 `POST /api/jobs` 提交路径。
-4. 目标流程会先只读识别并对账；仅确认是新的正式作品时，才通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv` 确认一级货架。当前 API 的 target-shelf-first 限制见 `docs/CURRENT-STATE.md`。
+4. 目标流程会先只读识别并对账；`merge_existing` 沿用已匹配作品根，`existing_gap` 进入限定审计/补源链路，只有 `new_work` 才通过 `POST /api/jobs/:id/start` 传入 `movie`、`anime` 或 `us_tv` 确认一级货架。
 5. 通过 `GET /api/jobs` 查看身份、阶段、重试次数、AList 回读和补源结果。
 
 系统只清理本任务从入站目录移动的内容、任务创建的 staging 和明确归类的临时残留；已有正式媒体不会因名称推测而被删除。
@@ -84,7 +84,7 @@ POST /api/library-audit/run
 GET  /api/browse?path=...
 ```
 
-`POST /api/jobs` 只接收来源目录路径，`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。长期合同中，`target_shelf` 是新作品首次正式入库时的受限确认枚举，不是普通输入进行只读 Engine 身份识别或正式库对账的前置门；已匹配的正式作品沿用其既有货架/作品根，身份不确定时安全停止。当前 HEAD 的登记与 `/start` 实现仍先要求货架选择，属于待收敛差距，详见 [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md)。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
+`POST /api/jobs` 只接收来源目录路径，`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。长期合同中，`target_shelf` 是新作品首次正式入库时的受限确认枚举，不是普通输入进行只读 Engine 身份识别或正式库对账的前置门；已匹配的正式作品沿用其既有货架/作品根，身份不确定时安全停止。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
 
 严格补源的第一阶只读取 PanSou 的 `POST /api/search`，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。默认 `SCRAPEFLOW_PANSOU_ENABLED=0`。启用时必须设置可达的 `SCRAPEFLOW_PANSOU_URL`（容器外的本机服务通常使用 `http://host.docker.internal:<port>`）及需要时的 token；配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 `quark_share`，不会伪造“没有候选”或跳到后续磁力层。
 
@@ -145,7 +145,7 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 - 隔离 API 启动后的只读核对可用
   `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:8765 --expected-commit <git-commit>`。
 
-文档权威层级如下：[`AGENTS.md`](AGENTS.md) 是长期产品与工程合同；[`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md) 是当前 HEAD 的实现事实和已知差距；[`ARCHITECTURE.md`](ARCHITECTURE.md) 描述目标架构，并与长期合同保持一致。`docs/scrapeflow-final-convergence-plan-v1.md`、旧目标货架计划、RC 和验收文档均仅作历史参考，不覆盖前述权威。它们不授权解除全局暂停或开放自动执行。
+文档权威层级如下：[`AGENTS.md`](AGENTS.md) 是唯一的长期产品与工程合同(含目标架构与 A→O 主流程)；当前实现事实与已知差距以源码、测试和 Git 工作树证据核对。`docs/scrapeflow-final-convergence-plan-v1.md`、旧目标货架计划、RC 和验收文档均仅作历史参考，不覆盖前述权威。它们不授权解除全局暂停或开放自动执行。
 
 ## 检查
 

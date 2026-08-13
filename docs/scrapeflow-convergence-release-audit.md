@@ -4,7 +4,7 @@
 
 > 文档性质：这是 2026-08-09 的历史 release-candidate 审计快照，记录当时 fake 环境、分支与阶段检查的证据。它不证明当前工作树、当前运行时或“用户选择目标货架后启动”主线已经实施完成，也不授权解除暂停。
 >
-> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前 HEAD 的实现事实和已知差距见 [`CURRENT-STATE.md`](CURRENT-STATE.md)；本文件是历史发布审计快照。
+> 长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前事实以根 AGENTS.md、源码、测试和 Git 工作树证据核对；本文件是历史发布审计快照。
 
 本审计所记录的 release candidate 当时位于 `codex/scrapeflow-transactional-convergence`；阶段 checkpoint 已按阶段提交，最后由 convergence commit 收束跨阶段 runtime wiring。精确提交号应由当时部署的 `/api/health.build_commit` 和 Git 共同记录，本文不硬编码。
 
