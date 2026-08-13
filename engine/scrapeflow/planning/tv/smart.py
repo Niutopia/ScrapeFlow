@@ -1882,6 +1882,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                         ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
                         episode_map_path=None, episode_group_id=None,
                         source_files=child_files,
+                        media_root=kwargs.get("media_root"),
                     )
                     try:
                         child_plan = build_tv_plan(
@@ -2261,7 +2262,11 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 # already directly below a production category root, that
                 # category itself is intentionally not lockable; keep the
                 # movie in its own child directory below the TV root instead.
-                placement_for(source_root, movie_parent)
+                placement_for(
+                    source_root,
+                    movie_parent,
+                    media_root=kwargs.get("media_root"),
+                )
             except ValueError:
                 movie_parent = first.target_root
             movie_plans = [
@@ -2445,7 +2450,10 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     if warning not in plan.warnings
                 )
             _dedupe_merged_tv_target_variants(plan)
-            validate_plan(kwargs["alist"], plan)
+            validate_plan(
+                kwargs["alist"], plan,
+                media_root=kwargs.get("media_root"),
+            )
             return plan
     try:
         plan = build_tv_plan(**smart_kwargs)

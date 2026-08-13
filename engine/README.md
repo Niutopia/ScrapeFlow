@@ -13,7 +13,7 @@ Engine 是 ScrapeFlow 的业务规划层，也是作品身份、媒体树和具�
   → AList 刷新与精确回读
 ```
 
-在正式写入或新的 Provider 提交之前，Engine 可以参与普通入站的只读身份识别和正式库对账；这些操作不创建正式作品、不解包归档、不触发写入。只有 `new_work` 需要 `movie`、`anime` 或 `us_tv` 的首次一级货架确认；随后 Engine 在对应的 `/电影`、`/番剧` 或 `/美剧` 一级根内规划具体作品路径。身份结果与已确认货架不兼容时必须停止，而不是用语言、国家或路径 marker 覆盖用户选择。当前实现事实见 `../docs/CURRENT-STATE.md`。
+在正式写入或新的 Provider 提交之前，Engine 可以参与普通入站的只读身份识别和正式库对账；这些操作不创建正式作品、不解包归档、不触发写入。只有 `new_work` 需要 `movie`、`anime` 或 `us_tv` 的首次一级货架确认；随后 Engine 在对应的 `/电影`、`/番剧` 或 `/美剧` 一级根内规划具体作品路径。身份结果与已确认货架不兼容时必须停止，而不是用语言、国家或路径 marker 覆盖用户选择。当前实现事实以仓库源码、测试和 Git 工作树证据核对。
 
 Engine 生成普通 JSON 计划。计划包含来源与目标路径、文件动作、元数据、资源缺口和任务拥有的清理项；凭据只从环境变量读取，不进入计划、持久化状态、API 响应或日志。
 
@@ -25,7 +25,7 @@ Engine 生成普通 JSON 计划。计划包含来源与目标路径、文件动�
 /quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>
 ```
 
-Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身份，生成内部补源阶段的计划，再由同一个正式库 writer 执行。Provider 不决定正式库位置、TMDB 身份、季集或最终命名；其内部 child 继承根任务已确认的 `target_shelf`，不重新自动路由。
+Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身份，生成内部补源阶段的计划，再由同一个正式库 writer 执行。Provider 不决定正式库位置、TMDB 身份、季集或最终命名；其内部 child 沿用已验证的 identity、具体作品根和同一 writer，不重新自动路由。由正式库 audit 产生的 existing-gap owner 可能没有顶层 `target_shelf` 字段，此时以严格的 shelf/work-root 映射和 child 目标根校验为准。
 
 内部补源 child 是 media-only：只整理视频，保留正式库已有的作品/季度 NFO 与海报，不为每个补入集数新建 episode NFO；字幕缺口走独立的目标语言侧车流程。
 
@@ -46,7 +46,7 @@ Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身�
 - `engine/scrapeflow/media_naming.py`：正式目录和文件名规则。
 - `engine/scrapeflow/plan_artifacts.py`：NFO、海报及其他计划产物。
 
-Local 服务负责入站登记、只读对账、仅新作品的目标货架确认、调度、持久化和 API；Engine 负责身份和规划判断。两者通过结构化请求和计划交接，任何远端写入都回到 Local 的单写执行路径。完整的长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)，当前实现事实见 [`../docs/CURRENT-STATE.md`](../docs/CURRENT-STATE.md)；历史收敛计划仅作参考。
+Local 服务负责入站登记、只读对账、仅新作品的目标货架确认、调度、持久化和 API；Engine 负责身份和规划判断。两者通过结构化请求和计划交接，任何远端写入都回到 Local 的单写执行路径。完整的长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前实现事实以仓库源码、测试和 Git 工作树证据核对，历史收敛计划仅作参考。
 
 ## 仓库检查
 

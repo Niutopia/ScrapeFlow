@@ -6333,6 +6333,7 @@ def build_tv_plan(
     auto_special_title_match: bool = False,
     auto_align_subtitles: bool = False,
     source_files: Sequence[Mapping[str, Any]] | None = None,
+    media_root: str | None = None,
 ) -> Plan:
     show = tmdb_client.get(f"/tv/{tmdb_id}")
     title = safe_name(str(show.get("name") or show.get("original_name") or tmdb_id))
@@ -7311,7 +7312,7 @@ def build_tv_plan(
             if episode_gaps:
                 plan.scan_report["resource_gaps"] = episode_gaps
     _add_snapshot_warnings(plan)
-    validate_plan(alist, plan)
+    validate_plan(alist, plan, media_root=media_root)
     return plan
 
 
@@ -9288,6 +9289,7 @@ def build_batch_plan(
     parent_path: str,
     ignore_orphan_temp: bool = False,
     _target_root: str | None = None,
+    media_root: str | None = None,
 ) -> Plan:
     """Combine independently identified descendants into one diagnostic plan."""
     source_root = normalize_remote_path(src_path)
@@ -9373,6 +9375,7 @@ def build_batch_plan(
                         parent_path=parent_path,
                         ignore_orphan_temp=ignore_orphan_temp,
                         _target_root=nested_target_root,
+                        media_root=media_root,
                     )
                 )
                 inferred_members += len(nested_members)
@@ -9436,6 +9439,7 @@ def build_batch_plan(
                         episode_map_path=None,
                         episode_group_id=None,
                         source_files=source_files,
+                        media_root=media_root,
                         _proven_member_season=member_season != 1,
                     )
                 )
@@ -9620,7 +9624,7 @@ def build_batch_plan(
             "member_posters": member_posters,
         },
     )
-    validate_plan(alist, result)
+    validate_plan(alist, result, media_root=media_root)
     return result
 
 
@@ -9802,6 +9806,8 @@ def _same_concrete_movie_release(
 def validate_plan(
     alist: AListClient,
     plan: Plan,
+    *,
+    media_root: str | None = None,
 ) -> None:
     _demote_unpaired_subtitles(alist, plan)
     _restrict_cleanup_to_allowlist(plan)
@@ -9818,7 +9824,7 @@ def validate_plan(
     source_root = normalize_remote_path(plan.source_root).rstrip("/") or "/"
     target_root = normalize_remote_path(plan.target_root).rstrip("/") or "/"
     try:
-        placement_for(source_root, target_root)
+        placement_for(source_root, target_root, media_root=media_root)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     source_root_folded = _collision_key(source_root)
@@ -9926,7 +9932,7 @@ def validate_plan(
         ):
             raise PlanError(f"计划中的目标目录不在 target_root 下: {target_dir}")
         try:
-            placement_for(source_root, target_dir)
+            placement_for(source_root, target_dir, media_root=media_root)
         except ValueError as exc:
             raise PlanError(str(exc)) from exc
 
