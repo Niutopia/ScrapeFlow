@@ -941,6 +941,37 @@ def _media_context_from_source_and_target(
     return requested_type, prefer_animation
 
 
+def bounded_auto_match_candidate_rows(
+    candidates: Sequence[AutoMatch], *, limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Project scored candidates into a bounded, JSON-only evidence list."""
+    return [
+        {
+            "media_type": item.media_type,
+            "tmdb_id": item.tmdb_id,
+            "title": item.title,
+            "year": item.year,
+            "confidence": item.confidence,
+            "status": item.status,
+        }
+        for item in list(candidates)[:limit]
+    ]
+
+
+class AutoMatchAmbiguityError(PlanError):
+    """A safe rejection that still carries bounded candidate evidence.
+
+    The matcher refuses to choose automatically, but the scored candidates
+    remain useful read-only evidence: the reconciliation U-node exposes them
+    so the operator can confirm one identity instead of researching TMDB by
+    hand.  This is deliberately not a fallback selection mechanism.
+    """
+
+    def __init__(self, message: str, *, candidates: Sequence[AutoMatch]) -> None:
+        super().__init__(message)
+        self.candidates = bounded_auto_match_candidate_rows(candidates)
+
+
 def auto_match_tmdb(
     client: TMDBClient,
     query: str,
@@ -1169,14 +1200,16 @@ def auto_match_tmdb(
             f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%}, {item.status})"
             for item in candidates[:3]
         )
-        raise PlanError(
-            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview
+        raise AutoMatchAmbiguityError(
+            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview,
+            candidates=candidates,
         )
     if "year_conflict" in best.decision_trace.get("blockers", []):
-        raise PlanError(
+        raise AutoMatchAmbiguityError(
             f"自动匹配候选年份与源目录冲突，拒绝自动选择: "
             f"query_year={query_year}, candidate={best.media_type}/{best.tmdb_id} "
-            f"{best.title} ({best.year})"
+            f"{best.title} ({best.year})",
+            candidates=candidates,
         )
     runner_up = candidates[1] if len(candidates) > 1 else None
     best_exact = max(
@@ -1194,18 +1227,21 @@ def auto_match_tmdb(
         < AUTO_MATCH_MIN_MARGIN
         and not exact_title_uniquely_identifies_best
     ):
-        raise PlanError(
+        raise AutoMatchAmbiguityError(
             "自动匹配前两名证据无法区分，拒绝自动选择: "
             + "; ".join(
                 f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%})"
                 for item in candidates[:2]
-            )
+            ),
+            candidates=candidates,
         )
     return best, candidates
 
 
 __all__ = [
     "AUTO_MATCH_MIN_MARGIN",
+    "AutoMatchAmbiguityError",
+    "bounded_auto_match_candidate_rows",
     "_extract_year",
     "_normalize_match_title",
     "_title_similarity",

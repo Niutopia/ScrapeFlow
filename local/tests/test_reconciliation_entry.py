@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from engine.scrapeflow.identity_matching import AutoMatchAmbiguityError
 from engine.scrapeflow.models import Plan, PlannedFile
 from local.simple_server import SimpleApplication
 from local.scrapeflow_api.simple_engine_runner import (
@@ -883,6 +884,109 @@ class ReconciliationEntryTests(unittest.TestCase):
         self.assertEqual(result.phase, "reconciliation_uncertain")
         self.assertEqual(result.summary["reconciliation"]["outcome"], "uncertain")
         self.assertIn("多个正式作品", result.summary["reconciliation"]["reason"])
+        self.assertEqual(client.mutations, [])
+
+    def test_ambiguous_matcher_rejection_exposes_bounded_identity_candidates(self) -> None:
+        """A safe matcher rejection surfaces its scored candidates to the U-node."""
+        client = ReadOnlyAList(self._tree())
+        runner = self._runner(client)
+        scored = [
+            SimpleNamespace(media_type="tv", tmdb_id=501, title="Show A",
+                            year="2020", confidence=0.62, status="near_confident"),
+            SimpleNamespace(media_type="movie", tmdb_id=502, title="Movie B",
+                            year="2019", confidence=0.61, status="candidate"),
+            # A collection row and an invalid TMDB id are read-only noise the
+            # confirmation tuple cannot consume; they must be filtered out.
+            SimpleNamespace(media_type="collection", tmdb_id=503, title="Set C",
+                            year="2018", confidence=0.53, status="candidate"),
+            SimpleNamespace(media_type="tv", tmdb_id=0, title="Broken",
+                            year="2017", confidence=0.5, status="candidate"),
+            SimpleNamespace(media_type="tv", tmdb_id=505, title="Show C",
+                            year="2021", confidence=0.44, status="candidate"),
+            # Bounded at five rows inside the matcher error itself.
+            SimpleNamespace(media_type="tv", tmdb_id=506, title="Cut",
+                            year="2016", confidence=0.4, status="candidate"),
+        ]
+        error = AutoMatchAmbiguityError(
+            "自动匹配前两名证据无法区分，拒绝自动选择", candidates=scored,
+        )
+        pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        with patch("engine.scraper.auto_match_tmdb", side_effect=error):
+            result = runner.reconcile_automatic_job(pending.id)
+
+        self.assertEqual(result.phase, "reconciliation_uncertain")
+        reconciliation = result.summary["reconciliation"]
+        self.assertEqual(reconciliation["outcome"], "uncertain")
+        self.assertIn("自动匹配", reconciliation["reason"])
+        self.assertEqual(reconciliation["identity_candidates"], [
+            {"media_type": "tv", "tmdb_id": 501, "title": "Show A",
+             "year": "2020", "confidence": 0.62, "status": "near_confident"},
+            {"media_type": "movie", "tmdb_id": 502, "title": "Movie B",
+             "year": "2019", "confidence": 0.61, "status": "candidate"},
+            {"media_type": "tv", "tmdb_id": 505, "title": "Show C",
+             "year": "2021", "confidence": 0.44, "status": "candidate"},
+        ])
+        # The public task payload carries the same bounded list so the
+        # operator can confirm an identity without researching TMDB by hand.
+        payload = SimpleApplication.public_engine_job(result)
+        self.assertEqual(
+            payload["reconciliation"]["identity_candidates"],
+            reconciliation["identity_candidates"],
+        )
+        self.assertEqual(client.mutations, [])
+
+    def test_classification_uncertain_exposes_trace_candidates(self) -> None:
+        """Library-evidence uncertainty reuses the identity's own trace rows."""
+        first = f"{self.movie_root}/First (2020)"
+        second = f"{self.movie_root}/Second (2020)"
+        tree = self._tree()
+        tree[self.movie_root] = [
+            {"name": "First (2020)", "is_dir": True},
+            {"name": "Second (2020)", "is_dir": True},
+        ]
+        tree[first] = [
+            {"name": "First (2020).mkv", "is_dir": False, "size": 10},
+            {"name": "First (2020).nfo", "is_dir": False, "size": 10},
+        ]
+        tree[second] = [
+            {"name": "Second (2020).mkv", "is_dir": False, "size": 10},
+            {"name": "Second (2020).nfo", "is_dir": False, "size": 10},
+        ]
+        client = ReadOnlyAList(
+            tree,
+            {
+                f"{first}/First (2020).mkv": b"first",
+                f"{first}/First (2020).nfo": _movie_nfo(14, "Same"),
+                f"{second}/Second (2020).mkv": b"second",
+                f"{second}/Second (2020).nfo": _movie_nfo(14, "Same"),
+            },
+        )
+        runner = self._runner(client)
+        match = self._match("movie", 14, "Same")
+        runner_up = SimpleNamespace(
+            media_type="movie", tmdb_id=15, title="Same Remake",
+            year="2023", confidence=0.41, status="candidate",
+        )
+        best_row = SimpleNamespace(
+            media_type="movie", tmdb_id=14, title="Same",
+            year="2020", confidence=0.99, status="confirmed",
+        )
+        pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        with patch(
+            "engine.scraper.auto_match_tmdb",
+            return_value=(match, [best_row, runner_up]),
+        ):
+            result = runner.reconcile_automatic_job(pending.id)
+
+        self.assertEqual(result.phase, "reconciliation_uncertain")
+        reconciliation = result.summary["reconciliation"]
+        self.assertIn("多个正式作品", reconciliation["reason"])
+        self.assertEqual(reconciliation["identity_candidates"], [
+            {"media_type": "movie", "tmdb_id": 14, "title": "Same",
+             "year": "2020", "confidence": 0.99, "status": "confirmed"},
+            {"media_type": "movie", "tmdb_id": 15, "title": "Same Remake",
+             "year": "2023", "confidence": 0.41, "status": "candidate"},
+        ])
         self.assertEqual(client.mutations, [])
 
     def test_uncertain_identity_confirmation_reopens_only_read_only_reconciliation(self) -> None:

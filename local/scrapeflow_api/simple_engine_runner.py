@@ -2611,6 +2611,52 @@ class SimpleEngineRunner:
             return "existing_gap", "已确认正式作品存在媒体缺口", work, shelf
         return "duplicate_complete", "正式作品身份与媒体范围已充分匹配", work, shelf
 
+    @staticmethod
+    def _reconciliation_identity_candidates(
+        identity: AutomaticIdentity | None,
+        error_candidates: object,
+    ) -> list[dict[str, object]]:
+        """Project bounded, confirmable identity candidates for uncertain.
+
+        Rows come either from a safe matcher rejection (which refused to
+        choose but scored candidates) or from the resolved identity's own
+        decision trace.  Only movie/tv rows with a usable TMDB id survive,
+        because the U-node confirmation tuple accepts exactly those two
+        media types.  This list is read-only evidence; it never authorises
+        a shelf, path, link or Provider operation.
+        """
+        rows: object = error_candidates
+        if rows is None and identity is not None:
+            trace = identity.trace if isinstance(identity.trace, Mapping) else {}
+            rows = trace.get("top_candidates")
+        if not isinstance(rows, list):
+            return []
+        projected: list[dict[str, object]] = []
+        for row in rows[:5]:
+            if not isinstance(row, Mapping):
+                continue
+            tmdb_id = row.get("tmdb_id")
+            media_type = str(row.get("media_type") or "")
+            if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+                continue
+            if media_type not in {"movie", "tv"}:
+                continue
+            confidence = row.get("confidence")
+            projected.append({
+                "media_type": media_type,
+                "tmdb_id": tmdb_id,
+                "title": str(row.get("title") or ""),
+                "year": str(row.get("year") or ""),
+                "confidence": (
+                    float(confidence)
+                    if isinstance(confidence, (int, float))
+                    and not isinstance(confidence, bool)
+                    else None
+                ),
+                "status": str(row.get("status") or ""),
+            })
+        return projected
+
     def reconcile_automatic_job(self, job_id: str) -> EngineJob:
         """Persist a bounded, read-only intake reconciliation result.
 
@@ -2720,6 +2766,13 @@ class SimpleEngineRunner:
             except Exception as exc:
                 outcome = "uncertain"
                 reason = self._reconciliation_reason(exc)
+                # A safe matcher rejection may still carry bounded candidate
+                # evidence (title/year/TMDB id/confidence).  Keep it for the
+                # U-node so the operator confirms from system candidates
+                # instead of researching identities by hand.
+                error_candidates = getattr(exc, "candidates", None)
+            else:
+                error_candidates = None
             summary = dict(job.summary)
             reconciliation: dict[str, object] = {
                 "status": "completed" if outcome != "uncertain" else "needs_attention",
@@ -2728,6 +2781,12 @@ class SimpleEngineRunner:
             }
             if identity is not None:
                 reconciliation["identity"] = identity.as_dict()
+            if outcome == "uncertain":
+                candidate_rows = self._reconciliation_identity_candidates(
+                    identity, error_candidates,
+                )
+                if candidate_rows:
+                    reconciliation["identity_candidates"] = candidate_rows
             if matched_work is not None:
                 reconciliation["matched_formal_work"] = self._reconciliation_public_work(matched_work)
             if matched_shelf is not None:
