@@ -101,6 +101,21 @@ def target_shelf_for_root(library_root: str, target_root: object) -> TargetShelf
     return None
 
 
+def target_shelf_for_shelf_segment(segment: object) -> TargetShelf | None:
+    """Map one exact first-level shelf directory name to its shelf.
+
+    Read-only helper for callers that hold a formal-library work path and
+    need the owning shelf semantics (for example per-shelf replenishment
+    source policy).  It never accepts partial or fuzzy names.
+    """
+    if not isinstance(segment, str):
+        return None
+    for shelf, name in _SHELF_SEGMENTS.items():
+        if segment == name:
+            return shelf
+    return None
+
+
 def target_shelf_allows_media_type(
     shelf: TargetShelf | str,
     media_type: object,
@@ -120,6 +135,7 @@ __all__ = [
     "target_root_for_shelf",
     "target_shelf_allows_media_type",
     "target_shelf_for_root",
+    "target_shelf_for_shelf_segment",
     "target_shelf_label",
     "target_shelf_values",
 ]

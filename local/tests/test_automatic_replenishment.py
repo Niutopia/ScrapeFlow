@@ -44,6 +44,7 @@ from local.scrapeflow_api.replenishment_tiers import (
     TIER_LOCAL_MAGNET,
     TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
+    apply_tier_outcome,
 )
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
@@ -321,6 +322,77 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             **candidate,
             "locator": "torrent:https://example.invalid/show.torrent?token=secret",
         }))
+
+    def test_search_tier_outcome_uses_shelf_scoped_required_sources(self) -> None:
+        class Search:
+            def run(self, request):
+                del request
+                return {"candidates": []}
+
+        class Materializer:
+            def acquire(self, *args, **kwargs):
+                del args, kwargs
+                raise AssertionError("materializer must not run in this test")
+
+        shelf_cases = {
+            "/quark/影视/电影/黑客帝国 (1999)": "movie",
+            "/quark/影视/番剧/某科学的超电磁炮": "anime",
+            "/quark/影视/美剧/风骚律师/Season 01": "us_tv",
+            # Only exact segment matches count: a work directory merely
+            # containing a shelf name stays scoped to its real shelf.
+            "/quark/影视/电影/番剧同名合集": "movie",
+            # Unknown / ambiguous roots must not claim a shelf.
+            "/quark/影视/纪录片/地球脉动": None,
+            "/quark/影视/电影/番剧": None,
+            "relative/电影": None,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=MemoryAList(),
+                search=Search(), materializer=Materializer(),
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            for target_root, expected in shelf_cases.items():
+                request = {"media": {"target_root": target_root}}
+                self.assertEqual(
+                    runtime._shelf_for_request(request), expected,
+                    msg=f"target_root={target_root}",
+                )
+            self.assertIsNone(runtime._shelf_for_request({}))
+
+            # A clean movie-shelf search that completed the general-purpose
+            # sources is a valid exhaustion proof even though the anime-only
+            # indexes never ran; the same evidence without a shelf claim
+            # stays conservative.
+            result = {
+                "search_complete": True,
+                "source_telemetry": {
+                    "Nyaa": {"source_exhausted": True, "infrastructure_failures": 0},
+                    "ACG": {"source_exhausted": True, "infrastructure_failures": 0},
+                },
+            }
+            bundle = {
+                "eligible_current_tier_candidate_count": 0,
+                "unchecked_current_tier_candidate_count": 0,
+            }
+            movie_outcome = runtime._search_tier_outcome(
+                result, bundle, tier=TIER_QUARK_MAGNET, shelf="movie",
+            )
+            self.assertEqual(movie_outcome["shelf"], "movie")
+            self.assertEqual(movie_outcome["completed_sources"], ["acg", "nyaa"])
+            advanced = apply_tier_outcome(
+                {"tier": TIER_QUARK_MAGNET}, movie_outcome,
+            )
+            self.assertEqual(advanced["tier"], TIER_LOCAL_MAGNET)
+
+            neutral_outcome = runtime._search_tier_outcome(
+                result, bundle, tier=TIER_QUARK_MAGNET,
+            )
+            self.assertNotIn("shelf", neutral_outcome)
+            conservative = apply_tier_outcome(
+                {"tier": TIER_QUARK_MAGNET}, neutral_outcome,
+            )
+            self.assertEqual(conservative["tier"], TIER_QUARK_MAGNET)
 
     def test_positive_memory_is_loaded_alongside_fresh_search_and_failed_is_excluded(self) -> None:
         root_job = _example_root_job("engine-positive-memory")

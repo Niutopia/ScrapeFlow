@@ -32,6 +32,16 @@ MAGNET_REQUIRED_SOURCES = frozenset({
     "nyaa",
     "acg",
 })
+# The magnet search lane is anime-oriented.  A no-candidate exhaustion proof
+# for anime works must therefore cover the full anime index list, while movie
+# and US-TV works only owe the general-purpose sources: demanding completion
+# of anime-only indexes for those shelves would leave their gaps permanently
+# stuck at quark_magnet without adding any real search evidence.
+MAGNET_REQUIRED_SOURCES_BY_SHELF: dict[str, frozenset[str]] = {
+    "anime": MAGNET_REQUIRED_SOURCES,
+    "movie": frozenset({"nyaa", "acg"}),
+    "us_tv": frozenset({"nyaa", "acg"}),
+}
 
 
 class ReplenishmentTierError(ValueError):
@@ -98,11 +108,25 @@ def _strings(values: object) -> set[str]:
     }
 
 
-def required_sources_for_tier(tier: str) -> frozenset[str]:
+def _outcome_shelf(outcome: Mapping[str, object]) -> str | None:
+    """Return a validated shelf claim from one outcome, if present.
+
+    Unknown or missing shelves keep the conservative full required-source
+    behavior instead of weakening the exhaustion proof.
+    """
+    shelf = outcome.get("shelf")
+    if isinstance(shelf, str) and shelf in MAGNET_REQUIRED_SOURCES_BY_SHELF:
+        return shelf
+    return None
+
+
+def required_sources_for_tier(tier: str, shelf: str | None = None) -> frozenset[str]:
     tier = _tier(tier)
     if tier == TIER_QUARK_SHARE:
         return SHARE_REQUIRED_SOURCES
     if tier == TIER_QUARK_MAGNET:
+        if shelf is not None and shelf in MAGNET_REQUIRED_SOURCES_BY_SHELF:
+            return MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf]
         return MAGNET_REQUIRED_SOURCES
     return frozenset()
 
@@ -111,7 +135,7 @@ def _has_complete_no_candidate_proof(tier: str, outcome: Mapping[str, object]) -
     if outcome.get("search_complete_no_candidates") is not True:
         return False
     completed = _strings(outcome.get("completed_sources"))
-    required = required_sources_for_tier(tier)
+    required = required_sources_for_tier(tier, _outcome_shelf(outcome))
     if required and not required.issubset(completed):
         return False
     unchecked = outcome.get("unchecked_secondary_candidates")
@@ -131,7 +155,7 @@ def _tier_exhausted(state: Mapping[str, object], tier: str, outcome: Mapping[str
             if tier != TIER_QUARK_MAGNET:
                 return True
             completed = _strings(outcome.get("completed_sources"))
-            required = required_sources_for_tier(tier)
+            required = required_sources_for_tier(tier, _outcome_shelf(outcome))
             if required.issubset(completed) and outcome.get("unchecked_secondary_candidates", 0) == 0:
                 return True
     proofs = state.get("exhaustion_proof_by_provider")
@@ -206,6 +230,7 @@ __all__ = [
     "FAILURE_IN_DOUBT",
     "FAILURE_INFRASTRUCTURE",
     "MAGNET_REQUIRED_SOURCES",
+    "MAGNET_REQUIRED_SOURCES_BY_SHELF",
     "SHARE_REQUIRED_SOURCES",
     "STRICT_TIER_ORDER",
     "TIER_LOCAL_MAGNET",

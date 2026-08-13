@@ -27,6 +27,7 @@ from engine.scrapeflow.subtitle_content import (
     DEFAULT_MAX_PREFIX_BYTES,
     classify_subtitle_content,
 )
+from engine.scrapeflow.target_shelf import target_shelf_for_shelf_segment
 from engine.scrapeflow.video_admission import (
     VideoAdmissionError,
     probe_remote_video_stream,
@@ -1840,15 +1841,40 @@ class AutomaticReplenishmentRuntime:
             return ""
         return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
+    @staticmethod
+    def _shelf_for_request(request: Mapping[str, object]) -> str | None:
+        """Derive the owning first-level shelf from the request work root.
+
+        The formal-library work root always sits below exactly one of the
+        three shelf directories.  Ambiguous or unrecognizable paths return
+        None so the pure tier policy keeps its conservative full
+        required-source behavior.
+        """
+        media = request.get("media")
+        if not isinstance(media, Mapping):
+            return None
+        target_root = media.get("target_root")
+        if not isinstance(target_root, str) or not target_root.startswith("/"):
+            return None
+        shelves = {
+            shelf.value
+            for segment in target_root.split("/")
+            if (shelf := target_shelf_for_shelf_segment(segment)) is not None
+        }
+        if len(shelves) == 1:
+            return next(iter(shelves))
+        return None
+
     def _search_tier_outcome(
         self,
         result: Mapping[str, object],
         selection_bundle: Mapping[str, object],
         *,
         tier: str,
+        shelf: str | None = None,
     ) -> dict[str, object]:
         """Translate read-only search evidence into the pure policy schema."""
-        required = required_sources_for_tier(tier)
+        required = required_sources_for_tier(tier, shelf)
         completed = {
             self._source_name(value)
             for value in result.get("completed_sources", [])
@@ -1903,7 +1929,7 @@ class AutomaticReplenishmentRuntime:
             or result.get("search_complete") is True
         )
         no_candidates = eligible == 0 and unchecked == 0
-        return {
+        outcome: dict[str, object] = {
             "scope": (
                 FAILURE_INFRASTRUCTURE
                 if infrastructure_failure else FAILURE_CANDIDATE
@@ -1914,6 +1940,9 @@ class AutomaticReplenishmentRuntime:
             "completed_sources": sorted(completed),
             "unchecked_secondary_candidates": unchecked,
         }
+        if shelf is not None:
+            outcome["shelf"] = shelf
+        return outcome
 
     def _active_attempt_record(
         self,
@@ -4396,6 +4425,7 @@ class AutomaticReplenishmentRuntime:
                     result if isinstance(result, Mapping) else {},
                     selection_bundle,
                     tier=current_tier,
+                    shelf=self._shelf_for_request(request_body),
                 )
                 tier_results = self._apply_tier_outcome_to_gap_states(
                     gap_state_paths,

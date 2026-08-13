@@ -8,11 +8,13 @@ from local.scrapeflow_api.replenishment_tiers import (
     FAILURE_IN_DOUBT,
     FAILURE_INFRASTRUCTURE,
     MAGNET_REQUIRED_SOURCES,
+    MAGNET_REQUIRED_SOURCES_BY_SHELF,
     TIER_LOCAL_MAGNET,
     TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
     apply_tier_outcome,
     initial_tier_state,
+    required_sources_for_tier,
 )
 
 
@@ -125,6 +127,55 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
         self.assertEqual(state["status"], "waiting_reconcile")
         self.assertEqual(state["candidate_failures_by_provider"], {})
         self.assertEqual(state["external_task_id"], "quark-task-1")
+
+    def test_required_magnet_sources_are_shelf_aware(self) -> None:
+        self.assertEqual(
+            required_sources_for_tier(TIER_QUARK_MAGNET, "anime"),
+            MAGNET_REQUIRED_SOURCES,
+        )
+        for shelf in ("movie", "us_tv"):
+            required = required_sources_for_tier(TIER_QUARK_MAGNET, shelf)
+            self.assertEqual(required, MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf])
+            self.assertTrue(required.issubset(MAGNET_REQUIRED_SOURCES))
+            self.assertTrue(required)
+        # Unknown or missing shelves keep the conservative full list.
+        self.assertEqual(
+            required_sources_for_tier(TIER_QUARK_MAGNET, None),
+            MAGNET_REQUIRED_SOURCES,
+        )
+        self.assertEqual(
+            required_sources_for_tier(TIER_QUARK_MAGNET, "music"),
+            MAGNET_REQUIRED_SOURCES,
+        )
+        # The share tier requirement does not vary by shelf.
+        self.assertEqual(
+            required_sources_for_tier(TIER_QUARK_SHARE, "movie"),
+            required_sources_for_tier(TIER_QUARK_SHARE),
+        )
+
+    def test_movie_shelf_proof_advances_without_anime_only_sources(self) -> None:
+        state = {**initial_tier_state(), "tier": TIER_QUARK_MAGNET}
+        outcome = {
+            "scope": FAILURE_CANDIDATE,
+            "search_complete_no_candidates": True,
+            "completed_sources": sorted(
+                MAGNET_REQUIRED_SOURCES_BY_SHELF["movie"],
+            ),
+            "unchecked_secondary_candidates": 0,
+        }
+
+        conservative = apply_tier_outcome(state, dict(outcome))
+        movie = apply_tier_outcome(state, {**outcome, "shelf": "movie"})
+        anime = apply_tier_outcome(state, {**outcome, "shelf": "anime"})
+        unknown_shelf = apply_tier_outcome(state, {**outcome, "shelf": "music"})
+
+        # Without a validated shelf claim the anime-only sources stay
+        # required, so the proof must not advance the tier.
+        self.assertEqual(conservative["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(unknown_shelf["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(anime["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(movie["tier"], TIER_LOCAL_MAGNET)
+        self.assertEqual(movie["status"], "advanced")
 
 
 if __name__ == "__main__":
