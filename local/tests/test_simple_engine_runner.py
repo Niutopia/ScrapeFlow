@@ -34,6 +34,7 @@ from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
     EngineExecutionError,
+    EnginePauseRequested,
     EngineRequest,
     EngineRequestError,
     EngineWorkerBusyError,
@@ -528,6 +529,30 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         done = runner.execute_job("engine-test")
         self.assertEqual(done.phase, "executed")
         self.assertEqual(done.execution, {"ok": True})
+
+    def test_pause_boundary_preserves_executing_job_without_writer_replay(self) -> None:
+        events: list[str] = []
+        paused = {"value": False}
+
+        def executor(_plan):
+            events.append("writer-start")
+            paused["value"] = True
+            # The concrete executor's next checkpoint observes the pause;
+            # this injected stand-in models the same boundary explicitly.
+            raise EnginePauseRequested("paused")
+
+        runner = SimpleEngineRunner(
+            self.root, alist=self.alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=executor,
+        )
+        planned = runner.plan_job(self.request, job_id="pause-preserve")
+        done = runner.execute_job(
+            planned.id,
+            pause_requested=lambda: paused["value"],
+        )
+        self.assertEqual(done.phase, "executing")
+        self.assertEqual(events, ["writer-start"])
+        self.assertIn("active_operation", runner.get_job(done.id).summary)
 
     def test_optional_archive_preprocessor_replaces_ordinary_source_before_plan(self) -> None:
         adapter = RecordingArchivePreprocessor()

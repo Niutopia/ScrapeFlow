@@ -35,6 +35,8 @@ from engine.scrapeflow.video_admission import (
 from .replenishment import (
     build_replenishment_requests,
     enrich_replenishment_plan_aliases,
+    normalize_reusable_candidate,
+    reusable_candidate_scope,
     select_replenishment_candidates,
 )
 from .provider_delivery import ProviderDeliveryError, validate_provider_delivery
@@ -79,6 +81,13 @@ _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
 _ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
 _JOB_ID_TOKEN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+_SELECTION_SNAPSHOT_FILE = "selected_candidate.json"
+_SELECTION_SNAPSHOT_MAX_BYTES = 256 * 1024
+_CANDIDATE_MEMORY_FILE = "replenishment-candidate-memory.json"
+_CANDIDATE_MEMORY_VERSION = 1
+_CANDIDATE_MEMORY_MAX_BYTES = 2 * 1024 * 1024
+_CANDIDATE_MEMORY_MAX_ENTRIES = 128
+_CANDIDATE_MEMORY_MAX_GAPS_PER_ENTRY = 64
 _FAILURE_DELIVERY = "delivery"
 _FAILURE_CANCELLED = "cancelled"
 _POST_ACQUISITION_REAUDIT_KEY = "post_acquisition_reaudit"
@@ -118,6 +127,10 @@ class AutomaticReplenishmentError(RuntimeError):
 
 class AutomaticReplenishmentCancelled(AutomaticReplenishmentError):
     """A cooperative control boundary stopped an in-flight provider run."""
+
+
+class AutomaticReplenishmentPaused(AutomaticReplenishmentCancelled):
+    """Pause stopped a child at a resumable boundary; do not cancel the child."""
 
 
 class _CandidateRoundLimitError(AutomaticReplenishmentError):
@@ -301,7 +314,20 @@ class AutomaticMaterializer(Protocol):
         *,
         staging_root: str,
         workspace: Path,
+            alist: object,
+    ) -> Mapping[str, object]: ...
+
+    # Optional recovery hook.  Implementations use the persisted external
+    # task id and must query that task; they must never submit a new one.
+    def reconcile_existing_task(
+        self,
+        request: Mapping[str, object],
+        selections: Sequence[Mapping[str, object]],
+        *,
+        staging_root: str,
+        workspace: Path,
         alist: object,
+        external_task_id: str,
     ) -> Mapping[str, object]: ...
 
 
@@ -394,6 +420,14 @@ class LocalTorrentAutomaticMaterializer:
             raise AutomaticReplenishmentError("归档预处理返回无效 delivery")
         return self._with_delivery_contract_defaults(
             prepared, staging_root=staging_root,
+        )
+
+    def reconcile_existing_task(
+        self, request, selections, *, staging_root, workspace, alist, external_task_id,
+    ) -> Mapping[str, object]:
+        del request, selections, staging_root, workspace, alist, external_task_id
+        raise AutomaticReplenishmentError(
+            "本地 Torrent 没有可查询的 external_task_id；必须重新进入严格 tier"
         )
 
 
@@ -861,6 +895,42 @@ class QuarkFastSaveAutomaticMaterializer:
         result["external_task_id"] = result_task_id
         return result
 
+    def reconcile_existing_task(
+        self, request, selections, *, staging_root, workspace, alist, external_task_id,
+    ) -> Mapping[str, object]:
+        """Query the persisted Quark share task through the existing bridge."""
+        task_id = self._safe_task_id(external_task_id)
+        if task_id is None:
+            raise AutomaticReplenishmentError("夸克分享 external_task_id 无效")
+        if len(selections) != 1 or not isinstance(selections[0], Mapping):
+            raise AutomaticReplenishmentError("夸克分享已有任务恢复候选无效")
+        selection = selections[0]
+        # ``acquire`` already passes the persisted id into the typed
+        # share-save bridge when this state file exists.  Seed it first for
+        # the crash window where the external submit returned a task id but
+        # the local workspace write did not complete; this is a resume/query,
+        # never a fresh submission.
+        state_path = self._state_path(workspace)
+        if state_path.exists():
+            state = self._read_attempt_state(
+                workspace, staging_root=staging_root, selection=selection,
+            )
+            if state.get("task_id") != task_id:
+                raise AutomaticReplenishmentError(
+                    "夸克分享已有 task_id 与本地 attempt 不一致"
+                )
+        else:
+            self._write_attempt_state(
+                workspace,
+                staging_root=staging_root,
+                selection=selection,
+                task_id=task_id,
+            )
+        return self.acquire(
+            request, selections, staging_root=staging_root, workspace=workspace,
+            alist=alist,
+        )
+
 
 def _delivery_kind_from_name(name: str) -> str:
     suffix = Path(name).suffix.casefold()
@@ -1057,6 +1127,36 @@ class QuarkMagnetAutomaticMaterializer:
             delivery["external_task_id"] = task_id
         return delivery
 
+    def reconcile_existing_task(
+        self, request, selections, *, staging_root, workspace, alist, external_task_id,
+    ) -> Mapping[str, object]:
+        """Re-enter ``execute(task_id=...)``; never submit a second magnet."""
+        task_id = self._safe_task_id(external_task_id)
+        if task_id is None:
+            raise AutomaticReplenishmentError("夸克磁力 external_task_id 无效")
+        if len(selections) != 1 or not isinstance(selections[0], Mapping):
+            raise AutomaticReplenishmentError("夸克磁力已有任务恢复候选无效")
+        selection = selections[0]
+        state_path = self._state_path(workspace)
+        if state_path.exists():
+            state = self._read_attempt_state(workspace, staging_root)
+            existing = self._safe_task_id(state.get("task_id"))
+            if existing != task_id:
+                raise AutomaticReplenishmentError(
+                    "夸克磁力已有 task_id 与本地 attempt 不一致"
+                )
+        else:
+            self._write_attempt_state(
+                workspace,
+                staging_root=staging_root,
+                selection=selection,
+                task_id=task_id,
+            )
+        return self.acquire(
+            request, selections, staging_root=staging_root, workspace=workspace,
+            alist=alist,
+        )
+
 
 class FixedTierAutomaticMaterializer:
     """Dispatch one attempt to exactly one fixed replenishment lane."""
@@ -1108,6 +1208,27 @@ class FixedTierAutomaticMaterializer:
                 workspace=workspace, alist=alist,
             )
         raise AutomaticReplenishmentError("单次补源 attempt 必须只使用一个固定 lane")
+
+    def reconcile_existing_task(
+        self, request, selections, *, staging_root, workspace, alist, external_task_id,
+    ) -> Mapping[str, object]:
+        providers = {
+            str(row.get("provider") or "").strip().casefold()
+            for row in selections if isinstance(row, Mapping)
+        }
+        delegate = (
+            self.quark_share if providers == {TIER_QUARK_SHARE}
+            else self.quark_magnet if providers == {TIER_QUARK_MAGNET}
+            else self.local_torrent if providers == {TIER_LOCAL_MAGNET}
+            else None
+        )
+        method = getattr(delegate, "reconcile_existing_task", None)
+        if not callable(method):
+            raise AutomaticReplenishmentError("当前补源 materializer 不支持 external_task_id 恢复")
+        return method(
+            request, selections, staging_root=staging_root, workspace=workspace,
+            alist=alist, external_task_id=external_task_id,
+        )
 
 
 def _now() -> str:
@@ -1215,6 +1336,7 @@ class AutomaticReplenishmentRuntime:
         max_candidate_rounds: int = 3,
         progress: Callable[[EngineJob, str, Mapping[str, object]], None] | None = None,
         cancel_requested: Callable[[EngineJob], bool] | None = None,
+        pause_requested: Callable[[EngineJob], bool] | None = None,
         remote_video_probe: Callable[[object, str], Mapping[str, object]] | None = None,
     ) -> None:
         self.state_root = Path(state_root).resolve()
@@ -1241,6 +1363,10 @@ class AutomaticReplenishmentRuntime:
         # safely interrupt an already-running downloader, but it prevents a
         # stopped pilot from starting another provider round or formal write.
         self.cancel_requested = cancel_requested
+        # Pause is kept separate from the provider pilot/cancel predicate so
+        # a child Engine operation remains resumable rather than becoming a
+        # terminal cancellation when the operator pauses the process.
+        self.pause_requested = pause_requested
         self.gaps_root = self.state_root / "gaps"
         self.workspace_root = self.state_root / "staging"
         for root in (self.gaps_root, self.workspace_root):
@@ -1275,6 +1401,13 @@ class AutomaticReplenishmentRuntime:
         fail-closed: continuing from a malformed/unknown control state could
         otherwise widen a deliberately bounded provider run.
         """
+        # Keep pause separate from cancellation.  Every existing provider
+        # operation boundary already funnels through this helper; checking the
+        # dedicated predicate first gives a paused child the resumable
+        # ``AutomaticReplenishmentPaused`` path instead of cancelling it.
+        self._raise_if_paused(
+            job, round_number=round_number, boundary=boundary,
+        )
         predicate = self.cancel_requested
         if predicate is None:
             return
@@ -1294,6 +1427,29 @@ class AutomaticReplenishmentRuntime:
                 cancellation_boundary=boundary,
             )
             raise AutomaticReplenishmentCancelled(message)
+
+    def _raise_if_paused(
+        self,
+        job: EngineJob,
+        *,
+        round_number: int,
+        boundary: str,
+    ) -> None:
+        predicate = self.pause_requested
+        if predicate is None:
+            return
+        try:
+            paused = bool(predicate(job))
+        except Exception as exc:
+            message = "自动补源暂停状态不可确认，已停止当前尝试"
+            self._progress(job, "retry_wait", round=round_number, error=message,
+                           cancellation_boundary=boundary)
+            raise AutomaticReplenishmentPaused(message) from exc
+        if paused:
+            message = "自动补源已暂停；保留 child 供恢复检查"
+            self._progress(job, "retry_wait", round=round_number, error=message,
+                           cancellation_boundary=boundary)
+            raise AutomaticReplenishmentPaused(message)
 
     def _plan_internal_child(
         self,
@@ -1792,10 +1948,269 @@ class AutomaticReplenishmentRuntime:
             "providers": providers,
             "locators": markers[:8],
         }
+        snapshot = self._selection_snapshot(selections)
+        if snapshot:
+            record["selections"] = snapshot
         task_id = self._safe_external_task_id(external_task_id)
         if task_id is not None:
             record["external_task_id"] = task_id
         return record
+
+    @staticmethod
+    def _selection_snapshot(
+        selections: Sequence[Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        """Keep a bounded, JSON-only copy for external-task recovery.
+
+        This is deliberately a reviewed-candidate snapshot, not a general
+        catalog.  It is capped per row and in total, and only fields consumed
+        by the existing materializers cross the restart boundary.
+        """
+        allowed = {
+            "provider", "locator", "infohash", "release_name", "title", "year",
+            "files", "file_coverage", "resolution", "quality", "coverage",
+            "selected_gap_ids", "acquisition",
+        }
+        output: list[dict[str, object]] = []
+        total = 0
+        for raw in selections:
+            if not isinstance(raw, Mapping):
+                continue
+            candidate = {key: raw[key] for key in allowed if key in raw}
+            try:
+                encoded = json.dumps(candidate, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                continue
+            if not encoded or len(encoded.encode("utf-8")) > 64 * 1024:
+                continue
+            total += len(encoded.encode("utf-8"))
+            if total > _SELECTION_SNAPSHOT_MAX_BYTES:
+                break
+            output.append(json.loads(encoded))
+            if len(output) >= 8:
+                break
+        return output
+
+    @property
+    def _candidate_memory_path(self) -> Path:
+        """One task-state-owned positive candidate ledger.
+
+        It intentionally lives beside (not inside) a gap record: the same
+        verified release can cover several later audit projections, while the
+        scope coordinate below prevents it crossing work identity or tier.
+        """
+        return self.state_root / _CANDIDATE_MEMORY_FILE
+
+    @staticmethod
+    def _candidate_memory_entry_key(entry: Mapping[str, object]) -> tuple[str, ...] | None:
+        scope = entry.get("scope")
+        candidate = entry.get("candidate")
+        if not isinstance(scope, Mapping) or not isinstance(candidate, Mapping):
+            return None
+        identity = scope.get("identity")
+        tier = str(scope.get("tier") or "").strip().casefold()
+        provider = str(candidate.get("provider") or "").strip().casefold()
+        locator = str(candidate.get("locator") or "").strip()
+        if not isinstance(identity, Mapping) or not tier or not provider or not locator:
+            return None
+        try:
+            identity_key = json.dumps(
+                dict(identity), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return None
+        return (identity_key, tier, provider, locator)
+
+    @classmethod
+    def _candidate_memory_file_entries(cls, raw: object) -> list[dict[str, object]]:
+        """Parse the bounded memory envelope without replaying arbitrary JSON."""
+        if not isinstance(raw, Mapping) or raw.get("version") != _CANDIDATE_MEMORY_VERSION:
+            return []
+        entries = raw.get("entries")
+        if not isinstance(entries, list):
+            return []
+        output: list[dict[str, object]] = []
+        for value in entries[:_CANDIDATE_MEMORY_MAX_ENTRIES]:
+            if not isinstance(value, Mapping):
+                continue
+            scope = value.get("scope")
+            candidate = value.get("candidate")
+            verified_at = value.get("verified_at")
+            verified_gap_ids = value.get("verified_gap_ids")
+            if (
+                not isinstance(scope, Mapping)
+                or not isinstance(candidate, Mapping)
+                or not isinstance(verified_at, str)
+                or not isinstance(verified_gap_ids, list)
+                or not verified_gap_ids
+                or len(verified_gap_ids) > _CANDIDATE_MEMORY_MAX_GAPS_PER_ENTRY
+                or any(
+                    not isinstance(item, str) or not item or len(item) > 256
+                    or any(char in item for char in ("/", "\\", "\x00", "\n", "\r"))
+                    for item in verified_gap_ids
+                )
+            ):
+                continue
+            normalized = normalize_reusable_candidate(candidate)
+            if normalized is None:
+                continue
+            # Candidate memory is never an execution result by itself.  The
+            # selector still recomputes identity/name/file coverage below.
+            normalized["_memory_reused"] = True
+            normalized["memory_verified_at"] = verified_at
+            normalized["memory_verified_gap_ids"] = sorted(set(verified_gap_ids))
+            output.append({
+                "scope": dict(scope),
+                "candidate": normalized,
+                "verified_at": verified_at,
+                "verified_gap_ids": sorted(set(verified_gap_ids)),
+            })
+        return output
+
+    def _load_candidate_memory(
+        self,
+        request: Mapping[str, object],
+        *,
+        tier: str,
+    ) -> list[dict[str, object]]:
+        """Load only positive rows matching this work, tier and live gaps."""
+        scope = reusable_candidate_scope(request, tier=tier)
+        if scope is None:
+            return []
+        path = self._candidate_memory_path
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > _CANDIDATE_MEMORY_MAX_BYTES:
+                return []
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        current_identity = scope.get("identity")
+        current_gap_ids = set(scope.get("gap_ids") or [])
+        output: list[dict[str, object]] = []
+        for entry in self._candidate_memory_file_entries(raw):
+            entry_scope = entry.get("scope")
+            candidate = entry.get("candidate")
+            if not isinstance(entry_scope, Mapping) or not isinstance(candidate, Mapping):
+                continue
+            if (
+                str(entry_scope.get("tier") or "").strip().casefold() != tier
+                or entry_scope.get("identity") != current_identity
+            ):
+                continue
+            remembered_scope_gaps = {
+                item for item in entry_scope.get("gap_ids", [])
+                if isinstance(item, str)
+            } if isinstance(entry_scope.get("gap_ids"), list) else set()
+            verified_gaps = {
+                item for item in entry.get("verified_gap_ids", [])
+                if isinstance(item, str)
+            }
+            if not (current_gap_ids & remembered_scope_gaps & verified_gaps):
+                continue
+            # Keep only the currently requested coordinates.  This is useful
+            # when one remembered pack covered multiple seasons but today’s
+            # audit asks for just one episode.
+            candidate = dict(candidate)
+            candidate["memory_verified_gap_ids"] = sorted(
+                current_gap_ids & remembered_scope_gaps & verified_gaps
+            )
+            output.append(candidate)
+        return output
+
+    def _remember_verified_candidates(
+        self,
+        request: Mapping[str, object],
+        *,
+        tier: str,
+        selections: Sequence[Mapping[str, object]],
+        resolved_gap_ids: set[str],
+    ) -> None:
+        """Best-effort persist candidates proven by an executed child.
+
+        This ledger is an optimization.  A failed write must never turn a
+        completed formal child into a provider failure; fresh search remains
+        the correctness path.  Only normalized, credential-free rows enter
+        the file and every later load revalidates the same schema.
+        """
+        scope = reusable_candidate_scope(request, tier=tier)
+        if scope is None or not resolved_gap_ids:
+            return
+        new_entries: list[dict[str, object]] = []
+        for raw in selections:
+            if not isinstance(raw, Mapping):
+                continue
+            candidate = normalize_reusable_candidate(raw)
+            if candidate is None:
+                continue
+            selected = {
+                item for item in raw.get("selected_gap_ids", [])
+                if isinstance(item, str)
+            } if isinstance(raw.get("selected_gap_ids"), list) else set()
+            verified = sorted(selected & resolved_gap_ids)
+            if not verified:
+                continue
+            candidate["memory_verified_at"] = _now()
+            candidate["memory_verified_gap_ids"] = verified
+            new_entries.append({
+                "scope": dict(scope),
+                "candidate": candidate,
+                "verified_at": candidate["memory_verified_at"],
+                "verified_gap_ids": verified,
+            })
+        if not new_entries:
+            return
+        path = self._candidate_memory_path
+        try:
+            raw_existing: object = {}
+            if path.is_file() and not path.is_symlink() and path.stat().st_size <= _CANDIDATE_MEMORY_MAX_BYTES:
+                raw_existing = json.loads(path.read_text(encoding="utf-8"))
+            entries = self._candidate_memory_file_entries(raw_existing)
+            by_key: dict[tuple[str, ...], dict[str, object]] = {}
+            for entry in entries:
+                key = self._candidate_memory_entry_key(entry)
+                if key is not None:
+                    by_key[key] = entry
+            for entry in new_entries:
+                key = self._candidate_memory_entry_key(entry)
+                if key is not None:
+                    by_key[key] = entry
+            # Both entry count and serialized envelope are bounded. A row is
+            # individually capped, but 128 maximal rows would otherwise
+            # exceed the loader's 2 MiB safety limit and make the whole
+            # positive-memory file unreadable on the next invocation.
+            bounded: list[dict[str, object]] = []
+            for entry in reversed(list(by_key.values())):
+                candidate_entries = [entry, *bounded]
+                try:
+                    candidate_size = len(json.dumps(
+                        {
+                            "version": _CANDIDATE_MEMORY_VERSION,
+                            "updated_at": _now(),
+                            "entries": candidate_entries,
+                        },
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8"))
+                except (TypeError, ValueError):
+                    continue
+                if candidate_size > _CANDIDATE_MEMORY_MAX_BYTES:
+                    continue
+                bounded = candidate_entries
+                if len(bounded) >= _CANDIDATE_MEMORY_MAX_ENTRIES:
+                    break
+            atomic_write_json(
+                path,
+                {
+                    "version": _CANDIDATE_MEMORY_VERSION,
+                    "updated_at": _now(),
+                    "entries": bounded,
+                },
+                allow_nan=False,
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            # Candidate memory is deliberately non-authoritative.
+            return
 
     def _coerce_active_attempt(
         self,
@@ -1841,6 +2256,11 @@ class AutomaticReplenishmentRuntime:
             "providers": providers,
             "locators": locators[:8],
         }
+        snapshot = self._selection_snapshot(
+            value.get("selections") if isinstance(value.get("selections"), list) else []
+        )
+        if snapshot:
+            record["selections"] = snapshot
         task_id = self._safe_external_task_id(value.get("external_task_id"))
         if task_id is not None:
             record["external_task_id"] = task_id
@@ -1852,6 +2272,7 @@ class AutomaticReplenishmentRuntime:
         gap_state_paths: Mapping[str, Path],
     ) -> tuple[str, str, Path, dict[str, object]] | None:
         records: dict[tuple[str, str], dict[str, object]] = {}
+        task_ids: set[str] = set()
         for path in dict.fromkeys(gap_state_paths.values()):
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
@@ -1864,13 +2285,49 @@ class AutomaticReplenishmentRuntime:
             )
             if record is None:
                 continue
+            top_level_task_id = self._safe_external_task_id(
+                state.get("external_task_id"),
+            )
+            if top_level_task_id is not None:
+                task_ids.add(top_level_task_id)
+                record.setdefault("external_task_id", top_level_task_id)
             records[(str(record["attempt_id"]), str(record["staging_root"]))] = record
-        if len(records) != 1:
+        # A split task id is itself an in-doubt fact.  Do not choose one copy
+        # merely because it happens to be encountered first on disk.
+        if len(records) != 1 or len(task_ids) > 1:
             return None
         record = next(iter(records.values()))
         attempt_id = str(record["attempt_id"])
         staging = str(record["staging_root"])
         return attempt_id, staging, self.workspace_root / job_id / attempt_id, record
+
+    @staticmethod
+    def _waiting_reconcile_result(
+        request: Mapping[str, object],
+        gaps: Sequence[Mapping[str, object]],
+        *,
+        tier: str,
+        message: str,
+        needs_attention: bool = False,
+        external_task_id: str | None = None,
+    ) -> dict[str, object]:
+        """Build the non-submitting result for an external-task barrier."""
+        result: dict[str, object] = {
+            "request": dict(request),
+            "resolved_gap_ids": [],
+            "unresolved_gap_ids": [
+                str(gap.get("id") or "") for gap in gaps
+                if isinstance(gap.get("id"), str) and gap.get("id")
+            ],
+            "tier": tier,
+            "tier_status": "needs_attention" if needs_attention else "waiting_reconcile",
+            "error": message,
+        }
+        if needs_attention:
+            result["needs_attention"] = True
+        if external_task_id is not None:
+            result["external_task_id"] = external_task_id
+        return result
 
     @classmethod
     def _selection_markers(
@@ -3774,29 +4231,84 @@ class AutomaticReplenishmentRuntime:
                 job, round_number=round_number, boundary="candidate_round",
             )
             current_tier = self._current_tier_for_gap_states(gap_state_paths)
-            if self._waiting_reconcile_gap_states(gap_state_paths):
-                message = "外部补源任务状态待核对，拒绝重新提交"
+            # Recovery ordering is intentional: load the durable attempt and
+            # task id *before* applying the waiting barrier.  A known id is an
+            # instruction to query/re-enter the existing provider task via
+            # the materializer; it is never permission to submit a new one.
+            restored_attempt = self._load_active_attempt(job.id, gap_state_paths)
+            restored_task_id = (
+                self._safe_external_task_id(restored_attempt[3].get("external_task_id"))
+                if restored_attempt is not None else None
+            )
+            waiting_reconcile = self._waiting_reconcile_gap_states(gap_state_paths)
+            if waiting_reconcile and restored_task_id is None:
+                message = "外部补源结果不确定且没有 task_id，必须人工核对"
                 self._progress(
                     job,
-                    "waiting_reconcile",
+                    "needs_attention",
                     round=round_number,
                     tier=current_tier,
                     error=message,
                 )
-                return {
-                    "request": request_body,
-                    "resolved_gap_ids": sorted(resolved_total),
-                    "unresolved_gap_ids": [
-                        str(gap.get("id") or "") for gap in request_gaps
-                        if isinstance(gap.get("id"), str) and gap.get("id")
-                    ],
-                    "tier": current_tier,
-                    "tier_status": "waiting_reconcile",
-                    "error": message,
-                }
-            restored_attempt = self._load_active_attempt(job.id, gap_state_paths)
+                result = self._waiting_reconcile_result(
+                    request_body,
+                    request_gaps,
+                    tier=current_tier,
+                    message=message,
+                    needs_attention=True,
+                )
+                result["failure_scope"] = FAILURE_IN_DOUBT
+                return result
+            restored_selections = (
+                restored_attempt[3].get("selections")
+                if waiting_reconcile and restored_attempt is not None
+                else None
+            )
+            reuse_existing_task = waiting_reconcile and restored_task_id is not None
+            if reuse_existing_task:
+                if (
+                    not isinstance(restored_selections, list)
+                    or not restored_selections
+                    or any(not isinstance(row, Mapping) for row in restored_selections)
+                    or not self._active_attempt_matches_selections(
+                        restored_attempt[3],
+                        [row for row in restored_selections if isinstance(row, Mapping)],
+                    )
+                ):
+                    message = "已有外部补源任务缺少可验证候选快照，必须人工核对"
+                    self._progress(
+                        job, "waiting_reconcile", round=round_number,
+                        tier=current_tier, error=message,
+                        external_task_id=restored_task_id,
+                    )
+                    result = self._waiting_reconcile_result(
+                        request_body, request_gaps, tier=current_tier,
+                        message=message, external_task_id=restored_task_id,
+                    )
+                    result["failure_scope"] = FAILURE_IN_DOUBT
+                    result["needs_attention"] = True
+                    return result
+                if not callable(getattr(self.materializer, "reconcile_existing_task", None)):
+                    # An injected/legacy materializer cannot prove the
+                    # external task status.  Do not call acquire (which may
+                    # submit again) and leave the durable attempt untouched.
+                    message = "当前 materializer 不支持已有 task_id 查询，必须人工核对"
+                    self._progress(
+                        job, "waiting_reconcile", round=round_number,
+                        tier=current_tier, error=message,
+                        external_task_id=restored_task_id,
+                    )
+                    result = self._waiting_reconcile_result(
+                        request_body, request_gaps, tier=current_tier,
+                        message=message, external_task_id=restored_task_id,
+                    )
+                    result["failure_scope"] = FAILURE_IN_DOUBT
+                    result["needs_attention"] = True
+                    return result
             self._progress(
-                job, "provider_searching", round=round_number, tier=current_tier,
+                job,
+                "waiting_reconcile" if reuse_existing_task else "provider_searching",
+                round=round_number, tier=current_tier,
             )
             request_body["excluded_candidates"] = list(excluded)
             request_body["gaps"] = [dict(gap) for gap in request_gaps]
@@ -3817,8 +4329,37 @@ class AutomaticReplenishmentRuntime:
                     "error": None,
                 })
                 self._write_gap(state, state_path)
-            result = self.search.run(request_body)
-            candidates = result.get("candidates") if isinstance(result, Mapping) else None
+            # A durable external task is resumed from its reviewed candidate
+            # snapshot.  The search adapter is deliberately not called: a
+            # fresh search could select a different locator or accidentally
+            # submit a second provider task.
+            if reuse_existing_task:
+                # A durable external task is resumed from its reviewed
+                # snapshot only.  Positive memory is intentionally not mixed
+                # into this path: changing the selected manifest could make
+                # the task id point at a different provider operation.
+                result: Mapping[str, object] = {
+                    "candidates": list(restored_selections or []),
+                }
+                candidates = result.get("candidates")
+            else:
+                search_result = self.search.run(request_body)
+                if not isinstance(search_result, Mapping):
+                    raise AutomaticReplenishmentError("provider 搜索结果不是对象")
+                fresh_candidates = search_result.get("candidates")
+                if not isinstance(fresh_candidates, list):
+                    raise AutomaticReplenishmentError("provider 搜索没有返回 candidates 数组")
+                remembered_candidates = self._load_candidate_memory(
+                    request_body, tier=current_tier,
+                )
+                # Search remains mandatory on every ordinary invocation.  A
+                # remembered row is merely additional evidence; the selector
+                # below applies the same identity, availability, coverage,
+                # exclusion and strict-tier gates to both sources.
+                candidates = [*remembered_candidates, *fresh_candidates]
+                result = dict(search_result)
+                result["candidates"] = candidates
+                result["reused_candidate_count"] = len(remembered_candidates)
             if not isinstance(candidates, list):
                 raise AutomaticReplenishmentError("provider 搜索没有返回 candidates 数组")
             try:
@@ -3829,6 +4370,28 @@ class AutomaticReplenishmentRuntime:
                 raise AutomaticReplenishmentError("补源当前 tier 无效") from exc
             selections = selection_bundle.get("selections")
             if not isinstance(selections, list) or not selections:
+                # A known external task cannot be advanced to another tier
+                # merely because a fresh provider search is empty.  Keep the
+                # existing task in reconcile and never create a new submit.
+                if waiting_reconcile and restored_task_id is not None:
+                    message = "已有外部补源任务待核对，当前搜索无候选，拒绝新提交"
+                    self._progress(
+                        job,
+                        "waiting_reconcile",
+                        round=round_number,
+                        tier=current_tier,
+                        error=message,
+                        external_task_id=restored_task_id,
+                    )
+                    result = self._waiting_reconcile_result(
+                        request_body,
+                        request_gaps,
+                        tier=current_tier,
+                        message=message,
+                        external_task_id=restored_task_id,
+                    )
+                    result["failure_scope"] = FAILURE_IN_DOUBT
+                    return result
                 search_outcome = self._search_tier_outcome(
                     result if isinstance(result, Mapping) else {},
                     selection_bundle,
@@ -3903,7 +4466,7 @@ class AutomaticReplenishmentRuntime:
                         "保留的补源 attempt 与当前候选不一致，等待重试核对",
                     )
             restored_task_id = (
-                restored_record.get("external_task_id")
+                self._safe_external_task_id(restored_record.get("external_task_id"))
                 if isinstance(restored_record, Mapping) else None
             )
             active_attempt = self._active_attempt_record(
@@ -3967,13 +4530,26 @@ class AutomaticReplenishmentRuntime:
                 self._raise_if_cancelled(
                     job, round_number=round_number, boundary="materialization",
                 )
-                acquisition = self.materializer.acquire(
-                    request_body,
-                    [dict(row) for row in selections if isinstance(row, Mapping)],
-                    staging_root=staging,
-                    workspace=workspace,
-                    alist=self.alist,
-                )
+                selected_rows = [
+                    dict(row) for row in selections if isinstance(row, Mapping)
+                ]
+                if reuse_existing_task:
+                    acquisition = self.materializer.reconcile_existing_task(
+                        request_body,
+                        selected_rows,
+                        staging_root=staging,
+                        workspace=workspace,
+                        alist=self.alist,
+                        external_task_id=str(restored_task_id),
+                    )
+                else:
+                    acquisition = self.materializer.acquire(
+                        request_body,
+                        selected_rows,
+                        staging_root=staging,
+                        workspace=workspace,
+                        alist=self.alist,
+                    )
                 if not isinstance(acquisition, Mapping):
                     raise AutomaticReplenishmentError("provider delivery 不是对象")
                 external_task_id = self._safe_external_task_id(
@@ -4102,8 +4678,30 @@ class AutomaticReplenishmentRuntime:
                         self._raise_if_cancelled(
                             job, round_number=round_number, boundary="child_write",
                         )
-                        completed_child = self.engine_runner.execute_automatic(child.id)
+                        try:
+                            child_pause = (
+                                lambda: bool(self.pause_requested(job))
+                                if self.pause_requested is not None
+                                else None
+                            )
+                            completed_child = self.engine_runner.execute_automatic(
+                                child.id,
+                                **({"pause_requested": child_pause}
+                                   if child_pause is not None else {}),
+                            )
+                        except TypeError as exc:
+                            # Small injected test runners may still expose the
+                            # legacy one-argument protocol. Preserve that
+                            # compatibility; production SimpleEngineRunner
+                            # accepts the cooperative pause predicate.
+                            if "pause_requested" not in str(exc):
+                                raise
+                            completed_child = self.engine_runner.execute_automatic(child.id)
                         if completed_child.phase != "executed":
+                            self._raise_if_paused(
+                                job, round_number=round_number,
+                                boundary="child_resume",
+                            )
                             raise AutomaticReplenishmentError("补源 child 未完成")
 
                     # This lane is distinct from an audited missing_subtitle
@@ -4169,12 +4767,52 @@ class AutomaticReplenishmentRuntime:
                 )
                 if child is not None:
                     if isinstance(exc, AutomaticReplenishmentCancelled):
+                        if isinstance(exc, AutomaticReplenishmentPaused):
+                            # A child that is still only ``planned`` has not
+                            # crossed the Engine's formal-write boundary, so
+                            # remove that local implementation record instead
+                            # of leaving an orphan that a later retry cannot
+                            # safely associate with this attempt.  Once the
+                            # child is executing/verifying/cleaning, preserve
+                            # it: its remote operation may already have
+                            # started and restart readback owns the decision.
+                            child_at_boundary = child
+                            get_child = getattr(self.engine_runner, "get_job", None)
+                            if callable(get_child):
+                                try:
+                                    observed_child = get_child(child.id)
+                                    if isinstance(observed_child, EngineJob):
+                                        child_at_boundary = observed_child
+                                except Exception:
+                                    pass
+                            if child_at_boundary.phase == "planned":
+                                cancel = getattr(self.engine_runner, "cancel_job", None)
+                                if callable(cancel):
+                                    try:
+                                        cancel(
+                                            child_at_boundary.id,
+                                            reason="provider paused before child write",
+                                        )
+                                    except TypeError:
+                                        try:
+                                            cancel(child_at_boundary.id)
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    else:
+                                        child = None
+                            else:
+                                child = child_at_boundary
+                            continue_cleanup = False
+                        else:
+                            continue_cleanup = True
                         # A plan may have been persisted in the narrow window
                         # between the pre-plan check and the pre-execute
                         # check.  Cancel that local child record without
                         # touching AList, rather than leaving a misleading
                         # planned implementation task behind.
-                        cancel = getattr(self.engine_runner, "cancel_job", None)
+                        cancel = getattr(self.engine_runner, "cancel_job", None) if continue_cleanup else None
                         if callable(cancel):
                             try:
                                 cancel(child.id, reason="provider paused before child write")
@@ -4366,6 +5004,15 @@ class AutomaticReplenishmentRuntime:
                 child_job_id=(
                     completed_child.id if completed_child is not None else None
                 ),
+            )
+            # The child/readback path has now proven the selected coordinates.
+            # Keep only those positive rows whose selected gaps were actually
+            # resolved; candidate metadata alone is never promoted to memory.
+            self._remember_verified_candidates(
+                request_body,
+                tier=current_tier,
+                selections=[row for row in selections if isinstance(row, Mapping)],
+                resolved_gap_ids=resolved_now,
             )
             resolved_total.update(resolved_now)
             pending = [
@@ -4572,6 +5219,7 @@ __all__ = [
     "AutomaticMaterializer",
     "AutomaticProviderSearch",
     "AutomaticReplenishmentCancelled",
+    "AutomaticReplenishmentPaused",
     "AutomaticReplenishmentError",
     "AutomaticReplenishmentRuntime",
     "CANONICAL_REPLENISHMENT_STAGING_ROOT",

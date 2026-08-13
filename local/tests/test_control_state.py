@@ -83,6 +83,33 @@ class PersistentControlStateTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), before_close)
         self.assertFalse(PersistentControlState(self.path).read()["paused"])
 
+    def test_new_application_starts_effectively_paused_after_prior_resume(self) -> None:
+        state_root = self.path.parent
+        first = SimpleApplication(
+            state_root=state_root,
+            remote_root="/library",
+            remote=object(),
+        )
+        first.set_paused(False, "operator opened lane")
+        first.close()
+
+        second = SimpleApplication(
+            state_root=state_root,
+            remote_root="/library",
+            remote=object(),
+        )
+        self.addCleanup(second.close)
+
+        # The persisted operator decision remains available for inspection,
+        # but it cannot authorize a new process to begin side effects.
+        self.assertFalse(PersistentControlState(self.path).read()["paused"])
+        self.assertTrue(second.control()["paused"])
+        self.assertEqual(second.control()["reason"], "startup_pause")
+
+        resumed = second.set_paused(False, "operator reopened lane")
+        self.assertFalse(resumed["paused"])
+        self.assertFalse(second.control()["paused"])
+
 
 if __name__ == "__main__":
     unittest.main()

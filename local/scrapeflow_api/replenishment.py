@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import base64
+import json
 import re
 from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
@@ -56,6 +57,213 @@ _SWARM_MAX_AGE_SECONDS = 6 * 60 * 60
 _SWARM_MAX_FUTURE_SKEW_SECONDS = 5 * 60
 _SWARM_COUNT_LIMIT = 1_000_000_000
 CHINESE_NUMERALS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
+
+# A successful provider child may be useful on a later run, but its candidate
+# must cross a much smaller boundary than the live search result.  Keep this
+# allow-list here (rather than copying arbitrary JSON in the coordinator) so
+# a remembered row cannot smuggle a helper cookie, bearer token, or a private
+# provider action back into a new request.
+_REUSABLE_CANDIDATE_TOP_FIELDS = frozenset({
+    "provider", "locator", "infohash", "release_name", "title", "titles",
+    "year", "files", "file_coverage", "name_coverage", "resolution",
+    "quality", "availability", "available", "updated_at", "swarm",
+    "swarm_observed_at", "seeders", "leechers", "tmdb_id", "identity_match",
+    "media_format", "coverage", "selected_gap_ids", "acquisition",
+    "memory_verified_at", "memory_verified_gap_ids",
+})
+_REUSABLE_CANDIDATE_SECRET_KEY_MARKERS = frozenset({
+    "passcode", "password", "passwd", "token", "secret", "cookie",
+    "authorization", "auth", "session", "credential", "api_key", "apikey",
+})
+_REUSABLE_CANDIDATE_MAX_BYTES = 64 * 1024
+_REUSABLE_CANDIDATE_MAX_DEPTH = 8
+_REUSABLE_CANDIDATE_MAX_LIST_ITEMS = 256
+_REUSABLE_CANDIDATE_MAX_STRING = 4096
+_REUSABLE_CANDIDATE_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?:^|[?&\s])(passcode|password|passwd|token|secret|api[_-]?key)="
+)
+_REUSABLE_CANDIDATE_USERINFO_RE = re.compile(r"(?i)://[^/\s@]+:[^/\s@]+@")
+
+
+def _reusable_candidate_key_is_secret(value: object) -> bool:
+    key = str(value or "").strip().casefold().replace("-", "_")
+    return any(marker in key for marker in _REUSABLE_CANDIDATE_SECRET_KEY_MARKERS)
+
+
+def _copy_reusable_candidate_value(value: Any, *, depth: int = 0) -> Any:
+    """Copy JSON values for the positive-candidate memory boundary.
+
+    Returning ``None`` is ambiguous because ``null`` is a valid JSON value;
+    callers therefore use the private sentinel below for malformed values.
+    """
+    invalid = _REUSABLE_CANDIDATE_INVALID
+    if depth > _REUSABLE_CANDIDATE_MAX_DEPTH:
+        return invalid
+    if value is None or type(value) in {bool, int, float}:
+        # JSON's non-finite numbers are rejected by the final encoder.
+        return value
+    if isinstance(value, str):
+        if len(value) > _REUSABLE_CANDIDATE_MAX_STRING:
+            return invalid
+        # Reject signed/user-info URLs rather than trying to parse and redact
+        # them.  A remembered candidate is optional; losing one is safer than
+        # persisting a credential-bearing locator.
+        if (
+            _REUSABLE_CANDIDATE_SECRET_VALUE_RE.search(value)
+            or _REUSABLE_CANDIDATE_USERINFO_RE.search(value)
+        ):
+            return invalid
+        return value
+    if isinstance(value, Mapping):
+        if len(value) > _REUSABLE_CANDIDATE_MAX_LIST_ITEMS:
+            return invalid
+        output: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            if not isinstance(raw_key, str) or not raw_key or len(raw_key) > 128:
+                return invalid
+            if _reusable_candidate_key_is_secret(raw_key):
+                return invalid
+            copied = _copy_reusable_candidate_value(raw_value, depth=depth + 1)
+            if copied is invalid:
+                return invalid
+            output[raw_key] = copied
+        return output
+    if isinstance(value, (list, tuple)):
+        if len(value) > _REUSABLE_CANDIDATE_MAX_LIST_ITEMS:
+            return invalid
+        output: list[Any] = []
+        for item in value:
+            copied = _copy_reusable_candidate_value(item, depth=depth + 1)
+            if copied is invalid:
+                return invalid
+            output.append(copied)
+        return output
+    return invalid
+
+
+_REUSABLE_CANDIDATE_INVALID = object()
+
+
+def normalize_reusable_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return one safe, replayable positive candidate or ``None``.
+
+    Only fixed, credential-free acquisition lanes are remembered.  Quark
+    share rows are intentionally excluded because their ``passcode`` is a
+    secret even when the current search adapter happened to return a public
+    share.  Fresh search remains responsible for rediscovering that lane.
+    """
+    if not isinstance(candidate, Mapping):
+        return None
+    provider = str(candidate.get("provider") or "").strip().casefold()
+    if provider not in PROVIDER_ORDER or provider == "quark_share":
+        return None
+    copied: dict[str, Any] = {}
+    for key in _REUSABLE_CANDIDATE_TOP_FIELDS:
+        if key not in candidate:
+            continue
+        value = _copy_reusable_candidate_value(candidate[key])
+        if value is _REUSABLE_CANDIDATE_INVALID:
+            return None
+        copied[key] = value
+    copied["provider"] = provider
+    locator = copied.get("locator")
+    release_name = copied.get("release_name")
+    acquisition = copied.get("acquisition")
+    if (
+        not isinstance(locator, str) or not locator.strip()
+        or not isinstance(release_name, str) or not release_name.strip()
+        or not isinstance(acquisition, Mapping)
+    ):
+        return None
+    copied["locator"] = locator.strip()
+    copied["release_name"] = release_name.strip()
+    # The selector is the authoritative identity/coverage gate.  Running the
+    # route validator here catches malformed remembered rows before they are
+    # written to disk, without making memory a second selection algorithm.
+    try:
+        acquisition_lane(copied)
+    except (AcquisitionRouteError, TypeError, ValueError):
+        return None
+    try:
+        encoded = json.dumps(copied, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > _REUSABLE_CANDIDATE_MAX_BYTES:
+        return None
+    return copied
+
+
+def reusable_candidate_scope(
+    request: Mapping[str, Any], *, tier: str,
+) -> dict[str, Any] | None:
+    """Build the non-secret identity coordinate for candidate memory.
+
+    The scope deliberately does not use a filesystem path or a user-provided
+    URL.  TMDB identity is preferred; a title/year fallback is accepted only
+    when both values are present.  The media namespace is retained too:
+    TMDB movie and TV identifiers are separate namespaces, so a numeric id
+    alone must never make a film release eligible for a TV gap (or vice
+    versa). Gap ids are retained as evidence on each
+    entry and are intersected by the runtime, so a verified S01E01 release can
+    help a later audit of the same work without claiming another episode.
+    """
+    tier_value = str(tier or "").strip().casefold()
+    if tier_value not in PROVIDER_ORDER:
+        return None
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    raw_media_type = (
+        media.get("media_type")
+        or media.get("type")
+        or request.get("media_type")
+        or request.get("project_key")
+    )
+    media_type = str(raw_media_type or "").strip().casefold()
+    if media_type.startswith("tmdb:"):
+        parts = media_type.split(":", 2)
+        media_type = parts[1] if len(parts) > 1 else ""
+    if media_type in {"movie", "film"}:
+        media_namespace = "movie"
+    elif media_type in {"tv", "series", "anime", "us_tv", "mixed"}:
+        media_namespace = "tv"
+    else:
+        # Builders always know the namespace. Older/handwritten provider
+        # records can still be searched, but cannot read or write positive
+        # cross-run memory.
+        return None
+    tmdb_id = media.get("tmdb_id")
+    if type(tmdb_id) is int and tmdb_id > 0:
+        identity: dict[str, Any] = {
+            "media_type": media_namespace,
+            "tmdb_id": tmdb_id,
+        }
+    else:
+        title = _normalized_text(media.get("title"))
+        year = str(media.get("year") or "").strip()
+        if len(title) < 2 or not re.fullmatch(r"(?:19|20)\d{2}", year):
+            return None
+        identity = {
+            "media_type": media_namespace,
+            "title": title,
+            "year": year,
+        }
+    media_format = str(media.get("media_format") or "").strip().casefold()
+    if media_format in {"animation", "live_action"}:
+        identity["media_format"] = media_format
+    raw_gaps = request.get("gaps")
+    gap_ids = sorted({
+        str(row.get("id"))
+        for row in (raw_gaps if isinstance(raw_gaps, list) else [])
+        if isinstance(row, Mapping)
+        and isinstance(row.get("id"), str)
+        and row.get("id")
+    })
+    if not gap_ids:
+        return None
+    return {
+        "identity": identity,
+        "tier": tier_value,
+        "gap_ids": gap_ids,
+    }
 
 
 def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1031,6 +1239,11 @@ def build_replenishment_request(
             "title": str(metadata.get("title") or "").strip(), "aliases": aliases,
             "year": year, "tmdb_id": metadata.get("tmdb_id"),
             "target_root": target_root,
+            "media_type": (
+                "movie"
+                if str(plan.get("mode") or "").casefold() == "movie"
+                else "tv"
+            ),
             **({"media_format": media_format} if media_format else {}),
         },
         "gaps": gaps, "query_groups": groups,

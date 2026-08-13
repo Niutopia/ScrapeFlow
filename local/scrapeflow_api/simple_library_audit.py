@@ -372,6 +372,7 @@ class SimpleLibraryAuditor:
         client: AListDirectoryLister | object | None,
         *,
         formal_roots: Sequence[str] = DEFAULT_FORMAL_LIBRARY_ROOTS,
+        scope_roots: Sequence[str] | None = None,
         max_directories: int = 20_000,
         max_files: int = 250_000,
         clock: Callable[[], str] | None = None,
@@ -385,7 +386,34 @@ class SimpleLibraryAuditor:
             raise ValueError("max_directories must be a positive integer")
         if type(max_files) is not int or max_files < 1:
             raise ValueError("max_files must be a positive integer")
+        # ``formal_roots`` remain the three authoritative shelf roots used
+        # for identity/type inference.  A scoped automatic audit may scan
+        # only concrete work roots, but those roots must still be contained
+        # by one of the authoritative shelves.  Keep the two concepts
+        # separate so a TV work leaf is never reclassified as a movie merely
+        # because it was passed as the first (or only) scan root.
+        scoped: tuple[str, ...] | None = None
+        if scope_roots is not None:
+            raw_scoped = tuple(_root(value) for value in scope_roots)
+            if not raw_scoped:
+                raise ValueError("scope roots must be non-empty when supplied")
+            if any(
+                not any(_inside(candidate, formal) for formal in roots)
+                for candidate in raw_scoped
+            ):
+                raise ValueError("scope roots must be inside a formal shelf root")
+            # Coalesce nested requests (for example a shelf and one of its
+            # work roots) before traversal, otherwise the inventory would be
+            # visited twice and produce duplicate evidence.
+            selected: list[str] = []
+            for candidate in sorted(set(raw_scoped), key=lambda value: (len(value), value.casefold())):
+                if any(_inside(candidate, parent) for parent in selected):
+                    continue
+                selected.append(candidate)
+            scoped = tuple(selected)
         self.client, self.roots = client, roots
+        self.scope_roots = scoped
+        self.scan_roots = scoped or roots
         self.max_directories, self.max_files = max_directories, max_files
         self.clock = clock or _utc_now
 
@@ -451,7 +479,7 @@ class SimpleLibraryAuditor:
             "clean": None,
             "roots": [
                 {"path": root, "status": "pending", "file_count": 0, "directory_count": 0}
-                for root in self.roots
+                for root in self.scan_roots
             ],
             "counts": {"files": 0, "directories": 0, "videos": 0, "subtitles": 0, "nfo": 0, "posters": 0},
             "inventory": [],
@@ -4459,6 +4487,7 @@ def audit_and_persist(
     *,
     works: Sequence[Mapping[str, object]] = (),
     formal_roots: Sequence[str] = DEFAULT_FORMAL_LIBRARY_ROOTS,
+    scope_roots: Sequence[str] | None = None,
     max_directories: int = 20_000,
     max_files: int = 250_000,
     clock: Callable[[], str] | None = None,
@@ -4469,7 +4498,8 @@ def audit_and_persist(
 ) -> dict[str, object]:
     """Write the replaceable structural plus optional semantic report."""
     auditor = SimpleLibraryAuditor(
-        client, formal_roots=formal_roots, max_directories=max_directories,
+        client, formal_roots=formal_roots, scope_roots=scope_roots,
+        max_directories=max_directories,
         max_files=max_files, clock=clock,
     )
     report = auditor.scan()
@@ -4496,6 +4526,7 @@ def run_automatic_library_audit(
     *,
     tmdb_client: object | None = None,
     formal_roots: Sequence[str] = DEFAULT_FORMAL_LIBRARY_ROOTS,
+    scope_roots: Sequence[str] | None = None,
     required_subtitle_language: str | Sequence[str] | None = None,
     subtitle_checker: Callable[[str], object] | None = None,
     subtitle_policy_overrides: Sequence[Mapping[str, object]] | None = None,
@@ -4512,6 +4543,7 @@ def run_automatic_library_audit(
     auditor = SimpleLibraryAuditor(
         client,
         formal_roots=formal_roots,
+        scope_roots=scope_roots,
         max_directories=max_directories,
         max_files=max_files,
         clock=clock,

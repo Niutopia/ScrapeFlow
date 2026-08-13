@@ -78,6 +78,51 @@ def _report() -> dict[str, object]:
 
 
 class AutomaticLibraryGapTests(unittest.TestCase):
+    def test_scoped_audit_keeps_authoritative_shelf_types(self) -> None:
+        """A concrete TV work scope must not be reclassified as a movie root."""
+        movie_root, anime_root, us_root = DEFAULT_FORMAL_LIBRARY_ROOTS
+        show = f"{anime_root}/Scoped Only"
+        nfo_path = f"{show}/tvshow.nfo"
+        client = NfoTreeAList(
+            {
+                movie_root: [],
+                anime_root: [{"name": "Scoped Only", "is_dir": True}],
+                show: [{"name": "tvshow.nfo", "is_dir": False, "size": 80}],
+                us_root: [],
+            },
+            {nfo_path: b"<tvshow><title>Scoped Only</title><tmdbid>4242</tmdbid></tvshow>"},
+        )
+
+        class OneEpisodeTMDB:
+            def get(self, path: str) -> dict[str, object]:
+                if path == "/tv/4242":
+                    return {"seasons": [{"season_number": 1}]}
+                return {"episodes": [{"episode_number": 1, "air_date": "2020-01-01"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_automatic_library_audit(
+                client,
+                tmp,
+                [],
+                formal_roots=DEFAULT_FORMAL_LIBRARY_ROOTS,
+                scope_roots=(show,),
+                tmdb_client=OneEpisodeTMDB(),
+            )
+
+        self.assertEqual([row["path"] for row in report["roots"]], [show])
+        self.assertEqual(report["semantic"]["gap_count"], 1)
+        self.assertEqual(report["semantic"]["unknown_count"], 0)
+        self.assertEqual(report["semantic"]["gaps"][0]["kind"], "missing_episode")
+        self.assertEqual(report["semantic"]["gaps"][0]["media"]["media_type"], "tv")
+
+    def test_scoped_audit_rejects_work_root_outside_formal_shelves(self) -> None:
+        with self.assertRaises(ValueError):
+            SimpleLibraryAuditor(
+                TreeAList({root: [] for root in DEFAULT_FORMAL_LIBRARY_ROOTS}),
+                formal_roots=DEFAULT_FORMAL_LIBRARY_ROOTS,
+                scope_roots=("/library/待刮削/Incoming",),
+            )
+
     def test_missing_episode_and_metadata_are_machine_gaps(self) -> None:
         report = _report()
         show = f"{DEFAULT_FORMAL_LIBRARY_ROOTS[1]}/Show"

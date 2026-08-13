@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import json
 import os
 import tempfile
@@ -256,8 +257,10 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         finally:
             self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
         self.assertEqual(len(scheduled), 1)
-        self.assertEqual(queued, [])
         created = self.runner.get_job(scheduled[0])
+        # Pause blocks formal/provider effects, not the newly registered
+        # task's bounded read-only reconciliation.
+        self.assertEqual(queued, [created.id])
         self.assertEqual(created.request["source_path"], "/library/待刮削/Real Release")
         self.assertEqual(created.phase, "reconciling")
 
@@ -535,6 +538,58 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         unchanged = self.runner.get_job(job.id)
         self.assertEqual(unchanged.phase, "failed_identity")
         self.assertNotIn("manual_identity", unchanged.summary)
+
+    def test_uncertain_retry_accepts_only_identity_confirmation_and_queues_read_only_reconcile(self) -> None:
+        pending = self.runner.create_pending_job("/library/待刮削/Example")
+        uncertain = replace(
+            pending,
+            phase="reconciliation_uncertain",
+            summary={
+                **pending.summary,
+                "reconciliation": {
+                    "status": "needs_attention",
+                    "outcome": "uncertain",
+                    "reason": "ambiguous formal identity",
+                },
+            },
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{pending.id}.json",
+            uncertain.as_dict(),
+            allow_nan=False,
+        )
+        with patch.object(self.application, "_queue_automatic_job") as queue:
+            status, payload = self.request(
+                "POST",
+                f"/api/jobs/{pending.id}/retry",
+                {"tmdb_id": 77, "media_type": "movie", "season": 1},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["engine_phase"], "reconciling")
+        self.assertEqual(
+            self.runner.get_job(pending.id).summary[
+                "reconciliation_identity_confirmation"
+            ]["tmdb_id"],
+            77,
+        )
+        queue.assert_called_once_with(pending.id)
+
+        blocked = replace(
+            uncertain,
+            updated_at="2099-01-01T00:00:00+00:00",
+        )
+        atomic_write_json(
+            self.runner.jobs_root / f"{pending.id}.json",
+            blocked.as_dict(),
+            allow_nan=False,
+        )
+        status, payload = self.request(
+            "POST",
+            f"/api/jobs/{pending.id}/retry",
+            {"tmdb_id": 77, "media_type": "movie", "target_root": "/library/电影"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("不支持", payload["error"])
 
     def test_cancel_stops_a_planned_root_job(self) -> None:
         job = self.runner.create_automatic_job("/library/待刮削/Cancel")
@@ -822,7 +877,13 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["operations"]["provider_active"], 1)
 
     def test_disabled_lanes_settle_verified_executed_root_without_queueing(self) -> None:
-        self.application.set_paused(False, "test")
+        # This fixture exercises lifecycle settlement, not the explicit
+        # resume scan. Keep that read-only scan out of this test so its
+        # scheduler cannot contend for the fixture runner lock.
+        with patch.object(self.application, "_scan_inbound_once", return_value=[]), patch.object(
+            self.application, "_start_startup_thread"
+        ):
+            self.application.set_paused(False, "test")
         pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         lifecycle = {
@@ -849,9 +910,231 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(persisted.summary["lifecycle"]["provider"]["status"], "deferred")
         self.assertTrue(persisted.summary["lifecycle"]["cleanup_ready"])
 
+    def test_intake_settled_audit_early_return_clears_queued_barrier(self) -> None:
+        self.application._intake_status["last_scan_empty"] = False  # noqa: SLF001
+        with patch.object(self.application, "control", return_value={"paused": False}), patch.object(
+            self.application, "_audit_auto_repair_enabled", return_value=True,
+        ), patch.object(
+            self.application, "_intake_is_settled", return_value=False,
+        ), patch.object(
+            self.application,
+            "_schedule_timer",
+            side_effect=lambda _lane, _owner, _delay, callback: callback(),
+        ):
+            self.application._queue_intake_settled_audit()  # noqa: SLF001
+
+        self.assertFalse(self.application._intake_audit_timer_armed)  # noqa: SLF001
+        self.assertEqual(
+            self.application._intake_status["full_audit_barrier"],  # noqa: SLF001
+            "waiting_for_intake",
+        )
+
+    def test_provider_submission_requires_successful_full_audit_admission(self) -> None:
+        """A scoped gap projection cannot bypass the L→M global gate."""
+        with patch.object(self.application, "_provider_auto_repair_enabled", return_value=True), \
+             patch.object(
+                 self.application,
+                 "_provider_worker_configuration",
+                 return_value={"valid": True},
+             ), patch.object(self.application, "_scan_inbound_once", return_value=[]), \
+             patch.object(self.application, "_schedule_timer") as timer, \
+             patch.object(self.application, "_start_startup_thread"):
+            self.application.set_paused(False, "test")
+            self.application._queue_provider_job("not-yet-admitted")  # noqa: SLF001
+        timer.assert_not_called()
+        self.assertFalse(self.application._provider_submission_admitted())  # noqa: SLF001
+
+    def test_full_audit_success_opens_provider_admission_but_incomplete_report_does_not(self) -> None:
+        """Only a complete L report may project gaps into the provider lane."""
+        for complete, expected_admitted, expected_barrier in (
+            (True, True, "completed"),
+            (False, False, "failed"),
+        ):
+            with self.subTest(complete=complete):
+                future: Future[object] = Future()
+                future.set_result({
+                    "audit": {
+                        "status": "completed" if complete else "unknown",
+                        "complete": complete,
+                        "semantic": {
+                            "gaps": [], "unknowns": [], "acquisition_projects": [],
+                        },
+                    },
+                })
+
+                class Pool:
+                    def submit(self, *_args: object, **_kwargs: object) -> Future[object]:
+                        return future
+
+                self.application._intake_status.update({  # noqa: SLF001
+                    "last_scan_empty": True,
+                    "full_audit_barrier": "ready",
+                })
+                with patch.object(self.application, "control", return_value={"paused": False}), \
+                     patch.object(self.application, "_audit_auto_repair_enabled", return_value=True), \
+                     patch.object(self.application, "_intake_is_settled", return_value=True), \
+                     patch.object(self.application, "_audit_pool", return_value=Pool()), \
+                     patch.object(self.application, "_apply_audit_gaps") as apply_gaps, \
+                     patch.object(
+                         self.application,
+                         "_schedule_timer",
+                         side_effect=lambda _lane, _owner, _delay, callback: callback(),
+                     ):
+                    self.application._queue_intake_settled_audit()  # noqa: SLF001
+
+                self.assertEqual(
+                    self.application._provider_submission_admitted(),  # noqa: SLF001
+                    expected_admitted,
+                )
+                self.assertEqual(
+                    self.application._intake_status["full_audit_barrier"],  # noqa: SLF001
+                    expected_barrier,
+                )
+                if complete:
+                    apply_gaps.assert_called_once()
+                else:
+                    apply_gaps.assert_not_called()
+
+    def test_new_intake_closes_previous_provider_admission_epoch(self) -> None:
+        self.remote.entries["/library/待刮削"] = [{"name": "New", "is_dir": True}]
+        with self.application._automatic_lock:  # noqa: SLF001
+            self.application._provider_full_audit_admitted = True  # noqa: SLF001
+            self.application._intake_status["full_audit_barrier"] = "completed"  # noqa: SLF001
+        with patch.object(self.application, "_queue_automatic_job"), patch.object(
+            self.application, "_refresh_intake_settlement",
+        ):
+            self.application._scan_inbound_once()  # noqa: SLF001
+        self.assertFalse(self.application._provider_submission_admitted())  # noqa: SLF001
+        self.assertNotEqual(
+            self.application._intake_status["full_audit_barrier"],  # noqa: SLF001
+            "completed",
+        )
+
+    def test_public_duplicate_readback_distinguishes_pending_and_failed_consumption(self) -> None:
+        pending = self.runner.create_automatic_job("/library/待刮削/DuplicateProjection")
+        reconciliation = {
+            "outcome": "duplicate_complete",
+            "reason": "formal match",
+        }
+        for phase, marker, expected_status in (
+            ("completed", None, "pending"),
+            ("failed_cleanup", {"status": "failed"}, "failed"),
+        ):
+            with self.subTest(phase=phase):
+                summary = {
+                    **pending.summary,
+                    "reconciliation": reconciliation,
+                }
+                if marker is not None:
+                    summary["duplicate_complete_consumption"] = marker
+                job = replace(pending, phase=phase, summary=summary)
+                public = self.application.public_engine_job(job)
+                self.assertEqual(public["readback"]["status"], expected_status)
+                self.assertNotIn("本任务仅消费重复输入", public["readback"]["message"])
+
+    def test_public_existing_gap_registration_projection_distinguishes_held_and_blocked(self) -> None:
+        pending = self.runner.create_automatic_job("/library/待刮削/ExistingGapProjection")
+        reconciliation = {
+            "outcome": "existing_gap",
+            "reason": "formal work is missing media",
+        }
+        held = replace(
+            pending,
+            phase="completed",
+            summary={
+                **pending.summary,
+                "reconciliation": {**reconciliation, "status": "completed"},
+                "existing_gap_registration": {
+                    "status": "moved_to_hold",
+                    "source": "/library/待刮削/ExistingGapProjection",
+                    "target": "/library/ScrapeFlow/归档/job/existing-gap-hold/ExistingGapProjection",
+                },
+                "source_fate": "moved_to_hold",
+            },
+        )
+        public_held = self.application.public_engine_job(held)
+        self.assertEqual(public_held["completion_kind"], "existing_gap_registered")
+        self.assertEqual(public_held["readback"]["status"], "source_held")
+        self.assertFalse(public_held["readback"]["formal_write"])
+        self.assertEqual(public_held["progress"]["completed"], 1)
+        self.assertEqual(public_held["progress"]["percent"], 100)
+
+        blocked = replace(
+            pending,
+            phase="reconciliation_uncertain",
+            summary={
+                **pending.summary,
+                "reconciliation": {**reconciliation, "status": "needs_attention"},
+                "existing_gap_registration": {
+                    "status": "blocked_nonempty_source",
+                    "source": "/library/待刮削/ExistingGapProjection",
+                    "target": "/library/ScrapeFlow/归档/job/existing-gap-hold/ExistingGapProjection",
+                },
+                "source_fate": "retained_needs_attention",
+            },
+        )
+        public_blocked = self.application.public_engine_job(blocked)
+        self.assertEqual(public_blocked["completion_kind"], "existing_gap_registered")
+        self.assertEqual(public_blocked["phase"], "needs_attention")
+        self.assertEqual(public_blocked["readback"]["status"], "registration_blocked")
+        self.assertFalse(public_blocked["progress"]["completed"])
+
+    def test_public_audit_owned_root_never_claims_intake_source_consumption(self) -> None:
+        root = self.runner.create_audit_owned_root({
+            "project_key": "tmdb:tv:42:Show",
+            "tmdb_id": 42,
+            "title": "Show",
+            "target_root": "/library/番剧/Show",
+            "gaps": [{
+                "id": "S01E02",
+                "kind": "missing_episode",
+                "label": "Show S01E02",
+                "media": {
+                    "tmdb_id": 42,
+                    "title": "Show",
+                    "target_root": "/library/番剧/Show",
+                    "media_type": "tv",
+                },
+                "season": 1,
+                "episode": 2,
+            }],
+            "plan": {
+                "mode": "tv",
+                "target_root": "/library/番剧/Show",
+                "metadata": {
+                    "tmdb_id": 42,
+                    "title": "Show",
+                    "target_root": "/library/番剧/Show",
+                    "media_type": "tv",
+                },
+            },
+        })
+
+        completed = replace(
+            root,
+            phase="completed",
+            plan={
+                **root.plan,
+                "scan_report": {"resource_gaps": []},
+            },
+            summary={
+                **root.summary,
+                "resource_gaps": [],
+                "replenishment": {"status": "completed", "terminal": True},
+            },
+        )
+        public = self.application.public_engine_job(completed)
+
+        self.assertEqual(public["readback"]["status"], "audit_completed")
+        self.assertFalse(public["readback"]["formal_write"])
+        self.assertIn("没有待刮削来源", public["readback"]["message"])
+
     def test_disabled_lanes_never_settle_a_verified_root_with_known_gaps(self) -> None:
         """A disabled provider is not evidence that a missing work is safe to delete."""
-        self.application.set_paused(False, "test")
+        with patch.object(self.application, "_scan_inbound_once", return_value=[]), patch.object(
+            self.application, "_start_startup_thread"
+        ):
+            self.application.set_paused(False, "test")
         pending = self.new_work_waiting()
         selected = self.runner.start_automatic_job(pending.id, target_shelf="movie")
         gap = {

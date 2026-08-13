@@ -131,6 +131,12 @@ def _project_for_tmdb(tmdb_id: int) -> dict[str, object]:
 
 
 class AuditOwnedRootTests(unittest.TestCase):
+    @staticmethod
+    def _admit_provider(app: SimpleApplication) -> None:
+        """Seed the explicit L-stage admission for provider-unit fixtures."""
+        with app._automatic_lock:  # noqa: SLF001
+            app._provider_full_audit_admitted = True  # noqa: SLF001
+
     def test_audit_owned_root_accepts_only_exact_subtitle_video_gap(self) -> None:
         target = "/library/番剧/Show"
         job = EngineJob(
@@ -850,6 +856,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                     side_effect=lambda job_id: (called.append(job_id), ran.set()),
                 ), patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                     app._resume_automatic_jobs()
                     self.assertTrue(ran.wait(2.0))
 
@@ -924,6 +931,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                self._admit_provider(app)
                 with patch.dict(
                     os.environ,
                     {"SCRAPEFLOW_PROVIDER_PILOT_TMDB": "99"},
@@ -933,6 +941,229 @@ class AuditOwnedRootTests(unittest.TestCase):
                     # selector instead of invoking the former root.
                     app._run_automatic_replenishment(matching.id)
                     runtime.assert_not_called()
+            finally:
+                app.close()
+
+    def test_provider_future_grant_epoch_blocks_reopened_token(self) -> None:
+        """A Future admitted by an old L audit cannot use a reopened token."""
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"SCRAPEFLOW_START_PAUSED": "1", "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42"},
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            pending: Future[object] = Future()
+            captured: list[tuple[object, tuple[object, ...]]] = []
+
+            class Pool:
+                def submit(self, callback: object, *args: object, **_kwargs: object) -> Future[object]:
+                    captured.append((callback, args))
+                    return pending
+
+            try:
+                with patch.object(app, "_start_startup_thread"), patch.object(
+                    app, "_scan_inbound_once", return_value=[],
+                ):
+                    app.set_paused(False)
+                self._admit_provider(app)
+                with patch.object(app, "_provider_pool", return_value=Pool()), patch.object(
+                    app, "_schedule_timer",
+                    side_effect=lambda _lane, _owner, _delay, callback: callback(),
+                ):
+                    app._queue_provider_job(job.id)
+                self.assertEqual(len(captured), 1)
+                callback, args = captured[0]
+                self.assertEqual(args, (job.id,))
+                with app._automatic_lock:  # noqa: SLF001
+                    old_epoch = app._provider_submission_grants[job.id]  # noqa: SLF001
+                    app._provider_admission_epoch = old_epoch + 1  # noqa: SLF001
+                    # Simulate a fresh L pass reopening the bool token.
+                    app._provider_full_audit_admitted = True  # noqa: SLF001
+                with patch.object(app, "_get_automatic_replenishment") as runtime:
+                    callback(*args)  # type: ignore[operator]
+                runtime.assert_not_called()
+                self.assertEqual(
+                    runner.get_job(job.id).summary["replenishment"]["status"],
+                    "retry_wait",
+                )
+            finally:
+                app.close()
+
+    def test_provider_worker_rechecks_admission_before_runtime_call(self) -> None:
+        """Revocation after worker entry must still block the Provider call."""
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"SCRAPEFLOW_START_PAUSED": "1", "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42"},
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            calls: list[str] = []
+
+            class Runtime:
+                def run_for_job(self, provider_job: EngineJob) -> dict[str, object]:
+                    calls.append(provider_job.id)
+                    return {"outcomes": [], "unresolved_gaps": []}
+
+            def runtime_after_revoke() -> Runtime:
+                with app._automatic_lock:  # noqa: SLF001
+                    app._provider_full_audit_admitted = False  # noqa: SLF001
+                    app._provider_admission_epoch += 1  # noqa: SLF001
+                return Runtime()
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                self._admit_provider(app)
+                with app._automatic_lock:  # noqa: SLF001
+                    app._provider_submission_grants[job.id] = app._provider_admission_epoch  # noqa: SLF001
+                with patch.object(
+                    app, "_get_automatic_replenishment", side_effect=runtime_after_revoke,
+                ):
+                    app._run_automatic_replenishment(job.id)  # noqa: SLF001
+                self.assertEqual(calls, [])
+                self.assertEqual(
+                    runner.get_job(job.id).summary["replenishment"]["status"],
+                    "retry_wait",
+                )
+            finally:
+                app.close()
+
+    def test_full_audit_keeps_provider_token_closed_during_gap_projection(self) -> None:
+        """L must finish its local gap projection before publishing M admission."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            observed: list[bool] = []
+            future: Future[object] = Future()
+            future.set_result({
+                "audit": {
+                    "status": "completed",
+                    "complete": True,
+                    "semantic": {"gaps": [], "unknowns": [], "acquisition_projects": []},
+                },
+            })
+
+            class Pool:
+                def submit(self, *_args: object, **_kwargs: object) -> Future[object]:
+                    return future
+
+            try:
+                with patch.object(app, "control", return_value={"paused": False}), patch.object(
+                    app, "_audit_auto_repair_enabled", return_value=True,
+                ), patch.object(
+                    app, "_full_audit_ready_for_provider", return_value=True,
+                ), patch.object(app, "_audit_pool", return_value=Pool()), patch.object(
+                    app, "_apply_audit_gaps",
+                    side_effect=lambda *_args, **_kwargs: (
+                        observed.append(app._provider_submission_admitted()),  # noqa: SLF001
+                        (),
+                    )[1],
+                ), patch.object(
+                    app, "_schedule_timer",
+                    side_effect=lambda _lane, _owner, _delay, callback: callback(),
+                ):
+                    app._intake_status.update({  # noqa: SLF001
+                        "last_scan_empty": True,
+                        "full_audit_barrier": "ready",
+                    })
+                    app._queue_intake_settled_audit()  # noqa: SLF001
+
+                self.assertEqual(observed, [False])
+                self.assertTrue(app._provider_submission_admitted())  # noqa: SLF001
+                self.assertEqual(app._intake_status["full_audit_barrier"], "completed")  # noqa: SLF001
+            finally:
+                app.close()
+
+    def test_full_audit_barrier_blocks_durable_pending_reaudit_state(self) -> None:
+        """A stale local gap marker keeps L closed even when the root says executed."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            with patch.object(SimpleApplication, "_start_startup_thread"):
+                app = SimpleApplication(
+                    state_root=root, remote_root="/library", remote=remote,
+                    engine_runner=runner, enforce_engine_roots=False,
+                )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            gap_dir = root / "gaps" / job.id
+            gap_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                gap_dir / "audit-row-1.json",
+                {
+                    "id": "audit-row-1",
+                    "phase": "resolved",
+                    "post_acquisition_reaudit": {"status": "pending"},
+                },
+                allow_nan=False,
+            )
+            try:
+                app._intake_status["last_scan_empty"] = True  # noqa: SLF001
+                self.assertTrue(runner.has_pending_replenishment_reaudit(job.id))
+                self.assertFalse(app._intake_is_settled())  # noqa: SLF001
+                self.assertFalse(app._full_audit_ready_for_provider())  # noqa: SLF001
+            finally:
+                app.close()
+
+    def test_full_audit_barrier_blocks_active_internal_child(self) -> None:
+        """An executing provider child is still an L-stage external side effect."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False, library_root="/library",
+            )
+            with patch.object(SimpleApplication, "_start_startup_thread"):
+                app = SimpleApplication(
+                    state_root=root, remote_root="/library", remote=remote,
+                    engine_runner=runner, enforce_engine_roots=False,
+                )
+            job = runner.create_audit_owned_root(_project(_gap()))
+            child = EngineJob(
+                id="child-active-barrier",
+                phase="executing",
+                created_at=job.created_at,
+                updated_at=job.updated_at,
+                request={},
+                plan={},
+                summary={"internal_child": True, "root_job_id": job.id},
+            )
+            atomic_write_json(
+                runner.jobs_root / f"{child.id}.json",
+                child.as_dict(),
+                allow_nan=False,
+            )
+            try:
+                app._intake_status["last_scan_empty"] = True  # noqa: SLF001
+                self.assertFalse(app._intake_is_settled())  # noqa: SLF001
+                self.assertFalse(app._full_audit_ready_for_provider())  # noqa: SLF001
             finally:
                 app.close()
 
@@ -1022,6 +1253,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 # this isolates the fresh-audit queue operation below.
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                self._admit_provider(app)
                 app._apply_audit_gaps(
                     {"semantic": {
                         "gaps": [_gap()],
@@ -1340,6 +1572,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                 app._record_replenishment_progress(
                     job, "retry_wait", {"error": "old child failed", "terminal": False},
                 )
@@ -1482,6 +1715,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                self._admit_provider(app)
 
                 class CancelledRuntime:
                     def run_for_job(self, _job: EngineJob) -> dict[str, object]:
@@ -1545,6 +1779,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=CandidateRuntime(),
                 ), patch.object(
@@ -1597,6 +1832,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=InDoubtRuntime(),
                 ), patch.object(
@@ -1657,6 +1893,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=ExhaustedRuntime(),
                 ), patch.object(
@@ -1708,6 +1945,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"):
                     app.set_paused(False)
+                    self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=InfrastructureRuntime(),
                 ), patch.object(

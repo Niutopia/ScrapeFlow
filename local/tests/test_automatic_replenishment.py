@@ -30,6 +30,8 @@ from local.scrapeflow_api.replenishment import (
     _expanded_episode_ids,
     build_replenishment_request,
     enrich_replenishment_plan_aliases,
+    normalize_reusable_candidate,
+    reusable_candidate_scope,
     select_replenishment_candidates,
     _swarm_preference,
 )
@@ -290,6 +292,92 @@ def _example_root_job(job_id: str = "engine-cancel-root") -> EngineJob:
 
 
 class AutomaticReplenishmentTests(unittest.TestCase):
+    def test_reusable_candidate_memory_is_credential_free_and_scoped(self) -> None:
+        request = {
+            "media": {
+                "tmdb_id": 7, "title": "Example Show", "year": "2020",
+                "media_type": "tv",
+            },
+            "gaps": [{"id": "S01E01", "kind": "missing_episode", "label": "Example Show S01E01"}],
+        }
+        candidate = {
+            "provider": "magnet",
+            "locator": "torrent:https://example.invalid/show.torrent",
+            "release_name": "Example Show S01E01 1080p",
+            "files": ["Example.Show.S01E01.mkv"],
+            "acquisition": {"kind": "torrent", "url": "https://example.invalid/show.torrent"},
+        }
+        remembered = normalize_reusable_candidate(candidate)
+        self.assertIsNotNone(remembered)
+        self.assertEqual(reusable_candidate_scope(request, tier="magnet")["identity"], {
+            "media_type": "tv", "tmdb_id": 7,
+        })
+        self.assertIsNone(normalize_reusable_candidate({
+            **candidate,
+            "acquisition": {"kind": "quark_fast_save", "pwd_id": "x", "passcode": "secret"},
+            "provider": "quark_share",
+        }))
+        self.assertIsNone(normalize_reusable_candidate({
+            **candidate,
+            "locator": "torrent:https://example.invalid/show.torrent?token=secret",
+        }))
+
+    def test_positive_memory_is_loaded_alongside_fresh_search_and_failed_is_excluded(self) -> None:
+        root_job = _example_root_job("engine-positive-memory")
+        candidate = {
+            "provider": "magnet",
+            "locator": "torrent:https://example.invalid/memory.torrent",
+            "infohash": "c" * 40,
+            "release_name": "Example Show S01E01 memory 1080p",
+            "title": "Example Show", "year": "2020",
+            "files": ["Example.Show.S01E01.mkv"],
+            "acquisition": {"kind": "torrent", "url": "https://example.invalid/memory.torrent"},
+        }
+
+        class Search:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+            def run(self, request):
+                self.requests.append(dict(request))
+                return {"candidates": []}
+
+        class Materializer:
+            def acquire(self, _request, _selections, *, staging_root, workspace, alist):
+                del staging_root, workspace, alist
+                raise AssertionError("memory candidate should be rejected by durable exclusion")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=MemoryAList(),
+                search=Search(), materializer=Materializer(),
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
+            )
+            scope = reusable_candidate_scope(
+                {"media": {"tmdb_id": 7, "media_type": "tv"}, "gaps": [{"id": "S01E01"}]},
+                tier="magnet",
+            )
+            runtime._candidate_memory_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime._candidate_memory_path.write_text(json.dumps({
+                "version": 1,
+                "entries": [{
+                    "scope": scope,
+                    "candidate": candidate,
+                    "verified_at": "2026-08-13T00:00:00Z",
+                    "verified_gap_ids": ["S01E01"],
+                }],
+            }), encoding="utf-8")
+            loaded = runtime._load_candidate_memory(
+                {"media": {"tmdb_id": 7, "media_type": "tv"}, "gaps": [{"id": "S01E01"}]},
+                tier="magnet",
+            )
+            self.assertEqual([row["locator"] for row in loaded], [candidate["locator"]])
+            excluded = runtime._merge_excluded_candidates([candidate])
+            self.assertEqual(runtime._load_candidate_memory(
+                {"media": {"tmdb_id": 7, "media_type": "tv"}, "gaps": [{"id": "S01E01"}]},
+                tier="magnet",
+            )[0]["locator"], candidate["locator"])
+            self.assertEqual(excluded[0]["infohash"], candidate["infohash"])
+
     def test_runtime_rejects_arbitrary_provider_staging_root_but_allows_one_acceptance_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(
@@ -4619,6 +4707,48 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(len(materializer.calls), 1)
         self.assertEqual(engine.planned, [])
         self.assertEqual(engine.executed, [])
+        self.assertEqual(state["phase"], "retry_wait")
+
+    def test_global_pause_cancels_planned_child_before_formal_write(self) -> None:
+        """Pause keeps the root resumable while clearing an unwritten child."""
+        root_job = _example_root_job("engine-child-pause-root")
+        paused = {"value": False}
+
+        class PauseAfterChildPlanEngine(FakeEngine):
+            def __init__(self):
+                super().__init__()
+                self.cancelled: list[str] = []
+
+            def plan_job(self, request, *, internal_child_of=None):
+                child = super().plan_job(
+                    request, internal_child_of=internal_child_of,
+                )
+                paused["value"] = True
+                return child
+
+            def cancel_job(self, job_id, reason=None):
+                self.cancelled.append(job_id)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            search = FakeSearch()
+            materializer = FakeMaterializer(alist)
+            engine = PauseAfterChildPlanEngine()
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=search, materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=3,
+                cancel_requested=lambda _job: False,
+                pause_requested=lambda _job: paused["value"],
+            )
+            outcome = runtime.run_for_job(root_job)
+            state_path = next((Path(temporary) / "gaps" / root_job.id).glob("*.json"))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(outcome["cancelled"])
+        self.assertEqual(len(engine.planned), 1)
+        self.assertEqual(engine.executed, [])
+        self.assertEqual(engine.cancelled, ["engine-child-1"])
         self.assertEqual(state["phase"], "retry_wait")
 
     def test_candidate_failure_exclusion_survives_runtime_recreation(self) -> None:

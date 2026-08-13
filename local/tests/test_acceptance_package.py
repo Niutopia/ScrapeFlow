@@ -113,7 +113,7 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "      ALIST_USERNAME: ${ALIST_USERNAME:-}\n"
         "      ALIST_PASSWORD: ${ALIST_PASSWORD:-}\n"
         "      SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}\n"
-        "      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}\n"
+        "      NO_PROXY: \"alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}\"\n"
         "      SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}\n"
         "      SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list\n"
         "    depends_on:\n"

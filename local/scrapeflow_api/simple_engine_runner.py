@@ -66,6 +66,14 @@ class EngineCancellationRequested(EngineExecutionError):
     """A durable operator cancellation reached a safe Engine boundary."""
 
 
+class EnginePauseRequested(EngineExecutionError):
+    """The global pause fence reached a safe Engine boundary.
+
+    Pause is deliberately distinct from cancellation: the current durable
+    operation remains resumable and is not converted to a terminal state.
+    """
+
+
 class EngineJobConflictError(EngineExecutionError):
     """A valid request conflicts with durable job/source state."""
 
@@ -237,13 +245,36 @@ _DEFER_TASK_CLEANUP: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _CANCEL_REQUEST_CHECK: contextvars.ContextVar[Callable[[], bool] | None] = (
     contextvars.ContextVar("scrapeflow_cancel_request_check", default=None)
 )
+_PAUSE_REQUEST_CHECK: contextvars.ContextVar[Callable[[], bool] | None] = (
+    contextvars.ContextVar("scrapeflow_pause_request_check", default=None)
+)
 
 
 def _cancellation_checkpoint() -> None:
-    """Stop only at an operation boundary when an operator requested it."""
+    """Stop only at an operation boundary when pause or cancel is requested."""
     checker = _CANCEL_REQUEST_CHECK.get()
     if callable(checker) and checker():
         raise EngineCancellationRequested("操作员已请求取消；当前远端操作完成后停止任务")
+    pause_checker = _PAUSE_REQUEST_CHECK.get()
+    if callable(pause_checker):
+        try:
+            paused = bool(pause_checker())
+        except Exception as exc:
+            raise EnginePauseRequested("暂停状态不可确认，已安全停止") from exc
+        if paused:
+            raise EnginePauseRequested("全局暂停已生效；当前远端操作完成后停止任务")
+
+
+def _pause_checkpoint(checker: Callable[[], bool] | None) -> None:
+    """Apply an optional composition-root pause fence at a phase boundary."""
+    if checker is None:
+        return
+    try:
+        paused = bool(checker())
+    except Exception as exc:
+        raise EnginePauseRequested("暂停状态不可确认，已安全停止") from exc
+    if paused:
+        raise EnginePauseRequested("全局暂停已生效；当前阶段保持可恢复")
 
 
 _ENGINE_PHASES = frozenset({
@@ -272,6 +303,20 @@ _CLEANUP_RETRYABLE_AUDIT_STATUSES = frozenset({
     "pending", "repairing", "retry_wait", "unknown", "blocked", "failed",
     "failed_provider",
 })
+# A duplicate-complete intake has no formal Engine write and therefore has
+# its own, deliberately small source-consumption gate.  Keep this list local
+# to the runner rather than importing the Provider runtime (which imports the
+# runner in a few deployment compositions).
+_DUPLICATE_TERMINAL_PROVIDER_STATUSES = frozenset({
+    "completed", "resolved", "ready", "skipped", "deferred", "no_gap", "terminal",
+})
+_DUPLICATE_ACTIVE_PROVIDER_STATUSES = frozenset({
+    "gap_discovering", "provider_searching", "acquiring", "staging_verifying",
+    "subtitle_installing", "child_planning", "child_executing", "final_verifying",
+    "cleaning", "child_failed", "retry_wait", "waiting_reconcile", "in_doubt",
+    "pending", "repairing",
+})
+_DUPLICATE_IN_DOUBT_SCOPES = frozenset({"in_doubt", "failure_in_doubt"})
 # Provider attempt staging is held in one gap JSON marker after a successful
 # child until a later scoped audit proves the selected gap disappeared.  Keep
 # this literal local to the runner to avoid importing the provider runtime
@@ -1494,6 +1539,10 @@ class SimpleEngineRunner:
         # owns only archive-to-task-staging preparation; the current Engine
         # still owns identity, naming, problem gates and the one formal writer.
         self.archive_preprocessor = archive_preprocessor
+        # The composition root binds the process-wide pause fence here.  It
+        # is intentionally an optional runner-owned callback so injected
+        # executors and provider child protocols remain backward compatible.
+        self._pause_requested: Callable[[], bool] | None = None
         self.library_root = _safe_remote_path(
             library_root.rstrip("/") or "/",
             field="library_root",
@@ -1569,6 +1618,12 @@ class SimpleEngineRunner:
             isinstance(request, Mapping)
             and request.get("operation_id") == operation_id
         )
+
+    def set_pause_requested(self, checker: Callable[[], bool] | None) -> None:
+        """Bind the application pause fence without adding a second state store."""
+        if checker is not None and not callable(checker):
+            raise TypeError("pause checker must be callable or None")
+        self._pause_requested = checker
 
     def _cancel_request_matches(
         self,
@@ -1778,6 +1833,15 @@ class SimpleEngineRunner:
     def _confirmed_target_selection(self, job: EngineJob) -> tuple[TargetShelf, str]:
         """Rebuild and verify a persisted ordinary-job shelf selection."""
         if job.target_shelf is None or job.target_root is None or job.selected_at is None:
+            reconciliation = job.summary.get("reconciliation")
+            if (
+                isinstance(reconciliation, Mapping)
+                and reconciliation.get("outcome") == "merge_existing"
+            ):
+                _identity, shelf, shelf_root, _work_root = self._merge_existing_context(
+                    job.summary,
+                )
+                return shelf, shelf_root
             raise EngineRequestError("自动任务尚未选择目标货架，不能启动正式处理")
         try:
             shelf = parse_target_shelf(job.target_shelf)
@@ -2149,6 +2213,169 @@ class SimpleEngineRunner:
             trace=dict(trace),
         )
 
+    def _merge_existing_context(
+        self,
+        summary: Mapping[str, object],
+    ) -> tuple[AutomaticIdentity, TargetShelf, str, str]:
+        """Validate the durable identity and destination selected by reconciliation.
+
+        ``EngineJob.target_root`` is intentionally the first-level shelf root;
+        the concrete matched work root remains in the reconciliation projection.
+        Keeping those meanings separate lets the existing planner/executor
+        retain their ordinary containment and readback gates.
+        """
+        return self._reconciled_existing_context(
+            summary,
+            expected_outcome="merge_existing",
+        )
+
+    def _reconciled_existing_context(
+        self,
+        summary: Mapping[str, object],
+        *,
+        expected_outcome: str,
+    ) -> tuple[AutomaticIdentity, TargetShelf, str, str]:
+        """Validate one matched-work reconciliation without doing remote I/O.
+
+        ``merge_existing`` and ``existing_gap`` share the same durable
+        identity/shelf/work-root proof.  Keeping this validation in one
+        helper prevents the Provider hand-off from trusting a second copy of
+        the path/identity rules.
+        """
+        reconciliation = summary.get("reconciliation")
+        if not isinstance(reconciliation, Mapping):
+            raise EngineRequestError("正式库对账记录缺失")
+        if reconciliation.get("outcome") != expected_outcome:
+            raise EngineRequestError(f"当前任务不是 {expected_outcome}")
+        identity = self._reconciled_identity(reconciliation.get("identity"))
+        matched = reconciliation.get("matched_formal_work")
+        if not isinstance(matched, Mapping):
+            raise EngineRequestError("merge_existing 缺少匹配的正式作品")
+        matched_key = self._reconciliation_work_key(matched)
+        if matched_key != self._reconciliation_identity_key(identity):
+            raise EngineRequestError("正式作品身份与对账身份不一致")
+        work_root = self._reconciliation_target_root(matched)
+        shelf_value = reconciliation.get("matched_shelf")
+        if work_root is None or not isinstance(shelf_value, str):
+            raise EngineRequestError("既有作品的货架或作品根无效")
+        try:
+            shelf = parse_target_shelf(shelf_value)
+            shelf_root = target_root_for_shelf(self.library_root, shelf)
+        except ValueError as exc:
+            raise EngineRequestError("既有作品的货架无效") from exc
+        # Reconciliation only accepts a concrete work directly below one of
+        # the three closed shelves. Re-check that invariant at the write gate.
+        if posixpath.dirname(work_root) != shelf_root:
+            raise EngineRequestError("既有作品根不在匹配一级货架下")
+        if self._reconciliation_shelf_for_work(work_root) != shelf.value:
+            raise EngineRequestError("既有作品根与货架映射不一致")
+        if not target_shelf_allows_media_type(shelf, identity.media_type):
+            raise EngineRequestError("既有作品媒体类型与货架不兼容")
+        if self._reconciliation_scope_is_ambiguous(matched):
+            raise EngineRequestError("正式作品身份范围不明确")
+        return identity, shelf, shelf_root, work_root
+
+    def reconciled_existing_work_root(
+        self,
+        job_id: str,
+        *,
+        outcome: str = "existing_gap",
+    ) -> str:
+        """Return a validated matched work root for a post-reconciliation lane.
+
+        This is a local-state read gate for the composition root.  It does
+        not scan AList, call TMDB, or create a Provider owner; the scoped
+        audit that follows remains the existing Provider/audit composition
+        path.
+        """
+        if outcome not in {"merge_existing", "existing_gap"}:
+            raise EngineRequestError("只允许读取既有作品对账结果")
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.phase not in {"reconciled", "queued", "planned", "executing", "executed"}:
+                raise EngineJobConflictError(
+                    f"任务当前没有可用的既有作品对账结果: {job.phase}"
+                )
+            _identity, _shelf, _shelf_root, work_root = self._reconciled_existing_context(
+                job.summary,
+                expected_outcome=outcome,
+            )
+            return work_root
+
+    def _request_from_reconciled_identity(
+        self,
+        source: str,
+        *,
+        identity: AutomaticIdentity,
+        shelf: TargetShelf,
+        shelf_root: str,
+    ) -> EngineRequest:
+        """Adapt persisted reconciliation evidence to the existing planner API."""
+        return EngineRequest.from_mapping({
+            "source_path": source,
+            "parent_path": shelf_root,
+            "media_type": identity.media_type,
+            "target_shelf": shelf.value,
+            "tmdb_id": identity.tmdb_id,
+            "query": identity.title,
+            "season": identity.season if isinstance(identity.season, int) else 1,
+        })
+
+    def _require_merge_existing_plan_target(
+        self,
+        plan: object,
+        *,
+        identity: AutomaticIdentity,
+        work_root: str,
+        stage: str,
+    ) -> None:
+        """Fail closed if the existing planner proposes a second work root."""
+        planned_root = getattr(plan, "target_root", None)
+        if not isinstance(planned_root, str):
+            raise FormalTargetConflictError(
+                f"{stage}缺少既有作品目标根"
+            )
+        try:
+            planned_root = _safe_remote_path(
+                planned_root, field=f"{stage} target_root", allow_root=False,
+            )
+        except EngineRequestError as exc:
+            raise FormalTargetConflictError(f"{stage}目标根无效") from exc
+        if planned_root != work_root:
+            raise FormalTargetConflictError(
+                f"{stage}不得为既有作品创建第二个正式作品根: "
+                f"expected={work_root}; planned={planned_root}"
+            )
+        self._require_reconciled_plan_identity(
+            plan,
+            identity=identity,
+            stage=stage,
+        )
+
+    @staticmethod
+    def _require_reconciled_plan_identity(
+        plan: object,
+        *,
+        identity: AutomaticIdentity,
+        stage: str,
+    ) -> None:
+        """Keep a persisted reconciliation identity stable through recovery."""
+        metadata = getattr(plan, "metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise FormalTargetConflictError(f"{stage}缺少作品身份元数据")
+        raw_tmdb_id = metadata.get("tmdb_id")
+        if isinstance(raw_tmdb_id, str) and raw_tmdb_id.isdecimal():
+            raw_tmdb_id = int(raw_tmdb_id)
+        if raw_tmdb_id != identity.tmdb_id:
+            raise FormalTargetConflictError(
+                f"{stage}计划身份与既有作品不一致"
+            )
+        mode = str(getattr(plan, "mode", "")).casefold()
+        if mode != identity.media_type:
+            raise FormalTargetConflictError(
+                f"{stage}计划媒体类型与既有作品不一致"
+            )
+
     def _reconciliation_source_video_paths(self, source: str) -> set[str] | None:
         """Return only real intake videos from an existing read-only walk."""
         walker = getattr(self.alist, "walk", None)
@@ -2166,12 +2393,29 @@ class SimpleEngineRunner:
         if not isinstance(rows, list):
             return None
         paths: set[str] = set()
+        source_prefix = source.rstrip("/") + "/"
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
             path = row.get("full_path") or row.get("path") or row.get("name")
-            if isinstance(path, str) and is_video_filename(path):
-                paths.add(path)
+            size = row.get("size")
+            # A zero-byte listing is not usable media evidence.  Keep the
+            # broader quality/readability gate in the existing planner, but
+            # do not let an empty placeholder authorize merge_existing.
+            if not isinstance(path, str) or not path.startswith(source_prefix):
+                continue
+            try:
+                normalized = _safe_remote_path(
+                    path, field="reconciliation source media path", allow_root=False,
+                )
+            except EngineRequestError:
+                continue
+            if (
+                normalized.startswith(source_prefix)
+                and is_video_filename(normalized)
+                and video_size_is_admissible(size)
+            ):
+                paths.add(normalized)
         return paths
 
     def _reconciliation_source_episode_tokens(
@@ -2190,6 +2434,44 @@ class SimpleEngineRunner:
         for path in paths:
             tokens.update(audit_episode_tokens(path, default_season=default_season))
         return tokens
+
+    @staticmethod
+    def _reconciliation_formal_video_paths(
+        report: Mapping[str, object],
+        target_root: str,
+    ) -> set[str]:
+        """Return formally admissible movie videos inside one matched root.
+
+        The semantic audit projection is intentionally reused for identity and
+        gap evidence, but its inventory may still contain zero-byte or tiny
+        video entries as diagnostics.  Those entries are not sufficient proof
+        of a complete formal movie; the same admission floor used by the
+        writer must apply at this reconciliation boundary too.
+        """
+        inventory = report.get("inventory")
+        if not isinstance(inventory, list):
+            return set()
+        prefix = target_root.rstrip("/") + "/"
+        paths: set[str] = set()
+        for row in inventory:
+            if not isinstance(row, Mapping) or row.get("type") != "file":
+                continue
+            path = row.get("path") or row.get("full_path")
+            if not isinstance(path, str):
+                continue
+            try:
+                normalized = _safe_remote_path(
+                    path, field="reconciliation formal media path", allow_root=False,
+                )
+            except EngineRequestError:
+                continue
+            if (
+                (normalized == target_root or normalized.startswith(prefix))
+                and is_video_filename(normalized)
+                and video_size_is_admissible(row.get("size"))
+            ):
+                paths.add(normalized)
+        return paths
 
     def _reconciliation_outcome(
         self,
@@ -2291,18 +2573,40 @@ class SimpleEngineRunner:
                 if not isinstance(row, Mapping) or row.get("type") != "file":
                     continue
                 path = row.get("path")
+                if not isinstance(path, str):
+                    continue
+                try:
+                    normalized = _safe_remote_path(
+                        path, field="reconciliation formal episode path", allow_root=False,
+                    )
+                except EngineRequestError:
+                    continue
                 if (
-                    isinstance(path, str)
-                    and is_video_filename(path)
-                    and (path == target_root or path.startswith(target_root.rstrip("/") + "/"))
+                    is_video_filename(normalized)
+                    and video_size_is_admissible(row.get("size"))
+                    and (normalized == target_root or normalized.startswith(target_root.rstrip("/") + "/"))
                 ):
-                    formal_tokens.update(audit_episode_tokens(path, default_season=identity.season))
+                    formal_tokens.update(
+                        audit_episode_tokens(normalized, default_season=identity.season),
+                    )
             if not source_tokens:
                 return "uncertain", "输入剧集没有可验证的季集坐标", work, shelf
             if source_tokens - formal_tokens:
                 return "merge_existing", "输入包含正式作品尚未覆盖的明确剧集", work, shelf
         if matching_unknowns:
             return "uncertain", "正式作品完整性证据不足", work, shelf
+        formal_movie_videos = (
+            self._reconciliation_formal_video_paths(report, target_root)
+            if identity.media_type == "movie"
+            else None
+        )
+        if identity.media_type == "movie" and not formal_movie_videos:
+            source_videos = self._reconciliation_source_video_paths(source)
+            if source_videos is None:
+                return "uncertain", "无法只读确认输入电影媒体", work, shelf
+            if source_videos:
+                return "merge_existing", "输入包含可补入既有正式电影的视频", work, shelf
+            return "existing_gap", "正式电影缺少可接受的视频媒体", work, shelf
         if matching_media_gaps:
             return "existing_gap", "已确认正式作品存在媒体缺口", work, shelf
         return "duplicate_complete", "正式作品身份与媒体范围已充分匹配", work, shelf
@@ -2329,7 +2633,48 @@ class SimpleEngineRunner:
                 source = self._job_ingress_source(job)
                 if not self.source_directory_exists(source):
                     raise EngineRequestError("待刮削来源目录不存在或不可读取")
-                identity = self.resolve_automatic_identity(source)
+                confirmation = job.summary.get("reconciliation_identity_confirmation")
+                if isinstance(confirmation, Mapping):
+                    # The operator confirms only the bounded identity tuple;
+                    # title/year remain Engine-derived source evidence and the
+                    # ordinary library comparison below still decides all
+                    # five outcomes.  In particular this is not a second
+                    # planner, destination, or Provider input path.
+                    original = self.resolve_automatic_identity(source)
+                    confirmed_id = confirmation.get("tmdb_id")
+                    confirmed_type = str(confirmation.get("media_type") or "").casefold()
+                    confirmed_season = confirmation.get("season")
+                    if (
+                        isinstance(confirmed_id, bool)
+                        or not isinstance(confirmed_id, int)
+                        or confirmed_id <= 0
+                        or confirmed_type not in {"movie", "tv"}
+                        or (
+                            confirmed_type == "tv"
+                            and (
+                                isinstance(confirmed_season, bool)
+                                or not isinstance(confirmed_season, int)
+                                or not 0 <= confirmed_season <= 999
+                            )
+                        )
+                        or (confirmed_type == "movie" and confirmed_season is not None)
+                    ):
+                        raise EngineRequestError("手工对账身份确认记录无效")
+                    trace = dict(original.trace)
+                    trace["reconciliation_identity_confirmation"] = {
+                        "tmdb_id": confirmed_id,
+                        "media_type": confirmed_type,
+                    }
+                    identity = replace(
+                        original,
+                        media_type=confirmed_type,
+                        tmdb_id=confirmed_id,
+                        confidence=1.0,
+                        season=confirmed_season if confirmed_type == "tv" else None,
+                        trace=trace,
+                    )
+                else:
+                    identity = self.resolve_automatic_identity(source)
                 from local.scrapeflow_api.simple_library_audit import (
                     SimpleLibraryAuditor,
                     TmdbEpisodeCatalog,
@@ -2399,6 +2744,11 @@ class SimpleEngineRunner:
                 "automatic_terminal": outcome != "new_work",
                 "next_retry_seconds": None,
             })
+            if isinstance(summary.get("reconciliation_identity_confirmation"), Mapping):
+                confirmation = dict(summary["reconciliation_identity_confirmation"])
+                confirmation["reconciled_at"] = _now()
+                confirmation["result"] = outcome
+                summary["reconciliation_identity_confirmation"] = confirmation
             phase = (
                 "awaiting_target_shelf" if outcome == "new_work"
                 else "reconciliation_uncertain" if outcome == "uncertain"
@@ -2419,6 +2769,164 @@ class SimpleEngineRunner:
                 return latest
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return self._read(job_id)
+
+    def reopen_reconciliation_uncertain(
+        self,
+        job_id: str,
+        correction: Mapping[str, object],
+    ) -> EngineJob:
+        """Accept one bounded identity confirmation and repeat only B/C.
+
+        ``uncertain`` must never be reopened into a shelf, planner, writer or
+        Provider lane.  The caller can confirm only the same compact identity
+        tuple used by the ordinary retry boundary; this method records it as
+        audit evidence and returns the root to ``reconciling``.  The next
+        invocation of :meth:`reconcile_automatic_job` performs the ordinary
+        read-only three-library comparison again.
+        """
+        if not isinstance(correction, Mapping):
+            raise EngineRequestError("对账身份确认必须是 JSON 对象")
+        forbidden = set(correction) - {"tmdb_id", "media_type", "season"}
+        if forbidden:
+            raise EngineRequestError("对账身份确认包含不支持的字段")
+        raw_id = correction.get("tmdb_id")
+        if isinstance(raw_id, str) and raw_id.isascii() and raw_id.isdecimal():
+            raw_id = int(raw_id)
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
+            raise EngineRequestError("对账身份确认需要正整数 tmdb_id")
+        media_type = str(correction.get("media_type") or "").strip().casefold()
+        if media_type not in {"movie", "tv"}:
+            raise EngineRequestError("对账身份确认需要 media_type=movie 或 tv")
+        raw_season = correction.get("season", 1)
+        if isinstance(raw_season, str) and raw_season.isascii() and raw_season.isdecimal():
+            raw_season = int(raw_season)
+        if isinstance(raw_season, bool) or not isinstance(raw_season, int) or not 0 <= raw_season <= 999:
+            raise EngineRequestError("对账身份确认 season 必须是 0–999 的整数")
+
+        normalized: dict[str, object] = {
+            "tmdb_id": raw_id,
+            "media_type": media_type,
+            # Keep the existing public correction shape backward compatible:
+            # movie retries historically carry the default ``season=1`` even
+            # though it is ignored.  It is discarded below and never becomes
+            # a movie identity fact.
+            "season": raw_season if media_type == "tv" else None,
+        }
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.phase != "reconciliation_uncertain":
+                raise EngineJobConflictError("只有 needs_attention 对账任务可以确认身份")
+            summary = job.summary if isinstance(job.summary, Mapping) else {}
+            reconciliation = summary.get("reconciliation")
+            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "uncertain":
+                raise EngineJobConflictError("当前任务不是不确定的只读对账结果")
+            if self._owned_children(job) or self._existing_gap_registration_blockers(job):
+                raise EngineJobConflictError("任务仍有活动 child 或 Provider 状态，不能重新对账")
+            source = self._job_ingress_source(job)
+            if not self.source_directory_exists(source):
+                raise EngineJobConflictError("待刮削来源目录不存在或不可读取")
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
+            updated_summary = dict(summary)
+            updated_summary["reconciliation_identity_confirmation"] = {
+                **normalized,
+                "confirmed_at": _now(),
+            }
+            updated_summary["automatic"] = True
+            updated_summary["automatic_stage"] = "reconciling"
+            updated_summary["automatic_terminal"] = False
+            updated_summary["next_retry_seconds"] = None
+            updated_summary.pop("existing_gap_registration", None)
+            updated_summary.pop("source_fate", None)
+            updated = replace(
+                job,
+                phase="reconciling",
+                request={"source_path": source},
+                plan={},
+                summary=updated_summary,
+                updated_at=_now(),
+                error=None,
+                execution=None,
+            )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return self._read(job.id)
+
+    def prepare_reconciled_merge_job(self, job_id: str) -> EngineJob:
+        """Open a read-only ``merge_existing`` result for the existing Engine.
+
+        Reconciliation intentionally leaves the result in ``reconciled`` so
+        the HTTP composition root can expose the five-way decision before any
+        formal planning starts.  This narrow local transition is the explicit
+        hand-off for the one result that is allowed to continue automatically:
+        it records no user shelf choice, copies the already validated matched
+        work coordinates into the summary, and changes only the local job
+        phase to ``queued``.  The planner branch below consumes the persisted
+        identity and performs the ordinary Engine/write path.
+
+        ``duplicate_complete`` and ``existing_gap`` deliberately do not use
+        this method.  They require their own terminal/Provider decisions and
+        must never be silently turned into a media write.
+        """
+        with self.worker_lock():
+            job = self._read(job_id)
+            if job.phase == "queued":
+                reconciliation = job.summary.get("reconciliation")
+                if (
+                    isinstance(reconciliation, Mapping)
+                    and reconciliation.get("outcome") == "merge_existing"
+                ):
+                    return job
+            if job.phase != "reconciled":
+                raise EngineJobConflictError(
+                    f"任务当前不能打开 merge_existing: {job.phase}"
+                )
+            reconciliation = job.summary.get("reconciliation")
+            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "merge_existing":
+                raise EngineJobConflictError("只有 merge_existing 对账结果才能进入现有 Engine")
+            # Validate every durable coordinate at the hand-off boundary.  No
+            # network call or planner is made here.
+            _identity, shelf, shelf_root, work_root = self._merge_existing_context(
+                job.summary,
+            )
+            source = self._job_ingress_source(job)
+            summary = dict(job.summary)
+            summary.update({
+                "automatic": True,
+                "automatic_stage": "queued",
+                "selected_target_root": shelf_root,
+                "target_work_path": work_root,
+                "merge_existing_ready": True,
+                "automatic_terminal": False,
+                "next_retry_seconds": None,
+            })
+            # Keep the classification and matched evidence intact.  The
+            # target shelf remains in reconciliation evidence, not in the
+            # user-selection fields used by ``new_work`` /start.
+            reconciliation_copy = dict(reconciliation)
+            reconciliation_copy.update({
+                "status": "completed",
+                "execution_ready": True,
+                "matched_shelf": shelf.value,
+                "matched_work_root": work_root,
+            })
+            summary["reconciliation"] = reconciliation_copy
+            now = _now()
+            updated = replace(
+                job,
+                phase="queued",
+                updated_at=now,
+                request={"source_path": source},
+                plan={},
+                summary=summary,
+                target_shelf=None,
+                target_root=None,
+                selected_at=None,
+                execution=None,
+                error=None,
+            )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return updated
 
     @staticmethod
     def _audit_text(value: object, *, field: str, required: bool = False) -> str:
@@ -3614,6 +4122,37 @@ class SimpleEngineRunner:
         complete user selection.
         """
         if job.target_shelf is None and job.target_root is None and job.selected_at is None:
+            reconciliation = job.summary.get("reconciliation")
+            if (
+                isinstance(reconciliation, Mapping)
+                and reconciliation.get("outcome") == "merge_existing"
+            ):
+                identity, _selected_shelf, expected_root, work_root = (
+                    self._merge_existing_context(job.summary)
+                )
+                self._require_plan_target_shelf_containment(
+                    plan,
+                    target_root=expected_root,
+                    stage=stage,
+                )
+                self._require_merge_existing_plan_target(
+                    plan,
+                    identity=identity,
+                    work_root=work_root,
+                    stage=stage,
+                )
+                return
+            if (
+                isinstance(reconciliation, Mapping)
+                and reconciliation.get("outcome") == "new_work"
+                and not isinstance(job.summary.get("manual_identity"), Mapping)
+            ):
+                identity = self._reconciled_identity(reconciliation.get("identity"))
+                self._require_reconciled_plan_identity(
+                    plan,
+                    identity=identity,
+                    stage=stage,
+                )
             if (
                 job.summary.get("automatic") is True
                 and job.summary.get("audit_owned") is not True
@@ -3627,6 +4166,17 @@ class SimpleEngineRunner:
             target_root=expected_root,
             stage=stage,
         )
+        reconciliation = job.summary.get("reconciliation")
+        if (
+            isinstance(reconciliation, Mapping)
+            and reconciliation.get("outcome") == "new_work"
+            and not isinstance(job.summary.get("manual_identity"), Mapping)
+        ):
+            self._require_reconciled_plan_identity(
+                plan,
+                identity=self._reconciled_identity(reconciliation.get("identity")),
+                stage=stage,
+            )
 
     def _archive_task_roots(self, job_id: str) -> tuple[Path, str]:
         """Return deterministic local/remote task-owned archive roots.
@@ -3992,6 +4542,7 @@ class SimpleEngineRunner:
                     ignore_orphan_temp=current.ignore_orphan_temp,
                     episode_map_path=None,
                     episode_group_id=current.episode_group_id,
+                    media_root=self.library_root,
                 )
             elif current.media_type == "collection":
                 if current.collection_map:
@@ -4025,7 +4576,16 @@ class SimpleEngineRunner:
         if self.validate:
             validate = getattr(engine, "validate_plan", None)
             if callable(validate):
-                validate(self.alist, plan)
+                try:
+                    validate(self.alist, plan, media_root=self.library_root)
+                except TypeError as exc:
+                    # Injected/legacy Engine validators may still expose the
+                    # old two-argument contract.  Only signature-level
+                    # incompatibility gets the compatibility call; an
+                    # internal TypeError must not replay validation blindly.
+                    if "media_root" not in str(exc):
+                        raise
+                    validate(self.alist, plan)
         return plan
 
     @staticmethod
@@ -4220,13 +4780,16 @@ class SimpleEngineRunner:
         job_id: str,
         *,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> EngineJob:
         """Resolve and persist the plan for an already queued source job."""
         with self.worker_lock():
             job = self._read(job_id)
+            effective_pause = pause_requested if pause_requested is not None else self._pause_requested
             cancelled = self._consume_cancel_request(job)
             if cancelled is not None:
                 return cancelled
+            _pause_checkpoint(effective_pause)
             if job.phase == "planned":
                 return job
             if job.phase == "executed":
@@ -4242,7 +4805,33 @@ class SimpleEngineRunner:
                 raise EngineJobConflictError(
                     f"Engine job {job_id} 当前不能规划: {job.phase}"
                 )
+            reconciliation = (
+                job.summary.get("reconciliation")
+                if isinstance(job.summary.get("reconciliation"), Mapping)
+                else {}
+            )
+            reconciliation_outcome = str(reconciliation.get("outcome") or "")
+            merge_existing = reconciliation_outcome == "merge_existing"
+            reconciled_new_work = reconciliation_outcome == "new_work"
+            merge_identity: AutomaticIdentity | None = None
+            merge_work_root: str | None = None
+            reconciled_identity: AutomaticIdentity | None = None
             selected_shelf, selected_root = self._confirmed_target_selection(job)
+            if merge_existing:
+                # This is a post-reconciliation planning boundary.  The
+                # identity and concrete work root are already authoritative;
+                # do not call TMDB/matcher again or ask for a new shelf.
+                merge_identity, selected_shelf, selected_root, merge_work_root = (
+                    self._merge_existing_context(job.summary)
+                )
+            elif reconciled_new_work and not isinstance(job.summary.get("manual_identity"), Mapping):
+                # Once read-only reconciliation has established a genuine
+                # new work, shelf selection is only a policy confirmation.
+                # Reuse that durable Engine identity instead of allowing a
+                # second TMDB/matcher pass to reinterpret the same intake.
+                reconciled_identity = self._reconciled_identity(
+                    reconciliation.get("identity"),
+                )
             original_source = self._job_ingress_source(job)
             intake = EngineRequest.from_mapping({
                 "source_path": original_source,
@@ -4262,6 +4851,7 @@ class SimpleEngineRunner:
                 summary=archiving_summary,
             )
             atomic_write_json(self._job_path(job_id), archiving.as_dict(), allow_nan=False)
+            pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
             try:
                 _cancellation_checkpoint()
                 archive_request, archive_projection = self._reusable_archive_projection(job, intake)
@@ -4272,6 +4862,11 @@ class SimpleEngineRunner:
                 cancelled = self._consume_cancel_request(archiving)
                 if cancelled is not None:
                     return cancelled
+            except EnginePauseRequested:
+                # Keep the active archive operation durable.  A later resume
+                # re-enters this same phase and can reuse its projection;
+                # pause never becomes a terminal cancellation.
+                return self._read(job_id)
             except (EngineRequestError, ArchivePasswordError) as exc:
                 summary = dict(archiving.summary)
                 summary.update({
@@ -4289,6 +4884,8 @@ class SimpleEngineRunner:
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 raise
+            finally:
+                _PAUSE_REQUEST_CHECK.reset(pause_token)
             archive_summary = dict(archiving.summary)
             if archive_projection is not None:
                 archive_summary["archive_preprocessed"] = dict(archive_projection)
@@ -4303,12 +4900,59 @@ class SimpleEngineRunner:
                 summary=archive_summary,
             )
             atomic_write_json(self._job_path(job_id), matching.as_dict(), allow_nan=False)
+            try:
+                _pause_checkpoint(effective_pause)
+            except EnginePauseRequested:
+                return self._read(job_id)
             cancelled = self._consume_cancel_request(matching)
             if cancelled is not None:
                 return cancelled
             correction = job.summary.get("manual_identity")
             try:
-                if isinstance(correction, Mapping):
+                if merge_existing and merge_identity is not None:
+                    request = self._request_from_reconciled_identity(
+                        archive_request.source_path,
+                        identity=replace(
+                            merge_identity,
+                            target_parent=selected_root,
+                            target_shelf=selected_shelf.value,
+                            target_shelf_root=selected_root,
+                        ),
+                        shelf=selected_shelf,
+                        shelf_root=selected_root,
+                    )
+                    identity = replace(
+                        merge_identity,
+                        target_parent=selected_root,
+                        target_shelf=selected_shelf.value,
+                        target_shelf_root=selected_root,
+                    )
+                elif (
+                    reconciled_new_work
+                    and reconciled_identity is not None
+                    and not isinstance(correction, Mapping)
+                ):
+                    if not target_shelf_allows_media_type(
+                        selected_shelf, reconciled_identity.media_type,
+                    ):
+                        raise TargetShelfPolicyConflictError(
+                            target_shelf=selected_shelf,
+                            media_type=reconciled_identity.media_type,
+                            identity=reconciled_identity,
+                        )
+                    identity = replace(
+                        reconciled_identity,
+                        target_parent=selected_root,
+                        target_shelf=selected_shelf.value,
+                        target_shelf_root=selected_root,
+                    )
+                    request = self._request_from_reconciled_identity(
+                        archive_request.source_path,
+                        identity=identity,
+                        shelf=selected_shelf,
+                        shelf_root=selected_root,
+                    )
+                elif isinstance(correction, Mapping):
                     request, identity = self._request_from_manual_identity(
                         archive_request.source_path,
                         correction,
@@ -4355,11 +4999,22 @@ class SimpleEngineRunner:
                 return conflicted
             planning = replace(matching, phase="planning", updated_at=_now())
             atomic_write_json(self._job_path(job_id), planning.as_dict(), allow_nan=False)
+            try:
+                _pause_checkpoint(effective_pause)
+            except EnginePauseRequested:
+                return self._read(job_id)
             cancelled = self._consume_cancel_request(planning)
             if cancelled is not None:
                 return cancelled
             try:
                 plan = self._build_plan(request)
+                if merge_existing and merge_identity is not None and merge_work_root is not None:
+                    self._require_merge_existing_plan_target(
+                        plan,
+                        identity=merge_identity,
+                        work_root=merge_work_root,
+                        stage="既有作品合并计划",
+                    )
             except FormalTargetConflictError as exc:
                 summary = dict(planning.summary)
                 summary.update({
@@ -4396,11 +5051,19 @@ class SimpleEngineRunner:
             cancelled = self._consume_cancel_request(planning)
             if cancelled is not None:
                 return cancelled
+            _pause_checkpoint(effective_pause)
             self._require_plan_target_shelf_containment(
                 plan,
                 target_root=selected_root,
                 stage="自动计划生成",
             )
+            if merge_existing and merge_identity is not None and merge_work_root is not None:
+                self._require_merge_existing_plan_target(
+                    plan,
+                    identity=merge_identity,
+                    work_root=merge_work_root,
+                    stage="自动计划生成",
+                )
             engine = __import__("engine.scraper", fromlist=["plan_to_dict"])
             serializer = getattr(engine, "plan_to_dict", None)
             if not callable(serializer):
@@ -4408,7 +5071,15 @@ class SimpleEngineRunner:
             body = serializer(plan)
             if not isinstance(body, Mapping):
                 raise SimpleEngineError("Engine 计划序列化结果无效")
-            summary = self._summary(plan)
+            # Preserve the reconciliation evidence through the hand-off.  It
+            # is the durable explanation for why this root may write into an
+            # existing work and must remain available on restart/UI reads.
+            preserve_reconciliation = merge_existing or reconciled_new_work
+            summary = (
+                {**dict(planning.summary), **self._summary(plan)}
+                if preserve_reconciliation
+                else self._summary(plan)
+            )
             summary.update({
                 "identity": identity.as_dict(),
                 "automatic": True,
@@ -4449,6 +5120,7 @@ class SimpleEngineRunner:
         *,
         defer_cleanup: bool = False,
         cancel_requested: Callable[[], bool] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         # Keep the gate here too. ``repair_automatic_artifacts`` and injected
         # executors both use this path, so neither can bypass the runner's
@@ -4461,11 +5133,14 @@ class SimpleEngineRunner:
         if target is None:
             raise SimpleEngineError("无可调用的 Engine executor")
         token = _DEFER_TASK_CLEANUP.set(bool(defer_cleanup))
+        effective_pause = pause_requested if pause_requested is not None else self._pause_requested
+        pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
         cancel_token = _CANCEL_REQUEST_CHECK.set(cancel_requested)
         try:
             result = target(plan)
         finally:
             _CANCEL_REQUEST_CHECK.reset(cancel_token)
+            _PAUSE_REQUEST_CHECK.reset(pause_token)
             _DEFER_TASK_CLEANUP.reset(token)
         if not isinstance(result, Mapping):
             return {"result": _jsonable(result)}
@@ -4521,12 +5196,19 @@ class SimpleEngineRunner:
         updated["lifecycle"] = lifecycle
         return updated
 
-    def execute_job(self, job_id: str) -> EngineJob:
+    def execute_job(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
         with self.worker_lock():
             job = self._read(job_id)
+            effective_pause = pause_requested if pause_requested is not None else self._pause_requested
             cancelled = self._consume_cancel_request(job)
             if cancelled is not None:
                 return cancelled
+            _pause_checkpoint(effective_pause)
             if job.phase == "executed":
                 return job
             if job.summary.get("audit_owned") is True:
@@ -4585,6 +5267,7 @@ class SimpleEngineRunner:
                     plan,
                     defer_cleanup=defer_cleanup,
                     cancel_requested=lambda: self._cancel_requested(executing),
+                    pause_requested=effective_pause,
                 )
                 result = dict(result)
                 if defer_cleanup:
@@ -4599,6 +5282,11 @@ class SimpleEngineRunner:
                 cancelled = self._consume_cancel_request(executing)
                 if cancelled is not None:
                     return cancelled
+            except EnginePauseRequested:
+                # Preserve ``executing`` and its active operation. Restart
+                # recovery/readback can safely decide whether the previous
+                # unit completed; resume must never replay blindly.
+                return self._read(job_id)
             except EngineCancellationRequested:
                 cancelled = self._consume_cancel_request(executing)
                 return cancelled or self._cancelled_job(
@@ -4618,6 +5306,7 @@ class SimpleEngineRunner:
                 )
                 atomic_write_json(self._job_path(job_id), failed.as_dict(), allow_nan=False)
                 raise
+            _pause_checkpoint(effective_pause)
             summary = self._without_active_operation(executing.summary)
             if defer_cleanup:
                 summary = self._with_verified_automatic_formal_write(
@@ -4712,9 +5401,936 @@ class SimpleEngineRunner:
             "target": f"{processed_root}/{name}",
         }
 
-    def execute_automatic(self, job_id: str) -> EngineJob:
+    def _remote_directory_exists(self, path: str) -> bool:
+        """Prove one exact remote path is a directory through its parent."""
+        return self._remote_entry_kind(path) == "directory"
+
+    def _remote_entry_kind(self, path: str) -> str:
+        """Return the exact parent-listing fact for one remote object.
+
+        AList can return an empty listing for both a missing path and an empty
+        directory.  The parent/name listing is therefore the only admissible
+        existence proof here.  ``ambiguous`` is deliberately distinct from a
+        regular file so a same-named stale object can never be overwritten by
+        a duplicate-consume move.
+        """
+        normalized = _safe_remote_path(path, field="remote directory", allow_root=False)
+        parent, name = posixpath.split(normalized)
+        listing = getattr(self.alist, "list", None)
+        if not parent or not name or not callable(listing):
+            return "missing"
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            try:
+                rows = listing(parent)
+            except Exception:
+                return "unknown"
+        except Exception:
+            return "unknown"
+        if not isinstance(rows, list):
+            return "unknown"
+        matches = [
+            row for row in rows
+            if isinstance(row, Mapping) and row.get("name") == name
+        ]
+        if len(matches) != 1:
+            return "ambiguous" if matches else "missing"
+        return "directory" if matches[0].get("is_dir") is True else "file"
+
+    def _duplicate_provider_blockers(self, job_id: str) -> list[str]:
+        """Return active/in-doubt Provider evidence that blocks duplicate consume."""
+        safe_id = _safe_job_id(job_id)
+        directory = self.state_root / "gaps" / re.sub(
+            r"[^a-zA-Z0-9._-]+", "-", safe_id,
+        ).strip(".-")[:96]
+        if not directory.exists():
+            return []
+        if directory.is_symlink() or not directory.is_dir():
+            return ["gap_state_directory_invalid"]
+        try:
+            paths = sorted(directory.glob("*.json"))
+        except OSError:
+            return ["gap_state_directory_unreadable"]
+        blockers: list[str] = []
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                blockers.append(path.name)
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                blockers.append(path.name)
+                continue
+            if not isinstance(raw, Mapping):
+                blockers.append(path.name)
+                continue
+            phase = str(raw.get("phase") or "").casefold()
+            tier_status = str(raw.get("tier_status") or "").casefold()
+            scope = str(raw.get("last_error_scope") or "").casefold()
+            active_attempt = raw.get("active_attempt")
+            post_audit = raw.get(_POST_ACQUISITION_REAUDIT_KEY)
+            post_audit_pending = post_audit is not None
+            if isinstance(post_audit, Mapping):
+                post_audit_pending = str(post_audit.get("status") or "").casefold() not in {
+                    "cleaned", "completed", "resolved", "closed",
+                }
+            active_attempt_pending = isinstance(active_attempt, Mapping)
+            # A terminal phase is not proof that a serialized attempt was
+            # cleaned: a crash can persist the phase before releasing the
+            # attempt marker.  Keep the source-consume gate conservative and
+            # allow that marker only when the post-acquisition audit records
+            # an explicit cleanup fact.
+            if active_attempt_pending and isinstance(post_audit, Mapping):
+                active_attempt_pending = (
+                    str(post_audit.get("status") or "").casefold() != "cleaned"
+                )
+            if (
+                phase in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
+                or tier_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
+                or scope in _DUPLICATE_IN_DOUBT_SCOPES
+                or active_attempt_pending
+                or post_audit_pending
+            ):
+                blockers.append(path.name)
+        return blockers
+
+    def _existing_gap_hold_paths(
+        self,
+        job: EngineJob,
+    ) -> tuple[str, str, str, str, str]:
+        """Build the only source/hold paths admitted for an ``existing_gap``.
+
+        Reconciliation stores the original intake path as task ownership.  A
+        later hand-off may consume *only* a direct child of ``待刮削`` and may
+        target the task's own archive lane.  Rebuilding both paths here keeps a
+        hand-edited ingress path from widening the move scope.
+        """
+        try:
+            source = self._job_ingress_source(job)
+            # Every persisted source coordinate is an ownership proof.  A
+            # hand-edited ``ingress_source_path`` that merely points at a
+            # different direct child of intake must not be accepted as this
+            # task's source.
+            for field, raw_value in (
+                ("request.source_path", job.request.get("source_path")),
+                ("summary.source_root", job.summary.get("source_root")),
+            ):
+                if raw_value is None:
+                    continue
+                persisted = _safe_remote_path(
+                    raw_value,
+                    field=f"existing_gap {field}",
+                    allow_root=False,
+                )
+                if persisted != source:
+                    raise EngineJobConflictError(
+                        "existing_gap 来源所有权记录不一致；拒绝执行来源交接"
+                    )
+            parent, name = posixpath.split(source.rstrip("/"))
+            expected_parent = f"{self.library_root.rstrip('/')}/待刮削"
+            if parent != expected_parent or not name or name in {".", ".."}:
+                raise EngineJobConflictError(
+                    "existing_gap ingress source 不属于任务待刮削直接子目录"
+                )
+            hold_root = _safe_remote_path(
+                f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/existing-gap-hold",
+                field="existing_gap hold root",
+                allow_root=False,
+            )
+            target = _safe_remote_path(
+                f"{hold_root}/{name}",
+                field="existing_gap hold target",
+                allow_root=False,
+            )
+        except EngineJobConflictError:
+            raise
+        except (EngineRequestError, ValueError) as exc:
+            raise EngineJobConflictError(
+                "existing_gap ingress/hold 路径无效；拒绝执行来源交接"
+            ) from exc
+        return source, parent, name, hold_root, target
+
+    @staticmethod
+    def _existing_gap_marker(summary: Mapping[str, object]) -> Mapping[str, object] | None:
+        marker = summary.get("existing_gap_registration")
+        return dict(marker) if isinstance(marker, Mapping) else None
+
+    def _block_existing_gap_registration(
+        self,
+        job: EngineJob,
+        *,
+        source: str,
+        target: str,
+        status: str,
+        reason: str,
+        observed_count: int | None = None,
+    ) -> EngineJob:
+        """Persist a visible, source-retaining registration block.
+
+        This path deliberately does not move, delete, or otherwise mutate the
+        intake object.  ``reconciliation_uncertain`` keeps the global L gate
+        closed while exposing a stable retry/needs-attention projection.
+        """
+        marker: dict[str, object] = {
+            "status": status,
+            "source": source,
+            "target": target,
+            "reason": redact_error(reason),
+            "updated_at": _now(),
+        }
+        if observed_count is not None:
+            marker["observed_count"] = observed_count
+        summary = dict(job.summary)
+        reconciliation_raw = summary.get("reconciliation")
+        if isinstance(reconciliation_raw, Mapping):
+            reconciliation = dict(reconciliation_raw)
+            reconciliation["status"] = "needs_attention"
+            reconciliation["registration_status"] = "blocked"
+            summary["reconciliation"] = reconciliation
+        summary["existing_gap_registration"] = marker
+        summary["source_fate"] = "retained_needs_attention"
+        summary["automatic_stage"] = "existing_gap_registration_blocked"
+        summary["automatic_terminal"] = True
+        summary["next_retry_seconds"] = None
+        updated = replace(
+            job,
+            phase="reconciliation_uncertain",
+            summary=summary,
+            updated_at=_now(),
+            error=redact_error(reason),
+        )
+        atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+        return self._read(job.id)
+
+    def _existing_gap_registration_blockers(self, job: EngineJob) -> list[str]:
+        """Return any Provider/child state that makes an E hand-off unsafe."""
+        blockers = self._duplicate_provider_blockers(job.id)
+        replenishment = job.summary.get("replenishment")
+        if isinstance(replenishment, Mapping):
+            status = str(replenishment.get("status") or "").casefold()
+            scope = str(
+                replenishment.get("failure_scope")
+                or replenishment.get("last_error_scope")
+                or ""
+            ).casefold()
+            if status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or (
+                status
+                and replenishment.get("terminal") is not True
+                and status not in _DUPLICATE_TERMINAL_PROVIDER_STATUSES
+            ):
+                blockers.append("root_provider_active")
+            if scope in _DUPLICATE_IN_DOUBT_SCOPES:
+                blockers.append("root_provider_in_doubt")
+        for child in self._owned_children(job):
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            child_provider = child_summary.get("replenishment")
+            child_status = ""
+            child_scope = ""
+            if isinstance(child_provider, Mapping):
+                child_status = str(child_provider.get("status") or "").casefold()
+                child_scope = str(
+                    child_provider.get("failure_scope")
+                    or child_provider.get("last_error_scope")
+                    or ""
+                ).casefold()
+            if child.phase not in _CLEANUP_TERMINAL_PHASES:
+                blockers.append(f"child_active:{child.id}")
+            if (
+                child_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
+                or child_scope in _DUPLICATE_IN_DOUBT_SCOPES
+            ):
+                blockers.append(f"child_provider:{child.id}")
+        post_audit = job.summary.get(_POST_ACQUISITION_REAUDIT_KEY)
+        if post_audit and (
+            not isinstance(post_audit, Mapping)
+            or str(post_audit.get("status") or "").casefold()
+            not in {"cleaned", "completed", "resolved", "closed"}
+        ):
+            blockers.append("post_acquisition_reaudit_pending")
+        return sorted(set(blockers))
+
+    def _existing_gap_hold_verified_locked(self, job: EngineJob) -> bool:
+        """Verify a durable existing-gap hold without performing mutations."""
+        summary = job.summary if isinstance(job.summary, Mapping) else {}
+        reconciliation = summary.get("reconciliation")
+        marker = self._existing_gap_marker(summary)
+        if (
+            job.phase != "completed"
+            or not isinstance(reconciliation, Mapping)
+            or reconciliation.get("outcome") != "existing_gap"
+            or reconciliation.get("status") != "completed"
+            or not isinstance(marker, Mapping)
+            or marker.get("status") not in {"moved_to_hold", "already_held"}
+            or summary.get("source_fate") not in {"moved_to_hold", "already_held"}
+        ):
+            return False
+        if marker.get("evidence") != "reconciliation.existing_gap.empty_ingress":
+            return False
+        completed_at = marker.get("completed_at")
+        if not isinstance(completed_at, str) or not completed_at.strip():
+            return False
+        try:
+            datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        try:
+            source, _parent, _name, _hold_root, expected_target = self._existing_gap_hold_paths(job)
+            self._reconciled_existing_context(summary, expected_outcome="existing_gap")
+        except (EngineRequestError, EngineJobConflictError, ValueError):
+            return False
+        if (
+            marker.get("source") == source
+            and marker.get("target") == expected_target
+            and self._remote_entry_kind(source) == "missing"
+            and self._remote_entry_kind(expected_target) == "directory"
+        ) is not True:
+            return False
+        listing = getattr(self.alist, "list", None)
+        if not callable(listing):
+            return False
+        try:
+            try:
+                rows = listing(expected_target, refresh=True)
+            except TypeError:
+                rows = listing(expected_target)
+        except Exception:
+            return False
+        return isinstance(rows, list) and not rows
+
+    def existing_gap_source_hold_verified(self, job_id: str) -> bool:
+        """Read-only proof used by the global intake-empty barrier."""
+        with self.worker_lock():
+            try:
+                return self._existing_gap_hold_verified_locked(self._read(job_id))
+            except (EngineJobNotFoundError, SimpleEngineError):
+                return False
+
+    @staticmethod
+    def _existing_gap_hold_intent_matches(
+        marker: Mapping[str, object] | None,
+        *,
+        source: str,
+        target: str,
+    ) -> bool:
+        """Return whether a durable pre-move receipt authorizes recovery.
+
+        The receipt is intentionally tiny: it records only that this exact
+        task proved its direct-child ingress empty immediately before its one
+        AList move.  It is *not* a completion fact; the target must still be
+        read back as an empty directory before a restarted process can turn
+        it into a completed hold.
+        """
+        if not isinstance(marker, Mapping):
+            return False
+        if (
+            marker.get("status") != "hold_prepared"
+            or marker.get("source") != source
+            or marker.get("target") != target
+            or marker.get("evidence") != "reconciliation.existing_gap.empty_ingress"
+        ):
+            return False
+        prepared_at = marker.get("prepared_at")
+        if not isinstance(prepared_at, str) or not prepared_at.strip():
+            return False
+        try:
+            datetime.fromisoformat(prepared_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return True
+
+    def _complete_existing_gap_hold(
+        self,
+        job: EngineJob,
+        *,
+        source: str,
+        target: str,
+        cancellation_observed_after_commit: bool = False,
+    ) -> EngineJob:
+        """Persist the local completion half after an exact empty hold readback."""
+        completed_marker: dict[str, object] = {
+            "status": "moved_to_hold",
+            "source": source,
+            "target": target,
+            "completed_at": _now(),
+            "evidence": "reconciliation.existing_gap.empty_ingress",
+        }
+        if cancellation_observed_after_commit:
+            completed_marker["cancellation_observed_after_commit"] = True
+        updated_summary = dict(job.summary)
+        updated_summary["existing_gap_registration"] = completed_marker
+        updated_summary["source_fate"] = "moved_to_hold"
+        updated_summary["automatic_stage"] = "existing_gap_registered"
+        updated_summary["automatic_terminal"] = True
+        updated_summary["next_retry_seconds"] = None
+        rec = updated_summary.get("reconciliation")
+        if isinstance(rec, Mapping):
+            rec_copy = dict(rec)
+            rec_copy["status"] = "completed"
+            rec_copy["registration_status"] = "held"
+            updated_summary["reconciliation"] = rec_copy
+        updated = replace(
+            job,
+            phase="completed",
+            summary=updated_summary,
+            updated_at=_now(),
+            error=None,
+        )
+        atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+        return self._read(job.id)
+
+    def hold_existing_gap_source(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
+        """Register an ``existing_gap`` source only when it is proven empty.
+
+        Existing-gap reconciliation is intentionally report-only before the
+        global L audit.  The sole E-side hand-off is moving an *empty*,
+        task-owned intake directory into that task's archive hold lane. Any
+        member (video, subtitle, archive, or unknown row) remains in intake
+        and becomes visible ``needs_attention``; no Provider or formal writer
+        is started here.
+        """
+        with self.worker_lock():
+            job = self._read(job_id)
+            effective_pause = (
+                pause_requested if callable(pause_requested) else self._pause_requested
+            )
+            summary = job.summary if isinstance(job.summary, Mapping) else {}
+            reconciliation = summary.get("reconciliation")
+            marker = self._existing_gap_marker(summary)
+
+            if job.phase == "completed":
+                if self._existing_gap_hold_verified_locked(job):
+                    return job
+                raise EngineExecutionError("existing_gap hold 目标回读失败；拒绝重复交接")
+            if job.phase not in {"reconciled", "reconciliation_uncertain", "failed_cleanup"}:
+                raise EngineJobConflictError(
+                    f"任务当前不能登记 existing_gap 来源: {job.phase}"
+                )
+            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "existing_gap":
+                raise EngineJobConflictError("只有 existing_gap 才能登记空来源 hold")
+            if reconciliation.get("status") not in {"completed", "needs_attention"}:
+                raise EngineJobConflictError("existing_gap 对账证据尚未完成")
+            reason = reconciliation.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise EngineJobConflictError("existing_gap 缺少完整对账理由")
+            if job.phase == "reconciliation_uncertain" and not (
+                isinstance(marker, Mapping)
+                and marker.get("status") in {
+                    "blocked_nonempty_source",
+                    "blocked_source_not_directory",
+                    "failed",
+                    "hold_prepared",
+                }
+            ):
+                raise EngineJobConflictError("needs_attention 任务缺少 existing_gap 登记阻断证据")
+            if job.phase == "failed_cleanup" and not (
+                isinstance(marker, Mapping)
+                and marker.get("status") in {"failed", "hold_prepared"}
+            ):
+                raise EngineJobConflictError("existing_gap 清理重试证据缺失")
+
+            # Revalidate identity, shelf, and exact matched work root before
+            # touching the task-owned source.
+            self._reconciled_existing_context(summary, expected_outcome="existing_gap")
+            source, parent, name, hold_root, target = self._existing_gap_hold_paths(job)
+            blockers = self._existing_gap_registration_blockers(job)
+            if blockers:
+                raise EngineWorkerBusyError(
+                    "existing_gap 仍有活动或待核对状态: " + ",".join(blockers)
+                )
+            cancelled = self._consume_cancel_request(job)
+            if cancelled is not None:
+                return cancelled
+
+            source_kind = self._remote_entry_kind(source)
+            target_kind = self._remote_entry_kind(target)
+            if source_kind == "unknown" or target_kind == "unknown":
+                raise EngineExecutionError("existing_gap source/hold 回读不可确认")
+            if source_kind in {"file", "ambiguous"}:
+                return self._block_existing_gap_registration(
+                    job,
+                    source=source,
+                    target=target,
+                    status="blocked_source_not_directory",
+                    reason="existing_gap 来源不是唯一目录；已保留入站对象",
+                )
+            if target_kind in {"file", "ambiguous"}:
+                raise EngineJobConflictError("existing_gap hold 目标已被占用")
+            if source_kind == "missing" and target_kind == "directory":
+                # A completed move may crash between the remote AList commit
+                # and the local completion receipt.  Recover only when this
+                # very task persisted its pre-move empty-ingress intent *and*
+                # the derived target is still exactly empty.  A bare matching
+                # directory remains ambiguous and must not turn the global
+                # barrier green.
+                if self._existing_gap_hold_intent_matches(
+                    marker,
+                    source=source,
+                    target=target,
+                ):
+                    listing = getattr(self.alist, "list", None)
+                    if callable(listing):
+                        try:
+                            try:
+                                target_rows = listing(target, refresh=True)
+                            except TypeError:
+                                target_rows = listing(target)
+                        except Exception:
+                            target_rows = None
+                        if isinstance(target_rows, list) and not target_rows:
+                            committed_job = self._read(job_id)
+                            cancellation_observed_after_commit = False
+                            cancel_request = self._read_cancel_request(job_id)
+                            if (
+                                isinstance(cancel_request, Mapping)
+                                and self._cancel_request_matches(committed_job, cancel_request)
+                            ):
+                                self._clear_cancel_request(job_id)
+                                cancellation_observed_after_commit = True
+                            return self._complete_existing_gap_hold(
+                                committed_job,
+                                source=source,
+                                target=target,
+                                cancellation_observed_after_commit=cancellation_observed_after_commit,
+                            )
+                return self._block_existing_gap_registration(
+                    job,
+                    source=source,
+                    target=target,
+                    status="failed",
+                    reason="existing_gap 来源已缺失但 hold 没有可验证空目录登记；已保留目标等待人工确认",
+                )
+            if source_kind == "missing":
+                raise EngineExecutionError("existing_gap source 与 hold 目标均无法回读")
+            if target_kind != "missing":
+                raise EngineJobConflictError("existing_gap source/hold 目标状态冲突")
+
+            listing = getattr(self.alist, "list", None)
+            if not callable(listing):
+                raise EngineExecutionError("AList 客户端缺少 existing_gap 来源读取接口")
+
+            def source_rows() -> list[object]:
+                try:
+                    rows = listing(source, refresh=True)
+                except TypeError:
+                    rows = listing(source)
+                except Exception as exc:
+                    raise EngineExecutionError("existing_gap 来源内容无法确认") from exc
+                if not isinstance(rows, list):
+                    raise EngineExecutionError("existing_gap 来源目录返回格式不可确认")
+                return rows
+
+            rows = source_rows()
+            if rows:
+                return self._block_existing_gap_registration(
+                    job,
+                    source=source,
+                    target=target,
+                    status="blocked_nonempty_source",
+                    reason="existing_gap 来源目录非空；已保留入站对象，等待人工处理",
+                    observed_count=len(rows),
+                )
+
+            ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
+            move = getattr(self.alist, "move", None)
+            if not callable(ensure) or not callable(move):
+                raise EngineExecutionError("AList 客户端缺少 existing_gap hold 接口")
+            hold_kind = self._remote_entry_kind(hold_root)
+            if hold_kind in {"file", "ambiguous", "unknown"}:
+                raise EngineExecutionError("existing_gap hold 根不是可用目录")
+            _pause_checkpoint(effective_pause)
+            if self._consume_cancel_request(self._read(job_id)) is not None:
+                return self._read(job_id)
+            if hold_kind == "missing":
+                ensure(hold_root)
+                if self._remote_entry_kind(hold_root) != "directory":
+                    raise EngineExecutionError("existing_gap hold 根创建后回读失败")
+            if self._remote_entry_kind(target) != "missing":
+                raise EngineJobConflictError("existing_gap hold 目标已被占用")
+            _pause_checkpoint(effective_pause)
+            latest = self._read(job_id)
+            if self._consume_cancel_request(latest) is not None:
+                return self._read(job_id)
+            # Recheck emptiness immediately before the only remote move.
+            if source_rows():
+                return self._block_existing_gap_registration(
+                    latest,
+                    source=source,
+                    target=target,
+                    status="blocked_nonempty_source",
+                    reason="existing_gap 来源在交接前变为非空；已保留入站对象",
+                )
+            # Persist a narrow intent before the only remote mutation.  It
+            # makes the otherwise unobservable move→local-write crash
+            # recoverable without accepting a hand-created hold directory as
+            # evidence.  The barrier still rejects this non-terminal marker.
+            prepared_summary = dict(latest.summary)
+            prepared_summary["existing_gap_registration"] = {
+                "status": "hold_prepared",
+                "source": source,
+                "target": target,
+                "prepared_at": _now(),
+                "evidence": "reconciliation.existing_gap.empty_ingress",
+            }
+            prepared_summary["source_fate"] = "hold_prepared"
+            prepared_summary["automatic_stage"] = "existing_gap_hold_prepared"
+            prepared = replace(
+                latest,
+                summary=prepared_summary,
+                updated_at=_now(),
+                error=None,
+            )
+            atomic_write_json(self._job_path(job.id), prepared.as_dict(), allow_nan=False)
+            latest = self._read(job_id)
+            move(parent, hold_root, [name])
+            target_rows: list[object] | None = None
+            listing_after_move = getattr(self.alist, "list", None)
+            if callable(listing_after_move):
+                try:
+                    try:
+                        target_rows = listing_after_move(target, refresh=True)
+                    except TypeError:
+                        target_rows = listing_after_move(target)
+                except Exception:
+                    target_rows = None
+            if (
+                self._remote_entry_kind(source) != "missing"
+                or self._remote_entry_kind(target) != "directory"
+                or not isinstance(target_rows, list)
+                or target_rows
+            ):
+                raise EngineExecutionError("existing_gap 来源交接后回读失败")
+            committed_job = self._read(job_id)
+            cancellation_observed_after_commit = False
+            # The move is the commit point.  An inactive cancellation request
+            # can arrive after the last pre-move checkpoint, so match and
+            # consume it explicitly rather than converting a committed hold
+            # back into ``cancelled`` (which would leave the source absent but
+            # falsely block the next barrier forever).
+            cancel_request = self._read_cancel_request(job_id)
+            if (
+                isinstance(cancel_request, Mapping)
+                and self._cancel_request_matches(committed_job, cancel_request)
+            ):
+                self._clear_cancel_request(job_id)
+                cancellation_observed_after_commit = True
+
+            return self._complete_existing_gap_hold(
+                committed_job,
+                source=source,
+                target=target,
+                cancellation_observed_after_commit=cancellation_observed_after_commit,
+            )
+
+    def consume_duplicate_complete_source(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
+        """Idempotently consume a proven duplicate-complete ingress directory.
+
+        This is intentionally separate from ``finalize_automatic_lifecycle``:
+        duplicate-complete has no formal write fact or cleanup transaction.  A
+        source is moved only after the read-only reconciliation proof and all
+        Provider/child state are rechecked under the existing worker lock.
+        Every remote mutation is followed by exact parent-listing readback;
+        an ambiguous result raises and leaves the job non-terminal.
+        """
+        with self.worker_lock():
+            job = self._read(job_id)
+            effective_pause = (
+                pause_requested if callable(pause_requested) else self._pause_requested
+            )
+            summary = job.summary if isinstance(job.summary, Mapping) else {}
+            reconciliation = summary.get("reconciliation")
+            marker = summary.get("duplicate_complete_consumption")
+            if not isinstance(marker, Mapping):
+                # Older WIP records used this name.  It is accepted only as
+                # an equivalent marker; paths are still rebuilt and checked
+                # against the current job below.
+                marker = summary.get("duplicate_cleanup")
+            marker = marker if isinstance(marker, Mapping) else None
+            expected_source: str | None = None
+            expected_target: str | None = None
+            try:
+                expected_source = self._job_ingress_source(job)
+                source_parent, source_name = posixpath.split(expected_source)
+                if (
+                    source_parent == f"{self.library_root.rstrip('/')}/待刮削"
+                    and source_name not in {"", ".", ".."}
+                ):
+                    expected_target = _safe_remote_path(
+                        f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed/{source_name}",
+                        field="duplicate processed target",
+                        allow_root=False,
+                    )
+            except (EngineRequestError, ValueError):
+                expected_source = expected_target = None
+            if (
+                isinstance(reconciliation, Mapping)
+                and reconciliation.get("outcome") == "duplicate_complete"
+                and isinstance(marker, Mapping)
+                and job.phase == "completed"
+            ):
+                # Repeated scheduler calls are reads, but retain the exact
+                # processed target proof; a missing target is corruption, not
+                # permission to move the source again.
+                target = marker.get("target")
+                if (
+                    expected_source is not None
+                    and expected_target is not None
+                    and marker.get("source") == expected_source
+                    and target == expected_target
+                    and isinstance(target, str)
+                    and marker.get("status") in {"moved_to_processed", "already_consumed"}
+                    and self._remote_entry_kind(target) == "directory"
+                ):
+                    return job
+                raise EngineExecutionError("duplicate_complete processed 目标回读失败")
+            if job.phase not in {"reconciled", "failed_cleanup"}:
+                raise EngineJobConflictError(
+                    f"任务当前不能消费 duplicate_complete 来源: {job.phase}"
+                )
+            if not isinstance(reconciliation, Mapping):
+                raise EngineJobConflictError("duplicate_complete 对账证据缺失")
+            if reconciliation.get("outcome") != "duplicate_complete":
+                raise EngineJobConflictError("只有 duplicate_complete 才能消费来源")
+            if reconciliation.get("status") != "completed":
+                raise EngineJobConflictError("duplicate_complete 对账证据尚未完成")
+            reason = reconciliation.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise EngineJobConflictError("duplicate_complete 缺少完整对账理由")
+            # Reuse the same identity/shelf/work-root proof used by the
+            # existing-work hand-off, but require the duplicate outcome.
+            self._reconciled_existing_context(
+                summary,
+                expected_outcome="duplicate_complete",
+            )
+            if job.phase == "failed_cleanup" and not (
+                isinstance(marker, Mapping)
+                and marker.get("status") in {"failed", "moved_to_processed", "already_consumed"}
+            ):
+                raise EngineJobConflictError("duplicate_complete 清理重试证据缺失")
+            blockers = self._duplicate_provider_blockers(job.id)
+            replenishment = summary.get("replenishment")
+            if isinstance(replenishment, Mapping):
+                status = str(replenishment.get("status") or "").casefold()
+                scope = str(
+                    replenishment.get("failure_scope")
+                    or replenishment.get("last_error_scope")
+                    or ""
+                ).casefold()
+                if status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or (
+                    status
+                    and replenishment.get("terminal") is not True
+                    and status not in _DUPLICATE_TERMINAL_PROVIDER_STATUSES
+                ):
+                    blockers.append("root_provider_active")
+                if scope in _DUPLICATE_IN_DOUBT_SCOPES:
+                    blockers.append("root_provider_in_doubt")
+            for child in self._owned_children(job):
+                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+                child_provider = child_summary.get("replenishment")
+                child_scope = ""
+                child_status = ""
+                if isinstance(child_provider, Mapping):
+                    child_status = str(child_provider.get("status") or "").casefold()
+                    child_scope = str(
+                        child_provider.get("failure_scope")
+                        or child_provider.get("last_error_scope")
+                        or ""
+                    ).casefold()
+                if child.phase not in _CLEANUP_TERMINAL_PHASES:
+                    blockers.append(f"child_active:{child.id}")
+                if child_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or child_scope in _DUPLICATE_IN_DOUBT_SCOPES:
+                    blockers.append(f"child_provider:{child.id}")
+            if blockers:
+                raise EngineWorkerBusyError(
+                    "duplicate_complete 仍有活动或待核对的补源状态: "
+                    + ",".join(sorted(set(blockers)))
+                )
+
+            try:
+                cancellation_observed_after_commit = False
+                source = self._job_ingress_source(job)
+                parent, name = posixpath.split(source.rstrip("/"))
+                expected_parent = f"{self.library_root.rstrip('/')}/待刮削"
+                if parent != expected_parent or not name or name in {".", ".."}:
+                    raise EngineExecutionError("duplicate_complete ingress source 不属于任务待刮削直接子目录")
+                processed_root = _safe_remote_path(
+                    f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed",
+                    field="duplicate processed root",
+                    allow_root=False,
+                )
+                target = f"{processed_root}/{name}"
+                source_kind = self._remote_entry_kind(source)
+                target_kind = self._remote_entry_kind(target)
+                if source_kind == "unknown" or target_kind == "unknown":
+                    raise EngineExecutionError("duplicate_complete source/processed 回读不可确认")
+                if source_kind == "directory" and target_kind != "missing":
+                    raise EngineExecutionError("duplicate_complete source 与 processed 目标冲突")
+                if source_kind in {"file", "ambiguous"}:
+                    raise EngineExecutionError("duplicate_complete ingress source 不是唯一目录")
+                if source_kind == "missing" and target_kind == "directory":
+                    consumed = {
+                        "status": "already_consumed",
+                        "source": source,
+                        "target": target,
+                    }
+                elif source_kind == "missing":
+                    raise EngineExecutionError("duplicate_complete source/processed 均无法回读")
+                else:
+                    ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
+                    move = getattr(self.alist, "move", None)
+                    if not callable(ensure) or not callable(move):
+                        raise EngineExecutionError("AList 客户端缺少 duplicate source 消费接口")
+                    processed_kind = self._remote_entry_kind(processed_root)
+                    if processed_kind in {"file", "ambiguous", "unknown"}:
+                        raise EngineExecutionError("duplicate_complete processed 根不是可用目录")
+                    _pause_checkpoint(effective_pause)
+                    if self._consume_cancel_request(self._read(job_id)) is not None:
+                        return self._read(job_id)
+                    ensure(processed_root)
+                    if self._remote_entry_kind(processed_root) != "directory":
+                        raise EngineExecutionError("processed 目录创建后回读失败")
+                    # A same-name object may have appeared while creating the
+                    # parent. Never let AList's move semantics overwrite it.
+                    if self._remote_entry_kind(target) != "missing":
+                        raise EngineExecutionError("duplicate_complete processed 目标已被占用")
+                    _pause_checkpoint(effective_pause)
+                    latest = self._read(job_id)
+                    if self._consume_cancel_request(latest) is not None:
+                        return self._read(job_id)
+                    move(parent, processed_root, [name])
+                    if (
+                        self._remote_entry_kind(source) != "missing"
+                        or self._remote_entry_kind(target) != "directory"
+                    ):
+                        raise EngineExecutionError("duplicate_complete source 消费后回读失败")
+                    # Move is the remote commit point.  If cancellation was
+                    # requested during that operation, consume the stale
+                    # marker and record the observation instead of exposing a
+                    # cancelled job whose source has already been consumed.
+                    committed_job = self._read(job_id)
+                    if self._cancel_requested(committed_job):
+                        self._clear_cancel_request(job_id)
+                        cancellation_observed_after_commit = True
+                    consumed = {
+                        "status": "moved_to_processed",
+                        "source": source,
+                        "target": target,
+                    }
+            except (EnginePauseRequested, EngineCancellationRequested):
+                raise
+            except Exception as exc:
+                # Persist a narrow retry lane, without fabricating a formal
+                # write/readback fact. The source remains owned and untouched
+                # whenever the remote result is ambiguous.
+                failed_marker = dict(marker) if isinstance(marker, Mapping) else {}
+                failed_marker.update({
+                    "status": "failed",
+                    "error": redact_error(exc),
+                    "updated_at": _now(),
+                })
+                failed_summary = dict(summary)
+                failed_summary["duplicate_complete_consumption"] = failed_marker
+                failed_summary["duplicate_cleanup"] = failed_marker
+                failed_summary["cleanup_only_retry"] = True
+                failed_summary["automatic_terminal"] = True
+                failed = replace(
+                    job,
+                    phase="failed_cleanup",
+                    summary=failed_summary,
+                    updated_at=_now(),
+                    error=redact_error(exc),
+                )
+                atomic_write_json(self._job_path(job.id), failed.as_dict(), allow_nan=False)
+                raise
+            marker = {
+                **consumed,
+                "completed_at": _now(),
+                "evidence": "reconciliation.duplicate_complete",
+            }
+            if cancellation_observed_after_commit:
+                marker["cancellation_observed_after_commit"] = True
+            updated_summary = dict(summary)
+            updated_summary["duplicate_complete_consumption"] = marker
+            updated_summary["duplicate_cleanup"] = marker
+            updated_summary["source_fate"] = str(consumed["status"])
+            updated_summary["automatic_stage"] = "duplicate_complete"
+            updated_summary["automatic_terminal"] = True
+            updated_summary["next_retry_seconds"] = None
+            updated = replace(
+                job,
+                phase="completed",
+                summary=updated_summary,
+                updated_at=_now(),
+                error=None,
+            )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return self._read(job.id)
+
+    def duplicate_complete_consumption_verified(self, job_id: str) -> bool:
+        """Verify the durable duplicate-consumption marker and remote facts.
+
+        The intake-empty barrier uses this read-only predicate so a stale or
+        hand-edited ``completed`` job cannot make the global audit look ready.
+        """
+        with self.worker_lock():
+            job = self._read(job_id)
+            reconciliation = job.summary.get("reconciliation")
+            marker = job.summary.get("duplicate_complete_consumption")
+            if not isinstance(marker, Mapping):
+                marker = job.summary.get("duplicate_cleanup")
+            if (
+                not isinstance(reconciliation, Mapping)
+                or reconciliation.get("outcome") != "duplicate_complete"
+                or job.phase != "completed"
+                or not isinstance(marker, Mapping)
+                or marker.get("status") not in {"moved_to_processed", "already_consumed"}
+            ):
+                return False
+            source = marker.get("source")
+            target = marker.get("target")
+            if not isinstance(source, str) or not isinstance(target, str):
+                return False
+            try:
+                self._reconciled_existing_context(
+                    job.summary,
+                    expected_outcome="duplicate_complete",
+                )
+                expected_source = self._job_ingress_source(job)
+                parent, name = posixpath.split(expected_source)
+                if parent != f"{self.library_root.rstrip('/')}/待刮削" or not name:
+                    return False
+                expected_target = _safe_remote_path(
+                    f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed/{name}",
+                    field="duplicate processed target",
+                    allow_root=False,
+                )
+            except (EngineRequestError, ValueError):
+                return False
+            if source != expected_source or target != expected_target:
+                return False
+            return (
+                self._remote_entry_kind(source) == "missing"
+                and self._remote_entry_kind(target) == "directory"
+            )
+
+    def execute_automatic(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
         """Execute or retry an automatic job."""
-        return self.execute_job(job_id)
+        return self.execute_job(job_id, pause_requested=pause_requested)
 
     def repair_automatic_artifacts(self, job_id: str) -> EngineJob:
         """Re-run only a completed plan's deterministic metadata/artwork.
@@ -5371,7 +6987,12 @@ class SimpleEngineRunner:
             gaps.append(dict(raw))
         return gaps
 
-    def finalize_automatic_lifecycle(self, job_id: str) -> EngineJob:
+    def finalize_automatic_lifecycle(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
         """Finish task-owned source/staging cleanup after audit/provider gates.
 
         The method is deliberately separate from ``execute_job``.  It is
@@ -5381,9 +7002,11 @@ class SimpleEngineRunner:
         """
         with self.worker_lock():
             job = self._read(job_id)
+            effective_pause = pause_requested if pause_requested is not None else self._pause_requested
             cancelled = self._consume_cancel_request(job)
             if cancelled is not None:
                 return cancelled
+            _pause_checkpoint(effective_pause)
             if job.summary.get("internal_child") is True:
                 raise EngineJobConflictError("内部 child 不能执行根任务最终清理")
             if job.summary.get("automatic") is not True:
@@ -5518,6 +7141,7 @@ class SimpleEngineRunner:
 
             current = running
             missing = object()
+            pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
             cancel_token = _CANCEL_REQUEST_CHECK.set(
                 lambda: self._cancel_requested(current)
             )
@@ -5625,6 +7249,10 @@ class SimpleEngineRunner:
                         label="archive local staging",
                     )
                     persist_completed_step("archive_local_staging", local_archive_removed)
+            except EnginePauseRequested:
+                # Keep the cleaning operation and completed-step evidence;
+                # resume can continue the next cleanup boundary idempotently.
+                return self._read(job_id)
             except EngineCancellationRequested:
                 cancelled = self._consume_cancel_request(current)
                 return cancelled or self._cancelled_job(
@@ -5661,6 +7289,7 @@ class SimpleEngineRunner:
                 return failed
             finally:
                 _CANCEL_REQUEST_CHECK.reset(cancel_token)
+                _PAUSE_REQUEST_CHECK.reset(pause_token)
 
             final_lifecycle = dict(lifecycle)
             final_cleanup = dict(cleanup)
@@ -5813,6 +7442,7 @@ class SimpleEngineRunner:
 __all__ = [
     "AutomaticIdentity",
     "EngineCancellationRequested",
+    "EnginePauseRequested",
     "EngineExecutionError",
     "EngineJob",
     "EngineJobConflictError",

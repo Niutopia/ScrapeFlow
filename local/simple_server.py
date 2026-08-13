@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import ipaddress
 import json
 import os
@@ -29,7 +30,9 @@ from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
 from engine.scrapeflow.target_shelf import target_shelf_values
 from local.scrapeflow_api.simple_engine_runner import (
+    EngineCancellationRequested,
     EngineExecutionError,
+    EnginePauseRequested,
     EngineJob,
     EngineJobConflictError,
     EngineJobNotFoundError,
@@ -172,11 +175,26 @@ class SimpleApplication:
         self._control_path = self.state_root / "global-control.json"
         self._control_state = PersistentControlState(self._control_path)
         self._control_lock = threading.Lock()
+        # A persisted ``paused=False`` records the last operator decision; it
+        # is not a startup authorization.  Every API process begins behind a
+        # fresh in-memory pause fence and remains there until this process
+        # receives an explicit resume command.  Keeping the fence in memory
+        # avoids rewriting operator state merely because a container restarted
+        # while preserving the fail-closed control document on disk.
+        self._startup_paused = True
         self._automatic_lock = threading.RLock()
         self._automatic_executor: ThreadPoolExecutor | None = None
         self._automatic_futures: dict[str, Future[object]] = {}
         self._provider_executor: ThreadPoolExecutor | None = None
         self._provider_futures: dict[str, Future[object]] = {}
+        # A local executor submission is cancellable until the worker reaches
+        # the real Provider boundary.  Remember that narrow admission so a
+        # newly discovered intake can defer (rather than silently abandon) a
+        # queued root whose worker has not started yet.
+        # Keep the admission epoch alongside each executor grant.  A boolean
+        # token alone cannot distinguish a Future submitted under an older L
+        # audit from one submitted after a later intake/re-audit cycle.
+        self._provider_submission_grants: dict[str, int] = {}
         # Delayed retries are real scheduler state, not fire-and-forget
         # ``threading.Timer`` instances.  Each lane/root key has at most one
         # pending callback so manual retry, terminal completion and shutdown
@@ -216,7 +234,17 @@ class SimpleApplication:
             "last_error": None,
             "last_scheduled_count": 0,
             "last_registered_count": 0,
+            "last_scan_empty": False,
+            "settled": False,
+            "full_audit_barrier": "waiting_for_intake",
         }
+        self._intake_audit_timer_armed = False
+        # Provider is a downstream L→M lane: a successful full report-only
+        # audit, after the intake has settled, is its only admission fact.
+        # This process-local token deliberately does not affect an already
+        # running worker; it gates new submissions only.
+        self._provider_full_audit_admitted = False
+        self._provider_admission_epoch = 0
         self._recover_persisted_engine_jobs()
         # Existing automatic jobs are resumed in the background.
         self._start_startup_thread(self._resume_automatic_jobs, name="scrapeflow-resume")
@@ -554,6 +582,11 @@ class SimpleApplication:
         registered: list[str] = []
         scheduled: list[str] = []
         seen_sources: set[str] = set()
+        # ``seen_sources`` intentionally contains only admissible direct
+        # directories.  The barrier must nevertheless distinguish an empty
+        # root from a root containing a loose file, malformed row, or invalid
+        # name; those objects are unresolved intake, not proof of emptiness.
+        intake_objects_present = False
         create = getattr(runner, "create_pending_job", None)
         if not callable(create):
             # Keep a small compatibility fallback for injected focused
@@ -562,10 +595,25 @@ class SimpleApplication:
         if not callable(create):
             return registered
         for row in rows:
-            if not isinstance(row, Mapping) or row.get("is_dir") is not True:
+            if not isinstance(row, Mapping):
+                intake_objects_present = True
                 continue
-            name = self._safe_inbound_name(row.get("name"))
+            raw_name = row.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                intake_objects_present = True
+                continue
+            name = self._safe_inbound_name(raw_name)
             if name is None:
+                intake_objects_present = True
+                continue
+            # Retired fixture directories are ignored by the product lane;
+            # all other listed objects (including loose files) keep the
+            # intake barrier non-empty until an operator resolves them.
+            candidate_source = f"{root}/{name}"
+            if is_production_test_media_path(candidate_source):
+                continue
+            intake_objects_present = True
+            if row.get("is_dir") is not True:
                 continue
             source = f"{root}/{name}"
             # Production intake must never turn the retired E2E fixture
@@ -573,8 +621,6 @@ class SimpleApplication:
             # writer repeat this guard, but filtering at discovery keeps a
             # future smoke test from polluting the dashboard or consuming a
             # TMDB/provider retry slot in the first place.
-            if is_production_test_media_path(source):
-                continue
             seen_sources.add(source)
             job = existing.get(source)
             if job is None:
@@ -584,7 +630,7 @@ class SimpleApplication:
                 # automatic lane may now run the bounded read-only
                 # reconciliation phase; only a later new_work result exposes
                 # the existing /start shelf confirmation.
-                if job.phase == "reconciling" and self.control().get("paused") is not True:
+                if job.phase == "reconciling":
                     self._queue_automatic_job(job.id)
                     scheduled.append(job.id)
         # A missing waiting source is an observation, not an instruction to
@@ -603,13 +649,712 @@ class SimpleApplication:
                     except Exception:
                         pass
         with self._automatic_lock:
+            # Any new/non-empty intake observation invalidates the previous
+            # full-audit admission before it can dispatch another Provider.
+            if intake_objects_present:
+                self._provider_full_audit_admitted = False
+                self._provider_admission_epoch += 1
+            admitted = self._provider_full_audit_admitted
+            prior_barrier = self._intake_status.get("full_audit_barrier")
             self._intake_status.update({
                 "last_scan_at": _now(),
                 "last_error": None,
                 "last_scheduled_count": len(scheduled),
                 "last_registered_count": len(registered),
+                "last_scan_empty": not intake_objects_present,
+                "settled": False,
+                # A successful L audit remains the admission epoch while its
+                # downstream Provider work is active.  Provider-owned roots
+                # and retry timers are intentionally not allowed to revoke
+                # that token on every intake poll; only a new intake object
+                # starts a new A→L cycle.
+                "full_audit_barrier": (
+                    "completed"
+                    if admitted and not intake_objects_present and prior_barrier == "completed"
+                    else (
+                        "waiting_for_jobs" if not intake_objects_present else "waiting_for_intake"
+                    )
+                ),
             })
+        # Empty intake is only the first half of the barrier.  The helper
+        # performs a second local-state check for ordinary roots, provider
+        # children, held staging and in-doubt attempts before queuing the
+        # report-only full-library pass.  It is deliberately gate-controlled;
+        # a read-only scan never turns on automatic repair by itself.
+        self._refresh_intake_settlement()
         return registered
+
+    def _intake_is_settled(self) -> bool:
+        """Return whether A→K has reached the explicit full-audit barrier.
+
+        This is a local/read-only predicate.  It never guesses that a missing
+        source was consumed, and it treats every non-terminal or ambiguous
+        root as a blocker.  A duplicate root is settled only after its
+        task-owned source-consumption marker is complete.
+        """
+        with self._automatic_lock:
+            if self._intake_status.get("last_scan_empty") is not True:
+                return False
+        try:
+            runner = self._get_engine_runner()
+            all_jobs = runner.list_jobs()
+            jobs = [job for job in all_jobs if not self._is_internal_child(job)]
+        except Exception:
+            return False
+        children_by_root: dict[str, list[EngineJob]] = {}
+        root_ids = {job.id for job in jobs}
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if isinstance(root_id, str) and root_id:
+                children_by_root.setdefault(root_id, []).append(child)
+
+        def children_blocked(root_id: str) -> bool:
+            terminal = {
+                "executed", "completed", "failed", "failed_archive",
+                "failed_identity", "failed_planning", "failed_provider",
+                "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+            }
+            for child in children_by_root.get(root_id, []):
+                if child.phase not in terminal:
+                    return True
+                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+                child_provider = child_summary.get("replenishment")
+                if isinstance(child_provider, Mapping):
+                    child_status = str(child_provider.get("status") or "").casefold()
+                    if child_status in _ORPHANED_PROVIDER_PROGRESS_PHASES or (
+                        child_status and child_provider.get("terminal") is not True
+                    ):
+                        return True
+                pending_child = getattr(runner, "has_pending_replenishment_reaudit", None)
+                if callable(pending_child):
+                    try:
+                        if pending_child(child.id):
+                            return True
+                    except Exception:
+                        return True
+            return False
+        # An orphaned internal child is not harmless historical noise: it may
+        # still own a remote write or staging attempt whose root JSON was
+        # removed/corrupted. Keep the global barrier closed until it is
+        # terminal and explicitly linked to a surviving root.
+        child_terminal = {
+            "executed", "completed", "failed", "failed_archive",
+            "failed_identity", "failed_planning", "failed_provider",
+            "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+        }
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if not isinstance(root_id, str) or root_id not in root_ids or child.phase not in child_terminal:
+                return False
+        blocked_phases = {
+            "reconciling", "reconciliation_uncertain", "awaiting_target_shelf",
+            "target_policy_conflict", "queued", "analyzing", "archive_preprocessing",
+            "identity_matching", "planning", "planned", "executing", "verifying",
+            "cleaning", "retry_wait", "failed_cleanup",
+        }
+        terminal_failures = {
+            "failed", "failed_archive", "failed_identity", "failed_planning",
+            "failed_provider", "failed_write", "failed_verification",
+        }
+        for job in jobs:
+            if children_blocked(job.id):
+                return False
+            if job.phase in blocked_phases or job.phase in terminal_failures or job.phase == "cancelled":
+                return False
+            reconciliation = job.summary.get("reconciliation")
+            outcome = (
+                reconciliation.get("outcome")
+                if isinstance(reconciliation, Mapping) else None
+            )
+            if outcome == "existing_gap":
+                # An existing-gap source is not a formal write and therefore
+                # has no ordinary lifecycle receipt.  The only way it may
+                # leave the A→K blocker set is the narrow, task-owned empty
+                # source hold proof produced by the Engine runner.  Non-empty
+                # or ambiguous sources remain needs_attention and keep L
+                # closed; never infer completion from phase alone.
+                verifier = getattr(runner, "existing_gap_source_hold_verified", None)
+                if (
+                    job.phase != "completed"
+                    or not callable(verifier)
+                    or not verifier(job.id)
+                ):
+                    return False
+                continue
+            if self._is_audit_owned_root(job):
+                # Audit-owned roots are the local ledger produced by L (or a
+                # bounded scoped re-audit).  They have no formal-write
+                # lifecycle by design, so requiring ordinary writer evidence
+                # here would make the first full audit unable to open the
+                # downstream M gate.  Their provider/attempt state is still
+                # checked below and any active/in-doubt work remains a
+                # blocker.
+                if job.phase not in {"executed", "completed"}:
+                    return False
+                audit_owned_provider = job.summary.get("replenishment")
+                if isinstance(audit_owned_provider, Mapping):
+                    provider_status = str(
+                        audit_owned_provider.get("status") or ""
+                    ).casefold()
+                    if (
+                        audit_owned_provider.get("terminal") is not True
+                        or provider_status in _ORPHANED_PROVIDER_PROGRESS_PHASES
+                    ):
+                        return False
+                post_audit = job.summary.get("post_acquisition_reaudit")
+                if post_audit and (
+                    not isinstance(post_audit, Mapping)
+                    or str(post_audit.get("status") or "").casefold()
+                    not in {"cleaned", "completed", "resolved", "closed"}
+                ):
+                    return False
+                pending = getattr(runner, "has_pending_replenishment_reaudit", None)
+                if callable(pending):
+                    try:
+                        if pending(job.id):
+                            return False
+                    except Exception:
+                        return False
+                continue
+            if outcome == "duplicate_complete":
+                # Duplicate completion is a source-consumption fact, not a
+                # formal write.  It must pass the runner's path/identity/
+                # remote readback verifier in both reconciled and completed
+                # projections before it can satisfy the global barrier.
+                verifier = getattr(runner, "duplicate_complete_consumption_verified", None)
+                if job.phase != "completed" or not callable(verifier) or not verifier(job.id):
+                    return False
+            elif job.phase == "reconciled":
+                return False
+            elif job.phase in {"executed", "completed"}:
+                lifecycle = job.summary.get("lifecycle")
+                if not isinstance(lifecycle, Mapping):
+                    return False
+                formal_write = lifecycle.get("formal_write")
+                cleanup = lifecycle.get("cleanup")
+                if not (
+                    isinstance(formal_write, Mapping)
+                    and formal_write.get("status") == "verified"
+                    and isinstance(cleanup, Mapping)
+                    and cleanup.get("status") == "completed"
+                ):
+                    return False
+                audit = lifecycle.get("audit")
+                provider = lifecycle.get("provider")
+                if not (
+                    isinstance(audit, Mapping)
+                    and str(audit.get("status") or "").casefold()
+                    in {"trusted", "deferred", "skipped", "no_gap"}
+                    and isinstance(provider, Mapping)
+                    and str(provider.get("status") or "").casefold()
+                    in {"terminal", "completed", "resolved", "ready", "deferred", "skipped", "no_gap"}
+                ):
+                    return False
+            elif job.phase not in {"failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider", "failed_write", "failed_verification"}:
+                # Unknown/legacy phases are not evidence that A→K settled.
+                return False
+            replenishment = job.summary.get("replenishment")
+            if isinstance(replenishment, Mapping):
+                status = str(replenishment.get("status") or "").casefold()
+                if status and replenishment.get("terminal") is not True:
+                    return False
+                if status in _ORPHANED_PROVIDER_PROGRESS_PHASES:
+                    return False
+            post_audit = job.summary.get("post_acquisition_reaudit")
+            if post_audit:
+                if not isinstance(post_audit, Mapping) or str(
+                    post_audit.get("status") or ""
+                ).casefold() not in {"cleaned", "completed", "resolved", "closed"}:
+                    return False
+        with self._automatic_lock:
+            if any(not future.done() for future in self._provider_futures.values()):
+                return False
+            if any(
+                timer.is_alive()
+                for key, timer in self._scheduled_timers.items()
+            ):
+                return False
+        with self._audit_lock:
+            if any(
+                future is not None and not future.done()
+                for future in (self._audit_future, self._manual_audit_future)
+            ):
+                return False
+        return True
+
+    def _full_audit_ready_for_provider(self) -> bool:
+        """Return whether the next L-stage report-only audit may run.
+
+        ``_intake_is_settled`` is intentionally the strict public barrier: it
+        also waits for every Provider retry/future to finish.  That predicate
+        cannot be reused to *restart* a Provider lane, however, because a
+        persisted audit-owned root in ``retry_wait`` would make the next L
+        audit impossible forever.  This narrower pre-audit check ignores only
+        already-audited Provider retry state; it still blocks new/uncertain
+        intake, active children, in-doubt attempts, ordinary writes, and any
+        live Provider future.
+        """
+        # Preserve the strict fast path (and the small injected fakes used by
+        # tests).  The relaxed path below is entered only for an audit-owned
+        # Provider root that needs a fresh post-restart L pass.
+        if self._intake_is_settled():
+            return True
+        with self._automatic_lock:
+            if self._closed.is_set() or self._intake_status.get("last_scan_empty") is not True:
+                return False
+            if any(not future.done() for future in self._provider_futures.values()):
+                return False
+            if any(
+                timer.is_alive() and key[0] == "provider"
+                for key, timer in self._scheduled_timers.items()
+            ):
+                return False
+        try:
+            runner = self._get_engine_runner()
+            all_jobs = runner.list_jobs()
+        except Exception:
+            return False
+        jobs = all_jobs
+        children_by_root: dict[str, list[EngineJob]] = {}
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if isinstance(root_id, str) and root_id:
+                children_by_root.setdefault(root_id, []).append(child)
+
+        def children_blocked(root_id: str) -> bool:
+            terminal = {
+                "executed", "completed", "failed", "failed_archive",
+                "failed_identity", "failed_planning", "failed_provider",
+                "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+            }
+            pending_child = getattr(runner, "has_pending_replenishment_reaudit", None)
+            for child in children_by_root.get(root_id, []):
+                if child.phase not in terminal:
+                    return True
+                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+                child_provider = child_summary.get("replenishment")
+                if isinstance(child_provider, Mapping):
+                    child_status = str(child_provider.get("status") or "").casefold()
+                    if child_status in _ORPHANED_PROVIDER_PROGRESS_PHASES or (
+                        child_status and child_provider.get("terminal") is not True
+                    ):
+                        return True
+                if callable(pending_child):
+                    try:
+                        if pending_child(child.id):
+                            return True
+                    except Exception:
+                        return True
+            return False
+        root_ids = {job.id for job in jobs}
+        child_terminal = {
+            "executed", "completed", "failed", "failed_archive",
+            "failed_identity", "failed_planning", "failed_provider",
+            "failed_write", "failed_verification", "failed_cleanup", "cancelled",
+        }
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if not isinstance(root_id, str) or root_id not in root_ids or child.phase not in child_terminal:
+                return False
+        blocked_phases = {
+            "reconciling", "reconciliation_uncertain", "awaiting_target_shelf",
+            "target_policy_conflict", "queued", "analyzing", "archive_preprocessing",
+            "identity_matching", "planning", "planned", "executing", "verifying",
+            "cleaning", "failed_cleanup", "cancelled",
+        }
+        terminal_failures = {
+            "failed", "failed_archive", "failed_identity", "failed_planning",
+            "failed_provider", "failed_write", "failed_verification",
+        }
+        for job in jobs:
+            summary = job.summary if isinstance(job.summary, Mapping) else {}
+            if children_blocked(job.id):
+                return False
+            if self._is_internal_child(job):
+                # An internal child is an external-write owner even though it
+                # is hidden from the ordinary public inventory.
+                if job.phase not in {"executed", "completed", "failed", "cancelled"}:
+                    return False
+                continue
+            reconciliation = summary.get("reconciliation")
+            outcome = (
+                reconciliation.get("outcome")
+                if isinstance(reconciliation, Mapping) else None
+            )
+            if outcome == "existing_gap":
+                verifier = getattr(runner, "existing_gap_source_hold_verified", None)
+                if (
+                    job.phase != "completed"
+                    or not callable(verifier)
+                    or not verifier(job.id)
+                ):
+                    return False
+                continue
+            if self._is_audit_owned_root(job):
+                if job.phase in blocked_phases or job.phase in terminal_failures:
+                    return False
+                replenishment = summary.get("replenishment")
+                if isinstance(replenishment, Mapping):
+                    status = str(replenishment.get("status") or "").casefold()
+                    # retry_wait/failed/completed are safe to re-audit; an
+                    # in-doubt or active task is not safe to supersede.
+                    if status in _ORPHANED_PROVIDER_PROGRESS_PHASES or status in {
+                        "waiting_reconcile", "needs_attention", "in_doubt",
+                    }:
+                        return False
+                pending = getattr(runner, "has_pending_replenishment_reaudit", None)
+                if callable(pending):
+                    try:
+                        if pending(job.id):
+                            return False
+                    except Exception:
+                        return False
+                continue
+            if job.phase in blocked_phases or job.phase in terminal_failures or job.phase == "reconciled":
+                return False
+            # A duplicate source is admissible only through the strict
+            # verifier; every other ordinary terminal requires the formal
+            # lifecycle proof checked by _intake_is_settled().
+            reconciliation = summary.get("reconciliation")
+            outcome = reconciliation.get("outcome") if isinstance(reconciliation, Mapping) else None
+            if outcome == "duplicate_complete":
+                verifier = getattr(runner, "duplicate_complete_consumption_verified", None)
+                if job.phase != "completed" or not callable(verifier) or not verifier(job.id):
+                    return False
+                continue
+            if job.phase not in {"executed", "completed"}:
+                return False
+            lifecycle = summary.get("lifecycle")
+            if not isinstance(lifecycle, Mapping):
+                return False
+            formal_write = lifecycle.get("formal_write")
+            cleanup = lifecycle.get("cleanup")
+            if not (
+                isinstance(formal_write, Mapping)
+                and formal_write.get("status") == "verified"
+                and isinstance(cleanup, Mapping)
+                and cleanup.get("status") == "completed"
+            ):
+                return False
+            # The relaxed restart predicate may ignore only persisted
+            # audit-owned Provider retry state.  An ordinary root with a
+            # non-terminal Provider or post-acquisition marker is still an
+            # A→K blocker; otherwise stale JSON could open a fresh L/M epoch
+            # while old staging or an external task remains unresolved.
+            replenishment = summary.get("replenishment")
+            if isinstance(replenishment, Mapping):
+                provider_status = str(replenishment.get("status") or "").casefold()
+                if (
+                    provider_status in _ORPHANED_PROVIDER_PROGRESS_PHASES
+                    or provider_status in {
+                        "gap_discovering", "retry_wait", "waiting_reconcile",
+                        "needs_attention", "in_doubt",
+                    }
+                    or (provider_status and replenishment.get("terminal") is not True)
+                ):
+                    return False
+            post_audit = summary.get("post_acquisition_reaudit")
+            if post_audit and (
+                not isinstance(post_audit, Mapping)
+                or str(post_audit.get("status") or "").casefold()
+                not in {"cleaned", "completed", "resolved", "closed"}
+            ):
+                return False
+            pending = getattr(runner, "has_pending_replenishment_reaudit", None)
+            if callable(pending):
+                try:
+                    if pending(job.id):
+                        return False
+                except Exception:
+                    return False
+        with self._audit_lock:
+            if any(
+                future is not None and not future.done()
+                for future in (self._audit_future, self._manual_audit_future)
+            ):
+                return False
+        return True
+
+    def _restart_provider_retry_needs_fresh_full_audit(self) -> bool:
+        """Whether an explicit resume must refresh A before an old M retry.
+
+        A normal ``resume`` must not unexpectedly scan and schedule every
+        item under ``待刮削``: the monitor/API discovery path owns that work.
+        The one exception is a process-restarted, audit-owned Provider root in
+        ``retry_wait``.  Its former in-memory L→M admission cannot be trusted,
+        so it needs one new passive intake observation before the fresh
+        report-only full audit may admit the retry again.
+        """
+        try:
+            runner = self._get_engine_runner()
+            jobs = runner.list_jobs()
+        except Exception:
+            return False
+        for job in jobs:
+            if not self._is_audit_owned_root(job) or job.phase != "executed":
+                continue
+            replenishment = job.summary.get("replenishment")
+            if not isinstance(replenishment, Mapping):
+                continue
+            if (
+                str(replenishment.get("status") or "").casefold() == "retry_wait"
+                and replenishment.get("terminal") is not True
+            ):
+                return True
+        return False
+
+    def _refresh_intake_settlement(self) -> bool:
+        """Update the barrier projection and optionally queue report-only audit."""
+        settled = self._intake_is_settled()
+        # A restarted process may have an audit-owned root in persisted
+        # Provider retry_wait.  That downstream state is deliberately ignored
+        # by this pre-L predicate so one fresh report-only audit can re-open
+        # the in-memory M admission token.
+        audit_ready = settled or self._full_audit_ready_for_provider()
+        with self._automatic_lock:
+            admitted = self._provider_full_audit_admitted
+            barrier = self._intake_status.get("full_audit_barrier")
+            if settled:
+                if not (admitted and barrier == "completed"):
+                    self._intake_status.update({
+                        "settled": True,
+                        "full_audit_barrier": "ready",
+                    })
+                else:
+                    self._intake_status["settled"] = True
+            elif self._intake_status.get("last_scan_empty") is True:
+                if not (admitted and barrier == "completed"):
+                    self._intake_status.update({
+                        "settled": False,
+                        "full_audit_barrier": "waiting_for_jobs",
+                    })
+                else:
+                    # The provider lane is downstream of the already
+                    # completed full audit.  Its own active/retry state is
+                    # not a reason to revoke the epoch.
+                    self._intake_status["settled"] = False
+        if not settled:
+            with self._automatic_lock:
+                if self._provider_full_audit_admitted and self._intake_status.get(
+                    "full_audit_barrier"
+                ) == "completed":
+                    return True
+            if not audit_ready:
+                return False
+            self._queue_intake_settled_audit()
+            return True
+        with self._automatic_lock:
+            if self._provider_full_audit_admitted and self._intake_status.get(
+                "full_audit_barrier"
+            ) == "completed":
+                return True
+        self._queue_intake_settled_audit()
+        return True
+
+    def _queue_intake_settled_audit(self, *, delay: float = 0.0) -> None:
+        """Queue the L-stage report-only audit once the intake barrier is ready."""
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._audit_auto_repair_enabled()
+        ):
+            return
+        with self._automatic_lock:
+            if self._provider_full_audit_admitted and self._intake_status.get(
+                "full_audit_barrier"
+            ) == "completed":
+                return
+            if self._intake_audit_timer_armed:
+                return
+            self._provider_full_audit_admitted = False
+            self._intake_audit_timer_armed = True
+            self._intake_status["full_audit_barrier"] = "queued"
+
+        def reset_queued_barrier(*, settled: bool) -> None:
+            """Release a queued timer when its submission precondition changed."""
+            with self._automatic_lock:
+                self._intake_audit_timer_armed = False
+                if self._intake_status.get("full_audit_barrier") != "queued":
+                    return
+                self._intake_status["full_audit_barrier"] = (
+                    "ready"
+                    if settled
+                    else (
+                        "waiting_for_jobs"
+                        if self._intake_status.get("last_scan_empty") is True
+                        else "waiting_for_intake"
+                    )
+                )
+
+        def submit() -> None:
+            submitted = False
+            admission_epoch: int | None = None
+            try:
+                if self._closed.is_set() or self.control().get("paused") is True:
+                    reset_queued_barrier(settled=False)
+                    return
+                if not self._full_audit_ready_for_provider():
+                    reset_queued_barrier(settled=False)
+                    return
+                with self._automatic_lock:
+                    admission_epoch = self._provider_admission_epoch
+                with self._audit_lock:
+                    audit_busy = (
+                        (self._audit_future is not None and not self._audit_future.done())
+                        or (self._manual_audit_future is not None and not self._manual_audit_future.done())
+                    )
+                    if audit_busy:
+                        future = None
+                    else:
+                        future = self._audit_pool().submit(
+                            self._run_library_audit_background,
+                            project_gaps=False,
+                        )
+                        self._manual_audit_future = future
+                        submitted = True
+                if audit_busy:
+                    # Settlement was true immediately before the audit-lock
+                    # check; leave the barrier retryable instead of stranded
+                    # as ``queued`` when another audit won the race.
+                    reset_queued_barrier(settled=True)
+                    return
+
+                def clear(done: Future[object]) -> None:
+                    success = False
+                    report: Mapping[str, object] | None = None
+                    try:
+                        result = done.result()
+                        report = result.get("audit") if isinstance(result, Mapping) else None
+                        success = bool(
+                            isinstance(report, Mapping)
+                            and report.get("status") == "completed"
+                            and report.get("complete") is True
+                        )
+                    except Exception:
+                        success = False
+                    with self._audit_lock:
+                        if self._manual_audit_future is done:
+                            self._manual_audit_future = None
+                    admitted = False
+                    provider_owner_ids: tuple[str, ...] = ()
+                    if (
+                        success
+                        and isinstance(report, Mapping)
+                        and not self._closed.is_set()
+                        and self.control().get("paused") is not True
+                        and self._full_audit_ready_for_provider()
+                    ):
+                        # This L-stage scan is report-only with respect to
+                        # AList.  Project the report while the M token is still
+                        # closed; only after the projection succeeds do we
+                        # publish admission and dispatch the exact owners.
+                        # This prevents another thread from observing a green
+                        # L→M gate while ``_apply_audit_gaps`` is half done.
+                        try:
+                            projected = self._apply_audit_gaps(
+                                report,
+                                self._get_engine_runner(),
+                                dispatch_provider=False,
+                            )
+                            if isinstance(projected, (list, tuple)):
+                                provider_owner_ids = tuple(
+                                    owner_id for owner_id in projected
+                                    if isinstance(owner_id, str) and owner_id
+                                )
+                        except Exception:
+                            admitted = False
+                        else:
+                            with self._automatic_lock:
+                                if admission_epoch == self._provider_admission_epoch:
+                                    self._provider_full_audit_admitted = True
+                                    admitted = True
+                                    self._intake_status["full_audit_barrier"] = "completed"
+                            if admitted:
+                                for owner_id in provider_owner_ids:
+                                    self._queue_provider_job(owner_id)
+                    with self._automatic_lock:
+                        self._intake_audit_timer_armed = False
+                        if admission_epoch == self._provider_admission_epoch:
+                            self._provider_full_audit_admitted = admitted
+                            self._intake_status["full_audit_barrier"] = (
+                                "completed" if admitted else "failed"
+                            )
+
+                future.add_done_callback(clear)
+            finally:
+                # If submission was rejected before a Future existed, permit a
+                # later explicit resume/scan to retry the same barrier.
+                if not submitted:
+                    with self._automatic_lock:
+                        if self._intake_status.get("full_audit_barrier") == "queued":
+                            self._intake_audit_timer_armed = False
+                            self._intake_status["full_audit_barrier"] = (
+                                "waiting_for_jobs"
+                                if self._intake_status.get("last_scan_empty") is True
+                                else "waiting_for_intake"
+                            )
+
+        self._schedule_timer("audit", "intake-settled", delay, submit)
+
+    def _provider_submission_admitted(self, expected_epoch: int | None = None) -> bool:
+        """Whether a new Provider future may cross the L→M admission gate."""
+        with self._automatic_lock:
+            return bool(
+                self._provider_full_audit_admitted
+                and (
+                    expected_epoch is None
+                    or expected_epoch == self._provider_admission_epoch
+                )
+            )
+
+    def _defer_provider_dispatch(self, job_id: str, *, reason: str) -> None:
+        """Persist a visible retry_wait when a queued Provider is gate-deferred."""
+        try:
+            runner = self._get_engine_runner()
+            # This projection races child completion and terminal cleanup.
+            # Re-read and write under the Engine's same worker lock so a stale
+            # gate callback cannot resurrect a completed/deleted root.
+            with runner.worker_lock():
+                current = runner.get_job(job_id)
+                if self._is_internal_child(current) or current.phase != "executed":
+                    return
+                summary = dict(current.summary)
+                prior = summary.get("replenishment")
+                replenishment = dict(prior) if isinstance(prior, Mapping) else {}
+                if replenishment.get("terminal") is True:
+                    return
+                replenishment.update({
+                    "status": "retry_wait",
+                    "terminal": False,
+                    "next_retry_seconds": None,
+                    "dispatch_deferred": True,
+                    "dispatch_deferred_reason": redact_error(reason),
+                    "updated_at": _now(),
+                })
+                summary["replenishment"] = replenishment
+                summary["automatic_stage"] = "retry_wait"
+                summary["next_retry_seconds"] = None
+                atomic_write_json(
+                    runner.jobs_root / f"{job_id}.json",
+                    _redacted_job_payload(replace(current, summary=summary, updated_at=_now())),
+                    allow_nan=False,
+                )
+        except Exception:
+            # The original durable gap remains visible if local state itself
+            # cannot be updated; never turn this fallback into a new retry.
+            return
 
     def _intake_monitor_loop(self) -> None:
         while not self._intake_stop.is_set():
@@ -617,14 +1362,22 @@ class SimpleApplication:
                 self._scan_inbound_once()
             except Exception:
                 # A transient AList/TMDB problem is handled by the ordinary
-                # job retry paths once a source is queued.  Before that, the
-                # monitor simply tries again on the next read-only poll.
+                # job retry paths once a source is queued.  Until a fresh
+                # listing succeeds, the previous empty-intake observation is
+                # no longer evidence: fail closed and revoke the old L→M
+                # admission epoch so a queued Provider cannot continue under
+                # an unverified intake state.
                 with self._automatic_lock:
+                    self._provider_full_audit_admitted = False
+                    self._provider_admission_epoch += 1
                     self._intake_status.update({
                         "last_scan_at": _now(),
                         "last_error": "待刮削目录暂时不可读取，将自动重试",
                         "last_scheduled_count": 0,
                         "last_registered_count": 0,
+                        "last_scan_empty": False,
+                        "settled": False,
+                        "full_audit_barrier": "waiting_for_intake",
                     })
             self._intake_wake.wait(self._intake_scan_seconds())
             self._intake_wake.clear()
@@ -632,10 +1385,16 @@ class SimpleApplication:
     def _get_engine_runner(self) -> SimpleEngineRunner:
         runner = self._engine_runner
         if runner is not None:
+            bind_pause = getattr(runner, "set_pause_requested", None)
+            if callable(bind_pause):
+                bind_pause(self._pause_requested)
             return runner
         with self._engine_runner_lock:
             runner = self._engine_runner
             if runner is not None:
+                bind_pause = getattr(runner, "set_pause_requested", None)
+                if callable(bind_pause):
+                    bind_pause(self._pause_requested)
                 return runner
             password = os.getenv("ALIST_PASSWORD", "").strip()
             tmdb_key = os.getenv("TMDB_API_KEY", "").strip()
@@ -669,7 +1428,17 @@ class SimpleApplication:
                 archive_preprocessor=self._archive_preprocessor,
             )
             self._engine_runner = runner
+            bind_pause = getattr(runner, "set_pause_requested", None)
+            if callable(bind_pause):
+                bind_pause(self._pause_requested)
             return runner
+
+    def _pause_requested(self) -> bool:
+        """Fail closed unless this process is explicitly and currently resumed."""
+        try:
+            return self.control().get("paused") is not False
+        except Exception:
+            return True
 
     def _automatic_pool(self) -> ThreadPoolExecutor:
         with self._automatic_lock:
@@ -786,8 +1555,162 @@ class SimpleApplication:
 
             timer = threading.Timer(float(delay), fire)
             timer.daemon = True
+            # Registration and start stay in the same projection lock as the
+            # replacement/removal above.  Otherwise a terminal cleanup could
+            # observe no timer, delete the job, and then have this stale timer
+            # dispatch it after the lock is released.
             self._scheduled_timers[key] = timer
             timer.start()
+
+    @staticmethod
+    def _consume_duplicate_source(
+        consumer: Callable[..., object],
+        job_id: str,
+        pause_checker: Callable[[], bool],
+    ) -> object:
+        """Call a duplicate consumer without replaying an internal TypeError.
+
+        A few focused test doubles still expose the historical one-argument
+        hook.  Determine that contract before invocation; catching a
+        TypeError *from* the call could replay a remote move after the helper
+        itself had already mutated AList.
+        """
+        try:
+            signature = inspect.signature(consumer)
+        except (TypeError, ValueError):
+            # An opaque callable is treated as the new contract.  If it does
+            # not accept the keyword, the error is surfaced once and is never
+            # retried with a second remote invocation.
+            return consumer(job_id, pause_requested=pause_checker)
+        parameters = signature.parameters.values()
+        accepts_keyword = (
+            "pause_requested" in signature.parameters
+            or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        )
+        if accepts_keyword:
+            return consumer(job_id, pause_requested=pause_checker)
+        return consumer(job_id)
+
+    @staticmethod
+    def _hold_existing_gap_source(
+        holder: Callable[..., object],
+        job_id: str,
+        pause_checker: Callable[[], bool],
+    ) -> object:
+        """Invoke the narrow E hand-off without replaying remote mutations."""
+        try:
+            signature = inspect.signature(holder)
+        except (TypeError, ValueError):
+            return holder(job_id, pause_requested=pause_checker)
+        parameters = signature.parameters.values()
+        accepts_keyword = (
+            "pause_requested" in signature.parameters
+            or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        )
+        if accepts_keyword:
+            return holder(job_id, pause_requested=pause_checker)
+        return holder(job_id)
+
+    @staticmethod
+    def _existing_gap_holder_retryable(job: EngineJob) -> bool:
+        """Return whether this is the narrow E-source hand-off/recovery lane.
+
+        This deliberately sits ahead of ordinary ``failed_cleanup`` and
+        identity retry handling.  ``existing_gap`` has neither a formal write
+        nor a normal lifecycle finalizer: a prepared empty-source hold must
+        only ever re-enter the same ownership-checked holder.
+        """
+        summary = job.summary if isinstance(job.summary, Mapping) else {}
+        reconciliation = summary.get("reconciliation")
+        if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "existing_gap":
+            return False
+        if job.phase == "reconciled":
+            return True
+        if job.phase not in {"reconciliation_uncertain", "failed_cleanup"}:
+            return False
+        marker = summary.get("existing_gap_registration")
+        return (
+            isinstance(marker, Mapping)
+            and str(marker.get("status") or "").casefold()
+            in {
+                "blocked_nonempty_source",
+                "blocked_source_not_directory",
+                "failed",
+                "hold_prepared",
+            }
+        )
+
+    def _record_existing_gap_hold_failure(
+        self,
+        job_id: str,
+        error: Exception,
+    ) -> None:
+        """Keep an E-side hand-off retryable without entering writer cleanup.
+
+        The generic cleanup retry is reserved for jobs with an already
+        verified formal write.  An ``existing_gap`` hold has no such write;
+        especially after ``hold_prepared`` it may be recovering the one AList
+        move itself.  Preserve that exact receipt and expose a needs-attention
+        state so `/retry {}` or an explicit post-restart resume can invoke the
+        same holder, never ``finalize_automatic_lifecycle``.
+        """
+        try:
+            runner = self._get_engine_runner()
+            with runner.worker_lock():
+                job = runner.get_job(job_id)
+                if not self._existing_gap_holder_retryable(job):
+                    return
+                cancelled = runner._consume_cancel_request(job)  # noqa: SLF001 - fenced local transition
+                if cancelled is not None:
+                    self._cancel_job_timers(job_id)
+                    return
+                summary = dict(job.summary)
+                marker_raw = summary.get("existing_gap_registration")
+                marker = dict(marker_raw) if isinstance(marker_raw, Mapping) else {}
+                if str(marker.get("status") or "").casefold() == "hold_prepared":
+                    # Keep the pre-move receipt intact: it is the only safe
+                    # evidence that can recover source-missing/target-empty
+                    # after a process or AList boundary interruption.
+                    marker["last_error"] = redact_error(error)
+                    marker["last_failed_at"] = _now()
+                else:
+                    marker.update({
+                        "status": "failed",
+                        "reason": redact_error(error),
+                        "updated_at": _now(),
+                    })
+                reconciliation_raw = summary.get("reconciliation")
+                if isinstance(reconciliation_raw, Mapping):
+                    reconciliation = dict(reconciliation_raw)
+                    reconciliation["status"] = "needs_attention"
+                    reconciliation["registration_status"] = "failed"
+                    summary["reconciliation"] = reconciliation
+                summary["existing_gap_registration"] = marker
+                summary["source_fate"] = (
+                    "hold_prepared"
+                    if str(marker.get("status") or "").casefold() == "hold_prepared"
+                    else "retained_needs_attention"
+                )
+                summary["automatic_stage"] = "existing_gap_registration_failed"
+                summary["automatic_terminal"] = True
+                summary["next_retry_seconds"] = None
+                summary.pop("cleanup_only_retry", None)
+                updated = replace(
+                    job,
+                    phase="reconciliation_uncertain",
+                    summary=summary,
+                    updated_at=_now(),
+                    error=redact_error(error),
+                )
+                atomic_write_json(
+                    runner.jobs_root / f"{job_id}.json",
+                    _redacted_job_payload(updated),
+                    allow_nan=False,
+                )
+        except (EngineJobNotFoundError, EngineWorkerBusyError):
+            return
+        finally:
+            self._cancel_job_timers(job_id)
 
     @staticmethod
     def _automatic_retry_limit() -> int:
@@ -922,15 +1845,25 @@ class SimpleApplication:
         """Return whether an already-running provider root must stop safely.
 
         The runtime invokes this only at cooperative boundaries, never in the
-        middle of an external operation.  Any unreadable/malformed control or
-        pilot state fails closed so a live worker cannot outrun an operator
-        pause or accidentally widen a bounded rollout.
+        middle of an external operation.  Global pause is deliberately *not*
+        returned here: it has its own ``pause_requested`` predicate so a
+        paused child remains resumable instead of being converted to a
+        terminal/cancelled provider attempt.  Any unreadable/malformed pilot
+        state still fails closed so a live worker cannot widen a bounded
+        rollout.
         """
         try:
-            control = self.control()
-            if self._closed.is_set() or control.get("paused") is not False:
+            if self._closed.is_set():
                 return True
             return not self._provider_job_allowed(job)
+        except Exception:
+            return True
+
+    def _provider_runtime_pause_requested(self, job: EngineJob) -> bool:
+        """Expose only the global pause fence to provider child Engine writes."""
+        del job
+        try:
+            return self.control().get("paused") is not False
         except Exception:
             return True
 
@@ -1018,6 +1951,18 @@ class SimpleApplication:
         """
         if cls._is_audit_owned_root(job):
             return True
+        reconciliation = (
+            job.summary.get("reconciliation")
+            if isinstance(job.summary, Mapping)
+            and isinstance(job.summary.get("reconciliation"), Mapping)
+            else {}
+        )
+        # ``merge_existing`` has no user-selected shelf.  Its authoritative
+        # shelf/work root was established by the read-only reconciliation
+        # result and the runner revalidates it at the planner/write boundary.
+        # Do not force this existing work back through the ``new_work`` gate.
+        if reconciliation.get("outcome") == "merge_existing":
+            return job.summary.get("merge_existing_ready") is True
         return (
             isinstance(job.target_shelf, str)
             and bool(job.target_shelf)
@@ -1453,24 +2398,34 @@ class SimpleApplication:
 
     def _queue_automatic_job(self, job_id: str, *, delay: float = 0.0) -> None:
         """Run one persisted plan from the automatic scheduler."""
-        if self._closed.is_set() or self.control().get("paused") is True:
+        if self._closed.is_set():
             return
         try:
             queued_job = self._get_engine_runner().get_job(job_id)
         except (EngineJobNotFoundError, SimpleEngineError):
             return
         read_only_reconciliation = queued_job.phase == "reconciling"
+        if not read_only_reconciliation and self.control().get("paused") is True:
+            return
         if not read_only_reconciliation and not self._ordinary_job_has_confirmed_selection(queued_job):
             return
 
         def submit() -> None:
+            if self._closed.is_set():
+                return
+            try:
+                current = self._get_engine_runner().get_job(job_id)
+            except (EngineJobNotFoundError, SimpleEngineError):
+                return
+            # Re-read the durable phase immediately before dispatch.  A
+            # reconciliation timer can outlive its read-only phase; it must
+            # never use that old snapshot to bypass a newly effective pause.
+            current_is_read_only = current.phase == "reconciling"
+            if not current_is_read_only and self.control().get("paused") is True:
+                return
             if (
-                self._closed.is_set()
-                or self.control().get("paused") is True
-                or (
-                    not read_only_reconciliation
-                    and self._provider_worker_configuration()["valid"] is not True
-                )
+                not current_is_read_only
+                and self._provider_worker_configuration()["valid"] is not True
             ):
                 return
             with self._automatic_lock:
@@ -1803,20 +2758,104 @@ class SimpleApplication:
 
     def _run_automatic_job(self, job_id: str) -> None:
         """Reconcile first, then execute only the still-missing plan work."""
-        if self.control().get("paused") is True:
-            return
         try:
             runner = self._get_engine_runner()
             job = runner.get_job(job_id)
             if self._is_internal_child(job):
                 return
+            # Pause blocks the next external side effect, not the bounded
+            # read-only reconciliation that can only update this task's local
+            # state. Every later phase remains behind the ordinary pause gate.
+            if job.phase != "reconciling" and self.control().get("paused") is True:
+                return
             if job.phase == "reconciling":
                 # The runner's reconciliation boundary is strictly read-only
                 # with respect to AList/formal media. It only persists the
-                # bounded local outcome and never falls through to planning,
-                # the writer, cleanup, or Provider scheduling.
-                runner.reconcile_automatic_job(job_id)
-                return
+                # bounded local outcome. Only the explicit, already-matched
+                # ``merge_existing`` hand-off below may continue into the
+                # ordinary planner/writer lane.
+                reconciled = runner.reconcile_automatic_job(job_id)
+                # Reconciliation may take long enough for an operator to
+                # pause. Its durable five-way result is safe to retain, but
+                # no hand-off (including the existing-gap audit) may begin
+                # after that boundary.
+                if self.control().get("paused") is True:
+                    return
+                reconciliation = (
+                    reconciled.summary.get("reconciliation")
+                    if isinstance(reconciled.summary, Mapping)
+                    and isinstance(reconciled.summary.get("reconciliation"), Mapping)
+                    else {}
+                )
+                outcome = reconciliation.get("outcome")
+                if outcome == "existing_gap":
+                    # E is a source-registration boundary, not a Provider
+                    # bypass.  Move only a freshly-proven *empty* intake
+                    # directory into its task-owned hold lane; non-empty
+                    # sources remain in /待刮削 and become needs_attention.
+                    hold = getattr(runner, "hold_existing_gap_source", None)
+                    if callable(hold):
+                        try:
+                            self._hold_existing_gap_source(
+                                hold, job_id, self._pause_requested,
+                            )
+                        except (EnginePauseRequested, EngineCancellationRequested):
+                            return
+                        except EngineWorkerBusyError:
+                            raise
+                        except Exception as exc:
+                            self._record_existing_gap_hold_failure(job_id, exc)
+                        finally:
+                            # A successful empty-source hold is itself the E
+                            # hand-off.  Refresh immediately so the next L
+                            # gate does not depend on a monitor heartbeat.
+                            self._refresh_intake_settlement()
+                    return
+                if outcome == "duplicate_complete":
+                    # A complete duplicate has no formal-write fact, so it
+                    # must not enter the ordinary lifecycle finalizer.  Use
+                    # the runner's narrow, task-owned source-consumption gate
+                    # and leave the reconciliation evidence visible locally.
+                    consume = getattr(runner, "consume_duplicate_complete_source", None)
+                    if callable(consume):
+                        try:
+                            self._consume_duplicate_source(
+                                consume, job_id, self._pause_requested,
+                            )
+                        except EngineWorkerBusyError:
+                            raise
+                        except (EnginePauseRequested, EngineCancellationRequested):
+                            # Pause/cancel is a resumable boundary, not a
+                            # provider/cleanup failure.  Leave the durable
+                            # reconciliation record untouched for the next
+                            # explicit resume or operator retry.
+                            return
+                        except Exception as exc:
+                            # The runner persists failed_cleanup for a real
+                            # remote ambiguity. Keep this lane retryable and
+                            # never route it through ordinary planning/writing.
+                            self._record_automatic_retry(job_id, exc, stage="cleanup")
+                            return
+                    self._refresh_intake_settlement()
+                    return
+                if outcome != "merge_existing":
+                    # ``new_work`` waits for an explicit shelf; the remaining
+                    # outcomes never become an ordinary write from this
+                    # scheduler branch.
+                    return
+                prepare = getattr(runner, "prepare_reconciled_merge_job", None)
+                if not callable(prepare):
+                    raise EngineJobConflictError(
+                        "当前 Engine 缺少既有作品合并接线入口"
+                    )
+                job = prepare(job_id)
+                # Reconciliation can be slow and is read-only. Before its
+                # local hand-off starts the next potentially effectful Engine
+                # stage, honor a pause race after the local transition too.
+                if (
+                    self.control().get("paused") is True
+                ):
+                    return
             if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
                 return
             # A pre-gate legacy record must never become a formal operation
@@ -1848,11 +2887,11 @@ class SimpleApplication:
                 try:
                     with self._automatic_lock:
                         retry_password = self._retry_archive_passwords.get(job_id)
-                    job = (
-                        runner.plan_automatic_job(job_id, retry_password=retry_password)
-                        if retry_password is not None
-                        else runner.plan_automatic_job(job_id)
-                    )
+                        job = (
+                            runner.plan_automatic_job(job_id, retry_password=retry_password)
+                            if retry_password is not None
+                            else runner.plan_automatic_job(job_id)
+                        )
                     if retry_password is not None:
                         with self._automatic_lock:
                             # Consume only after the planner persisted its
@@ -1889,6 +2928,10 @@ class SimpleApplication:
             if job.phase not in {"planned", "retry_wait", "failed", "failed_write", "failed_verification"}:
                 return
             done = runner.execute_automatic(job_id)
+            if done.phase in {"executing", "archive_preprocessing", "identity_matching", "planning"}:
+                # Pause preserves an in-flight durable operation for recovery;
+                # do not sync/settle or schedule another side effect here.
+                return
             done = self._sync_replenishment_child(done)
             if self._settle_disabled_automatic_lifecycle(done):
                 return
@@ -1921,9 +2964,81 @@ class SimpleApplication:
                 if self._is_internal_child(job):
                     continue
                 if job.phase == "reconciling":
-                    if not paused:
-                        self._queue_automatic_job(job.id)
+                    # Reconciliation is a bounded read-only phase and may
+                    # still establish a user-visible five-way result while
+                    # this process remains effectively paused. Its scheduler
+                    # branch stops before every later side effect.
+                    self._queue_automatic_job(job.id)
                     continue
+                if self._existing_gap_holder_retryable(job):
+                    if paused:
+                        continue
+                    hold = getattr(runner, "hold_existing_gap_source", None)
+                    if callable(hold):
+                        try:
+                            self._hold_existing_gap_source(
+                                hold, job.id, self._pause_requested,
+                            )
+                        except (EnginePauseRequested, EngineCancellationRequested):
+                            continue
+                        except EngineWorkerBusyError:
+                            continue
+                        except Exception as exc:
+                            self._record_existing_gap_hold_failure(job.id, exc)
+                        finally:
+                            self._refresh_intake_settlement()
+                    continue
+                if job.phase == "reconciled":
+                    reconciliation = (
+                        job.summary.get("reconciliation")
+                        if isinstance(job.summary, Mapping)
+                        and isinstance(job.summary.get("reconciliation"), Mapping)
+                        else {}
+                    )
+                    outcome = reconciliation.get("outcome")
+                    if paused:
+                        continue
+                    if outcome == "duplicate_complete":
+                        consume = getattr(runner, "consume_duplicate_complete_source", None)
+                        if callable(consume):
+                            try:
+                                self._consume_duplicate_source(
+                                    consume, job.id, self._pause_requested,
+                                )
+                            except EngineWorkerBusyError:
+                                continue
+                            except (EnginePauseRequested, EngineCancellationRequested):
+                                continue
+                            except Exception as exc:
+                                self._record_automatic_retry(job.id, exc, stage="cleanup")
+                                continue
+                        self._refresh_intake_settlement()
+                        continue
+                    if outcome == "merge_existing":
+                        prepare = getattr(runner, "prepare_reconciled_merge_job", None)
+                        if callable(prepare):
+                            try:
+                                prepared = prepare(job.id)
+                            except Exception:
+                                continue
+                            self._queue_automatic_job(prepared.id)
+                        continue
+                    if outcome == "existing_gap":
+                        hold = getattr(runner, "hold_existing_gap_source", None)
+                        if callable(hold):
+                            try:
+                                self._hold_existing_gap_source(
+                                    hold, job.id, self._pause_requested,
+                                )
+                            except (EnginePauseRequested, EngineCancellationRequested):
+                                continue
+                            except EngineWorkerBusyError:
+                                continue
+                            except Exception as exc:
+                                self._record_existing_gap_hold_failure(job.id, exc)
+                            finally:
+                                self._refresh_intake_settlement()
+                        continue
                 if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
                     continue
                 if not self._ordinary_job_has_confirmed_selection(job):
@@ -2042,6 +3157,7 @@ class SimpleApplication:
                 staging_root=replenishment_staging,
                 progress=self._record_replenishment_progress,
                 cancel_requested=self._provider_runtime_cancel_requested,
+                pause_requested=self._provider_runtime_pause_requested,
             )
             self._automatic_replenishment = runtime
             return runtime
@@ -2054,6 +3170,13 @@ class SimpleApplication:
             or self._provider_worker_configuration()["valid"] is not True
         ):
             return
+        # A delayed timer belongs to the audit epoch that armed it. Capture
+        # that epoch now instead of allowing a later re-opened boolean token
+        # to authorize an old retry after a new intake cycle.
+        with self._automatic_lock:
+            if not self._provider_full_audit_admitted:
+                return
+            queue_epoch = self._provider_admission_epoch
 
         # A fresh full-library audit may rediscover the same gap while its
         # provider future is acquiring or verifying a candidate. Do not
@@ -2097,6 +3220,8 @@ class SimpleApplication:
                         self._closed.is_set()
                         or self.control().get("paused") is True
                         or not self._provider_auto_repair_enabled()
+                        or not self._provider_full_audit_admitted
+                        or self._provider_admission_epoch != queue_epoch
                     ):
                         return
                     existing = self._provider_futures.get(job_id)
@@ -2146,21 +3271,58 @@ class SimpleApplication:
                 or self._provider_worker_configuration()["valid"] is not True
             ):
                 return
+            # The timer may fire after a new intake object revoked the L→M
+            # epoch.  This callback owns the durable ``gap_discovering``
+            # projection written above; close it visibly instead of leaving a
+            # root looking active with no future behind it.  Pause/config
+            # exits remain resumable and are deliberately not rewritten here.
+            if not self._provider_submission_admitted(queue_epoch):
+                self._defer_provider_dispatch(
+                    job_id,
+                    reason="新的入站使全库补源门禁失效，等待下一次只读复核",
+                )
+                return
+            defer_after_lock = False
             with self._automatic_lock:
                 # The pilot environment can change while a delayed retry is
                 # waiting. Re-read the persisted root immediately before
                 # submitting so a stale timer cannot widen the rollout.
-                try:
-                    current = self._get_engine_runner().get_job(job_id)
-                except Exception:
-                    return
-                if self._is_internal_child(current) or not self._provider_job_allowed(current):
-                    return
-                existing = self._provider_futures.get(job_id)
-                if existing is not None and not existing.done():
-                    return
-                self._provider_futures[job_id] = self._provider_pool().submit(
-                    self._run_automatic_replenishment, job_id,
+                if (
+                    not self._provider_full_audit_admitted
+                    or self._provider_admission_epoch != queue_epoch
+                ):
+                    defer_after_lock = True
+                else:
+                    try:
+                        current = self._get_engine_runner().get_job(job_id)
+                    except Exception:
+                        return
+                    if self._is_internal_child(current) or not self._provider_job_allowed(current):
+                        return
+                    existing = self._provider_futures.get(job_id)
+                    if existing is not None and not existing.done():
+                        return
+                    # Capture the exact L admission epoch with the grant.
+                    # A later intake may revoke/reopen the boolean token before
+                    # this Future starts; the worker must not inherit that new
+                    # epoch's permission.
+                    expected_epoch = queue_epoch
+                    self._provider_submission_grants[job_id] = queue_epoch
+                    try:
+                        # Keep the callable's one-argument shape for injected
+                        # worker fakes; the captured epoch lives in the grant
+                        # map and is consumed atomically by the worker.
+                        future = self._provider_pool().submit(
+                            self._run_automatic_replenishment, job_id,
+                        )
+                    except Exception:
+                        self._provider_submission_grants.pop(job_id, None)
+                        raise
+                    self._provider_futures[job_id] = future
+            if defer_after_lock:
+                self._defer_provider_dispatch(
+                    job_id,
+                    reason="新的入站使全库补源门禁失效，等待下一次只读复核",
                 )
 
         self._schedule_timer("provider", job_id, delay, submit)
@@ -2327,11 +3489,24 @@ class SimpleApplication:
                 return False
         return terminal_rows > 0
 
-    def _run_automatic_replenishment(self, job_id: str) -> None:
+    def _run_automatic_replenishment(
+        self,
+        job_id: str,
+        expected_epoch: int | None = None,
+    ) -> None:
         # A resume can submit more futures than the provider worker count. A
         # queued future may therefore start after a pause or after the pilot
         # selector changes; re-check both immediately before doing any provider
         # work so the global pause remains a real dispatch boundary.
+        with self._automatic_lock:
+            granted_epoch = self._provider_submission_grants.pop(job_id, None)
+        # Direct unit/operator calls have no executor grant and retain the
+        # historical bool-only gate. Real Futures always carry their captured
+        # epoch as the explicit argument; prefer that value over the map only
+        # when one was supplied by the submitter.
+        if expected_epoch is None:
+            expected_epoch = granted_epoch
+        submitted_before_gate = granted_epoch is not None or expected_epoch is not None
         self._provider_pilot_tmdb()
         if (
             self._closed.is_set()
@@ -2339,6 +3514,13 @@ class SimpleApplication:
             or not self._provider_auto_repair_enabled()
             or self._provider_worker_configuration()["valid"] is not True
         ):
+            return
+        if not self._provider_submission_admitted(expected_epoch):
+            if submitted_before_gate:
+                self._defer_provider_dispatch(
+                    job_id,
+                    reason="全库门禁在 Provider worker 开始前关闭，等待下一次成功只读审计",
+                )
             return
         try:
             runner = self._get_engine_runner()
@@ -2379,6 +3561,13 @@ class SimpleApplication:
                 or self.control().get("paused") is True
                 or self._provider_worker_configuration()["valid"] is not True
             ):
+                return
+            if not self._provider_submission_admitted(expected_epoch):
+                if submitted_before_gate:
+                    self._defer_provider_dispatch(
+                        job_id,
+                        reason="全库门禁在 Provider 调用前关闭，等待下一次成功只读审计",
+                    )
                 return
             if not self._provider_job_allowed(job):
                 return
@@ -2651,12 +3840,23 @@ class SimpleApplication:
         rerun_if_busy: bool = False,
     ) -> None:
         """Coalesce a bounded audit to the affected work roots."""
+        formal_roots = tuple(
+            f"{self.remote_root.rstrip('/')}/{category}"
+            for category in ("电影", "番剧", "美剧")
+        )
         normalized: set[str] = set()
         for raw in target_roots:
             if not isinstance(raw, str) or not raw.startswith("/"):
                 continue
             value = posixpath.normpath(raw)
-            if value != "/" and all(part not in {"", ".", ".."} for part in value.split("/")[1:]):
+            if (
+                value != "/"
+                and all(part not in {"", ".", ".."} for part in value.split("/")[1:])
+                and any(
+                    value == root or value.startswith(root.rstrip("/") + "/")
+                    for root in formal_roots
+                )
+            ):
                 normalized.add(value)
         if not normalized:
             # Scope is mandatory for automatic audit/repair.  An empty or
@@ -2789,6 +3989,32 @@ class SimpleApplication:
             identity.get("media_type") or metadata.get("media_type")
             or job.plan.get("mode") or summary.get("mode") or ""
         ).casefold()
+        # A fresh existing-work reconciliation keeps its authoritative proof
+        # under ``summary.reconciliation`` until the existing-gap audit or
+        # merge hand-off completes.  Let the bounded audit coordinator reuse
+        # that proof for legacy/partially projected records without creating
+        # a second identity path or widening the scan scope.
+        reconciliation = (
+            summary.get("reconciliation")
+            if isinstance(summary.get("reconciliation"), Mapping)
+            else {}
+        )
+        if reconciliation.get("outcome") in {"merge_existing", "existing_gap"}:
+            reconciled_identity = (
+                reconciliation.get("identity")
+                if isinstance(reconciliation.get("identity"), Mapping)
+                else {}
+            )
+            matched_work = (
+                reconciliation.get("matched_formal_work")
+                if isinstance(reconciliation.get("matched_formal_work"), Mapping)
+                else {}
+            )
+            tmdb = tmdb or reconciled_identity.get("tmdb_id")
+            target = target or matched_work.get("target_root")
+            media_type = str(
+                media_type or reconciled_identity.get("media_type") or ""
+            ).casefold()
         return tmdb, target, media_type
 
     @classmethod
@@ -2905,7 +4131,8 @@ class SimpleApplication:
         runner: SimpleEngineRunner | None,
         *,
         scope_roots: Sequence[str] | None = None,
-    ) -> None:
+        dispatch_provider: bool = True,
+    ) -> tuple[str, ...]:
         """Attach fresh semantic gaps to their owning automatic jobs.
 
         The audit is read-only with respect to AList.  Updating a JSON job
@@ -2914,7 +4141,7 @@ class SimpleApplication:
         any remote write.
         """
         if runner is None:
-            return
+            return ()
         semantic = report.get("semantic") if isinstance(report.get("semantic"), Mapping) else {}
         raw_gaps = semantic.get("gaps") if isinstance(semantic, Mapping) else []
         raw_unknowns = semantic.get("unknowns") if isinstance(semantic, Mapping) else []
@@ -3444,7 +4671,7 @@ class SimpleApplication:
         # A paused control plane may persist the owner/projection but must not
         # even submit a provider future.  Resume/startup will perform the
         # bounded dispatch once the operator opens the lane.
-        if self.control().get("paused") is not True:
+        if dispatch_provider and self.control().get("paused") is not True:
             for job_id in dict.fromkeys(provider_gap_owners.values()):
                 self._queue_provider_job(job_id)
         if audit_retry_needed or post_acquisition_cleanup_retry_needed:
@@ -3455,6 +4682,7 @@ class SimpleApplication:
                 self._queue_scoped_library_audit(scope_roots, delay=30.0)
             else:
                 self._queue_library_audit(delay=30.0)
+        return tuple(dict.fromkeys(provider_gap_owners.values()))
 
     def _validate_automatic_source(self, source: str) -> str:
         normalized = source.strip().rstrip("/")
@@ -3495,7 +4723,7 @@ class SimpleApplication:
         if not callable(create):
             raise EngineRequestError("Engine 缺少待处理任务登记入口")
         created = create(normalized_source)
-        if created.phase == "reconciling" and self.control().get("paused") is not True:
+        if created.phase == "reconciling":
             self._queue_automatic_job(created.id)
         return created
 
@@ -3651,7 +4879,14 @@ class SimpleApplication:
             f"{self.remote_root.rstrip('/')}/{category}"
             for category in ("电影", "番剧", "美剧")
         )
-        roots = tuple(scope_roots) if scope_roots else all_roots
+        # Keep the authoritative shelf roots separate from the bounded work
+        # scope.  Passing a concrete TV work root as ``formal_roots`` would
+        # make the audit's fallback shelf classifier treat its leaf as a
+        # movie (especially when it is the only root).  The existing audit
+        # scanner now traverses ``scope_roots`` while retaining these three
+        # roots for identity/type and containment decisions.
+        roots = all_roots
+        bounded_scope = tuple(scope_roots) if scope_roots else None
         runner: SimpleEngineRunner | None = None
         jobs: list[EngineJob] = []
         if self._engine_runner is not None or self.engine_configured:
@@ -3687,6 +4922,7 @@ class SimpleApplication:
                 jobs,
                 tmdb_client=runner.tmdb,
                 formal_roots=roots,
+                scope_roots=bounded_scope,
                 required_subtitle_language=required_subtitle_language,
                 subtitle_checker=subtitle_checker,
             )
@@ -3695,6 +4931,7 @@ class SimpleApplication:
                 self._alist_client,
                 self.state_root,
                 formal_roots=roots,
+                scope_roots=bounded_scope,
                 required_subtitle_language=required_subtitle_language,
                 subtitle_checker=subtitle_checker,
             )
@@ -3841,12 +5078,96 @@ class SimpleApplication:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         if not isinstance(payload, Mapping):
             raise EngineRequestError("重试请求必须是 JSON 对象")
+        # duplicate_complete cleanup has no target-shelf or formal-write
+        # selection.  Handle its narrow failed-cleanup lane before the
+        # ordinary selection gates; an empty request only re-enters the same
+        # task-owned source consumer, never the planner or writer.
+        duplicate_reconciliation = (
+            engine_job.summary.get("reconciliation")
+            if isinstance(engine_job.summary, Mapping)
+            and isinstance(engine_job.summary.get("reconciliation"), Mapping)
+            else {}
+        )
+        duplicate_marker = engine_job.summary.get("duplicate_complete_consumption")
+        if not isinstance(duplicate_marker, Mapping):
+            duplicate_marker = engine_job.summary.get("duplicate_cleanup")
+        if (
+            engine_job.phase == "failed_cleanup"
+            and duplicate_reconciliation.get("outcome") == "duplicate_complete"
+            and isinstance(duplicate_marker, Mapping)
+        ):
+            if payload:
+                raise EngineRequestError("duplicate_complete 清理重试只允许空 JSON 请求")
+            runner = self._get_engine_runner()
+            consume = getattr(runner, "consume_duplicate_complete_source", None)
+            if not callable(consume):
+                raise EngineRequestError("当前 Engine 缺少 duplicate source 消费入口")
+            try:
+                retried = self._consume_duplicate_source(
+                    consume, job_id, self._pause_requested,
+                )
+            except (EnginePauseRequested, EngineCancellationRequested):
+                return self.public_engine_job(runner.get_job(job_id))
+            if not isinstance(retried, EngineJob):
+                retried = runner.get_job(job_id)
+            return self.public_engine_job(retried)
+        if self._existing_gap_holder_retryable(engine_job):
+            # E has no formal write and no ordinary lifecycle finalizer.  Its
+            # only retry/recovery action is the same task-owned empty-source
+            # holder; no target shelf, path, link, or provider instruction is
+            # accepted here.  This also recovers a persisted hold_prepared
+            # receipt after a move→local-write interruption.
+            if payload:
+                raise EngineRequestError(
+                    "existing_gap 来源登记重试只允许空 JSON 请求"
+                )
+            runner = self._get_engine_runner()
+            hold = getattr(runner, "hold_existing_gap_source", None)
+            if not callable(hold):
+                raise EngineRequestError(
+                    "当前 Engine 缺少 existing_gap 来源登记入口"
+                )
+            try:
+                retried = self._hold_existing_gap_source(
+                    hold, job_id, self._pause_requested,
+                )
+            except (EnginePauseRequested, EngineCancellationRequested):
+                return self.public_engine_job(runner.get_job(job_id))
+            except Exception as exc:
+                self._record_existing_gap_hold_failure(job_id, exc)
+                return self.public_engine_job(runner.get_job(job_id))
+            if not isinstance(retried, EngineJob):
+                retried = runner.get_job(job_id)
+            self._refresh_intake_settlement()
+            return self.public_engine_job(retried)
         if engine_job.phase == "reconciling":
             raise EngineRequestError("任务正在只读对账；请等待对账结果")
         if engine_job.phase == "reconciled":
             raise EngineRequestError("已匹配正式作品；本轮不会从 retry 启动正式处理")
         if engine_job.phase == "reconciliation_uncertain":
-            raise EngineRequestError("对账结果不确定；请先处理 needs_attention")
+            # ``uncertain`` is deliberately not a normal retry.  The only
+            # permitted escape hatch is one bounded identity confirmation;
+            # it re-enters the same read-only B/C reconciliation and cannot
+            # name a shelf, target path, link, or Provider operation.
+            allowed = {"tmdb_id", "media_type", "season"}
+            unknown = set(payload) - allowed
+            if unknown:
+                raise EngineRequestError("对账身份确认包含不支持的字段")
+            correction = self._manual_identity_correction(payload)
+            if correction is None:
+                raise EngineRequestError(
+                    "对账结果不确定；请确认 tmdb_id、media_type 和 season 后重新只读对账"
+                )
+            runner = self._get_engine_runner()
+            reopen = getattr(runner, "reopen_reconciliation_uncertain", None)
+            if not callable(reopen):
+                raise EngineRequestError("当前 Engine 缺少不确定对账确认入口")
+            retried = reopen(job_id, correction)
+            # Reconciliation is explicitly read-only and remains permissible
+            # behind the startup/global pause fence.  Its scheduler branch
+            # checks pause again before every later hand-off.
+            self._queue_automatic_job(job_id)
+            return self.public_engine_job(retried)
         if engine_job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
             raise EngineRequestError("任务尚未通过目标货架启动门；请使用 /start 选择目标货架")
         if not self._ordinary_job_has_confirmed_selection(engine_job):
@@ -4080,6 +5401,30 @@ class SimpleApplication:
             if isinstance(reconciliation, Mapping)
             else ""
         )
+        duplicate_complete = reconciliation_outcome == "duplicate_complete"
+        duplicate_marker = summary.get("duplicate_complete_consumption")
+        if not isinstance(duplicate_marker, Mapping):
+            duplicate_marker = summary.get("duplicate_cleanup")
+        duplicate_consumed = (
+            duplicate_complete
+            and job.phase == "completed"
+            and isinstance(duplicate_marker, Mapping)
+            and duplicate_marker.get("status") in {"moved_to_processed", "already_consumed"}
+        )
+        existing_gap = reconciliation_outcome == "existing_gap"
+        existing_gap_marker = summary.get("existing_gap_registration")
+        existing_gap_held = (
+            existing_gap
+            and job.phase == "completed"
+            and isinstance(existing_gap_marker, Mapping)
+            and existing_gap_marker.get("status") in {"moved_to_hold", "already_held"}
+        )
+        existing_gap_blocked = (
+            existing_gap
+            and isinstance(existing_gap_marker, Mapping)
+            and str(existing_gap_marker.get("status") or "").casefold()
+            in {"blocked_nonempty_source", "blocked_source_not_directory", "failed"}
+        )
         # Only a reconciled new work (or a pre-reconciliation legacy record)
         # may be offered the closed shelf enum. Keep target-policy conflict
         # reselection available for that same new-work record.
@@ -4162,9 +5507,17 @@ class SimpleApplication:
             provider_message = audit_message
         payload["progress"] = {
             "stage": display_phase,
-            "completed": 1 if display_phase in {"completed", "completed_with_gaps"} else 0,
+            "completed": 1 if (
+                display_phase in {"completed", "completed_with_gaps"}
+                and (not duplicate_complete or duplicate_consumed)
+                and (not existing_gap or existing_gap_held)
+            ) else 0,
             "total": int(summary.get("file_count") or 0),
-            "percent": 100 if display_phase in {"completed", "completed_with_gaps"} else provider_percent or 0,
+            "percent": 100 if (
+                display_phase in {"completed", "completed_with_gaps"}
+                and (not duplicate_complete or duplicate_consumed)
+                and (not existing_gap or existing_gap_held)
+            ) else provider_percent or 0,
             "message": (
                 provider_message
                 if provider_message is not None
@@ -4192,19 +5545,67 @@ class SimpleApplication:
         )
         if SimpleApplication._is_audit_owned_root(job):
             payload["readback"] = {
-                "status": "verified" if display_phase in {"completed", "completed_with_gaps"} else "pending",
+                # An audit-owned root has no intake source and no formal
+                # writer of its own.  It represents a verified read-only
+                # responsibility projection, so never borrow the duplicate
+                # lane's ``source_consumed`` wording.
+                "status": "audit_completed" if display_phase in {"completed", "completed_with_gaps"} else "pending",
                 "checked_at": job.updated_at if display_phase in {"completed", "completed_with_gaps"} else None,
+                "formal_write": False,
                 "message": (
-                    "全库审计已确认缺口消失"
+                    "全库审计缺口责任范围已核对；该审计根没有待刮削来源，正式写入由补源 child 完成"
                     if display_phase in {"completed", "completed_with_gaps"}
-                    else "审计只记录现有库状态；正式写入由补源 child 完成"
+                    else "审计只记录现有库状态；该审计根没有待刮削来源，正式写入由补源 child 完成"
                 ),
             }
         else:
-            payload["readback"] = {
-                "status": "verified" if job.phase in {"executed", "completed"} else "pending",
-                "checked_at": job.updated_at if job.phase in {"executed", "completed"} else None,
-            }
+            if duplicate_complete:
+                payload["completion_kind"] = "duplicate_complete"
+                duplicate_failed = (
+                    job.phase == "failed_cleanup"
+                    or (
+                        isinstance(duplicate_marker, Mapping)
+                        and str(duplicate_marker.get("status") or "").casefold() == "failed"
+                    )
+                )
+                duplicate_readback_status = (
+                    "source_consumed"
+                    if duplicate_consumed
+                    else "failed"
+                    if duplicate_failed
+                    else "pending"
+                )
+                payload["readback"] = {
+                    "status": duplicate_readback_status,
+                    "checked_at": job.updated_at if duplicate_consumed else None,
+                    "formal_write": False,
+                    "message": (
+                        "正式库已有完整作品；重复输入已消费并隔离，未执行正式写入"
+                        if duplicate_consumed
+                        else "正式库已有完整作品；重复输入消费失败，未执行正式写入，等待重试"
+                        if duplicate_failed
+                        else "正式库已有完整作品；等待消费重复输入并隔离到 processed，未执行正式写入"
+                    ),
+                }
+            elif existing_gap:
+                payload["completion_kind"] = "existing_gap_registered"
+                payload["readback"] = {
+                    "status": "source_held" if existing_gap_held else "registration_blocked" if existing_gap_blocked else "pending",
+                    "checked_at": job.updated_at if existing_gap_held else None,
+                    "formal_write": False,
+                    "message": (
+                        "正式库既有作品缺口已登记；空入站目录已隔离到任务 hold，等待全库只读审计后补源"
+                        if existing_gap_held
+                        else "正式库既有作品缺口已登记；入站来源非空或无法确认，已保留并标记 needs_attention"
+                        if existing_gap_blocked
+                        else "正式库既有作品缺口已登记；等待全库只读审计，未执行补源或正式写入"
+                    ),
+                }
+            else:
+                payload["readback"] = {
+                    "status": "verified" if job.phase in {"executed", "completed"} else "pending",
+                    "checked_at": job.updated_at if job.phase in {"executed", "completed"} else None,
+                }
         payload["settings"] = {
             "media_type": summary.get("mode"),
             "tmdb_id": summary.get("tmdb_id"),
@@ -4221,14 +5622,40 @@ class SimpleApplication:
 
     def control(self) -> dict[str, object]:
         with self._control_lock:
-            return self._control_state.read()
+            payload = self._control_state.read()
+            if self._startup_paused:
+                # Expose the effective session gate to every scheduler and to
+                # the API status projection.  The persisted document remains
+                # untouched until an explicit operator resume/pause.
+                payload["paused"] = True
+                payload["scheduler_paused"] = True
+                payload["reason"] = "startup_pause"
+            return payload
 
     def set_paused(self, paused: bool, reason: str | None = None) -> dict[str, object]:
         if not isinstance(paused, bool):
             raise TypeError("paused must be boolean")
         with self._control_lock:
             payload = self._control_state.set_paused(paused, reason)
+            # Only an explicit transition in this process may open the lane.
+            # In particular, a previous process' persisted ``False`` does not
+            # clear the startup fence by itself.
+            self._startup_paused = paused
         if not paused and not self._closed.is_set():
+            # A fresh process intentionally has no inherited L→M admission
+            # token.  Only a persisted Provider retry needs an immediate
+            # passive A observation on resume; scanning every ordinary intake
+            # on every resume would unexpectedly dispatch reconciliation work
+            # and race the operator's next explicit action.
+            if self._restart_provider_retry_needs_fresh_full_audit():
+                try:
+                    self._scan_inbound_once()
+                except Exception:
+                    # Resume remains available when AList is temporarily
+                    # unreadable; the monitor or the next explicit action will
+                    # surface the bounded read-only error without opening a
+                    # Provider lane.
+                    pass
             self._start_startup_thread(
                 self._resume_automatic_jobs,
                 name="scrapeflow-resume",

@@ -95,7 +95,7 @@ REQUIRED_HELPER_ENVIRONMENT = {
     "ALIST_USERNAME": "${ALIST_USERNAME:-}",
     "ALIST_PASSWORD": "${ALIST_PASSWORD:-}",
     "SCRAPEFLOW_MEDIA_ROOT": "${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}",
-    "NO_PROXY": "${NO_PROXY:-alist,localhost,127.0.0.1}",
+    "NO_PROXY": "alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}",
     "SCRAPEFLOW_QUARK_HELPER_CDP_URL": (
         "http://host.docker.internal:19222/json/list"

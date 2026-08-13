@@ -41,9 +41,10 @@ services:
       TMDB_LANGUAGE: ${TMDB_LANGUAGE:-zh-CN}
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}
+      NO_PROXY: "alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
       SCRAPEFLOW_API_HOST: 0.0.0.0
       SCRAPEFLOW_STATE_DIR: /data
+      SCRAPEFLOW_MIN_VIDEO_BYTES: ${SCRAPEFLOW_MIN_VIDEO_BYTES:-1048576}
       SCRAPEFLOW_BUILD_COMMIT: ${SCRAPEFLOW_BUILD_COMMIT:-}
       SCRAPEFLOW_BUILD_TIME: ${SCRAPEFLOW_BUILD_TIME:-}
       SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
@@ -116,7 +117,7 @@ services:
       # The Helper derives its only writable staging parent from the exact
       # same media root as the API; it never receives an arbitrary root.
       SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
-      NO_PROXY: ${NO_PROXY:-alist,localhost,127.0.0.1}
+      NO_PROXY: "alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
       SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}
       SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list
       TZ: ${TZ:-Asia/Shanghai}
