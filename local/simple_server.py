@@ -108,6 +108,55 @@ _PROVIDER_PROJECTION_PHASES = _ORPHANED_PROVIDER_PROGRESS_PHASES | frozenset({
 })
 _PROVIDER_PILOT_GAP_RE = re.compile(r"^S\d{2}E\d{2}$")
 
+# --- A→K settlement barrier invariant sets -------------------------------
+# One definition for both the strict public barrier (_intake_is_settled) and
+# the relaxed post-restart pre-audit check (_full_audit_ready_for_provider).
+# These sets used to be inlined in each predicate; keeping them here prevents
+# the two copies from drifting apart again.
+_ENGINE_TERMINAL_FAILURE_PHASES = frozenset({
+    "failed", "failed_archive", "failed_identity", "failed_planning",
+    "failed_provider", "failed_write", "failed_verification",
+})
+# Every phase in which an Engine job cannot own further external work.
+_ENGINE_TERMINAL_PHASES = _ENGINE_TERMINAL_FAILURE_PHASES | frozenset({
+    "executed", "completed", "failed_cleanup", "cancelled",
+})
+# Root phases that always keep the barrier closed in both predicates.  The
+# strict barrier additionally blocks "retry_wait" (an audited Provider root
+# waiting to retry) while the relaxed restart check additionally blocks
+# nothing here but handles "cancelled"/"reconciled" at its call sites.
+_BARRIER_BLOCKED_ROOT_PHASES = frozenset({
+    "reconciling", "reconciliation_uncertain", "awaiting_target_shelf",
+    "target_policy_conflict", "queued", "analyzing", "archive_preprocessing",
+    "identity_matching", "planning", "planned", "executing", "verifying",
+    "cleaning", "failed_cleanup",
+})
+# post_acquisition_reaudit projections that no longer own staging or writes.
+_BARRIER_CLEAN_POST_AUDIT_STATUSES = frozenset({
+    "cleaned", "completed", "resolved", "closed",
+})
+# lifecycle.audit / lifecycle.provider projections accepted by the strict
+# barrier for an ordinary executed/completed root.
+_SETTLED_LIFECYCLE_AUDIT_STATUSES = frozenset({
+    "trusted", "deferred", "skipped", "no_gap",
+})
+_SETTLED_LIFECYCLE_PROVIDER_STATUSES = frozenset({
+    "terminal", "completed", "resolved", "ready", "deferred", "skipped",
+    "no_gap",
+})
+# Audit-owned Provider projections that are unsafe to supersede with a fresh
+# L pass even after a restart (an external task may still be pending).
+_RESTART_UNSAFE_PROVIDER_STATUSES = frozenset({
+    "waiting_reconcile", "needs_attention", "in_doubt",
+})
+# Ordinary-root Provider projections that the relaxed restart check refuses
+# to ignore: only audit-owned retry state may be relaxed, never an ordinary
+# root's persisted Provider work.
+_RESTART_BLOCKED_ORDINARY_PROVIDER_STATUSES = frozenset({
+    "gap_discovering", "retry_wait", "waiting_reconcile", "needs_attention",
+    "in_doubt",
+})
+
 
 class DuplicateEngineTask(SimpleEngineError):
     """A source already has a pending Engine plan."""
@@ -684,6 +733,126 @@ class SimpleApplication:
         self._refresh_intake_settlement()
         return registered
 
+    def _barrier_children_by_root(
+        self, all_jobs: Sequence[EngineJob],
+    ) -> dict[str, list[EngineJob]]:
+        """Group internal children under their declared root job id."""
+        children_by_root: dict[str, list[EngineJob]] = {}
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if isinstance(root_id, str) and root_id:
+                children_by_root.setdefault(root_id, []).append(child)
+        return children_by_root
+
+    @staticmethod
+    def _barrier_children_blocked(
+        runner: object, children: Sequence[EngineJob],
+    ) -> bool:
+        """True while any internal child of one root still owns external work."""
+        pending_child = getattr(runner, "has_pending_replenishment_reaudit", None)
+        for child in children:
+            if child.phase not in _ENGINE_TERMINAL_PHASES:
+                return True
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            child_provider = child_summary.get("replenishment")
+            if isinstance(child_provider, Mapping):
+                child_status = str(child_provider.get("status") or "").casefold()
+                if child_status in _ORPHANED_PROVIDER_PROGRESS_PHASES or (
+                    child_status and child_provider.get("terminal") is not True
+                ):
+                    return True
+            if callable(pending_child):
+                try:
+                    if pending_child(child.id):
+                        return True
+                except Exception:
+                    return True
+        return False
+
+    def _barrier_orphaned_children_block(
+        self, all_jobs: Sequence[EngineJob], root_ids: set[str],
+    ) -> bool:
+        """An orphaned internal child is not harmless historical noise.
+
+        It may still own a remote write or staging attempt whose root JSON
+        was removed/corrupted.  Keep the global barrier closed until every
+        internal child is terminal and explicitly linked to a surviving root.
+        """
+        for child in all_jobs:
+            if not self._is_internal_child(child):
+                continue
+            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
+            root_id = child_summary.get("root_job_id")
+            if (
+                not isinstance(root_id, str)
+                or root_id not in root_ids
+                or child.phase not in _ENGINE_TERMINAL_PHASES
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _barrier_post_audit_blocks(summary: Mapping[str, object]) -> bool:
+        """A non-clean post-acquisition re-audit still owns its staging."""
+        post_audit = summary.get("post_acquisition_reaudit")
+        if not post_audit:
+            return False
+        return not isinstance(post_audit, Mapping) or str(
+            post_audit.get("status") or ""
+        ).casefold() not in _BARRIER_CLEAN_POST_AUDIT_STATUSES
+
+    @staticmethod
+    def _barrier_pending_reaudit_blocks(runner: object, job_id: str) -> bool:
+        """A durable pending re-audit marker keeps the barrier closed."""
+        pending = getattr(runner, "has_pending_replenishment_reaudit", None)
+        if not callable(pending):
+            return False
+        try:
+            return bool(pending(job_id))
+        except Exception:
+            return True
+
+    @staticmethod
+    def _barrier_existing_gap_blocks(runner: object, job: EngineJob) -> bool:
+        """An existing-gap root settles only via the narrow hold verifier.
+
+        An existing-gap source is not a formal write and therefore has no
+        ordinary lifecycle receipt.  The only way it may leave the A→K
+        blocker set is the task-owned empty source hold proof produced by
+        the Engine runner.  Non-empty or ambiguous sources remain
+        needs_attention and keep L closed; never infer completion from
+        phase alone.
+        """
+        verifier = getattr(runner, "existing_gap_source_hold_verified", None)
+        return (
+            job.phase != "completed"
+            or not callable(verifier)
+            or not verifier(job.id)
+        )
+
+    @staticmethod
+    def _barrier_duplicate_consumption_blocks(
+        runner: object, job: EngineJob,
+    ) -> bool:
+        """Duplicate completion settles only via the strict runner verifier.
+
+        Duplicate completion is a source-consumption fact, not a formal
+        write.  It must pass the runner's path/identity/remote readback
+        verifier in both reconciled and completed projections before it can
+        satisfy the global barrier.
+        """
+        verifier = getattr(
+            runner, "duplicate_complete_consumption_verified", None,
+        )
+        return (
+            job.phase != "completed"
+            or not callable(verifier)
+            or not verifier(job.id)
+        )
+
     def _intake_is_settled(self) -> bool:
         """Return whether A→K has reached the explicit full-audit barrier.
 
@@ -701,71 +870,24 @@ class SimpleApplication:
             jobs = [job for job in all_jobs if not self._is_internal_child(job)]
         except Exception:
             return False
-        children_by_root: dict[str, list[EngineJob]] = {}
+        children_by_root = self._barrier_children_by_root(all_jobs)
         root_ids = {job.id for job in jobs}
-        for child in all_jobs:
-            if not self._is_internal_child(child):
-                continue
-            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-            root_id = child_summary.get("root_job_id")
-            if isinstance(root_id, str) and root_id:
-                children_by_root.setdefault(root_id, []).append(child)
-
-        def children_blocked(root_id: str) -> bool:
-            terminal = {
-                "executed", "completed", "failed", "failed_archive",
-                "failed_identity", "failed_planning", "failed_provider",
-                "failed_write", "failed_verification", "failed_cleanup", "cancelled",
-            }
-            for child in children_by_root.get(root_id, []):
-                if child.phase not in terminal:
-                    return True
-                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-                child_provider = child_summary.get("replenishment")
-                if isinstance(child_provider, Mapping):
-                    child_status = str(child_provider.get("status") or "").casefold()
-                    if child_status in _ORPHANED_PROVIDER_PROGRESS_PHASES or (
-                        child_status and child_provider.get("terminal") is not True
-                    ):
-                        return True
-                pending_child = getattr(runner, "has_pending_replenishment_reaudit", None)
-                if callable(pending_child):
-                    try:
-                        if pending_child(child.id):
-                            return True
-                    except Exception:
-                        return True
+        if self._barrier_orphaned_children_block(all_jobs, root_ids):
             return False
-        # An orphaned internal child is not harmless historical noise: it may
-        # still own a remote write or staging attempt whose root JSON was
-        # removed/corrupted. Keep the global barrier closed until it is
-        # terminal and explicitly linked to a surviving root.
-        child_terminal = {
-            "executed", "completed", "failed", "failed_archive",
-            "failed_identity", "failed_planning", "failed_provider",
-            "failed_write", "failed_verification", "failed_cleanup", "cancelled",
-        }
-        for child in all_jobs:
-            if not self._is_internal_child(child):
-                continue
-            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-            root_id = child_summary.get("root_job_id")
-            if not isinstance(root_id, str) or root_id not in root_ids or child.phase not in child_terminal:
-                return False
-        blocked_phases = {
-            "reconciling", "reconciliation_uncertain", "awaiting_target_shelf",
-            "target_policy_conflict", "queued", "analyzing", "archive_preprocessing",
-            "identity_matching", "planning", "planned", "executing", "verifying",
-            "cleaning", "retry_wait", "failed_cleanup",
-        }
-        terminal_failures = {
-            "failed", "failed_archive", "failed_identity", "failed_planning",
-            "failed_provider", "failed_write", "failed_verification",
-        }
         for job in jobs:
-            if children_blocked(job.id):
+            if self._barrier_children_blocked(
+                runner, children_by_root.get(job.id, []),
+            ):
                 return False
-            if job.phase in blocked_phases or job.phase in terminal_failures or job.phase == "cancelled":
+            if (
+                job.phase in _BARRIER_BLOCKED_ROOT_PHASES
+                # The strict barrier waits for every audited Provider retry;
+                # only _full_audit_ready_for_provider may relax this for
+                # audit-owned roots after a restart.
+                or job.phase == "retry_wait"
+                or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
+                or job.phase == "cancelled"
+            ):
                 return False
             reconciliation = job.summary.get("reconciliation")
             outcome = (
@@ -773,18 +895,7 @@ class SimpleApplication:
                 if isinstance(reconciliation, Mapping) else None
             )
             if outcome == "existing_gap":
-                # An existing-gap source is not a formal write and therefore
-                # has no ordinary lifecycle receipt.  The only way it may
-                # leave the A→K blocker set is the narrow, task-owned empty
-                # source hold proof produced by the Engine runner.  Non-empty
-                # or ambiguous sources remain needs_attention and keep L
-                # closed; never infer completion from phase alone.
-                verifier = getattr(runner, "existing_gap_source_hold_verified", None)
-                if (
-                    job.phase != "completed"
-                    or not callable(verifier)
-                    or not verifier(job.id)
-                ):
+                if self._barrier_existing_gap_blocks(runner, job):
                     return False
                 continue
             if self._is_audit_owned_root(job):
@@ -807,28 +918,13 @@ class SimpleApplication:
                         or provider_status in _ORPHANED_PROVIDER_PROGRESS_PHASES
                     ):
                         return False
-                post_audit = job.summary.get("post_acquisition_reaudit")
-                if post_audit and (
-                    not isinstance(post_audit, Mapping)
-                    or str(post_audit.get("status") or "").casefold()
-                    not in {"cleaned", "completed", "resolved", "closed"}
-                ):
+                if self._barrier_post_audit_blocks(job.summary):
                     return False
-                pending = getattr(runner, "has_pending_replenishment_reaudit", None)
-                if callable(pending):
-                    try:
-                        if pending(job.id):
-                            return False
-                    except Exception:
-                        return False
+                if self._barrier_pending_reaudit_blocks(runner, job.id):
+                    return False
                 continue
             if outcome == "duplicate_complete":
-                # Duplicate completion is a source-consumption fact, not a
-                # formal write.  It must pass the runner's path/identity/
-                # remote readback verifier in both reconciled and completed
-                # projections before it can satisfy the global barrier.
-                verifier = getattr(runner, "duplicate_complete_consumption_verified", None)
-                if job.phase != "completed" or not callable(verifier) or not verifier(job.id):
+                if self._barrier_duplicate_consumption_blocks(runner, job):
                     return False
             elif job.phase == "reconciled":
                 return False
@@ -850,13 +946,13 @@ class SimpleApplication:
                 if not (
                     isinstance(audit, Mapping)
                     and str(audit.get("status") or "").casefold()
-                    in {"trusted", "deferred", "skipped", "no_gap"}
+                    in _SETTLED_LIFECYCLE_AUDIT_STATUSES
                     and isinstance(provider, Mapping)
                     and str(provider.get("status") or "").casefold()
-                    in {"terminal", "completed", "resolved", "ready", "deferred", "skipped", "no_gap"}
+                    in _SETTLED_LIFECYCLE_PROVIDER_STATUSES
                 ):
                     return False
-            elif job.phase not in {"failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider", "failed_write", "failed_verification"}:
+            elif job.phase not in _ENGINE_TERMINAL_FAILURE_PHASES:
                 # Unknown/legacy phases are not evidence that A→K settled.
                 return False
             replenishment = job.summary.get("replenishment")
@@ -866,12 +962,8 @@ class SimpleApplication:
                     return False
                 if status in _ORPHANED_PROVIDER_PROGRESS_PHASES:
                     return False
-            post_audit = job.summary.get("post_acquisition_reaudit")
-            if post_audit:
-                if not isinstance(post_audit, Mapping) or str(
-                    post_audit.get("status") or ""
-                ).casefold() not in {"cleaned", "completed", "resolved", "closed"}:
-                    return False
+            if self._barrier_post_audit_blocks(job.summary):
+                return False
         with self._automatic_lock:
             if any(not future.done() for future in self._provider_futures.values()):
                 return False
@@ -920,67 +1012,17 @@ class SimpleApplication:
             all_jobs = runner.list_jobs()
         except Exception:
             return False
-        jobs = all_jobs
-        children_by_root: dict[str, list[EngineJob]] = {}
-        for child in all_jobs:
-            if not self._is_internal_child(child):
-                continue
-            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-            root_id = child_summary.get("root_job_id")
-            if isinstance(root_id, str) and root_id:
-                children_by_root.setdefault(root_id, []).append(child)
-
-        def children_blocked(root_id: str) -> bool:
-            terminal = {
-                "executed", "completed", "failed", "failed_archive",
-                "failed_identity", "failed_planning", "failed_provider",
-                "failed_write", "failed_verification", "failed_cleanup", "cancelled",
-            }
-            pending_child = getattr(runner, "has_pending_replenishment_reaudit", None)
-            for child in children_by_root.get(root_id, []):
-                if child.phase not in terminal:
-                    return True
-                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-                child_provider = child_summary.get("replenishment")
-                if isinstance(child_provider, Mapping):
-                    child_status = str(child_provider.get("status") or "").casefold()
-                    if child_status in _ORPHANED_PROVIDER_PROGRESS_PHASES or (
-                        child_status and child_provider.get("terminal") is not True
-                    ):
-                        return True
-                if callable(pending_child):
-                    try:
-                        if pending_child(child.id):
-                            return True
-                    except Exception:
-                        return True
+        children_by_root = self._barrier_children_by_root(all_jobs)
+        # Unlike the strict barrier this sweep runs over every job id, so a
+        # terminal child linked to another child id stays acceptable here.
+        root_ids = {job.id for job in all_jobs}
+        if self._barrier_orphaned_children_block(all_jobs, root_ids):
             return False
-        root_ids = {job.id for job in jobs}
-        child_terminal = {
-            "executed", "completed", "failed", "failed_archive",
-            "failed_identity", "failed_planning", "failed_provider",
-            "failed_write", "failed_verification", "failed_cleanup", "cancelled",
-        }
-        for child in all_jobs:
-            if not self._is_internal_child(child):
-                continue
-            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-            root_id = child_summary.get("root_job_id")
-            if not isinstance(root_id, str) or root_id not in root_ids or child.phase not in child_terminal:
-                return False
-        blocked_phases = {
-            "reconciling", "reconciliation_uncertain", "awaiting_target_shelf",
-            "target_policy_conflict", "queued", "analyzing", "archive_preprocessing",
-            "identity_matching", "planning", "planned", "executing", "verifying",
-            "cleaning", "failed_cleanup", "cancelled",
-        }
-        terminal_failures = {
-            "failed", "failed_archive", "failed_identity", "failed_planning",
-            "failed_provider", "failed_write", "failed_verification",
-        }
-        for job in jobs:
+        for job in all_jobs:
             summary = job.summary if isinstance(job.summary, Mapping) else {}
-            if children_blocked(job.id):
+            if self._barrier_children_blocked(
+                runner, children_by_root.get(job.id, []),
+            ):
                 return False
             if self._is_internal_child(job):
                 # An internal child is an external-write owner even though it
@@ -994,44 +1036,44 @@ class SimpleApplication:
                 if isinstance(reconciliation, Mapping) else None
             )
             if outcome == "existing_gap":
-                verifier = getattr(runner, "existing_gap_source_hold_verified", None)
-                if (
-                    job.phase != "completed"
-                    or not callable(verifier)
-                    or not verifier(job.id)
-                ):
+                if self._barrier_existing_gap_blocks(runner, job):
                     return False
                 continue
             if self._is_audit_owned_root(job):
-                if job.phase in blocked_phases or job.phase in terminal_failures:
+                if (
+                    job.phase in _BARRIER_BLOCKED_ROOT_PHASES
+                    or job.phase == "cancelled"
+                    or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
+                ):
+                    # retry_wait is intentionally absent: relaxing the
+                    # persisted retry state of an already-audited Provider
+                    # root is the sole purpose of this predicate.
                     return False
                 replenishment = summary.get("replenishment")
                 if isinstance(replenishment, Mapping):
                     status = str(replenishment.get("status") or "").casefold()
                     # retry_wait/failed/completed are safe to re-audit; an
                     # in-doubt or active task is not safe to supersede.
-                    if status in _ORPHANED_PROVIDER_PROGRESS_PHASES or status in {
-                        "waiting_reconcile", "needs_attention", "in_doubt",
-                    }:
+                    if (
+                        status in _ORPHANED_PROVIDER_PROGRESS_PHASES
+                        or status in _RESTART_UNSAFE_PROVIDER_STATUSES
+                    ):
                         return False
-                pending = getattr(runner, "has_pending_replenishment_reaudit", None)
-                if callable(pending):
-                    try:
-                        if pending(job.id):
-                            return False
-                    except Exception:
-                        return False
+                if self._barrier_pending_reaudit_blocks(runner, job.id):
+                    return False
                 continue
-            if job.phase in blocked_phases or job.phase in terminal_failures or job.phase == "reconciled":
+            if (
+                job.phase in _BARRIER_BLOCKED_ROOT_PHASES
+                or job.phase == "cancelled"
+                or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
+                or job.phase == "reconciled"
+            ):
                 return False
             # A duplicate source is admissible only through the strict
             # verifier; every other ordinary terminal requires the formal
             # lifecycle proof checked by _intake_is_settled().
-            reconciliation = summary.get("reconciliation")
-            outcome = reconciliation.get("outcome") if isinstance(reconciliation, Mapping) else None
             if outcome == "duplicate_complete":
-                verifier = getattr(runner, "duplicate_complete_consumption_verified", None)
-                if job.phase != "completed" or not callable(verifier) or not verifier(job.id):
+                if self._barrier_duplicate_consumption_blocks(runner, job):
                     return False
                 continue
             if job.phase not in {"executed", "completed"}:
@@ -1058,27 +1100,14 @@ class SimpleApplication:
                 provider_status = str(replenishment.get("status") or "").casefold()
                 if (
                     provider_status in _ORPHANED_PROVIDER_PROGRESS_PHASES
-                    or provider_status in {
-                        "gap_discovering", "retry_wait", "waiting_reconcile",
-                        "needs_attention", "in_doubt",
-                    }
+                    or provider_status in _RESTART_BLOCKED_ORDINARY_PROVIDER_STATUSES
                     or (provider_status and replenishment.get("terminal") is not True)
                 ):
                     return False
-            post_audit = summary.get("post_acquisition_reaudit")
-            if post_audit and (
-                not isinstance(post_audit, Mapping)
-                or str(post_audit.get("status") or "").casefold()
-                not in {"cleaned", "completed", "resolved", "closed"}
-            ):
+            if self._barrier_post_audit_blocks(summary):
                 return False
-            pending = getattr(runner, "has_pending_replenishment_reaudit", None)
-            if callable(pending):
-                try:
-                    if pending(job.id):
-                        return False
-                except Exception:
-                    return False
+            if self._barrier_pending_reaudit_blocks(runner, job.id):
+                return False
         with self._audit_lock:
             if any(
                 future is not None and not future.done()
