@@ -32,6 +32,11 @@ from engine.scrapeflow.video_admission import (
     VideoAdmissionError,
     probe_remote_video_stream,
 )
+from engine.tools.replenishment_adapter import (
+    SubtitleInfrastructureError,
+    SubtitleMaterializer,
+    SubtitleProviderError,
+)
 
 from .replenishment import (
     build_replenishment_requests,
@@ -1333,6 +1338,7 @@ class AutomaticReplenishmentRuntime:
         alist: object,
         search: AutomaticProviderSearch,
         materializer: AutomaticMaterializer,
+        subtitle_materializer: SubtitleMaterializer | None = None,
         staging_root: str = CANONICAL_REPLENISHMENT_STAGING_ROOT,
         max_candidate_rounds: int = 3,
         progress: Callable[[EngineJob, str, Mapping[str, object]], None] | None = None,
@@ -1345,6 +1351,7 @@ class AutomaticReplenishmentRuntime:
         self.alist = alist
         self.search = search
         self.materializer = materializer
+        self.subtitle_materializer = subtitle_materializer or SubtitleMaterializer()
         try:
             self.staging_root = validate_provider_staging_root(staging_root)
         except ProviderStagingPathError as exc:
@@ -5098,6 +5105,210 @@ class AutomaticReplenishmentRuntime:
             }
         raise AutomaticReplenishmentError("补源没有可执行候选")
 
+    def _run_subtitle_request(
+        self,
+        *,
+        job: EngineJob,
+        request: Mapping[str, object],
+        gap_state_paths: Mapping[str, Path],
+    ) -> dict[str, object]:
+        """Acquire standalone subtitles via the dedicated Subtitle Provider."""
+        request_body = dict(request)
+        request_gaps = self._request_gaps(request_body)
+
+        attempt_id = f"attempt-{uuid.uuid4().hex}"
+        staging = f"{self.staging_root}/{job.id}/{attempt_id}"
+        workspace = self.workspace_root / job.id / attempt_id
+
+        attempt_error: Exception | None = None
+        acquisition: Mapping[str, object] | None = None
+        try:
+            acquisition = self.subtitle_materializer.acquire_subtitles(
+                request_body,
+                request_gaps,
+                staging_root=staging,
+                workspace=workspace,
+                alist=self.alist,
+            )
+        except Exception as exc:
+            attempt_error = exc
+
+        delivered_files = (
+            acquisition.get("files")
+            if isinstance(acquisition, Mapping) and isinstance(acquisition.get("files"), list)
+            else []
+        )
+
+        if not delivered_files:
+            audit_only = (
+                job.summary.get("audit_subtitle_only") is True
+                or job.summary.get("audit_owned") is True
+                or str(job.id).startswith("audit-")
+                or all(str(g.get("kind") or "") == "missing_subtitle" for g in request_gaps)
+            )
+            if not audit_only and self.search is not None and self.materializer is not None:
+                try:
+                    self._remove_staging(staging)
+                    self._remove_local_attempt_workspace(job_id=job.id, attempt_id=attempt_id)
+                except Exception:
+                    pass
+                return self._run_request(
+                    job=job,
+                    request=request_body,
+                    gap_state_paths=gap_state_paths,
+                )
+
+
+
+
+        self._raise_if_cancelled(job, round_number=1, boundary="candidate_round")
+        self._progress(job, "provider_searching", round=1, provider="subtitle")
+        for gap in request_gaps:
+            gap_id = str(gap.get("id") or "")
+            state_path = gap_state_paths.get(gap_id)
+            if state_path:
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state.update({
+                        "phase": "provider_searching",
+                        "attempts": 1,
+                        "updated_at": _now(),
+                        "error": None,
+                    })
+                    self._write_gap(state, state_path)
+                except Exception:
+                    pass
+
+        self._progress(job, "acquiring", round=1, staging_root=staging, provider="subtitle")
+        self._raise_if_cancelled(job, round_number=1, boundary="materialization")
+
+        try:
+            if attempt_error is not None:
+                scope = (
+                    FAILURE_INFRASTRUCTURE
+                    if isinstance(attempt_error, SubtitleInfrastructureError)
+                    else FAILURE_CANDIDATE
+                )
+                for gap in request_gaps:
+                    gap_id = str(gap.get("id") or "")
+                    state_path = gap_state_paths.get(gap_id)
+                    if state_path:
+                        try:
+                            state = json.loads(state_path.read_text(encoding="utf-8"))
+                            state.update({
+                                "phase": "retry_wait",
+                                "updated_at": _now(),
+                                "error": redact_error(attempt_error),
+                                "last_error_scope": scope,
+                                "next_retry_at": None,
+                            })
+                            self._write_gap(state, state_path)
+                        except Exception:
+                            pass
+                self._progress(job, "retry_wait", round=1, error=redact_error(attempt_error))
+                return {
+                    "request": request_body,
+                    "resolved_gap_ids": [],
+                    "unresolved_gap_ids": [
+                        str(g.get("id") or "") for g in request_gaps
+                        if isinstance(g.get("id"), str) and g.get("id")
+                    ],
+                    "failure_scope": scope,
+                    "error": redact_error(attempt_error),
+                    "terminal": False,
+                    "status": "retry_wait",
+                }
+
+            if delivered_files:
+                delivered_gap_ids: set[str] = set()
+                for file_entry in delivered_files:
+                    if isinstance(file_entry, Mapping) and isinstance(file_entry.get("gap_ids"), list):
+                        for g_id in file_entry["gap_ids"]:
+                            delivered_gap_ids.add(str(g_id))
+                self._raise_if_cancelled(job, round_number=1, boundary="subtitle_write")
+                self._progress(job, "subtitle_installing", round=1)
+                installed = self._install_subtitle_members(
+                    job=job,
+                    request=request_body,
+                    acquisition=acquisition if isinstance(acquisition, Mapping) else {},
+                    staging_root=staging,
+                    round_number=1,
+                    required_gap_ids=delivered_gap_ids,
+                )
+                for gap_id in delivered_gap_ids:
+                    state_path = gap_state_paths.get(gap_id)
+                    if state_path:
+                        try:
+                            state = json.loads(state_path.read_text(encoding="utf-8"))
+                            state.update({
+                                "phase": "resolved",
+                                "resolved": True,
+                                "error": None,
+                                "updated_at": _now(),
+                            })
+                            self._write_gap(state, state_path)
+                        except Exception:
+                            pass
+                self._progress(
+                    job,
+                    "final_verifying",
+                    round=1,
+                    subtitle_sidecars=len(installed),
+                )
+                unresolved = [
+                    str(g.get("id") or "") for g in request_gaps
+                    if str(g.get("id") or "") not in delivered_gap_ids
+                ]
+                return {
+                    "request": request_body,
+                    "resolved_gap_ids": sorted(delivered_gap_ids),
+                    "unresolved_gap_ids": unresolved,
+                    "terminal": len(unresolved) == 0,
+                    "status": "completed" if len(unresolved) == 0 else "completed_with_gaps",
+                }
+            else:
+                for gap in request_gaps:
+                    gap_id = str(gap.get("id") or "")
+                    state_path = gap_state_paths.get(gap_id)
+                    if state_path:
+                        try:
+                            state = json.loads(state_path.read_text(encoding="utf-8"))
+                            state.update({
+                                "phase": "completed_with_gaps",
+                                "tier_status": "exhausted",
+                                "error": "字幕接口未检索到可用字幕",
+                                "updated_at": _now(),
+                            })
+                            self._write_gap(state, state_path)
+                        except Exception:
+                            pass
+
+
+                self._progress(
+                    job,
+                    "completed_with_gaps",
+                    round=1,
+                    message="未检索到匹配字幕，安全停止",
+                )
+                return {
+                    "request": request_body,
+                    "resolved_gap_ids": [],
+                    "unresolved_gap_ids": [
+                        str(g.get("id") or "") for g in request_gaps
+                        if isinstance(g.get("id"), str) and g.get("id")
+                    ],
+                    "terminal": True,
+                    "status": "completed_with_gaps",
+                    "failure_scope": FAILURE_CANDIDATE,
+                    "error": "未检索到匹配字幕",
+                }
+        finally:
+            try:
+                self._remove_staging(staging)
+                self._remove_local_attempt_workspace(job_id=job.id, attempt_id=attempt_id)
+            except Exception:
+                pass
+
     def run_for_job(self, job: EngineJob) -> dict[str, object]:
         """Automatically resolve all engine-discovered, provider-compatible gaps."""
         if not isinstance(job.plan, Mapping):
@@ -5169,11 +5380,22 @@ class AutomaticReplenishmentRuntime:
             active_request = dict(request)
             active_request["gaps"] = active_gaps
             try:
-                outcomes.append(self._run_request(
-                    job=job,
-                    request=active_request,
-                    gap_state_paths=states,
-                ))
+                subtitle_only_request = (
+                    job.summary.get("audit_subtitle_only") is True
+                    or all(str(g.get("kind") or "") == "missing_subtitle" for g in active_gaps)
+                )
+                if subtitle_only_request:
+                    outcomes.append(self._run_subtitle_request(
+                        job=job,
+                        request=active_request,
+                        gap_state_paths=states,
+                    ))
+                else:
+                    outcomes.append(self._run_request(
+                        job=job,
+                        request=active_request,
+                        gap_state_paths=states,
+                    ))
             except AutomaticReplenishmentCancelled as exc:
                 scope = self._failure_scope(exc, [])
                 for gap_id, path in states.items():

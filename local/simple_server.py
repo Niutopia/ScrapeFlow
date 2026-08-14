@@ -141,7 +141,7 @@ _SETTLED_LIFECYCLE_AUDIT_STATUSES = frozenset({
     "trusted", "deferred", "skipped", "no_gap",
 })
 _SETTLED_LIFECYCLE_PROVIDER_STATUSES = frozenset({
-    "terminal", "completed", "resolved", "ready", "deferred", "skipped",
+    "terminal", "completed", "completed_with_gaps", "resolved", "ready", "deferred", "skipped",
     "no_gap",
 })
 # Audit-owned Provider projections that are unsafe to supersede with a fresh
@@ -920,16 +920,6 @@ class SimpleApplication:
                 runner, children_by_root.get(job.id, []),
             ):
                 return False
-            if (
-                job.phase in _BARRIER_BLOCKED_ROOT_PHASES
-                # The strict barrier waits for every audited Provider retry;
-                # only _full_audit_ready_for_provider may relax this for
-                # audit-owned roots after a restart.
-                or job.phase == "retry_wait"
-                or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
-                or job.phase == "cancelled"
-            ):
-                return False
             reconciliation = job.summary.get("reconciliation")
             outcome = (
                 reconciliation.get("outcome")
@@ -947,15 +937,23 @@ class SimpleApplication:
                 # downstream M gate.  Their provider/attempt state is still
                 # checked below and any active/in-doubt work remains a
                 # blocker.
-                if job.phase not in {"executed", "completed"}:
+                if (
+                    job.phase in _BARRIER_BLOCKED_ROOT_PHASES
+                    or job.phase == "cancelled"
+                    or job.phase not in {"executed", "completed"}
+                ):
                     return False
+
                 audit_owned_provider = job.summary.get("replenishment")
                 if isinstance(audit_owned_provider, Mapping):
                     provider_status = str(
                         audit_owned_provider.get("status") or ""
                     ).casefold()
                     if (
-                        audit_owned_provider.get("terminal") is not True
+                        (
+                            audit_owned_provider.get("terminal") is not True
+                            and provider_status not in {"completed_with_gaps", "failed", "completed"}
+                        )
                         or provider_status in _ORPHANED_PROVIDER_PROGRESS_PHASES
                     ):
                         return False
@@ -964,6 +962,17 @@ class SimpleApplication:
                 if self._barrier_pending_reaudit_blocks(runner, job.id):
                     return False
                 continue
+            if (
+                job.phase in _BARRIER_BLOCKED_ROOT_PHASES
+                # The strict barrier waits for every audited Provider retry;
+                # only _full_audit_ready_for_provider may relax this for
+                # audit-owned roots after a restart.
+                or job.phase == "retry_wait"
+                or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
+                or job.phase == "cancelled"
+            ):
+                return False
+
             if outcome == "duplicate_complete":
                 if self._barrier_duplicate_consumption_blocks(runner, job):
                     return False
@@ -1086,6 +1095,7 @@ class SimpleApplication:
                     or job.phase == "cancelled"
                     or job.phase in _ENGINE_TERMINAL_FAILURE_PHASES
                 ):
+
                     # retry_wait is intentionally absent: relaxing the
                     # persisted retry state of an already-audited Provider
                     # root is the sole purpose of this predicate.
@@ -2294,6 +2304,14 @@ class SimpleApplication:
         """
         if job.phase not in {"executed", "completed"}:
             return False
+        if SimpleApplication._is_audit_owned_root(job):
+            replenishment = job.summary.get("replenishment")
+            if isinstance(replenishment, Mapping):
+                status = str(replenishment.get("status") or "").casefold()
+                return replenishment.get("terminal") is True or status in {
+                    "completed_with_gaps", "completed", "failed", "no_gap",
+                }
+            return False
         lifecycle_raw = job.summary.get("lifecycle")
         lifecycle = lifecycle_raw if isinstance(lifecycle_raw, Mapping) else {}
         cleanup = lifecycle.get("cleanup") if isinstance(lifecycle.get("cleanup"), Mapping) else {}
@@ -2303,7 +2321,7 @@ class SimpleApplication:
         provider = lifecycle.get("provider") if isinstance(lifecycle.get("provider"), Mapping) else {}
         return (
             str(audit.get("status") or "").casefold() in {"trusted", "deferred", "skipped"}
-            and str(provider.get("status") or "").casefold() in {"deferred", "skipped"}
+            and str(provider.get("status") or "").casefold() in {"deferred", "skipped", "completed_with_gaps"}
         )
 
     @staticmethod
@@ -3613,14 +3631,20 @@ class SimpleApplication:
                 return False
             if not isinstance(raw, Mapping):
                 return False
-            if str(raw.get("phase") or "").casefold() == "resolved":
+            phase = str(raw.get("phase") or "").casefold()
+            if phase in {"resolved", "completed_with_gaps"}:
                 continue
             terminal_rows += 1
             if (
-                str(raw.get("tier") or "").casefold() != TIER_LOCAL_MAGNET
-                or str(raw.get("tier_status") or "").casefold() != "exhausted"
+                phase == "completed_with_gaps"
+                or (
+                    str(raw.get("tier") or "").casefold() == TIER_LOCAL_MAGNET
+                    and str(raw.get("tier_status") or "").casefold() == "exhausted"
+                )
+                or str(raw.get("tier_status") or "").casefold() == "exhausted"
             ):
-                return False
+                continue
+            return False
         return terminal_rows > 0
 
     def _run_automatic_replenishment(
@@ -3750,10 +3774,21 @@ class SimpleApplication:
                 outcome["terminal"] = False
                 outcome["status"] = "waiting_reconcile"
                 outcome["next_retry_seconds"] = None
+            elif (
+                outcome.get("status") == "completed_with_gaps"
+                or any(
+                    isinstance(row, Mapping) and row.get("status") == "completed_with_gaps"
+                    for row in outcome.get("outcomes", [])
+                )
+            ):
+                outcome["terminal"] = True
+                outcome["status"] = "completed_with_gaps"
+                outcome["next_retry_seconds"] = None
             elif candidate_exhausted:
                 outcome["terminal"] = True
                 outcome["status"] = "failed"
                 outcome["next_retry_seconds"] = None
+
             elif infrastructure_failure and provider_attempts >= provider_limit:
                 outcome["terminal"] = True
                 outcome["status"] = "failed"

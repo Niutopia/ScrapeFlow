@@ -290,7 +290,15 @@ class IntakeBarrierMatrixTests(unittest.TestCase):
                 }},
                 True, True,
             ),
+            (
+                "provider_completed_with_gaps",
+                {"extra_summary": {
+                    "replenishment": {"status": "completed_with_gaps", "terminal": True},
+                }},
+                True, True,
+            ),
         ]
+
         for name, mutation, want_strict, want_relaxed in cases:
             def build(app, runner, mutation=mutation):
                 job = runner.create_audit_owned_root(_project(_gap()))
