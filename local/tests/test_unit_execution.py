@@ -61,8 +61,29 @@ def _recording_planner(events: list[dict], *, fail_for: str | None = None):
     return planner
 
 
+class CatalogTMDB:
+    """Minimal TMDB double for the episode catalog used by gap discovery."""
+
+    def __init__(self, tmdb_id: int, episodes: int) -> None:
+        self.tmdb_id = tmdb_id
+        self.episodes = episodes
+
+    def get(self, path: str, **params: object) -> dict:
+        del params
+        if path == f"/tv/{self.tmdb_id}":
+            return {"seasons": [{"season_number": 1, "name": "Season 1"}]}
+        if path == f"/tv/{self.tmdb_id}/season/1":
+            return {
+                "episodes": [
+                    {"episode_number": number, "air_date": "2020-01-01"}
+                    for number in range(1, self.episodes + 1)
+                ],
+            }
+        return {}
+
+
 class UnitExecutionTests(unittest.TestCase):
-    def _setup(self, files: dict[str, bytes], *, library_files: dict[str, bytes] | None = None):
+    def _setup(self, files: dict[str, bytes], *, library_files: dict[str, bytes] | None = None, tmdb: object | None = None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         state_root = Path(temp.name)
@@ -74,7 +95,7 @@ class UnitExecutionTests(unittest.TestCase):
         runner = SimpleEngineRunner(
             state_root,
             alist=alist,
-            tmdb=object(),
+            tmdb=tmdb if tmdb is not None else object(),
             planner=_recording_planner(planner_events),
             validate=False,
             library_root="/library",
@@ -200,6 +221,40 @@ class UnitExecutionTests(unittest.TestCase):
         )
         self.assertEqual(len(planner_events), 1)
         self.assertEqual(len(executor_events), 1)
+
+
+    def test_accepted_tv_unit_registers_precise_episode_gaps(self) -> None:
+        files = {"/incoming/one/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files, tmdb=CatalogTMDB(101, 10),
+        )
+        root_task_id = "root-gaps"
+        pending = runner.create_pending_job("/incoming/one", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 1)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        results = execute_new_work_units(runner, state_root, root_task_id)
+        self.assertEqual(results[0].outcome, "accepted")
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        gaps = load_gap_ledger(state_root, root_task_id)
+        # Official catalog E01..E10, plan wrote only E01 -> 9 open gaps.
+        self.assertEqual(len(gaps), 9)
+        self.assertTrue(
+            all(gap.work_unit_id == records[0].work_unit_id for gap in gaps),
+        )
+        self.assertEqual(
+            {gap.gap_id.rsplit("::", 1)[1] for gap in gaps},
+            {f"S01E{episode:02d}" for episode in range(2, 11)},
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.gap_ledger import discover_episode_gaps
+from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.target_shelf import target_root_for_shelf
 from engine.scrapeflow.work_units import (
     WorkUnitRecord,
@@ -28,6 +30,7 @@ from engine.scrapeflow.work_units import (
 
 from .redaction import redact_error
 from .simple_engine_runner import EngineRequest, SimpleEngineRunner
+from .simple_library_audit import TmdbEpisodeCatalog
 
 
 def _now() -> str:
@@ -143,6 +146,69 @@ def _request_for_unit(
     return EngineRequest.from_mapping(payload)
 
 
+def _register_unit_episode_gaps(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    executed_plan: Mapping[str, Any],
+) -> list[Any]:
+    """Register precise per-episode gaps after a successful write (J step).
+
+    Expected coordinates come from the official TMDB episode catalog; actual
+    coordinates from the executed plan's final names.  Failures are bounded:
+    a missing/unavailable catalog simply registers no gaps.
+    """
+    identity = record.identity or {}
+    if str(identity.get("media_type")) != "tv":
+        return []
+    tmdb_id = identity.get("tmdb_id")
+    if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
+        return []
+    try:
+        catalog = TmdbEpisodeCatalog(runner.tmdb)
+        expected = catalog({"tmdb_id": tmdb_id, "media_type": "tv"})
+    except Exception:
+        return []
+    if expected is None:
+        return []
+    expected_by_season: dict[int, list[int]] = {}
+    for season, rows in expected.items():
+        if not isinstance(season, int) or isinstance(season, bool) or not isinstance(rows, list):
+            continue
+        episodes = [
+            int(row.get("episode_number"))
+            for row in rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("episode_number"), int)
+            and not isinstance(row.get("episode_number"), bool)
+            and int(row.get("episode_number")) > 0
+        ]
+        if episodes:
+            expected_by_season[season] = episodes
+    if not expected_by_season:
+        return []
+    actual: list[str] = []
+    for item in executed_plan.get("files") or []:
+        if not isinstance(item, Mapping) or item.get("media_kind") != "video":
+            continue
+        name = str(item.get("final_name") or "")
+        for season, episode in audit_episode_tokens(name):
+            actual.append(f"S{season:02d}E{episode:02d}")
+    try:
+        return discover_episode_gaps(
+            state_root,
+            root_task_id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=tmdb_id,
+            expected_by_season=expected_by_season,
+            actual_tokens=actual,
+        )
+    except Exception:
+        return []
+
+
 def execute_new_work_units(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -212,6 +278,15 @@ def execute_new_work_units(
                 error=None,
                 recorded_at=_now(),
             ))
+            # J step: register precise episode gaps against the official
+            # TMDB catalog.  Advisories: no gap simply means no catalog or
+            # no missing coordinates.
+            try:
+                _register_unit_episode_gaps(
+                    runner, state_root, root_task_id, record, executed.plan,
+                )
+            except Exception:
+                pass
         except Exception as exc:
             # Keep writer_job_id unset so the next run retries the unit.
             results.append(WorkAcceptanceResult(

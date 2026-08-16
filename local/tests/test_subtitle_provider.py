@@ -7,7 +7,7 @@ from pathlib import Path
 import posixpath
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from engine.tools.replenishment_adapter import (
     PROVIDER_SUBTITLE_A4K,
@@ -282,7 +282,9 @@ class SubtitleProviderTests(unittest.TestCase):
         mock_runner = MagicMock()
         alist = MockAList()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"SCRAPEFLOW_OPENSUBTITLES_API_KEY": "test-key"},
+        ):
             runtime = AutomaticReplenishmentRuntime(
                 state_root=Path(tmpdir),
                 engine_runner=mock_runner,
@@ -459,6 +461,48 @@ class SubtitleProviderTests(unittest.TestCase):
             self.assertEqual(first["status"], "retry_wait")
             self.assertFalse(first["terminal"])
             self.assertEqual(first["failure_scope"], "infrastructure")
+
+    def test_opensubtitles_without_api_key_is_explicitly_unavailable(self) -> None:
+        from engine.tools.replenishment_adapter.subtitle_provider import (
+            SubtitleDiscoveryService,
+            SubtitleInfrastructureError,
+        )
+        discovery = SubtitleDiscoveryService(enabled=True, fetcher=lambda u, h: b"{}")
+        gap = {
+            "id": "g1",
+            "kind": "missing_subtitle",
+            "path": "/library/番剧/Show/Season 01/Show S01E01.mkv",
+            "media": {"title": "Show", "tmdb_id": 123},
+            "subtitle_language": "zh",
+        }
+        with patch.dict("os.environ", {"SCRAPEFLOW_OPENSUBTITLES_API_KEY": ""}):
+            with self.assertRaises(SubtitleInfrastructureError):
+                discovery.search_gap(gap, {"media": {"title": "Show", "tmdb_id": 123}})
+
+    def test_search_page_responses_are_size_bounded(self) -> None:
+        from engine.tools.replenishment_adapter.subtitle_provider import (
+            SubtitleDiscoveryService,
+            SubtitleInfrastructureError,
+        )
+        # The fetcher short-circuits HTTP, so exercise the bound through the
+        # materializer download path instead.
+        from engine.tools.replenishment_adapter.subtitle_provider import (
+            MAX_SUBTITLE_BYTES,
+            SubtitleMaterializer,
+            SubtitleProviderError,
+        )
+        discovery = SubtitleDiscoveryService(enabled=True, fetcher=lambda u, h: b"{}")
+        materializer = SubtitleMaterializer(discovery=discovery)
+        materializer.downloader = lambda url: b"x" * (MAX_SUBTITLE_BYTES + 1)
+        gap = {
+            "id": "g1",
+            "kind": "missing_subtitle",
+            "path": "/library/番剧/Show/Show.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(SubtitleProviderError):
+                materializer._fetch_bytes("http://example.test/huge.srt")
 
 
 if __name__ == "__main__":

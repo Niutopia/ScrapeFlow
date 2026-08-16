@@ -49,6 +49,7 @@ PROVIDER_BASE_WEIGHTS: dict[str, float] = {
 SUPPORTED_SUBTITLE_EXTENSIONS = frozenset({".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"})
 MIN_SUBTITLE_BYTES = 64
 MAX_SUBTITLE_BYTES = 10 * 1024 * 1024
+MAX_SEARCH_PAGE_BYTES = 8 * 1024 * 1024
 
 _SUBTITLE_CONTENT_TYPES = {
     "ass": "text/x-ass",
@@ -210,11 +211,21 @@ class SubtitleDiscoveryService:
 
     @classmethod
     def from_env(cls) -> SubtitleDiscoveryService:
-        raw_enabled = os.getenv("SCRAPEFLOW_SUBTITLE_PROVIDER_ENABLED", "1").strip().casefold()
+        # The dedicated subtitle lane is OFF by default (2026-08-16 operator
+        # decision): it must be explicitly enabled.  When disabled, no search
+        # request is ever made.
+        raw_enabled = os.getenv("SCRAPEFLOW_SUBTITLE_PROVIDER_ENABLED", "0").strip().casefold()
         enabled = raw_enabled not in {"0", "false", "no", "off", "disable", "disabled"}
         return cls(enabled=enabled)
 
-    def _http_get(self, target_url: str, headers: Mapping[str, str] | None = None, timeout: float = 8.0) -> bytes:
+    def _http_get(
+        self,
+        target_url: str,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = 8.0,
+        max_bytes: int | None = None,
+        truncation_is_infra: bool = True,
+    ) -> bytes:
         if self.fetcher is not None:
             try:
                 return self.fetcher(target_url, headers)
@@ -237,7 +248,15 @@ class SubtitleDiscoveryService:
         req = urllib.request.Request(target_url, headers=req_headers)
         try:
             with opener.open(req, timeout=timeout) as resp:
-                return resp.read()
+                limit = max_bytes if max_bytes is not None else MAX_SEARCH_PAGE_BYTES
+                data = resp.read(limit)
+                if resp.read(1):
+                    if truncation_is_infra:
+                        raise SubtitleInfrastructureError("字幕接口响应超过大小上限")
+                    return data
+                return data
+        except SubtitleInfrastructureError:
+            raise
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise SubtitleInfrastructureError(f"字幕接口网络请求失败: {exc}") from exc
 
@@ -299,8 +318,6 @@ class SubtitleDiscoveryService:
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
-                    "downloads": 50,
-                    "score": 1.0,
                 })
             return candidates
         except SubtitleInfrastructureError:
@@ -329,8 +346,6 @@ class SubtitleDiscoveryService:
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
-                    "downloads": 30,
-                    "score": 1.0,
                 })
             return candidates
         except SubtitleInfrastructureError:
@@ -359,8 +374,6 @@ class SubtitleDiscoveryService:
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
-                    "downloads": 20,
-                    "score": 1.0,
                 })
             return candidates
         except SubtitleInfrastructureError:
@@ -402,9 +415,14 @@ class SubtitleDiscoveryService:
             return []
 
     def _search_opensubtitles(self, tmdb_id: Any, season: int | None, episode: int | None, lang: str) -> list[dict[str, Any]]:
-        """Search OpenSubtitles API by TMDB ID."""
+        """Search OpenSubtitles API by TMDB ID (requires an API key)."""
         if not tmdb_id:
             return []
+        api_key = os.getenv("SCRAPEFLOW_OPENSUBTITLES_API_KEY", "").strip()
+        if not api_key:
+            # An unconfigured source must never look like an empty search:
+            # the lane stays explicitly incomplete (fail closed).
+            raise SubtitleInfrastructureError("OpenSubtitles 未配置 API Key")
         lang_code = "zh-CN,zh-TW,zh,zho"
         url = f"https://api.opensubtitles.com/api/v1/subtitles?tmdb_id={tmdb_id}&languages={lang_code}"
         if season is not None:
@@ -412,7 +430,7 @@ class SubtitleDiscoveryService:
         if episode is not None:
             url += f"&episode_number={episode}"
         try:
-            data = self._http_get(url, timeout=5.0)
+            data = self._http_get(url, timeout=5.0, headers={"Api-Key": api_key})
             parsed = json.loads(data.decode("utf-8", errors="ignore"))
             items = parsed.get("data") or []
             candidates = []
@@ -579,8 +597,18 @@ class SubtitleMaterializer:
 
     def _fetch_bytes(self, url: str) -> bytes:
         if self.downloader is not None:
-            return self.downloader(url)
-        return self.discovery._http_get(url)
+            raw = self.downloader(url)
+        else:
+            # Bound the HTTP read BEFORE holding the payload in memory; an
+            # oversized payload is a candidate defect, not an outage.
+            raw = self.discovery._http_get(
+                url,
+                max_bytes=MAX_SUBTITLE_BYTES + 1,
+                truncation_is_infra=False,
+            )
+        if len(raw) > MAX_SUBTITLE_BYTES:
+            raise SubtitleProviderError("下载的字幕文件超过大小上限")
+        return raw
 
     @staticmethod
     def _content_type(fmt: str) -> str:
@@ -778,5 +806,5 @@ class SubtitleMaterializer:
         return {
             "delivery_kind": "subtitle_delivery",
             "files": files_out,
-            "provider": PROVIDER_SUBTITLE_ASSRT,
+            "provider": files_out[0].get("provider") if files_out else None,
         }
