@@ -1120,12 +1120,14 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         method: str,
         query: Mapping[str, object] | None = None,
         body: Mapping[str, object] | None = None,
+        retryable: bool | None = None,
     ) -> Mapping[str, object]:
-        # A read-only GET can be truncated mid-body by an intervening network
-        # path (live-observed: an intermittent ~1KB cut of a 10KB listing).
-        # GET retries are safe; mutating POSTs never retry (duplicate-submit
-        # hazard) and stay fail-closed.
-        attempts = 3 if method == "GET" else 1
+        # A read-only GET (or an explicitly idempotent POST such as the
+        # offline parse) can be truncated mid-body by an intervening network
+        # path (live-observed: intermittent ~1KB cuts).  Retrying those is
+        # safe; mutating POSTs never retry (duplicate-submit hazard) and stay
+        # fail-closed.
+        attempts = 3 if (retryable is True or (retryable is None and method == "GET")) else 1
         last_invalid: Exception | None = None
         for attempt in range(attempts):
             if attempt:
@@ -1466,6 +1468,7 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
                 path="/offline/download/parse",
                 method="POST",
                 body={"url": payload["magnet_url"]},
+                retryable=True,  # parse is idempotent: safe to retry truncation
             )
             parsed_data = parsed.get("data")
             if not isinstance(parsed_data, Mapping):
