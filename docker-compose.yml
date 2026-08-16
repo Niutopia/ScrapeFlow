@@ -99,7 +99,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"
+      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765"
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8765),2); s.close()"]
       interval: 10s

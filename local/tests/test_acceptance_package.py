@@ -100,7 +100,7 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "      alist:\n"
         "        condition: service_healthy\n"
         "    ports:\n"
-        '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"\n'
+        '      - "127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765"\n'
         "    volumes:\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
@@ -288,9 +288,14 @@ def fake_runner(args: tuple[str, ...], cwd: Path, env: dict[str, str] | None) ->
                         "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
                         "SCRAPEFLOW_PROVIDER_WORKERS": "1",
                     },
+                    # The container listens on 8765 internally; the host-side
+                    # port defaults to 3010 and is controlled by the
+                    # SCRAPEFLOW_API_PORT environment variable, matching the
+                    # real docker-compose.yml mapping:
+                    #   127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765
                     "ports": [{
                         "host_ip": "127.0.0.1",
-                        "published": "8765",
+                        "published": "3010",
                         "target": 8765,
                         "protocol": "tcp",
                     }],
@@ -419,7 +424,8 @@ class AcceptancePackageTests(unittest.TestCase):
 
         self.assertEqual(evidence["status"], "可读")
         api = next(service for service in evidence["services"] if service["name"] == "api")
-        self.assertEqual(api["ports"], ["127.0.0.1:8765->8765/tcp"])
+        # Host default port is 3010 (SCRAPEFLOW_API_PORT), container is 8765.
+        self.assertEqual(api["ports"], ["127.0.0.1:3010->8765/tcp"])
         self.assertEqual(api["start_paused"], "1")
         self.assertEqual(api["provider_workers"], "1")
         helper = next(

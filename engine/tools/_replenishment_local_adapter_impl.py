@@ -952,13 +952,30 @@ def _gap_file_map(
     request: Mapping[str, Any], release_name: str, manifest: Mapping[str, Any],
     *, allowed_payload_extensions: frozenset[str] = VIDEO_EXTENSIONS,
 ) -> tuple[dict[str, list[int]], set[str]]:
-    gaps = [gap for gap in request.get("gaps") or [] if isinstance(gap, Mapping)]
+    raw_gaps = request.get("gaps")
+    if not isinstance(raw_gaps, list) or any(
+        not isinstance(gap, Mapping) for gap in raw_gaps
+    ):
+        return {}, set()
+    gaps = [dict(gap) for gap in raw_gaps]
+    if any(
+        str(gap.get("kind") or "") not in {
+            "missing_episode", "missing_season", "missing_media", "missing_subtitle",
+        }
+        for gap in gaps
+    ):
+        return {}, set()
     subtitle_gaps = [gap for gap in gaps if gap.get("kind") == "missing_subtitle"]
     if subtitle_gaps:
+        if any(gap.get("kind") != "missing_subtitle" for gap in gaps):
+            # Explicit subtitle repairs are a sidecar-only provider lane.
+            # Companion subtitles remain supported by the media-only branch
+            # below, but an audited subtitle gap must never share a torrent
+            # manifest or materializer request with video gaps.
+            return {}, set()
         # A subtitle gap is an explicit audit coordinate.  It may share one
-        # provider request with ordinary media gaps, but the two lanes retain
-        # separate file-kind and identity gates.  Never let a language-only
-        # member become a guessed sidecar for another episode.
+        # provider request only with other subtitle gaps. Never let a
+        # language-only member become a guessed sidecar for another episode.
         subtitle_candidates: dict[str, list[tuple[int, int]]] = {}
         for gap in subtitle_gaps:
             gap_id = str(gap.get("id") or "")
@@ -1014,31 +1031,8 @@ def _gap_file_map(
             subtitle_mapping[gap_id] = [index]
             available_indices.discard(index)
 
-        if len(subtitle_gaps) == len(gaps):
-            # Pure subtitle requests remain a subtitle-only materializer lane.
-            return subtitle_mapping, set(subtitle_mapping)
-
-        # Mixed requests are allowed only as the union of two independently
-        # validated maps.  The coordinator will move videos first and install
-        # these explicitly paired sidecars afterwards.
-        media_request = dict(request)
-        media_request["gaps"] = [
-            dict(gap) for gap in gaps if gap.get("kind") != "missing_subtitle"
-        ]
-        media_mapping, media_coverage = _gap_file_map(
-            media_request, release_name, manifest,
-            allowed_payload_extensions=VIDEO_EXTENSIONS,
-        )
-        mapping = dict(media_mapping)
-        for gap_id, indices in subtitle_mapping.items():
-            if gap_id in mapping:
-                # A duplicate gap coordinate is malformed request evidence;
-                # do not let one file satisfy two lanes.
-                continue
-            mapping[gap_id] = indices
-        return _sanitize_episode_gap_mapping(
-            gaps, manifest, mapping, media_coverage | set(subtitle_mapping),
-        )
+        # Pure subtitle requests remain a subtitle-only materializer lane.
+        return subtitle_mapping, set(subtitle_mapping)
     movie_gaps = [gap for gap in gaps if gap.get("kind") == "missing_media"]
     if movie_gaps:
         # The automatic movie lane is deliberately narrow: one known movie
@@ -3993,6 +3987,33 @@ def _acquire(
             stage="staging_root",
         )
     uploaded: list[dict[str, Any]] = []
+    raw_request_rows = request.get("gaps")
+    if not isinstance(raw_request_rows, list) or any(
+        not isinstance(gap, Mapping) for gap in raw_request_rows
+    ):
+        raise ReplenishmentCandidateError(
+            "补源请求 gap 证据无效，拒绝下载",
+            stage="lane_validation",
+        )
+    request_rows = [dict(gap) for gap in raw_request_rows]
+    if not request_rows:
+        raise ReplenishmentCandidateError(
+            "补源请求没有可执行 gap",
+            stage="lane_validation",
+        )
+    request_kinds = {str(gap.get("kind") or "") for gap in request_rows}
+    if request_kinds - {
+        "missing_episode", "missing_season", "missing_media", "missing_subtitle",
+    }:
+        raise ReplenishmentCandidateError(
+            "补源请求包含不支持的 gap 类型",
+            stage="lane_validation",
+        )
+    if "missing_subtitle" in request_kinds and request_kinds - {"missing_subtitle"}:
+        raise ReplenishmentCandidateError(
+            "字幕缺口必须使用独立 sidecar 补源请求",
+            stage="lane_validation",
+        )
     # ``client`` may be injected by the automatic coordinator so the staging
     # upload and its later Engine readback use the same AList session.  Do not
     # overwrite it below with a second client.

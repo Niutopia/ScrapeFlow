@@ -1,0 +1,9 @@
+{
+  "root": "/quark/影视/待刮削/某作品字幕包",
+  "children": [
+    {"name": "S01E01.chi.srt", "is_dir": false, "size": 40960},
+    {"name": "S01E02.chi.srt", "is_dir": false, "size": 40960},
+    {"name": "S01E03.chi.srt", "is_dir": false, "size": 40960},
+    {"name": "S01E04.chi.srt", "is_dir": false, "size": 40960}
+  ]
+}

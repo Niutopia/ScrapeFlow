@@ -72,7 +72,7 @@ REQUIRED_COMPOSE_DEFAULTS = {
 }
 REQUIRED_LOOPBACK_PORTS = {
     "alist": ["127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"],
-    "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"],
+    "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765"],
     # The Helper is reachable only through the API network namespace.
     "quark-helper": [],
 }

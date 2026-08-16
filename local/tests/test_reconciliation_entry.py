@@ -179,6 +179,9 @@ class ReconciliationEntryTests(unittest.TestCase):
 
     def _reconcile(self, runner: SimpleEngineRunner, *, source: str, match: SimpleNamespace):
         pending = runner.create_pending_job(source)
+        shelf = "movie" if match.media_type == "movie" else "anime"
+        started = runner.start_automatic_job(pending.id, target_shelf=shelf)
+        runner.mark_reconciling(started.id)
         with patch("engine.scraper.auto_match_tmdb", return_value=(match, [])) as matcher:
             result = runner.reconcile_automatic_job(pending.id)
         self.assertEqual(matcher.call_count, 1)
@@ -194,7 +197,7 @@ class ReconciliationEntryTests(unittest.TestCase):
             match=self._match("movie", 10, "New Movie"),
         )
 
-        self.assertEqual(result.phase, "awaiting_target_shelf")
+        self.assertEqual(result.phase, "queued")
         self.assertEqual(result.summary["reconciliation"]["outcome"], "new_work")
         started = runner.start_automatic_job(result.id, target_shelf="movie")
         self.assertEqual(started.phase, "queued")
@@ -668,7 +671,7 @@ class ReconciliationEntryTests(unittest.TestCase):
 
         self.assertEqual(result.phase, "reconciled")
         self.assertEqual(result.summary["reconciliation"]["outcome"], "existing_gap")
-        self.assertIsNone(result.target_shelf)
+        self.assertIsNotNone(result.target_shelf)
         self.assertEqual(client.mutations, [])
 
     def test_incoming_movie_video_overlaps_existing_media_gap_as_merge(self) -> None:
@@ -749,7 +752,7 @@ class ReconciliationEntryTests(unittest.TestCase):
         self.assertEqual(result.phase, "reconciled")
         self.assertEqual(result.summary["reconciliation"]["outcome"], "merge_existing")
         self.assertEqual(result.summary["reconciliation"]["matched_shelf"], "anime")
-        self.assertIsNone(result.target_shelf)
+        self.assertEqual(result.target_shelf, "anime")
         self.assertEqual(client.mutations, [])
 
     def test_tiny_incoming_tv_episode_does_not_become_merge_existing(self) -> None:
@@ -911,6 +914,8 @@ class ReconciliationEntryTests(unittest.TestCase):
             "自动匹配前两名证据无法区分，拒绝自动选择", candidates=scored,
         )
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        runner.mark_reconciling(pending.id)
         with patch("engine.scraper.auto_match_tmdb", side_effect=error):
             result = runner.reconcile_automatic_job(pending.id)
 
@@ -972,6 +977,8 @@ class ReconciliationEntryTests(unittest.TestCase):
             year="2020", confidence=0.99, status="confirmed",
         )
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        runner.start_automatic_job(pending.id, target_shelf="movie")
+        runner.mark_reconciling(pending.id)
         with patch(
             "engine.scraper.auto_match_tmdb",
             return_value=(match, [best_row, runner_up]),
@@ -1031,7 +1038,7 @@ class ReconciliationEntryTests(unittest.TestCase):
             return_value=(self._match("movie", 10, "Incoming"), []),
         ):
             reconciled = runner.reconcile_automatic_job(pending.id)
-        self.assertEqual(reconciled.phase, "awaiting_target_shelf")
+        self.assertEqual(reconciled.phase, "queued")
         self.assertEqual(reconciled.summary["reconciliation"]["outcome"], "new_work")
         self.assertEqual(reconciled.summary["reconciliation"]["identity"]["tmdb_id"], 77)
         self.assertEqual(client.mutations, [])
@@ -1066,6 +1073,8 @@ class ReconciliationEntryTests(unittest.TestCase):
         client = ReadOnlyAList(self._tree())
         runner = self._runner(client)
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        runner.start_automatic_job(pending.id, target_shelf="movie")
+        pending = runner.mark_reconciling(pending.id)
         # Do not let startup recovery enqueue this fixture before the explicit
         # scheduler-boundary assertion below.
         with patch.object(SimpleApplication, "_start_startup_thread"):
@@ -1117,8 +1126,10 @@ class ReconciliationEntryTests(unittest.TestCase):
         client = ReadOnlyAList(self._tree())
         runner = self._runner(client)
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        selected_root = runner.start_automatic_job(pending.id, target_shelf="movie")
+        pending = runner.mark_reconciling(pending.id)
         selected = replace(
-            pending,
+            selected_root,
             phase="planned",
             target_shelf="movie",
             target_root=self.movie_root,
@@ -1157,6 +1168,8 @@ class ReconciliationEntryTests(unittest.TestCase):
         )
         runner = self._runner(client)
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        runner.start_automatic_job(pending.id, target_shelf="movie")
+        pending = runner.mark_reconciling(pending.id)
         with patch.object(SimpleApplication, "_start_startup_thread"):
             application = SimpleApplication(
                 state_root=Path(self.temporary.name) / "app",
@@ -1193,6 +1206,8 @@ class ReconciliationEntryTests(unittest.TestCase):
         client = ReadOnlyAList(self._tree())
         runner = self._runner(client)
         pending = runner.create_pending_job(f"{self.intake_root}/Incoming")
+        runner.start_automatic_job(pending.id, target_shelf="movie")
+        pending = runner.mark_reconciling(pending.id)
         reconciliation = {
             "outcome": "merge_existing",
             "identity": {"media_type": "movie", "tmdb_id": 23},

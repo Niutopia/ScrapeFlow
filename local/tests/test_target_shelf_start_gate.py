@@ -192,21 +192,18 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(request.query, query)
         self.assertEqual(identity.target_shelf_root, "/library/番剧")
 
-    def test_pending_registration_enters_read_only_reconciliation_then_new_work_starts(self) -> None:
+    def test_pending_registration_waits_for_shelf_before_reconciliation(self) -> None:
         pending = self.runner.create_pending_job("/library/待刮削/Source")
 
-        self.assertEqual(pending.phase, "reconciling")
+        self.assertEqual(pending.phase, "awaiting_target_shelf")
         self.assertEqual(pending.plan, {})
         self.assertEqual(pending.summary["ingress_source_path"], "/library/待刮削/Source")
         self.assertIsNone(pending.target_shelf)
         self.assertEqual(self.events, [])
         self.assertEqual(self.alist.login_calls, 0)
-        with self.assertRaisesRegex(EngineJobConflictError, "对账尚未完成"):
-            self.runner.start_automatic_job(pending.id, target_shelf="anime")
 
-        waiting = self._new_work_waiting()
-        started = self.runner.start_automatic_job(waiting.id, target_shelf="anime")
-        repeated = self.runner.start_automatic_job(waiting.id, target_shelf="anime")
+        started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
+        repeated = self.runner.start_automatic_job(pending.id, target_shelf="anime")
 
         self.assertEqual(started.phase, "queued")
         self.assertEqual(started.target_shelf, "anime")
@@ -253,8 +250,8 @@ class TargetShelfStartGateTests(unittest.TestCase):
 
         recovered = self.runner.recover_job(pending.id)
 
-        self.assertEqual(recovered.phase, "reconciling")
-        self.assertEqual(self.runner.get_job(pending.id).phase, "reconciling")
+        self.assertEqual(recovered.phase, "awaiting_target_shelf")
+        self.assertEqual(self.runner.get_job(pending.id).phase, "awaiting_target_shelf")
         self.assertEqual(self.events, [])
 
     def test_legacy_automatic_root_cannot_execute_without_a_selection(self) -> None:

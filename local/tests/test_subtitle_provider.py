@@ -213,6 +213,63 @@ class SubtitleProviderTests(unittest.TestCase):
         # Verify that candidate 2 (.ass) was installed after candidate 1 failed language check
         self.assertIn("/quark/影视/ScrapeFlow/补源/test-root/subtitles/Show S01E01.zh-CN.ass", alist.files)
 
+    def test_materializer_uses_production_alist_upload_signature(self) -> None:
+        """The real AList client receives one complete target path and MIME."""
+        content = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "你好，这是生产签名测试字幕。\n"
+        ).encode("utf-8")
+
+        class ProductionShapeAList(MockAList):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[str, int, str, bool]] = []
+
+            def upload_bytes(
+                self, target_path: str, data: bytes, content_type: str,
+                *, overwrite: bool = False,
+            ) -> None:
+                self.calls.append((target_path, len(data), content_type, overwrite))
+                parent = posixpath.dirname(target_path)
+                name = posixpath.basename(target_path)
+                self.files[target_path] = data
+                self.tree.setdefault(parent, [])
+                self.tree[parent].append({
+                    "name": name, "is_dir": False, "size": len(data),
+                })
+
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt", "url": "https://example.test/sub.srt",
+            "format": "srt",
+        }]
+        materializer = SubtitleMaterializer(
+            discovery=discovery,
+            downloader=lambda _url: content,
+        )
+        alist = ProductionShapeAList()
+        gap = {
+            "id": "missing_subtitle:production",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                {"media": {"title": "Show"}}, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/production/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(
+            alist.calls,
+            [(
+                "/quark/影视/ScrapeFlow/补源/production/attempt/Show.S01E01.zh-CN.srt",
+                len(content), "application/x-subrip", False,
+            )],
+        )
+
     def test_runtime_handles_no_subtitles_found_as_completed_with_gaps(self) -> None:
         discovery = SubtitleDiscoveryService(
             enabled=True,

@@ -25,6 +25,7 @@ from .remote_paths import (
 
 if TYPE_CHECKING:
     from .core import TMDBClient
+    from .work_units import IdentityEvidence
 
 
 AUTO_MATCH_MIN_MARGIN = 0.08
@@ -1238,6 +1239,313 @@ def auto_match_tmdb(
     return best, candidates
 
 
+def auto_match_from_evidence(
+    client: TMDBClient,
+    evidence: IdentityEvidence,
+    *,
+    min_confidence: float = 0.70,
+    prefer_animation: bool = False,
+    excluded_tmdb_ids: Collection[int] | None = None,
+) -> tuple[AutoMatch, list[AutoMatch]]:
+    """Match a WorkUnit's IdentityEvidence against TMDB.
+
+    Evaluates boundary labels, parent container clues, representative names,
+    years, and structural episode counts to select and score candidates.
+    """
+    if not evidence.boundary_label.strip():
+        raise PlanError("IdentityEvidence boundary_label 为空")
+    if not 0 <= min_confidence <= 1:
+        raise PlanError("自动匹配最低置信度必须在 0 到 1 之间")
+
+    excluded_ids = {int(value) for value in (excluded_tmdb_ids or ())}
+    target_media_type = evidence.media_shape if evidence.media_shape in {"tv", "movie"} else None
+    initial_types = [target_media_type] if target_media_type else ["tv", "movie"]
+
+    # Gather search queries in prioritized order
+    candidate_queries: list[str] = []
+
+    # 1. Combined parent + boundary queries first if parent labels exist (e.g. "Fate Zero", "Fate/Zero")
+    for parent in evidence.parent_labels:
+        p_clean = parent.strip()
+        b_clean = evidence.boundary_label.strip()
+        if p_clean and b_clean:
+            candidate_queries.append(f"{p_clean} {b_clean}")
+            candidate_queries.append(f"{p_clean}/{b_clean}")
+
+    # 2. Direct boundary label
+    candidate_queries.append(evidence.boundary_label)
+
+    # 3. Normalized titles and combined with parent
+    for t in evidence.normalized_titles:
+        for parent in evidence.parent_labels:
+            if parent.strip() and t.strip():
+                candidate_queries.append(f"{parent.strip()} {t.strip()}")
+        candidate_queries.append(t)
+
+    # 4. Aliases and representative names
+    for a in evidence.aliases:
+        for parent in evidence.parent_labels:
+            if parent.strip() and a.strip():
+                candidate_queries.append(f"{parent.strip()} {a.strip()}")
+        candidate_queries.append(a)
+    for r in evidence.representative_names:
+        candidate_queries.append(r)
+
+    # Deduplicate while preserving order
+    seen_q: set[str] = set()
+    search_queries: list[str] = []
+    for q in candidate_queries:
+        norm_q = q.strip()
+        if norm_q and norm_q not in seen_q:
+            seen_q.add(norm_q)
+            search_queries.append(norm_q)
+
+    expected_episode_count = (
+        evidence.episode_pattern.total_episodes
+        if evidence.episode_pattern and evidence.episode_pattern.total_episodes > 0 and evidence.media_shape == "tv"
+        else None
+    )
+
+    query_years = {str(y) for y in evidence.years}
+    raw_candidates: list[dict[str, Any]] = []
+    searched_types: list[str] = []
+
+    search_query_keys = [_normalize_match_title(sq) for sq in search_queries if _normalize_match_title(sq)]
+
+    def collect_type(candidate_type: str) -> None:
+        if candidate_type in searched_types:
+            return
+        searched_types.append(candidate_type)
+        search_items: list[Any] = []
+        seen_search_ids: set[int] = set()
+
+        def ingest(response: Mapping[str, Any]) -> None:
+            for item in list(response.get("results") or [])[:10]:
+                if not isinstance(item, Mapping) or isinstance(item.get("id"), bool):
+                    continue
+                try:
+                    item_id = int(item["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if item_id in seen_search_ids:
+                    continue
+                seen_search_ids.add(item_id)
+                search_items.append(item)
+
+        # Search top candidate queries
+        for sq in search_queries[:6]:
+            for variant in _search_query_variants(sq):
+                response = client.get(f"/search/{candidate_type}", query=variant)
+                ingest(response)
+
+        if not search_items and search_queries:
+            first_q = search_queries[0]
+            response = client.get(f"/search/{candidate_type}", query=first_q, page=1)
+            ingest(response)
+
+        for index, item in enumerate(search_items):
+            if not isinstance(item, Mapping) or isinstance(item.get("id"), bool):
+                continue
+            try:
+                tmdb_id = int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            titles = _search_item_titles(item, candidate_type)
+            if not titles:
+                continue
+
+            # Calculate title score against all query variants
+            title_score = max(
+                (_title_similarity(k, title) for k in search_query_keys for title in titles),
+                default=0.0,
+            )
+
+            aliases = (
+                _alternative_tmdb_titles(client, candidate_type, tmdb_id)
+                if index < 5 else []
+            )
+            alias_score = max(
+                (_title_similarity(k, title) for k in search_query_keys for title in aliases),
+                default=0.0,
+            )
+
+            date_value = item.get(
+                "first_air_date" if candidate_type == "tv" else "release_date"
+            )
+            year = _extract_year(date_value)
+            genre_ids = item.get("genre_ids") or []
+            is_animation = 16 in genre_ids if isinstance(genre_ids, list) and genre_ids else None
+            actual_episode_count: int | None = None
+            if expected_episode_count and candidate_type == "tv" and index < 5:
+                try:
+                    details = client.get(f"/tv/{tmdb_id}")
+                except ApiError:
+                    details = {}
+                actual_count = details.get("number_of_episodes")
+                if isinstance(actual_count, int) and not isinstance(actual_count, bool):
+                    actual_episode_count = actual_count
+            raw_candidates.append({
+                "media_type": candidate_type,
+                "tmdb_id": tmdb_id,
+                "title": titles[0],
+                "titles": titles,
+                "aliases": aliases,
+                "year": year,
+                "title_score": title_score,
+                "alias_score": alias_score,
+                "cross_script": _cross_script_unique_match(evidence.boundary_label, [*titles, *aliases]),
+                "matched_query": evidence.boundary_label,
+                "is_animation": is_animation,
+                "actual_episode_count": actual_episode_count,
+            })
+
+    def score(raw: Mapping[str, Any]) -> AutoMatch:
+        title_score = float(raw["title_score"])
+        alias_score = float(raw["alias_score"])
+        evidence_score = max(title_score, alias_score)
+
+        parent_bonus = 0.0
+        candidate_all_titles = [str(t).lower() for t in raw["titles"]] + [str(a).lower() for a in raw["aliases"]]
+        for p in evidence.parent_labels:
+            p_norm = p.strip().lower()
+            if p_norm and any(p_norm in ct for ct in candidate_all_titles):
+                parent_bonus = max(parent_bonus, 0.04)
+
+        year_score = 0.0
+        wrong_year = False
+        if query_years:
+            candidate_year = str(raw["year"])
+            if candidate_year in query_years:
+                year_score = 0.0
+            elif candidate_year == "未知年份":
+                year_score = -0.06
+            else:
+                try:
+                    cand_y_int = int(candidate_year)
+                    deltas = [abs(cand_y_int - int(qy)) for qy in query_years if qy.isdigit()]
+                    min_delta = min(deltas) if deltas else 0
+                    wrong_year = min_delta >= 2
+                    year_score = -0.30 if wrong_year else -0.12
+                except ValueError:
+                    year_score = -0.06
+
+        media_type_score = 0.0
+        context_score = 0.0
+        if prefer_animation and raw["media_type"] in {"tv", "movie"}:
+            if raw["is_animation"] is True:
+                context_score = 0.0
+            elif raw["is_animation"] is False:
+                context_score = -0.12
+
+        episode_structure_score = 0.0
+        actual_count = raw["actual_episode_count"]
+        if expected_episode_count and isinstance(actual_count, int):
+            episode_structure_score = 0.0 if actual_count == expected_episode_count else -0.08
+
+        confidence = max(0.0, min(1.0, evidence_score + parent_bonus + year_score + media_type_score + context_score + episode_structure_score))
+        blockers: list[str] = []
+        if wrong_year:
+            blockers.append("year_conflict")
+        if raw["cross_script"] and alias_score < 0.88:
+            blockers.append("cross_script_without_alias_evidence")
+        if confidence < min_confidence:
+            blockers.append("below_confidence_threshold")
+
+        status = "rejected" if blockers else "confirmed"
+        components = {
+            "title_score": round(title_score, 6),
+            "alias_score": round(alias_score, 6),
+            "parent_bonus": round(parent_bonus, 6),
+            "year_score": round(year_score, 6),
+            "media_type_score": round(media_type_score, 6),
+            "episode_structure_score": round(episode_structure_score, 6),
+            "context_score": round(context_score, 6),
+            "final_score": round(confidence, 6),
+        }
+        return AutoMatch(
+            str(raw["media_type"]), int(raw["tmdb_id"]), str(raw["title"]),
+            str(raw["year"]), confidence, status, components,
+            {
+                "query": evidence.boundary_label,
+                "matched_query_variant": raw.get("matched_query", evidence.boundary_label),
+                "query_years": sorted(query_years),
+                "official_titles": list(raw["titles"]),
+                "aliases_checked": list(raw["aliases"]),
+                "blockers": blockers,
+                "expected_episode_count": expected_episode_count,
+                "actual_episode_count": actual_count,
+                "work_unit_id": evidence.work_unit_id,
+            },
+        )
+
+    for initial_type in initial_types:
+        collect_type(initial_type)
+    candidates = [
+        score(item) for item in raw_candidates
+        if int(item["tmdb_id"]) not in excluded_ids
+    ]
+    if len(initial_types) == 1 and initial_types[0] in {"tv", "movie"}:
+        initial_scored = [item for item in candidates if item.media_type == initial_types[0]]
+        if not initial_scored or max(item.confidence for item in initial_scored) < min_confidence or not any(
+            item.status == "confirmed" for item in initial_scored
+        ):
+            try:
+                collect_type("movie" if initial_types[0] == "tv" else "tv")
+            except ApiError:
+                if not initial_scored:
+                    raise
+            candidates = [
+                score(item) for item in raw_candidates
+                if int(item["tmdb_id"]) not in excluded_ids
+            ]
+
+    candidates.sort(key=lambda item: (-item.confidence, item.media_type, item.tmdb_id))
+    if not candidates:
+        raise PlanError(f"TMDB 未找到自动匹配候选: {evidence.boundary_label}")
+    best = candidates[0]
+    if best.status != "confirmed":
+        preview = "; ".join(
+            f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%}, {item.status})"
+            for item in candidates[:3]
+        )
+        raise AutoMatchAmbiguityError(
+            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview,
+            candidates=candidates,
+        )
+    if "year_conflict" in best.decision_trace.get("blockers", []):
+        raise AutoMatchAmbiguityError(
+            f"自动匹配候选年份与源目录冲突，拒绝自动选择: "
+            f"query_years={sorted(query_years)}, candidate={best.media_type}/{best.tmdb_id} "
+            f"{best.title} ({best.year})",
+            candidates=candidates,
+        )
+    runner_up = candidates[1] if len(candidates) > 1 else None
+    best_exact = max(
+        float(best.score_components.get("title_score", 0.0)),
+        float(best.score_components.get("alias_score", 0.0)),
+    ) >= 0.999999
+    runner_exact = bool(runner_up) and max(
+        float(runner_up.score_components.get("title_score", 0.0)),
+        float(runner_up.score_components.get("alias_score", 0.0)),
+    ) >= 0.999999
+    exact_title_uniquely_identifies_best = best_exact and not runner_exact
+    if (
+        runner_up is not None
+        and best.confidence - runner_up.confidence + 1e-9
+        < AUTO_MATCH_MIN_MARGIN
+        and not exact_title_uniquely_identifies_best
+    ):
+        raise AutoMatchAmbiguityError(
+            "自动匹配前两名证据无法区分，拒绝自动选择: "
+            + "; ".join(
+                f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%})"
+                for item in candidates[:2]
+            ),
+            candidates=candidates,
+        )
+    return best, candidates
+
+
 __all__ = [
     "AUTO_MATCH_MIN_MARGIN",
     "AutoMatchAmbiguityError",
@@ -1264,4 +1572,5 @@ __all__ = [
     "_source_is_animation_library",
     "_media_context_from_source_and_target",
     "auto_match_tmdb",
+    "auto_match_from_evidence",
 ]

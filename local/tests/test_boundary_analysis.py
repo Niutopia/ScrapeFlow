@@ -1,0 +1,464 @@
+"""Tests for Phase-2 SourceInventory and BoundaryAnalysis.
+
+All tests are fully offline — no network, no AList, no TMDB.
+Fixtures are loaded from local/tests/fixtures/media_cases/*.json.
+"""
+
+from __future__ import annotations
+
+import json
+import unittest
+from pathlib import Path
+
+from engine.scrapeflow.boundary_analysis import (
+    DirectoryRole,
+    WorkCandidate,
+    analyze_boundaries,
+)
+from engine.scrapeflow.source_inventory import (
+    SourceFile,
+    SourceNode,
+    build_source_inventory_from_fixture,
+    classify_object_type,
+    collect_all_files,
+    count_video_files,
+    count_subtitle_files,
+    direct_video_file_count,
+    has_only_subtitles,
+    load_fixture,
+)
+
+_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media_cases"
+
+
+def _load(case_id: str) -> SourceNode:
+    return load_fixture(_FIXTURE_DIR / case_id / "source_tree.json")
+
+
+# ===========================================================================
+# SourceInventory unit tests
+# ===========================================================================
+
+class TestClassifyObjectType(unittest.TestCase):
+    def test_video_extensions(self) -> None:
+        for name in ("movie.mkv", "ep01.mp4", "ep02.avi", "clip.ts"):
+            with self.subTest(name=name):
+                self.assertEqual(classify_object_type(name), "video")
+
+    def test_subtitle_extensions(self) -> None:
+        for name in ("sub.srt", "sub.ass", "sub.ssa"):
+            with self.subTest(name=name):
+                self.assertEqual(classify_object_type(name), "subtitle")
+
+    def test_poster(self) -> None:
+        self.assertEqual(classify_object_type("poster.jpg"), "poster")
+        self.assertEqual(classify_object_type("fanart.png"), "poster")
+
+    def test_nfo(self) -> None:
+        self.assertEqual(classify_object_type("tvshow.nfo"), "nfo")
+
+    def test_other(self) -> None:
+        self.assertEqual(classify_object_type("readme.txt"), "other")
+
+
+class TestBuildFromFixture(unittest.TestCase):
+    def test_ordinary_movie_structure(self) -> None:
+        node = _load("ordinary_movie")
+        self.assertEqual(node.name, "流浪地球2 (2023)")
+        self.assertEqual(node.depth, 0)
+        # No sub-directories — all items are direct files
+        self.assertEqual(len(node.children), 0)
+        file_names = {f.name for f in node.files}
+        self.assertIn("流浪地球2.2023.2160p.mkv", file_names)
+        self.assertIn("poster.jpg", file_names)
+
+    def test_fate_container_structure(self) -> None:
+        node = _load("fate_container")
+        self.assertEqual(node.name, "Fate系列")
+        child_names = {c.name for c in node.children}
+        self.assertIn("空之境界", child_names)
+        self.assertIn("Fate Stay Night UBW", child_names)
+        self.assertIn("Fate Zero", child_names)
+
+    def test_multiseason_structure(self) -> None:
+        node = _load("single_tv_multiseason")
+        child_names = {c.name for c in node.children}
+        self.assertIn("Season 01", child_names)
+        self.assertIn("Season 02", child_names)
+        self.assertIn("Season 03", child_names)
+
+    def test_depth_assignment(self) -> None:
+        node = _load("fate_container")
+        # Root = depth 0
+        self.assertEqual(node.depth, 0)
+        # Immediate children = depth 1
+        for child in node.children:
+            self.assertEqual(child.depth, 1)
+        # Season dirs inside FSN UBW = depth 2
+        fsn = next(c for c in node.children if c.name == "Fate Stay Night UBW")
+        for season in fsn.children:
+            self.assertEqual(season.depth, 2)
+
+
+class TestCountHelpers(unittest.TestCase):
+    def test_count_video_files_ordinary_movie(self) -> None:
+        node = _load("ordinary_movie")
+        self.assertEqual(count_video_files(node), 1)
+
+    def test_count_video_files_fate_container(self) -> None:
+        node = _load("fate_container")
+        # 空之境界: 3, FSN UBW S1: 2 + S2: 1, Fate Zero: 4 = 10
+        self.assertEqual(count_video_files(node), 10)
+
+    def test_count_subtitle_files(self) -> None:
+        node = _load("ordinary_movie")
+        self.assertEqual(count_subtitle_files(node), 1)
+
+    def test_subtitle_only_has_no_video(self) -> None:
+        node = _load("subtitle_only")
+        self.assertEqual(count_video_files(node), 0)
+        self.assertEqual(count_subtitle_files(node), 4)
+
+    def test_direct_video_count_excludes_subdirs(self) -> None:
+        node = _load("fate_container")
+        # Fate series root has NO videos directly — all are in sub-directories
+        self.assertEqual(direct_video_file_count(node), 0)
+
+    def test_collect_all_files_flat(self) -> None:
+        node = _load("ordinary_movie")
+        all_files = collect_all_files(node)
+        self.assertEqual(len(all_files), 3)  # mkv + srt + jpg
+
+    def test_has_only_subtitles_true(self) -> None:
+        node = _load("subtitle_only")
+        self.assertTrue(has_only_subtitles(node))
+
+    def test_has_only_subtitles_false_when_video_present(self) -> None:
+        node = _load("ordinary_movie")
+        self.assertFalse(has_only_subtitles(node))
+
+
+# ===========================================================================
+# BoundaryAnalysis — per-fixture contract tests
+# ===========================================================================
+
+class TestBoundaryOrdinaryMovie(unittest.TestCase):
+    """单部电影 → single_work, media_context=movie."""
+
+    def setUp(self) -> None:
+        node = _load("ordinary_movie")
+        self.candidates = analyze_boundaries(node, root_task_id="test-root-movie")
+
+    def test_exactly_one_candidate(self) -> None:
+        self.assertEqual(len(self.candidates), 1)
+
+    def test_role_is_single_work(self) -> None:
+        c = self.candidates[0]
+        self.assertEqual(c.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
+    def test_media_context_is_movie(self) -> None:
+        c = self.candidates[0]
+        self.assertEqual(c.proposed_media_context, "movie")
+
+    def test_confidence_above_threshold(self) -> None:
+        self.assertGreater(self.candidates[0].boundary_evidence.confidence, 0.5)
+
+    def test_work_unit_id_is_stable(self) -> None:
+        node = _load("ordinary_movie")
+        candidates2 = analyze_boundaries(node, root_task_id="test-root-movie")
+        self.assertEqual(
+            self.candidates[0].work_unit_id,
+            candidates2[0].work_unit_id,
+        )
+
+
+class TestBoundaryMultiSeason(unittest.TestCase):
+    """单剧多季 → single_work（多个季目录属于同一作品）, media_context=tv."""
+
+    def setUp(self) -> None:
+        node = _load("single_tv_multiseason")
+        self.candidates = analyze_boundaries(node, root_task_id="test-root-bb")
+
+    def test_exactly_one_candidate(self) -> None:
+        """Multi-season single TV show must NOT produce multiple WorkCandidates."""
+        self.assertEqual(len(self.candidates), 1)
+
+    def test_role_is_single_work(self) -> None:
+        c = self.candidates[0]
+        self.assertEqual(c.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
+    def test_media_context_is_tv(self) -> None:
+        self.assertEqual(self.candidates[0].proposed_media_context, "tv")
+
+
+class TestBoundaryFateContainer(unittest.TestCase):
+    """Fate 系列容器 → series_container, 至少 2 个独立 WorkCandidate."""
+
+    def setUp(self) -> None:
+        node = _load("fate_container")
+        self.candidates = analyze_boundaries(node, root_task_id="test-root-fate")
+
+    def test_at_least_two_candidates(self) -> None:
+        self.assertGreaterEqual(len(self.candidates), 2)
+
+    def test_all_roles_are_series_container(self) -> None:
+        for c in self.candidates:
+            self.assertEqual(
+                c.boundary_evidence.role,
+                DirectoryRole.SERIES_CONTAINER,
+                msg=f"Candidate '{c.display_label}' has unexpected role",
+            )
+
+    def test_known_works_are_candidates(self) -> None:
+        labels = {c.display_label for c in self.candidates}
+        self.assertIn("空之境界", labels)
+        self.assertIn("Fate Zero", labels)
+
+    def test_work_unit_ids_are_distinct(self) -> None:
+        ids = [c.work_unit_id for c in self.candidates]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_all_candidates_have_source_paths(self) -> None:
+        for c in self.candidates:
+            self.assertTrue(len(c.source_paths) > 0)
+
+
+class TestBoundarySubtitleOnly(unittest.TestCase):
+    """只有字幕文件的目录 → subtitle_group."""
+
+    def setUp(self) -> None:
+        node = _load("subtitle_only")
+        self.candidates = analyze_boundaries(node, root_task_id="test-root-sub")
+
+    def test_exactly_one_candidate(self) -> None:
+        self.assertEqual(len(self.candidates), 1)
+
+    def test_role_is_subtitle_group(self) -> None:
+        c = self.candidates[0]
+        self.assertEqual(c.boundary_evidence.role, DirectoryRole.SUBTITLE_GROUP)
+
+
+# ===========================================================================
+# BoundaryAnalysis — semantic unit tests
+# ===========================================================================
+
+class TestSeasonDirNotIndependentWork(unittest.TestCase):
+    """Season sub-directories must NOT become independent WorkCandidates
+    when they are inside a multi-season root."""
+
+    def test_season_dirs_treated_as_single_work(self) -> None:
+        node = _load("single_tv_multiseason")
+        candidates = analyze_boundaries(node, root_task_id="test-root")
+        # Season 01/02/03 are NOT separate works
+        self.assertEqual(len(candidates), 1)
+        season_labels = {"Season 01", "Season 02", "Season 03"}
+        for c in candidates:
+            self.assertNotIn(c.display_label, season_labels)
+
+    def test_season_subdir_analyzed_directly_returns_season_role(self) -> None:
+        """If we analyse a season dir in isolation, it should report SEASON."""
+        fixture = {
+            "root": "/quark/影视/待刮削/绝命毒师/Season 01",
+            "children": [
+                {"name": "S01E01.mkv", "is_dir": False, "size": 1073741824},
+            ],
+        }
+        node = build_source_inventory_from_fixture(fixture)
+        candidates = analyze_boundaries(node, root_task_id="test-root")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SEASON)
+
+
+class TestManifestConsistency(unittest.TestCase):
+    """Manifest entries must each have a matching fixture directory."""
+
+    def test_all_manifest_cases_have_fixture(self) -> None:
+        manifest_path = _FIXTURE_DIR / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest:
+            case_id = entry["id"]
+            fixture_path = _FIXTURE_DIR / case_id / "source_tree.json"
+            self.assertTrue(
+                fixture_path.exists(),
+                msg=f"Fixture missing: {fixture_path}",
+            )
+
+    def test_manifest_cases_produce_expected_role(self) -> None:
+        manifest_path = _FIXTURE_DIR / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest:
+            case_id = entry["id"]
+            expected_role = entry.get("expected_role")
+            if not expected_role:
+                continue
+            node = _load(case_id)
+            candidates = analyze_boundaries(node, root_task_id=f"test-{case_id}")
+            actual_roles = {c.boundary_evidence.role.value for c in candidates}
+            self.assertIn(
+                expected_role,
+                actual_roles,
+                msg=f"Case '{case_id}': expected role '{expected_role}' not in {actual_roles}",
+            )
+
+    def test_manifest_cases_produce_expected_count(self) -> None:
+        manifest_path = _FIXTURE_DIR / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest:
+            case_id = entry["id"]
+            expected = entry.get("expected_work_count")
+            if expected is None:
+                continue
+            node = _load(case_id)
+            candidates = analyze_boundaries(node, root_task_id=f"test-{case_id}")
+            count = len(candidates)
+            if isinstance(expected, int):
+                self.assertEqual(
+                    count, expected,
+                    msg=f"Case '{case_id}': expected {expected} candidates, got {count}",
+                )
+            elif isinstance(expected, str) and expected.startswith(">="):
+                threshold = int(expected[2:])
+                self.assertGreaterEqual(
+                    count, threshold,
+                    msg=f"Case '{case_id}': expected >={threshold} candidates, got {count}",
+                )
+
+
+class TestSyntheticCases(unittest.TestCase):
+    """Synthetic inline fixtures for edge cases not covered by file fixtures."""
+
+    def _node(self, fixture_dict: dict) -> SourceNode:
+        return build_source_inventory_from_fixture(fixture_dict)
+
+    def test_single_subdirectory_with_videos_is_single_work(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/SomeMovie",
+            "children": [
+                {
+                    "name": "Video",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "movie.mkv", "is_dir": False, "size": 5368709120},
+                    ],
+                }
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
+    def test_two_titled_children_gives_two_candidates(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Container",
+            "children": [
+                {
+                    "name": "Work A",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "ep01.mkv", "is_dir": False, "size": 1073741824},
+                    ],
+                },
+                {
+                    "name": "Work B",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "ep01.mkv", "is_dir": False, "size": 1073741824},
+                    ],
+                },
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        self.assertEqual(len(candidates), 2)
+
+    def test_extras_subdir_excluded_from_series_container(self) -> None:
+        """An 'Extras' directory must not make the root a SERIES_CONTAINER."""
+        fixture = {
+            "root": "/quark/影视/待刮削/SomeSeries",
+            "children": [
+                {
+                    "name": "Extras",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "bonus.mkv", "is_dir": False, "size": 500000000},
+                    ],
+                },
+                {
+                    "name": "Season 01",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "S01E01.mkv", "is_dir": False, "size": 1073741824},
+                    ],
+                },
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        # Should be single_work (multi-season), not series_container
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
+    def test_empty_directory_returns_uncertain(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/EmptyDir",
+            "children": [],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.UNCERTAIN)
+
+    def test_chinese_season_dir_is_season(self) -> None:
+        """'第1季' and similar Chinese patterns must match the season rule."""
+        fixture = {
+            "root": "/quark/影视/待刮削/某剧/第1季",
+            "children": [
+                {"name": "EP01.mkv", "is_dir": False, "size": 1073741824},
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SEASON)
+
+    def test_s01_dir_is_season(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/SomeShow/S01",
+            "children": [
+                {"name": "ep01.mkv", "is_dir": False, "size": 1073741824},
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="t")
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SEASON)
+
+    def test_work_unit_id_stable_across_calls(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Fate系列",
+            "children": [
+                {
+                    "name": "空之境界",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "01.mkv", "is_dir": False, "size": 4000000000},
+                    ],
+                },
+                {
+                    "name": "Fate Zero",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "01.mkv", "is_dir": False, "size": 1000000000},
+                    ],
+                },
+            ],
+        }
+        node = build_source_inventory_from_fixture(fixture)
+        c1 = analyze_boundaries(node, root_task_id="root-xyz")
+        c2 = analyze_boundaries(node, root_task_id="root-xyz")
+        ids1 = {c.work_unit_id for c in c1}
+        ids2 = {c.work_unit_id for c in c2}
+        self.assertEqual(ids1, ids2)
+
+
+if __name__ == "__main__":
+    unittest.main()

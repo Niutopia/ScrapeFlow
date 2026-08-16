@@ -1850,7 +1850,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             finally:
                 app.close()
 
-    def test_final_tier_candidate_exhaustion_stops_without_infrastructure_budget(self) -> None:
+    def test_final_tier_candidate_exhaustion_completes_with_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
             {
@@ -1903,10 +1903,72 @@ class AuditOwnedRootTests(unittest.TestCase):
 
                 persisted = runner.get_job(job.id)
                 replenishment = persisted.summary["replenishment"]
-                self.assertEqual(replenishment["status"], "failed")
+                self.assertEqual(replenishment["status"], "completed_with_gaps")
                 self.assertTrue(replenishment["terminal"])
                 self.assertEqual(persisted.summary.get("replenishment_attempts"), 0)
                 provider_queue.assert_not_called()
+            finally:
+                app.close()
+
+    def test_subtitle_exhaustion_does_not_terminate_retryable_media_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "SCRAPEFLOW_START_PAUSED": "1",
+                "SCRAPEFLOW_PROVIDER_PILOT_TMDB": "42",
+            },
+            clear=False,
+        ):
+            root = Path(directory)
+            remote = EmptyAList()
+            runner = SimpleEngineRunner(
+                root, alist=remote, tmdb=object(), validate=False,
+                library_root="/library",
+            )
+            app = SimpleApplication(
+                state_root=root, remote_root="/library", remote=remote,
+                engine_runner=runner, enforce_engine_roots=False,
+            )
+            job = runner.create_audit_owned_root(_project(_gap()))
+
+            class SplitLaneRuntime:
+                def run_for_job(self, _job: EngineJob) -> dict[str, object]:
+                    return {
+                        "job_id": job.id,
+                        "outcomes": [
+                            {
+                                "request": {"lane": "media"},
+                                "error": "media tier still retryable",
+                                "failure_scope": "candidate",
+                            },
+                            {
+                                "request": {"lane": "subtitle"},
+                                "status": "completed_with_gaps",
+                                "terminal": True,
+                                "error": "no subtitle candidate",
+                                "failure_scope": "candidate",
+                            },
+                        ],
+                        "unresolved_gaps": [],
+                    }
+
+            try:
+                with patch.object(app, "_start_startup_thread"):
+                    app.set_paused(False)
+                    self._admit_provider(app)
+                with patch.object(
+                    app, "_get_automatic_replenishment",
+                    return_value=SplitLaneRuntime(),
+                ), patch.object(
+                    app, "_queue_scoped_library_audit",
+                ), patch.object(app, "_queue_provider_job") as provider_queue:
+                    app._run_automatic_replenishment(job.id)
+
+                replenishment = runner.get_job(job.id).summary["replenishment"]
+                self.assertEqual(replenishment["status"], "retry_wait")
+                self.assertFalse(replenishment["terminal"])
+                self.assertEqual(replenishment["next_retry_seconds"], 30)
+                provider_queue.assert_called_once_with(job.id, delay=30.0)
             finally:
                 app.close()
 

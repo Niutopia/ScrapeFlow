@@ -1,0 +1,29 @@
+[
+  {
+    "id": "ordinary_movie",
+    "description": "单部电影：根目录直接含主视频文件",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "movie"
+  },
+  {
+    "id": "single_tv_multiseason",
+    "description": "单剧多季（Breaking Bad 风格）：多个 Season 子目录属于同一 TV 作品",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "tv"
+  },
+  {
+    "id": "fate_container",
+    "description": "Fate 系列容器：顶层有多个独立作品子目录，每个子目录有自己的视频",
+    "expected_role": "series_container",
+    "expected_work_count": ">=2",
+    "expected_media_context": "mixed"
+  },
+  {
+    "id": "subtitle_only",
+    "description": "字幕组目录：只含字幕文件，无视频",
+    "expected_role": "subtitle_group",
+    "expected_work_count": 1
+  }
+]

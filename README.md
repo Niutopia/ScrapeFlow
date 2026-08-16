@@ -1,7 +1,7 @@
 # ScrapeFlow
 
 ScrapeFlow 是一个单用户、本机运行的 AList 影视库管理服务。长期产品与工程合同(含
-A→O 唯一主流程、门禁与补源纪律)见 [`AGENTS.md`](AGENTS.md)。当前 HEAD
+A→P 唯一主流程、门禁与补源纪律)见 [`AGENTS.md`](AGENTS.md)。当前 HEAD
 的实现事实与已知差距以源码、测试和 Git 工作树证据核对。
 
 目标普通入站流程先对来源做只读身份识别，并与电影、番剧、美剧正式库对账；结果只能是
@@ -26,6 +26,27 @@ Provider 降级。Provider 自动补源和自动审计保持默认关闭。
 `awaiting_target_shelf` 货架确认阶段，旧记录仍按兼容规则处理。系统会在短暂的网络、TMDB 或 AList
 延迟后按规则重试；最终失败的任务可重新尝试或取消。
 
+## 当前实现状态与合同差距（2026-08-16 P0 冻结基线）
+
+当前运行实现是 **legacy execution core**：入口仍是"对账优先、仅 `new_work` 事后选货架"的旧流程，
+与 [`AGENTS.md`](AGENTS.md) 的 A→P 合同（创建任务时选择来源+货架 → 先边界分析 → 逐作品身份 →
+三库五分类对账 → 统一写入）不一致。目标领域模型 `IntakeSource → RootJob → WorkUnit` 的四个纯函数模块
+（`intake_source / source_inventory / boundary_analysis / work_units`）已就位并随 P0 提交，但尚未接入运行时。
+迁移按已批准方案分 P0–P10 推进：
+
+- **P0** 冻结 checkpoint 与基线校准（本提交；实测 800 tests passed, 300 subtests passed, 0 failed）；
+- **P1** 只读发现：`IntakeSource` 快照真实填充，发现不再自动创建 EngineJob；
+- **P2** Web 创建任务：选择来源 + 电影/番剧/美剧 + 创建唯一 RootJob（按合同 S 步）；
+- **P3** 边界分析与 WorkUnit 拆分（B/W）→ **P4** 逐单元身份识别与 uncertain durable override（C/U）；
+- **P5** 三库 `LibraryIndex` 五分类对账（D，含跨货架查重）→ **P6** 统一规划与单写器（F/G/H）；
+- **P7** Gap 账本（绑 `work_unit_id`）与三阶补源闭环（J/N；字幕走独立渠道）→ **P8** 根任务聚合与 Web 呈现（R）；
+- **P9** 合规清理：作品名硬编码数据化、删除货架-媒体类型矩阵、统一 TMDB 匹配器、字幕渠道缺陷修复；
+- **P10** `tests/corpus/` 建设与真实完整链路回归。
+
+期间任何代码变更不得使测试通过数低于 800。存量 `EngineJob.summary` 业务字段与 provider gate 机制
+冻结不新增，随 P5–P7 迁移逐步清退。三项用户裁决（2026-08-16）：创建任务时选货架；存量字段渐进清退；
+字幕保留独立渠道并修复缺陷。
+
 ## 最少配置
 
 复制环境文件并填写凭据：
@@ -45,7 +66,7 @@ cp .env.local.example .env.local
 ```sh
 docker compose --env-file .env.local build api
 docker compose --env-file .env.local up -d alist api quark-helper pansou
-curl -fsS http://127.0.0.1:8765/api/health
+curl -fsS http://127.0.0.1:3010/api/health
 ```
 
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。

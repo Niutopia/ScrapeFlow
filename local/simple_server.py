@@ -29,6 +29,7 @@ from engine.scrapeflow.media_quality import (
 from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
 from engine.scrapeflow.target_shelf import target_shelf_values
+from local.web_dashboard import dashboard_html
 from local.scrapeflow_api.simple_engine_runner import (
     EngineCancellationRequested,
     EngineExecutionError,
@@ -158,7 +159,9 @@ _RESTART_UNSAFE_PROVIDER_STATUSES = frozenset({
 # audit that would re-drive it could never start, and retry/cancel/cleanup are
 # all refused while the projection survives.  The strict barrier and every
 # ordinary root keep blocking on it.
-_RESTART_RELAXABLE_AUDIT_PROVIDER_STATUSES = frozenset({"child_failed"})
+_RESTART_RELAXABLE_AUDIT_PROVIDER_STATUSES = frozenset({
+    "child_failed", "retry_wait", "failed",
+})
 # Ordinary-root Provider projections that the relaxed restart check refuses
 # to ignore: only audit-owned retry state may be relaxed, never an ordinary
 # root's persisted Provider work.
@@ -406,6 +409,35 @@ class SimpleApplication:
                 "SCRAPEFLOW_PROVIDER_WORKERS 必须严格为 1；"
                 f"当前为 {rendered}，拒绝启动 Provider"
             )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Intake catalog
+    # ------------------------------------------------------------------
+
+    def intake_catalog(self) -> list[dict[str, object]]:
+        """Return the persisted IntakeSource catalog as a list of plain dicts.
+
+        This is the read-only view exposed by ``GET /api/intake``.  It never
+        triggers a network scan; the intake monitor thread updates the catalog
+        asynchronously via ``_scan_inbound_once()``.
+        """
+        from engine.scrapeflow.intake_source import load_intake_catalog
+        sources = load_intake_catalog(self.state_root)
+        result: list[dict[str, object]] = []
+        for src in sources:
+            d = src.as_dict()
+            # Enrich with the target_shelf from the linked EngineJob when
+            # available so the Web UI can show the selection state.
+            if src.root_task_id is not None and self.engine_configured:
+                try:
+                    runner = self._get_engine_runner()
+                    job = runner._read(src.root_task_id)  # noqa: SLF001
+                    d["root_job_phase"] = job.phase
+                    d["root_job_target_shelf"] = job.target_shelf
+                except Exception:
+                    pass
+            result.append(d)
+        return result
 
     def health(self) -> dict[str, object]:
         operations = self._operations_summary()
@@ -703,17 +735,40 @@ class SimpleApplication:
             # future smoke test from polluting the dashboard or consuming a
             # TMDB/provider retry slot in the first place.
             seen_sources.add(source)
+
+            # Phase 1: maintain the intake catalog in parallel with the
+            # legacy EngineJob registration.  The catalog is the new
+            # truth source for the /api/intake endpoint; the EngineJob
+            # path is retained for backward compatibility.
+            try:
+                from engine.scrapeflow.intake_source import (
+                    load_intake_catalog,
+                    save_intake_catalog,
+                    upsert_intake_source,
+                )
+                _catalog = load_intake_catalog(self.state_root)
+                _child_count = (
+                    len([r for r in rows
+                         if isinstance(r, Mapping) and r.get("is_dir") is True
+                         and str(r.get("name", "")).strip()
+                         and f"{root}/{str(r.get('name', '')).strip()}" == source])
+                    if False  # placeholder: child listing deferred to Phase 2
+                    else None
+                )
+                _catalog, _ = upsert_intake_source(
+                    _catalog, source, present=True, child_count=None, file_count=None,
+                )
+                save_intake_catalog(self.state_root, _catalog)
+            except Exception:
+                pass  # Catalog update is best-effort; EngineJob path is authoritative
+
             job = existing.get(source)
             if job is None:
                 job = create(source)
                 registered.append(job.id)
-                # Registration owns no formal side effect. The existing
-                # automatic lane may now run the bounded read-only
-                # reconciliation phase; only a later new_work result exposes
-                # the existing /start shelf confirmation.
-                if job.phase == "reconciling":
-                    self._queue_automatic_job(job.id)
-                    scheduled.append(job.id)
+                # Every ordinary inbound root waits for an explicit user
+                # shelf selection. Registration must not schedule even the
+                # read-only reconciliation phase before /start persists it.
         # A missing waiting source is an observation, not an instruction to
         # delete/retry/recreate it. Persist a clear error only after a
         # successful narrow listing of the intake root.
@@ -727,6 +782,18 @@ class SimpleApplication:
                 ):
                     try:
                         marker(job.id)
+                    except Exception:
+                        pass
+                    # Phase 1: also mark the intake catalog entry missing.
+                    try:
+                        from engine.scrapeflow.intake_source import (
+                            load_intake_catalog,
+                            mark_source_missing,
+                            save_intake_catalog,
+                        )
+                        _cat = load_intake_catalog(self.state_root)
+                        _cat, _ = mark_source_missing(_cat, source)
+                        save_intake_catalog(self.state_root, _cat)
                     except Exception:
                         pass
         with self._automatic_lock:
@@ -2918,8 +2985,18 @@ class SimpleApplication:
             # Pause blocks the next external side effect, not the bounded
             # read-only reconciliation that can only update this task's local
             # state. Every later phase remains behind the ordinary pause gate.
-            if job.phase != "reconciling" and self.control().get("paused") is True:
+            if job.phase not in {"queued", "reconciling"} and self.control().get("paused") is True:
                 return
+            reconciliation = (
+                job.summary.get("reconciliation")
+                if isinstance(job.summary, Mapping)
+                and isinstance(job.summary.get("reconciliation"), Mapping)
+                else {}
+            )
+            reconciliation_pending = not reconciliation.get("outcome")
+            if job.phase in {"queued", "reconciling"} and reconciliation_pending:
+                if job.phase == "queued":
+                    job = runner.mark_reconciling(job_id)
             if job.phase == "reconciling":
                 # The runner's reconciliation boundary is strictly read-only
                 # with respect to AList/formal media. It only persists the
@@ -2990,24 +3067,22 @@ class SimpleApplication:
                             return
                     self._refresh_intake_settlement()
                     return
-                if outcome != "merge_existing":
-                    # ``new_work`` waits for an explicit shelf; the remaining
-                    # outcomes never become an ordinary write from this
-                    # scheduler branch.
+                if outcome == "new_work":
+                    job = runner.get_job(job_id)
+                elif outcome != "merge_existing":
                     return
-                prepare = getattr(runner, "prepare_reconciled_merge_job", None)
-                if not callable(prepare):
-                    raise EngineJobConflictError(
-                        "当前 Engine 缺少既有作品合并接线入口"
-                    )
-                job = prepare(job_id)
-                # Reconciliation can be slow and is read-only. Before its
-                # local hand-off starts the next potentially effectful Engine
-                # stage, honor a pause race after the local transition too.
-                if (
-                    self.control().get("paused") is True
-                ):
-                    return
+                if outcome == "merge_existing":
+                    prepare = getattr(runner, "prepare_reconciled_merge_job", None)
+                    if not callable(prepare):
+                        raise EngineJobConflictError(
+                            "当前 Engine 缺少既有作品合并接线入口"
+                        )
+                    job = prepare(job_id)
+                    # Reconciliation can be slow and is read-only. Before its
+                    # local hand-off starts the next potentially effectful Engine
+                    # stage, honor a pause race after the local transition too.
+                    if self.control().get("paused") is True:
+                        return
             if job.phase in {"awaiting_target_shelf", "target_policy_conflict"}:
                 return
             # A pre-gate legacy record must never become a formal operation
@@ -3741,15 +3816,100 @@ class SimpleApplication:
             # per-tier limit (30), while pause and in-doubt submissions must
             # never be converted into a delayed resubmit.
             failure_scopes = self._replenishment_failure_scopes(outcome)
+            exhausted_gap_ids = outcome.get("already_exhausted_gap_ids")
+            has_exhausted_gaps = bool(
+                isinstance(exhausted_gap_ids, list)
+                and any(isinstance(gap_id, str) and gap_id for gap_id in exhausted_gap_ids)
+            )
             provider_attempts = int(summary_before.get("replenishment_attempts") or 0)
             provider_limit_raw = os.getenv("SCRAPEFLOW_PROVIDER_RETRY_LIMIT", "5").strip()
             try:
                 provider_limit = max(0, min(30, int(provider_limit_raw)))
             except ValueError:
                 provider_limit = 5
+            outcome_rows = [
+                row for row in outcome.get("outcomes", [])
+                if isinstance(row, Mapping)
+            ]
+            exhausted_ids = {
+                str(gap_id)
+                for gap_id in (exhausted_gap_ids or [])
+                if isinstance(gap_id, str) and gap_id
+            }
+            top_level_unresolved = outcome.get("unresolved_gaps")
+            unresolved_without_terminal_proof = False
+            if isinstance(top_level_unresolved, list) and top_level_unresolved:
+                unresolved_ids: set[str] = set()
+                unresolved_without_id = False
+                for raw_gap in top_level_unresolved:
+                    if not isinstance(raw_gap, Mapping):
+                        unresolved_without_id = True
+                        continue
+                    gap_id = raw_gap.get("id")
+                    if isinstance(gap_id, str) and gap_id:
+                        unresolved_ids.add(gap_id)
+                    else:
+                        unresolved_without_id = True
+                unresolved_without_terminal_proof = bool(
+                    unresolved_without_id or not unresolved_ids <= exhausted_ids
+                )
+            known_failure_scopes = {
+                FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE,
+                FAILURE_IN_DOUBT, "delivery",
+            }
+            unclassified_error = any(
+                row.get("error")
+                and str(row.get("failure_scope") or "").strip().casefold()
+                not in known_failure_scopes
+                and str(row.get("tier_status") or "").casefold()
+                != "waiting_reconcile"
+                for row in outcome_rows
+            )
+            if has_exhausted_gaps and not unclassified_error:
+                failure_scopes.add(FAILURE_CANDIDATE)
+            completed_gap_rows = [
+                row for row in outcome_rows
+                if row.get("status") == "completed_with_gaps"
+            ]
+            deferred_gap_present = bool(completed_gap_rows or has_exhausted_gaps)
+            unfinished_work = any(
+                (
+                    deferred_gap_present
+                    and row.get("error")
+                    and row.get("status") != "completed_with_gaps"
+                )
+                or row.get("terminal") is False
+                or (
+                    bool(row.get("unresolved_gap_ids"))
+                    and row.get("status") != "completed_with_gaps"
+                )
+                or (
+                    isinstance(row.get("status"), str)
+                    and row.get("status") not in {
+                        "", "completed", "completed_with_gaps",
+                    }
+                )
+                or unresolved_without_terminal_proof
+                for row in outcome_rows
+            ) or unresolved_without_terminal_proof
+            pending_reaudit = bool(
+                isinstance(outcome.get("pending_reaudit_gap_ids"), list)
+                and any(
+                    isinstance(gap_id, str) and gap_id
+                    for gap_id in outcome["pending_reaudit_gap_ids"]
+                )
+            ) or any(
+                isinstance(row.get("post_acquisition_reaudit"), Mapping)
+                and str(
+                    row["post_acquisition_reaudit"].get("status") or ""
+                ).casefold() != "cleaned"
+                for row in outcome_rows
+            )
             has_error = (
-                any(isinstance(row, Mapping) and row.get("error") for row in outcome.get("outcomes", []))
+                any(row.get("error") for row in outcome_rows)
                 or bool(outcome.get("unresolved_gaps"))
+                or has_exhausted_gaps
+                or unfinished_work
             )
             in_doubt = FAILURE_IN_DOUBT in failure_scopes
             infrastructure_failure = FAILURE_INFRASTRUCTURE in failure_scopes
@@ -3767,6 +3927,14 @@ class SimpleApplication:
                 outcome["terminal"] = False
                 outcome["status"] = "retry_wait"
                 outcome["next_retry_seconds"] = None
+            elif pending_reaudit and not unfinished_work and not in_doubt:
+                # A successful sidecar/child still owns task staging until a
+                # fresh scoped audit proves the selected gap gone. Keep the
+                # provider projection visible and non-terminal while that
+                # marker is pending; the audit callback clears it later.
+                outcome["terminal"] = False
+                outcome["status"] = "retry_wait"
+                outcome["next_retry_seconds"] = None
             elif not has_error:
                 outcome["terminal"] = True
                 outcome["status"] = "completed"
@@ -3774,19 +3942,24 @@ class SimpleApplication:
                 outcome["terminal"] = False
                 outcome["status"] = "waiting_reconcile"
                 outcome["next_retry_seconds"] = None
+            elif unclassified_error:
+                # Never infer a retry class from a sibling's exhaustion
+                # marker. Keep malformed/unsupported outcome evidence visible
+                # for an operator instead of silently resubmitting it.
+                outcome["terminal"] = True
+                outcome["status"] = "failed"
+                outcome["next_retry_seconds"] = None
             elif (
                 outcome.get("status") == "completed_with_gaps"
-                or any(
-                    isinstance(row, Mapping) and row.get("status") == "completed_with_gaps"
-                    for row in outcome.get("outcomes", [])
-                )
-            ):
+                or completed_gap_rows
+                or has_exhausted_gaps
+            ) and not unfinished_work and not pending_reaudit:
                 outcome["terminal"] = True
                 outcome["status"] = "completed_with_gaps"
                 outcome["next_retry_seconds"] = None
-            elif candidate_exhausted:
+            elif candidate_exhausted and not unfinished_work and not pending_reaudit:
                 outcome["terminal"] = True
-                outcome["status"] = "failed"
+                outcome["status"] = "completed_with_gaps"
                 outcome["next_retry_seconds"] = None
 
             elif infrastructure_failure and provider_attempts >= provider_limit:
@@ -3804,7 +3977,9 @@ class SimpleApplication:
                 outcome["terminal"] = False
                 outcome["status"] = "retry_wait"
                 outcome["next_retry_seconds"] = (
-                    30
+                    None
+                    if pending_reaudit and not unfinished_work
+                    else 30
                     if failure_scopes <= {FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE}
                     else None
                 )
@@ -5594,9 +5769,9 @@ class SimpleApplication:
             and str(existing_gap_marker.get("status") or "").casefold()
             in {"blocked_nonempty_source", "blocked_source_not_directory", "failed"}
         )
-        # Only a reconciled new work (or a pre-reconciliation legacy record)
-        # may be offered the closed shelf enum. Keep target-policy conflict
-        # reselection available for that same new-work record.
+        # Every newly registered ordinary root is offered the closed shelf
+        # enum before reconciliation. Keep conflict reselection available for
+        # legacy new-work records that already crossed the old ordering.
         may_select_shelf = (
             job.phase in {"awaiting_target_shelf", "target_policy_conflict"}
             and (reconciliation_outcome == "new_work" or not has_reconciliation)
@@ -5968,7 +6143,9 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path, query = self._path()
         try:
-            if path == "/api/health":
+            if path in {"/", "/index.html"}:
+                self._send_html(200, dashboard_html())
+            elif path == "/api/health":
                 self._send(200, self.application.health())
             elif path == "/api/control":
                 self._send(200, self.application.control())
@@ -5986,6 +6163,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send(200, self.application.browse(browse_path, refresh=refresh))
             elif path == "/api/library-audit/latest":
                 self._send(200, self.application.latest_library_audit())
+            elif path == "/api/intake":
+                self._send(200, {"sources": self.application.intake_catalog()})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as exc:
@@ -6113,6 +6292,16 @@ class SimpleHandler(BaseHTTPRequestHandler):
             status = 500
         message = str(exc) or type(exc).__name__
         self._send(status, {"error": redact_error(message)})
+
+    def _send_html(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send(self, status: int, payload: Mapping[str, object]) -> None:
         body = json.dumps(redact_value(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")

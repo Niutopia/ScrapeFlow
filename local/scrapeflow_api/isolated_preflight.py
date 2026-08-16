@@ -77,7 +77,7 @@ DECLARATION_BOOL_KEYS = (
 def isolated_preflight_template() -> dict[str, object]:
     """Return the JSON shape a real stage-10 declaration should fill."""
     return {
-        "api_url": "http://127.0.0.1:8765",
+        "api_url": "http://127.0.0.1:3010",
         "alist_url": "http://127.0.0.1:5244",
         "scrapeflow_state_dir": "/absolute/isolated/scrapeflow-data",
         "alist_data_dir": "/absolute/isolated/alist-data",

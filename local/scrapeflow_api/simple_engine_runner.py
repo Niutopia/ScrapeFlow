@@ -1937,14 +1937,14 @@ class SimpleEngineRunner:
             now = _now()
             job = EngineJob(
                 id=identifier,
-                phase="reconciling",
+                phase="awaiting_target_shelf",
                 created_at=now,
                 updated_at=now,
                 request={"source_path": source},
                 plan={},
                 summary={
                     "automatic": True,
-                    "automatic_stage": "reconciling",
+                    "automatic_stage": "awaiting_target_shelf",
                     "source_root": source,
                     "ingress_source_path": source,
                     "mode": "auto",
@@ -1952,7 +1952,7 @@ class SimpleEngineRunner:
                     "automatic_terminal": False,
                     "next_retry_seconds": None,
                     "reconciliation": {
-                        "status": "pending",
+                        "status": "blocked_by_target_shelf",
                         "outcome": None,
                     },
                 },
@@ -1971,6 +1971,85 @@ class SimpleEngineRunner:
     ) -> EngineJob:
         """Compatibility alias for the no-side-effect inbound registration."""
         return self.create_pending_job(source_path, job_id=job_id)
+
+    # ------------------------------------------------------------------
+    # Phase 1: IntakeSource → RootJob binding
+    # ------------------------------------------------------------------
+
+    def find_root_job_by_intake(self, source_id: str) -> EngineJob | None:
+        """Return the unique RootJob associated with an IntakeSource, or None.
+
+        Searches the persisted intake catalog for the given ``source_id``, then
+        looks up the linked ``root_task_id`` in the jobs store.  Returns
+        ``None`` if no catalog entry exists, the entry has no ``root_task_id``,
+        or the linked job record has been deleted.
+        """
+        from engine.scrapeflow.intake_source import (
+            find_by_source_id,
+            load_intake_catalog,
+        )
+        catalog = load_intake_catalog(self.state_root)
+        intake = find_by_source_id(catalog, source_id)
+        if intake is None or intake.root_task_id is None:
+            return None
+        try:
+            return self._read(intake.root_task_id)
+        except (SimpleEngineError, FileNotFoundError):
+            return None
+
+    def create_root_job(
+        self,
+        source_id: str,
+        *,
+        source_path: str,
+        target_shelf: object | None = None,
+    ) -> EngineJob:
+        """Create or return the unique RootJob for an IntakeSource.
+
+        This is the Phase-1 entry point called when the user explicitly
+        creates a task from the intake catalog.  It guarantees that the same
+        ``source_id`` always maps to at most one ``EngineJob``:
+
+        - If the intake catalog already records a ``root_task_id`` whose job
+          record still exists, that job is returned without creating a new one.
+        - Otherwise a new ``EngineJob`` is created via ``create_pending_job()``
+          and the catalog is updated to record the association.
+
+        ``target_shelf`` is accepted but **not persisted** here — shelf
+        selection still goes through ``start_automatic_job()`` after the user
+        reviews the intake catalog entry.  This keeps the two-step
+        (discover → select shelf → reconcile) contract intact.
+        """
+        from engine.scrapeflow.intake_source import (
+            bind_root_task,
+            find_by_source_id,
+            load_intake_catalog,
+            save_intake_catalog,
+        )
+        with self.worker_lock():
+            catalog = load_intake_catalog(self.state_root)
+            intake = find_by_source_id(catalog, source_id)
+            if intake is not None and intake.root_task_id is not None:
+                try:
+                    existing_job = self._read(intake.root_task_id)
+                    return existing_job
+                except (SimpleEngineError, FileNotFoundError):
+                    pass  # Orphaned reference — create a fresh job below.
+
+            # create_pending_job already checks for duplicate source paths
+            # under the worker lock, so we can call it safely here.
+            job = self.create_pending_job(source_path)
+
+            # Persist the intake → root_task binding in the catalog.
+            try:
+                new_catalog, _ = bind_root_task(catalog, source_id, job.id)
+                save_intake_catalog(self.state_root, new_catalog)
+            except (ValueError, OSError):
+                # Binding failed — the job is still valid; the catalog update
+                # is best-effort and will be retried on the next scan cycle.
+                pass
+
+            return job
 
     def start_automatic_job(
         self,
@@ -2002,18 +2081,18 @@ class SimpleEngineRunner:
             )
             reconciliation_outcome = str(reconciliation.get("outcome") or "")
             if job.phase == "reconciling":
-                raise EngineJobConflictError("只读对账尚未完成，不能选择目标货架")
+                raise EngineJobConflictError("任务已开始只读对账，不能更改目标货架")
             if job.phase == "reconciliation_uncertain":
                 raise EngineJobConflictError("身份/正式库对账不确定，请先处理 needs_attention")
             if job.phase == "reconciled":
                 raise EngineJobConflictError("已匹配现有作品，不需要重新选择目标货架")
-            # Legacy records have no reconciliation key and retain their
-            # historical /start compatibility. A record claiming a
-            # reconciliation result must name ``new_work`` exactly; an empty
-            # or malformed projection cannot reopen formal processing.
-            if has_reconciliation and reconciliation_outcome != "new_work":
-                raise EngineJobConflictError("只有确认 new_work 后才能选择目标货架")
-            if has_reconciliation and reconciliation_outcome == "new_work":
+            # Every newly registered ordinary root reaches this gate before
+            # reconciliation. Legacy records that already completed the old
+            # reconciliation-first flow may still start only when that result
+            # is a validated ``new_work`` outcome.
+            if has_reconciliation and reconciliation_outcome:
+                if reconciliation_outcome != "new_work":
+                    raise EngineJobConflictError("已匹配现有作品的任务不能重新选择目标货架")
                 try:
                     self._reconciled_identity(reconciliation.get("identity"))
                 except EngineRequestError as exc:
@@ -2050,6 +2129,7 @@ class SimpleEngineRunner:
             if children:
                 raise EngineJobConflictError("任务仍有活动内部子任务，不能重新选择目标货架")
             summary = dict(job.summary)
+            pre_reconciliation = not reconciliation_outcome
             summary.update({
                 "automatic": True,
                 "automatic_stage": "queued",
@@ -2082,6 +2162,31 @@ class SimpleEngineRunner:
                 execution=None,
                 error=None,
             )
+            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
+            return updated
+
+    def mark_reconciling(self, job_id: str) -> EngineJob:
+        """Open read-only reconciliation after the user shelf is durable."""
+        with self.worker_lock():
+            job = self._read(job_id)
+            reconciliation = (
+                job.summary.get("reconciliation")
+                if isinstance(job.summary.get("reconciliation"), Mapping)
+                else {}
+            )
+            if job.phase == "reconciling":
+                return job
+            if (
+                job.phase != "queued"
+                or not job.target_shelf
+                or not job.target_root
+                or not job.selected_at
+                or reconciliation.get("outcome")
+            ):
+                raise EngineJobConflictError("任务当前不能进入只读对账")
+            summary = dict(job.summary)
+            summary["automatic_stage"] = "reconciling"
+            updated = replace(job, phase="reconciling", summary=summary, updated_at=_now())
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return updated
 
@@ -2763,6 +2868,12 @@ class SimpleEngineRunner:
                     works=works,
                     semantic=semantic,
                 )
+                if matched_shelf is not None and matched_shelf != job.target_shelf:
+                    outcome = "uncertain"
+                    reason = (
+                        f"用户选择的一级货架 {job.target_shelf} 与正式库匹配货架 "
+                        f"{matched_shelf} 冲突"
+                    )
             except Exception as exc:
                 outcome = "uncertain"
                 reason = self._reconciliation_reason(exc)
@@ -2794,13 +2905,13 @@ class SimpleEngineRunner:
             summary.update({
                 "automatic": True,
                 "automatic_stage": (
-                    "awaiting_target_shelf" if outcome == "new_work"
+                    "queued" if outcome == "new_work"
                     else "reconciliation_needs_attention" if outcome == "uncertain"
                     else "reconciled"
                 ),
                 "reconciliation": reconciliation,
                 "reconciliation_outcome": outcome,
-                "automatic_terminal": outcome != "new_work",
+                "automatic_terminal": outcome not in {"new_work", "merge_existing"},
                 "next_retry_seconds": None,
             })
             if isinstance(summary.get("reconciliation_identity_confirmation"), Mapping):
@@ -2809,7 +2920,7 @@ class SimpleEngineRunner:
                 confirmation["result"] = outcome
                 summary["reconciliation_identity_confirmation"] = confirmation
             phase = (
-                "awaiting_target_shelf" if outcome == "new_work"
+                "queued" if outcome == "new_work"
                 else "reconciliation_uncertain" if outcome == "uncertain"
                 else "reconciled"
             )

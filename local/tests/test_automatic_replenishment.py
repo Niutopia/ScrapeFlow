@@ -29,6 +29,7 @@ from local.scrapeflow_api.replenishment import (
     _coverage_tokens,
     _expanded_episode_ids,
     build_replenishment_request,
+    build_replenishment_requests,
     enrich_replenishment_plan_aliases,
     normalize_reusable_candidate,
     reusable_candidate_scope,
@@ -199,6 +200,49 @@ class FakeMaterializer:
                 "gap_ids": ["S01E01"],
             }],
         )
+
+
+class FakeStandaloneSubtitleMaterializer:
+    """Dedicated sidecar lane fixture; it never exposes a video acquire API."""
+
+    def __init__(self, alist: MemoryAList) -> None:
+        self.alist = alist
+        self.requests: list[dict[str, object]] = []
+        self.gap_batches: list[list[dict[str, object]]] = []
+        self.staging_roots: list[str] = []
+
+    def acquire_subtitles(
+        self, request, gaps, *, staging_root, workspace, alist,
+    ):
+        del workspace, alist
+        rows = [dict(gap) for gap in gaps]
+        if not rows or any(gap.get("kind") != "missing_subtitle" for gap in rows):
+            raise AssertionError("subtitle materializer received a media gap")
+        self.requests.append(dict(request))
+        self.gap_batches.append(rows)
+        self.staging_roots.append(staging_root)
+        self.alist.mkdir(posixpath.dirname(staging_root))
+        self.alist.mkdir(staging_root)
+        subtitle_root = f"{staging_root}/subtitles"
+        self.alist.mkdir(subtitle_root)
+        files: list[dict[str, object]] = []
+        listing: list[dict[str, object]] = []
+        for gap in rows:
+            gap_id = str(gap["id"])
+            video_stem = posixpath.splitext(
+                posixpath.basename(str(gap.get("path") or "video"))
+            )[0]
+            name = f"{gap_id} - {video_stem}.zh.srt"
+            path = f"{subtitle_root}/{name}"
+            listing.append({"name": name, "is_dir": False, "size": 321})
+            files.append({
+                "path": path,
+                "size": 321,
+                "kind": "subtitle",
+                "gap_ids": [gap_id],
+            })
+        self.alist.tree[subtitle_root] = listing
+        return {"delivery_kind": "subtitle_delivery", "files": files}
 
 
 class FakeEngine:
@@ -1731,8 +1775,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(expanded_episode_ids(canonical_conflict), {"S04E18"})
         self.assertEqual(_expanded_episode_ids(canonical_conflict), {"S04E18"})
 
-    def test_mixed_torrent_maps_only_exact_audited_subtitle_companion(self) -> None:
-        """A mixed candidate may carry a sidecar, but never guess its episode."""
+    def test_mixed_torrent_request_is_rejected_before_manifest_mapping(self) -> None:
+        """An audited subtitle gap never enters the video torrent selector."""
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         request = {
             "media": {
@@ -1768,13 +1812,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             },
         )
 
-        self.assertIsNotNone(candidate)
-        assert candidate is not None
-        self.assertEqual(
-            candidate["acquisition"]["file_index_by_gap"],
-            {"S01E01": [1], subtitle_id: [2]},
-        )
-        self.assertNotIn("Example.Show.S01E03.zh.srt", candidate["files"])
+        self.assertIsNone(candidate)
 
     def test_subtitle_only_selector_never_expands_one_sidecar_to_all_gaps(self) -> None:
         """One exact manifest sidecar must leave its sibling audit uncovered."""
@@ -2173,8 +2211,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     )
             upload.assert_not_called()
 
-    def test_mixed_delivery_isolates_media_and_subtitle_task_subroots(self) -> None:
-        """The local adapter must expose only `/media` to a child planner."""
+    def test_mixed_delivery_request_is_rejected_before_download(self) -> None:
+        """The local adapter requires separate media and sidecar requests."""
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         request = {
             "media": {"tmdb_id": 7, "title": "Example Show"},
@@ -2260,35 +2298,20 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 "engine.tools._replenishment_local_adapter_impl._verify_remote_uploads",
                 side_effect=record_visibility,
             ):
-                result = _acquire(
-                    {
-                        "request": request,
-                        "selection": {"selections": [selection]},
-                        "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
-                        "automatic_staging_root": staging,
-                    },
-                    workspace,
-                    client=Client(),
-                )
+                with self.assertRaises(ReplenishmentCandidateError):
+                    _acquire(
+                        {
+                            "request": request,
+                            "selection": {"selections": [selection]},
+                            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+                            "automatic_staging_root": staging,
+                        },
+                        workspace,
+                        client=Client(),
+                    )
 
-        self.assertEqual(
-            set(result), {"lane", "attempt_id", "staging_root", "files"},
-        )
-        self.assertEqual(
-            [root for root, _name in uploads],
-            [staging + "/media", staging + "/subtitles"],
-        )
-        self.assertEqual([root for root, _names in verified], [staging + "/media", staging + "/subtitles"])
-        self.assertEqual(
-            [row["path"] for row in result["files"]],
-            [
-                staging + "/media/S01E01 - Example.Show.S01E01.mkv",
-                # Staging names are filename-sanitized; the durable files
-                # map, rather than the human-readable basename, keeps the
-                # exact subtitle-gap association.
-                staging + "/subtitles/missing_subtitle 7 S01E02 zh - Example.Show.S01E02.zh.srt",
-            ],
-        )
+        self.assertEqual(uploads, [])
+        self.assertEqual(verified, [])
 
     def test_companion_delivery_returns_exact_manifest_provenance(self) -> None:
         """Runtime gets the one selected companion's map and delivered row."""
@@ -4134,8 +4157,10 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 }]}
 
         class SubtitleMaterializer(FakeMaterializer):
-            def acquire(self, request, selections, *, staging_root, workspace, alist):
-                del request, selections, workspace, alist
+            def acquire_subtitles(
+                self, request, gaps, *, staging_root, workspace, alist,
+            ):
+                del request, gaps, workspace, alist
                 self.calls.append(staging_root)
                 parent = posixpath.dirname(staging_root)
                 self.alist.mkdir(parent)
@@ -4161,6 +4186,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             runtime = AutomaticReplenishmentRuntime(
                 Path(temporary), engine_runner=engine, alist=alist,
                 search=SubtitleSearch(), materializer=SubtitleMaterializer(alist),
+                subtitle_materializer=SubtitleMaterializer(alist),
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
                 progress=lambda _job, phase, _details: progress.append(phase),
             )
@@ -4175,6 +4201,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
             self.assertEqual(outcome["unresolved_gaps"], [])
             self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], [subtitle_gap_id])
+            self.assertIn("post_acquisition_reaudit", outcome["outcomes"][0])
             self.assertNotIn("child_job_id", outcome["outcomes"][0])
             self.assertEqual(engine.planned, [])
             self.assertEqual(engine.executed, [])
@@ -4198,8 +4225,124 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
             self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
 
-    def test_mixed_media_request_installs_only_its_explicit_subtitle_gap(self) -> None:
-        """A video child may reuse an exact subtitle companion after its move."""
+    def test_subtitle_gap_state_does_not_inherit_video_tier_evidence(self) -> None:
+        gap = {
+            "id": "missing_subtitle:state",
+            "kind": "missing_subtitle",
+            "label": "Example Show S01E01 中文字幕",
+            "path": "/quark/影视/番剧/Example Show/S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=FakeEngine(), alist=alist,
+                search=FakeSearch(), materializer=FakeMaterializer(alist),
+            )
+            state = runtime._gap_state(  # noqa: SLF001 - lane schema fixture
+                gap,
+                job_id="subtitle-state-root",
+                prior_state={
+                    "tier": TIER_LOCAL_MAGNET,
+                    "tier_status": "candidate_failed",
+                    "candidate_failures_by_provider": {TIER_LOCAL_MAGNET: ["x"]},
+                    "exhaustion_proof_by_provider": {TIER_LOCAL_MAGNET: {"count": 1}},
+                    "excluded_candidates": [{"provider": TIER_LOCAL_MAGNET}],
+                    "active_attempt": {"attempt_id": "attempt-old"},
+                    "external_task_id": "task-old",
+                    "last_error_scope": FAILURE_IN_DOUBT,
+                },
+            )
+
+        self.assertEqual(state["lane"], "subtitle")
+        for key in (
+            "tier", "tier_status", "candidate_failures_by_provider",
+            "exhaustion_proof_by_provider", "excluded_candidates",
+        ):
+            self.assertNotIn(key, state)
+        self.assertIsNone(state["active_attempt"])
+        self.assertIsNone(state["external_task_id"])
+        self.assertIsNone(state["last_error_scope"])
+
+    def test_request_builder_keeps_unsupported_gap_visible(self) -> None:
+        plan = {
+            "mode": "movie",
+            "metadata": {"title": "Example Movie", "year": "2020"},
+            "scan_report": {"resource_gaps": [
+                {
+                    "id": "missing_media:movie", "kind": "missing_media",
+                    "label": "Example Movie (2020)",
+                },
+                {
+                    "id": "unsupported:movie", "kind": "mystery_gap",
+                    "label": "Example Movie unknown evidence",
+                },
+            ]},
+        }
+        bundle = build_replenishment_requests(
+            plan, job_id="unsupported-gap-root", round_number=1,
+        )
+        self.assertEqual(len(bundle["requests"]), 1)
+        self.assertEqual(bundle["requests"][0]["lane"], "media")
+        self.assertEqual(
+            [row["id"] for row in bundle["unresolved_gaps"]],
+            ["unsupported:movie"],
+        )
+
+    def test_mixed_request_is_rejected_at_execution_boundary(self) -> None:
+        mixed = {
+            "lane": "media",
+            "gaps": [
+                {"id": "S01E01", "kind": "missing_episode"},
+                {"id": "subtitle-1", "kind": "missing_subtitle"},
+            ],
+        }
+        with self.assertRaisesRegex(
+            AutomaticReplenishmentError, "混合了字幕与视频缺口",
+        ):
+            AutomaticReplenishmentRuntime._validated_request_lane(mixed)
+
+    def test_movie_bundle_also_splits_media_and_subtitle_lanes(self) -> None:
+        plan = {
+            "mode": "movie",
+            "target_root": "/quark/影视/电影/Example Movie (2020)",
+            "metadata": {
+                "title": "Example Movie",
+                "year": "2020",
+                "target_root": "/quark/影视/电影/Example Movie (2020)",
+            },
+            "scan_report": {"resource_gaps": [
+                {
+                    "id": "missing_media:movie",
+                    "kind": "missing_media",
+                    "label": "Example Movie (2020)",
+                },
+                {
+                    "id": "missing_subtitle:movie:zh",
+                    "kind": "missing_subtitle",
+                    "label": "Example Movie 中文字幕",
+                    "path": (
+                        "/quark/影视/电影/Example Movie (2020)/"
+                        "Example.Movie.2020.mkv"
+                    ),
+                    "subtitle_language": "zh",
+                },
+            ]},
+        }
+        bundle = build_replenishment_requests(
+            plan, job_id="movie-lanes", round_number=1,
+        )
+        self.assertEqual(
+            [(request["lane"], [gap["kind"] for gap in request["gaps"]])
+             for request in bundle["requests"]],
+            [
+                ("media", ["missing_media"]),
+                ("subtitle", ["missing_subtitle"]),
+            ],
+        )
+
+    def test_mixed_gaps_use_independent_media_and_subtitle_requests(self) -> None:
+        """One work with two gap types must invoke two isolated providers."""
         root_job = _example_root_job("engine-mixed-subtitle-root")
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         subtitle_video = (
@@ -4224,91 +4367,34 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         root_job = replace(root_job, plan=plan)
 
         class MixedSearch:
-            def run(self, _request):
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+
+            def run(self, request):
+                self.requests.append(dict(request))
                 return {"candidates": [{
                     "provider": "magnet",
                     "locator": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
                     "release_name": "Example Show S01E01 1080p",
                     "title": "Example Show", "year": "2020",
-                    "files": [
-                        "Example.Show.S01E01.mkv",
-                        "Example.Show.S01E02.zh.srt",
-                    ],
-                    "file_coverage": ["S01E01", subtitle_id],
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "file_coverage": ["S01E01"],
                     "acquisition": {
                         "kind": "torrent",
-                        "file_index_by_gap": {
-                            "S01E01": [1], subtitle_id: [2],
-                        },
+                        "file_index_by_gap": {"S01E01": [1]},
                     },
                 }]}
 
-        class MixedMaterializer(FakeMaterializer):
-            def acquire(self, request, selections, *, staging_root, workspace, alist):
-                del request, selections, workspace, alist
-                self.calls.append(staging_root)
-                parent = posixpath.dirname(staging_root)
-                self.alist.mkdir(parent)
-                self.alist.mkdir(staging_root)
-                media_root = f"{staging_root}/media"
-                subtitle_root = f"{staging_root}/subtitles"
-                self.alist.mkdir(media_root)
-                self.alist.mkdir(subtitle_root)
-                video = f"{media_root}/S01E01 - Example.Show.S01E01.mkv"
-                subtitle = f"{subtitle_root}/{subtitle_id} - Example.Show.S01E02.zh.srt"
-                self.alist.tree[staging_root] = [
-                    {"name": "media", "is_dir": True},
-                    {"name": "subtitles", "is_dir": True},
-                ]
-                self.alist.tree[media_root] = [
-                    {"name": posixpath.basename(video), "is_dir": False, "size": 123},
-                ]
-                self.alist.tree[subtitle_root] = [
-                    {"name": posixpath.basename(subtitle), "is_dir": False, "size": 321},
-                ]
-                return _ready_delivery(
-                    staging_root,
-                    [
-                        {
-                            "path": video, "size": 123,
-                            "kind": "video", "gap_ids": ["S01E01"],
-                        },
-                        {
-                            "path": subtitle, "size": 321,
-                            "kind": "subtitle", "gap_ids": [subtitle_id],
-                        },
-                    ],
-                    media_staging_root=media_root,
-                    subtitle_staging_root=subtitle_root,
-                )
-
-        class StrictPlannerEngine(FakeSubtitleEngine):
-            """Approximate the production planner's subtitle rejection gate."""
-
-            def __init__(self, alist):
-                super().__init__()
-                self.alist = alist
-
-            def plan_job(self, request, *, internal_child_of=None):
-                source = str(request.get("source_path") or "")
-                if not source.endswith("/media"):
-                    raise AssertionError("mixed child planner received the parent staging root")
-                rows = self.alist.list(source, refresh=True)
-                if any(
-                    not row.get("is_dir")
-                    and Path(str(row.get("name") or "")).suffix.casefold()
-                    in {".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
-                    for row in rows
-                ):
-                    raise AssertionError("subtitle leaked into the media child planner")
-                return super().plan_job(request, internal_child_of=internal_child_of)
-
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
-            engine = StrictPlannerEngine(alist)
+            engine = FakeSubtitleEngine()
+            media_search = MixedSearch()
+            media_materializer = FakeMaterializer(alist)
+            subtitle_materializer = FakeStandaloneSubtitleMaterializer(alist)
             runtime = AutomaticReplenishmentRuntime(
                 Path(temporary), engine_runner=engine, alist=alist,
-                search=MixedSearch(), materializer=MixedMaterializer(alist),
+                search=media_search, materializer=media_materializer,
+                subtitle_materializer=subtitle_materializer,
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
             )
             _seed_runtime_tier(
@@ -4319,15 +4405,26 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
             outcome = runtime.run_for_job(root_job)
 
+        self.assertEqual(len(outcome["outcomes"]), 2)
+        by_lane = {
+            str(row["request"]["lane"]): row
+            for row in outcome["outcomes"]
+        }
+        self.assertEqual(by_lane["media"]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(by_lane["subtitle"]["resolved_gap_ids"], [subtitle_id])
         self.assertEqual(
-            outcome["outcomes"][0]["resolved_gap_ids"],
-            ["S01E01", subtitle_id],
+            [gap["kind"] for gap in media_search.requests[0]["gaps"]],
+            ["missing_episode"],
+        )
+        self.assertEqual(
+            [gap["kind"] for gap in subtitle_materializer.gap_batches[0]],
+            ["missing_subtitle"],
+        )
+        self.assertNotEqual(
+            media_materializer.calls[0],
+            subtitle_materializer.staging_roots[0],
         )
         self.assertEqual(engine.executed, ["engine-child-1"])
-        # The real planner receives only the media lane.  If the subtitle
-        # sibling leaked into this source root, strict TV planning would mark
-        # it as a problem file and the provider child could not be committed.
-        self.assertTrue(engine.planned[0]["source_path"].endswith("/media"))
         self.assertEqual(len(engine.installed_subtitles), 1)
         installed = engine.installed_subtitles[0]
         self.assertIn("/subtitles/", str(installed["source_path"]))
@@ -4337,6 +4434,66 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E02.zh.srt",
         )
         self.assertEqual(installed["expected_size"], 321)
+
+    def test_retrying_media_does_not_restart_exhausted_subtitle_lane(self) -> None:
+        root_job = _example_root_job("engine-split-lane-retry")
+        subtitle_id = "missing_subtitle:7:S01E02:zh"
+        plan = dict(root_job.plan)
+        plan["scan_report"] = {"resource_gaps": [
+            {
+                "id": "S01E01", "kind": "missing_episode",
+                "season": 1, "episodes": [1],
+                "label": "Example Show S01E01", "reason": "missing",
+            },
+            {
+                "id": subtitle_id, "kind": "missing_subtitle",
+                "label": "Example Show S01E02 中文字幕",
+                "reason": "缺少中文字幕",
+                "path": (
+                    "/quark/影视/番剧/Example Show/Season 01/"
+                    "Example.Show.S01E02.mkv"
+                ),
+                "subtitle_language": "zh",
+            },
+        ]}
+        root_job = replace(root_job, plan=plan)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = FakeSubtitleEngine()
+            subtitle_materializer = FakeStandaloneSubtitleMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary), engine_runner=engine, alist=alist,
+                search=FakeSearch(), materializer=FakeMaterializer(alist),
+                subtitle_materializer=subtitle_materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_LOCAL_MAGNET,
+            )
+            runtime._write_gap(  # noqa: SLF001 - durable terminal fixture
+                {
+                    "id": subtitle_id,
+                    "job_id": root_job.id,
+                    "phase": "completed_with_gaps",
+                    "tier_status": "exhausted",
+                },
+                runtime._gap_path(  # noqa: SLF001
+                    job_id=root_job.id, gap_id=subtitle_id,
+                ),
+            )
+
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertEqual(len(outcome["outcomes"]), 1)
+        self.assertEqual(outcome["outcomes"][0]["request"]["lane"], "media")
+        self.assertEqual(outcome["already_exhausted_gap_ids"], [subtitle_id])
+        self.assertEqual(subtitle_materializer.requests, [])
+        self.assertEqual(engine.executed, ["engine-child-1"])
 
     def _run_new_media_companion(
         self, companion_member: str | None, *, child_status: str = "moved",
@@ -4547,8 +4704,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(engine.installed_subtitles, [])
         self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
 
-    def test_mixed_staging_passes_only_media_subroot_to_real_engine_planner(self) -> None:
-        """The durable child plan must never present a sidecar to its planner."""
+    def test_separate_lanes_keep_subtitle_out_of_real_engine_planner(self) -> None:
+        """The media child planner must never receive the subtitle request."""
         root_job = _example_root_job("engine-isolated-planner-root")
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         subtitle_video = (
@@ -4579,13 +4736,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     "locator": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
                     "release_name": "Example Show S01E01 1080p",
                     "title": "Example Show", "year": "2020",
-                    "files": ["Example.Show.S01E01.mkv", "Example.Show.S01E02.zh.srt"],
-                    "file_coverage": ["S01E01", subtitle_id],
+                    "files": ["Example.Show.S01E01.mkv"],
+                    "file_coverage": ["S01E01"],
                     "acquisition": {
                         "kind": "torrent",
-                        "file_index_by_gap": {
-                            "S01E01": [1], subtitle_id: [2],
-                        },
+                        "file_index_by_gap": {"S01E01": [1]},
                     },
                 }]}
 
@@ -4597,35 +4752,19 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.alist.mkdir(parent)
                 self.alist.mkdir(staging_root)
                 media_root = f"{staging_root}/media"
-                subtitle_root = f"{staging_root}/subtitles"
                 self.alist.mkdir(media_root)
-                self.alist.mkdir(subtitle_root)
                 video = f"{media_root}/S01E01 - Example.Show.S01E01.mkv"
-                subtitle = f"{subtitle_root}/{subtitle_id} - Example.Show.S01E02.zh.srt"
-                self.alist.tree[staging_root] = [
-                    {"name": "media", "is_dir": True},
-                    {"name": "subtitles", "is_dir": True},
-                ]
+                self.alist.tree[staging_root] = [{"name": "media", "is_dir": True}]
                 self.alist.tree[media_root] = [
                     {"name": posixpath.basename(video), "is_dir": False, "size": 123},
                 ]
-                self.alist.tree[subtitle_root] = [
-                    {"name": posixpath.basename(subtitle), "is_dir": False, "size": 321},
-                ]
                 return _ready_delivery(
                     staging_root,
-                    [
-                        {
-                            "path": video, "size": 123,
-                            "kind": "video", "gap_ids": ["S01E01"],
-                        },
-                        {
-                            "path": subtitle, "size": 321,
-                            "kind": "subtitle", "gap_ids": [subtitle_id],
-                        },
-                    ],
+                    [{
+                        "path": video, "size": 123,
+                        "kind": "video", "gap_ids": ["S01E01"],
+                    }],
                     media_staging_root=media_root,
-                    subtitle_staging_root=subtitle_root,
                 )
 
         class RealPlannerRunner(SimpleEngineRunner):
@@ -4688,9 +4827,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
             engine = RealPlannerRunner(Path(temporary) / "engine", alist)
+            subtitle_materializer = FakeStandaloneSubtitleMaterializer(alist)
             runtime = AutomaticReplenishmentRuntime(
                 Path(temporary) / "runtime", engine_runner=engine, alist=alist,
                 search=MixedSearch(), materializer=IsolatedMaterializer(alist),
+                subtitle_materializer=subtitle_materializer,
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
             )
             _seed_runtime_tier(
@@ -4701,7 +4842,13 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
             outcome = runtime.run_for_job(root_job)
 
-        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01", subtitle_id])
+        self.assertEqual(len(outcome["outcomes"]), 2)
+        by_lane = {
+            str(row["request"]["lane"]): row
+            for row in outcome["outcomes"]
+        }
+        self.assertEqual(by_lane["media"]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(by_lane["subtitle"]["resolved_gap_ids"], [subtitle_id])
         self.assertEqual(len(engine.planner_sources), 1)
         self.assertTrue(engine.planner_sources[0].endswith("/media"))
         self.assertEqual(len(engine.installed_subtitles), 1)

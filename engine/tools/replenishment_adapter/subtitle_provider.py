@@ -11,6 +11,7 @@ files into AList for safe installation by SimpleEngineRunner.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import inspect
 import json
 import math
 import os
@@ -48,6 +49,16 @@ PROVIDER_BASE_WEIGHTS: dict[str, float] = {
 SUPPORTED_SUBTITLE_EXTENSIONS = frozenset({".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"})
 MIN_SUBTITLE_BYTES = 64
 MAX_SUBTITLE_BYTES = 10 * 1024 * 1024
+
+_SUBTITLE_CONTENT_TYPES = {
+    "ass": "text/x-ass",
+    "ssa": "text/x-ssa",
+    "srt": "application/x-subrip",
+    "vtt": "text/vtt",
+    "sub": "text/plain",
+    "idx": "text/plain",
+    "sup": "application/octet-stream",
+}
 
 _EPISODE_REGEX = re.compile(r"(?i)\bS0*(\d{1,3})[ ._-]*E0*(\d{1,4})\b|第0*(\d{1,4})[集话話]|\[0*(\d{1,4})[vV\d]*\]|\bEP0*(\d{1,4})\b")
 _SEASON_REGEX = re.compile(r"(?i)\bS0*(\d{1,3})\b|第0*(\d{1,3})季|\bSeason\s*0*(\d{1,3})\b")
@@ -205,7 +216,14 @@ class SubtitleDiscoveryService:
 
     def _http_get(self, target_url: str, headers: Mapping[str, str] | None = None, timeout: float = 8.0) -> bytes:
         if self.fetcher is not None:
-            return self.fetcher(target_url, headers)
+            try:
+                return self.fetcher(target_url, headers)
+            except SubtitleInfrastructureError:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise SubtitleInfrastructureError(
+                    f"字幕接口网络请求失败: {exc}"
+                ) from exc
         req_headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ScrapeFlow/4.0"}
         if headers:
             req_headers.update(headers)
@@ -255,6 +273,8 @@ class SubtitleDiscoveryService:
                             "score": float(item.get("score") or 1.0),
                         })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -283,6 +303,8 @@ class SubtitleDiscoveryService:
                     "score": 1.0,
                 })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -311,6 +333,8 @@ class SubtitleDiscoveryService:
                     "score": 1.0,
                 })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -339,6 +363,8 @@ class SubtitleDiscoveryService:
                     "score": 1.0,
                 })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -370,6 +396,8 @@ class SubtitleDiscoveryService:
                         "score": 1.0,
                     })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -404,6 +432,8 @@ class SubtitleDiscoveryService:
                             "score": float(attr.get("ratings") or 1.0),
                         })
             return candidates
+        except SubtitleInfrastructureError:
+            raise
         except Exception:
             return []
 
@@ -430,6 +460,7 @@ class SubtitleDiscoveryService:
             return []
 
         raw_candidates: list[dict[str, Any]] = []
+        infrastructure_errors: list[SubtitleInfrastructureError] = []
 
         # 1. Shooter / Assrt API
         try:
@@ -439,6 +470,8 @@ class SubtitleDiscoveryService:
                 episode=episode if isinstance(episode, int) else None,
                 lang=normalized_lang,
             ))
+        except SubtitleInfrastructureError as exc:
+            infrastructure_errors.append(exc)
         except Exception:
             pass
 
@@ -450,6 +483,8 @@ class SubtitleDiscoveryService:
                 episode=episode if isinstance(episode, int) else None,
                 lang=normalized_lang,
             ))
+        except SubtitleInfrastructureError as exc:
+            infrastructure_errors.append(exc)
         except Exception:
             pass
 
@@ -461,6 +496,8 @@ class SubtitleDiscoveryService:
                 episode=episode if isinstance(episode, int) else None,
                 lang=normalized_lang,
             ))
+        except SubtitleInfrastructureError as exc:
+            infrastructure_errors.append(exc)
         except Exception:
             pass
 
@@ -472,6 +509,8 @@ class SubtitleDiscoveryService:
                 episode=episode if isinstance(episode, int) else None,
                 lang=normalized_lang,
             ))
+        except SubtitleInfrastructureError as exc:
+            infrastructure_errors.append(exc)
         except Exception:
             pass
 
@@ -483,6 +522,8 @@ class SubtitleDiscoveryService:
                 episode=episode if isinstance(episode, int) else None,
                 lang=normalized_lang,
             ))
+        except SubtitleInfrastructureError as exc:
+            infrastructure_errors.append(exc)
         except Exception:
             pass
 
@@ -495,15 +536,16 @@ class SubtitleDiscoveryService:
                     episode=episode if isinstance(episode, int) else None,
                     lang=normalized_lang,
                 ))
+            except SubtitleInfrastructureError as exc:
+                infrastructure_errors.append(exc)
             except Exception:
                 pass
 
         if not raw_candidates:
-            return []
-
-
-
-        if not raw_candidates:
+            if infrastructure_errors:
+                raise SubtitleInfrastructureError(
+                    "字幕搜索源不可用，无法证明没有候选"
+                ) from infrastructure_errors[0]
             return []
 
         # Multi-dimensional scoring & Deduplication
@@ -540,6 +582,82 @@ class SubtitleMaterializer:
             return self.downloader(url)
         return self.discovery._http_get(url)
 
+    @staticmethod
+    def _content_type(fmt: str) -> str:
+        return _SUBTITLE_CONTENT_TYPES.get(fmt.casefold().lstrip("."), "text/plain")
+
+    @staticmethod
+    def _parameter_names(callable_obj: object) -> list[str]:
+        try:
+            return [
+                parameter.name
+                for parameter in inspect.signature(callable_obj).parameters.values()
+            ]
+        except (TypeError, ValueError):
+            return []
+
+    @classmethod
+    def _upload_staged_file(
+        cls,
+        alist: Any,
+        *,
+        staging_root: str,
+        staging_sub_path: str,
+        local_sub_path: Path,
+        sub_filename: str,
+        raw_bytes: bytes,
+        content_type: str,
+    ) -> None:
+        """Upload one sidecar using the production AList path contract.
+
+        A few old in-process test doubles expose ``(remote_dir, name, data)``
+        while the real client exposes ``(target_path, data, content_type)``.
+        Detect the narrow legacy shape by parameter names; never send a
+        directory/name tuple to the production client, where it would either
+        raise or target the wrong object.
+        """
+        upload_bytes = getattr(alist, "upload_bytes", None)
+        upload_file = getattr(alist, "upload_file", None)
+        if callable(upload_bytes):
+            names = cls._parameter_names(upload_bytes)
+            legacy_shape = (
+                len(names) >= 3
+                and names[1].casefold() in {"name", "filename"}
+                and names[2].casefold() in {"data", "content", "payload"}
+            )
+            if legacy_shape:
+                upload_bytes(staging_root, sub_filename, raw_bytes)
+            else:
+                # AListClient.upload_bytes(target_path, data, content_type,
+                # *, overwrite=False) is the production contract.
+                upload_bytes(staging_sub_path, raw_bytes, content_type)
+            return
+
+        if callable(upload_file):
+            names = cls._parameter_names(upload_file)
+            legacy_shape = (
+                len(names) >= 3
+                and names[1].casefold() in {"local_path", "path"}
+                and names[2].casefold() in {"name", "filename"}
+            )
+            if legacy_shape:
+                upload_file(staging_root, str(local_sub_path), sub_filename)
+            else:
+                # The real client streams from a Path and takes the complete
+                # remote target path plus an explicit MIME type.
+                upload_file(staging_sub_path, local_sub_path, content_type)
+            return
+
+        put_file = getattr(alist, "put_file", None)
+        if callable(put_file):
+            put_file(staging_sub_path, raw_bytes)
+            return
+        write_file_bytes = getattr(alist, "write_file_bytes", None)
+        if callable(write_file_bytes):
+            write_file_bytes(staging_sub_path, raw_bytes)
+            return
+        raise SubtitleInfrastructureError("AList 客户端缺少字幕上传接口")
+
     def acquire_subtitles(
         self,
         request: Mapping[str, Any],
@@ -552,6 +670,7 @@ class SubtitleMaterializer:
         """Download, validate, and stage subtitles for the requested missing_subtitle gaps."""
         workspace.mkdir(parents=True, exist_ok=True)
         files_out: list[dict[str, Any]] = []
+        used_staging_names: set[str] = set()
 
         for gap in gaps:
             gap_id = str(gap.get("id") or "")
@@ -592,19 +711,45 @@ class SubtitleMaterializer:
                     video_stem = posixpath.splitext(video_name)[0]
                     lang_tag = "zh-CN" if target_lang == "simplified_chinese" else ("zh-TW" if target_lang == "traditional_chinese" else "zh")
                     sub_filename = f"{video_stem}.{lang_tag}.{fmt}"
+                    # Two audited rows can point at files with the same
+                    # basename (for example duplicate season roots).  Keep
+                    # the familiar name for the first row, but isolate later
+                    # rows so a create-only AList PUT cannot collide or make
+                    # one row appear to resolve another.
+                    if sub_filename in used_staging_names:
+                        safe_gap = re.sub(
+                            r"[^a-zA-Z0-9._-]+", "-", gap_id,
+                        ).strip(".-")[:48] or "gap"
+                        sub_filename = f"{video_stem}.{safe_gap}.{lang_tag}.{fmt}"
+                    used_staging_names.add(sub_filename)
 
                     local_sub_path = workspace / sub_filename
                     local_sub_path.write_bytes(raw_bytes)
 
                     staging_sub_path = f"{staging_root.rstrip('/')}/{sub_filename}"
-                    if hasattr(alist, "upload_bytes"):
-                        alist.upload_bytes(staging_root, sub_filename, raw_bytes)
-                    elif hasattr(alist, "upload_file"):
-                        alist.upload_file(staging_root, str(local_sub_path), sub_filename)
-                    elif hasattr(alist, "put_file"):
-                        alist.put_file(staging_sub_path, raw_bytes)
-                    elif hasattr(alist, "write_file_bytes"):
-                        alist.write_file_bytes(staging_sub_path, raw_bytes)
+                    try:
+                        mkdir = getattr(alist, "mkdir", None)
+                        if callable(mkdir):
+                            # Match the existing media materializers: create
+                            # the parent and attempt directory before the
+                            # first PUT.
+                            mkdir(posixpath.dirname(staging_root))
+                            mkdir(staging_root)
+                        self._upload_staged_file(
+                            alist,
+                            staging_root=staging_root,
+                            staging_sub_path=staging_sub_path,
+                            local_sub_path=local_sub_path,
+                            sub_filename=sub_filename,
+                            raw_bytes=raw_bytes,
+                            content_type=self._content_type(fmt),
+                        )
+                    except SubtitleInfrastructureError:
+                        raise
+                    except Exception as exc:
+                        raise SubtitleInfrastructureError(
+                            "字幕 staging 上传失败"
+                        ) from exc
 
                     acquired_file = {
                         "path": staging_sub_path,
@@ -616,6 +761,13 @@ class SubtitleMaterializer:
                     break
                 except SubtitleInfrastructureError:
                     raise
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    # A candidate download failure is an infrastructure
+                    # outage, not proof that the subtitle candidate is bad or
+                    # that this lane is exhausted.
+                    raise SubtitleInfrastructureError(
+                        f"字幕下载接口不可用: {exc}"
+                    ) from exc
                 except Exception as exc:
                     last_err = exc
                     continue

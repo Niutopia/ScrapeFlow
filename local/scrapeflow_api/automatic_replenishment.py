@@ -33,15 +33,14 @@ from engine.scrapeflow.video_admission import (
     probe_remote_video_stream,
 )
 from engine.tools.replenishment_adapter import (
-    SubtitleInfrastructureError,
     SubtitleMaterializer,
-    SubtitleProviderError,
 )
 
 from .replenishment import (
     build_replenishment_requests,
     enrich_replenishment_plan_aliases,
     normalize_reusable_candidate,
+    replenishment_request_lane,
     reusable_candidate_scope,
     select_replenishment_candidates,
 )
@@ -1297,13 +1296,34 @@ def reconcile_interrupted_gap_states(
         if not isinstance(raw, Mapping) or str(raw.get("phase") or "") not in _INTERRUPTED_GAP_PHASES:
             continue
         state = dict(raw)
-        state.update({
-            "phase": "retry_wait",
-            "updated_at": _now(),
-            "error": redact_error(error),
-            "last_error_scope": FAILURE_INFRASTRUCTURE,
-            "next_retry_at": None,
-        })
+        gap = state.get("gap") if isinstance(state.get("gap"), Mapping) else {}
+        if str(gap.get("kind") or "") == "missing_subtitle":
+            # Reconciliation after a process restart must not resurrect video
+            # tier/candidate evidence on a sidecar row.
+            for key in (
+                "tier", "tier_status", "candidate_failures_by_provider",
+                "exhaustion_proof_by_provider", "excluded_candidates",
+                "resolved",
+            ):
+                state.pop(key, None)
+            state.update({
+                "lane": "subtitle",
+                "phase": "retry_wait",
+                "updated_at": _now(),
+                "error": redact_error(error),
+                "last_error_scope": FAILURE_INFRASTRUCTURE,
+                "active_attempt": None,
+                "external_task_id": None,
+                "next_retry_at": None,
+            })
+        else:
+            state.update({
+                "phase": "retry_wait",
+                "updated_at": _now(),
+                "error": redact_error(error),
+                "last_error_scope": FAILURE_INFRASTRUCTURE,
+                "next_retry_at": None,
+            })
         try:
             redacted = redact_value(state)
             atomic_write_json(
@@ -1612,6 +1632,27 @@ class AutomaticReplenishmentRuntime:
         if not isinstance(raw, Mapping):
             return True
         return str(raw.get("status") or "").casefold() != "cleaned"
+
+    @classmethod
+    def _post_acquisition_reaudit_blocks_provider(
+        cls, state: Mapping[str, object],
+    ) -> bool:
+        """Whether a re-audit marker must prevent a fresh provider attempt.
+
+        ``gap_still_actionable`` is different from an in-flight/uncertain
+        marker: the scoped audit has completed and explicitly returned the gap
+        to node M of the flow.  Keep its old staging for evidence, but allow
+        the independent lane to make a bounded next attempt.
+        """
+        if _POST_ACQUISITION_REAUDIT_KEY not in state:
+            return False
+        raw = state.get(_POST_ACQUISITION_REAUDIT_KEY)
+        if not isinstance(raw, Mapping):
+            return True
+        status = str(raw.get("status") or "").casefold()
+        if status == "gap_still_actionable":
+            return False
+        return status != "cleaned"
 
     def _coerce_post_acquisition_reaudit(
         self,
@@ -2498,6 +2539,26 @@ class AutomaticReplenishmentRuntime:
         return [dict(row) for row in rows if isinstance(row, Mapping)]
 
     @classmethod
+    def _validated_request_lane(cls, request: Mapping[str, object]) -> str:
+        """Validate that declared and actual gap lanes are homogeneous."""
+        raw_gaps = request.get("gaps")
+        if not isinstance(raw_gaps, list) or not raw_gaps:
+            raise AutomaticReplenishmentError("补源请求缺少 gap 列表")
+        if any(not isinstance(gap, Mapping) for gap in raw_gaps):
+            raise AutomaticReplenishmentError("补源请求包含无效 gap 行")
+        lane = replenishment_request_lane(
+            [dict(gap) for gap in raw_gaps if isinstance(gap, Mapping)]
+        )
+        if lane is None:
+            raise AutomaticReplenishmentError(
+                "补源请求混合了字幕与视频缺口，拒绝执行"
+            )
+        declared = request.get("lane")
+        if declared is not None and declared != lane:
+            raise AutomaticReplenishmentError("补源请求 lane 与 gap 类型不一致")
+        return lane
+
+    @classmethod
     def _delivered_subtitle_gap_ids(
         cls,
         acquisition: Mapping[str, object],
@@ -2542,14 +2603,15 @@ class AutomaticReplenishmentRuntime:
         subtitles = [item.path for item in staging_files if item.kind == "subtitle"]
         if not videos:
             raise AutomaticReplenishmentError("媒体 child staging 没有视频文件")
-        if not subtitles:
-            return root
         relative = [path[len(root) + 1:] for path in videos]
         first_parts = {
             value.split("/", 1)[0]
             for value in relative if "/" in value
         }
-        if len(first_parts) != 1 or any("/" not in value for value in relative):
+        isolated = len(first_parts) == 1 and all("/" in value for value in relative)
+        if not subtitles:
+            return f"{root}/{next(iter(first_parts))}" if isolated else root
+        if not isolated:
             raise AutomaticReplenishmentError("混合补源无法从 files 证明视频隔离根")
         media_root = f"{root}/{next(iter(first_parts))}"
         prefix = media_root + "/"
@@ -3045,12 +3107,14 @@ class AutomaticReplenishmentRuntime:
         gap_id = gap.get("id")
         if not isinstance(gap_id, str) or not gap_id:
             raise AutomaticReplenishmentError("Engine gap 缺少 id")
+        subtitle_lane = str(gap.get("kind") or "") == "missing_subtitle"
         # Re-projecting an existing gap normally starts a new provider-search
         # round.  An ambiguous external submit is the exception: preserve its
         # reconciliation barrier so this write cannot make a later run look
         # safe to resubmit.
         waiting_reconcile = bool(
-            isinstance(prior_state, Mapping)
+            not subtitle_lane
+            and isinstance(prior_state, Mapping)
             and (
                 prior_state.get("tier_status") == "waiting_reconcile"
                 or prior_state.get("last_error_scope") == FAILURE_IN_DOUBT
@@ -3066,6 +3130,28 @@ class AutomaticReplenishmentRuntime:
             and isinstance(prior_state.get("error"), str)
             else None
         )
+        if subtitle_lane:
+            # A sidecar repair is not a provider-tier attempt.  In particular,
+            # do not carry a stale video tier, candidate exclusion ledger,
+            # external task id, or in-doubt marker from an older mixed run.
+            # The only durable video-adjacent evidence a subtitle row may
+            # retain is a pending post-acquisition audit marker, because that
+            # marker owns task staging until a fresh scoped audit completes.
+            durable_fields: dict[str, object] = {
+                "lane": "subtitle",
+                "active_attempt": None,
+                "external_task_id": None,
+                "next_retry_at": None,
+                "last_error_scope": None,
+            }
+            if waiting_reaudit and isinstance(prior_state, Mapping):
+                marker = prior_state.get(_POST_ACQUISITION_REAUDIT_KEY)
+                durable_fields[_POST_ACQUISITION_REAUDIT_KEY] = (
+                    dict(marker) if isinstance(marker, Mapping) else marker
+                )
+        else:
+            durable_fields = self._durable_gap_fields(prior_state, job_id=job_id)
+            durable_fields["lane"] = "media"
         state: dict[str, object] = {
             "id": gap_id,
             "job_id": job_id,
@@ -3079,20 +3165,59 @@ class AutomaticReplenishmentRuntime:
             "created_at": _now(),
             "updated_at": _now(),
             "error": prior_error if waiting_reconcile else None,
-            **self._durable_gap_fields(prior_state, job_id=job_id),
+            **durable_fields,
         }
         # Candidate failures are local, task-owned evidence.  Carry only the
         # bounded, normalized identity list forward when a fresh audit
         # projection recreates this gap state; never copy arbitrary persisted
         # JSON into a provider request.
-        prior_exclusions = (
-            prior_state.get("excluded_candidates")
-            if isinstance(prior_state, Mapping) else None
-        )
-        exclusions = self._merge_excluded_candidates(prior_exclusions)
-        if exclusions:
-            state["excluded_candidates"] = exclusions
+        if not subtitle_lane:
+            prior_exclusions = (
+                prior_state.get("excluded_candidates")
+                if isinstance(prior_state, Mapping) else None
+            )
+            exclusions = self._merge_excluded_candidates(prior_exclusions)
+            if exclusions:
+                state["excluded_candidates"] = exclusions
         return state
+
+    @staticmethod
+    def _project_subtitle_lane_state(
+        state: dict[str, object],
+        *,
+        phase: str,
+        error: str | None = None,
+        failure_scope: str | None = None,
+        preserve_reaudit: bool = True,
+    ) -> None:
+        """Project one gap onto the independent subtitle state schema.
+
+        Subtitle rows deliberately have no video tier/candidate evidence.
+        Keeping this projection in one small helper also makes exception paths
+        (including a materializer failure after a partial write) clear stale
+        video attempts instead of inheriting them on the next audit.
+        """
+        marker = state.get(_POST_ACQUISITION_REAUDIT_KEY)
+        for key in (
+            "tier", "tier_status", "candidate_failures_by_provider",
+            "exhaustion_proof_by_provider", "excluded_candidates",
+            "resolved",
+        ):
+            state.pop(key, None)
+        state.update({
+            "lane": "subtitle",
+            "phase": phase,
+            "error": error,
+            "active_attempt": None,
+            "external_task_id": None,
+            "next_retry_at": None,
+            "last_error_scope": failure_scope,
+            "updated_at": _now(),
+        })
+        if preserve_reaudit and marker is not None:
+            state[_POST_ACQUISITION_REAUDIT_KEY] = marker
+        else:
+            state.pop(_POST_ACQUISITION_REAUDIT_KEY, None)
 
     def _fresh_list(self, path: str) -> list[Mapping[str, object]]:
         listing = getattr(self.alist, "list", None)
@@ -3299,11 +3424,10 @@ class AutomaticReplenishmentRuntime:
     ) -> list[dict[str, object]]:
         """Pair explicitly delivered subtitle members with audited videos.
 
-        A mixed media request may contain a partial subtitle selection.  The
-        caller passes the subset actually present in ``acquisition.files``;
-        no candidate metadata alone can mark a subtitle gap resolved.  Pure
-        subtitle requests leave this unset and therefore require every
-        requested subtitle gap to have one exact member.
+        The caller passes the subset actually present in
+        ``acquisition.files``; no candidate metadata alone can mark a
+        subtitle gap resolved. Explicit ``missing_subtitle`` rows reach this
+        writer only through the dedicated subtitle request lane.
         """
         rows = acquisition.get("files")
         if not isinstance(rows, list):
@@ -4258,6 +4382,10 @@ class AutomaticReplenishmentRuntime:
         excluded = self._load_excluded_candidates(gap_state_paths)
         request_body = dict(request)
         request_gaps = self._request_gaps(request_body)
+        if self._validated_request_lane(request_body) != "media":
+            raise AutomaticReplenishmentError(
+                "字幕缺口不得进入视频三阶补源链"
+            )
         resolved_total: set[str] = set()
         for round_number in range(1, self.max_candidate_rounds + 1):
             # A failed downloader may return after an operator has paused the
@@ -5115,10 +5243,39 @@ class AutomaticReplenishmentRuntime:
         """Acquire standalone subtitles via the dedicated Subtitle Provider."""
         request_body = dict(request)
         request_gaps = self._request_gaps(request_body)
+        if self._validated_request_lane(request_body) != "subtitle":
+            raise AutomaticReplenishmentError(
+                "视频缺口不得进入字幕补全通道"
+            )
 
         attempt_id = f"attempt-{uuid.uuid4().hex}"
         staging = f"{self.staging_root}/{job.id}/{attempt_id}"
         workspace = self.workspace_root / job.id / attempt_id
+
+        # The dedicated provider performs its own search, download and staging
+        # writes in one bounded call.  Check the shared pause/admission
+        # boundary before that call; a subtitle request never falls back to a
+        # video search or materializer.
+        self._raise_if_cancelled(job, round_number=1, boundary="candidate_round")
+        self._progress(job, "provider_searching", round=1, provider="subtitle")
+        for gap in request_gaps:
+            gap_id = str(gap.get("id") or "")
+            state_path = gap_state_paths.get(gap_id)
+            if state_path:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self._project_subtitle_lane_state(
+                    state,
+                    phase="provider_searching",
+                    error=None,
+                    failure_scope=None,
+                )
+                state["attempts"] = 1
+                self._write_gap(state, state_path)
+        self._progress(
+            job, "acquiring", round=1, staging_root=staging,
+            provider="subtitle",
+        )
+        self._raise_if_cancelled(job, round_number=1, boundary="materialization")
 
         attempt_error: Exception | None = None
         acquisition: Mapping[str, object] | None = None
@@ -5130,6 +5287,8 @@ class AutomaticReplenishmentRuntime:
                 workspace=workspace,
                 alist=self.alist,
             )
+        except AutomaticReplenishmentCancelled:
+            raise
         except Exception as exc:
             attempt_error = exc
 
@@ -5139,69 +5298,21 @@ class AutomaticReplenishmentRuntime:
             else []
         )
 
-        if not delivered_files:
-            audit_only = (
-                job.summary.get("audit_subtitle_only") is True
-                or job.summary.get("audit_owned") is True
-                or str(job.id).startswith("audit-")
-                or all(str(g.get("kind") or "") == "missing_subtitle" for g in request_gaps)
-            )
-            if not audit_only and self.search is not None and self.materializer is not None:
-                try:
-                    self._remove_staging(staging)
-                    self._remove_local_attempt_workspace(job_id=job.id, attempt_id=attempt_id)
-                except Exception:
-                    pass
-                return self._run_request(
-                    job=job,
-                    request=request_body,
-                    gap_state_paths=gap_state_paths,
-                )
-
-
-
-
-        self._raise_if_cancelled(job, round_number=1, boundary="candidate_round")
-        self._progress(job, "provider_searching", round=1, provider="subtitle")
-        for gap in request_gaps:
-            gap_id = str(gap.get("id") or "")
-            state_path = gap_state_paths.get(gap_id)
-            if state_path:
-                try:
-                    state = json.loads(state_path.read_text(encoding="utf-8"))
-                    state.update({
-                        "phase": "provider_searching",
-                        "attempts": 1,
-                        "updated_at": _now(),
-                        "error": None,
-                    })
-                    self._write_gap(state, state_path)
-                except Exception:
-                    pass
-
-        self._progress(job, "acquiring", round=1, staging_root=staging, provider="subtitle")
-        self._raise_if_cancelled(job, round_number=1, boundary="materialization")
-
         try:
             if attempt_error is not None:
-                scope = (
-                    FAILURE_INFRASTRUCTURE
-                    if isinstance(attempt_error, SubtitleInfrastructureError)
-                    else FAILURE_CANDIDATE
-                )
+                scope = self._failure_scope(attempt_error, [])
                 for gap in request_gaps:
                     gap_id = str(gap.get("id") or "")
                     state_path = gap_state_paths.get(gap_id)
                     if state_path:
                         try:
                             state = json.loads(state_path.read_text(encoding="utf-8"))
-                            state.update({
-                                "phase": "retry_wait",
-                                "updated_at": _now(),
-                                "error": redact_error(attempt_error),
-                                "last_error_scope": scope,
-                                "next_retry_at": None,
-                            })
+                            self._project_subtitle_lane_state(
+                                state,
+                                phase="retry_wait",
+                                error=redact_error(attempt_error),
+                                failure_scope=scope,
+                            )
                             self._write_gap(state, state_path)
                         except Exception:
                             pass
@@ -5220,13 +5331,16 @@ class AutomaticReplenishmentRuntime:
                 }
 
             if delivered_files:
+                self._progress(
+                    job, "staging_verifying", round=1,
+                    staging_root=staging, provider="subtitle",
+                )
                 delivered_gap_ids: set[str] = set()
                 for file_entry in delivered_files:
                     if isinstance(file_entry, Mapping) and isinstance(file_entry.get("gap_ids"), list):
                         for g_id in file_entry["gap_ids"]:
                             delivered_gap_ids.add(str(g_id))
                 self._raise_if_cancelled(job, round_number=1, boundary="subtitle_write")
-                self._progress(job, "subtitle_installing", round=1)
                 installed = self._install_subtitle_members(
                     job=job,
                     request=request_body,
@@ -5235,20 +5349,20 @@ class AutomaticReplenishmentRuntime:
                     round_number=1,
                     required_gap_ids=delivered_gap_ids,
                 )
-                for gap_id in delivered_gap_ids:
-                    state_path = gap_state_paths.get(gap_id)
-                    if state_path:
-                        try:
-                            state = json.loads(state_path.read_text(encoding="utf-8"))
-                            state.update({
-                                "phase": "resolved",
-                                "resolved": True,
-                                "error": None,
-                                "updated_at": _now(),
-                            })
-                            self._write_gap(state, state_path)
-                        except Exception:
-                            pass
+                installed_gap_ids = {
+                    str(row.get("gap_id"))
+                    for row in installed
+                    if isinstance(row, Mapping)
+                    and isinstance(row.get("gap_id"), str)
+                    and row.get("gap_id")
+                }
+                post_acquisition_reaudit = self._mark_post_acquisition_reaudit(
+                    gap_state_paths,
+                    job_id=job.id,
+                    attempt_id=attempt_id,
+                    staging_root=staging,
+                    selected_gap_ids=installed_gap_ids,
+                )
                 self._progress(
                     job,
                     "final_verifying",
@@ -5257,12 +5371,40 @@ class AutomaticReplenishmentRuntime:
                 )
                 unresolved = [
                     str(g.get("id") or "") for g in request_gaps
-                    if str(g.get("id") or "") not in delivered_gap_ids
+                    if str(g.get("id") or "") not in installed_gap_ids
                 ]
+                if unresolved:
+                    partial_error = "字幕获取仅覆盖部分缺口，未覆盖项等待独立重试"
+                    unresolved_set = set(unresolved)
+                    for gap_id, state_path in gap_state_paths.items():
+                        if gap_id not in unresolved_set:
+                            continue
+                        try:
+                            state = json.loads(state_path.read_text(encoding="utf-8"))
+                            self._project_subtitle_lane_state(
+                                state,
+                                phase="retry_wait",
+                                error=partial_error,
+                                failure_scope=FAILURE_CANDIDATE,
+                            )
+                            self._write_gap(state, state_path)
+                        except Exception:
+                            pass
+                    return {
+                        "request": request_body,
+                        "resolved_gap_ids": sorted(installed_gap_ids),
+                        "unresolved_gap_ids": unresolved,
+                        "post_acquisition_reaudit": post_acquisition_reaudit,
+                        "failure_scope": FAILURE_CANDIDATE,
+                        "error": partial_error,
+                        "terminal": False,
+                        "status": "retry_wait",
+                    }
                 return {
                     "request": request_body,
-                    "resolved_gap_ids": sorted(delivered_gap_ids),
+                    "resolved_gap_ids": sorted(installed_gap_ids),
                     "unresolved_gap_ids": unresolved,
+                    "post_acquisition_reaudit": post_acquisition_reaudit,
                     "terminal": len(unresolved) == 0,
                     "status": "completed" if len(unresolved) == 0 else "completed_with_gaps",
                 }
@@ -5273,12 +5415,13 @@ class AutomaticReplenishmentRuntime:
                     if state_path:
                         try:
                             state = json.loads(state_path.read_text(encoding="utf-8"))
-                            state.update({
-                                "phase": "completed_with_gaps",
-                                "tier_status": "exhausted",
-                                "error": "字幕接口未检索到可用字幕",
-                                "updated_at": _now(),
-                            })
+                            self._project_subtitle_lane_state(
+                                state,
+                                phase="completed_with_gaps",
+                                error="字幕接口未检索到可用字幕",
+                                failure_scope=FAILURE_CANDIDATE,
+                                preserve_reaudit=False,
+                            )
                             self._write_gap(state, state_path)
                         except Exception:
                             pass
@@ -5303,11 +5446,23 @@ class AutomaticReplenishmentRuntime:
                     "error": "未检索到匹配字幕",
                 }
         finally:
-            try:
-                self._remove_staging(staging)
-                self._remove_local_attempt_workspace(job_id=job.id, attempt_id=attempt_id)
-            except Exception:
-                pass
+            # A successfully installed sidecar remains task-owned staging
+            # until a later scoped audit proves its exact gap disappeared.
+            # Only a clean zero-candidate attempt is eligible for immediate
+            # bounded cleanup; failures retain evidence for safe recovery.
+            if not delivered_files and attempt_error is None:
+                try:
+                    self._raise_if_cancelled(
+                        job, round_number=1, boundary="subtitle_cleanup",
+                    )
+                    self._remove_staging(staging)
+                    self._remove_local_attempt_workspace(
+                        job_id=job.id, attempt_id=attempt_id,
+                    )
+                except AutomaticReplenishmentCancelled:
+                    raise
+                except Exception:
+                    pass
 
     def run_for_job(self, job: EngineJob) -> dict[str, object]:
         """Automatically resolve all engine-discovered, provider-compatible gaps."""
@@ -5327,12 +5482,40 @@ class AutomaticReplenishmentRuntime:
         requests = request_bundle.get("requests") if isinstance(request_bundle, Mapping) else None
         if not isinstance(requests, list):
             raise AutomaticReplenishmentError("Engine gap 请求格式无效")
+        # A subtitle-audit root is a sidecar-only transaction.  Validate the
+        # complete split before creating any gap state or invoking a provider;
+        # a malformed/mixed plan must not leak a media request first and only
+        # then fail at the per-request dispatch boundary.
+        if job.summary.get("audit_subtitle_only") is True:
+            for candidate_request in requests:
+                if not isinstance(candidate_request, Mapping):
+                    raise AutomaticReplenishmentError("字幕审计请求格式无效")
+                raw_candidate_gaps = candidate_request.get("gaps")
+                if isinstance(raw_candidate_gaps, list) and raw_candidate_gaps:
+                    if self._validated_request_lane(candidate_request) != "subtitle":
+                        raise AutomaticReplenishmentError(
+                            "字幕专属任务包含视频或混合缺口，拒绝执行"
+                        )
+                elif raw_candidate_gaps not in (None, []):
+                    raise AutomaticReplenishmentError("字幕审计请求 gap 列表无效")
         outcomes: list[dict[str, object]] = []
         already_resolved: list[str] = []
+        already_exhausted: list[str] = []
         pending_reaudit: list[str] = []
         for request in requests:
-            if not isinstance(request, Mapping) or not self._request_gaps(request):
+            if not isinstance(request, Mapping):
+                raise AutomaticReplenishmentError("补源请求不是对象")
+            raw_request_gaps = request.get("gaps")
+            if not isinstance(raw_request_gaps, list):
+                raise AutomaticReplenishmentError("补源请求缺少 gap 列表")
+            if any(not isinstance(gap, Mapping) for gap in raw_request_gaps):
+                raise AutomaticReplenishmentError("补源请求包含无效 gap 行")
+            if not raw_request_gaps:
                 continue
+            # Validate the complete row set before filtering durable rows or
+            # invoking either provider lane.  A valid subtitle row paired
+            # with a malformed sibling must not be executed in isolation.
+            self._validated_request_lane(request)
             active_gaps: list[dict[str, object]] = []
             states: dict[str, Path] = {}
             for gap in self._request_gaps(request):
@@ -5348,13 +5531,23 @@ class AutomaticReplenishmentRuntime:
                         state = None
                     if (
                         isinstance(state, Mapping)
-                        and self._post_acquisition_reaudit_is_pending(state)
+                        and self._post_acquisition_reaudit_blocks_provider(state)
                     ):
                         # A completed child must not become a fresh provider
-                        # request while the targeted audit still owns its
-                        # staging.  This also preserves a cleanup-failed
-                        # attempt for an explicit/later scoped re-audit.
+                        # request while the targeted audit is in flight or
+                        # uncertain.  A completed audit that still reports
+                        # the gap as actionable is deliberately allowed back
+                        # into M; its old staging remains task-owned evidence.
                         pending_reaudit.append(gap_id)
+                        continue
+                    if (
+                        isinstance(state, Mapping)
+                        and state.get("phase") == "completed_with_gaps"
+                    ):
+                        # Exhaustion is lane-local durable evidence.  A retry
+                        # for a sibling media gap must not restart subtitle
+                        # discovery (and vice versa).
+                        already_exhausted.append(gap_id)
                         continue
                     if (
                         isinstance(state, Mapping)
@@ -5380,17 +5573,21 @@ class AutomaticReplenishmentRuntime:
             active_request = dict(request)
             active_request["gaps"] = active_gaps
             try:
-                subtitle_only_request = (
+                lane = self._validated_request_lane(active_request)
+                if (
                     job.summary.get("audit_subtitle_only") is True
-                    or all(str(g.get("kind") or "") == "missing_subtitle" for g in active_gaps)
-                )
-                if subtitle_only_request:
+                    and lane != "subtitle"
+                ):
+                    raise AutomaticReplenishmentError(
+                        "字幕专属任务包含视频缺口，拒绝执行"
+                    )
+                if lane == "subtitle":
                     outcomes.append(self._run_subtitle_request(
                         job=job,
                         request=active_request,
                         gap_state_paths=states,
                     ))
-                else:
+                elif lane == "media":
                     outcomes.append(self._run_request(
                         job=job,
                         request=active_request,
@@ -5398,19 +5595,28 @@ class AutomaticReplenishmentRuntime:
                     ))
             except AutomaticReplenishmentCancelled as exc:
                 scope = self._failure_scope(exc, [])
+                subtitle_lane = request.get("lane") == "subtitle"
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if (
                         state.get("phase") != "resolved"
-                        and not self._post_acquisition_reaudit_is_pending(state)
+                        and not self._post_acquisition_reaudit_blocks_provider(state)
                     ):
-                        state.update({
-                            "phase": "retry_wait",
-                            "updated_at": _now(),
-                            "error": redact_error(exc),
-                            "last_error_scope": scope,
-                            "next_retry_at": None,
-                        })
+                        if subtitle_lane:
+                            self._project_subtitle_lane_state(
+                                state,
+                                phase="retry_wait",
+                                error=redact_error(exc),
+                                failure_scope=scope,
+                            )
+                        else:
+                            state.update({
+                                "phase": "retry_wait",
+                                "updated_at": _now(),
+                                "error": redact_error(exc),
+                                "last_error_scope": scope,
+                                "next_retry_at": None,
+                            })
                         self._write_gap(state, path)
                 outcomes.append({
                     "request": active_request,
@@ -5425,6 +5631,7 @@ class AutomaticReplenishmentRuntime:
                     "job_id": job.id,
                     "outcomes": outcomes,
                     "already_resolved_gap_ids": sorted(set(already_resolved)),
+                    "already_exhausted_gap_ids": sorted(set(already_exhausted)),
                     "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
                     "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
                     "cancelled": True,
@@ -5436,20 +5643,29 @@ class AutomaticReplenishmentRuntime:
                     "waiting_reconcile"
                     if scope == FAILURE_IN_DOUBT else "retry_wait"
                 )
+                subtitle_lane = request.get("lane") == "subtitle"
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if (
                         state.get("phase") != "resolved"
-                        and not self._post_acquisition_reaudit_is_pending(state)
+                        and not self._post_acquisition_reaudit_blocks_provider(state)
                     ):
-                        state.update({
-                            "phase": failure_phase,
-                            "updated_at": _now(),
-                            "error": redact_error(exc),
-                            "last_error_scope": scope,
-                            "next_retry_at": None,
-                        })
-                        if task_id is not None:
+                        if subtitle_lane:
+                            self._project_subtitle_lane_state(
+                                state,
+                                phase=failure_phase,
+                                error=redact_error(exc),
+                                failure_scope=scope,
+                            )
+                        else:
+                            state.update({
+                                "phase": failure_phase,
+                                "updated_at": _now(),
+                                "error": redact_error(exc),
+                                "last_error_scope": scope,
+                                "next_retry_at": None,
+                            })
+                        if task_id is not None and not subtitle_lane:
                             state["external_task_id"] = task_id
                         self._write_gap(state, path)
                 outcomes.append({
@@ -5462,6 +5678,7 @@ class AutomaticReplenishmentRuntime:
             "job_id": job.id,
             "outcomes": outcomes,
             "already_resolved_gap_ids": sorted(set(already_resolved)),
+            "already_exhausted_gap_ids": sorted(set(already_exhausted)),
             "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
             "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
         }

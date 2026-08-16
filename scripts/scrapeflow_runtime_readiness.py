@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--api-url",
-        default="http://127.0.0.1:8765",
+        default="http://127.0.0.1:3010",
         help="loopback ScrapeFlow API URL",
     )
     parser.add_argument(

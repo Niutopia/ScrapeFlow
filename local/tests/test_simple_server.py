@@ -100,6 +100,20 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read())
 
+    def test_root_serves_same_origin_dashboard_with_shelf_controls(self) -> None:
+        with urllib.request.urlopen(self.base + "/", timeout=3) as response:
+            body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.get_content_type(), "text/html")
+            self.assertIn("ScrapeFlow", body)
+            self.assertIn("这个任务应整理到哪里？", body)
+            self.assertIn("/api/jobs/${encodeURIComponent(b.dataset.job)}/start", body)
+            self.assertIn("target_shelf", body)
+            self.assertIn("电影", body)
+            self.assertIn("番剧", body)
+            self.assertIn("美剧", body)
+            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+
     def create_job(self, source: str = "/library/待刮削/Example") -> dict[str, object]:
         status, payload = self.request("POST", "/api/jobs", {"path": source})
         self.assertEqual(status, 201)
@@ -159,11 +173,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
         created = self.create_job()
         job_id = created["id"]
-        self.assertEqual(created["phase"], "reconciling")
+        self.assertEqual(created["phase"], "awaiting_target_shelf")
         self.assertEqual(created["source"], "/library/待刮削/Example")
         self.assertIsNone(created["target_shelf"])
         self.assertIsNone(created["target_root"])
-        self.assertEqual(created["reconciliation"]["status"], "pending")
+        self.assertEqual(created["reconciliation"]["status"], "blocked_by_target_shelf")
         self.assertEqual(created["allowed_target_shelves"], [])
         self.assertNotIn("identity_override", created["plan"])
         persisted = self.runner.get_job(job_id)
@@ -258,11 +272,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
         self.assertEqual(len(scheduled), 1)
         created = self.runner.get_job(scheduled[0])
-        # Pause blocks formal/provider effects, not the newly registered
-        # task's bounded read-only reconciliation.
-        self.assertEqual(queued, [created.id])
+        # Registration never schedules reconciliation before the user selects
+        # the task's target shelf.
+        self.assertEqual(queued, [])
         self.assertEqual(created.request["source_path"], "/library/待刮削/Real Release")
-        self.assertEqual(created.phase, "reconciling")
+        self.assertEqual(created.phase, "awaiting_target_shelf")
 
     def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
         self.remote.entries["/library/待刮削"] = [

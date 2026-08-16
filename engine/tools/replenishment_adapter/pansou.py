@@ -542,7 +542,7 @@ class PanSouDiscovery:
             inspector=inspector,
             transport=transport,
             timeout=_bounded_float("SCRAPEFLOW_PANSOU_TIMEOUT", 12.0, 1.0, 60.0),
-            max_queries=_bounded_int("SCRAPEFLOW_PANSOU_MAX_QUERIES", 4, 1, 12),
+            max_queries=_bounded_int("SCRAPEFLOW_PANSOU_MAX_QUERIES", 12, 1, 32),
             max_links=_bounded_int("SCRAPEFLOW_PANSOU_MAX_LINKS", 64, 1, 256),
             config_issue=config_issue,
         )

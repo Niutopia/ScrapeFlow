@@ -39,6 +39,10 @@ from .replenishment_tiers import STRICT_TIER_ORDER
 ACTIONABLE_GAP_KINDS = frozenset({
     "missing_episode", "missing_season", "missing_media", "missing_subtitle",
 })
+MEDIA_GAP_KINDS = frozenset({
+    "missing_episode", "missing_season", "missing_media",
+})
+SUBTITLE_GAP_KIND = "missing_subtitle"
 PROVIDER_ORDER = {
     provider: index
     for index, provider in enumerate(STRICT_TIER_ORDER)
@@ -1233,7 +1237,7 @@ def build_replenishment_request(
     optional_only = bool(gaps) and all(gap.get("season") == 0 for gap in gaps)
     target_root = str(metadata.get("series_root") or plan.get("target_root") or "")
     media_format = _requested_media_format(metadata, target_root)
-    return {
+    request = {
         "version": 2, "job_id": job_id, "round": round_number,
         "media": {
             "title": str(metadata.get("title") or "").strip(), "aliases": aliases,
@@ -1265,18 +1269,88 @@ def build_replenishment_request(
             } if optional_only else {}),
         },
     }
+    lane = replenishment_request_lane(gaps)
+    if lane is not None:
+        request["lane"] = lane
+        if lane == "subtitle":
+            # Keep the sidecar payload intentionally small.  Video tier order,
+            # quality ladders and candidate fallback policy are not part of a
+            # subtitle repair request and must not be mistaken for executable
+            # video-provider instructions by an adapter or a future caller.
+            request["rules"] = {
+                "subtitle_only": True,
+                "require_title_identity": True,
+                "require_target_video_path": True,
+                "allowed_formats": sorted(
+                    extension.lstrip(".") for extension in SUBTITLE_EXTENSIONS
+                ),
+            }
+    return request
+
+
+def replenishment_request_lane(
+    gaps: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Return the one legal execution lane for a homogeneous gap set.
+
+    An explicit subtitle gap repairs an already-existing video's sidecar and
+    must never inherit video candidates, tiers, attempts, or child planning.
+    ``None`` is deliberately fail-closed for empty, unsupported, or mixed
+    rows; callers must split before dispatching rather than guessing.
+    """
+    kinds = {
+        str(gap.get("kind") or "")
+        for gap in gaps
+        if isinstance(gap, Mapping)
+    }
+    if kinds == {SUBTITLE_GAP_KIND}:
+        return "subtitle"
+    if kinds and kinds <= MEDIA_GAP_KINDS:
+        return "media"
+    return None
+
+
+def _plan_for_replenishment_lane(
+    plan: Mapping[str, Any], gaps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Copy one plan while replacing only its provider gap projection."""
+    lane_plan = dict(plan)
+    scan_report = (
+        dict(plan.get("scan_report"))
+        if isinstance(plan.get("scan_report"), Mapping)
+        else {}
+    )
+    scan_report["resource_gaps"] = [dict(gap) for gap in gaps]
+    lane_plan["scan_report"] = scan_report
+    return lane_plan
 
 
 def build_replenishment_requests(
     plan: Mapping[str, Any], *, job_id: str, round_number: int,
 ) -> dict[str, Any]:
-    """Build one automatic acquisition request per media identity."""
+    """Build one request per media identity and per execution lane."""
     metadata = plan.get("metadata") if isinstance(plan.get("metadata"), Mapping) else {}
     raw_gaps = (
         plan.get("scan_report", {}).get("resource_gaps")
         if isinstance(plan.get("scan_report"), Mapping) else []
     )
-    gaps = [dict(gap) for gap in raw_gaps or [] if isinstance(gap, Mapping)]
+    gaps: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    for raw_gap in raw_gaps if isinstance(raw_gaps, list) else []:
+        if not isinstance(raw_gap, Mapping):
+            unresolved.append({
+                "kind": "invalid_gap",
+                "reason": "resource gap 不是对象，无法安全补源",
+            })
+            continue
+        gap = dict(raw_gap)
+        # Do not silently discard an unsupported or incomplete audit row.  It
+        # must remain visible to the root barrier instead of being mistaken
+        # for a plan with no work.
+        if _gap_identity(gap) is None:
+            unresolved.append(gap)
+            continue
+        gaps.append(gap)
     identities: dict[int, dict[str, Any]] = {}
     raw_tmdb_id = metadata.get("tmdb_id")
     if type(raw_tmdb_id) is int and raw_tmdb_id > 0 and plan.get("mode") in {"tv", "mixed"}:
@@ -1298,11 +1372,28 @@ def build_replenishment_requests(
             if type(tmdb_id) is int and tmdb_id > 0:
                 identities[tmdb_id] = {**dict(identity), "target_root": str(target_root)}
     if not identities:
-        request = build_replenishment_request(plan, job_id=job_id, round_number=round_number)
-        return {"version": 1, "requests": [request], "unresolved_gaps": []}
+        requests: list[dict[str, Any]] = []
+        for lane, lane_kinds in (
+            ("media", MEDIA_GAP_KINDS),
+            ("subtitle", frozenset({SUBTITLE_GAP_KIND})),
+        ):
+            lane_gaps = [
+                gap for gap in gaps
+                if str(gap.get("kind") or "") in lane_kinds
+            ]
+            if not lane_gaps:
+                continue
+            request = build_replenishment_request(
+                _plan_for_replenishment_lane(plan, lane_gaps),
+                job_id=job_id,
+                round_number=round_number,
+            )
+            if request.get("gaps"):
+                request["lane"] = lane
+                requests.append(request)
+        return {"version": 1, "requests": requests, "unresolved_gaps": unresolved}
 
-    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    unresolved: list[dict[str, Any]] = []
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for gap in gaps:
         identity_id: int | None = None
         media = gap.get("media") if isinstance(gap.get("media"), Mapping) else {}
@@ -1330,13 +1421,14 @@ def build_replenishment_requests(
                 ]
                 if len(title_matches) == 1:
                     identity_id = title_matches[0]
-        if identity_id is None:
+        lane = replenishment_request_lane([gap])
+        if identity_id is None or lane is None:
             unresolved.append(gap)
         else:
-            grouped[identity_id].append(gap)
+            grouped[(identity_id, lane)].append(gap)
 
     requests: list[dict[str, Any]] = []
-    for tmdb_id, project_gaps in grouped.items():
+    for (tmdb_id, lane), project_gaps in grouped.items():
         identity = identities[tmdb_id]
         aliases = [
             identity.get("title"), identity.get("original_title"),
@@ -1358,7 +1450,12 @@ def build_replenishment_requests(
         request = build_replenishment_request(
             project_plan, job_id=job_id, round_number=round_number,
         )
-        request["project_key"] = f"tmdb:tv:{tmdb_id}"
+        request["lane"] = lane
+        request["project_key"] = (
+            f"tmdb:tv:{tmdb_id}:subtitle"
+            if lane == "subtitle"
+            else f"tmdb:tv:{tmdb_id}"
+        )
         requests.append(request)
     return {
         "version": 1, "requests": requests,
