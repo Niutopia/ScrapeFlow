@@ -525,6 +525,55 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(season_gap.status, "open")
             self.assertNotIn("unit-tv::missing_season::S02", result["gaps_closed"])
 
+    def test_empty_identity_titles_are_enriched_from_tmdb(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            save_work_unit_records(state_root, "root-1", [
+                WorkUnitRecord(
+                    work_unit_id="unit-tv",
+                    root_task_id="root-1",
+                    boundary_key="unit-tv",
+                    source_paths=("/待刮削/unit-tv",),
+                    source_revision=1,
+                    role="single_work",
+                    media_context="tv",
+                    identity_status="confirmed",
+                    identity={"media_type": "tv", "tmdb_id": 35507},
+                ),
+            ])
+            save_gap_ledger(state_root, "root-1", [
+                _episode_gap(
+                    "root-1", "unit-tv",
+                    media_type="tv", tmdb_id=35507, season=1, episode=2,
+                ),
+            ])
+            self._set_tier(state_root, "root-1", "magnet")
+
+            class DetailsTMDB:
+                def get(self, path, **params):
+                    return {
+                        "/tv/35507": {
+                            "name": "Fate/Zero",
+                            "original_name": "Fate/Zero",
+                        },
+                    }.get(path)
+
+            seen: list[dict[str, Any]] = []
+
+            def search(request):
+                seen.append(dict(request))
+                return {"candidates": []}
+
+            runner = self._runner(state_root)
+            runner.tmdb = DetailsTMDB()
+            run_root_replenishment(
+                runner, state_root, "root-1", search_runner=search,
+            )
+            self.assertEqual(len(seen), 1)
+            media = seen[0]["media"]
+            self.assertEqual(media["title"], "Fate/Zero")
+            self.assertIn("Fate/Zero", media["aliases"])
+
     def test_subtitle_gaps_never_enter_the_video_tiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)

@@ -67,7 +67,11 @@ from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.target_shelf import target_root_for_shelf
 from engine.scrapeflow.work_units import load_work_unit_records
 
-from .replenishment_bridge import gap_ledger_requests, gap_ledger_selection
+from .replenishment_bridge import (
+    _nonempty_strings,
+    gap_ledger_requests,
+    gap_ledger_selection,
+)
 from .replenishment_tiers import (
     FAILURE_CANDIDATE,
     FAILURE_IN_DOUBT,
@@ -507,6 +511,60 @@ def _noop_result(state: dict[str, Any], tier: str) -> dict[str, Any]:
     }
 
 
+def _enrich_media_titles(runner: Any, request: dict[str, Any]) -> None:
+    """Fill an empty bridged media title/aliases from TMDB.
+
+    An operator-confirmed unit identity may carry only ``media_type +
+    tmdb_id`` (no title), which would leave the bridge with empty aliases and
+    the selector would reject every candidate.  The TMDB client is the
+    canonical title source; enrichment is best-effort and never overrides a
+    non-empty alias list.
+    """
+    media = request.get("media")
+    if not isinstance(media, dict):
+        return
+    aliases = media.get("aliases")
+    if isinstance(aliases, list) and aliases:
+        return
+    media_type = str(media.get("media_type") or "").strip().casefold()
+    tmdb_id = media.get("tmdb_id")
+    if (
+        media_type not in {"movie", "tv"}
+        or isinstance(tmdb_id, bool)
+        or not isinstance(tmdb_id, int)
+        or tmdb_id <= 0
+    ):
+        return
+    tmdb = getattr(runner, "tmdb", None)
+    getter = getattr(tmdb, "get", None)
+    if not callable(getter):
+        return
+    try:
+        details = getter(f"/{media_type}/{tmdb_id}")
+    except Exception:
+        return
+    if not isinstance(details, Mapping):
+        return
+    title = (
+        str(details.get("name") or "").strip()
+        if media_type == "tv"
+        else str(details.get("title") or "").strip()
+    )
+    original_title = str(
+        details.get("original_name") or details.get("original_title") or ""
+    ).strip()
+    if not title:
+        return
+    media["title"] = title
+    if original_title:
+        media["original_title"] = original_title
+    media["aliases"] = _nonempty_strings([
+        title,
+        original_title,
+        *(media.get("aliases") if isinstance(media.get("aliases"), list) else []),
+    ])
+
+
 def run_root_replenishment(
     runner,
     state_root: Path,
@@ -538,6 +596,11 @@ def run_root_replenishment(
     requests = gap_ledger_requests(state_root, root_task_id)
     if not requests:
         return _noop_result(state, tier)
+
+    # Operator-confirmed identities may carry no title; fill it from TMDB so
+    # the selection boundary has real alias evidence.
+    for request in requests:
+        _enrich_media_titles(runner, request)
 
     # Drop in-flight (in_doubt) gaps so the same coordinate is never re-submitted.
     # missing_subtitle gaps are NOT served by the three video tiers: contract
