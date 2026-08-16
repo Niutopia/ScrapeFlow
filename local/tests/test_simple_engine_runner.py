@@ -611,6 +611,45 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertNotIn("writer", events)
         self.assertEqual(runner._read(queued.id).phase, "archive_preprocessing")
 
+    def test_boundary_analysis_runs_before_identity_and_persists_work_units(self) -> None:
+        """B/W must complete before any TMDB identity work (contract rule 3)."""
+        events: list[str] = []
+        runner = SimpleEngineRunner(
+            self.root, alist=self.alist, tmdb=object(), planner=fake_plan,
+            validate=False, executor=lambda _plan: {"ok": True},
+        )
+        # Fate-style container: two titled children each carrying videos.
+        self.alist.files["/incoming/fate/Fate Zero/01.mkv"] = FAKE_VIDEO_BYTES
+        self.alist.files["/incoming/fate/Fate Zero/02.mkv"] = FAKE_VIDEO_BYTES
+        self.alist.files["/incoming/fate/Fate Zero/03.mkv"] = FAKE_VIDEO_BYTES
+        self.alist.files["/incoming/fate/Fate Zero/04.mkv"] = FAKE_VIDEO_BYTES
+        self.alist.files["/incoming/fate/Fate Stay Night UBW/Season 01/S01E01.mkv"] = FAKE_VIDEO_BYTES
+        match = SimpleNamespace(
+            media_type="tv", tmdb_id=35507, title="Fate/Zero", year="2011",
+            confidence=0.99, decision_trace={},
+        )
+        waiting = self._new_work_waiting(runner, "/incoming/fate", job_id="auto-boundary")
+        queued = runner.start_automatic_job(waiting.id, target_shelf="anime")
+        with patch(
+            "engine.scraper.auto_match_tmdb",
+            side_effect=lambda *args, **kwargs: events.append("resolve_identity") or (match, []),
+        ):
+            job = runner.plan_automatic_job(queued.id)
+        self.assertEqual(job.phase, "planned")
+        self.assertIn("resolve_identity", events)
+        from engine.scrapeflow.work_units import load_work_unit_records
+
+        records = load_work_unit_records(self.root, "auto-boundary")
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            {record.boundary_key for record in records},
+            {
+                "/incoming/fate/Fate Zero",
+                "/incoming/fate/Fate Stay Night UBW",
+            },
+        )
+        self.assertTrue(all(record.identity_status == "pending" for record in records))
+
     def test_existing_formal_target_is_terminal_planning_conflict_without_retry(self) -> None:
         alist = TargetConflictAList()
         source_root = "/library/待刮削/movie"

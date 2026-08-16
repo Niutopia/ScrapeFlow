@@ -5090,6 +5090,21 @@ class SimpleEngineRunner:
                 summary=archive_summary,
             )
             atomic_write_json(self._job_path(job_id), matching.as_dict(), allow_nan=False)
+            # B/W step: understand the directory structure before any TMDB
+            # identity work (contract rule 3).  The WorkUnit ledger is
+            # persisted beside the job for the per-unit identity stage (C/U);
+            # it stays advisory here so the legacy chain keeps its current
+            # behavior until C consumes it.
+            try:
+                from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+                analyze_root_boundaries(
+                    self.alist,
+                    archive_request.source_path,
+                    root_task_id=job_id,
+                    state_root=self.state_root,
+                )
+            except Exception:
+                pass  # Advisory in P3; the C/U stage will make it authoritative.
             try:
                 _pause_checkpoint(effective_pause)
             except EnginePauseRequested:
