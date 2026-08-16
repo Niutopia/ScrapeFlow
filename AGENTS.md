@@ -12,19 +12,28 @@
 
 ### 实现状态说明 (Phase 0 冻结基线，2026-08-16)
 
-当前代码实现是 **legacy execution core**。上方领域模型层次（`IntakeSource → RootJob → WorkUnit`）
-是目标架构，代码中尚未实现。禁止在过渡期内执行以下操作：
+目标领域模型（`IntakeSource → RootJob → WorkUnit`）已实现并接入入站链路（见下方迁移状态）。
+既有 legacy execution core 保留为**内部单作品执行与回读载体**（`EngineJob`），继续冻结。禁止在过渡期内执行以下操作：
 
 - **禁止**继续往 `EngineJob.summary` 新增业务语义字段；
 - **禁止**新增 release evidence 包装、provider gate 层级、admission barrier 规则；
 - **禁止**创建第二套 writer 或第二套 TMDB 匹配器；
 - **必须**通过 `IntakeSource → RootJob → WorkUnit` 路径新增功能，而不是扩展 `EngineJob` phase 字段。
 
-测试基线（2026-08-16 实测）：**800 tests passed, 300 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，33 秒）。
+测试基线（2026-08-16 实测）：**850 tests passed, 310 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，35 秒）。
 任何代码变更不得使通过数减少。
 
-迁移状态：目标架构迁移已启动（2026-08-16 P0 checkpoint 已提交；P1–P10 按已批准方案推进，
-差距清单见 README 的"当前实现状态与合同差距"一节）。
+迁移状态：目标架构迁移 **P0–P10 已完成**（2026-08-16）：
+
+- A/S：待刮削只读发现（零 job 创建）、Web 创建任务（来源+货架，`POST /api/root-jobs`）；
+- B/W/C/U：快照与边界分析（`root_boundaries`）、逐单元身份与 durable override（`unit_identity`，确认端点 `/api/jobs/:id/work-units/:unit/confirm`）；
+- D：三库 `LibraryIndex` 五分类对账（跨货架查重，`library_index`）；
+- F/G/H：单元驱动规划 + 唯一写器 + `WorkAcceptanceResult`（`unit_execution`，EngineJob 为内部载体）；
+- J/N：Gap 账本绑 `work_unit_id`（`gap_ledger`）；字幕独立渠道默认关闭且缺陷已修；
+- R：根任务聚合（`root_aggregation`，`GET /api/jobs/:id/work-units`）；
+- 合规：作品名硬编码全部数据化（`engine/scrapeflow/data/release_lexicon.py`）、货架-媒体类型矩阵已删除、TMDB 匹配器统一为单一评分核心；
+- 测试：`tests/corpus/` 10 场景 + 真实 A→B→W→C→D 链路回归。
+- 存量 `EngineJob.summary` 业务字段与 provider gate 机制保持冻结，随后续运行节奏继续清退。
 
 ## 1. 产品边界与核心领域模型
 
