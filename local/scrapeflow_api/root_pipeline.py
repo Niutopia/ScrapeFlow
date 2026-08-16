@@ -23,6 +23,8 @@ Pipeline contract:
 
 from __future__ import annotations
 
+import posixpath
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -129,6 +131,83 @@ def _refresh_lane_acceptance(
     save_work_acceptance(
         state_root, root_task_id, list(fresh.values()),
     )
+
+
+def _cleanup_empty_source_shells(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    source: str,
+) -> list[str]:
+    """Remove only verifiably empty dirs in a completed root's own intake tree.
+
+    Ownership is proven by the durable catalog binding (S step), never by path
+    naming: the catalog entry must bind this exact root task to this exact
+    source path.  Only directories that list as empty are removed; every
+    removal is confirmed through a fresh parent listing, and files or
+    non-empty directories are never touched.  The source root itself is
+    removed when it ends up empty, which lets the intake monitor mark the
+    catalog entry missing on its next scan.
+    """
+    try:
+        bound = any(
+            entry.root_task_id == root_task_id and entry.canonical_path == source
+            for entry in load_intake_catalog(state_root)
+        )
+    except Exception:
+        bound = False
+    if not bound:
+        return []
+    if not runner.source_directory_exists(source):
+        # Already consumed (e.g. archived by an E1 lane): nothing to clean.
+        return []
+    listing = getattr(runner.alist, "list", None)
+    remove_empty = getattr(runner.alist, "remove_empty_dir", None)
+    if not callable(listing) or not callable(remove_empty):
+        return []
+
+    def rows(path: str) -> list[Mapping[str, object]]:
+        try:
+            raw = listing(path, refresh=True)
+        except TypeError:
+            raw = listing(path)
+        if not isinstance(raw, list) or any(
+            not isinstance(item, Mapping) for item in raw
+        ):
+            raise RuntimeError(f"AList 源目录回读格式无效: {path}")
+        return list(raw)
+
+    removed: list[str] = []
+
+    def visit(directory: str) -> None:
+        for item in rows(directory):
+            name = item.get("name")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+            ):
+                raise RuntimeError(f"AList 源目录出现不安全条目: {directory}")
+            if item.get("is_dir") is True:
+                visit(posixpath.join(directory, name))
+        if rows(directory):
+            return
+        deleted = remove_empty(directory)
+        if deleted is False:
+            return
+        parent = posixpath.dirname(directory) or "/"
+        name = posixpath.basename(directory)
+        try:
+            parent_rows = rows(parent)
+        except Exception:
+            parent_rows = []
+        if not any(item.get("name") == name for item in parent_rows):
+            removed.append(directory)
+
+    visit(source)
+    return removed
 
 
 def run_root_pipeline(
@@ -251,6 +330,17 @@ def run_root_pipeline(
             runner, job, PARK_PHASE,
             error="部分作品单元尚未完成，等待继续处理",
         )
+    # Post-completion housekeeping: drop the empty source-dir shells the
+    # writer leaves behind in this root's own intake tree.  Strictly
+    # emptiness-gated and best-effort — a failure never rolls back the
+    # completion, and a paused run skips remote deletes entirely.
+    if not (callable(pause_requested) and pause_requested()):
+        try:
+            _cleanup_empty_source_shells(
+                runner, state_root, root_task_id, source,
+            )
+        except Exception:
+            pass
     return _persist_root(runner, job, "completed")
 
 

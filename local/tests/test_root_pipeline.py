@@ -412,5 +412,150 @@ class RootPipelineTests(unittest.TestCase):
         self.assertIsNone(reopened[0].matched_work_root)
 
 
+class CleaningIndexAList(IndexAList):
+    """IndexAList plus explicit empty-directory removal for shell cleanup."""
+
+    def __init__(self, files: dict[str, bytes] | None = None) -> None:
+        super().__init__(files)
+        self.remove_empty_calls: list[str] = []
+
+    def remove_empty_dir(self, path: str) -> bool:
+        normalized = path.rstrip("/") or "/"
+        self.remove_empty_calls.append(normalized)
+        prefix = normalized.rstrip("/") + "/"
+        if any(name.startswith(prefix) for name in self.files):
+            return False
+        if any(name.startswith(prefix) and name != normalized for name in self.dirs):
+            return False
+        if normalized in self.dirs:
+            self.dirs.discard(normalized)
+            return True
+        return False
+
+
+class SourceShellCleanupTests(unittest.TestCase):
+    """Empty source-dir shells are dropped after a root completes."""
+
+    def _setup(
+        self,
+        files: dict[str, bytes],
+        *,
+        executor=None,
+        tmdb: object | None = None,
+    ):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = CleaningIndexAList(files)
+        executor_events: list[str] = []
+        if executor is None:
+            def executor(plan):
+                executor_events.append(str(plan.target_root))
+                for item in plan.files:
+                    data = alist.files.pop(item.source_path, None)
+                    if data is not None:
+                        alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
+                return {"ok": True}
+
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=tmdb if tmdb is not None else _confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=executor,
+        )
+        return state_root, alist, runner, executor_events
+
+    def _root(self, runner: SimpleEngineRunner, source: str) -> str:
+        job = runner.create_root_job(
+            intake_source_id(source), source_path=source, target_shelf="anime",
+        )
+        started = runner.start_automatic_job(job.id, target_shelf="anime")
+        return started.id
+
+    def test_completion_removes_empty_source_shells(self) -> None:
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, executor_events = self._setup(files)
+        root_task_id = self._root(runner, "/incoming/My Show")
+
+        # A real write leaves emptied directory shells behind; model that by
+        # seeding them when the executor has already moved the media out.
+        original = runner.executor
+
+        def executor(plan):
+            result = original(plan)
+            alist.dirs.add("/incoming/My Show")
+            alist.dirs.add("/incoming/My Show/Extras")
+            return result
+
+        runner.executor = executor
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertEqual(len(executor_events), 1)
+        self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
+        self.assertIn("/incoming/My Show", alist.remove_empty_calls)
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+        self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
+
+    def test_completion_keeps_nonempty_source_and_unclaimed_junk(self) -> None:
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, executor_events = self._setup(files)
+        root_task_id = self._root(runner, "/incoming/My Show")
+        original = runner.executor
+
+        def executor(plan):
+            result = original(plan)
+            # A leftover junk file the plan never claimed keeps its shell.
+            alist.files["/incoming/My Show/notes.txt"] = b"junk"
+            alist.dirs.add("/incoming/My Show")
+            alist.dirs.add("/incoming/My Show/Extras")
+            return result
+
+        runner.executor = executor
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
+        self.assertNotIn("/incoming/My Show", alist.remove_empty_calls)
+        self.assertIn("/incoming/My Show", alist.dirs)
+        self.assertIn("/incoming/My Show/notes.txt", alist.files)
+
+    def test_parked_root_never_triggers_shell_cleanup(self) -> None:
+        files = {"/incoming/Mystery Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, executor_events = self._setup(
+            files, tmdb=FakeTMDBClient(),
+        )
+        root_task_id = self._root(runner, "/incoming/Mystery Show")
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(executor_events, [])
+        self.assertEqual(alist.remove_empty_calls, [])
+        self.assertIn("/incoming/Mystery Show/S01E01.mkv", alist.files)
+
+    def test_unbound_source_is_never_cleaned(self) -> None:
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, executor_events = self._setup(files)
+        root_task_id = self._root(runner, "/incoming/My Show")
+        # Simulate a catalog that no longer binds the source to this root
+        # (e.g. an external catalog reset): the cleanup ownership gate must
+        # refuse the tree even when it is fully empty.
+        from engine.scrapeflow.intake_source import save_intake_catalog
+        save_intake_catalog(state_root, [])
+        alist.dirs.add("/incoming/My Show")
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertEqual(alist.remove_empty_calls, [])
+        self.assertIn("/incoming/My Show", alist.dirs)
+
+
 if __name__ == "__main__":
     unittest.main()

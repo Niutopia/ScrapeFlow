@@ -7,7 +7,7 @@ import json
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from engine.scrapeflow.provider_capabilities import (
     QUARK_HELPER_NAME,
@@ -41,8 +41,12 @@ def _endpoint(api_url: str, path: str) -> str:
 
 def _fetch_json(url: str, timeout: float) -> tuple[int, object]:
     request = Request(url, headers={"Accept": "application/json"})
+    # Loopback probes must never leak through an ambient host proxy: macOS
+    # forwards them to the proxy port, which dials its own loopback instead
+    # of this machine and makes the readiness check hang or report garbage.
+    opener = build_opener(ProxyHandler({}))
     try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310
+        with opener.open(request, timeout=timeout) as response:
             status = int(response.status)
             body = response.read()
     except HTTPError as exc:

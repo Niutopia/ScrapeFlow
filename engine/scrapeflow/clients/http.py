@@ -125,16 +125,21 @@ class JsonHttpClient:
 
     def _build_opener(
         self, url_validator: Callable[[str], None] | None = None,
-    ) -> urllib.request.OpenerDirector | None:
+    ) -> urllib.request.OpenerDirector:
         handlers: list[Any] = []
         if self.proxy_url:
             handlers.append(urllib.request.ProxyHandler({
                 "http": self.proxy_url,
                 "https": self.proxy_url,
             }))
+        else:
+            # Never fall back to an ambient host proxy (macOS system proxy
+            # included): loopback targets such as the AList origin would be
+            # dialed from the proxy's own host and hang or misroute.
+            handlers.append(urllib.request.ProxyHandler({}))
         if url_validator is not None:
             handlers.append(ValidatingRedirectHandler(url_validator))
-        return urllib.request.build_opener(*handlers) if handlers else None
+        return urllib.request.build_opener(*handlers)
 
     @staticmethod
     def _secrets(url: str, headers: Mapping[str, str], body: Mapping[str, Any] | None = None) -> set[str]:

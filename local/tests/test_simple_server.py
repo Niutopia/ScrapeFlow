@@ -319,6 +319,43 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(release["child_count"], 1)
         self.assertEqual(release["file_count"], 2)
 
+    def test_discovery_marks_vanished_catalog_entries_missing_and_revives_them(self) -> None:
+        self.remote.entries["/library/待刮削"] = [
+            {"name": "Real Release", "is_dir": True},
+        ]
+        self.application._scan_inbound_once()  # noqa: SLF001 - intake boundary
+        status, intake = self.request("GET", "/api/intake")
+        self.assertEqual(status, 200)
+        by_path = {row["canonical_path"]: row for row in intake["sources"]}
+        first_seen = by_path["/library/待刮削/Real Release"]["first_seen_at"]
+        self.assertTrue(by_path["/library/待刮削/Real Release"]["present"])
+
+        # The source directory vanishes.  The next fresh scan must mark the
+        # catalog entry missing without deleting the record or its history.
+        self.remote.entries["/library/待刮削"] = []
+        self.application._scan_inbound_once()  # noqa: SLF001 - intake boundary
+        status, intake = self.request("GET", "/api/intake")
+        self.assertEqual(status, 200)
+        by_path = {row["canonical_path"]: row for row in intake["sources"]}
+        self.assertIn("/library/待刮削/Real Release", by_path)
+        self.assertFalse(by_path["/library/待刮削/Real Release"]["present"])
+        self.assertEqual(
+            by_path["/library/待刮削/Real Release"]["first_seen_at"], first_seen,
+        )
+
+        # A re-created same-path source revives the entry without new history.
+        self.remote.entries["/library/待刮削"] = [
+            {"name": "Real Release", "is_dir": True},
+        ]
+        self.application._scan_inbound_once()  # noqa: SLF001 - intake boundary
+        status, intake = self.request("GET", "/api/intake")
+        self.assertEqual(status, 200)
+        by_path = {row["canonical_path"]: row for row in intake["sources"]}
+        self.assertTrue(by_path["/library/待刮削/Real Release"]["present"])
+        self.assertEqual(
+            by_path["/library/待刮削/Real Release"]["first_seen_at"], first_seen,
+        )
+
     def test_root_job_creation_selects_shelf_in_one_action(self) -> None:
         self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
         status, payload = self.request(

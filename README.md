@@ -179,6 +179,14 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 python3 scripts/scrapeflow_release_check.py
 ```
 
+日常跑测试用带 pytest 的解释器（当前基线 883 tests + 310 subtests）：
+
+```sh
+/opt/homebrew/bin/python3.12 -m pytest local/tests/ -q
+# 注意：不要用系统默认 python3（本机已升到 3.14，未装 pytest），
+# 也不要先 source .env.local 再跑测试（代理/搜索开关会污染环境变量，导致 lane-gate 测试失败）
+```
+
 该命令会按顺序运行：
 
 ```sh

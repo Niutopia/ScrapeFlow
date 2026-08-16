@@ -756,6 +756,31 @@ class SimpleApplication:
                     registered.append(source)
             except Exception:
                 pass  # Catalog update is best-effort; the next scan retries it.
+        # Generic staleness pass (A step): a catalog entry under the intake
+        # root that this fresh listing no longer contains is a vanished
+        # source.  Mark it missing without deleting the record, its history
+        # or the root_task_id binding — a re-created same-path source revives
+        # the entry.  Only run after a successful fresh listing.
+        try:
+            from engine.scrapeflow.intake_source import (
+                load_intake_catalog,
+                mark_source_missing,
+                save_intake_catalog,
+            )
+            _cat = load_intake_catalog(self.state_root)
+            stale_paths = [
+                src.canonical_path
+                for src in _cat
+                if src.present
+                and src.canonical_path.startswith(root.rstrip("/") + "/")
+                and src.canonical_path not in seen_sources
+            ]
+            if stale_paths:
+                for stale_path in stale_paths:
+                    _cat, _ = mark_source_missing(_cat, stale_path)
+                save_intake_catalog(self.state_root, _cat)
+        except Exception:
+            pass  # Best-effort; the next scan retries it.
         # A missing waiting source is an observation, not an instruction to
         # delete/retry/recreate it. Persist a clear error only after a
         # successful narrow listing of the intake root.
@@ -2927,15 +2952,14 @@ class SimpleApplication:
             if isinstance(prior_replenishment, Mapping)
             else {}
         )
-        if (
-            next_core == current_core
-            and str(current.summary.get("automatic_stage") or "") == status
-        ):
+        # 存量清退：``automatic_stage`` 是 legacy 状态镜像。replenishment.status
+        # 已承载同一 ``status`` 值，因此防重写判断退化为纯 ``next_core == current_core``，
+        # 不再读/写镜像字段。
+        if next_core == current_core:
             return current
         replenishment.update({**next_core, "updated_at": _now()})
         summary = dict(current.summary)
         summary["replenishment"] = replenishment
-        summary["automatic_stage"] = status
         updated = replace(current, summary=summary, updated_at=_now())
         lock_factory = getattr(runner, "worker_lock", None)
         if callable(lock_factory):

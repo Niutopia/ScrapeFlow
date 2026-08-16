@@ -243,6 +243,10 @@ class SubtitleDiscoveryService:
         handlers: list[urllib.request.BaseHandler] = []
         if proxy:
             handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            # Never use an ambient host proxy for subtitle fetches: an
+            # implicit macOS/system proxy is environment drift, not config.
+            handlers.append(urllib.request.ProxyHandler({}))
         opener = urllib.request.build_opener(*handlers)
 
         req = urllib.request.Request(target_url, headers=req_headers)
