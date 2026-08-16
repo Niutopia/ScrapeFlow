@@ -33,6 +33,12 @@ from . import media_quality as _media_quality
 from . import media_policy as _media_policy
 from . import plan_artifacts as _plan_artifacts
 from . import remote_paths as _remote_paths
+from .data.release_lexicon import (
+    NORMALIZED_PARENT_ALIASES,
+    RELEASE_EDITION_RULES,
+    SPECIAL_CONTEXT_RELEASE_TOKENS,
+    SPECIAL_LABEL_RULES,
+)
 from .canonical_work_tree import (
     CanonicalTreeError,
     CanonicalWork,
@@ -2690,10 +2696,11 @@ def _contextual_cleanup_reason(item: Mapping[str, Any]) -> str | None:
     if (
         Path(name).suffix.lower() in VIDEO_EXTS
         and BONUS_DIRECTORY_RE.search(full_path)
-        and re.search(r"(?:^|[\s._\-\[\]()])MagiRepo(?:$|[\s._\-\[\]()])", name, re.I)
         and extract_episode_key(name) is not None
     ):
-        return "特典动画广告/Animated Magia Report Commercial"
+        for token_re, label in SPECIAL_LABEL_RULES:
+            if re.search(token_re, name, re.I):
+                return label
     return None
 
 
@@ -4690,14 +4697,17 @@ def _has_special_context(item: Mapping[str, Any]) -> bool:
     key = extract_episode_key(str(item.get("name", "")))
     if key is not None and key.kind == "special":
         return True
+    # Generic special markers stay inline; concrete release spellings come
+    # from the release lexicon (data, not business logic).
+    release_tokens = "|".join(SPECIAL_CONTEXT_RELEASE_TOKENS)
     return bool(
         re.search(
-            r"(?:特别篇|特典|番外|specials?|ovbsp|ova|oav|oad|通往大人的阶梯|最大的危机|"
-            r"ex[ ._-]*season|fate[ ._/-]*prototype|special[ ._-]*season|"
-            r"柯里乌斯之梦|coleus[ ._-]*no[ ._-]*yume|"
+            r"(?:特别篇|特典|番外|specials?|ovbsp|ova|oav|oad|"
+            r"ex[ ._-]*season|special[ ._-]*season|"
             r"break[ ._-]*time|休息时间|休憩時間|小剧场|小劇場|petit|ぷち|"
-            r"课外授业篇|課外授業編|kagai[ ._-]*jugy[oō][ ._-]*hen|"
-            r"(?:^|[/\\])SPs?(?:[/\\]|$))",
+            r"(?:^|[/\\])SPs?(?:[/\\]|$)"
+            + ("|" + release_tokens if release_tokens else "")
+            + r")",
             text,
             re.IGNORECASE,
         )
@@ -5119,10 +5129,7 @@ def _map_explicit_special_release_runs(
         if candidate_run is None and not source_years:
             parent_key = _normalize_match_title(split_remote(parent)[1])
             parent_key = re.sub(r"^(?:剧中剧|劇中劇|作中作)", "", parent_key)
-            named_aliases = {
-                "daisanhikoushoujotai": "第三飞行少女队",
-            }
-            parent_key = named_aliases.get(parent_key, parent_key)
+            parent_key = NORMALIZED_PARENT_ALIASES.get(parent_key, parent_key)
             candidates = sorted({
                 int(number)
                 for number, variants in official_title_variants.items()
@@ -5172,9 +5179,9 @@ def _map_explicit_special_release_runs(
             subtitle_parent_key = re.sub(
                 r"^(?:剧中剧|劇中劇|作中作)", "", subtitle_parent_key
             )
-            subtitle_parent_key = {
-                "daisanhikoushoujotai": "第三飞行少女队",
-            }.get(subtitle_parent_key, subtitle_parent_key)
+            subtitle_parent_key = NORMALIZED_PARENT_ALIASES.get(
+                subtitle_parent_key, subtitle_parent_key
+            )
             subtitle_candidates = tuple(sorted({
                 int(number)
                 for number, variants in official_title_variants.items()
@@ -5262,27 +5269,20 @@ def _map_explicit_beta_alternate(
     return changed
 
 
-def _map_minitodo_release_editions(
+def _map_release_label_editions(
     items: Iterable[dict[str, Any]],
     official_title_variants: Mapping[int, Sequence[str]],
 ) -> int:
-    """Map evidenced Mini Todoke 2D/3D and epilogue release labels.
+    """Map evidenced release-label editions from the release lexicon.
 
-    The 2D and stereoscopic 3D files are two presentations of the same
-    official Romeo & Juliet mini-theatre episode; ``Epilogue``/``Sorekara`` is
-    the following After Story.  The mapping is enabled only when multilingual
-    TMDB titles expose one unique candidate for each identity, so these release
-    labels cannot affect an unrelated show's generic ``2D``/``3D`` extras.
+    The mapping logic is generic: two data-supplied title patterns each select
+    exactly one official candidate, and data-supplied file patterns bind
+    release labels to them.  The one-unique-candidate gate keeps these labels
+    from affecting an unrelated show's generic ``2D``/``3D`` extras.
     """
-    romeo_re = re.compile(
-        r"romeo.*juliet|罗密欧.*朱丽叶|羅密歐.*朱麗葉|"
-        r"ロミオ.*ジュリエット",
-        re.IGNORECASE,
-    )
-    after_re = re.compile(
-        r"after[ ._-]*story|epilogue|后日谈|後日談|后篇|後篇|それから",
-        re.IGNORECASE,
-    )
+    rules = RELEASE_EDITION_RULES
+    romeo_re = re.compile(rules["romeo_title"], re.IGNORECASE)
+    after_re = re.compile(rules["after_title"], re.IGNORECASE)
     romeo = {
         number for number, titles in official_title_variants.items()
         if any(
@@ -5296,19 +5296,18 @@ def _map_minitodo_release_editions(
     }
     if len(romeo) != 1 or len(after) != 1 or romeo == after:
         return 0
+    marker_re = re.compile(rules["marker"], re.IGNORECASE)
+    after_file_re = re.compile(rules["after_file"], re.IGNORECASE)
+    romeo_file_re = re.compile(rules["romeo_file"], re.IGNORECASE)
     changed = 0
     for item in items:
         name = unicodedata.normalize("NFKC", str(item.get("name", "")))
-        if not re.search(r"mini[ ._-]*todo|minitodo|ミニ届", name, re.IGNORECASE):
+        if not marker_re.search(name):
             continue
         target: int | None = None
-        if re.search(r"epilogue|sorekara|それから", name, re.IGNORECASE):
+        if after_file_re.search(name):
             target = next(iter(after))
-        elif re.search(
-            r"romeo.*juliet|\b(?:2D|3D)(?:[ ._-]*ver)?\b",
-            name,
-            re.IGNORECASE,
-        ):
+        elif romeo_file_re.search(name):
             target = next(iter(romeo))
         if target is None:
             continue
@@ -5791,8 +5790,11 @@ def _matches_named_special_release_context(
         re.sub(r"^(?:剧中剧|劇中劇|作中作)", "", key)
         for key in parent_keys
     }
-    aliases = {"daisanhikoushoujotai": "第三飞行少女队"}
-    parent_keys = {aliases.get(key, key) for key in parent_keys if len(key) >= 6}
+    parent_keys = {
+        NORMALIZED_PARENT_ALIASES.get(key, key)
+        for key in parent_keys
+        if len(key) >= 6
+    }
     # Franchise query cleanup can reduce a noisy release folder to the exact
     # series title.  That shared title is not evidence for Season 00 when an
     # official special merely repeats the franchise name.

@@ -48,7 +48,7 @@ _IMPLEMENTATION_NAMES = (
     "_map_disc_extras_by_official_release_runs",
     "_map_explicit_beta_alternate",
     "_map_explicit_special_release_runs",
-    "_map_minitodo_release_editions",
+    "_map_release_label_editions",
     "_map_split_official_special_folder",
     "_map_unnumbered_special_from_subtitle_title",
     "_matches_named_special_release_context",
@@ -130,6 +130,13 @@ def _make_runtime_dispatch(name: str):
 
 for _name in _IMPLEMENTATION_NAMES:
     globals()[_name] = _make_runtime_dispatch(_name)
+
+
+def _release_edition_warning_template() -> str:
+    """Return the user-facing release-edition warning template (lexicon data)."""
+    from ...data.release_lexicon import RELEASE_EDITION_RULES
+
+    return RELEASE_EDITION_RULES["warning_template"]
 
 
 __all__ = ["build_tv_plan_smart", "bind_compat_runtime"]
@@ -340,15 +347,15 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 f"{beta_alternate_count} 个明确 23B/23β 版本已根据多语言官方"
                 "β/Missing Link 特别篇标题映射到 Season 00"
             )
-        minitodo_count = _map_minitodo_release_editions(
+        release_edition_count = _map_release_label_editions(
             files,
             official_special_title_variants,
         )
-        if minitodo_count:
+        if release_edition_count:
             special_release_warnings.append(
-                f"{minitodo_count} 个 Mini Todoke 2D/3D/后日谈视频或字幕"
-                "已根据多语言官方「罗密欧与朱丽叶」/后日谈标题"
-                "映射到 Season 00；3D 作为同集版本保留"
+                _release_edition_warning_template().format(
+                    count=release_edition_count,
+                )
             )
         split_special_count = _map_split_official_special_folder(
             files,

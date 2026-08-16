@@ -42,11 +42,57 @@ CROSS_SCRIPT_SEASON_ALIASES: dict[str, tuple[str, ...]] = {
     "illya": ("伊莉雅", "イリヤ"),
 }
 
+# Special-context release tokens used by the special-context classifier.
+# Everything here is a concrete release spelling, never a generic label.
+SPECIAL_CONTEXT_RELEASE_TOKENS: tuple[str, ...] = (
+    "通往大人的阶梯",
+    "最大的危机",
+    r"fate[ ._/-]*prototype",
+    "柯里乌斯之梦",
+    r"coleus[ ._-]*no[ ._-]*yume",
+    "课外授业篇",
+    "課外授業編",
+    r"kagai[ ._-]*jugy[oō][ ._-]*hen",
+)
+
+# Special-label rules: ``(token regex, returned label)`` for labeled extras.
+SPECIAL_LABEL_RULES: tuple[tuple[str, str], ...] = (
+    (
+        r"(?:^|[\s._\-\[\]()])MagiRepo(?:$|[\s._\-\[\]()])",
+        "特典动画广告/Animated Magia Report Commercial",
+    ),
+)
+
+# Normalized parent-directory aliases (release spelling -> official title).
+NORMALIZED_PARENT_ALIASES: dict[str, str] = {
+    "daisanhikoushoujotai": "第三飞行少女队",
+}
+
+# Edition-mapping rules for release labels.  The mapping logic in the planner
+# is generic and gated on official TMDB title variants; these regexes are the
+# only data it needs.  ``warning_template`` is the user-facing summary label.
+RELEASE_EDITION_RULES: dict[str, str] = {
+    "marker": r"mini[ ._-]*todo|minitodo|ミニ届",
+    "romeo_title": r"romeo.*juliet|罗密欧.*朱丽叶|羅密歐.*朱麗葉|ロミオ.*ジュリエット",
+    "after_title": r"after[ ._-]*story|epilogue|后日谈|後日談|后篇|後篇|それから",
+    "romeo_file": r"romeo.*juliet|\b(?:2D|3D)(?:[ ._-]*ver)?\b",
+    "after_file": r"epilogue|sorekara|それから",
+    "warning_template": (
+        "{count} 个 Mini Todoke 2D/3D/后日谈视频或字幕"
+        "已根据多语言官方「罗密欧与朱丽叶」/后日谈标题"
+        "映射到 Season 00；3D 作为同集版本保留"
+    ),
+}
+
 __all__ = [
     "BIDIRECTIONAL_LEXICAL_VARIANTS",
     "CROSS_SCRIPT_SEASON_ALIASES",
     "LEXICAL_VARIANTS",
+    "NORMALIZED_PARENT_ALIASES",
     "QUERY_VARIANT_ALIASES",
+    "RELEASE_EDITION_RULES",
     "SOURCE_NAME_CORRECTIONS",
     "SOURCE_QUERY_OVERRIDES",
+    "SPECIAL_CONTEXT_RELEASE_TOKENS",
+    "SPECIAL_LABEL_RULES",
 ]

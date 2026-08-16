@@ -11,9 +11,13 @@ import unittest
 
 from engine.scrapeflow.data.release_lexicon import (
     CROSS_SCRIPT_SEASON_ALIASES,
+    NORMALIZED_PARENT_ALIASES,
     QUERY_VARIANT_ALIASES,
+    RELEASE_EDITION_RULES,
     SOURCE_NAME_CORRECTIONS,
     SOURCE_QUERY_OVERRIDES,
+    SPECIAL_CONTEXT_RELEASE_TOKENS,
+    SPECIAL_LABEL_RULES,
 )
 from engine.scrapeflow.identity_matching import (
     _query_from_source,
@@ -61,6 +65,26 @@ class ReleaseLexiconTests(unittest.TestCase):
             self.assertTrue(cjk_aliases)
         self.assertIn("illya", CROSS_SCRIPT_SEASON_ALIASES)
         self.assertIn("伊莉雅", CROSS_SCRIPT_SEASON_ALIASES["illya"])
+
+    def test_special_context_tokens_and_label_rules_are_data(self) -> None:
+        self.assertTrue(SPECIAL_CONTEXT_RELEASE_TOKENS)
+        self.assertTrue(SPECIAL_LABEL_RULES)
+        for token_re, label in SPECIAL_LABEL_RULES:
+            self.assertNotEqual(token_re, "")
+            self.assertNotEqual(label, "")
+        from engine.scrapeflow.core import _has_special_context
+
+        # Generic markers still classify; the release tokens are data.
+        self.assertTrue(_has_special_context({"name": "EP01.mkv", "full_path": "/x/SPs"}))
+        self.assertTrue(_has_special_context({"name": "Fate/Prototype SP1.mkv", "full_path": "/x"}))
+        self.assertFalse(_has_special_context({"name": "EP01.mkv", "full_path": "/x/Season 1"}))
+
+    def test_parent_aliases_and_edition_rules_are_data(self) -> None:
+        self.assertIn("daisanhikoushoujotai", NORMALIZED_PARENT_ALIASES)
+        self.assertEqual(NORMALIZED_PARENT_ALIASES["daisanhikoushoujotai"], "第三飞行少女队")
+        for key in ("marker", "romeo_title", "after_title", "romeo_file", "after_file"):
+            self.assertIn(key, RELEASE_EDITION_RULES)
+            self.assertNotEqual(RELEASE_EDITION_RULES[key], "")
 
 
 if __name__ == "__main__":
