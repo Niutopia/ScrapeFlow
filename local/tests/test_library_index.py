@@ -34,10 +34,18 @@ def _nfo_movie(tmdb_id: int, title: str, year: str) -> bytes:
 
 
 class IndexAList:
-    """Read-only AList double over a files dict."""
+    """Read-only AList double over a files dict (plus explicit dirs/moves)."""
 
     def __init__(self, files: dict[str, bytes] | None = None) -> None:
         self.files: dict[str, bytes] = dict(files or {})
+        self.dirs: set[str] = set()
+        self.move_calls: list[tuple[str, str, list[str]]] = []
+        for full_path in self.files:
+            parts = full_path.strip("/").split("/")[:-1]
+            current = ""
+            for part in parts:
+                current += "/" + part
+                self.dirs.add(current)
 
     def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
         del refresh
@@ -50,6 +58,7 @@ class IndexAList:
             for part in parts:
                 current += "/" + part
                 directory_paths.add(current)
+        directory_paths |= self.dirs
         rows: dict[str, dict[str, object]] = {}
         for directory in directory_paths:
             if not directory.startswith(prefix):
@@ -76,6 +85,28 @@ class IndexAList:
         if max_bytes is not None:
             return value[:max_bytes]
         return value
+
+    def ensure_directory(self, path: str) -> bool:
+        self.dirs.add(path.rstrip("/") or "/")
+        return True
+
+    def move(self, parent: str, target: str, names: list[str]) -> bool:
+        parent = parent.rstrip("/")
+        target = target.rstrip("/")
+        self.move_calls.append((parent, target, list(names)))
+        for name in names:
+            src = f"{parent}/{name}"
+            dst = f"{target}/{name}"
+            self.dirs.discard(src)
+            self.dirs.add(dst)
+            moved: dict[str, bytes] = {}
+            for full_path, payload in list(self.files.items()):
+                if full_path == src or full_path.startswith(src + "/"):
+                    moved[full_path[len(src):]] = payload
+                    del self.files[full_path]
+            for relative, payload in moved.items():
+                self.files[dst + relative] = payload
+        return True
 
 
 def _sample_library() -> dict[str, bytes]:

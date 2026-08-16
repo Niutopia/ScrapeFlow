@@ -67,8 +67,17 @@ def aggregate_root_job(state_root: Path, root_task_id: str) -> RootJobAggregate:
         if result is not None and result.outcome == "accepted":
             completed += 1
             continue
-        if record.reconciliation_outcome in {"duplicate_complete", "existing_gap"}:
-            completed += 1
+        if record.reconciliation_outcome == "duplicate_complete":
+            if record.lane_status == "duplicate_consumed":
+                completed += 1
+            continue
+        if record.reconciliation_outcome == "existing_gap":
+            if record.lane_status in {"existing_gap_registered", "existing_gap_held"}:
+                completed += 1
+            continue
+        if record.reconciliation_outcome == "merge_existing":
+            if record.lane_status == "merge_done":
+                completed += 1
             continue
     in_progress = len(records) - completed - attention - failed
     return RootJobAggregate(
@@ -124,6 +133,7 @@ def public_work_unit_row(
         "candidate_identities": list(record.candidate_identities)[:5],
         "reconciliation_outcome": record.reconciliation_outcome,
         "matched_work_root": record.matched_work_root,
+        "lane_status": record.lane_status,
         "acceptance": (
             {
                 "outcome": result.outcome,

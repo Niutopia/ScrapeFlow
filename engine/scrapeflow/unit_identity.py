@@ -212,9 +212,13 @@ def apply_work_unit_override(
             identity_status="confirmed",
             identity=identity,
             # A new identity invalidates any decision computed for the old
-            # one; the next D pass must re-evaluate the unit.
+            # one; the next D pass must re-evaluate the unit, and any
+            # finished E lane must re-run for the new identity.
             reconciliation_outcome=None,
             matched_work_root=None,
+            uncovered_tokens=(),
+            lane_status=None,
+            lane_detail=None,
             attention=None,
             updated_at=_now(),
         )

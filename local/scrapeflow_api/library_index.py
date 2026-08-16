@@ -69,6 +69,11 @@ class ReconciliationDecision:
     shelf: str | None
     work_root: str | None
     reasons: tuple[str, ...] = ()
+    # Precise coordinate evidence consumed by the E2 lane:
+    # ``new_tokens`` are input coordinates the existing work lacks;
+    # ``uncovered_tokens`` are known gaps the input does not cover.
+    new_tokens: frozenset[str] = frozenset()
+    uncovered_tokens: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -210,12 +215,14 @@ def decide_reconciliation(
         return ReconciliationDecision(
             "merge_existing", shelf, work_root,
             (f"输入包含 {len(new_tokens)} 个既有作品没有的新媒体",),
+            new_tokens=frozenset(new_tokens),
         )
     uncovered = set(known_gap_tokens) - existing_tokens - set(unit_tokens)
     if uncovered:
         return ReconciliationDecision(
             "existing_gap", shelf, work_root,
             (f"既有作品存在 {len(uncovered)} 个确认缺口，当前输入不含对应内容",),
+            uncovered_tokens=frozenset(uncovered),
         )
     return ReconciliationDecision(
         "duplicate_complete", shelf, work_root,
@@ -296,6 +303,11 @@ def reconcile_root_work_units(
             record,
             reconciliation_outcome=decision.outcome,
             matched_work_root=decision.work_root,
+            uncovered_tokens=(
+                tuple(sorted(decision.uncovered_tokens))
+                if decision.outcome == "existing_gap"
+                else ()
+            ),
             attention=(
                 "; ".join(decision.reasons)
                 if decision.outcome == "uncertain"

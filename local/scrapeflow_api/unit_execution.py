@@ -29,7 +29,7 @@ from engine.scrapeflow.work_units import (
 )
 
 from .redaction import redact_error
-from .simple_engine_runner import EngineRequest, SimpleEngineRunner
+from .simple_engine_runner import EngineJob, EngineRequest, SimpleEngineRunner
 from .simple_library_audit import TmdbEpisodeCatalog
 
 
@@ -43,6 +43,30 @@ def _acceptance_path(state_root: Path, root_task_id: str) -> Path:
 
 def _unit_job_id(work_unit_id: str) -> str:
     return f"unit-{work_unit_id}"
+
+
+def _mark_internal_carrier(
+    runner: SimpleEngineRunner,
+    carrier: EngineJob,
+    root_task_id: str,
+) -> EngineJob:
+    """Tag one unit carrier so it never surfaces as a second public task.
+
+    ``internal_child``/``root_job_id`` are the stock internal-carrier markers
+    the provider lane already uses; no new summary field is introduced.
+    """
+    summary = dict(carrier.summary)
+    if summary.get("internal_child") is True and summary.get("root_job_id") == root_task_id:
+        return carrier
+    summary["internal_child"] = True
+    summary["root_job_id"] = root_task_id
+    marked = replace(carrier, summary=summary, updated_at=_now())
+    atomic_write_json(
+        runner._job_path(carrier.id),  # noqa: SLF001 - carrier composition
+        marked.as_dict(),
+        allow_nan=False,
+    )
+    return marked
 
 
 @dataclass(frozen=True)
@@ -260,9 +284,13 @@ def execute_new_work_units(
             continue
         try:
             request = _request_for_unit(runner, record, root_task_id)
-            planned = runner.plan_job(
-                request,
-                job_id=_unit_job_id(record.work_unit_id),
+            planned = _mark_internal_carrier(
+                runner,
+                runner.plan_job(
+                    request,
+                    job_id=_unit_job_id(record.work_unit_id),
+                ),
+                root_task_id,
             )
             record = replace(record, writer_job_id=planned.id)
             changed = True

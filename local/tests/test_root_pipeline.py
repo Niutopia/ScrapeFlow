@@ -53,6 +53,40 @@ def _recording_planner(events: list[dict[str, Any]]):
     return planner
 
 
+def _merge_planner(events: list[dict[str, Any]]):
+    """Planner double that locks the target onto the existing work root."""
+
+    def planner(request, _alist, _tmdb) -> Plan:
+        events.append({
+            "source_path": request.source_path,
+            "parent_path": request.parent_path,
+            "media_type": request.media_type,
+            "tmdb_id": request.tmdb_id,
+        })
+        return Plan(
+            mode="tv" if request.media_type == "tv" else "movie",
+            source_root=request.source_path,
+            target_root=request.parent_path,
+            files=[PlannedFile(
+                source_path=f"{request.source_path}/S01E11.mkv",
+                source_dir=request.source_path,
+                original_name="S01E11.mkv",
+                final_name="S01E11.mkv",
+                target_dir=request.parent_path,
+                media_kind="video",
+                source_size=FAKE_VIDEO_SIZE,
+            )],
+            warnings=[],
+            metadata={
+                "tmdb_id": request.tmdb_id,
+                "title": "Fate/Zero",
+                "year": "2011",
+            },
+        )
+
+    return planner
+
+
 def _confirming_tmdb() -> FakeTMDBClient:
     return FakeTMDBClient(
         search_results={
@@ -77,6 +111,7 @@ class RootPipelineTests(unittest.TestCase):
         library_files: dict[str, bytes] | None = None,
         tmdb: object | None = None,
         shelf: str = "anime",
+        planner=None,
     ):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -88,7 +123,7 @@ class RootPipelineTests(unittest.TestCase):
             state_root,
             alist=alist,
             tmdb=tmdb if tmdb is not None else _confirming_tmdb(),
-            planner=_recording_planner(planner_events),
+            planner=planner if planner is not None else _recording_planner(planner_events),
             validate=False,
             library_root="/library",
             executor=lambda plan: (
@@ -152,20 +187,20 @@ class RootPipelineTests(unittest.TestCase):
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].identity_status, "uncertain")
 
-    def test_pipeline_parks_duplicate_units_readonly(self) -> None:
+    def test_pipeline_consumes_duplicate_units_into_archive(self) -> None:
         files = {
             "/incoming/Fate Zero/S01E03.mkv": FAKE_VIDEO_BYTES,
         }
-        state_root, _alist, runner, planner_events, executor_events = self._setup(
+        state_root, alist, runner, planner_events, executor_events = self._setup(
             files, library_files=_sample_library(),
         )
         job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
         root_task_id = job.id
         # Seed B/W + a durable identity the same way the pipeline would on
-        # its first pass, then let the pipeline run D and the E-lane park.
+        # its first pass, then let the pipeline run D and the E1 lane.
         from engine.scrapeflow.root_boundaries import analyze_root_boundaries
         analyze_root_boundaries(
-            _alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
+            alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
         )
         records = load_work_unit_records(state_root, root_task_id)
         apply_work_unit_override(
@@ -175,12 +210,133 @@ class RootPipelineTests(unittest.TestCase):
 
         final = run_root_pipeline(runner, state_root, root_task_id)
 
-        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(final.phase, "completed")
         self.assertEqual(executor_events, [])
         self.assertEqual(planner_events, [])
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].reconciliation_outcome, "duplicate_complete")
-        self.assertIn("E 通道", records[0].attention or "")
+        self.assertEqual(records[0].lane_status, "duplicate_consumed")
+        # Exactly one task-archive move; never a formal-library write.
+        self.assertEqual(len(alist.move_calls), 1)
+        parent, target, names = alist.move_calls[0]
+        self.assertEqual(parent, "/incoming")
+        self.assertIn("/ScrapeFlow/归档/", target)
+        self.assertEqual(names, ["Fate Zero"])
+        self.assertNotIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
+
+    def test_pipeline_reruns_duplicate_consumption_idempotently(self) -> None:
+        files = {
+            "/incoming/Fate Zero/S01E03.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _p, _e = self._setup(
+            files, library_files=_sample_library(),
+        )
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        root_task_id = job.id
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+        analyze_root_boundaries(
+            alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=35507,
+        )
+
+        first = run_root_pipeline(runner, state_root, root_task_id)
+        second = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(first.phase, "completed")
+        self.assertEqual(second.phase, "completed")
+        self.assertEqual(len(alist.move_calls), 1)
+
+    def test_pipeline_registers_existing_gap_and_keeps_source(self) -> None:
+        files = {
+            "/incoming/Fate Zero/S01E03.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            files, library_files=_sample_library(),
+        )
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        root_task_id = job.id
+        # A known open gap for (tv, 35507) lives in another root's ledger.
+        from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
+        save_gap_ledger(state_root, "root-other", [Gap(
+            gap_id="other::missing_episode::S02E01",
+            root_task_id="root-other",
+            work_unit_id="other-unit",
+            kind="missing_episode",
+            media_type="tv",
+            tmdb_id=35507,
+            season=2,
+            episodes=(1,),
+            subtitle_path=None,
+            subtitle_language=None,
+            status="open",
+        )])
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+        analyze_root_boundaries(
+            alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=35507,
+        )
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertEqual(executor_events, [])
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(records[0].reconciliation_outcome, "existing_gap")
+        self.assertEqual(records[0].lane_status, "existing_gap_registered")
+        # The uncovered S02E01 coordinate is registered on the unit ledger.
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+        gaps = load_gap_ledger(state_root, root_task_id)
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].gap_id, f"{records[0].work_unit_id}::missing_episode::S02E01")
+        self.assertEqual(gaps[0].status, "open")
+        # Non-empty source stays in intake: no move happened.
+        self.assertEqual(alist.move_calls, [])
+        self.assertIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
+
+    def test_pipeline_merges_new_episodes_into_existing_work(self) -> None:
+        files = {
+            "/incoming/Fate Zero/S01E11.mkv": FAKE_VIDEO_BYTES,
+        }
+        merge_events: list[dict[str, Any]] = []
+        state_root, alist, runner, _generic_planner, executor_events = self._setup(
+            files, library_files=_sample_library(),
+            planner=_merge_planner(merge_events),
+        )
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        root_task_id = job.id
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+        analyze_root_boundaries(
+            alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=35507, season=1,
+        )
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertEqual(len(merge_events), 1)
+        self.assertEqual(merge_events[0]["parent_path"], "/library/番剧/Fate Zero")
+        self.assertEqual(len(executor_events), 1)
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(records[0].reconciliation_outcome, "merge_existing")
+        self.assertEqual(records[0].lane_status, "merge_done")
+        self.assertEqual(records[0].matched_work_root, "/library/番剧/Fate Zero")
+        self.assertIsNotNone(records[0].writer_job_id)
+        # The carrier is an internal child, never a second public task.
+        carrier = runner.get_job(records[0].writer_job_id)
+        self.assertIs(carrier.summary.get("internal_child"), True)
+        self.assertEqual(carrier.summary.get("root_job_id"), root_task_id)
 
     def test_pipeline_pause_gate_keeps_writer_idle(self) -> None:
         files = {

@@ -322,6 +322,13 @@ class WorkUnitRecord:
     reconciliation_outcome: str | None = None
     matched_work_root: str | None = None
     writer_job_id: str | None = None
+    # Per-unit E-lane state (P12).  Values:
+    #   duplicate_consumed / existing_gap_registered / existing_gap_held /
+    #   merge_done.  ``None`` means the lane has not finished yet.
+    lane_status: str | None = None
+    lane_detail: str | None = None
+    # Known-gap coordinates the E2 lane must register (from the D verdict).
+    uncovered_tokens: tuple[str, ...] = ()
     attention: str | None = None
     updated_at: str = field(default_factory=_now)
 
@@ -340,6 +347,9 @@ class WorkUnitRecord:
             "reconciliation_outcome": self.reconciliation_outcome,
             "matched_work_root": self.matched_work_root,
             "writer_job_id": self.writer_job_id,
+            "lane_status": self.lane_status,
+            "lane_detail": self.lane_detail,
+            "uncovered_tokens": list(self.uncovered_tokens),
             "attention": self.attention,
             "updated_at": self.updated_at,
         }
@@ -362,6 +372,11 @@ class WorkUnitRecord:
             reconciliation_outcome=str(raw["reconciliation_outcome"]) if raw.get("reconciliation_outcome") else None,
             matched_work_root=str(raw["matched_work_root"]) if raw.get("matched_work_root") else None,
             writer_job_id=str(raw["writer_job_id"]) if raw.get("writer_job_id") else None,
+            lane_status=str(raw["lane_status"]) if raw.get("lane_status") else None,
+            lane_detail=str(raw["lane_detail"]) if raw.get("lane_detail") else None,
+            uncovered_tokens=tuple(
+                str(value) for value in (raw.get("uncovered_tokens") or ())
+            ),
             attention=str(raw["attention"]) if raw.get("attention") else None,
             updated_at=str(raw.get("updated_at") or _now()),
         )

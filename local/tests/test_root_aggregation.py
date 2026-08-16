@@ -24,6 +24,7 @@ def _unit(
     *,
     identity_status: str = "pending",
     outcome: str | None = None,
+    lane_status: str | None = None,
 ) -> WorkUnitRecord:
     return WorkUnitRecord(
         work_unit_id=unit_id,
@@ -46,6 +47,7 @@ def _unit(
         matched_work_root=(
             "/library/番剧/Show" if outcome == "duplicate_complete" else None
         ),
+        lane_status=lane_status,
     )
 
 
@@ -56,7 +58,10 @@ class RootAggregationTests(unittest.TestCase):
             units = [
                 _unit("u1", identity_status="confirmed", outcome="new_work"),
                 _unit("u2", identity_status="uncertain"),
-                _unit("u3", identity_status="confirmed", outcome="duplicate_complete"),
+                _unit(
+                    "u3", identity_status="confirmed",
+                    outcome="duplicate_complete", lane_status="duplicate_consumed",
+                ),
             ]
             save_work_unit_records(state_root, "root-agg", units)
             save_work_acceptance(state_root, "root-agg", [
