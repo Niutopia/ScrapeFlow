@@ -272,19 +272,39 @@ def reconcile_root_work_units(
     """Run the D step for one root task and persist each unit's decision.
 
     Only ``confirmed`` units without an existing decision are re-evaluated, so
-    retries are idempotent and durable overrides stay authoritative.
+    retries are idempotent and durable overrides stay authoritative.  One
+    exception: a unit whose last acceptance FAILED is re-evaluated, because a
+    failed run (e.g. "target already exists") may prove the previous verdict
+    was computed against a stale library view.
     """
     records = load_work_unit_records(state_root, root_task_id)
     snapshot = load_source_snapshot(state_root, root_task_id)
     if not records or snapshot is None:
         return records
+    from .unit_execution import load_work_acceptance
+    acceptance = {
+        result.work_unit_id: result
+        for result in load_work_acceptance(state_root, root_task_id)
+    }
     index = build_library_index(alist, media_root)
     node = build_source_inventory(snapshot["rows"], snapshot["root"])
     nodes_by_path = {candidate.path: candidate for candidate in _iter_nodes(node)}
     known = known_gap_tokens_by_identity or {}
     updated: list[WorkUnitRecord] = []
     for record in records:
-        if record.identity_status != "confirmed" or record.reconciliation_outcome is not None:
+        if record.reconciliation_outcome is not None:
+            previous = acceptance.get(record.work_unit_id)
+            if previous is not None and previous.outcome == "failed":
+                record = replace(
+                    record,
+                    reconciliation_outcome=None,
+                    matched_work_root=None,
+                    uncovered_tokens=(),
+                )
+            else:
+                updated.append(record)
+                continue
+        if record.identity_status != "confirmed":
             updated.append(record)
             continue
         identity = record.identity or {}

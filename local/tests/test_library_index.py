@@ -250,3 +250,46 @@ class TitledMovieNfoTests(unittest.TestCase):
         ).encode("utf-8")
         index = build_library_index(IndexAList(files), "/library")
         self.assertEqual(len(index.entries_for("tv", 35507)), 1)
+
+
+class FailedAcceptanceRedecisionTests(unittest.TestCase):
+    def test_failed_acceptance_reopens_the_decision(self) -> None:
+        files = _sample_library()
+        files["/library/电影/Big Buck Bunny (2008)/大雄兔 (2008).nfo"] = _nfo_movie(
+            10378, "Big Buck Bunny", "2008",
+        )
+        files["/library/电影/Big Buck Bunny (2008)/大雄兔 (2008).mkv"] = b"v"
+        alist = IndexAList(files)
+        import tempfile
+        from pathlib import Path
+        from local.scrapeflow_api.unit_execution import (
+            WorkAcceptanceResult, save_work_acceptance,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-redo"
+            analyze_root_boundaries(
+                alist, "/incoming/Big Buck Bunny (2008)",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="movie", tmdb_id=10378,
+            )
+            # First pass with a library that does not yet contain the movie:
+            # the decision is new_work and the write fails.
+            empty = IndexAList({})
+            first = reconcile_root_work_units(empty, "/library", state_root, root_task_id)
+            self.assertEqual(first[0].reconciliation_outcome, "new_work")
+            save_work_acceptance(state_root, root_task_id, [
+                WorkAcceptanceResult(
+                    work_unit_id=records[0].work_unit_id, outcome="failed",
+                    writer_job_id=None, phase="failed", target_root="",
+                    planned_files=0, error="目标已存在", recorded_at="2026-08-16T00:00:00Z",
+                ),
+            ])
+            # Second pass: the failed acceptance reopens the decision and the
+            # fixed index now proves the duplicate.
+            second = reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+            self.assertEqual(second[0].reconciliation_outcome, "duplicate_complete")
