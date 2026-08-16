@@ -96,6 +96,11 @@ _KNOWN_FAILURE_SCOPES = frozenset({
     FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE, FAILURE_IN_DOUBT,
 })
 
+
+def _trace(message: str) -> None:
+    """Bounded live observability line (mirrors the legacy runner's tracer)."""
+    print(f"[root-replenishment] {message}", flush=True)
+
 # The provider name for each tier equals the tier name (quark_share /
 # quark_magnet / magnet), which is also what the materializers validate.
 _TIER_PROVIDER = {
@@ -594,6 +599,7 @@ def run_root_replenishment(
     }
 
     requests = gap_ledger_requests(state_root, root_task_id)
+    _trace(f"start root={root_task_id} tier={tier} requests={len(requests)}")
     if not requests:
         return _noop_result(state, tier)
 
@@ -655,6 +661,7 @@ def run_root_replenishment(
         )
 
         request["tier"] = tier
+        _trace(f"select root={root_task_id} tier={tier} tmdb={tmdb_id} gaps={len(request.get('gaps') or [])}")
         try:
             bundle = gap_ledger_selection(
                 state_root, root_task_id, request, search_runner=search_runner,
@@ -700,6 +707,7 @@ def run_root_replenishment(
             bundle = {}
         selections = bundle.get("selections")
         selections = selections if isinstance(selections, list) else []
+        _trace(f"selected root={root_task_id} tier={tier} tmdb={tmdb_id} selections={len(selections)}")
 
         if not selections:
             # Candidate exhaustion evidence for this request.
@@ -737,6 +745,7 @@ def run_root_replenishment(
 
             locator = str(selection.get("locator") or "")
             provider = str(selection.get("provider") or _TIER_PROVIDER.get(tier, tier))
+            _trace(f"materialize root={root_task_id} tier={tier} locator={locator[:60]!r}")
             attempt_id = uuid.uuid4().hex
             staging_root = (
                 f"{str(runner.library_root).rstrip('/')}"
@@ -946,6 +955,7 @@ def run_root_replenishment(
 
     state["updated_at"] = _now()
     state["waiting"] = waiting
+    _trace(f"end root={root_task_id} tier={state.get('tier')} waiting={waiting} closed={len(gaps_closed)}")
     for entry in attempts:
         _append_attempt_log(state, {
             "gap_id": entry["gap_id"],
