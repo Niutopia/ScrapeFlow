@@ -648,14 +648,16 @@ class SimpleApplication:
         }
 
     def _scan_inbound_once(self) -> list[str]:
-        """Register each direct child of ``/待刮削`` for read-only reconciliation.
+        """Update the IntakeSource catalog for each direct child of ``/待刮削``.
 
-        Only directories are accepted.  Treating loose files at the intake
-        root as one job could accidentally combine unrelated titles, so they
-        are left untouched until placed in their own source directory.  This
-        method reads AList with ``refresh=True`` and only writes a small local
-        ownership record. It intentionally runs while globally paused: pause
-        blocks automatic work, not passive discovery of user-visible intake.
+        Discovery is a passive observation: it records the source with real
+        child/file counts and never creates an EngineJob, never matches TMDB,
+        and never schedules reconciliation.  Only a user-created RootJob may
+        move a source past discovery (P2).  Loose files at the intake root are
+        left untouched so they cannot be combined into one accidental work.
+        This method reads AList with ``refresh=True`` and only writes the small
+        local catalog record.  It intentionally runs while globally paused:
+        pause blocks automatic work, not passive discovery.
         """
         if not self.engine_configured:
             return []
@@ -700,13 +702,6 @@ class SimpleApplication:
         # root from a root containing a loose file, malformed row, or invalid
         # name; those objects are unresolved intake, not proof of emptiness.
         intake_objects_present = False
-        create = getattr(runner, "create_pending_job", None)
-        if not callable(create):
-            # Keep a small compatibility fallback for injected focused
-            # runners. The real runner exposes create_pending_job.
-            create = getattr(runner, "create_automatic_job", None)
-        if not callable(create):
-            return registered
         for row in rows:
             if not isinstance(row, Mapping):
                 intake_objects_present = True
@@ -736,39 +731,41 @@ class SimpleApplication:
             # TMDB/provider retry slot in the first place.
             seen_sources.add(source)
 
-            # Phase 1: maintain the intake catalog in parallel with the
-            # legacy EngineJob registration.  The catalog is the new
-            # truth source for the /api/intake endpoint; the EngineJob
-            # path is retained for backward compatibility.
+            # A step (discovery): update the IntakeSource catalog with real
+            # child/file counts.  No EngineJob is created and nothing is
+            # scheduled; the catalog is the only truth source before the
+            # user creates a RootJob.
             try:
                 from engine.scrapeflow.intake_source import (
                     load_intake_catalog,
                     save_intake_catalog,
                     upsert_intake_source,
                 )
+                try:
+                    child_rows = listing(source, refresh=True)
+                except TypeError:
+                    child_rows = listing(source)
+                child_count: int | None = None
+                file_count: int | None = None
+                if isinstance(child_rows, list):
+                    child_count = sum(
+                        1 for item in child_rows
+                        if isinstance(item, Mapping) and item.get("is_dir") is True
+                    )
+                    file_count = sum(
+                        1 for item in child_rows
+                        if isinstance(item, Mapping) and item.get("is_dir") is not True
+                    )
                 _catalog = load_intake_catalog(self.state_root)
-                _child_count = (
-                    len([r for r in rows
-                         if isinstance(r, Mapping) and r.get("is_dir") is True
-                         and str(r.get("name", "")).strip()
-                         and f"{root}/{str(r.get('name', '')).strip()}" == source])
-                    if False  # placeholder: child listing deferred to Phase 2
-                    else None
-                )
-                _catalog, _ = upsert_intake_source(
-                    _catalog, source, present=True, child_count=None, file_count=None,
+                _catalog, record = upsert_intake_source(
+                    _catalog, source, present=True,
+                    child_count=child_count, file_count=file_count,
                 )
                 save_intake_catalog(self.state_root, _catalog)
+                if record.snapshot_revision == 0:
+                    registered.append(source)
             except Exception:
-                pass  # Catalog update is best-effort; EngineJob path is authoritative
-
-            job = existing.get(source)
-            if job is None:
-                job = create(source)
-                registered.append(job.id)
-                # Every ordinary inbound root waits for an explicit user
-                # shelf selection. Registration must not schedule even the
-                # read-only reconciliation phase before /start persists it.
+                pass  # Catalog update is best-effort; the next scan retries it.
         # A missing waiting source is an observation, not an instruction to
         # delete/retry/recreate it. Persist a clear error only after a
         # successful narrow listing of the intake root.

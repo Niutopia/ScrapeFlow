@@ -252,7 +252,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         status, _ = self.request("GET", "/api/jobs/does-not-exist")
         self.assertEqual(status, 404)
 
-    def test_production_e2e_sources_are_rejected_before_intake_or_job_creation(self) -> None:
+    def test_discovery_registers_the_intake_catalog_without_creating_jobs(self) -> None:
         status, payload = self.request(
             "POST", "/api/jobs", {"path": "/library/待刮削/ScrapeFlow-E2E-Fight-Club-1999"},
         )
@@ -263,6 +263,11 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             {"name": "ScrapeFlow-E2E-Keep-Out", "is_dir": True},
             {"name": "Real Release", "is_dir": True},
         ]
+        self.remote.entries["/library/待刮削/Real Release"] = [
+            {"name": "Season 01", "is_dir": True},
+            {"name": "poster.jpg", "is_dir": False, "size": 3},
+            {"name": "notes.txt", "is_dir": False, "size": 3},
+        ]
         queued: list[str] = []
         original_queue = self.application._queue_automatic_job  # noqa: SLF001 - intake boundary
         self.application._queue_automatic_job = queued.append  # type: ignore[method-assign]
@@ -270,13 +275,21 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             scheduled = self.application._scan_inbound_once()  # noqa: SLF001 - intake boundary
         finally:
             self.application._queue_automatic_job = original_queue  # type: ignore[method-assign]
-        self.assertEqual(len(scheduled), 1)
-        created = self.runner.get_job(scheduled[0])
-        # Registration never schedules reconciliation before the user selects
-        # the task's target shelf.
+        # Discovery is a passive observation (A step): it returns the newly
+        # registered source paths, fills the catalog with real child/file
+        # counts, and must not create an EngineJob or schedule anything
+        # before the user creates a RootJob.
+        self.assertEqual(scheduled, ["/library/待刮削/Real Release"])
         self.assertEqual(queued, [])
-        self.assertEqual(created.request["source_path"], "/library/待刮削/Real Release")
-        self.assertEqual(created.phase, "awaiting_target_shelf")
+        self.assertEqual(self.runner.list_jobs(), [])
+        status, intake = self.request("GET", "/api/intake")
+        self.assertEqual(status, 200)
+        sources = {row["canonical_path"]: row for row in intake["sources"]}
+        self.assertNotIn("/library/待刮削/ScrapeFlow-E2E-Keep-Out", sources)
+        self.assertIn("/library/待刮削/Real Release", sources)
+        release = sources["/library/待刮削/Real Release"]
+        self.assertEqual(release["child_count"], 1)
+        self.assertEqual(release["file_count"], 2)
 
     def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
         self.remote.entries["/library/待刮削"] = [
