@@ -971,6 +971,186 @@ class AutoMatchAmbiguityError(PlanError):
         self.candidates = bounded_auto_match_candidate_rows(candidates)
 
 
+def _score_identity_candidate(
+    raw: Mapping[str, Any],
+    *,
+    query_years: Collection[str],
+    parent_labels: Sequence[str] = (),
+    prefer_animation: bool,
+    expected_episode_count: int | None,
+    min_confidence: float,
+    trace_extra: Mapping[str, Any],
+) -> AutoMatch:
+    """Score one raw candidate row with the single shared evidence policy.
+
+    This is the ONLY scoring implementation for both matcher entries
+    (query-based and IdentityEvidence-based); the two public functions differ
+    only in how they gather candidate rows.
+    """
+    title_score = float(raw["title_score"])
+    alias_score = float(raw["alias_score"])
+    evidence_score = max(title_score, alias_score)
+
+    parent_bonus = 0.0
+    candidate_all_titles = [
+        str(value).casefold() for value in [*raw["titles"], *raw["aliases"]]
+    ]
+    for parent in parent_labels:
+        parent_norm = parent.strip().casefold()
+        if parent_norm and any(
+            parent_norm in title for title in candidate_all_titles
+        ):
+            parent_bonus = max(parent_bonus, 0.04)
+
+    year_score = 0.0
+    wrong_year = False
+    if query_years:
+        candidate_year = str(raw["year"])
+        if candidate_year in query_years:
+            year_score = 0.0
+        elif candidate_year == "未知年份":
+            year_score = -0.06
+        else:
+            try:
+                candidate_year_int = int(candidate_year)
+                deltas = [
+                    abs(candidate_year_int - int(year))
+                    for year in query_years
+                    if year.isdigit()
+                ]
+                minimum_delta = min(deltas) if deltas else 0
+                wrong_year = minimum_delta >= 2
+                year_score = -0.30 if wrong_year else -0.12
+            except ValueError:
+                year_score = -0.06
+
+    # The media namespace is routing context, not title evidence.  Keep it
+    # visible in the trace but never let it push a weak title over the
+    # threshold.
+    media_type_score = 0.0
+    context_score = 0.0
+    if prefer_animation and raw["media_type"] in {"tv", "movie"}:
+        if raw["is_animation"] is True:
+            context_score = 0.0
+        elif raw["is_animation"] is False:
+            # An animation-shelf target is strong context: keep enough
+            # separation that a same-title live-action result cannot pass the
+            # global ambiguity margin on title evidence alone.
+            context_score = -0.12
+
+    episode_structure_score = 0.0
+    actual_count = raw["actual_episode_count"]
+    if expected_episode_count and isinstance(actual_count, int):
+        episode_structure_score = (
+            0.0 if actual_count == expected_episode_count else -0.08
+        )
+
+    confidence = max(
+        0.0,
+        min(
+            1.0,
+            evidence_score
+            + parent_bonus
+            + year_score
+            + media_type_score
+            + context_score
+            + episode_structure_score,
+        ),
+    )
+    blockers: list[str] = []
+    if wrong_year:
+        blockers.append("year_conflict")
+    if raw["cross_script"] and alias_score < 0.88:
+        blockers.append("cross_script_without_alias_evidence")
+    if confidence < min_confidence:
+        blockers.append("below_confidence_threshold")
+    status = "rejected" if blockers else "confirmed"
+    components = {
+        "title_score": round(title_score, 6),
+        "alias_score": round(alias_score, 6),
+        "parent_bonus": round(parent_bonus, 6),
+        "year_score": round(year_score, 6),
+        "media_type_score": round(media_type_score, 6),
+        "episode_structure_score": round(episode_structure_score, 6),
+        "context_score": round(context_score, 6),
+        "final_score": round(confidence, 6),
+    }
+    return AutoMatch(
+        str(raw["media_type"]),
+        int(raw["tmdb_id"]),
+        str(raw["title"]),
+        str(raw["year"]),
+        confidence,
+        status,
+        components,
+        {
+            **dict(trace_extra),
+            "official_titles": list(raw["titles"]),
+            "aliases_checked": list(raw["aliases"]),
+            "blockers": blockers,
+            "expected_episode_count": expected_episode_count,
+            "actual_episode_count": actual_count,
+        },
+    )
+
+
+def _select_auto_match(
+    candidates: Sequence[AutoMatch],
+    *,
+    query_label: str,
+    year_label: str,
+) -> tuple[AutoMatch, list[AutoMatch]]:
+    """Apply the shared final-selection policy (margin + exact-title rules)."""
+    ordered = sorted(
+        list(candidates),
+        key=lambda item: (-item.confidence, item.media_type, item.tmdb_id),
+    )
+    if not ordered:
+        raise PlanError(f"TMDB 未找到自动匹配候选: {query_label}")
+    best = ordered[0]
+    if best.status != "confirmed":
+        preview = "; ".join(
+            f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%}, {item.status})"
+            for item in ordered[:3]
+        )
+        raise AutoMatchAmbiguityError(
+            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview,
+            candidates=ordered,
+        )
+    if "year_conflict" in best.decision_trace.get("blockers", []):
+        raise AutoMatchAmbiguityError(
+            f"自动匹配候选年份与源目录冲突，拒绝自动选择: "
+            f"{year_label}, candidate={best.media_type}/{best.tmdb_id} "
+            f"{best.title} ({best.year})",
+            candidates=ordered,
+        )
+    runner_up = ordered[1] if len(ordered) > 1 else None
+    best_exact = max(
+        float(best.score_components.get("title_score", 0.0)),
+        float(best.score_components.get("alias_score", 0.0)),
+    ) >= 0.999999
+    runner_exact = bool(runner_up) and max(
+        float(runner_up.score_components.get("title_score", 0.0)),
+        float(runner_up.score_components.get("alias_score", 0.0)),
+    ) >= 0.999999
+    exact_title_uniquely_identifies_best = best_exact and not runner_exact
+    if (
+        runner_up is not None
+        and best.confidence - runner_up.confidence + 1e-9
+        < AUTO_MATCH_MIN_MARGIN
+        and not exact_title_uniquely_identifies_best
+    ):
+        raise AutoMatchAmbiguityError(
+            "自动匹配前两名证据无法区分，拒绝自动选择: "
+            + "; ".join(
+                f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%})"
+                for item in ordered[:2]
+            ),
+            candidates=ordered,
+        )
+    return best, ordered
+
+
 def auto_match_tmdb(
     client: TMDBClient,
     query: str,
@@ -1099,68 +1279,17 @@ def auto_match_tmdb(
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
-        title_score = float(raw["title_score"])
-        alias_score = float(raw["alias_score"])
-        evidence_score = max(title_score, alias_score)
-        year_score = 0.0
-        wrong_year = False
-        if query_year:
-            candidate_year = str(raw["year"])
-            if candidate_year == query_year:
-                year_score = 0.0
-            elif candidate_year == "未知年份":
-                year_score = -0.06
-            else:
-                delta = abs(int(candidate_year) - int(query_year))
-                wrong_year = delta >= 2
-                year_score = -0.30 if wrong_year else -0.12
-        # Namespace is routing context, not title evidence. Keep it visible in
-        # the trace but do not let it push a weak title over the threshold.
-        media_type_score = 0.0
-        context_score = 0.0
-        if prefer_animation and raw["media_type"] in {"tv", "movie"}:
-            if raw["is_animation"] is True:
-                context_score = 0.0
-            elif raw["is_animation"] is False:
-                # A target explicitly identified as an animation shelf is
-                # strong context, not a cosmetic tie-breaker.  Keep enough
-                # separation that a same-title live-action result cannot pass
-                # the global ambiguity margin on title evidence alone.
-                context_score = -0.12
-        episode_structure_score = 0.0
-        actual_count = raw["actual_episode_count"]
-        if expected_episode_count and isinstance(actual_count, int):
-            episode_structure_score = 0.0 if actual_count == expected_episode_count else -0.08
-        confidence = max(0.0, min(1.0, evidence_score + year_score + media_type_score + context_score + episode_structure_score))
-        blockers: list[str] = []
-        if wrong_year:
-            blockers.append("year_conflict")
-        if raw["cross_script"] and alias_score < 0.88:
-            blockers.append("cross_script_without_alias_evidence")
-        if confidence < min_confidence:
-            blockers.append("below_confidence_threshold")
-        status = "rejected" if blockers else "confirmed"
-        components = {
-            "title_score": round(title_score, 6),
-            "alias_score": round(alias_score, 6),
-            "year_score": round(year_score, 6),
-            "media_type_score": round(media_type_score, 6),
-            "episode_structure_score": round(episode_structure_score, 6),
-            "context_score": round(context_score, 6),
-            "final_score": round(confidence, 6),
-        }
-        return AutoMatch(
-            str(raw["media_type"]), int(raw["tmdb_id"]), str(raw["title"]),
-            str(raw["year"]), confidence, status, components,
-            {
+        return _score_identity_candidate(
+            raw,
+            query_years={query_year} if query_year else set(),
+            parent_labels=(),
+            prefer_animation=prefer_animation,
+            expected_episode_count=expected_episode_count,
+            min_confidence=min_confidence,
+            trace_extra={
                 "query": query,
                 "matched_query_variant": raw.get("matched_query", query),
                 "query_year": query_year,
-                "official_titles": list(raw["titles"]),
-                "aliases_checked": list(raw["aliases"]),
-                "blockers": blockers,
-                "expected_episode_count": expected_episode_count,
-                "actual_episode_count": actual_count,
             },
         )
 
@@ -1190,51 +1319,11 @@ def auto_match_tmdb(
                 score(item) for item in raw_candidates
                 if int(item["tmdb_id"]) not in excluded_ids
             ]
-    candidates.sort(key=lambda item: (-item.confidence, item.media_type, item.tmdb_id))
-    if not candidates:
-        raise PlanError(f"TMDB 未找到自动匹配候选: {query}")
-    best = candidates[0]
-    if best.status != "confirmed":
-        preview = "; ".join(
-            f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%}, {item.status})"
-            for item in candidates[:3]
-        )
-        raise AutoMatchAmbiguityError(
-            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview,
-            candidates=candidates,
-        )
-    if "year_conflict" in best.decision_trace.get("blockers", []):
-        raise AutoMatchAmbiguityError(
-            f"自动匹配候选年份与源目录冲突，拒绝自动选择: "
-            f"query_year={query_year}, candidate={best.media_type}/{best.tmdb_id} "
-            f"{best.title} ({best.year})",
-            candidates=candidates,
-        )
-    runner_up = candidates[1] if len(candidates) > 1 else None
-    best_exact = max(
-        float(best.score_components.get("title_score", 0.0)),
-        float(best.score_components.get("alias_score", 0.0)),
-    ) >= 0.999999
-    runner_exact = bool(runner_up) and max(
-        float(runner_up.score_components.get("title_score", 0.0)),
-        float(runner_up.score_components.get("alias_score", 0.0)),
-    ) >= 0.999999
-    exact_title_uniquely_identifies_best = best_exact and not runner_exact
-    if (
-        runner_up is not None
-        and best.confidence - runner_up.confidence + 1e-9
-        < AUTO_MATCH_MIN_MARGIN
-        and not exact_title_uniquely_identifies_best
-    ):
-        raise AutoMatchAmbiguityError(
-            "自动匹配前两名证据无法区分，拒绝自动选择: "
-            + "; ".join(
-                f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%})"
-                for item in candidates[:2]
-            ),
-            candidates=candidates,
-        )
-    return best, candidates
+    return _select_auto_match(
+        candidates,
+        query_label=query,
+        year_label=f"query_year={query_year}",
+    )
 
 
 def auto_match_from_evidence(
@@ -1398,80 +1487,19 @@ def auto_match_from_evidence(
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
-        title_score = float(raw["title_score"])
-        alias_score = float(raw["alias_score"])
-        evidence_score = max(title_score, alias_score)
-
-        parent_bonus = 0.0
-        candidate_all_titles = [str(t).lower() for t in raw["titles"]] + [str(a).lower() for a in raw["aliases"]]
-        for p in evidence.parent_labels:
-            p_norm = p.strip().lower()
-            if p_norm and any(p_norm in ct for ct in candidate_all_titles):
-                parent_bonus = max(parent_bonus, 0.04)
-
-        year_score = 0.0
-        wrong_year = False
-        if query_years:
-            candidate_year = str(raw["year"])
-            if candidate_year in query_years:
-                year_score = 0.0
-            elif candidate_year == "未知年份":
-                year_score = -0.06
-            else:
-                try:
-                    cand_y_int = int(candidate_year)
-                    deltas = [abs(cand_y_int - int(qy)) for qy in query_years if qy.isdigit()]
-                    min_delta = min(deltas) if deltas else 0
-                    wrong_year = min_delta >= 2
-                    year_score = -0.30 if wrong_year else -0.12
-                except ValueError:
-                    year_score = -0.06
-
-        media_type_score = 0.0
-        context_score = 0.0
-        if prefer_animation and raw["media_type"] in {"tv", "movie"}:
-            if raw["is_animation"] is True:
-                context_score = 0.0
-            elif raw["is_animation"] is False:
-                context_score = -0.12
-
-        episode_structure_score = 0.0
-        actual_count = raw["actual_episode_count"]
-        if expected_episode_count and isinstance(actual_count, int):
-            episode_structure_score = 0.0 if actual_count == expected_episode_count else -0.08
-
-        confidence = max(0.0, min(1.0, evidence_score + parent_bonus + year_score + media_type_score + context_score + episode_structure_score))
-        blockers: list[str] = []
-        if wrong_year:
-            blockers.append("year_conflict")
-        if raw["cross_script"] and alias_score < 0.88:
-            blockers.append("cross_script_without_alias_evidence")
-        if confidence < min_confidence:
-            blockers.append("below_confidence_threshold")
-
-        status = "rejected" if blockers else "confirmed"
-        components = {
-            "title_score": round(title_score, 6),
-            "alias_score": round(alias_score, 6),
-            "parent_bonus": round(parent_bonus, 6),
-            "year_score": round(year_score, 6),
-            "media_type_score": round(media_type_score, 6),
-            "episode_structure_score": round(episode_structure_score, 6),
-            "context_score": round(context_score, 6),
-            "final_score": round(confidence, 6),
-        }
-        return AutoMatch(
-            str(raw["media_type"]), int(raw["tmdb_id"]), str(raw["title"]),
-            str(raw["year"]), confidence, status, components,
-            {
+        return _score_identity_candidate(
+            raw,
+            query_years=query_years,
+            parent_labels=evidence.parent_labels,
+            prefer_animation=prefer_animation,
+            expected_episode_count=expected_episode_count,
+            min_confidence=min_confidence,
+            trace_extra={
                 "query": evidence.boundary_label,
-                "matched_query_variant": raw.get("matched_query", evidence.boundary_label),
+                "matched_query_variant": raw.get(
+                    "matched_query", evidence.boundary_label
+                ),
                 "query_years": sorted(query_years),
-                "official_titles": list(raw["titles"]),
-                "aliases_checked": list(raw["aliases"]),
-                "blockers": blockers,
-                "expected_episode_count": expected_episode_count,
-                "actual_episode_count": actual_count,
                 "work_unit_id": evidence.work_unit_id,
             },
         )
@@ -1496,52 +1524,11 @@ def auto_match_from_evidence(
                 score(item) for item in raw_candidates
                 if int(item["tmdb_id"]) not in excluded_ids
             ]
-
-    candidates.sort(key=lambda item: (-item.confidence, item.media_type, item.tmdb_id))
-    if not candidates:
-        raise PlanError(f"TMDB 未找到自动匹配候选: {evidence.boundary_label}")
-    best = candidates[0]
-    if best.status != "confirmed":
-        preview = "; ".join(
-            f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%}, {item.status})"
-            for item in candidates[:3]
-        )
-        raise AutoMatchAmbiguityError(
-            "自动匹配缺少可验证的标题/别名证据，已拒绝自动选择: " + preview,
-            candidates=candidates,
-        )
-    if "year_conflict" in best.decision_trace.get("blockers", []):
-        raise AutoMatchAmbiguityError(
-            f"自动匹配候选年份与源目录冲突，拒绝自动选择: "
-            f"query_years={sorted(query_years)}, candidate={best.media_type}/{best.tmdb_id} "
-            f"{best.title} ({best.year})",
-            candidates=candidates,
-        )
-    runner_up = candidates[1] if len(candidates) > 1 else None
-    best_exact = max(
-        float(best.score_components.get("title_score", 0.0)),
-        float(best.score_components.get("alias_score", 0.0)),
-    ) >= 0.999999
-    runner_exact = bool(runner_up) and max(
-        float(runner_up.score_components.get("title_score", 0.0)),
-        float(runner_up.score_components.get("alias_score", 0.0)),
-    ) >= 0.999999
-    exact_title_uniquely_identifies_best = best_exact and not runner_exact
-    if (
-        runner_up is not None
-        and best.confidence - runner_up.confidence + 1e-9
-        < AUTO_MATCH_MIN_MARGIN
-        and not exact_title_uniquely_identifies_best
-    ):
-        raise AutoMatchAmbiguityError(
-            "自动匹配前两名证据无法区分，拒绝自动选择: "
-            + "; ".join(
-                f"{item.media_type}/{item.tmdb_id} {item.title} ({item.confidence:.1%})"
-                for item in candidates[:2]
-            ),
-            candidates=candidates,
-        )
-    return best, candidates
+    return _select_auto_match(
+        candidates,
+        query_label=evidence.boundary_label,
+        year_label=f"query_years={sorted(query_years)}",
+    )
 
 
 __all__ = [
