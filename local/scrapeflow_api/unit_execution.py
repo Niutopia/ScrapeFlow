@@ -203,8 +203,13 @@ def _multi_season_absolute_map_path(
     for name in names:
         match = _ABSOLUTE_BRACKET_RE.search(name)
         if match is None:
-            return None
+            # Non-bracketed videos (NCED/NCOP/[18.5]-style specials) stay on
+            # the planner's ordinary special path; only regular bracketed
+            # episodes participate in the explicit map.
+            continue
         numbers.append(int(match.group(1)))
+    if not numbers:
+        return None
     if sorted(numbers) != list(range(1, len(numbers) + 1)):
         return None
     total = len(numbers)

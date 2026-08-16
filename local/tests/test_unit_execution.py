@@ -312,6 +312,10 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
             f"/incoming/sao/[TUDO] Sword Art Online Alicization [{i:02d}][Ma10p_2160p][x265].mkv": FAKE_VIDEO_BYTES
             for i in range(1, 48)
         }
+        # Specials without a bracketed regular number stay on the planner's
+        # ordinary special path and must not abort the map bridge.
+        files["/incoming/sao/[TUDO] Sword Art Online Alicization [NCED01][Ma10p].mkv"] = FAKE_VIDEO_BYTES
+        files["/incoming/sao/[TUDO] Sword Art Online Alicization [18.5][Ma10p].mkv"] = FAKE_VIDEO_BYTES
         state_root, alist, runner = self._setup(
             files, MultiSeasonTMDB(45782, {1: 25, 2: 24, 3: 24, 4: 23}),
         )
