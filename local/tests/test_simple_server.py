@@ -119,6 +119,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             self.assertIn("/api/root-jobs", body)
             self.assertIn("data-source", body)
             self.assertIn("/api/intake", body)
+            # P8: the minimal uncertain-unit confirmation panel (U node).
+            self.assertIn("需要确认", body)
+            self.assertIn("识别不确定，请确认正确身份：", body)
+            self.assertIn("/confirm", body)
+            self.assertIn("data-confirm", body)
+            self.assertIn("/work-units", body)
 
     def create_job(self, source: str = "/library/待刮削/Example") -> dict[str, object]:
         status, payload = self.request("POST", "/api/jobs", {"path": source})
@@ -353,6 +359,65 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("来源目录不存在", missing["error"])
         self.assertEqual(self.runner.list_jobs(), [])
+
+    def test_work_units_view_and_durable_confirm_flow(self) -> None:
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
+        self.remote.entries["/library/待刮削/Example"] = [
+            {"name": "S01E01.mkv", "is_dir": False, "size": 3},
+        ]
+        status, created = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "anime"},
+        )
+        self.assertEqual(status, 201)
+        job_id = created["job"]["id"]
+        analyze_root_boundaries(
+            self.remote, "/library/待刮削/Example",
+            root_task_id=job_id, state_root=self.state_root,
+        )
+        status, view = self.request("GET", f"/api/jobs/{job_id}/work-units")
+        self.assertEqual(status, 200)
+        self.assertEqual(view["aggregate"]["unit_count"], 1)
+        self.assertEqual(view["aggregate"]["in_progress"], 1)
+        unit = view["units"][0]
+        self.assertEqual(unit["identity_status"], "pending")
+        # The only confirmation surface is media_type + tmdb_id (+season).
+        confirm_payload = {"media_type": "tv", "tmdb_id": 123}
+        status, confirmed = self.request(
+            "POST",
+            f"/api/jobs/{job_id}/work-units/{unit['work_unit_id']}/confirm",
+            confirm_payload,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(confirmed["unit"]["identity"]["tmdb_id"], 123)
+        self.assertEqual(confirmed["unit"]["identity"]["source"], "operator_override")
+        # Idempotent and durable: a second confirm keeps the override.
+        status, repeated = self.request(
+            "POST",
+            f"/api/jobs/{job_id}/work-units/{unit['work_unit_id']}/confirm",
+            confirm_payload,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repeated["unit"]["identity"]["tmdb_id"], 123)
+        # Bad payloads are rejected without touching the override.
+        status, bad = self.request(
+            "POST",
+            f"/api/jobs/{job_id}/work-units/{unit['work_unit_id']}/confirm",
+            {"media_type": "ova", "tmdb_id": 1},
+        )
+        self.assertEqual(status, 400)
+        status, missing = self.request(
+            "POST",
+            f"/api/jobs/{job_id}/work-units/missing/confirm",
+            confirm_payload,
+        )
+        self.assertEqual(status, 404)
+        status, view2 = self.request("GET", f"/api/jobs/{job_id}/work-units")
+        self.assertEqual(status, 200)
+        self.assertEqual(view2["units"][0]["identity"]["source"], "operator_override")
+        self.assertEqual(view2["units"][0]["identity"]["tmdb_id"], 123)
 
     def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
         self.remote.entries["/library/待刮削"] = [

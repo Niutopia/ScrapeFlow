@@ -30,6 +30,11 @@ from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
 from engine.scrapeflow.target_shelf import parse_target_shelf, target_shelf_values
 from local.web_dashboard import dashboard_html
+from local.scrapeflow_api.root_aggregation import (
+    aggregate_root_job,
+    public_work_unit_row,
+    public_work_unit_rows,
+)
 from local.scrapeflow_api.simple_engine_runner import (
     EngineCancellationRequested,
     EngineExecutionError,
@@ -5120,6 +5125,72 @@ class SimpleApplication:
             self._queue_automatic_job(selected.id)
         return selected
 
+    def work_units_view(self, job_id: str) -> dict[str, object]:
+        """Read-only R-node projection of one root task's work units."""
+        runner = self._get_engine_runner()
+        job = runner.get_job(job_id)
+        aggregate = aggregate_root_job(self.state_root, job_id)
+        return {
+            "root_task_id": job_id,
+            "source": job.request.get("source_path"),
+            "phase": job.phase,
+            "aggregate": aggregate.as_dict(),
+            "units": public_work_unit_rows(self.state_root, job_id),
+        }
+
+    def confirm_work_unit(
+        self,
+        job_id: str,
+        work_unit_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Persist one durable operator identity confirmation (U node).
+
+        Only ``media_type + tmdb_id`` (and an optional season) are accepted.
+        The override lives on the WorkUnit ledger, so retrying the same root
+        task never asks the same question again.
+        """
+        if not isinstance(payload, Mapping):
+            raise EngineRequestError("确认请求必须是 JSON 对象")
+        unknown = set(payload) - {"tmdb_id", "media_type", "season"}
+        if unknown:
+            raise EngineRequestError("确认只接受 tmdb_id、media_type 与可选 season")
+        media_type = payload.get("media_type")
+        if media_type not in {"movie", "tv"}:
+            raise EngineRequestError("media_type 必须是 movie 或 tv")
+        tmdb_id = payload.get("tmdb_id")
+        if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+            raise EngineRequestError("tmdb_id 必须是正整数")
+        season = payload.get("season")
+        if season is not None and (
+            isinstance(season, bool) or not isinstance(season, int) or season <= 0
+        ):
+            raise EngineRequestError("season 必须是正整数或省略")
+        from engine.scrapeflow.unit_identity import apply_work_unit_override
+
+        try:
+            unit = apply_work_unit_override(
+                self.state_root, job_id, work_unit_id,
+                media_type=media_type, tmdb_id=tmdb_id, season=season,
+            )
+        except KeyError as exc:
+            raise EngineJobNotFoundError(f"work unit 不存在: {work_unit_id}") from exc
+        except ValueError as exc:
+            raise EngineRequestError(str(exc)) from exc
+        # Resume the same root task: refresh the read-only reconciliation for
+        # the confirmed identity (D step).  Never create a new task.
+        try:
+            runner = self._get_engine_runner()
+            from local.scrapeflow_api.library_index import (
+                reconcile_root_work_units,
+            )
+            reconcile_root_work_units(
+                runner.alist, runner.library_root, self.state_root, job_id,
+            )
+        except Exception:
+            pass  # Read-only refinement; the durable override already stands.
+        return public_work_unit_row(unit, self.state_root, job_id)
+
     def engine_jobs(self) -> list[EngineJob]:
         if self._engine_runner is not None or self.engine_configured:
             return self._get_engine_runner().list_jobs()
@@ -6206,6 +6277,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 if engine_job is None:
                     raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
                 self._send(200, {"job": self.application.public_engine_job(engine_job)})
+            elif path.startswith("/api/jobs/") and path.count("/") == 4 and path.endswith("/work-units"):
+                pieces = path.split("/")
+                job_id = urllib.parse.unquote(pieces[3])
+                if self.application.maybe_engine_job(job_id) is None:
+                    raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+                self._send(200, self.application.work_units_view(job_id))
             elif path == "/api/browse":
                 browse_path = (query.get("path") or [self.application.remote_root])[0]
                 refresh = (query.get("refresh") or ["0"])[0] == "1"
@@ -6244,6 +6321,20 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send(200, self.application.set_paused(False))
             elif path == "/api/library-audit/run":
                 self._send(200, self.application.run_library_audit())
+            elif path.startswith("/api/jobs/") and path.endswith("/confirm"):
+                pieces = path.split("/")
+                if len(pieces) != 7:
+                    self._send(404, {"error": "not found"})
+                    return
+                job_id = urllib.parse.unquote(pieces[3])
+                unit_id = urllib.parse.unquote(pieces[5])
+                if self.application.maybe_engine_job(job_id) is None:
+                    raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+                self._send(
+                    200,
+                    {"unit": self.application.confirm_work_unit(job_id, unit_id, payload)},
+                )
+                return
             elif path.startswith("/api/jobs/"):
                 pieces = path.split("/")
                 if len(pieces) != 5:
