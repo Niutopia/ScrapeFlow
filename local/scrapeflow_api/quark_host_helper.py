@@ -1127,11 +1127,13 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         # path (live-observed: intermittent ~1KB cuts).  Retrying those is
         # safe; mutating POSTs never retry (duplicate-submit hazard) and stay
         # fail-closed.
-        attempts = 3 if (retryable is True or (retryable is None and method == "GET")) else 1
+        attempts = 4 if (retryable is True or (retryable is None and method == "GET")) else 1
         last_invalid: Exception | None = None
         for attempt in range(attempts):
             if attempt:
-                await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                # Longer backoff: the live degradation windows (Quark-side
+                # truncated bodies under burst traffic) last several seconds.
+                await asyncio.sleep(min(2 + 3 * (attempt - 1), 12))
             delegated = self._delegated_session.get()
             if delegated is None:
                 # This fallback keeps the renderer transport independently
