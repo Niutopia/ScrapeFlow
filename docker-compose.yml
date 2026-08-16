@@ -145,6 +145,12 @@ services:
       # same media root as the API; it never receives an arbitrary root.
       SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
       NO_PROXY: "alist,localhost,127.0.0.1${NO_PROXY:+,}${NO_PROXY:-}"
+      # The Helper's own Quark HTTPS follows the same proxy the API search
+      # layer uses (a distinct egress avoids the per-IP burst correlation
+      # with AList's direct Quark traffic); CDP discovery stays direct via
+      # the explicit docker-sidecar URL below.
+      HTTP_PROXY: ${SCRAPEFLOW_HTTP_PROXY:-}
+      HTTPS_PROXY: ${SCRAPEFLOW_HTTPS_PROXY:-}
       SCRAPEFLOW_QUARK_HELPER_TOKEN: ${SCRAPEFLOW_QUARK_HELPER_TOKEN:-}
       SCRAPEFLOW_QUARK_HELPER_CDP_URL: http://host.docker.internal:19222/json/list
       TZ: ${TZ:-Asia/Shanghai}
