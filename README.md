@@ -68,6 +68,16 @@ docker compose --env-file .env.local up -d alist api quark-helper pansou
 curl -fsS http://127.0.0.1:3010/api/health
 ```
 
+### 代理与直连（Clash TUN 全局模式）
+
+搜索层（TMDB、字幕站点、被墙索引）允许走代理；**BT 下载一律直连**（下载子进程会清空代理环境变量并开启 DHT/PEX/LPD）。在 TUN 全局代理下，需要给 Docker 网段加 DIRECT 规则，否则容器出站下载也会被代理截走：
+
+```yaml
+rules:
+  - IP-CIDR,172.20.0.0/16,DIRECT,no-resolve   # ScrapeFlow compose 网段（api/alist/pansou）
+  - IP-CIDR,192.168.65.0/24,DIRECT,no-resolve # Docker Desktop VM 网段
+```
+
 Compose 的 API 进程入口是 `python3 -m local.simple_server`，默认只在宿主机 <http://127.0.0.1:8765> 暴露。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
 同一镜像还会启动四动作 `quark-helper` sidecar。它与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。Sidecar 使用同一组 `ALIST_USERNAME`/`ALIST_PASSWORD` 访问 Compose 内部 AList，每次从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和当前 AList 的 `root_folder_id`（兼容旧 `root_id`），并只在该次固定 Quark HTTPS/WSG 操作期间保存在内存；两者不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
