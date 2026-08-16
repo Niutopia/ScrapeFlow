@@ -7,6 +7,7 @@ import json
 import posixpath
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -811,6 +812,10 @@ class QuarkFastSaveAutomaticMaterializer:
             raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
         mkdir(posixpath.dirname(staging_root))
         mkdir(staging_root)
+        # Settle window: Quark rate-limits the same account when the AList
+        # mkdir (direct egress) and the Helper's follow-up fixed requests
+        # burst in the same seconds; a short pause decorrelates them.
+        time.sleep(4.0)
         helper = self._helper()
         self._require_helper_ready(helper)
         persisted_task_id = existing_task_id
@@ -1068,6 +1073,10 @@ class QuarkMagnetAutomaticMaterializer:
             raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
         mkdir(posixpath.dirname(staging_root))
         mkdir(staging_root)
+        # Settle window: Quark rate-limits the same account when the AList
+        # mkdir (direct egress) and the Helper's follow-up fixed requests
+        # burst in the same seconds; a short pause decorrelates them.
+        time.sleep(4.0)
         execute = getattr(self._bridge(), "execute", None)
         if not callable(execute):
             raise AutomaticReplenishmentError("夸克磁力 materializer 缺少 execute")
