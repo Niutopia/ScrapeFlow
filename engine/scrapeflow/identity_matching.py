@@ -15,6 +15,14 @@ from pathlib import Path
 from typing import Any, Collection, Mapping, Sequence, TYPE_CHECKING
 
 from .errors import ApiError, PlanError
+from .data.release_lexicon import (
+    BIDIRECTIONAL_LEXICAL_VARIANTS,
+    CROSS_SCRIPT_SEASON_ALIASES,
+    LEXICAL_VARIANTS,
+    QUERY_VARIANT_ALIASES,
+    SOURCE_NAME_CORRECTIONS,
+    SOURCE_QUERY_OVERRIDES,
+)
 from .models import AutoMatch
 from .remote_paths import (
     join_remote,
@@ -121,35 +129,29 @@ def _search_query_variants(query: str) -> list[str]:
         variants.append(without_year)
     if relaxed and relaxed not in variants:
         variants.append(relaxed)
-    # TMDB Chinese localization alternates between “物语” and “故事” for
-    # the same subtitle. Add one bounded word variant; normal candidate
-    # scoring must still prove the work before it can be selected.
+    # Bounded lexical variants come from the release lexicon (data, not
+    # logic).  Normal candidate scoring must still prove the work before any
+    # variant can be selected; these spellings never grant an identity.
     lexical_base = without_year or without_parenthetical_date or normalized
-    if "物语" in lexical_base:
-        story_variant = lexical_base.replace("物语", "故事")
-        if story_variant not in variants:
-            variants.append(story_variant)
-    elif "故事" in lexical_base:
-        tale_variant = lexical_base.replace("故事", "物语")
-        if tale_variant not in variants:
-            variants.append(tale_variant)
-    # Common Chinese release-title wording differs from TMDB by the optional
-    # intensifier 神 (for example “神圣之星” vs “圣星”).  Preserve the original
-    # query and add only this bounded lexical variant; never globally delete
-    # 神 from unrelated titles.
-    sacred_variant = re.sub(r"神圣之", "圣", relaxed or normalized)
-    if sacred_variant and sacred_variant not in variants:
-        variants.append(sacred_variant)
+    for old, new in BIDIRECTIONAL_LEXICAL_VARIANTS:
+        if old in lexical_base:
+            variant = lexical_base.replace(old, new)
+            if variant not in variants:
+                variants.append(variant)
+        elif new in lexical_base:
+            variant = lexical_base.replace(new, old)
+            if variant not in variants:
+                variants.append(variant)
+    for old, new in LEXICAL_VARIANTS:
+        base = lexical_base if old in lexical_base else (relaxed or normalized)
+        variant = base.replace(old, new)
+        if variant and variant not in variants:
+            variants.append(variant)
     # Bounded release aliases cover well-established short translations and
     # recurring transcription/obfuscation errors.  These are query variants,
     # never direct identities: candidate scoring, ambiguity margins and media
     # type checks remain authoritative.
-    bounded_aliases = (
-        (r"^\s*末日三问\s*$", "末日时在做什么？有没有空？可以来拯救吗？"),
-        (r"杖与剑的魔法谭", "杖与剑的魔剑谭"),
-        (r"瑞克和\s*MD", "瑞克和莫蒂"),
-    )
-    for pattern, replacement in bounded_aliases:
+    for pattern, replacement in QUERY_VARIANT_ALIASES:
         alias = re.sub(pattern, replacement, normalized, flags=re.I).strip()
         if alias != normalized and alias and alias not in variants:
             variants.append(alias)
@@ -218,11 +220,11 @@ def _query_from_source(src: str) -> str:
     # regular release-name cleanup below.
     name = re.sub(r"\.part\d+\.rar\s*$", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\.(?:zip|7z|rar|001|r0\d)\s*$", "", name, flags=re.IGNORECASE)
-    # Commonly shared 86 release folders abbreviate the Chinese subtitle to
-    # ``不存/ZDZQ``. Keep this bounded canonical alias instead of sending an
-    # unsearchable release-code fragment to TMDB.
-    if re.search(r"86.*(?:不存(?!在)|ZDZQ)", name, re.IGNORECASE):
-        return "86 -不存在的战区-"
+    # Regex-guarded canonical queries for abbreviated release folder labels
+    # come from the release lexicon (data, not logic).
+    for pattern, replacement in SOURCE_QUERY_OVERRIDES:
+        if re.search(pattern, name, re.IGNORECASE):
+            return replacement
     # Library shelf labels are single Latin letters.  Most are followed by a
     # quality token (``H 4k``), while older folders may directly start with a
     # Chinese title (``R 日在校园``).
@@ -285,11 +287,9 @@ def _query_from_source(src: str) -> str:
     )
     # Quark appends a numeric collision suffix when a same-name folder is recreated.
     name = re.sub(r"\s*[（(]\d{1,3}[)）]\s*$", "", name)
-    # A common source-folder typo; TMDB uses the official title 白色相簿.
-    name = name.replace("白色相薄", "白色相簿")
-    # The source library uses this shortened translation while TMDB exposes
-    # the full official Chinese title.
-    name = name.replace("最弱无败神龙", "最弱无败神装机龙")
+    # Exact source-name corrections from the release lexicon (data, not logic).
+    for wrong, correct in SOURCE_NAME_CORRECTIONS:
+        name = name.replace(wrong, correct)
     # Do not strip parentheses one character at a time: ``Title (2021)`` used
     # to become ``Title (2021`` because only the trailing parenthesis was at
     # the edge.  TMDB can use the balanced year as an additional signal.
@@ -687,9 +687,7 @@ def _season_from_series_variant(
     cross_script_identity = any(
         latin in source_identity
         and any(cjk in season_identity for cjk in cjk_aliases)
-        for latin, cjk_aliases in {
-            "illya": ("伊莉雅", "イリヤ"),
-        }.items()
+        for latin, cjk_aliases in CROSS_SCRIPT_SEASON_ALIASES.items()
     )
     if not cross_script_identity:
         return None

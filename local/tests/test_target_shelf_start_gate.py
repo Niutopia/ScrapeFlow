@@ -15,7 +15,6 @@ from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.target_shelf import (
     parse_target_shelf,
     target_root_for_shelf,
-    target_shelf_allows_media_type,
 )
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
@@ -142,15 +141,13 @@ class TargetShelfStartGateTests(unittest.TestCase):
         )
         return waiting
 
-    def test_shelf_mapping_and_type_matrix_are_closed(self) -> None:
+    def test_shelf_mapping_is_closed_and_type_matrix_removed(self) -> None:
         self.assertEqual(target_root_for_shelf("/library", "movie"), "/library/电影")
         self.assertEqual(target_root_for_shelf("/library", "anime"), "/library/番剧")
         self.assertEqual(target_root_for_shelf("/library", "us_tv"), "/library/美剧")
-        self.assertTrue(target_shelf_allows_media_type("movie", "movie"))
-        self.assertFalse(target_shelf_allows_media_type("anime", "movie"))
-        self.assertTrue(target_shelf_allows_media_type("anime", "tv"))
-        self.assertTrue(target_shelf_allows_media_type("us_tv", "tv"))
-        self.assertFalse(target_shelf_allows_media_type("movie", "unknown"))
+        # 2026-08-16 operator decision: the shelf is an archive location, not
+        # a media-type constraint.  The identity owns movie/tv, so an anime
+        # movie may live inside 番剧 and a TV identity drives TV planning.
         with self.assertRaises(ValueError):
             parse_target_shelf("/library/电影")
 

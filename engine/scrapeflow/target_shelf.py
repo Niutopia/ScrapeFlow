@@ -116,24 +116,11 @@ def target_shelf_for_shelf_segment(segment: object) -> TargetShelf | None:
     return None
 
 
-def target_shelf_allows_media_type(
-    shelf: TargetShelf | str,
-    media_type: object,
-) -> bool:
-    """Apply the conservative media-type/shelf compatibility matrix."""
-    selected = parse_target_shelf(shelf)
-    normalized_type = str(media_type or "").strip().casefold()
-    if selected is TargetShelf.MOVIE:
-        return normalized_type == "movie"
-    return normalized_type == "tv"
-
-
 __all__ = [
     "ALLOWED_TARGET_SHELVES",
     "TargetShelf",
     "parse_target_shelf",
     "target_root_for_shelf",
-    "target_shelf_allows_media_type",
     "target_shelf_for_root",
     "target_shelf_for_shelf_segment",
     "target_shelf_label",

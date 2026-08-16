@@ -79,7 +79,7 @@ class ReleaseCheckTests(unittest.TestCase):
         )
         compose_values = dict(self.COMPOSE_DEFAULTS)
         compose_values.update(compose_overrides or {})
-        api_port_values = api_ports or ["127.0.0.1:${SCRAPEFLOW_API_PORT:-8765}:8765"]
+        api_port_values = api_ports or ["127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765"]
         api_env = "\n".join(
             f"      {key}: ${{{key}:-{value}}}"
             for key, value in compose_values.items()
@@ -299,7 +299,7 @@ class ReleaseCheckTests(unittest.TestCase):
             self._write_deployment_contract_files(
                 root,
                 compose_overrides={"SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "1"},
-                api_ports=["0.0.0.0:${SCRAPEFLOW_API_PORT:-8765}:8765"],
+                api_ports=["0.0.0.0:${SCRAPEFLOW_API_PORT:-3010}:8765"],
             )
 
             issues = local_deployment_contract_issues(root)

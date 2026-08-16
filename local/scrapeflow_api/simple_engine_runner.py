@@ -43,7 +43,6 @@ from engine.scrapeflow.target_shelf import (
     TargetShelf,
     parse_target_shelf,
     target_root_for_shelf,
-    target_shelf_allows_media_type,
     target_shelf_for_root,
 )
 from local.scrapeflow_api.replenishment import ACTIONABLE_GAP_KINDS
@@ -2394,8 +2393,6 @@ class SimpleEngineRunner:
             raise EngineRequestError("既有作品根不在匹配一级货架下")
         if self._reconciliation_shelf_for_work(work_root) != shelf.value:
             raise EngineRequestError("既有作品根与货架映射不一致")
-        if not target_shelf_allows_media_type(shelf, identity.media_type):
-            raise EngineRequestError("既有作品媒体类型与货架不兼容")
         if self._reconciliation_scope_is_ambiguous(matched):
             raise EngineRequestError("正式作品身份范围不明确")
         return identity, shelf, shelf_root, work_root
@@ -4602,12 +4599,6 @@ class SimpleEngineRunner:
             target_shelf=selected_shelf.value,
             target_shelf_root=selected_root,
         )
-        if not target_shelf_allows_media_type(selected_shelf, identity.media_type):
-            raise TargetShelfPolicyConflictError(
-                target_shelf=selected_shelf,
-                media_type=identity.media_type,
-                identity=identity,
-            )
         request = EngineRequest.from_mapping({
             "source_path": source,
             "parent_path": selected_root,
@@ -4665,12 +4656,6 @@ class SimpleEngineRunner:
             target_shelf=selected_shelf.value,
             target_shelf_root=parent,
         )
-        if not target_shelf_allows_media_type(selected_shelf, media_type):
-            raise TargetShelfPolicyConflictError(
-                target_shelf=selected_shelf,
-                media_type=media_type,
-                identity=identity,
-            )
         request = EngineRequest.from_mapping({
             "source_path": source,
             "parent_path": parent,
@@ -5167,14 +5152,6 @@ class SimpleEngineRunner:
                     and reconciled_identity is not None
                     and not isinstance(correction, Mapping)
                 ):
-                    if not target_shelf_allows_media_type(
-                        selected_shelf, reconciled_identity.media_type,
-                    ):
-                        raise TargetShelfPolicyConflictError(
-                            target_shelf=selected_shelf,
-                            media_type=reconciled_identity.media_type,
-                            identity=reconciled_identity,
-                        )
                     identity = replace(
                         reconciled_identity,
                         target_parent=selected_root,
