@@ -195,8 +195,6 @@ def _cleanup_empty_source_shells(
         if rows(directory):
             return
         deleted = remove_empty(directory)
-        if deleted is False:
-            return
         parent = posixpath.dirname(directory) or "/"
         name = posixpath.basename(directory)
         try:
@@ -205,6 +203,21 @@ def _cleanup_empty_source_shells(
             parent_rows = []
         if not any(item.get("name") == name for item in parent_rows):
             removed.append(directory)
+            return
+        if deleted is not False:
+            # Some drivers (Quark via AList) accept remove_empty_directory
+            # with HTTP success but never delete.  The directory was just
+            # verified empty through a fresh listing, so an explicit remove
+            # of that single name is the bounded fallback.
+            try:
+                remove = getattr(runner.alist, "remove", None)
+                if callable(remove):
+                    remove(parent, [name])
+                    parent_rows = rows(parent)
+                    if not any(item.get("name") == name for item in parent_rows):
+                        removed.append(directory)
+            except Exception:
+                pass
 
     visit(source)
     return removed

@@ -433,6 +433,30 @@ class CleaningIndexAList(IndexAList):
         return False
 
 
+class NoopRemoveEmptyAList(CleaningIndexAList):
+    """AList double whose remove_empty_directory succeeds but never deletes
+    (the observed Quark-via-AList behavior); explicit remove() does delete."""
+
+    def __init__(self, files: dict[str, bytes] | None = None) -> None:
+        super().__init__(files)
+        self.remove_calls: list[tuple[str, list[str]]] = []
+
+    def remove_empty_dir(self, path: str) -> bool:
+        self.remove_empty_calls.append(path.rstrip("/") or "/")
+        return True
+
+    def remove(self, parent: str, names: list[str]) -> bool:
+        self.remove_calls.append((parent.rstrip("/") or "/", list(names)))
+        prefix = parent.rstrip("/") + "/"
+        for name in names:
+            target = prefix + name
+            self.dirs.discard(target)
+            for full in list(self.files):
+                if full == target or full.startswith(target + "/"):
+                    self.files.pop(full, None)
+        return True
+
+
 class SourceShellCleanupTests(unittest.TestCase):
     """Empty source-dir shells are dropped after a root completes."""
 
@@ -555,6 +579,51 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertEqual(final.phase, "completed")
         self.assertEqual(alist.remove_empty_calls, [])
         self.assertIn("/incoming/My Show", alist.dirs)
+
+    def test_noop_remove_empty_driver_falls_back_to_explicit_remove(self) -> None:
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = NoopRemoveEmptyAList(files)
+        executor_events: list[str] = []
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_events.append(str(plan.target_root)) or {"ok": True},
+        )
+        root_task_id = self._root(runner, "/incoming/My Show")
+
+        def original(plan):
+            executor_events.append(str(plan.target_root))
+            for item in plan.files:
+                data = alist.files.pop(item.source_path, None)
+                if data is not None:
+                    alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
+            return {"ok": True}
+
+        def executor(plan):
+            result = original(plan)
+            alist.dirs.add("/incoming/My Show")
+            alist.dirs.add("/incoming/My Show/Extras")
+            return result
+
+        runner.executor = executor
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        # remove_empty_directory succeeded but deleted nothing: the cleanup
+        # must fall back to an explicit verified-empty remove().
+        self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
+        self.assertIn("/incoming/My Show", alist.remove_empty_calls)
+        self.assertEqual(len(alist.remove_calls), 2)
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+        self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
 
 
 if __name__ == "__main__":
