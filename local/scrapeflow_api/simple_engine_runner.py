@@ -1447,7 +1447,9 @@ class SimplePlanExecutor:
                     if not isinstance(target, str) or not isinstance(data, (bytes, bytearray)):
                         raise EngineExecutionError("Engine 生成的 NFO 结构无效")
                     self._ensure_dir(posixpath.dirname(target) or "/")
-                    observed = self._upload_bytes(target, bytes(data), "application/xml")
+                    observed = self._preserve_or_upload_bytes(
+                        target, bytes(data), "application/xml",
+                    )
                     artifacts.append({"target": target, "kind": "nfo", **observed})
 
             planned_artwork = getattr(__import__("engine.scraper", fromlist=["planned_artwork"]), "planned_artwork", None)
@@ -1461,7 +1463,9 @@ class SimplePlanExecutor:
                     if not isinstance(data, (bytes, bytearray)):
                         raise EngineExecutionError(f"TMDB 海报响应无效: {image_path}")
                     self._ensure_dir(posixpath.dirname(target) or "/")
-                    observed = self._upload_bytes(target, bytes(data), "image/jpeg")
+                    observed = self._preserve_or_upload_bytes(
+                        target, bytes(data), "image/jpeg",
+                    )
                     artifacts.append({"target": target, "kind": role, **observed})
 
         if _DEFER_TASK_CLEANUP.get():
