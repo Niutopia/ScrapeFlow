@@ -113,6 +113,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             self.assertIn("番剧", body)
             self.assertIn("美剧", body)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+            # P2: the S-step intake creation panel (source + shelf in one action).
+            self.assertIn("创建任务", body)
+            self.assertIn("这个来源整理到哪里？", body)
+            self.assertIn("/api/root-jobs", body)
+            self.assertIn("data-source", body)
+            self.assertIn("/api/intake", body)
 
     def create_job(self, source: str = "/library/待刮削/Example") -> dict[str, object]:
         status, payload = self.request("POST", "/api/jobs", {"path": source})
@@ -290,6 +296,63 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         release = sources["/library/待刮削/Real Release"]
         self.assertEqual(release["child_count"], 1)
         self.assertEqual(release["file_count"], 2)
+
+    def test_root_job_creation_selects_shelf_in_one_action(self) -> None:
+        self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
+        status, payload = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "anime"},
+        )
+        self.assertEqual(status, 201)
+        job = payload["job"]
+        self.assertEqual(job["target_shelf"], "anime")
+        self.assertEqual(job["target_root"], "/library/番剧")
+        self.assertEqual(job["phase"], "queued")
+        # Exactly one durable RootJob, bound to the intake catalog (S step).
+        self.assertEqual(len(self.runner.list_jobs()), 1)
+        status, intake = self.request("GET", "/api/intake")
+        self.assertEqual(status, 200)
+        sources = {row["canonical_path"]: row for row in intake["sources"]}
+        example = sources["/library/待刮削/Example"]
+        self.assertEqual(example["root_task_id"], job["id"])
+        self.assertEqual(example["root_job_target_shelf"], "anime")
+
+    def test_root_job_creation_is_idempotent_and_rejects_shelf_change(self) -> None:
+        self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
+        status, first = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "anime"},
+        )
+        self.assertEqual(status, 201)
+        status, repeated = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "anime"},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(repeated["job"]["id"], first["job"]["id"])
+        self.assertEqual(len(self.runner.list_jobs()), 1)
+        status, conflict = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "movie"},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("不能更改", conflict["error"])
+
+    def test_root_job_creation_rejects_bad_shelf_and_bad_path(self) -> None:
+        self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
+        status, bad_shelf = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Example", "target_shelf": "/library/电影"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("target_shelf", bad_shelf["error"])
+        status, missing = self.request(
+            "POST", "/api/root-jobs",
+            {"path": "/library/待刮削/Missing", "target_shelf": "movie"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("来源目录不存在", missing["error"])
+        self.assertEqual(self.runner.list_jobs(), [])
 
     def test_start_persists_one_allowed_shelf_without_running_while_paused(self) -> None:
         self.remote.entries["/library/待刮削"] = [

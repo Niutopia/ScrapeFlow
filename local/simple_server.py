@@ -28,7 +28,7 @@ from engine.scrapeflow.media_quality import (
 )
 from engine.scrapeflow.provider_capabilities import provider_capability_snapshot
 from engine.scrapeflow.archive_preprocessing import ArchivePreprocessingAdapter
-from engine.scrapeflow.target_shelf import target_shelf_values
+from engine.scrapeflow.target_shelf import parse_target_shelf, target_shelf_values
 from local.web_dashboard import dashboard_html
 from local.scrapeflow_api.simple_engine_runner import (
     EngineCancellationRequested,
@@ -5068,6 +5068,58 @@ class SimpleApplication:
             self._queue_automatic_job(created.id)
         return created
 
+    def create_root_task(self, payload: Mapping[str, object]) -> EngineJob:
+        """Create the user-authorized RootJob for one intake source (S step).
+
+        The user picks the source and its first-level shelf in one action.
+        The same source path always maps to at most one RootJob: an existing
+        job is returned idempotently, a different shelf on an already-selected
+        job is rejected, and an unselected legacy job simply has the choice
+        persisted.  The durable selection is authoritative even while paused;
+        the scheduler stays a separate conditional step.
+        """
+        unknown = set(payload) - {"path", "source_path", "target_shelf"}
+        if unknown:
+            raise EngineRequestError("创建任务只接受 path/source_path 与 target_shelf")
+        source = payload.get("path", payload.get("source_path"))
+        if not isinstance(source, str) or not source.strip():
+            raise EngineRequestError("请输入媒体源目录 path")
+        normalized_source = self._validate_automatic_source(source)
+        try:
+            shelf = parse_target_shelf(payload.get("target_shelf"))
+        except ValueError as exc:
+            raise EngineRequestError(str(exc)) from exc
+        runner = self._get_engine_runner()
+        try:
+            existing = runner.find_by_source(normalized_source)
+        except SimpleEngineError:
+            existing = None
+        if existing is not None:
+            if existing.target_shelf is not None and existing.target_shelf != shelf.value:
+                raise EngineJobConflictError("同一来源已选择其他货架，不能更改")
+            if existing.target_shelf is None:
+                selected = runner.start_automatic_job(existing.id, target_shelf=shelf)
+                if self.control().get("paused") is not True:
+                    self._queue_automatic_job(selected.id)
+                return selected
+            return existing
+        if not runner.source_directory_exists(normalized_source):
+            raise EngineRequestError("来源目录不存在或不是可读取的目录")
+        create_root = getattr(runner, "create_root_job", None)
+        if not callable(create_root):
+            raise EngineRequestError("Engine 缺少根任务创建入口")
+        from engine.scrapeflow.intake_source import intake_source_id
+
+        job = create_root(
+            intake_source_id(normalized_source),
+            source_path=normalized_source,
+            target_shelf=shelf,
+        )
+        selected = runner.start_automatic_job(job.id, target_shelf=shelf)
+        if self.control().get("paused") is not True:
+            self._queue_automatic_job(selected.id)
+        return selected
+
     def engine_jobs(self) -> list[EngineJob]:
         if self._engine_runner is not None or self.engine_configured:
             return self._get_engine_runner().list_jobs()
@@ -6182,6 +6234,9 @@ class SimpleHandler(BaseHTTPRequestHandler):
                         {"error": str(exc), "job": self.application.public_engine_job(exc.job)},
                     )
                     return
+                self._send(201, {"job": self.application.public_engine_job(job)})
+            elif path == "/api/root-jobs":
+                job = self.application.create_root_task(payload)
                 self._send(201, {"job": self.application.public_engine_job(job)})
             elif path == "/api/control/pause":
                 self._send(200, self.application.set_paused(True, self._optional_reason(payload)))

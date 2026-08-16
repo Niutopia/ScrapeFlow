@@ -95,6 +95,7 @@ POST /api/control/pause
 POST /api/control/resume
 GET  /api/jobs
 POST /api/jobs                    {"path":"/quark/影视/待刮削/作品目录"}
+POST /api/root-jobs               {"path":"/quark/影视/待刮削/作品目录","target_shelf":"movie|anime|us_tv"}
 GET  /api/jobs/:id
 POST /api/jobs/:id/start          {"target_shelf":"movie|anime|us_tv"}
 POST /api/jobs/:id/retry
@@ -103,9 +104,10 @@ POST /api/jobs/:id/repair-artifacts {}
 GET  /api/library-audit/latest
 POST /api/library-audit/run
 GET  /api/browse?path=...
+GET  /api/intake
 ```
 
-`POST /api/jobs` 只接收来源目录路径，`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。长期合同中，`target_shelf` 是新作品首次正式入库时的受限确认枚举，不是普通输入进行只读 Engine 身份识别或正式库对账的前置门；已匹配的正式作品沿用其既有货架/作品根，身份不确定时安全停止。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
+`POST /api/jobs` 只接收来源目录路径，`POST /api/jobs/:id/start` 只接收三个固定 `target_shelf` 枚举之一；后端据此映射一级目标根，拒绝任意目标路径。`POST /api/root-jobs` 是 A→P 合同的 S 步入口：一次提交来源与货架，创建或激活唯一 RootJob（同一来源幂等返回同一任务，已选货架不可更改），也是 Web 控制台"创建任务"面板调用的接口；`POST /api/jobs` 与 `/start` 保留为 legacy 兼容入口。长期合同中，`target_shelf` 是新作品首次正式入库时的受限确认枚举，不是普通输入进行只读 Engine 身份识别或正式库对账的前置门；已匹配的正式作品沿用其既有货架/作品根，身份不确定时安全停止。`repair-artifacts` 只接受空 JSON 对象，并只重放该已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。Provider/audit lane 默认关闭；生产补源使用任务专属 staging `/quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>`。隔离验收只能把 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`，其 staging 只能派生为 `<media-root>/ScrapeFlow/补源/<root-job-id>/<attempt-id>`；内部 child 只投影到所属根任务。
 
 对账结果为 `uncertain` 的任务会停在 `needs_attention`，同时 `GET /api/jobs/:id` 的 `reconciliation.identity_candidates` 列出系统计算的候选身份（类型 / TMDB id / 片名 / 年份 / 置信度，最多 5 条）。用户唯一的回流动作是从候选中确认身份后，向 `POST /api/jobs/:id/retry` 提交 `{"tmdb_id": 123, "media_type": "movie|tv", "season": 1}`（电影不带 `season`），系统随即重新执行同一只读对账；该入口不接受货架、路径、链接或 Provider 指令。
 

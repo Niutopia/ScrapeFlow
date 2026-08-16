@@ -1920,48 +1920,62 @@ class SimpleEngineRunner:
         job_id: str | None = None,
     ) -> EngineJob:
         """Persist inbound ownership without starting formal processing."""
+        with self.worker_lock():
+            return self._create_pending_job_locked(source_path, job_id=job_id)
+
+    def _create_pending_job_locked(
+        self,
+        source_path: str,
+        *,
+        job_id: str | None = None,
+    ) -> EngineJob:
+        """Worker-lock-held helper for ``create_pending_job``.
+
+        The formal-write lock is a non-reentrant ``flock``: composition roots
+        that already hold it (``create_root_job``) must use this helper instead
+        of nesting a second lock acquisition.
+        """
         source = _safe_remote_path(source_path, field="source_path", allow_root=False)
         if is_production_test_media_path(source):
             raise EngineRequestError("生产 E2E 测试目录不能创建自动任务")
         # Intake polling and an explicit POST can arrive together.  Re-check
         # durable ownership under the existing process lock so neither caller
         # creates a second pending root for the same source.
-        with self.worker_lock():
-            existing = self.find_by_source(source)
-            if existing is not None:
-                return existing
-            identifier = job_id or f"engine-{uuid.uuid4().hex}"
-            _safe_job_id(identifier)
-            if self._job_path(identifier).exists():
-                raise SimpleEngineError(f"Engine job 已存在: {identifier}")
-            now = _now()
-            job = EngineJob(
-                id=identifier,
-                phase="awaiting_target_shelf",
-                created_at=now,
-                updated_at=now,
-                request={"source_path": source},
-                plan={},
-                summary={
-                    "automatic": True,
-                    "automatic_stage": "awaiting_target_shelf",
-                    "source_root": source,
-                    "ingress_source_path": source,
-                    "mode": "auto",
-                    "automatic_attempts": 0,
-                    "automatic_terminal": False,
-                    "next_retry_seconds": None,
-                    "reconciliation": {
-                        "status": "blocked_by_target_shelf",
-                        "outcome": None,
-                    },
+        existing = self.find_by_source(source)
+        if existing is not None:
+            return existing
+        identifier = job_id or f"engine-{uuid.uuid4().hex}"
+        _safe_job_id(identifier)
+        if self._job_path(identifier).exists():
+            raise SimpleEngineError(f"Engine job 已存在: {identifier}")
+        now = _now()
+        job = EngineJob(
+            id=identifier,
+            phase="awaiting_target_shelf",
+            created_at=now,
+            updated_at=now,
+            request={"source_path": source},
+            plan={},
+            summary={
+                "automatic": True,
+                "automatic_stage": "awaiting_target_shelf",
+                "source_root": source,
+                "ingress_source_path": source,
+                "mode": "auto",
+                "automatic_attempts": 0,
+                "automatic_terminal": False,
+                "next_retry_seconds": None,
+                "reconciliation": {
+                    "status": "blocked_by_target_shelf",
+                    "outcome": None,
                 },
-                target_shelf=None,
-                target_root=None,
-                selected_at=None,
-            )
-            atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
-            return job
+            },
+            target_shelf=None,
+            target_root=None,
+            selected_at=None,
+        )
+        atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
+        return job
 
     def create_automatic_job(
         self,
@@ -2006,25 +2020,25 @@ class SimpleEngineRunner:
     ) -> EngineJob:
         """Create or return the unique RootJob for an IntakeSource.
 
-        This is the Phase-1 entry point called when the user explicitly
-        creates a task from the intake catalog.  It guarantees that the same
-        ``source_id`` always maps to at most one ``EngineJob``:
+        This is the S-step entry point called when the user explicitly creates
+        a task from the intake catalog (source + shelf).  It guarantees that
+        the same ``source_id`` always maps to at most one ``EngineJob``:
 
         - If the intake catalog already records a ``root_task_id`` whose job
           record still exists, that job is returned without creating a new one.
-        - Otherwise a new ``EngineJob`` is created via ``create_pending_job()``
-          and the catalog is updated to record the association.
+        - Otherwise a new ``EngineJob`` is created under the worker lock and
+          the catalog is updated to record the association.
 
-        ``target_shelf`` is accepted but **not persisted** here — shelf
-        selection still goes through ``start_automatic_job()`` after the user
-        reviews the intake catalog entry.  This keeps the two-step
-        (discover → select shelf → reconcile) contract intact.
+        ``target_shelf`` is accepted for observability only; the shelf itself
+        is persisted by the caller through ``start_automatic_job()`` so the
+        create-and-authorize transition stays atomic to the user action.
         """
         from engine.scrapeflow.intake_source import (
             bind_root_task,
             find_by_source_id,
             load_intake_catalog,
             save_intake_catalog,
+            upsert_intake_source,
         )
         with self.worker_lock():
             catalog = load_intake_catalog(self.state_root)
@@ -2036,11 +2050,17 @@ class SimpleEngineRunner:
                 except (SimpleEngineError, FileNotFoundError):
                     pass  # Orphaned reference — create a fresh job below.
 
-            # create_pending_job already checks for duplicate source paths
-            # under the worker lock, so we can call it safely here.
-            job = self.create_pending_job(source_path)
+            # The worker lock is already held; create_pending_job would nest a
+            # second non-reentrant flock, so use the locked helper directly.
+            job = self._create_pending_job_locked(source_path)
 
-            # Persist the intake → root_task binding in the catalog.
+            # Persist the intake → root_task binding in the catalog.  A direct
+            # POST may arrive before the intake monitor ever scanned the
+            # source, so register the entry first when it is missing.
+            if intake is None:
+                catalog, intake = upsert_intake_source(
+                    catalog, source_path, present=True,
+                )
             try:
                 new_catalog, _ = bind_root_task(catalog, source_id, job.id)
                 save_intake_catalog(self.state_root, new_catalog)
