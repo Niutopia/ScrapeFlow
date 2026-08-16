@@ -5194,8 +5194,12 @@ class SimpleApplication:
             from local.scrapeflow_api.library_index import (
                 reconcile_root_work_units,
             )
+            from local.scrapeflow_api.unit_e_lanes import compute_known_gap_tokens
             reconcile_root_work_units(
                 runner.alist, runner.library_root, self.state_root, job_id,
+                known_gap_tokens_by_identity=compute_known_gap_tokens(
+                    self.state_root
+                ),
             )
         except Exception:
             pass  # Read-only refinement; the durable override already stands.
