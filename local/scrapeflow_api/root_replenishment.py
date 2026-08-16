@@ -680,6 +680,17 @@ def run_root_replenishment(
         )
 
         request["tier"] = tier
+        # Feed the durable per-tier candidate failures back as excluded
+        # locators so a Quark-rejected candidate is never re-submitted.
+        excluded = [
+            {"locator": locator}
+            for locator in (
+                (state.get("candidate_failures_by_provider") or {}).get(tier) or []
+            )
+            if isinstance(locator, str) and locator
+        ]
+        if excluded:
+            request["excluded_candidates"] = excluded
         _trace(f"select root={root_task_id} tier={tier} tmdb={tmdb_id} gaps={len(request.get('gaps') or [])}")
         try:
             bundle = gap_ledger_selection(

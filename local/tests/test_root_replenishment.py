@@ -574,6 +574,42 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(media["title"], "Fate/Zero")
             self.assertIn("Fate/Zero", media["aliases"])
 
+    def test_rejected_candidates_are_excluded_on_the_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(state_root)
+            seen: list[dict[str, Any]] = []
+
+            def search(request):
+                seen.append(dict(request))
+                return _magnet_search("S01E02")(request)
+
+            # First run: the materializer rejects the candidate; the locator
+            # must be remembered durably.
+            run_root_replenishment(
+                runner, state_root, "root-1",
+                search_runner=search,
+                materializer_factory=lambda tier: _FakeMaterializer(error=_CandidateError()),
+            )
+            state = load_root_replenishment_state(state_root, "root-1")
+            locators = (state.get("candidate_failures_by_provider") or {}).get("magnet") or []
+            self.assertIn("torrent:https://example.test/S01E02.torrent", locators)
+            # Second run: the failed locator arrives as an excluded candidate.
+            run_root_replenishment(
+                runner, state_root, "root-1",
+                search_runner=search,
+                materializer_factory=lambda tier: _FakeMaterializer(),
+            )
+            second = seen[-1]
+            excluded = [
+                row.get("locator")
+                for row in (second.get("excluded_candidates") or [])
+                if isinstance(row, dict)
+            ]
+            self.assertIn("torrent:https://example.test/S01E02.torrent", excluded)
+
     def test_subtitle_gaps_never_enter_the_video_tiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
