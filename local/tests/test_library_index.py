@@ -224,3 +224,29 @@ class LibraryIndexTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TitledMovieNfoTests(unittest.TestCase):
+    def test_index_recognises_titled_movie_nfo(self) -> None:
+        files = _sample_library()
+        files["/library/电影/Big Buck Bunny (2008)/大雄兔 (2008).nfo"] = _nfo_movie(
+            10378, "Big Buck Bunny", "2008",
+        )
+        files["/library/电影/Big Buck Bunny (2008)/大雄兔 (2008).mkv"] = b"v"
+        index = build_library_index(IndexAList(files), "/library")
+        entries = index.entries_for("movie", 10378)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].work_root, "/library/电影/Big Buck Bunny (2008)")
+        # The duplicate is then provable, not a fresh new_work.
+        decision = decide_reconciliation(
+            index, media_type="movie", tmdb_id=10378, unit_tokens=frozenset(),
+        )
+        self.assertEqual(decision.outcome, "duplicate_complete")
+
+    def test_episode_nfo_without_tmdbid_is_ignored(self) -> None:
+        files = _sample_library()
+        files["/library/番剧/Fate Zero/Season 01/番剧 - S01E01 - 试播.nfo"] = (
+            "<episodedetails><title>x</title></episodedetails>"
+        ).encode("utf-8")
+        index = build_library_index(IndexAList(files), "/library")
+        self.assertEqual(len(index.entries_for("tv", 35507)), 1)

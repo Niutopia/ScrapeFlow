@@ -157,6 +157,14 @@ def build_library_index(alist: object, media_root: str) -> LibraryIndex:
                     lowered = child_name.casefold()
                     if lowered in {"tvshow.nfo", "movie.nfo"}:
                         identity = _read_nfo_identity(alist, child_path)
+                    elif lowered.endswith(".nfo"):
+                        # The movie planner names the root NFO
+                        # "<title> (year).nfo"; recognise it by its XML root
+                        # (<movie>/<tvshow> with a tmdbid) instead of the
+                        # filename, and keep episode/special NFOs out.
+                        parsed = _read_nfo_identity(alist, child_path)
+                        if parsed is not None and parsed.get("tmdb_id"):
+                            identity = parsed
                     elif is_video_filename(child_name):
                         for season, episode in audit_episode_tokens(child_name):
                             tokens.add(f"S{season:02d}E{episode:02d}")
