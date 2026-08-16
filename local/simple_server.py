@@ -3753,8 +3753,10 @@ class SimpleApplication:
         if open_gaps <= 0:
             return
         if waiting == "retry_wait":
+            # Gentler cadence: Quark rate-limits bursty retries against the
+            # same account; a longer window lands clean requests more often.
             self._queue_root_replenishment(
-                root_task_id, delay=300.0, operator=operator,
+                root_task_id, delay=900.0, operator=operator,
             )
         elif waiting == "waiting_reconcile":
             self._queue_root_replenishment(
