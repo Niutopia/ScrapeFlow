@@ -23,7 +23,7 @@ from typing import Any, Mapping, Sequence
 from engine.scrapeflow.media_policy import is_video_filename
 from engine.scrapeflow.root_boundaries import load_source_snapshot
 from engine.scrapeflow.serialization import atomic_write_json
-from engine.scrapeflow.gap_ledger import discover_episode_gaps
+from engine.scrapeflow.gap_ledger import discover_episode_gaps, parse_gap_token
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.target_shelf import target_root_for_shelf
 from engine.scrapeflow.work_units import (
@@ -178,6 +178,7 @@ def load_work_acceptance(
 
 _ABSOLUTE_BRACKET_RE = re.compile(r"\[0*(\d{1,4})\]", re.IGNORECASE)
 _SE_TOKEN_RE = re.compile(r"S0*\d{1,3}E0*\d{1,4}", re.IGNORECASE)
+_BARE_SEASON_RE = re.compile(r"^S0*(\d{1,3})$", re.IGNORECASE)
 _LEADING_INDEX_RE = re.compile(r"^\d{1,3}[.、．\-]\s*")
 _BRACKET_GROUP_RE = re.compile(
     r"\[[^\]]*\]|【[^】]*】|"
@@ -473,9 +474,15 @@ def _register_unit_episode_gaps(
 ) -> list[Any]:
     """Register precise per-episode gaps after a successful write (J step).
 
-    Expected coordinates come from the official TMDB episode catalog; actual
-    coordinates from the executed plan's final names.  Failures are bounded:
-    a missing/unavailable catalog simply registers no gaps.
+    Expected coordinates come from the official TMDB episode catalog, but ONLY
+    for the seasons this unit actually owns: registering the whole-series
+    catalog from one season unit would turn every sibling unit's files into
+    phantom gaps.  Ownership is derived from the executed plan's own files
+    (video tokens and bare ``Sxx`` season rows) plus the durable identity
+    season.  When the plan does not enumerate videos (whole-directory moves),
+    actual coverage falls back to the B snapshot rows.  Seasons whose written
+    coverage cannot be proven are dropped (fail closed): the J step never
+    invents a missing coordinate it cannot verify.
     """
     identity = record.identity or {}
     if str(identity.get("media_type")) != "tv":
@@ -483,6 +490,51 @@ def _register_unit_episode_gaps(
     tmdb_id = identity.get("tmdb_id")
     if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
         return []
+
+    plan_files = [
+        item for item in (executed_plan.get("files") or [])
+        if isinstance(item, Mapping)
+    ]
+    owned: set[int] = set()
+    actual: list[str] = []
+    has_video_row = False
+    for item in plan_files:
+        name = str(item.get("final_name") or "")
+        if item.get("media_kind") == "video":
+            has_video_row = True
+            tokens = list(audit_episode_tokens(name))
+            actual.extend(f"S{season:02d}E{episode:02d}" for season, episode in tokens)
+            owned.update(season for season, _ in tokens)
+            continue
+        match = _BARE_SEASON_RE.match(name)
+        if match:
+            owned.add(int(match.group(1)))
+    season_hint = identity.get("season")
+    if isinstance(season_hint, int) and not isinstance(season_hint, bool) and season_hint > 0:
+        owned.add(season_hint)
+    if not owned:
+        # Fail closed: without provable season ownership nothing is registered.
+        return []
+    if not has_video_row:
+        # Whole-directory move plans do not enumerate videos; the B snapshot
+        # is the durable record of what this unit actually carried.
+        for row in _unit_video_rows(state_root, root_task_id, record):
+            name = str(row.get("name") or "")
+            for season, episode in audit_episode_tokens(name):
+                actual.append(f"S{season:02d}E{episode:02d}")
+                owned.add(season)
+    # Only register seasons whose coverage is provable: a season with zero
+    # parseable files is unverified, and registering it would recreate the
+    # phantom-gap failure (library-present files reported as missing).
+    verified_seasons: set[int] = set()
+    for token in actual:
+        coordinate = parse_gap_token(token)
+        if coordinate is not None:
+            verified_seasons.add(coordinate[0])
+    owned &= verified_seasons
+    if not owned:
+        return []
+
     try:
         catalog = TmdbEpisodeCatalog(runner.tmdb)
         expected = catalog({"tmdb_id": tmdb_id, "media_type": "tv"})
@@ -492,6 +544,8 @@ def _register_unit_episode_gaps(
         return []
     expected_by_season: dict[int, list[int]] = {}
     for season, rows in expected.items():
+        if season not in owned:
+            continue
         if not isinstance(season, int) or isinstance(season, bool) or not isinstance(rows, list):
             continue
         episodes = [
@@ -506,13 +560,6 @@ def _register_unit_episode_gaps(
             expected_by_season[season] = episodes
     if not expected_by_season:
         return []
-    actual: list[str] = []
-    for item in executed_plan.get("files") or []:
-        if not isinstance(item, Mapping) or item.get("media_kind") != "video":
-            continue
-        name = str(item.get("final_name") or "")
-        for season, episode in audit_episode_tokens(name):
-            actual.append(f"S{season:02d}E{episode:02d}")
     try:
         return discover_episode_gaps(
             state_root,

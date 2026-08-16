@@ -17,6 +17,7 @@ from engine.scrapeflow.work_units import load_work_unit_records
 from local.scrapeflow_api.library_index import reconcile_root_work_units
 from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
 from local.scrapeflow_api.unit_execution import (
+    _register_unit_episode_gaps,
     _request_for_unit,
     execute_new_work_units,
     load_work_acceptance,
@@ -287,6 +288,145 @@ class UnitExecutionTests(unittest.TestCase):
             {gap.gap_id.rsplit("::", 1)[1] for gap in gaps},
             {f"S01E{episode:02d}" for episode in range(2, 11)},
         )
+
+    def _record_for(self, state_root: Path, root_task_id: str, tmdb_id: int):
+        pending = self._record_runner.create_pending_job(
+            "/incoming/one", job_id=root_task_id,
+        )
+        self._record_runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            self._record_alist, "/incoming/one",
+            root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=tmdb_id,
+        )
+        return load_work_unit_records(state_root, root_task_id)[0]
+
+    def test_gap_registration_restricts_to_unit_owned_seasons(self) -> None:
+        files = {"/incoming/one/Fate Zero/S02E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _p, _e = self._setup(
+            files, tmdb=MultiSeasonTMDB(101, {1: 25, 2: 24}),
+        )
+        self._record_runner = runner
+        self._record_alist = alist
+        record = self._record_for(state_root, "root-owned", 101)
+        executed_plan = {
+            "files": [{
+                "final_name": "S02E01.mkv",
+                "media_kind": "video",
+                "target_dir": "/library/番剧/Work (101)",
+            }],
+            "target_root": "/library/番剧/Work (101)",
+        }
+        _register_unit_episode_gaps(
+            runner, state_root, "root-owned", record, executed_plan,
+        )
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        gaps = load_gap_ledger(state_root, "root-owned")
+        tokens = {gap.gap_id.rsplit("::", 1)[1] for gap in gaps}
+        # Only the unit's own season (S2) is registered; the sibling S1
+        # catalog rows must never become phantom gaps.
+        self.assertEqual(tokens, {f"S02E{e:02d}" for e in range(2, 25)})
+
+    def test_gap_registration_dedupes_across_units_of_one_series(self) -> None:
+        files = {"/incoming/one/Fate Zero/S02E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _p, _e = self._setup(
+            files, tmdb=MultiSeasonTMDB(101, {1: 25, 2: 24}),
+        )
+        self._record_runner = runner
+        self._record_alist = alist
+        first = self._record_for(state_root, "root-dedupe", 101)
+        plan = {
+            "files": [{
+                "final_name": "S02E01.mkv",
+                "media_kind": "video",
+                "target_dir": "/library/番剧/Work (101)",
+            }],
+            "target_root": "/library/番剧/Work (101)",
+        }
+        _register_unit_episode_gaps(runner, state_root, "root-dedupe", first, plan)
+        # A second unit of the same series registering the same season must
+        # not create duplicate open rows for the same coordinates.
+        second = replace_work_unit_record(first)
+        _register_unit_episode_gaps(runner, state_root, "root-dedupe", second, plan)
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        gaps = load_gap_ledger(state_root, "root-dedupe")
+        coordinates = [
+            (gap.season, list(gap.episodes)[0])
+            for gap in gaps
+            if gap.status == "open"
+        ]
+        self.assertEqual(len(coordinates), len(set(coordinates)))
+        self.assertEqual(len(gaps), 23)
+
+    def test_dir_move_plan_derives_coverage_from_the_snapshot(self) -> None:
+        files = {
+            "/incoming/one/Fate Zero/Season 01/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/one/Fate Zero/Season 02/S02E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _p, _e = self._setup(
+            files, tmdb=MultiSeasonTMDB(101, {1: 25, 2: 24}),
+        )
+        self._record_runner = runner
+        self._record_alist = alist
+        record = self._record_for(state_root, "root-dirmove", 101)
+        executed_plan = {
+            # Whole-directory move plans carry bare season rows, not videos.
+            "files": [
+                {"final_name": "S01", "media_kind": None, "target_dir": "/library/番剧/Work (101)"},
+                {"final_name": "S02", "media_kind": None, "target_dir": "/library/番剧/Work (101)"},
+            ],
+            "target_root": "/library/番剧/Work (101)",
+        }
+        _register_unit_episode_gaps(
+            runner, state_root, "root-dirmove", record, executed_plan,
+        )
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        tokens = {
+            gap.gap_id.rsplit("::", 1)[1]
+            for gap in load_gap_ledger(state_root, "root-dirmove")
+        }
+        self.assertEqual(
+            tokens,
+            {f"S01E{e:02d}" for e in range(2, 26)}
+            | {f"S02E{e:02d}" for e in range(2, 25)},
+        )
+
+    def test_unverifiable_season_registers_nothing(self) -> None:
+        files = {"/incoming/one/Fate Zero/[01] 第一集.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _p, _e = self._setup(
+            files, tmdb=MultiSeasonTMDB(101, {3: 24}),
+        )
+        self._record_runner = runner
+        self._record_alist = alist
+        record = self._record_for(state_root, "root-absolute", 101)
+        executed_plan = {
+            "files": [
+                {"final_name": "S03", "media_kind": None, "target_dir": "/library/番剧/Work (101)"},
+            ],
+            "target_root": "/library/番剧/Work (101)",
+        }
+        _register_unit_episode_gaps(
+            runner, state_root, "root-absolute", record, executed_plan,
+        )
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        # Absolute-number names cannot be verified against season coordinates:
+        # the J step must fail closed and register nothing.
+        self.assertEqual(load_gap_ledger(state_root, "root-absolute"), [])
+
+
+def replace_work_unit_record(record):
+    from dataclasses import replace as _replace
+    from engine.scrapeflow.work_units import WorkUnitRecord
+
+    return _replace(record, work_unit_id=f"{record.work_unit_id}-b")
 
 
 if __name__ == "__main__":

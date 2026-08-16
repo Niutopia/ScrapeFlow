@@ -598,6 +598,20 @@ def run_root_replenishment(
         if isinstance(key, str) and key
     }
 
+    # J/N discipline: close gaps the library already proves present before
+    # anything reaches the acquisition lane.  Phantom ledger rows (historical
+    # registration bugs) must never be searched, submitted or downloaded.
+    try:
+        from .gap_reaudit import reaudit_open_gaps
+        reaudit = reaudit_open_gaps(runner, state_root, root_task_id)
+        if reaudit.get("closed"):
+            _trace(
+                f"reaudit root={root_task_id} closed={len(reaudit['closed'])} "
+                f"kept={len(reaudit.get('kept_open') or [])}",
+            )
+    except Exception:
+        reaudit = {}
+
     requests = gap_ledger_requests(state_root, root_task_id)
     _trace(f"start root={root_task_id} tier={tier} requests={len(requests)}")
     if not requests:

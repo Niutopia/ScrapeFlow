@@ -249,6 +249,18 @@ def discover_episode_gaps(
         for gap in load_gap_ledger(state_root, root_task_id)
         if gap.work_unit_id == work_unit_id
     }
+    # A coordinate is a root-level fact: two units of the same series (e.g.
+    # the container unit and one season unit) must never each register the
+    # same (media_type, tmdb_id, season, episode) as separate open rows.
+    open_coordinates = {
+        (gap.media_type, gap.tmdb_id, gap.season, int(episode))
+        for gap in load_gap_ledger(state_root, root_task_id)
+        if gap.kind == "missing_episode"
+        and gap.status == "open"
+        and isinstance(gap.episodes, (list, tuple))
+        for episode in gap.episodes
+        if isinstance(episode, int) and not isinstance(episode, bool)
+    }
     missing: list[tuple[int, int]] = []
     for season, episodes in expected_by_season.items():
         if isinstance(season, bool) or not isinstance(season, int) or season < 0:
@@ -260,8 +272,11 @@ def discover_episode_gaps(
                 or episode <= 0
             ):
                 continue
-            if (season, episode) not in actual:
-                missing.append((season, episode))
+            if (season, episode) in actual:
+                continue
+            if (media_type, tmdb_id, season, episode) in open_coordinates:
+                continue
+            missing.append((season, episode))
     ledger = load_gap_ledger(state_root, root_task_id)
     for coordinate in missing:
         token = gap_token(*coordinate)
