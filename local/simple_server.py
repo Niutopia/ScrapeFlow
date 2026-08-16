@@ -3736,35 +3736,39 @@ class SimpleApplication:
                 runner, self.state_root, root_task_id,
                 pause_requested=self._pause_requested,
             )
-            waiting = result.get("waiting")
-            open_gaps = aggregate_root_job(self.state_root, root_task_id).open_gaps
-            if open_gaps <= 0:
-                return
-            if waiting == "retry_wait":
-                self._queue_root_replenishment(
-                    root_task_id, delay=300.0, operator=operator,
-                )
-            elif waiting == "waiting_reconcile":
-                self._queue_root_replenishment(
-                    root_task_id, delay=60.0, operator=operator,
-                )
-            elif result.get("tier") != result.get("tier_before"):
-                # The tier advanced without a wait: continue the ladder in
-                # the same session.  No advance means candidate failures or
-                # exhaustion — both stop here (bounded, loop-free).
-                self._queue_root_replenishment(
-                    root_task_id, delay=5.0, operator=operator,
-                )
-            # waiting is None with open gaps = tier exhaustion: manual
-            # operator trigger only, no automatic re-arm loop.
         except Exception:
             # Transient server-side failure: fail closed without legacy
             # summary mirrors; the operator trigger remains available.  Keep
             # the traceback visible in the container log for live diagnosis.
             import traceback
             traceback.print_exc()
+            return
         finally:
+            # Release the dedupe slot BEFORE any re-queue below, or the
+            # queue would see this very future and skip the continuation.
             self._provider_futures.pop(root_task_id, None)
+
+        waiting = result.get("waiting")
+        open_gaps = aggregate_root_job(self.state_root, root_task_id).open_gaps
+        if open_gaps <= 0:
+            return
+        if waiting == "retry_wait":
+            self._queue_root_replenishment(
+                root_task_id, delay=300.0, operator=operator,
+            )
+        elif waiting == "waiting_reconcile":
+            self._queue_root_replenishment(
+                root_task_id, delay=60.0, operator=operator,
+            )
+        elif result.get("tier") != result.get("tier_before"):
+            # The tier advanced without a wait: continue the ladder in the
+            # same session.  No advance means candidate failures or
+            # exhaustion — both stop here (bounded, loop-free).
+            self._queue_root_replenishment(
+                root_task_id, delay=5.0, operator=operator,
+            )
+        # waiting is None with open gaps = tier exhaustion: manual
+        # operator trigger only, no automatic re-arm loop.
 
     def replenishment_view(self, job_id: str) -> dict[str, object]:
         """Read-only P14 preview: aggregate, tier state and bridged requests."""
