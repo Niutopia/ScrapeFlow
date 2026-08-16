@@ -5120,6 +5120,21 @@ class SimpleEngineRunner:
                 )
             except Exception:
                 pass  # Advisory in P4; P6 planning will consume the ledger.
+            # D step: three-shelf reconciliation per confirmed WorkUnit.  The
+            # index spans 电影/番剧/美剧, so an existing work in another shelf
+            # is inherited instead of duplicated (contract rule D).
+            try:
+                from local.scrapeflow_api.library_index import (
+                    reconcile_root_work_units,
+                )
+                reconcile_root_work_units(
+                    self.alist,
+                    self.library_root,
+                    self.state_root,
+                    job_id,
+                )
+            except Exception:
+                pass  # Advisory in P5; P6 planning will consume the ledger.
             try:
                 _pause_checkpoint(effective_pause)
             except EnginePauseRequested:
