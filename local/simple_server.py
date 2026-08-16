@@ -5205,8 +5205,10 @@ class SimpleApplication:
             pass  # Read-only refinement; the durable override already stands.
         # Re-dispatch the root through the unit pipeline when running; the
         # durable override alone does not trigger execution while paused.
+        # Immediate dispatch (no timer hop) so the override is never left
+        # parked behind a lost scheduling edge.
         if self.control().get("paused") is not True:
-            self._queue_automatic_job(job_id, delay=0.5)
+            self._queue_automatic_job(job_id)
         return public_work_unit_row(unit, self.state_root, job_id)
 
     def engine_jobs(self) -> list[EngineJob]:
@@ -5560,6 +5562,22 @@ class SimpleApplication:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
         if not isinstance(payload, Mapping):
             raise EngineRequestError("重试请求必须是 JSON 对象")
+        from local.scrapeflow_api.root_pipeline import is_intake_bound_root
+        if is_intake_bound_root(self.state_root, job_id) and engine_job.phase not in {
+            "queued", "reconciliation_uncertain", "retry_wait",
+        }:
+            # P11: reopen a parked intake-bound root into the unit pipeline.
+            # The legacy failure/identity/reconciliation machinery never
+            # applies to new-path roots; run it before those branches.
+            retried = replace(
+                engine_job,
+                phase="queued",
+                error=None,
+                updated_at=_now(),
+            )
+            retried = self._persist_retry_transition(engine_job, retried)
+            self._queue_automatic_job(job_id)
+            return self.public_engine_job(retried)
         # duplicate_complete cleanup has no target-shelf or formal-write
         # selection.  Handle its narrow failed-cleanup lane before the
         # ordinary selection gates; an empty request only re-enters the same
@@ -5753,22 +5771,6 @@ class SimpleApplication:
                 retried = replace(engine_job, summary=summary, updated_at=_now(), error=None)
                 retried = self._persist_retry_transition(engine_job, retried)
                 self._queue_provider_job(job_id)
-                return self.public_engine_job(retried)
-            from local.scrapeflow_api.root_pipeline import is_intake_bound_root
-            if is_intake_bound_root(self.state_root, job_id) and engine_job.phase not in {
-                "queued", "reconciliation_uncertain", "retry_wait",
-            }:
-                # P11: reopen a parked intake-bound root into the unit
-                # pipeline.  The legacy failure/identity machinery never
-                # applies to new-path roots.
-                retried = replace(
-                    engine_job,
-                    phase="queued",
-                    error=None,
-                    updated_at=_now(),
-                )
-                retried = self._persist_retry_transition(engine_job, retried)
-                self._queue_automatic_job(job_id)
                 return self.public_engine_job(retried)
             if self._is_terminal_automatic_failure(engine_job):
                 summary = dict(engine_job.summary)
