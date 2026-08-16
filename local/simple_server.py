@@ -3741,9 +3741,20 @@ class SimpleApplication:
             if open_gaps <= 0:
                 return
             if waiting == "retry_wait":
-                self._queue_root_replenishment(root_task_id, delay=300.0)
+                self._queue_root_replenishment(
+                    root_task_id, delay=300.0, operator=operator,
+                )
             elif waiting == "waiting_reconcile":
-                self._queue_root_replenishment(root_task_id, delay=60.0)
+                self._queue_root_replenishment(
+                    root_task_id, delay=60.0, operator=operator,
+                )
+            elif result.get("tier") != result.get("tier_before"):
+                # The tier advanced without a wait: continue the ladder in
+                # the same session.  No advance means candidate failures or
+                # exhaustion — both stop here (bounded, loop-free).
+                self._queue_root_replenishment(
+                    root_task_id, delay=5.0, operator=operator,
+                )
             # waiting is None with open gaps = tier exhaustion: manual
             # operator trigger only, no automatic re-arm loop.
         except Exception:

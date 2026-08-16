@@ -508,6 +508,7 @@ def _append_attempt_log(
 def _noop_result(state: dict[str, Any], tier: str) -> dict[str, Any]:
     return {
         "tier": tier,
+        "tier_before": tier,
         "requests_built": 0,
         "attempts": [],
         "gaps_closed": [],
@@ -640,13 +641,17 @@ def run_root_replenishment(
             filtered.append(copied)
     requests = filtered
     if not requests:
+        # Every remaining gap is in-flight or subtitle-channel-owned: nothing
+        # for the three video tiers to do.  Not a wait state — waiting must
+        # stay None so the caller does not re-queue a pointless loop.
         return {
             "tier": tier,
+            "tier_before": tier,
             "requests_built": 0,
             "attempts": [],
             "gaps_closed": [],
             "state": state,
-            "waiting": state.get("waiting") or "waiting_reconcile",
+            "waiting": None,
         }
 
     requests_built = len(requests)
@@ -982,6 +987,7 @@ def run_root_replenishment(
 
     return {
         "tier": str(state.get("tier") or tier),
+        "tier_before": tier,
         "requests_built": requests_built,
         "attempts": attempts,
         "gaps_closed": gaps_closed,
