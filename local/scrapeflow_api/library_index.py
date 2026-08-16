@@ -133,8 +133,13 @@ def build_library_index(alist: object, media_root: str) -> LibraryIndex:
                 directory_count += 1
                 if directory_count > MAX_WORK_DIRECTORIES:
                     raise ValueError(f"作品目录深度/数量超过索引上限: {work_root}")
+                # Only the three shelf roots refresh; the nested walk uses
+                # cached listings.  A per-directory refresh on a large Quark
+                # library turns the D step into tens of minutes of re-syncs,
+                # and the inner NFO/episode facts are written by the single
+                # writer with its own fresh readback.
                 try:
-                    items = listing(current, refresh=True)
+                    items = listing(current)
                 except TypeError:
                     items = listing(current)
                 if not isinstance(items, list):
