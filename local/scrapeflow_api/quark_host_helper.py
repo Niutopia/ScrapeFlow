@@ -1233,22 +1233,30 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             if entry is not None and entry[0] > now:
                 parent = entry[1]
                 continue
-            listing = await self._call_fixed(
-                origin=QUARK_DRIVE_API,
-                path="/file/sort",
-                method="GET",
-                query={
-                    "pdir_fid": parent, "_page": 1, "_size": 20,
-                    "_fetch_total": 1,
-                },
-            )
-            data = listing.get("data")
-            rows = data.get("list") if isinstance(data, Mapping) else None
-            matches = [
-                row for row in rows if isinstance(row, Mapping)
-                and row.get("file_name") == component and row.get("file") is False
-                and isinstance(row.get("fid"), str) and row.get("fid")
-            ] if isinstance(rows, list) else []
+            matches: list[Mapping[str, object]] = []
+            for attempt in range(3):
+                listing = await self._call_fixed(
+                    origin=QUARK_DRIVE_API,
+                    path="/file/sort",
+                    method="GET",
+                    query={
+                        "pdir_fid": parent, "_page": 1, "_size": 20,
+                        "_fetch_total": 1,
+                    },
+                )
+                data = listing.get("data")
+                rows = data.get("list") if isinstance(data, Mapping) else None
+                matches = [
+                    row for row in rows if isinstance(row, Mapping)
+                    and row.get("file_name") == component and row.get("file") is False
+                    and isinstance(row.get("fid"), str) and row.get("fid")
+                ] if isinstance(rows, list) else []
+                if matches:
+                    break
+                if attempt < 2:
+                    # A just-mkdir'd staging folder may not be visible to
+                    # listings yet; bounded visibility retries are read-only.
+                    await asyncio.sleep(3.0)
             if len(matches) != 1:
                 raise QuarkHelperNotReady("task staging folder is not uniquely available in Quark")
             parent = str(matches[0]["fid"])
