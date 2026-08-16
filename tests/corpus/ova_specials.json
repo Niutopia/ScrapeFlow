@@ -1,0 +1,30 @@
+{
+  "root": "/quark/影视/待刮削/某TV动画",
+  "children": [
+    {
+      "name": "S01E01.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "S01E02.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "S00E01.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "SP02.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "OVA 03.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    }
+  ]
+}

@@ -1,13 +1,248 @@
-"""Dependency-free same-origin Web dashboard for the local ScrapeFlow API."""
+"""Dependency-free same-origin Web dashboard for the local ScrapeFlow API.
+
+Visual language follows the Media Engine v4 mock (dark industrial palette,
+sidebar navigation, task rows with progress, modal-based task creation).
+All functionality stays inline: no external assets, no new API surface.
+"""
 
 DASHBOARD_HTML = r'''<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>ScrapeFlow 控制台</title>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ScrapeFlow</title>
 <style>
-:root{--bg:#f5f7fa;--panel:#fff;--soft:#f1f4f8;--text:#18212f;--muted:#687487;--line:#dfe5ec;--brand:#3158d4;--brand-soft:#e9eeff;--ok:#18875b;--warn:#b36508;--bad:#c23b3b;--shadow:0 12px 30px rgba(35,48,73,.08);--radius:18px}*{box-sizing:border-box}html{font-size:15px}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,"SF Pro Text","PingFang SC",system-ui,sans-serif}.app{min-height:100vh}.topbar{height:72px;background:rgba(255,255,255,.9);border-bottom:1px solid var(--line);backdrop-filter:blur(16px);position:sticky;top:0;z-index:5}.topbar-inner{max-width:1180px;height:100%;margin:auto;padding:0 28px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:12px;font-weight:720;font-size:18px;letter-spacing:-.02em}.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(145deg,#243e9e,#5d7eff);display:grid;place-items:center;color:white;box-shadow:0 6px 15px #3158d43d}.logo svg{width:19px}.top-actions{display:flex;align-items:center;gap:10px}.health{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px;margin-right:8px}.dot{width:8px;height:8px;border-radius:50%;background:#a4acb8}.dot.ok{background:var(--ok);box-shadow:0 0 0 4px #18875b18}.btn{appearance:none;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:11px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:.15s}.btn:hover{border-color:#b8c2cf;background:var(--soft)}.btn:focus-visible,.tab:focus-visible{outline:3px solid #3158d433;outline-offset:2px}.btn svg{width:16px}.btn.primary{background:var(--brand);border-color:var(--brand);color:white}.btn.primary:hover{background:#294bb7}.btn.danger{color:var(--bad)}button:disabled{opacity:.55;cursor:wait}.main{max-width:1180px;margin:auto;padding:42px 28px 80px}.intro{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;margin-bottom:30px}.intro h1{font-size:30px;letter-spacing:-.04em;margin:0 0 7px}.intro p{margin:0;color:var(--muted)}.summary{display:flex;gap:24px}.metric{min-width:90px}.metric strong{display:block;font-size:26px;line-height:1;font-variant-numeric:tabular-nums}.metric span{display:block;color:var(--muted);font-size:12px;margin-top:7px}.focus{background:linear-gradient(135deg,#fff 35%,#f2f5ff);border:1px solid #d8e0fa;border-radius:22px;padding:25px;margin-bottom:26px;box-shadow:var(--shadow)}.focus-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:19px}.eyebrow{font-size:12px;color:var(--brand);font-weight:750;letter-spacing:.08em;text-transform:uppercase}.focus h2{margin:3px 0 0;font-size:20px}.count{background:var(--brand-soft);color:var(--brand);font-weight:700;padding:5px 10px;border-radius:999px;font-size:12px}.waiting-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.waiting-card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:18px}.job-title{font-weight:680;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.job-path{font-size:12px;color:var(--muted);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.choose-label{margin:17px 0 9px;font-size:12px;color:var(--muted)}.shelves{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.shelf{border:1px solid var(--line);background:var(--soft);color:var(--text);border-radius:10px;padding:10px 8px;font:inherit;font-weight:650;cursor:pointer}.shelf:hover{border-color:var(--brand);background:var(--brand-soft);color:var(--brand)}.empty-waiting{padding:27px;text-align:center;border:1px dashed #cad3df;border-radius:14px;color:var(--muted)}.empty-waiting svg{width:30px;color:var(--ok);display:block;margin:0 auto 9px}.workspace{background:var(--panel);border:1px solid var(--line);border-radius:22px;overflow:hidden}.workspace-head{padding:20px 22px 0;border-bottom:1px solid var(--line)}.workspace-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.workspace h2{font-size:18px;margin:0}.tabs{display:flex;gap:24px}.tab{appearance:none;border:0;border-bottom:2px solid transparent;background:none;padding:0 1px 12px;color:var(--muted);font:inherit;font-weight:650;cursor:pointer}.tab.active{color:var(--brand);border-color:var(--brand)}.job-list{min-height:180px}.row{display:grid;grid-template-columns:minmax(0,1fr) 160px 130px;align-items:center;gap:20px;padding:17px 22px;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.status-pill{justify-self:start;padding:5px 9px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:12px}.status-pill.running{background:#eaf7f1;color:var(--ok)}.status-pill.failed{background:#fff0f0;color:var(--bad)}.time{color:var(--muted);font-size:12px;text-align:right}.row-error{color:var(--bad);font-size:12px;margin-top:5px}.list-empty{text-align:center;padding:50px;color:var(--muted)}.toast{position:fixed;right:24px;bottom:24px;max-width:380px;background:#202937;color:white;border-radius:12px;padding:13px 17px;box-shadow:0 12px 35px #0003;display:none;z-index:10}.toast.bad{background:#8f2f2f}.skeleton{height:150px;border-radius:15px;background:linear-gradient(90deg,var(--soft),#fafbfc,var(--soft));background-size:200% 100%;animation:shimmer 1.3s infinite}@keyframes shimmer{to{background-position:-200% 0}}@media(prefers-color-scheme:dark){:root{--bg:#101318;--panel:#181c23;--soft:#222832;--text:#edf1f7;--muted:#99a4b4;--line:#2c3440;--brand:#8ca5ff;--brand-soft:#26345d;--shadow:none}.topbar{background:rgba(24,28,35,.9)}.focus{background:linear-gradient(135deg,#181c23,#1c2333);border-color:#354261}.status-pill.running{background:#16392d}.status-pill.failed{background:#402426}.skeleton{background:linear-gradient(90deg,var(--soft),#2a3039,var(--soft));background-size:200% 100%}}@media(max-width:760px){.topbar-inner,.main{padding-left:17px;padding-right:17px}.topbar{height:64px}.health span{display:none}.intro{display:block;margin-bottom:22px}.summary{margin-top:23px;justify-content:space-between}.metric{min-width:0}.focus{padding:18px}.waiting-grid{grid-template-columns:1fr}.shelves{grid-template-columns:1fr}.row{grid-template-columns:1fr auto;gap:8px 14px}.row .status-pill{grid-column:2;grid-row:1}.time{grid-column:1/-1;text-align:left}.tabs{gap:17px;overflow:auto}.btn-label{display:none}}
-</style></head><body><div class="app"><header class="topbar"><div class="topbar-inner"><div class="brand"><span class="logo"><svg viewBox="0 0 24 24" fill="none"><path d="M5 7.5 12 3l7 4.5v9L12 21l-7-4.5v-9Z" stroke="currentColor" stroke-width="1.8"/><path d="m8.5 10 3.5 2 3.5-2M12 12v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>ScrapeFlow</div><div class="top-actions"><span class="health"><i id="healthDot" class="dot"></i><span id="healthText">连接中</span></span><button id="refresh" class="btn" aria-label="刷新任务"><svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="btn-label">刷新</span></button><button id="control" class="btn primary">载入中</button></div></div></header><main class="main"><section class="intro"><div><h1>媒体整理控制台</h1><p>确认入站内容的一级货架，其余流程由系统自动完成。</p></div><div id="summary" class="summary"></div></section><section class="focus"><div class="focus-head"><div><span class="eyebrow">需要处理</span><h2>等待选择货架</h2></div><span id="waitingCount" class="count">0 个任务</span></div><div id="waiting" class="waiting-grid"><div class="skeleton"></div><div class="skeleton"></div></div></section><section class="focus"><div class="focus-head"><div><span class="eyebrow">待刮削</span><h2>创建任务</h2></div><span id="intakeCount" class="count">0 个来源</span></div><div id="intake" class="waiting-grid"><div class="skeleton"></div><div class="skeleton"></div></div></section><section class="focus"><div class="focus-head"><div><span class="eyebrow">需要处理</span><h2>需要确认</h2></div><span id="confirmCount" class="count">0 个单元</span></div><div id="confirm" class="waiting-grid"><div class="skeleton"></div><div class="skeleton"></div></div></section><section class="workspace"><div class="workspace-head"><div class="workspace-title"><h2>任务记录</h2></div><div class="tabs" role="tablist"><button class="tab active" data-tab="active" role="tab">进行中</button><button class="tab" data-tab="attention" role="tab">需要关注</button><button class="tab" data-tab="history" role="tab">历史记录</button><button class="tab" data-tab="all" role="tab">全部</button></div></div><div id="jobList" class="job-list"><div class="list-empty">正在载入任务…</div></div></section></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div>
+:root{
+  --bg:#171714;--side:#1a1a17;--panel:#1f1f1b;--panel2:#24231f;--line:#35332d;
+  --text:#ece8de;--muted:#8a867e;--faint:#5e5b55;--accent:#d36b47;--ok:#8da379;--warn:#d0a05b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+button,input{font:inherit}
+button{color:inherit}
+body{overflow:hidden}
+.app{height:100vh;display:grid;grid-template-columns:190px minmax(0,1fr);grid-template-rows:46px minmax(0,1fr)}
+.top{grid-column:1/3;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:#191916}
+.brand{display:flex;align-items:center;gap:9px}
+.mark{width:14px;height:14px;border:2px solid var(--accent);border-left-width:5px}
+.brand strong{font-size:12px}.brand span{font-size:10px;color:var(--faint)}
+.top-actions{display:flex;align-items:center;gap:8px}
+.health{font-size:9px;color:#77736b;display:flex;align-items:center;gap:6px}
+.health i{width:6px;height:6px;border-radius:50%;background:#656159}
+.health i.ok{background:var(--ok)}
+.sidebar{grid-row:2;background:var(--side);border-right:1px solid var(--line);padding:15px 10px;position:relative}
+.side-title{font-size:8.5px;color:#5f5b54;text-transform:uppercase;letter-spacing:.12em;padding:0 8px 6px;margin-top:5px}
+.nav{height:32px;width:100%;border:0;background:transparent;text-align:left;padding:0 8px;display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:6px;color:#918d84;font-size:10.5px;cursor:pointer;border-left:2px solid transparent}
+.nav:hover{background:#22211e}
+.nav.active{background:#27251f;color:#f0ece2;border-left-color:var(--accent)}
+.nav em{font-style:normal;font-size:8.5px;color:#66625b}
+.spacer{height:14px}
+.side-bottom{position:absolute;bottom:14px;left:10px;right:10px}
+.main{grid-column:2;grid-row:2;overflow:auto;background:#1c1c19}
+.page{max-width:980px;margin:0 auto;padding:34px 34px 60px}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:26px}
+.page-head h1{font-size:25px;margin:0 0 7px;font-weight:650;letter-spacing:-.035em}
+.page-head p{margin:0;color:#77736b;font-size:10.5px}
+.btn{height:30px;border:1px solid #454138;background:#22211d;color:#b9b4aa;padding:0 11px;font-size:9.5px;cursor:pointer}
+.btn:hover{background:#292722}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1b1714;font-weight:650}
+.btn.danger{color:#d89b76;border-color:#5a3b2f}
+.btn:disabled{opacity:.5;cursor:wait}
+.summary-line{display:flex;gap:22px;margin-bottom:22px;color:#77736b;font-size:9.5px}
+.summary-line b{color:#cbc6bb;font-weight:600}
+.summary-line .warn{color:var(--warn)}
+.section{margin-bottom:26px}
+.section-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.section-title h2{font-size:11px;margin:0;color:#8a867e;font-weight:600;letter-spacing:.04em}
+.section-title span{font-size:8.5px;color:#5f5b54}
+.task-list{border-top:1px solid var(--line)}
+.task{display:grid;grid-template-columns:minmax(0,1fr) 130px 90px;gap:16px;align-items:center;min-height:78px;border-bottom:1px solid var(--line);padding:0 4px}
+.task:hover{background:#20201c}
+.task-main strong{font-size:13px;font-weight:600;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task-main p{font-size:9px;color:#66625b;margin:5px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task-progress{height:2px;background:#34322c;margin-top:10px;max-width:460px}
+.task-progress i{display:block;height:100%;background:var(--accent)}
+.task-meta{font-size:9px;color:#77736b;line-height:1.7}
+.task-state{text-align:right;font-size:9.5px}
+.run{color:#aaa69d}.done{color:var(--ok)}.attention{color:var(--warn)}.row-error{color:#c46a4a;font-size:8.5px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.notice{margin-top:14px;border-left:2px solid var(--warn);background:#231f19;padding:11px 13px;display:flex;align-items:center;justify-content:space-between;gap:14px}
+.notice strong{font-size:9.5px;color:#caa46d}
+.notice p{font-size:8.8px;color:#776958;margin:4px 0 0}
+.notice button{border:0;background:transparent;color:#d89b76;font-size:9px;cursor:pointer}
+.waiting-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);padding:13px 14px}
+.card strong{display:block;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card small{display:block;font-size:8.5px;color:#615e57;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.choicebox{border:1px solid var(--line);margin-top:12px}
+.choice{min-height:48px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:17px 1fr;align-items:center;padding:0 10px;cursor:pointer}
+.choice:last-child{border-bottom:0}
+.choice.active{background:#29261f}
+.choice i{width:9px;height:9px;border-radius:50%;border:1px solid #5d5952}
+.choice.active i{border:3px solid var(--accent)}
+.choice b{display:block;font-size:9.8px}
+.choice small{display:block;font-size:8.2px;color:#66625b;margin-top:3px}
+.segment{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);margin-top:9px}
+.segment button{height:28px;border:0;border-right:1px solid var(--line);background:#1a1a17;color:#77736b;font-size:9px;cursor:pointer}
+.segment button:last-child{border:0}
+.segment button.active{background:#33251f;color:#efb294}
+.choose-label{font-size:8.5px;color:#67635c;margin:12px 0 8px}
+.empty{padding:24px;text-align:center;border:1px dashed #35332d;color:#5e5b55;font-size:9px}
+.modalback{position:fixed;inset:0;background:rgba(10,10,8,.72);display:none;align-items:center;justify-content:center;z-index:30}
+.modalback.show{display:flex}
+.modal{width:min(520px,calc(100vw - 32px));background:#1e1e1a;border:1px solid #464239}
+.modal-head{height:44px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 13px}
+.modal-head strong{font-size:11px}
+.close{border:0;background:transparent;color:#747068;font-size:17px;cursor:pointer}
+.modal-body{padding:13px;max-height:64vh;overflow:auto}
+.label{font-size:8.5px;color:#67635c;margin-bottom:7px}
+.dirlist{border:1px solid var(--line)}
+.dir{width:100%;min-height:44px;border:0;border-bottom:1px solid var(--line);background:#1b1b18;display:grid;grid-template-columns:18px 1fr auto;align-items:center;text-align:left;padding:0 10px;color:#9a968d;cursor:pointer}
+.dir:last-child{border-bottom:0}
+.dir.active{background:#29261f}
+.dir b{display:block;font-size:9.8px;color:#cac5bb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dir small{display:block;font-size:8.2px;color:#5e5a53;margin-top:3px}
+.dir em{font-style:normal;color:var(--accent);font-size:9px}
+.modal-foot{height:47px;border-top:1px solid var(--line);display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:0 13px}
+.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,8px);background:#e7e1d7;color:#171714;padding:8px 11px;font-size:9px;opacity:0;transition:.2s;z-index:50;max-width:80vw}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.bad{background:#5a2c22;color:#f0d9cf}
+@media(max-width:760px){
+  body{overflow:auto}
+  .app{display:block;height:auto}
+  .top{position:sticky;top:0;z-index:10}
+  .sidebar{display:none}
+  .main{overflow:visible}
+  .page{padding:28px 18px 50px}
+  .task{grid-template-columns:1fr 90px}
+  .task-meta{display:none}
+  .waiting-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><div class="mark"></div><strong>ScrapeFlow</strong><span>影视整理</span></div>
+    <div class="top-actions">
+      <span class="health"><i id="healthDot"></i><span id="healthText">连接中</span></span>
+      <button id="refresh" class="btn">刷新</button>
+      <button id="control" class="btn primary">载入中</button>
+    </div>
+  </header>
+
+  <aside class="sidebar">
+    <div class="side-title">任务</div>
+    <button class="nav active" data-tab="active"><span>▸</span><span>进行中</span><em id="countActive">0</em></button>
+    <button class="nav" data-tab="attention"><span>!</span><span>需要关注</span><em id="countAttention">0</em></button>
+    <button class="nav" data-tab="history"><span>✓</span><span>历史记录</span><em id="countHistory">0</em></button>
+    <button class="nav" data-tab="all"><span>▤</span><span>全部</span><em id="countAll">0</em></button>
+
+    <div class="spacer"></div>
+    <div class="side-title">媒体</div>
+    <button class="nav" id="openCreate"><span>＋</span><span>创建任务</span></button>
+    <button class="nav" data-tab="waiting"><span>▣</span><span>等待选择货架</span><em id="countWaiting">0</em></button>
+
+    <div class="side-bottom">
+      <button class="nav" id="sideControl"><span>⚙</span><span>运行控制</span></button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="page">
+      <div class="page-head">
+        <div>
+          <h1>任务</h1>
+          <p>资源放进待刮削，选择来源与货架建立任务，其余交给系统。</p>
+        </div>
+        <div class="top-actions">
+          <button class="btn" id="topRefresh">刷新</button>
+          <button class="btn primary" id="topCreate">＋ 创建任务</button>
+        </div>
+      </div>
+
+      <div class="summary-line" id="summary">
+        <span><b id="sumWaiting">0</b> 等待选择</span>
+        <span><b id="sumActive">0</b> 处理中</span>
+        <span><b class="warn" id="sumIssues">0</b> 需要关注</span>
+      </div>
+
+      <div class="section" id="waitingSection">
+        <div class="section-title"><h2>等待选择货架</h2><span id="waitingCount">0 个任务</span></div>
+        <div id="waiting" class="waiting-grid"><div class="empty">载入中…</div></div>
+      </div>
+
+      <div class="section" id="confirmSection">
+        <div class="section-title"><h2>需要确认</h2><span id="confirmCount">0 个单元</span></div>
+        <div id="confirm" class="waiting-grid"><div class="empty">载入中…</div></div>
+      </div>
+
+      <div class="section" id="workspaceSection">
+        <div class="section-title"><h2>任务记录</h2><span id="jobCount">0 个任务</span></div>
+        <div id="jobList" class="task-list"><div class="empty">正在载入任务…</div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="modalback" id="createModal">
+  <div class="modal">
+    <div class="modal-head"><strong>创建任务</strong><button class="close" data-close="createModal">×</button></div>
+    <div class="modal-body">
+      <div class="label">选择待刮削目录</div>
+      <div class="dirlist" id="intakeList"><div class="empty">正在载入来源…</div></div>
+      <div class="choose-label">这个来源整理到哪里？</div>
+      <div class="segment" id="shelfSegment">
+        <button data-shelf-segment="movie">电影</button>
+        <button data-shelf-segment="anime" class="active">番剧</button>
+        <button data-shelf-segment="us_tv">美剧</button>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close="createModal">取消</button>
+      <button class="btn primary" id="confirmCreate">建立任务</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
 <script>
-const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let jobs=[],intakeSources=[],unitViews={},paused=true,busy=false,currentTab='active';const shelfLabels={movie:'电影',anime:'番剧',us_tv:'美剧'},terminal=new Set(['completed','executed','cancelled']),attention=new Set(['failed','failed_cleanup','failed_identity','reconciliation_uncertain','target_policy_conflict']);async function api(path,opt){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt}),d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||`请求失败 (${r.status})`);return d}function toast(msg,bad=false){const n=$('#toast');n.textContent=msg;n.className='toast'+(bad?' bad':'');n.style.display='block';clearTimeout(n.timer);n.timer=setTimeout(()=>n.style.display='none',3500)}function title(j){const raw=j.source||j.summary?.source_root||j.id;return String(raw).split('/').filter(Boolean).pop()||j.id}function phaseLabel(p){return({queued:'已排队',reconciling:'正在对账',archive_preprocessing:'归档预处理',identity_matching:'识别内容',planning:'生成计划',executing:'正在写入',completed:'已完成',executed:'已执行',cancelled:'已取消',failed:'失败',failed_cleanup:'清理失败',failed_identity:'识别失败',reconciliation_uncertain:'对账不确定',target_policy_conflict:'货架冲突',retry_wait:'等待重试'}[p]||p)}function intakeCard(s){const counts=`${s.child_count==null?'—':s.child_count} 个子目录 · ${s.file_count==null?'—':s.file_count} 个文件`;const state=s.root_task_id?`<div class="choose-label">已创建任务${s.root_job_target_shelf?'（'+((shelfLabels[s.root_job_target_shelf])||s.root_job_target_shelf)+'）':''}：${esc(s.root_job_phase?phaseLabel(s.root_job_phase):s.root_task_id)}</div>`:`<div class="choose-label">这个来源整理到哪里？</div><div class="shelves">${['movie','anime','us_tv'].map(x=>`<button class="shelf" data-source="${esc(s.canonical_path)}" data-shelf="${x}">${shelfLabels[x]}</button>`).join('')}</div>`;return `<article class="waiting-card"><div class="job-title" title="${esc(s.canonical_path)}">${esc(s.display_name||s.canonical_path)}</div><div class="job-path">${esc(s.canonical_path)}</div><div class="job-path">${counts}</div>${state}</article>`}function confirmCard(job,unit){const cands=(unit.candidate_identities||[]).map(c=>`<button class="shelf" data-confirm="1" data-job="${esc(job.id)}" data-unit="${esc(unit.work_unit_id)}" data-tmdb="${esc(c.tmdb_id)}" data-type="${esc(c.media_type)}">${esc(c.media_type)}/${esc(c.tmdb_id)} ${esc(c.title||'')} (${esc(c.year||'')})</button>`).join('');return `<article class="waiting-card"><div class="job-title" title="${esc(unit.boundary_key||'')}">${esc(unit.display_label||unit.boundary_key)}</div><div class="job-path">${esc(job.source||job.id)}</div><div class="choose-label">识别不确定，请确认正确身份：</div><div class="shelves">${cands||'<span class="job-path">无可选候选</span>'}</div></article>`}function renderConfirm(){const rows=[];for(const j of jobs){const view=unitViews[j.id];if(!view)continue;for(const u of view.units||[]){if(u.identity_status==='uncertain'&&(u.candidate_identities||[]).length)rows.push(confirmCard(j,u))}}$('#confirmCount').textContent=`${rows.length} 个单元`;$('#confirm').innerHTML=rows.length?rows.join(''):`<div class="empty-waiting" style="grid-column:1/-1"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>没有需要确认的单元</div>`}function renderIntake(){const present=intakeSources.filter(s=>s.present!==false);$('#intakeCount').textContent=`${present.length} 个来源`;$('#intake').innerHTML=present.length?present.map(intakeCard).join(''):`<div class="empty-waiting" style="grid-column:1/-1"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>待刮削目录中没有来源</div>`}function waitingCard(j){return `<article class="waiting-card"><div class="job-title" title="${esc(j.source||j.id)}">${esc(title(j))}</div><div class="job-path">${esc(j.source||j.id)}</div>${j.error?`<div class="row-error">${esc(j.error)}</div>`:''}<div class="choose-label">这个任务应整理到哪里？</div><div class="shelves">${j.allowed_target_shelves.map(s=>`<button class="shelf" data-job="${esc(j.id)}" data-shelf="${esc(s)}">${shelfLabels[s]||esc(s)}</button>`).join('')}</div></article>`}function row(j){const bad=attention.has(j.phase),run=!terminal.has(j.phase)&&!bad;return `<article class="row"><div><div class="job-title" title="${esc(j.source||j.id)}">${esc(title(j))}</div><div class="job-path">${esc(j.source||j.id)}</div>${j.error?`<div class="row-error">${esc(j.error)}</div>`:''}</div><span class="status-pill ${bad?'failed':run?'running':''}">${esc(phaseLabel(j.phase))}</span><time class="time">${esc(j.updated_at?new Date(j.updated_at).toLocaleString('zh-CN'):'')}</time></article>`}function render(){const waiting=jobs.filter(j=>Array.isArray(j.allowed_target_shelves)&&j.allowed_target_shelves.length);$('#waitingCount').textContent=`${waiting.length} 个任务`;$('#waiting').innerHTML=waiting.length?waiting.map(waitingCard).join(''):`<div class="empty-waiting" style="grid-column:1/-1"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>没有等待选择的任务</div>`;let rows=jobs.filter(j=>!waiting.includes(j));if(currentTab==='active')rows=rows.filter(j=>!terminal.has(j.phase)&&!attention.has(j.phase));if(currentTab==='attention')rows=rows.filter(j=>attention.has(j.phase));if(currentTab==='history')rows=rows.filter(j=>terminal.has(j.phase));$('#jobList').innerHTML=rows.length?rows.map(row).join(''):'<div class="list-empty">这个分类中暂无任务</div>'}async function load(){try{const[h,c,j,i]=await Promise.all([api('/api/health'),api('/api/control'),api('/api/jobs'),api('/api/intake')]);paused=c.paused!==false;jobs=j.jobs||[];intakeSources=i.sources||[];unitViews={};$('#healthText').textContent=h.ok?'服务正常':'服务异常';$('#healthDot').className='dot'+(h.ok?' ok':'');await Promise.all(jobs.filter(j=>attention.has(j.phase)).map(async j=>{try{unitViews[j.id]=await api('/api/jobs/'+encodeURIComponent(j.id)+'/work-units')}catch(e){unitViews[j.id]=null}}));const waiting=jobs.filter(x=>x.allowed_target_shelves?.length).length,active=jobs.filter(x=>!terminal.has(x.phase)&&!attention.has(x.phase)&&!x.allowed_target_shelves?.length).length,issues=jobs.filter(x=>attention.has(x.phase)).length;$('#summary').innerHTML=`<div class="metric"><strong>${waiting}</strong><span>等待选择</span></div><div class="metric"><strong>${active}</strong><span>处理中</span></div><div class="metric"><strong>${issues}</strong><span>需要关注</span></div>`;const b=$('#control');b.textContent=paused?'恢复运行':'暂停运行';b.className='btn '+(paused?'primary':'danger');render();renderIntake();renderConfirm()}catch(e){$('#healthText').textContent='连接失败';toast(e.message,true)}}async function post(path,payload={}){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api(path,{method:'POST',body:JSON.stringify(payload)});await load();toast('操作已保存')}catch(e){toast(e.message,true)}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)}}$('#refresh').onclick=load;$('#control').onclick=()=>post(paused?'/api/control/resume':'/api/control/pause');$('#confirm').onclick=e=>{const b=e.target.closest('[data-confirm]');if(b)post('/api/jobs/'+encodeURIComponent(b.dataset.job)+'/work-units/'+encodeURIComponent(b.dataset.unit)+'/confirm',{media_type:b.dataset.type,tmdb_id:Number(b.dataset.tmdb)})};$('#intake').onclick=e=>{const b=e.target.closest('[data-source]');if(b)post('/api/root-jobs',{path:b.dataset.source,target_shelf:b.dataset.shelf})};$('#waiting').onclick=e=>{const b=e.target.closest('[data-shelf]');if(b)post(`/api/jobs/${encodeURIComponent(b.dataset.job)}/start`,{target_shelf:b.dataset.shelf})};document.querySelector('.tabs').onclick=e=>{const t=e.target.closest('[data-tab]');if(!t)return;currentTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===t));render()};load();setInterval(load,10000);
-</script></body></html>'''
+const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s)),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let jobs=[],intakeSources=[],unitViews={},paused=true,busy=false,currentTab='active',selectedSource=null,selectedShelf='anime';
+const shelfLabels={movie:'电影',anime:'番剧',us_tv:'美剧'},terminal=new Set(['completed','executed','cancelled']),attention=new Set(['failed','failed_cleanup','failed_identity','reconciliation_uncertain','target_policy_conflict']);
+async function api(path,opt){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt}),d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||`请求失败 (${r.status})`);return d}
+function toast(msg,bad=false){const n=$('#toast');n.textContent=msg;n.className='toast show'+(bad?' bad':'');clearTimeout(n.timer);n.timer=setTimeout(()=>n.classList.remove('show'),2600)}
+function title(j){const raw=j.source||j.summary?.source_root||j.id;return String(raw).split('/').filter(Boolean).pop()||j.id}
+function phaseLabel(p){return({queued:'已排队',reconciling:'正在对账',archive_preprocessing:'归档预处理',identity_matching:'识别内容',planning:'生成计划',executing:'正在写入',completed:'已完成',executed:'已执行',cancelled:'已取消',failed:'失败',failed_cleanup:'清理失败',failed_identity:'识别失败',reconciliation_uncertain:'对账不确定',target_policy_conflict:'货架冲突',retry_wait:'等待重试',awaiting_target_shelf:'等待选择货架'}[p]||p)}
+function unitProgress(j){const v=unitViews[j.id];if(!v||!v.aggregate||!v.aggregate.unit_count)return null;const a=v.aggregate;return {unit_count:a.unit_count,completed:a.completed,attention:a.attention,failed:a.failed,open_gaps:a.open_gaps}}
+function waitingCard(j){const shelves=j.allowed_target_shelves||[];return `<div class="card"><strong title="${esc(j.source||j.id)}">${esc(title(j))}</strong><small>${esc(j.source||j.id)}</small>${j.error?`<small class="row-error">${esc(j.error)}</small>`:''}<div class="choose-label">这个任务应整理到哪里？</div><div class="segment">${shelves.map(s=>`<button data-job="${esc(j.id)}" data-shelf="${esc(s)}">${shelfLabels[s]||esc(s)}</button>`).join('')}</div></div>`}
+function confirmCard(job,unit){const cands=(unit.candidate_identities||[]).map(c=>`<div class="choice" data-confirm="1" data-job="${esc(job.id)}" data-unit="${esc(unit.work_unit_id)}" data-tmdb="${esc(c.tmdb_id)}" data-type="${esc(c.media_type)}"><i></i><span><b>${esc(c.title||c.media_type)}</b><small>${esc(c.media_type)} / ${esc(c.tmdb_id)}${c.year?` · ${esc(c.year)}`:''}</small></span></div>`).join('');return `<div class="card"><strong title="${esc(unit.boundary_key||'')}">${esc(unit.display_label||unit.boundary_key)}</strong><small>${esc(job.source||job.id)}</small><div class="choose-label">识别不确定，请确认正确身份：</div><div class="choicebox">${cands||`<div class="choice"><i></i><span><small>无可选候选</small></span></div>`}</div></div>`}
+function intakeDir(s){const state=s.root_task_id?`<em>已建立</em>`:`<em></em>`;const counts=`${s.child_count==null?'—':s.child_count} 个子目录 · ${s.file_count==null?'—':s.file_count} 个文件`;return `<button class="dir${selectedSource===s.canonical_path?' active':''}" data-source="${esc(s.canonical_path)}"><span>▣</span><span><b>${esc(s.display_name||s.canonical_path)}</b><small>${counts}</small></span>${state}</button>`}
+function row(j){const bad=attention.has(j.phase),run=!terminal.has(j.phase)&&!bad;const prog=unitProgress(j);const pct=prog&&prog.unit_count?Math.round(prog.completed*100/prog.unit_count):0;const meta=prog?`${prog.unit_count} 个作品<br>${prog.completed} 已完成${prog.attention?` · ${prog.attention} 待确认`:''}`:(j.allowed_target_shelves?.length?'等待选择货架':'—');const stateCls=bad?'attention':(terminal.has(j.phase)?'done':'run');return `<div class="task" data-job-row="${esc(j.id)}"><div class="task-main"><strong title="${esc(j.source||j.id)}">${esc(title(j))}</strong><p>${esc(j.source||j.id)}</p>${prog?`<div class="task-progress"><i style="width:${pct}%;${pct===100?'background:var(--ok)':''}"></i></div>`:''}${j.error?`<div class="row-error">${esc(j.error)}</div>`:''}</div><div class="task-meta">${meta}</div><div class="task-state ${stateCls}">${esc(phaseLabel(j.phase))}</div></div>`}
+function render(){const waiting=jobs.filter(j=>Array.isArray(j.allowed_target_shelves)&&j.allowed_target_shelves.length);$('#waitingCount').textContent=`${waiting.length} 个任务`;$('#countWaiting').textContent=waiting.length;$('#waitingSection').style.display=waiting.length?'':'none';$('#waiting').innerHTML=waiting.length?waiting.map(waitingCard).join(''):`<div class="empty">没有等待选择的任务</div>`;let rows=jobs.filter(j=>!waiting.includes(j));if(currentTab==='waiting')rows=waiting;if(currentTab==='active')rows=rows.filter(j=>!terminal.has(j.phase)&&!attention.has(j.phase));if(currentTab==='attention')rows=rows.filter(j=>attention.has(j.phase));if(currentTab==='history')rows=rows.filter(j=>terminal.has(j.phase));$('#jobCount').textContent=`${rows.length} 个任务`;$('#jobList').innerHTML=rows.length?rows.map(row).join(''):`<div class="empty">这个分类中暂无任务</div>`;$('#countActive').textContent=jobs.filter(j=>!terminal.has(j.phase)&&!attention.has(j.phase)&&!j.allowed_target_shelves?.length).length;$('#countAttention').textContent=jobs.filter(j=>attention.has(j.phase)).length;$('#countHistory').textContent=jobs.filter(j=>terminal.has(j.phase)).length;$('#countAll').textContent=jobs.length;$$('.nav[data-tab]').forEach(x=>x.classList.toggle('active',x.dataset.tab===currentTab))}
+function renderIntake(){const present=intakeSources.filter(s=>s.present!==false);$('#intakeList').innerHTML=present.length?present.map(intakeDir).join(''):`<div class="empty">待刮削目录中没有来源</div>`}
+function renderConfirm(){const rows=[];for(const j of jobs){const view=unitViews[j.id];if(!view)continue;for(const u of view.units||[]){if(u.identity_status==='uncertain'&&(u.candidate_identities||[]).length)rows.push(confirmCard(j,u))}}$('#confirmCount').textContent=`${rows.length} 个单元`;$('#confirmSection').style.display=rows.length?'':'none';$('#confirm').innerHTML=rows.length?rows.join(''):`<div class="empty">没有需要确认的单元</div>`}
+async function load(){try{const[h,c,j,i]=await Promise.all([api('/api/health'),api('/api/control'),api('/api/jobs'),api('/api/intake')]);paused=c.paused!==false;jobs=j.jobs||[];intakeSources=i.sources||[];unitViews={};$('#healthText').textContent=h.ok?'服务正常':'服务异常';$('#healthDot').className=h.ok?'ok':'';await Promise.all(jobs.filter(j=>!terminal.has(j.phase)).map(async j=>{try{unitViews[j.id]=await api('/api/jobs/'+encodeURIComponent(j.id)+'/work-units')}catch(e){unitViews[j.id]=null}}));const waiting=jobs.filter(x=>x.allowed_target_shelves?.length).length,active=jobs.filter(x=>!terminal.has(x.phase)&&!attention.has(x.phase)&&!x.allowed_target_shelves?.length).length,issues=jobs.filter(x=>attention.has(x.phase)).length;$('#sumWaiting').textContent=waiting;$('#sumActive').textContent=active;$('#sumIssues').textContent=issues;const b=$('#control'),sb=$('#sideControl');b.textContent=paused?'恢复运行':'暂停运行';b.className='btn '+(paused?'primary':'danger');sb.querySelector('span').textContent=paused?'恢复运行':'暂停运行';render();renderIntake();renderConfirm()}catch(e){$('#healthText').textContent='连接失败';toast(e.message,true)}}
+async function post(path,payload={}){if(busy)return;busy=true;$$('button').forEach(b=>b.disabled=true);try{await api(path,{method:'POST',body:JSON.stringify(payload)});await load();toast('操作已保存')}catch(e){toast(e.message,true)}finally{busy=false;$$('button').forEach(b=>b.disabled=false)}}
+$('#refresh').onclick=load;$('#topRefresh').onclick=load;
+$('#control').onclick=()=>post(paused?'/api/control/resume':'/api/control/pause');
+$('#sideControl').onclick=()=>post(paused?'/api/control/resume':'/api/control/pause');
+$$('.nav[data-tab]').forEach(n=>n.onclick=()=>{currentTab=n.dataset.tab;render()});
+$('#waiting').onclick=e=>{const b=e.target.closest('[data-shelf]');if(b)post(`/api/jobs/${encodeURIComponent(b.dataset.job)}/start`,{target_shelf:b.dataset.shelf})};
+$('#confirm').onclick=e=>{const b=e.target.closest('[data-confirm]');if(b)post('/api/jobs/'+encodeURIComponent(b.dataset.job)+'/work-units/'+encodeURIComponent(b.dataset.unit)+'/confirm',{media_type:b.dataset.type,tmdb_id:Number(b.dataset.tmdb)})};
+function openModal(m){m.classList.add('show')}
+function closeModal(m){m.classList.remove('show')}
+$('#openCreate').onclick=()=>openModal($('#createModal'));
+$('#topCreate').onclick=()=>openModal($('#createModal'));
+$$('[data-close]').forEach(b=>b.onclick=()=>closeModal(document.getElementById(b.dataset.close)));
+$$('.modalback').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)closeModal(m)}));
+$('#intakeList').onclick=e=>{const b=e.target.closest('[data-source]');if(!b||b.dataset.source===selectedSource)return;selectedSource=b.dataset.source;renderIntake()};
+$$('#shelfSegment button').forEach(b=>b.onclick=()=>{selectedShelf=b.dataset.shelfSegment;$$('#shelfSegment button').forEach(x=>x.classList.toggle('active',x===b))});
+$('#confirmCreate').onclick=async()=>{if(!selectedSource){toast('请先选择待刮削目录',true);return}if(busy)return;busy=true;$$('button').forEach(b=>b.disabled=true);try{await api('/api/root-jobs',{method:'POST',body:JSON.stringify({path:selectedSource,target_shelf:selectedShelf})});closeModal($('#createModal'));selectedSource=null;await load();toast('任务已建立')}catch(e){toast(e.message,true)}finally{busy=false;$$('button').forEach(b=>b.disabled=false)}};
+load();setInterval(load,10000);
+</script>
+</body>
+</html>'''
 
 
 def dashboard_html() -> bytes:

@@ -1,0 +1,78 @@
+[
+  {
+    "id": "ordinary_movie",
+    "description": "普通电影",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "movie"
+  },
+  {
+    "id": "same_title_two_years",
+    "description": "同名不同年份电影合集",
+    "expected_role": "movie_collection",
+    "expected_work_count": 2,
+    "expected_media_contexts": [
+      "movie",
+      "movie"
+    ]
+  },
+  {
+    "id": "multiseason_us_tv",
+    "description": "多季美剧",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "tv"
+  },
+  {
+    "id": "absolute_number_anime",
+    "description": "绝对集数动画",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "tv"
+  },
+  {
+    "id": "ova_specials",
+    "description": "OVA/特别篇",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "tv"
+  },
+  {
+    "id": "movie_collection",
+    "description": "电影合集",
+    "expected_role": "movie_collection",
+    "expected_work_count": 3,
+    "expected_media_contexts": [
+      "movie",
+      "movie",
+      "movie"
+    ]
+  },
+  {
+    "id": "fate_container",
+    "description": "Fate 系列容器",
+    "expected_role": "series_container",
+    "expected_work_count": 3,
+    "expected_media_contexts": null
+  },
+  {
+    "id": "gundam_container",
+    "description": "高达系列容器",
+    "expected_role": "series_container",
+    "expected_work_count": 2
+  },
+  {
+    "id": "monogatari_container",
+    "description": "物语系列容器",
+    "expected_role": "series_container",
+    "expected_work_count": 3
+  },
+  {
+    "id": "duplicate_source",
+    "description": "完全重复来源",
+    "expected_role": "single_work",
+    "expected_work_count": 1,
+    "expected_media_context": "tv",
+    "expected_outcome": "duplicate_complete"
+  }
+]

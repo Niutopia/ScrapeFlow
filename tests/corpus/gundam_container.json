@@ -1,0 +1,57 @@
+{
+  "root": "/quark/影视/待刮削/高达系列",
+  "children": [
+    {
+      "name": "机动战士高达0079",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "01.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "02.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "03.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "04.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        }
+      ]
+    },
+    {
+      "name": "机动战士高达SEED",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "01.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "02.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "03.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "04.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        }
+      ]
+    }
+  ]
+}

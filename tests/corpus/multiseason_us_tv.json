@@ -1,0 +1,53 @@
+{
+  "root": "/quark/影视/待刮削/绝命毒师",
+  "children": [
+    {
+      "name": "Season 01",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "S01E01.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "S01E02.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "S01E03.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        }
+      ]
+    },
+    {
+      "name": "Season 02",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "S02E01.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        },
+        {
+          "name": "S02E02.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        }
+      ]
+    },
+    {
+      "name": "Season 03",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "S03E01.mkv",
+          "is_dir": false,
+          "size": 1073741824
+        }
+      ]
+    }
+  ]
+}

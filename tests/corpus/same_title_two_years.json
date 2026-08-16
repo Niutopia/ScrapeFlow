@@ -1,0 +1,27 @@
+{
+  "root": "/quark/影视/待刮削/生死时速合集",
+  "children": [
+    {
+      "name": "Speed (1994)",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "Speed.1994.1080p.mkv",
+          "is_dir": false,
+          "size": 8589934592
+        }
+      ]
+    },
+    {
+      "name": "Speed 2 (1997)",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "Speed.2.1997.1080p.mkv",
+          "is_dir": false,
+          "size": 7516192768
+        }
+      ]
+    }
+  ]
+}

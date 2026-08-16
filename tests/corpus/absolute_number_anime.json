@@ -1,0 +1,65 @@
+{
+  "root": "/quark/影视/待刮削/绝对动画",
+  "children": [
+    {
+      "name": "01.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "02.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "03.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "04.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "05.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "06.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "07.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "08.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "09.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "10.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "11.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    },
+    {
+      "name": "12.mkv",
+      "is_dir": false,
+      "size": 1073741824
+    }
+  ]
+}

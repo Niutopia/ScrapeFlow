@@ -1,0 +1,38 @@
+{
+  "root": "/quark/影视/待刮削/指环王合集",
+  "children": [
+    {
+      "name": "The Fellowship of the Ring (2001)",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "part1.mkv",
+          "is_dir": false,
+          "size": 32212254720
+        }
+      ]
+    },
+    {
+      "name": "The Two Towers (2002)",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "part2.mkv",
+          "is_dir": false,
+          "size": 32212254720
+        }
+      ]
+    },
+    {
+      "name": "The Return of the King (2003)",
+      "is_dir": true,
+      "children": [
+        {
+          "name": "part3.mkv",
+          "is_dir": false,
+          "size": 32212254720
+        }
+      ]
+    }
+  ]
+}
