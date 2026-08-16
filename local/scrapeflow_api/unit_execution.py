@@ -45,6 +45,34 @@ def _acceptance_path(state_root: Path, root_task_id: str) -> Path:
     return state_root / f"work_acceptance_{root_task_id}.json"
 
 
+_TERMINAL_CARRIER_PHASES = frozenset({
+    "failed", "failed_planning", "failed_write", "failed_verification",
+    "failed_cleanup", "failed_archive", "failed_provider", "failed_identity",
+    "cancelled", "planned",
+})
+
+
+def _retire_stale_unit_carrier(runner: SimpleEngineRunner, carrier_id: str) -> None:
+    """Remove a terminal unit carrier so a retry re-plans from current state.
+
+    Only internal unit carriers (``internal_child``) in terminal/planned
+    phases are ever removed; the root ledger, gap ledger and formal library
+    are never touched here.
+    """
+    try:
+        carrier = runner.get_job(carrier_id)
+    except Exception:
+        return
+    summary = carrier.summary if isinstance(carrier.summary, Mapping) else {}
+    if summary.get("internal_child") is not True:
+        return
+    if carrier.phase not in _TERMINAL_CARRIER_PHASES:
+        return
+    path = runner._job_path(carrier_id)  # noqa: SLF001 - carrier composition
+    if path.exists():
+        path.unlink()
+
+
 def _unit_job_id(work_unit_id: str) -> str:
     return f"unit-{work_unit_id}"
 
@@ -542,19 +570,29 @@ def execute_new_work_units(
         if record.writer_job_id is not None:
             # Already planned and executed; re-verify the carrier state.
             carrier = runner.get_job(record.writer_job_id)
-            plan_files = len(carrier.plan.get("files") or [])
-            results.append(WorkAcceptanceResult(
-                work_unit_id=record.work_unit_id,
-                outcome="accepted" if carrier.phase == "executed" else "failed",
-                writer_job_id=carrier.id,
-                phase=carrier.phase,
-                target_root=str((carrier.plan.get("target_root")) or ""),
-                planned_files=plan_files,
-                error=carrier.error,
-                recorded_at=_now(),
-            ))
-            updated.append(record)
-            continue
+            if carrier.phase not in {"executed"}:
+                # A terminal carrier is a stale plan from a previous failed
+                # attempt.  Retire it and fall through to re-plan from the
+                # current source state.
+                _retire_stale_unit_carrier(runner, carrier.id)
+                record = replace(record, writer_job_id=None)
+                changed = True
+            else:
+                plan_files = len(carrier.plan.get("files") or [])
+                results.append(WorkAcceptanceResult(
+                    work_unit_id=record.work_unit_id,
+                    outcome="accepted",
+                    writer_job_id=carrier.id,
+                    phase=carrier.phase,
+                    target_root=str((carrier.plan.get("target_root")) or ""),
+                    planned_files=plan_files,
+                    error=carrier.error,
+                    recorded_at=_now(),
+                ))
+                updated.append(record)
+                continue
+        base_record = record
+        carrier_id = _unit_job_id(record.work_unit_id)
         try:
             identity = record.identity or {}
             is_main_tv = (
@@ -574,11 +612,14 @@ def execute_new_work_units(
                 runner, record, root_task_id, state_root,
                 parent_override=parent_override,
             )
+            # plan_job refuses an existing carrier id; a stale terminal
+            # carrier must be gone before the fresh plan is persisted.
+            _retire_stale_unit_carrier(runner, carrier_id)
             planned = _mark_internal_carrier(
                 runner,
                 runner.plan_job(
                     request,
-                    job_id=_unit_job_id(record.work_unit_id),
+                    job_id=carrier_id,
                 ),
                 root_task_id,
             )
@@ -586,10 +627,10 @@ def execute_new_work_units(
                 main_target_root = (
                     str(planned.plan.get("target_root") or "") or None
                 )
-            record = replace(record, writer_job_id=planned.id)
-            changed = True
             executed = runner.execute_job(planned.id)
             plan_files = len(executed.plan.get("files") or [])
+            record = replace(record, writer_job_id=planned.id)
+            changed = True
             results.append(WorkAcceptanceResult(
                 work_unit_id=record.work_unit_id,
                 outcome="accepted",
@@ -610,7 +651,14 @@ def execute_new_work_units(
             except Exception:
                 pass
         except Exception as exc:
-            # Keep writer_job_id unset so the next run retries the unit.
+            # Keep writer_job_id unset so the next run re-plans the unit;
+            # retire the just-planned carrier so plan_job's existing-id
+            # guard cannot pin a stale plan either.
+            try:
+                _retire_stale_unit_carrier(runner, carrier_id)
+            except Exception:
+                pass
+            record = base_record
             results.append(WorkAcceptanceResult(
                 work_unit_id=record.work_unit_id,
                 outcome="failed",

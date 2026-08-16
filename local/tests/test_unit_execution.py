@@ -391,3 +391,51 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
         request = _request_for_unit(runner, record, "root-se", state_root)
 
         self.assertIsNone(request.episode_map_path)
+
+
+class FailedUnitRetryTests(unittest.TestCase):
+    def test_failed_unit_replans_on_retry_and_retires_stale_carrier(self) -> None:
+        files = {"/incoming/one/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = IndexAList(dict(files))
+        plan_calls: list[str] = []
+        executor_failures = {"remaining": 1}
+
+        def failing_executor(plan):
+            if executor_failures["remaining"] > 0:
+                executor_failures["remaining"] -= 1
+                raise RuntimeError("injected executor failure")
+            return {"ok": True}
+
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=object(),
+            planner=_recording_planner(plan_calls), validate=False,
+            library_root="/library", executor=failing_executor,
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-fail")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-fail", state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-fail")
+        apply_work_unit_override(
+            state_root, "root-fail", records[0].work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, "root-fail")
+
+        first = execute_new_work_units(runner, state_root, "root-fail")
+        self.assertEqual(first[0].outcome, "failed")
+        records = load_work_unit_records(state_root, "root-fail")
+        self.assertIsNone(records[0].writer_job_id)
+        # The stale carrier must not survive a failed attempt.
+        carrier_path = state_root / "jobs" / f"unit-{records[0].work_unit_id}.json"
+        self.assertFalse(carrier_path.exists())
+
+        second = execute_new_work_units(runner, state_root, "root-fail")
+        self.assertEqual(second[0].outcome, "accepted")
+        self.assertEqual(len(plan_calls), 2)
+        records = load_work_unit_records(state_root, "root-fail")
+        self.assertIsNotNone(records[0].writer_job_id)
