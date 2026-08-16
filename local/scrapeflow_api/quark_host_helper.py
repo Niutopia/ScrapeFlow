@@ -696,6 +696,11 @@ class PassiveQuarkCdp:
             raise QuarkHelperValidationError("staging root is outside the configured Quark mount")
         self._sequence = 0
         self._lock = asyncio.Lock()
+        # Serializes whole typed actions (health listings, parse+submit
+        # sequences).  Separate from ``_lock`` (the CDP evaluation lock) so
+        # the nested acquisitions never deadlock.  Concurrent bursts against
+        # Quark were live-observed to trigger truncated responses.
+        self._action_lock = asyncio.Lock()
         self._delegated_session: ContextVar[DelegatedQuarkSession | None] = (
             ContextVar(f"scrapeflow_quark_session_{id(self)}", default=None)
         )
@@ -709,19 +714,20 @@ class PassiveQuarkCdp:
             # construction always supplies the AList resolver below.
             yield
             return
-        delegated = await self.session_resolver.resolve(destination)
-        if not (
-            destination == delegated.mount_path
-            or destination.startswith(delegated.mount_path.rstrip("/") + "/")
-        ):
-            raise QuarkHelperNotReady(
-                "delegated Quark storage does not cover the task destination"
-            )
-        token = self._delegated_session.set(delegated)
-        try:
-            yield
-        finally:
-            self._delegated_session.reset(token)
+        async with self._action_lock:
+            delegated = await self.session_resolver.resolve(destination)
+            if not (
+                destination == delegated.mount_path
+                or destination.startswith(delegated.mount_path.rstrip("/") + "/")
+            ):
+                raise QuarkHelperNotReady(
+                    "delegated Quark storage does not cover the task destination"
+                )
+            token = self._delegated_session.set(delegated)
+            try:
+                yield
+            finally:
+                self._delegated_session.reset(token)
 
     def _active_mount(self) -> tuple[str, str]:
         """Return the mount/root selected for the current typed action."""
