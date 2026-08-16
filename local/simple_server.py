@@ -1567,7 +1567,6 @@ class SimpleApplication:
                     "updated_at": _now(),
                 })
                 summary["replenishment"] = replenishment
-                summary["automatic_stage"] = "retry_wait"
                 summary["next_retry_seconds"] = None
                 atomic_write_json(
                     runner.jobs_root / f"{job_id}.json",
@@ -1914,7 +1913,6 @@ class SimpleApplication:
                     if str(marker.get("status") or "").casefold() == "hold_prepared"
                     else "retained_needs_attention"
                 )
-                summary["automatic_stage"] = "existing_gap_registration_failed"
                 summary["automatic_terminal"] = True
                 summary["next_retry_seconds"] = None
                 summary.pop("cleanup_only_retry", None)
@@ -2128,7 +2126,6 @@ class SimpleApplication:
                     "updated_at": _now(),
                 })
                 summary["replenishment"] = replenishment
-                summary["automatic_stage"] = "retry_wait"
                 updated = replace(current, summary=summary, updated_at=_now())
                 atomic_write_json(
                     runner.jobs_root / f"{current.id}.json",
@@ -3513,7 +3510,6 @@ class SimpleApplication:
                                 "updated_at": _now(),
                             })
                             summary["replenishment"] = replenishment
-                            summary["automatic_stage"] = "gap_discovering"
                             atomic_write_json(
                                 runner.jobs_root / f"{job_id}.json",
                                 _redacted_job_payload(
@@ -3693,7 +3689,6 @@ class SimpleApplication:
                     children.append(child_row)
                 replenishment["child_jobs"] = children
             summary["replenishment"] = replenishment
-            summary["automatic_stage"] = phase
             updated = replace(current, summary=summary, updated_at=now)
             atomic_write_json(
                 runner.jobs_root / f"{current.id}.json",

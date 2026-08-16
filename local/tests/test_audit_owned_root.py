@@ -1684,7 +1684,8 @@ class AuditOwnedRootTests(unittest.TestCase):
                 self.assertEqual(replenishment["status"], "retry_wait")
                 self.assertFalse(replenishment["terminal"])
                 self.assertIsNone(replenishment["next_retry_seconds"])
-                self.assertEqual(persisted.summary["automatic_stage"], "retry_wait")
+                # 存量清退：automatic_stage 镜像已退休，replenishment.status
+                # 上方的断言是同一状态转移的 durable 权威。
                 self.assertEqual(gap_state["phase"], "retry_wait")
                 self.assertEqual(resumed._provider_futures, {})
                 self.assertEqual(SimpleApplication.public_engine_job(persisted)["phase"], "retry_wait")
