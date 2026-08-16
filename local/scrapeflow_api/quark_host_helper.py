@@ -1121,59 +1121,71 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
         query: Mapping[str, object] | None = None,
         body: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
-        delegated = self._delegated_session.get()
-        if delegated is None:
-            # This fallback keeps the renderer transport independently
-            # testable.  Production construction always binds an AList
-            # resolver, so live actions use the delegated Cookie path below.
-            result = await self._evaluate_json(self._fixed_fetch_expression(
-                origin=origin, path=path, method=method, query=query, body=body,
-            ))
-        else:
-            result = await self._delegated_fixed_request(
-                delegated,
-                origin=origin,
-                path=path,
-                method=method,
-                query=query,
-                body=body,
-            )
-        if result.get("kind") == "transport_error":
-            raise QuarkHelperLostResponse("Quark renderer response was lost")
-        if result.get("kind") != "response" or type(result.get("status")) is not int:
-            raise QuarkHelperNotReady("Quark session cannot complete a fixed request")
-        status = int(result["status"])
-        text = result.get("text")
-        if status < 200 or status >= 300 or not isinstance(text, str):
-            if status in {401, 403, 408, 425, 429} or status >= 500:
+        # A read-only GET can be truncated mid-body by an intervening network
+        # path (live-observed: an intermittent ~1KB cut of a 10KB listing).
+        # GET retries are safe; mutating POSTs never retry (duplicate-submit
+        # hazard) and stay fail-closed.
+        attempts = 3 if method == "GET" else 1
+        last_invalid: Exception | None = None
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(min(2 ** (attempt - 1), 4))
+            delegated = self._delegated_session.get()
+            if delegated is None:
+                # This fallback keeps the renderer transport independently
+                # testable.  Production construction always binds an AList
+                # resolver, so live actions use the delegated Cookie path below.
+                result = await self._evaluate_json(self._fixed_fetch_expression(
+                    origin=origin, path=path, method=method, query=query, body=body,
+                ))
+            else:
+                result = await self._delegated_fixed_request(
+                    delegated,
+                    origin=origin,
+                    path=path,
+                    method=method,
+                    query=query,
+                    body=body,
+                )
+            if result.get("kind") == "transport_error":
+                raise QuarkHelperLostResponse("Quark renderer response was lost")
+            if result.get("kind") != "response" or type(result.get("status")) is not int:
+                raise QuarkHelperNotReady("Quark session cannot complete a fixed request")
+            status = int(result["status"])
+            text = result.get("text")
+            if status < 200 or status >= 300 or not isinstance(text, str):
+                if status in {401, 403, 408, 425, 429} or status >= 500:
+                    raise QuarkHelperNotReady("Quark session or service is unavailable")
+                raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
+            try:
+                payload = json.loads(text)
+            except (TypeError, json.JSONDecodeError) as exc:
+                last_invalid = exc
+                continue
+            if not isinstance(payload, Mapping):
+                last_invalid = ValueError("Quark response is not an object")
+                continue
+            raw_code = payload.get("code")
+            raw_status = payload.get("status")
+            try:
+                numeric_code = int(raw_code) if raw_code is not None else 0
+            except (TypeError, ValueError):
+                numeric_code = 0
+            try:
+                numeric_status = int(raw_status) if raw_status is not None else 200
+            except (TypeError, ValueError):
+                numeric_status = 200
+            # Quark business codes such as 41004 are not HTTP status codes.  Do
+            # not treat every large numeric code as an outage: only a real 5xx
+            # code, auth, timeout, or rate-limit response is infrastructure.
+            if numeric_code in {401, 403, 408, 425, 429} or 500 <= numeric_code <= 599:
                 raise QuarkHelperNotReady("Quark session or service is unavailable")
-            raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
-        try:
-            payload = json.loads(text)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise QuarkHelperNotReady("Quark returned an invalid fixed response") from exc
-        if not isinstance(payload, Mapping):
-            raise QuarkHelperNotReady("Quark returned an invalid fixed response")
-        raw_code = payload.get("code")
-        raw_status = payload.get("status")
-        try:
-            numeric_code = int(raw_code) if raw_code is not None else 0
-        except (TypeError, ValueError):
-            numeric_code = 0
-        try:
-            numeric_status = int(raw_status) if raw_status is not None else 200
-        except (TypeError, ValueError):
-            numeric_status = 200
-        # Quark business codes such as 41004 are not HTTP status codes.  Do
-        # not treat every large numeric code as an outage: only a real 5xx
-        # code, auth, timeout, or rate-limit response is infrastructure.
-        if numeric_code in {401, 403, 408, 425, 429} or 500 <= numeric_code <= 599:
-            raise QuarkHelperNotReady("Quark session or service is unavailable")
-        if numeric_status in {401, 403, 408, 425, 429} or numeric_status >= 500:
-            raise QuarkHelperNotReady("Quark session or service is unavailable")
-        if raw_code not in {None, 0, "0"} or raw_status not in {None, 200, "200"}:
-            raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
-        return dict(payload)
+            if numeric_status in {401, 403, 408, 425, 429} or numeric_status >= 500:
+                raise QuarkHelperNotReady("Quark session or service is unavailable")
+            if raw_code not in {None, 0, "0"} or raw_status not in {None, 200, "200"}:
+                raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
+            return dict(payload)
+        raise QuarkHelperNotReady("Quark returned an invalid fixed response") from last_invalid
 
     async def _destination_fid(self, destination: str) -> str:
         mount_path, parent = self._active_mount()
