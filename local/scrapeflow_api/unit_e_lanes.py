@@ -134,10 +134,29 @@ def _move_with_readback(
 ) -> None:
     """Move one task-owned directory into a bounded lane with exact readback."""
     target = f"{target_root}/{name}"
+    ensure = getattr(runner.alist, "ensure_directory", None) or getattr(
+        runner.alist, "mkdir", None
+    )
+    move = getattr(runner.alist, "move", None)
+    if not callable(ensure) or not callable(move):
+        raise EngineExecutionError(f"AList 客户端缺少 {field} 移动接口")
     source_kind = runner._remote_entry_kind(source)
+    if source_kind == "unknown":
+        raise EngineExecutionError(f"{field} source 回读不可确认")
     target_kind = runner._remote_entry_kind(target)
-    if source_kind == "unknown" or target_kind == "unknown":
-        raise EngineExecutionError(f"{field} source/目标回读不可确认")
+    if target_kind == "unknown":
+        # On the real AList client, listing a not-yet-created lane root can
+        # surface as an error instead of an empty listing.  Create the lane
+        # root first, then re-probe the exact target.
+        root_kind = runner._remote_entry_kind(target_root)
+        if root_kind in {"file", "ambiguous", "unknown"}:
+            _pause_checkpoint(pause_requested)
+            ensure(target_root)
+            if runner._remote_entry_kind(target_root) != "directory":
+                raise EngineExecutionError(f"{field} 归档根创建后回读失败")
+        target_kind = runner._remote_entry_kind(target)
+        if target_kind == "unknown":
+            raise EngineExecutionError(f"{field} 目标回读不可确认")
     if source_kind == "missing" and target_kind == "directory":
         return  # The move already committed; idempotent success.
     if source_kind == "missing":
@@ -146,12 +165,6 @@ def _move_with_readback(
         raise EngineExecutionError(f"{field} 来源不是唯一目录")
     if target_kind != "missing":
         raise EngineExecutionError(f"{field} 目标已被占用")
-    ensure = getattr(runner.alist, "ensure_directory", None) or getattr(
-        runner.alist, "mkdir", None
-    )
-    move = getattr(runner.alist, "move", None)
-    if not callable(ensure) or not callable(move):
-        raise EngineExecutionError(f"AList 客户端缺少 {field} 移动接口")
     root_kind = runner._remote_entry_kind(target_root)
     if root_kind in {"file", "ambiguous", "unknown"}:
         raise EngineExecutionError(f"{field} 归档根不是可用目录")
