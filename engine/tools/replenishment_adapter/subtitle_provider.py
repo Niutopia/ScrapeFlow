@@ -305,9 +305,10 @@ class SubtitleDiscoveryService:
         """Search SubHD subtitle site."""
         if not title:
             return []
+        # SubHD matches the bare show name; appending SxxEyy yields zero
+        # server-side results.  Episode-level filtering happens later in the
+        # weighted scoring (extract_episode_numbers on the subtitle titles).
         query_str = title
-        if season is not None and episode is not None:
-            query_str += f" S{season:02d}E{episode:02d}"
         url = f"https://subhd.tv/search/{urllib.parse.quote(query_str)}"
         try:
             data = self._http_get(url, timeout=5.0)
