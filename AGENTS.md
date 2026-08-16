@@ -20,7 +20,7 @@
 - **禁止**创建第二套 writer 或第二套 TMDB 匹配器；
 - **必须**通过 `IntakeSource → RootJob → WorkUnit` 路径新增功能，而不是扩展 `EngineJob` phase 字段。
 
-测试基线（2026-08-16 实测）：**854 tests passed, 310 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，35 秒）。
+测试基线（2026-08-16 实测）：**861 tests passed, 310 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，35 秒）。
 任何代码变更不得使通过数减少。
 
 迁移状态：目标架构迁移 **P0–P10 已完成**（2026-08-16）：
@@ -31,6 +31,7 @@
 - F/G/H：单元驱动规划 + 唯一写器 + `WorkAcceptanceResult`（`unit_execution`，EngineJob 为内部载体）；
 - J/N：Gap 账本绑 `work_unit_id`（`gap_ledger`）；字幕独立渠道默认关闭且缺陷已修；
 - R：根任务聚合（`root_aggregation`，`GET /api/jobs/:id/work-units`）；
+- P11：实机运行回路已切换（2026-08-16，`root_pipeline`）：intake 目录绑定的 RootJob 由调度器分派到权威单元管线（B/W 快照边界 → C/U 逐单元身份 → D 三库对账 → `execute_new_work_units` 驱动 F/G/H/J → R 聚合落 durable phase）；legacy 自动链保留为存量记录读取，不再接管新路径任务；身份/对账不确定与 duplicate/existing_gap/merge_existing 单元保持 fail-closed 只读挂起（单元级 E 通道接入前绝不写入正式库），人工确认后重新分派（`/confirm` 触发）；
 - 合规：作品名硬编码全部数据化（`engine/scrapeflow/data/release_lexicon.py`）、货架-媒体类型矩阵已删除、TMDB 匹配器统一为单一评分核心；
 - 测试：`tests/corpus/` 10 场景 + 真实 A→B→W→C→D 链路回归。
 - 存量清退（裁决②，渐进）：`target_work_path` 的新流程写入已移除（公开投影改由 plan/summary `target_root` 派生，legacy 合并交接读取保留）；创建期的 `reconciliation{status:blocked_by_target_shelf}` 标记已移除（等待任务即刻展示三货架枚举，符合 S 步）；`TargetShelfPolicyConflictError` 与其处理器已删除（矩阵删除后无生产 raise 位点，phase 值保留供 legacy 记录读取，身份媒体类型直接驱动规划）；死代码 `pre_reconciliation`、`_automatic_job_needs_dispatch` 已删；`automatic_stage` 的 engine-runner 侧状态镜像写入已全部移除（`phase`/`replenishment.status` 为唯一权威，执行链路接管记录时丢弃旧记录残留镜像值，测试夹具保留该键以模拟存量旧记录）；server 侧补源/重试 lane 的两处读写（身份修正门与 replenishment 防重写判断）保留为后续清退对象；其余存量字段与 provider gate 机制保持冻结，继续按运行节奏清退。
