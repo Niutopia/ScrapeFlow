@@ -573,6 +573,10 @@ class EngineRequest:
     episode_map: Mapping[str, object] | None = None
     episode_group_id: str | None = None
     ignore_orphan_temp: bool = False
+    # Local state-root path of an explicit episode-map file the pipeline may
+    # derive for multi-season absolute-number releases.  Deliberately NOT
+    # accepted from the HTTP payload: only the internal unit pipeline sets it.
+    episode_map_path: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "EngineRequest":
@@ -4686,7 +4690,11 @@ class SimpleEngineRunner:
                     prefer_simplified=current.prefer_simplified,
                     allow_unmapped=current.allow_unmapped,
                     ignore_orphan_temp=current.ignore_orphan_temp,
-                    episode_map_path=None,
+                    episode_map_path=(
+                        Path(current.episode_map_path)
+                        if current.episode_map_path
+                        else None
+                    ),
                     episode_group_id=current.episode_group_id,
                     media_root=self.library_root,
                 )

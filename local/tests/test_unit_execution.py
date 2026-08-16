@@ -3,6 +3,7 @@ and typed acceptance."""
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from engine.scrapeflow.work_units import load_work_unit_records
 from local.scrapeflow_api.library_index import reconcile_root_work_units
 from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
 from local.scrapeflow_api.unit_execution import (
+    _request_for_unit,
     execute_new_work_units,
     load_work_acceptance,
 )
@@ -79,6 +81,33 @@ class CatalogTMDB:
                     for number in range(1, self.episodes + 1)
                 ],
             }
+        return {}
+
+
+class MultiSeasonTMDB:
+    """TMDB double with several positive seasons (S1 25/S2 24/S3 24/S4 23)."""
+
+    def __init__(self, tmdb_id: int, seasons: dict[int, int]) -> None:
+        self.tmdb_id = tmdb_id
+        self.seasons = seasons
+
+    def get(self, path: str, **params: object) -> dict:
+        del params
+        if path == f"/tv/{self.tmdb_id}":
+            return {
+                "seasons": [
+                    {"season_number": season, "name": f"Season {season}"}
+                    for season in self.seasons
+                ],
+            }
+        for season, count in self.seasons.items():
+            if path == f"/tv/{self.tmdb_id}/season/{season}":
+                return {
+                    "episodes": [
+                        {"episode_number": number, "air_date": "2020-01-01"}
+                        for number in range(1, count + 1)
+                    ],
+                }
         return {}
 
 
@@ -259,3 +288,99 @@ class UnitExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultiSeasonAbsoluteMapTests(unittest.TestCase):
+    def _setup(self, files: dict[str, bytes], tmdb: object):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = IndexAList(dict(files))
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=tmdb,
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: {"ok": True},
+        )
+        return state_root, alist, runner
+
+    def test_multi_season_absolute_block_carries_explicit_episode_map(self) -> None:
+        files = {
+            f"/incoming/sao/[TUDO] Sword Art Online Alicization [{i:02d}][Ma10p_2160p][x265].mkv": FAKE_VIDEO_BYTES
+            for i in range(1, 48)
+        }
+        state_root, alist, runner = self._setup(
+            files, MultiSeasonTMDB(45782, {1: 25, 2: 24, 3: 24, 4: 23}),
+        )
+        pending = runner.create_pending_job("/incoming/sao", job_id="root-map")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/sao", root_task_id="root-map", state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-map")
+        self.assertEqual(len(records), 1)
+        apply_work_unit_override(
+            state_root, "root-map", records[0].work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        record = load_work_unit_records(state_root, "root-map")[0]
+
+        request = _request_for_unit(runner, record, "root-map", state_root)
+
+        self.assertIsNotNone(request.episode_map_path)
+        mapping = json.loads(Path(request.episode_map_path).read_text(encoding="utf-8"))
+        self.assertEqual(mapping["1"], "S03E01")
+        self.assertEqual(mapping["24"], "S03E24")
+        self.assertEqual(mapping["25"], "S04E01")
+        self.assertEqual(mapping["47"], "S04E23")
+
+    def test_single_season_block_keeps_the_ordinary_path(self) -> None:
+        files = {
+            f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES
+            for i in range(1, 25)
+        }
+        state_root, alist, runner = self._setup(
+            files, MultiSeasonTMDB(45782, {1: 25, 2: 24, 3: 24, 4: 23}),
+        )
+        pending = runner.create_pending_job("/incoming/sao", job_id="root-single")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/sao", root_task_id="root-single", state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-single")
+        apply_work_unit_override(
+            state_root, "root-single", records[0].work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        record = load_work_unit_records(state_root, "root-single")[0]
+
+        request = _request_for_unit(runner, record, "root-single", state_root)
+
+        self.assertIsNone(request.episode_map_path)
+
+    def test_se_token_files_skip_the_map_bridge(self) -> None:
+        files = {
+            f"/incoming/sao/Show.S03E{i:02d}.mkv": FAKE_VIDEO_BYTES
+            for i in range(1, 48)
+        }
+        state_root, alist, runner = self._setup(
+            files, MultiSeasonTMDB(45782, {1: 25, 2: 24, 3: 24, 4: 23}),
+        )
+        pending = runner.create_pending_job("/incoming/sao", job_id="root-se")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/sao", root_task_id="root-se", state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-se")
+        apply_work_unit_override(
+            state_root, "root-se", records[0].work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        record = load_work_unit_records(state_root, "root-se")[0]
+
+        request = _request_for_unit(runner, record, "root-se", state_root)
+
+        self.assertIsNone(request.episode_map_path)

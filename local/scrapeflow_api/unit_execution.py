@@ -16,8 +16,11 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
+from engine.scrapeflow.media_policy import is_video_filename
+from engine.scrapeflow.root_boundaries import load_source_snapshot
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.gap_ledger import discover_episode_gaps
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
@@ -144,10 +147,125 @@ def load_work_acceptance(
     return output
 
 
+_ABSOLUTE_BRACKET_RE = re.compile(r"\[0*(\d{1,4})\]", re.IGNORECASE)
+_SE_TOKEN_RE = re.compile(r"S0*\d{1,3}E0*\d{1,4}", re.IGNORECASE)
+
+
+def _unit_video_rows(
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+) -> list[dict[str, Any]]:
+    """Return the unit's video-file rows from the persisted B snapshot."""
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None or not record.source_paths:
+        return []
+    boundary = str(record.source_paths[0]).rstrip("/")
+    rows: list[dict[str, Any]] = []
+    for row in snapshot["rows"]:
+        full_path = str(row.get("full_path") or "")
+        if row.get("is_dir") is True:
+            continue
+        if full_path != boundary and not full_path.startswith(boundary + "/"):
+            continue
+        name = str(row.get("name") or "")
+        if is_video_filename(name):
+            rows.append(row)
+    return rows
+
+
+def _multi_season_absolute_map_path(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+) -> str | None:
+    """Derive an explicit episode map for a multi-season absolute-number block.
+
+    ``[01]..[47]`` style releases whose episode count exactly equals one
+    contiguous suffix of the official TMDB seasons (e.g. 爱丽丝篇 = S3+S4 of
+    the parent series) cannot be expressed by a single ``season`` hint.  The
+    Engine's explicit episode map bypasses the smart season inference for
+    exactly this shape; the map is written to the local state root and the
+    request carries only its path.  Returns ``None`` when the shape does not
+    match, leaving the ordinary planner path untouched.
+    """
+    identity = record.identity or {}
+    if str(identity.get("media_type") or "") != "tv":
+        return None
+    rows = _unit_video_rows(state_root, root_task_id, record)
+    if not rows:
+        return None
+    names = [str(row.get("name") or "") for row in rows]
+    if any(_SE_TOKEN_RE.search(name) for name in names):
+        return None
+    numbers: list[int] = []
+    for name in names:
+        match = _ABSOLUTE_BRACKET_RE.search(name)
+        if match is None:
+            return None
+        numbers.append(int(match.group(1)))
+    if sorted(numbers) != list(range(1, len(numbers) + 1)):
+        return None
+    total = len(numbers)
+    tmdb_id = identity.get("tmdb_id")
+    if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+        return None
+    try:
+        expected = TmdbEpisodeCatalog(runner.tmdb)(
+            {"tmdb_id": tmdb_id, "media_type": "tv"}
+        )
+    except Exception:
+        return None
+    if expected is None:
+        return None
+    seasons: dict[int, list[int]] = {}
+    for season, episode_rows in expected.items():
+        if isinstance(season, bool) or not isinstance(season, int) or season <= 0:
+            continue
+        if not isinstance(episode_rows, list):
+            continue
+        episodes = [
+            int(row.get("episode_number"))
+            for row in episode_rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("episode_number"), int)
+            and not isinstance(row.get("episode_number"), bool)
+            and int(row.get("episode_number")) > 0
+        ]
+        if episodes:
+            seasons[season] = sorted(set(episodes))
+    if not seasons:
+        return None
+    ordered = sorted(seasons)
+    chosen: list[int] | None = None
+    for start in ordered:
+        suffix = [season for season in ordered if season >= start]
+        if len(suffix) >= 2 and sum(len(seasons[s]) for s in suffix) == total:
+            chosen = suffix
+            break
+    if chosen is None:
+        return None
+    mapping: dict[str, str] = {}
+    absolute = 1
+    for season in chosen:
+        for episode in seasons[season]:
+            if absolute > total:
+                break
+            mapping[str(absolute)] = f"S{season:02d}E{episode:02d}"
+            absolute += 1
+    if absolute - 1 != total:
+        return None
+    path = state_root / f"episode_map_{record.work_unit_id}.json"
+    atomic_write_json(path, mapping, allow_nan=False)
+    return str(path)
+
+
 def _request_for_unit(
     runner: SimpleEngineRunner,
     record: WorkUnitRecord,
     root_task_id: str,
+    state_root: Path,
 ) -> EngineRequest:
     root_job = runner._read(root_task_id)  # noqa: SLF001 - ledger composition
     if root_job.target_shelf is None:
@@ -167,7 +285,16 @@ def _request_for_unit(
     season = identity.get("season")
     if isinstance(season, int) and not isinstance(season, bool) and season > 0:
         payload["season"] = season
-    return EngineRequest.from_mapping(payload)
+    request = EngineRequest.from_mapping(payload)
+    # Multi-season absolute-number blocks get the engine's explicit episode
+    # map (derived from the B snapshot + official TMDB seasons); anything
+    # else keeps the ordinary planner path.
+    map_path = _multi_season_absolute_map_path(
+        runner, state_root, root_task_id, record,
+    )
+    if map_path is not None:
+        request = replace(request, episode_map_path=map_path)
+    return request
 
 
 def _register_unit_episode_gaps(
@@ -283,7 +410,7 @@ def execute_new_work_units(
             updated.append(record)
             continue
         try:
-            request = _request_for_unit(runner, record, root_task_id)
+            request = _request_for_unit(runner, record, root_task_id, state_root)
             planned = _mark_internal_carrier(
                 runner,
                 runner.plan_job(
