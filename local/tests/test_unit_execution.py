@@ -171,7 +171,10 @@ class UnitExecutionTests(unittest.TestCase):
         self.assertEqual([result.outcome for result in results], ["accepted", "accepted"])
         self.assertEqual(len(planner_events), 2)
         for event in planner_events:
-            self.assertEqual(event["parent_path"], "/library/番剧")
+            # Two distinct TV identities in one intake root follow the
+            # Fate-style container rule: everything nests under one folder
+            # named after the cleaned intake directory.
+            self.assertEqual(event["parent_path"], "/library/番剧/two")
             self.assertEqual(event["media_type"], "tv")
         self.assertIn(101, {event["tmdb_id"] for event in planner_events})
         self.assertIn(102, {event["tmdb_id"] for event in planner_events})

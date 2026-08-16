@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import posixpath
 import re
 from typing import Any, Mapping, Sequence
 
@@ -149,6 +150,121 @@ def load_work_acceptance(
 
 _ABSOLUTE_BRACKET_RE = re.compile(r"\[0*(\d{1,4})\]", re.IGNORECASE)
 _SE_TOKEN_RE = re.compile(r"S0*\d{1,3}E0*\d{1,4}", re.IGNORECASE)
+_LEADING_INDEX_RE = re.compile(r"^\d{1,3}[.、．\-]\s*")
+_BRACKET_GROUP_RE = re.compile(
+    r"\[[^\]]*\]|【[^】]*】|"
+    r"\([^)]*(?:1080p|2160p|4k|x26[45]|hevc|avc|bdrip|web-?dl|bluray|remux)[^)]*\)",
+    re.IGNORECASE,
+)
+_RESOLUTION_TOKEN_RE = re.compile(
+    r"\b(1080p|2160p|4k|720p|480p|x26[45]|hevc|avc|bdrip|web-?dl|bluray|remux|dts|aac|flac|ma10p)\b",
+    re.IGNORECASE,
+)
+_JUNK_DIGIT_RUN_RE = re.compile(r"\d{2,}")
+
+
+def _clean_container_name(value: object) -> str | None:
+    """Strip release noise from a container folder name (bounded).
+
+    The operator's own folder name is the primary container name; only
+    obvious noise (release groups, resolutions, leading indexes, filler
+    symbols, digit runs) is removed.  A name that is still garbage after
+    cleaning yields ``None`` so the caller falls back to TMDB evidence.
+    """
+    name = str(value or "").strip()
+    if not name:
+        return None
+    name = _BRACKET_GROUP_RE.sub(" ", name)
+    name = _LEADING_INDEX_RE.sub(" ", name)
+    name = _RESOLUTION_TOKEN_RE.sub(" ", name)
+    name = re.sub(r"[#@！!]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" ._-/\\")
+    if len(name) < 2 or _JUNK_DIGIT_RUN_RE.search(name):
+        return None
+    return name
+
+
+def _container_plan(
+    runner: SimpleEngineRunner,
+    root_job: EngineJob,
+    records: list[WorkUnitRecord],
+) -> tuple[list[WorkUnitRecord], str | None, int | None]:
+    """Decide the Fate-style container layout for a multi-unit root.
+
+    Evidence-driven, no name guessing:
+
+    - one distinct TV identity (e.g. 刀剑神域 + its movies): the main series
+      owns the container; TV units plan at the shelf root and the main
+      unit's planned target root becomes the parent of every movie unit;
+    - several distinct TV identities or none (e.g. Fate, 空之境界): the
+      container is a pure collection named after the cleaned intake folder
+      (falling back to the first unit's TMDB title/boundary), and every
+      unit nests under it.
+
+    Single-unit roots are returned unchanged with no container parent.
+    Returns ``(ordered_records, container_parent, main_tmdb)``.
+    """
+    if len(records) <= 1:
+        return list(records), None, None
+    tv_ids: list[int] = []
+    for record in records:
+        identity = record.identity or {}
+        tmdb_id = identity.get("tmdb_id")
+        if (
+            str(identity.get("media_type") or "") == "tv"
+            and isinstance(tmdb_id, int)
+            and not isinstance(tmdb_id, bool)
+            and tmdb_id > 0
+        ):
+            if tmdb_id not in tv_ids:
+                tv_ids.append(tmdb_id)
+    if len(tv_ids) == 1:
+        main_tmdb = tv_ids[0]
+        ordered = sorted(
+            records,
+            key=lambda record: (
+                0
+                if (record.identity or {}).get("tmdb_id") == main_tmdb
+                and str((record.identity or {}).get("media_type") or "") == "tv"
+                else 1
+            ),
+        )
+        return ordered, None, main_tmdb
+    shelf = str(root_job.target_shelf or "anime")
+    shelf_root = target_root_for_shelf(runner.library_root, shelf)
+    intake_basename = posixpath.basename(
+        str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
+    )
+    container_name = _clean_container_name(intake_basename)
+    if container_name is None:
+        tv_records = [
+            record for record in records
+            if str((record.identity or {}).get("media_type") or "") == "tv"
+        ]
+        for candidate in tv_records or list(records):
+            title = str((candidate.identity or {}).get("title") or "").strip()
+            cleaned = (
+                title
+                if title
+                else _clean_container_name(
+                    posixpath.basename(str(candidate.source_paths[0]).rstrip("/"))
+                )
+            )
+            if cleaned:
+                container_name = cleaned
+                break
+    container_parent = (
+        f"{shelf_root}/{container_name}" if container_name else None
+    )
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            0
+            if str((record.identity or {}).get("media_type") or "") == "tv"
+            else 1
+        ),
+    )
+    return ordered, container_parent, None
 
 
 def _unit_video_rows(
@@ -271,6 +387,8 @@ def _request_for_unit(
     record: WorkUnitRecord,
     root_task_id: str,
     state_root: Path,
+    *,
+    parent_override: str | None = None,
 ) -> EngineRequest:
     root_job = runner._read(root_task_id)  # noqa: SLF001 - ledger composition
     if root_job.target_shelf is None:
@@ -283,7 +401,7 @@ def _request_for_unit(
         raise ValueError("单元身份缺少有效 tmdb_id")
     payload: dict[str, object] = {
         "source_path": record.source_paths[0],
-        "parent_path": shelf_root,
+        "parent_path": parent_override or shelf_root,
         "media_type": media_type,
         "tmdb_id": tmdb_id,
     }
@@ -381,10 +499,33 @@ def execute_new_work_units(
     retries it without creating a second carrier.
     """
     records = load_work_unit_records(state_root, root_task_id)
+    root_job = runner.get_job(root_task_id)
+    ordered, container_parent, main_tmdb = _container_plan(
+        runner, root_job, records,
+    )
+    main_target_root: str | None = None
+    if main_tmdb is not None:
+        # On re-runs the main unit is already executed; reuse its real
+        # target root as the container parent for movie units.
+        for record in ordered:
+            identity = record.identity or {}
+            if (
+                record.writer_job_id
+                and str(identity.get("media_type") or "") == "tv"
+                and identity.get("tmdb_id") == main_tmdb
+            ):
+                try:
+                    carrier = runner.get_job(record.writer_job_id)
+                    main_target_root = (
+                        str(carrier.plan.get("target_root") or "") or None
+                    )
+                except Exception:
+                    pass
+                break
     results: list[WorkAcceptanceResult] = []
     updated: list[WorkUnitRecord] = []
     changed = False
-    for record in records:
+    for record in ordered:
         if record.reconciliation_outcome != "new_work":
             results.append(WorkAcceptanceResult(
                 work_unit_id=record.work_unit_id,
@@ -415,7 +556,24 @@ def execute_new_work_units(
             updated.append(record)
             continue
         try:
-            request = _request_for_unit(runner, record, root_task_id, state_root)
+            identity = record.identity or {}
+            is_main_tv = (
+                main_tmdb is not None
+                and str(identity.get("media_type") or "") == "tv"
+                and identity.get("tmdb_id") == main_tmdb
+            )
+            if is_main_tv:
+                parent_override = None
+            elif container_parent:
+                parent_override = container_parent
+            elif main_tmdb is not None:
+                parent_override = main_target_root
+            else:
+                parent_override = None
+            request = _request_for_unit(
+                runner, record, root_task_id, state_root,
+                parent_override=parent_override,
+            )
             planned = _mark_internal_carrier(
                 runner,
                 runner.plan_job(
@@ -424,6 +582,10 @@ def execute_new_work_units(
                 ),
                 root_task_id,
             )
+            if is_main_tv and main_target_root is None:
+                main_target_root = (
+                    str(planned.plan.get("target_root") or "") or None
+                )
             record = replace(record, writer_job_id=planned.id)
             changed = True
             executed = runner.execute_job(planned.id)
