@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 import posixpath
+import time
 from typing import Callable, Mapping
 
 from engine.scrapeflow.gap_ledger import (
@@ -122,6 +123,28 @@ def _unit_subtree_is_empty(
     return True
 
 
+def _stable_kind(
+    runner: SimpleEngineRunner,
+    path: str,
+    *,
+    attempts: int = 4,
+    delay_seconds: float = 3.0,
+) -> str:
+    """Probe the remote kind with bounded retries against eventual consistency.
+
+    The Quark mount's listing cache can briefly return the pre-move snapshot
+    even with ``refresh=True``, so verification probes retry for a few
+    seconds before giving up.
+    """
+    last = runner._remote_entry_kind(path)
+    for _ in range(max(1, attempts) - 1):
+        if last != "unknown":
+            return last
+        time.sleep(delay_seconds)
+        last = runner._remote_entry_kind(path)
+    return last
+
+
 def _move_with_readback(
     runner: SimpleEngineRunner,
     *,
@@ -179,10 +202,16 @@ def _move_with_readback(
     _pause_checkpoint(pause_requested)
     parent = posixpath.dirname(source)
     move(parent, target_root, [name])
-    if (
-        runner._remote_entry_kind(source) != "missing"
-        or runner._remote_entry_kind(target) != "directory"
-    ):
+    verified = False
+    for _ in range(4):
+        time.sleep(3.0)
+        if (
+            _stable_kind(runner, source) == "missing"
+            and _stable_kind(runner, target) == "directory"
+        ):
+            verified = True
+            break
+    if not verified:
         raise EngineExecutionError(f"{field} 移动后回读失败")
 
 
