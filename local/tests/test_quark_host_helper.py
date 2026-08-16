@@ -473,7 +473,10 @@ class AListDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(request["allow_redirects"])
         client_options = captured["session"]
         assert isinstance(client_options, dict)
-        self.assertFalse(client_options["trust_env"])
+        # The delegated Quark HTTPS honors the ambient proxy (the live route
+        # for drive.quark.cn); only CDP discovery keeps an explicit direct
+        # session, so this session must NOT pin trust_env=False.
+        self.assertNotIn("trust_env", client_options)
 
 
 class HelperHttpTests(unittest.IsolatedAsyncioTestCase):

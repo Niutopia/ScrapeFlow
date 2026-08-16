@@ -1200,7 +1200,8 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
                 raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
             return dict(payload)
         raise QuarkHelperNotReady(
-            f"Quark returned an invalid fixed response (len={len(text) if isinstance(text, str) else 'n/a'})"
+            f"Quark returned an invalid fixed response "
+            f"(path={path} len={len(text) if isinstance(text, str) else 'n/a'})"
         ) from last_invalid
 
     async def _destination_fid(self, destination: str) -> str:
