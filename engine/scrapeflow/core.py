@@ -3533,28 +3533,99 @@ def _fractional_recap_evidence_candidates(
         specials_payload = tmdb_client.get(f"/tv/{tmdb_id}/season/0")
     except ApiError:
         specials_payload = {}
-    regular_episodes = [
-        item
-        for item in season_payload.get("episodes") or []
-        if isinstance(item, Mapping)
-        and isinstance(item.get("episode_number"), int)
-        and not isinstance(item.get("episode_number"), bool)
+    # A fractional recap often sits between the LAST episode of one season and
+    # the FIRST of the next (War of Underworld 24.5/36.5), or inside a season
+    # folder whose ordinal differs from the planning season.  Fetch a bounded
+    # set of positive seasons so the N/N+1 air-date interval can be found
+    # across season boundaries instead of only inside ``season``.
+    season_episodes: dict[int, list[Mapping[str, Any]]] = {
+        season: [
+            item
+            for item in season_payload.get("episodes") or []
+            if isinstance(item, Mapping)
+            and isinstance(item.get("episode_number"), int)
+            and not isinstance(item.get("episode_number"), bool)
+        ],
+    }
+    try:
+        show_payload = tmdb_client.get(f"/tv/{tmdb_id}")
+        candidate_seasons = [
+            int(item["season_number"])
+            for item in show_payload.get("seasons") or []
+            if isinstance(item, Mapping)
+            and isinstance(item.get("season_number"), int)
+            and not isinstance(item.get("season_number"), bool)
+            and int(item["season_number"]) > 0
+        ]
+    except ApiError:
+        candidate_seasons = []
+    for other_season in candidate_seasons[:10]:
+        if other_season in season_episodes:
+            continue
+        try:
+            payload = tmdb_client.get(f"/tv/{tmdb_id}/season/{other_season}")
+        except ApiError:
+            continue
+        rows = [
+            item
+            for item in payload.get("episodes") or []
+            if isinstance(item, Mapping)
+            and isinstance(item.get("episode_number"), int)
+            and not isinstance(item.get("episode_number"), bool)
+        ]
+        if rows:
+            season_episodes[other_season] = rows
+    all_regular_episodes = [
+        item for rows in season_episodes.values() for item in rows
     ]
     regular_by_number = {
-        int(item["episode_number"]): item for item in regular_episodes
+        int(item["episode_number"]): item for item in season_episodes.get(season, [])
     }
     before = regular_by_number.get(source_key.number)
     after = regular_by_number.get(source_key.number + 1)
     before_date = parsed_date(before.get("air_date")) if before else None
     after_date = parsed_date(after.get("air_date")) if after else None
+    # Cross-season interval evidence: any season whose episode N precedes the
+    # candidate and whose episode N+1 (or the next season's E01) follows it.
+    interval_pairs: list[tuple[date, date]] = []
+    for _season_number, rows in season_episodes.items():
+        by_number = {int(item["episode_number"]): item for item in rows}
+        before_item = by_number.get(source_key.number)
+        after_item = by_number.get(source_key.number + 1)
+        before_value = (
+            parsed_date(before_item.get("air_date")) if before_item else None
+        )
+        after_value = parsed_date(after_item.get("air_date")) if after_item else None
+        if before_value is None:
+            continue
+        if after_value is None:
+            # N is the season finale: the next season's first episode is the
+            # natural upper bound of the interval.
+            for next_season in sorted(season_episodes):
+                if next_season <= _season_number:
+                    continue
+                next_rows = season_episodes.get(next_season) or []
+                first_item = next(
+                    (
+                        item for item in next_rows
+                        if int(item.get("episode_number")) == 1
+                    ),
+                    None,
+                )
+                after_value = (
+                    parsed_date(first_item.get("air_date")) if first_item else None
+                )
+                break
+        if after_value is not None and before_value < after_value:
+            interval_pairs.append((before_value, after_value))
     regular_dates = sorted(
         item_date
-        for item in regular_episodes
+        for item in all_regular_episodes
         if (item_date := parsed_date(item.get("air_date"))) is not None
     )
     regular_runtimes = sorted(
         int(item["runtime"])
-        for item in regular_episodes
+        for item in all_regular_episodes
         if isinstance(item.get("runtime"), int)
         and not isinstance(item.get("runtime"), bool)
         and int(item["runtime"]) > 0
@@ -3682,13 +3753,14 @@ def _fractional_recap_evidence_candidates(
         candidate_date = parsed_date(metadata.get("air_date"))
         exact_interval = bool(
             candidate_date
-            and before_date
-            and after_date
-            and before_date < candidate_date < after_date
+            and any(
+                interval_start < candidate_date < interval_end
+                for interval_start, interval_end in interval_pairs
+            )
         )
         if exact_interval:
-            score += 3.0
-            evidence.append("官方播出日位于 N 与 N+1 之间")
+            score += 4.0
+            evidence.append("官方播出日位于某季 N 与 N+1 之间（含跨季边界）")
         elif candidate_date and before_date and not after_date:
             if 0 < (candidate_date - before_date).days <= 35:
                 score += 1.5
@@ -3788,6 +3860,14 @@ def _fractional_recap_evidence_candidates(
                 and runtime >= 40
                 and exact_interval
                 and (movie_release_inside or exact_title_overlap)
+            )
+            or (
+                # A full-length program airing exactly between one season's
+                # N and N+1 is the generic structural identity of a recap;
+                # it must not require any title semantics or data row.
+                exact_interval
+                and runtime is not None
+                and runtime >= 18
             )
         )
         scored.append({

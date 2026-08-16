@@ -1,4 +1,4 @@
-"""Tests for the fractional-special mapping (data-ized N.5 answers)."""
+"""Tests for the fractional-special mapping (generic cross-season intervals)."""
 
 from __future__ import annotations
 
@@ -15,26 +15,38 @@ class FakeTMDB:
 
     def __init__(
         self,
-        season_episodes: list[dict[str, Any]],
+        seasons: dict[int, list[dict[str, Any]]],
         specials: list[dict[str, Any]],
     ) -> None:
-        self.season_episodes = season_episodes
+        self.seasons = seasons
         self.specials = specials
 
     def get(self, path: str, **params: Any) -> dict[str, Any]:
         del params
         if path.endswith("/season/0"):
             return {"episodes": self.specials}
-        if path.endswith("/season/1"):
-            return {"episodes": self.season_episodes}
+        for season, rows in self.seasons.items():
+            if path.endswith(f"/season/{season}"):
+                return {"episodes": rows}
+        if not path.endswith("/season/0") and path.count("/") == 2:
+            return {
+                "seasons": [
+                    {"season_number": season, "name": f"S{season}"}
+                    for season in sorted(self.seasons)
+                ],
+            }
         return {"episodes": []}
 
 
-SAO_S1 = [
-    {"episode_number": n, "air_date": f"2012-{7 + (n % 6):02d}-{1 + (n % 27):02d}",
-     "runtime": 24}
-    for n in range(1, 26)
-]
+def _episodes(first: int, last: int, year: int) -> list[dict[str, Any]]:
+    return [
+        {"episode_number": n, "air_date": f"{year}-{1 + (n % 9):02d}-{1 + (n % 27):02d}",
+         "runtime": 24}
+        for n in range(first, last + 1)
+    ]
+
+
+SAO_S1 = _episodes(1, 25, 2012)
 
 
 class FractionalSpecialMappingTests(unittest.TestCase):
@@ -45,11 +57,8 @@ class FractionalSpecialMappingTests(unittest.TestCase):
         self.assertEqual(rows["36.5"], ("S00E25", "第12.5话 回忆"))
 
     def test_explicit_fractional_title_ignores_the_far_future_veto(self) -> None:
-        # [18.5] matches the official S00E23 title literally, but the special
-        # aired in 2019 while the season context is 2012.  The literal title
-        # must win over the season-timeline veto.
         tmdb = FakeTMDB(
-            SAO_S1,
+            {1: SAO_S1},
             [{"episode_number": 23, "name": "第18.5话 Recollection",
               "air_date": "2019-02-17", "runtime": 24}],
         )
@@ -63,10 +72,8 @@ class FractionalSpecialMappingTests(unittest.TestCase):
         self.assertEqual([(item[0], item[1]) for item in candidates], [(0, 23)])
 
     def test_data_ized_mapping_bridges_a_numberless_title(self) -> None:
-        # [24.5] has no official title containing "24.5"; only the lexicon
-        # row says it is S00E24 第0话 Reflection.
         tmdb = FakeTMDB(
-            SAO_S1,
+            {1: SAO_S1},
             [{"episode_number": 24, "name": "第0话 Reflection",
               "air_date": "2019-10-06", "runtime": 24}],
         )
@@ -79,8 +86,45 @@ class FractionalSpecialMappingTests(unittest.TestCase):
         )
         self.assertEqual([(item[0], item[1]) for item in candidates], [(0, 24)])
 
+    def test_cross_season_interval_matches_without_any_data_row(self) -> None:
+        # A series OUTSIDE the lexicon: N=24 is the season-2 finale, and the
+        # recap airs between S2E24 and S3E01.  The generic interval evidence
+        # must match even though the planning season is 1.
+        tmdb = FakeTMDB(
+            {1: _episodes(1, 24, 2015),
+             2: _episodes(1, 24, 2019),
+             3: _episodes(1, 23, 2020)},
+            [{"episode_number": 2, "name": "第0话 Reflection",
+              "air_date": "2019-10-06", "runtime": 24}],
+        )
+        candidates, _reason = _fractional_recap_evidence_candidates(
+            tmdb, 999, 1,
+            EpisodeKey(kind="fractional", number=24, fractional_digits="5"),
+            {(0, 2): ["第0话 Reflection"]},
+            [{"name": "Some.Show.War.of.Underworld.[24.5].mkv",
+              "full_path": "/x/[24.5].mkv"}],
+        )
+        self.assertEqual([(item[0], item[1]) for item in candidates], [(0, 2)])
+
+    def test_season_finale_fractional_uses_next_season_opener_as_bound(self) -> None:
+        # A [13.5] recap inside a 13-episode season folder: the upper bound is
+        # the next season's E01.
+        tmdb = FakeTMDB(
+            {1: _episodes(1, 13, 2016),
+             2: _episodes(1, 13, 2017)},
+            [{"episode_number": 3, "name": "第13.5话 总集篇",
+              "air_date": "2016-12-25", "runtime": 24}],
+        )
+        candidates, _reason = _fractional_recap_evidence_candidates(
+            tmdb, 998, 1,
+            EpisodeKey(kind="fractional", number=13, fractional_digits="5"),
+            {(0, 3): ["第13.5话 总集篇"]},
+            [{"name": "Durarara.S1.[13.5].mkv", "full_path": "/x/[13.5].mkv"}],
+        )
+        self.assertEqual([(item[0], item[1]) for item in candidates], [(0, 3)])
+
     def test_unknown_fractional_still_fails_closed(self) -> None:
-        tmdb = FakeTMDB(SAO_S1, [])
+        tmdb = FakeTMDB({1: SAO_S1}, [])
         candidates, reason = _fractional_recap_evidence_candidates(
             tmdb, 45782, 1,
             EpisodeKey(kind="fractional", number=99, fractional_digits="5"),
