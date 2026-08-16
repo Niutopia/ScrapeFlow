@@ -90,6 +90,47 @@ def _persist_root(
     return updated
 
 
+def _refresh_lane_acceptance(
+    state_root: Path,
+    root_task_id: str,
+    records: list,
+) -> None:
+    """Rewrite acceptance rows for completed E-lane units.
+
+    E lanes record progress on the WorkUnit ledger, not the acceptance file,
+    so a stale failed acceptance from an earlier run must be replaced once
+    the lane finishes; otherwise R would keep counting the old failure.
+    """
+    from .unit_execution import (
+        WorkAcceptanceResult,
+        load_work_acceptance,
+        save_work_acceptance,
+    )
+    fresh = {
+        row.work_unit_id: row
+        for row in load_work_acceptance(state_root, root_task_id)
+    }
+    for record in records:
+        outcome = record.reconciliation_outcome
+        if (
+            outcome in {"duplicate_complete", "existing_gap", "merge_existing"}
+            and record.lane_status
+        ):
+            fresh[record.work_unit_id] = WorkAcceptanceResult(
+                work_unit_id=record.work_unit_id,
+                outcome="accepted",
+                writer_job_id=record.writer_job_id,
+                phase="executed" if outcome == "merge_existing" else "completed",
+                target_root=record.matched_work_root or "",
+                planned_files=0,
+                error=None,
+                recorded_at=_now(),
+            )
+    save_work_acceptance(
+        state_root, root_task_id, list(fresh.values()),
+    )
+
+
 def run_root_pipeline(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -178,6 +219,11 @@ def run_root_pipeline(
                 runner, job, "failed",
                 error=f"单元 E 通道执行失败: {redact_error(exc)}",
             )
+        _refresh_lane_acceptance(
+            state_root,
+            root_task_id,
+            load_work_unit_records(state_root, root_task_id),
+        )
 
     new_work_records = [
         record

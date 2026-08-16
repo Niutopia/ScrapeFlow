@@ -55,18 +55,15 @@ def aggregate_root_job(state_root: Path, root_task_id: str) -> RootJobAggregate:
     failed = 0
     for record in records:
         result = acceptance.get(record.work_unit_id)
-        if result is not None and result.outcome == "failed":
-            failed += 1
-            continue
         if record.identity_status in {"uncertain", "failed"}:
             attention += 1
             continue
         if record.reconciliation_outcome == "uncertain":
             attention += 1
             continue
-        if result is not None and result.outcome == "accepted":
-            completed += 1
-            continue
+        # E-lane units: the durable lane status is authoritative; a stale
+        # failed acceptance from an earlier run must not mask a completed
+        # lane (the pipeline refreshes acceptance after each lane pass).
         if record.reconciliation_outcome == "duplicate_complete":
             if record.lane_status == "duplicate_consumed":
                 completed += 1
@@ -78,6 +75,12 @@ def aggregate_root_job(state_root: Path, root_task_id: str) -> RootJobAggregate:
         if record.reconciliation_outcome == "merge_existing":
             if record.lane_status == "merge_done":
                 completed += 1
+            continue
+        if result is not None and result.outcome == "failed":
+            failed += 1
+            continue
+        if result is not None and result.outcome == "accepted":
+            completed += 1
             continue
     in_progress = len(records) - completed - attention - failed
     return RootJobAggregate(
