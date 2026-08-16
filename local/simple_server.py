@@ -457,7 +457,7 @@ class SimpleApplication:
             "connected": self.remote_configured,
             "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
             "engine_configured": self.engine_configured,
-            "build_version": os.getenv("SCRAPEFLOW_BUILD_VERSION", "").strip() or "target-shelf-rc1",
+            "build_version": os.getenv("SCRAPEFLOW_BUILD_VERSION", "").strip() or "p0-p10-migration",
             "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or None,
             "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or None,
             "provider_capabilities": provider_capability_snapshot(),
