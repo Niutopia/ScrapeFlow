@@ -1964,10 +1964,6 @@ class SimpleEngineRunner:
                 "automatic_attempts": 0,
                 "automatic_terminal": False,
                 "next_retry_seconds": None,
-                "reconciliation": {
-                    "status": "blocked_by_target_shelf",
-                    "outcome": None,
-                },
             },
             target_shelf=None,
             target_root=None,

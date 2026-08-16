@@ -189,8 +189,15 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(created["source"], "/library/待刮削/Example")
         self.assertIsNone(created["target_shelf"])
         self.assertIsNone(created["target_root"])
-        self.assertEqual(created["reconciliation"]["status"], "blocked_by_target_shelf")
-        self.assertEqual(created["allowed_target_shelves"], [])
+        # Retirement batch #2: creation no longer writes the legacy
+        # blocked_by_target_shelf reconciliation marker; the awaiting gate
+        # reads the phase, and reconciliation appears only after D runs.
+        self.assertIsNone(created["reconciliation"])
+        # The awaiting task is offered the closed shelf enum (S-step): shelf
+        # selection no longer waits for a legacy reconciliation verdict.
+        self.assertEqual(
+            created["allowed_target_shelves"], ["movie", "anime", "us_tv"],
+        )
         self.assertNotIn("identity_override", created["plan"])
         persisted = self.runner.get_job(job_id)
         self.assertEqual(persisted.request, {"source_path": "/library/待刮削/Example"})
