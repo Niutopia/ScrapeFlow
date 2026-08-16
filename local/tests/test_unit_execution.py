@@ -1,0 +1,206 @@
+"""Tests for F/G/H composition: unit-driven planning, single-writer execution,
+and typed acceptance."""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from engine.scrapeflow.errors import PlanError
+from engine.scrapeflow.models import Plan, PlannedFile
+from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+from engine.scrapeflow.unit_identity import apply_work_unit_override
+from engine.scrapeflow.work_units import load_work_unit_records
+
+from local.scrapeflow_api.library_index import reconcile_root_work_units
+from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+from local.scrapeflow_api.unit_execution import (
+    execute_new_work_units,
+    load_work_acceptance,
+)
+
+from local.tests.test_library_index import IndexAList
+from local.tests.test_simple_engine_runner import FAKE_VIDEO_BYTES, FAKE_VIDEO_SIZE
+
+
+def _recording_planner(events: list[dict], *, fail_for: str | None = None):
+    def planner(request, _alist, _tmdb) -> Plan:
+        events.append({
+            "source_path": request.source_path,
+            "parent_path": request.parent_path,
+            "media_type": request.media_type,
+            "tmdb_id": request.tmdb_id,
+        })
+        if fail_for is not None and request.source_path == fail_for:
+            raise PlanError("injected planner failure")
+        target = f"{request.parent_path.rstrip('/')}/Work ({request.tmdb_id})"
+        return Plan(
+            mode="tv" if request.media_type == "tv" else "movie",
+            source_root=request.source_path,
+            target_root=target,
+            files=[PlannedFile(
+                source_path=f"{request.source_path}/S01E01.mkv",
+                source_dir=request.source_path,
+                original_name="S01E01.mkv",
+                final_name="S01E01.mkv",
+                target_dir=target,
+                media_kind="video",
+                source_size=FAKE_VIDEO_SIZE,
+            )],
+            warnings=[],
+            metadata={
+                "tmdb_id": request.tmdb_id,
+                "title": "Work",
+                "year": "2020",
+                "poster_path": None,
+                "backdrop_path": None,
+            },
+        )
+
+    return planner
+
+
+class UnitExecutionTests(unittest.TestCase):
+    def _setup(self, files: dict[str, bytes], *, library_files: dict[str, bytes] | None = None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        all_files = dict(files)
+        library = library_files or {}
+        alist = IndexAList({**all_files, **library})
+        planner_events: list[dict] = []
+        executor_events: list[str] = []
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=object(),
+            planner=_recording_planner(planner_events),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: (
+                executor_events.append(str(plan.target_root)) or {"ok": True}
+            ),
+        )
+        return state_root, alist, runner, planner_events, executor_events
+
+    def _prepare_two_new_work_units(
+        self,
+        files: dict[str, bytes],
+        runner: SimpleEngineRunner,
+        alist: IndexAList,
+        state_root: Path,
+        root_task_id: str,
+    ) -> None:
+        pending = runner.create_pending_job("/incoming/two", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/two", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 2)
+        for index, record in enumerate(records):
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=101 + index,
+            )
+
+    def test_new_work_units_plan_and_execute_through_the_carrier(self) -> None:
+        files = {
+            "/incoming/two/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/two/Another Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(files)
+        root_task_id = "root-1"
+        self._prepare_two_new_work_units(files, runner, alist, state_root, root_task_id)
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        for record in load_work_unit_records(state_root, root_task_id):
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+
+        results = execute_new_work_units(runner, state_root, root_task_id)
+        self.assertEqual([result.outcome for result in results], ["accepted", "accepted"])
+        self.assertEqual(len(planner_events), 2)
+        for event in planner_events:
+            self.assertEqual(event["parent_path"], "/library/番剧")
+            self.assertEqual(event["media_type"], "tv")
+        self.assertIn(101, {event["tmdb_id"] for event in planner_events})
+        self.assertIn(102, {event["tmdb_id"] for event in planner_events})
+        self.assertEqual(len(executor_events), 2)
+        for event in executor_events:
+            self.assertIn("/library/番剧/", event)
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertTrue(all(record.writer_job_id for record in records))
+        persisted = load_work_acceptance(state_root, root_task_id)
+        self.assertEqual(len(persisted), 2)
+        self.assertTrue(all(result.outcome == "accepted" for result in persisted))
+        self.assertTrue(all(result.planned_files == 1 for result in persisted))
+
+    def test_retry_skips_executed_units_and_retries_failures(self) -> None:
+        files = {
+            "/incoming/two/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/two/Broken Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _planner_events, executor_events = self._setup(files)
+        root_task_id = "root-2"
+        self._prepare_two_new_work_units(files, runner, alist, state_root, root_task_id)
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        # Fail the planner for the second unit on the first pass.
+        retry_events: list[dict] = []
+        runner.planner = _recording_planner(
+            retry_events, fail_for="/incoming/two/Broken Show",
+        )
+        first = execute_new_work_units(runner, state_root, root_task_id)
+        by_outcome = {result.outcome for result in first}
+        self.assertEqual(by_outcome, {"accepted", "failed"})
+        failed = next(result for result in first if result.outcome == "failed")
+        self.assertIsNone(failed.writer_job_id)
+        self.assertIsNotNone(failed.error)
+        records = load_work_unit_records(state_root, root_task_id)
+        written = {record.boundary_key for record in records if record.writer_job_id}
+        self.assertEqual(written, {"/incoming/two/Fate Zero"})
+        # A second pass retries only the failed unit.
+        retry_events.clear()
+        runner.planner = _recording_planner(retry_events)
+        second = execute_new_work_units(runner, state_root, root_task_id)
+        self.assertTrue(all(result.outcome == "accepted" for result in second))
+        self.assertEqual(len(retry_events), 1)
+        self.assertEqual(retry_events[0]["source_path"], "/incoming/two/Broken Show")
+        self.assertEqual(len(executor_events), 2)
+
+    def test_non_new_work_units_are_skipped_without_writes(self) -> None:
+        files = {
+            "/incoming/two/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/two/Another Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        library = {
+            "/library/番剧/Fate Zero/tvshow.nfo": (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                b"<tvshow><title>Fate/Zero</title><year>2011</year>"
+                b"<tmdbid>101</tmdbid></tvshow>\n"
+            ),
+            "/library/番剧/Fate Zero/Season 01/S01E01.mkv": b"v",
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            files, library_files=library,
+        )
+        root_task_id = "root-3"
+        self._prepare_two_new_work_units(files, runner, alist, state_root, root_task_id)
+        # Fate Zero (tmdb 101) now exists in 番剧; its unit must flip to
+        # duplicate/merge and stay out of the new-work writer.
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        records = load_work_unit_records(state_root, root_task_id)
+        by_tmdb = {record.identity["tmdb_id"]: record for record in records}
+        self.assertNotEqual(by_tmdb[101].reconciliation_outcome, "new_work")
+        self.assertEqual(by_tmdb[102].reconciliation_outcome, "new_work")
+
+        results = execute_new_work_units(runner, state_root, root_task_id)
+        self.assertEqual(
+            {result.outcome for result in results},
+            {"accepted", "skipped"},
+        )
+        self.assertEqual(len(planner_events), 1)
+        self.assertEqual(len(executor_events), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

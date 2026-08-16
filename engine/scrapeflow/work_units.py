@@ -321,6 +321,7 @@ class WorkUnitRecord:
     candidate_identities: tuple[dict[str, Any], ...] = ()
     reconciliation_outcome: str | None = None
     matched_work_root: str | None = None
+    writer_job_id: str | None = None
     attention: str | None = None
     updated_at: str = field(default_factory=_now)
 
@@ -338,6 +339,7 @@ class WorkUnitRecord:
             "candidate_identities": [dict(c) for c in self.candidate_identities],
             "reconciliation_outcome": self.reconciliation_outcome,
             "matched_work_root": self.matched_work_root,
+            "writer_job_id": self.writer_job_id,
             "attention": self.attention,
             "updated_at": self.updated_at,
         }
@@ -359,6 +361,7 @@ class WorkUnitRecord:
             candidate_identities=tuple(dict(c) for c in cand_list if isinstance(c, Mapping)),
             reconciliation_outcome=str(raw["reconciliation_outcome"]) if raw.get("reconciliation_outcome") else None,
             matched_work_root=str(raw["matched_work_root"]) if raw.get("matched_work_root") else None,
+            writer_job_id=str(raw["writer_job_id"]) if raw.get("writer_job_id") else None,
             attention=str(raw["attention"]) if raw.get("attention") else None,
             updated_at=str(raw.get("updated_at") or _now()),
         )
@@ -387,6 +390,7 @@ def create_work_units_from_candidates(
             candidate_identities=(),
             reconciliation_outcome=None,
             matched_work_root=None,
+            writer_job_id=None,
             attention=None,
             updated_at=now_str,
         )
