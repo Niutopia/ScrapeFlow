@@ -492,7 +492,12 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         *,
         job_id: str | None = None,
     ):
-        """Construct a legacy downstream fixture for plan-boundary tests."""
+        """Construct a legacy downstream fixture for plan-boundary tests.
+
+        The explicit ``automatic_stage`` key models a pre-retirement legacy
+        record; the runner no longer writes the mirror field, and the start
+        transition drops it.
+        """
         pending = runner.create_pending_job(source, job_id=job_id)
         summary = dict(pending.summary)
         summary.pop("reconciliation", None)
@@ -724,7 +729,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
 
         self.assertEqual(failed.phase, "failed_planning")
         self.assertTrue(failed.summary["automatic_terminal"])
-        self.assertEqual(failed.summary["automatic_stage"], "failed_planning")
+        # 存量清退：automatic_stage 镜像已不再由 runner 续写，phase 为唯一权威。
+        self.assertNotIn("automatic_stage", failed.summary)
         self.assertEqual(failed.summary["automatic_attempts"], 0)
         self.assertIsNone(failed.summary["next_retry_seconds"])
         self.assertEqual(failed.plan, {})
@@ -829,7 +835,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         failed = runner.get_job(queued.id)
         self.assertEqual(failed.phase, "failed_archive")
         self.assertTrue(failed.summary["automatic_terminal"])
-        self.assertEqual(failed.summary["automatic_stage"], "failed_archive")
+        # 存量清退：automatic_stage 镜像已不再由 runner 续写，phase 为唯一权威。
+        self.assertNotIn("automatic_stage", failed.summary)
         self.assertEqual(failed.summary["automatic_attempts"], 0)
         self.assertEqual(events, ["archive_preprocess"])
         identity.assert_not_called()

@@ -1937,7 +1937,6 @@ class SimpleEngineRunner:
             plan={},
             summary={
                 "automatic": True,
-                "automatic_stage": "awaiting_target_shelf",
                 "source_root": source,
                 "ingress_source_path": source,
                 "mode": "auto",
@@ -2124,9 +2123,11 @@ class SimpleEngineRunner:
             if children:
                 raise EngineJobConflictError("任务仍有活动内部子任务，不能重新选择目标货架")
             summary = dict(job.summary)
+            # 存量清退：``automatic_stage`` 是 legacy 状态镜像，phase 是唯一权威。
+            # 执行链路接管记录时丢弃旧记录残留的镜像值，且不再续写。
+            summary.pop("automatic_stage", None)
             summary.update({
                 "automatic": True,
-                "automatic_stage": "queued",
                 "source_root": source,
                 "ingress_source_path": source,
                 "target_shelf": selected.value,
@@ -2178,7 +2179,8 @@ class SimpleEngineRunner:
             ):
                 raise EngineJobConflictError("任务当前不能进入只读对账")
             summary = dict(job.summary)
-            summary["automatic_stage"] = "reconciling"
+            # 存量清退：phase=reconciling 即权威状态，不再续写镜像字段。
+            summary.pop("automatic_stage", None)
             updated = replace(job, phase="reconciling", summary=summary, updated_at=_now())
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return updated
@@ -2895,11 +2897,6 @@ class SimpleEngineRunner:
                 reconciliation["matched_shelf"] = matched_shelf
             summary.update({
                 "automatic": True,
-                "automatic_stage": (
-                    "queued" if outcome == "new_work"
-                    else "reconciliation_needs_attention" if outcome == "uncertain"
-                    else "reconciled"
-                ),
                 "reconciliation": reconciliation,
                 "reconciliation_outcome": outcome,
                 "automatic_terminal": outcome not in {"new_work", "merge_existing"},
@@ -2995,7 +2992,8 @@ class SimpleEngineRunner:
                 "confirmed_at": _now(),
             }
             updated_summary["automatic"] = True
-            updated_summary["automatic_stage"] = "reconciling"
+            # 存量清退：phase=reconciling 即权威状态，不再续写镜像字段。
+            updated_summary.pop("automatic_stage", None)
             updated_summary["automatic_terminal"] = False
             updated_summary["next_retry_seconds"] = None
             updated_summary.pop("existing_gap_registration", None)
@@ -3052,9 +3050,10 @@ class SimpleEngineRunner:
             )
             source = self._job_ingress_source(job)
             summary = dict(job.summary)
+            # 存量清退：phase=queued 即权威状态，不再续写镜像字段。
+            summary.pop("automatic_stage", None)
             summary.update({
                 "automatic": True,
-                "automatic_stage": "queued",
                 "selected_target_root": shelf_root,
                 "target_work_path": work_root,
                 "merge_existing_ready": True,
@@ -3722,7 +3721,6 @@ class SimpleEngineRunner:
             "audit_owned": True,
             "audit_work_key": work_key,
             "audit_origin": "library_audit",
-            "automatic_stage": "gap_discovering",
             "source_root": "全库审计",
             "target_root": target_root,
             "mode": media_type,
@@ -3845,7 +3843,6 @@ class SimpleEngineRunner:
             "subtitle_only": True,
             "audit_work_key": work_key,
             "audit_origin": "library_audit",
-            "automatic_stage": "gap_discovering",
             "source_root": "全库审计",
             "target_root": target_root,
             "mode": media_type,
@@ -4988,7 +4985,7 @@ class SimpleEngineRunner:
                 "target_shelf": selected_shelf.value,
             })
             archiving_summary = self._with_active_operation(
-                {**job.summary, "automatic_stage": "archive_preprocessing"},
+                dict(job.summary),
                 kind="planning",
             )
             archiving = replace(
@@ -5019,7 +5016,6 @@ class SimpleEngineRunner:
                 summary = dict(archiving.summary)
                 summary.update({
                     "automatic_terminal": True,
-                    "automatic_stage": "failed_archive",
                     "archive_projection_status": "invalid",
                 })
                 summary = self._without_active_operation(summary)
@@ -5173,7 +5169,6 @@ class SimpleEngineRunner:
                 summary.update({
                     "identity": identity.as_dict(),
                     "automatic": True,
-                    "automatic_stage": "failed_planning",
                     "target_shelf": selected_shelf.value,
                     "selected_target_root": selected_root,
                     "automatic_terminal": True,
@@ -5235,7 +5230,6 @@ class SimpleEngineRunner:
             summary.update({
                 "identity": identity.as_dict(),
                 "automatic": True,
-                "automatic_stage": "formal_write",
                 "target_shelf": selected_shelf.value,
                 "selected_target_root": selected_root,
                 "resource_gaps": list(
@@ -5739,7 +5733,6 @@ class SimpleEngineRunner:
             summary["reconciliation"] = reconciliation
         summary["existing_gap_registration"] = marker
         summary["source_fate"] = "retained_needs_attention"
-        summary["automatic_stage"] = "existing_gap_registration_blocked"
         summary["automatic_terminal"] = True
         summary["next_retry_seconds"] = None
         updated = replace(
@@ -5909,7 +5902,6 @@ class SimpleEngineRunner:
         updated_summary = dict(job.summary)
         updated_summary["existing_gap_registration"] = completed_marker
         updated_summary["source_fate"] = "moved_to_hold"
-        updated_summary["automatic_stage"] = "existing_gap_registered"
         updated_summary["automatic_terminal"] = True
         updated_summary["next_retry_seconds"] = None
         rec = updated_summary.get("reconciliation")
@@ -6127,7 +6119,6 @@ class SimpleEngineRunner:
                 "evidence": "reconciliation.existing_gap.empty_ingress",
             }
             prepared_summary["source_fate"] = "hold_prepared"
-            prepared_summary["automatic_stage"] = "existing_gap_hold_prepared"
             prepared = replace(
                 latest,
                 summary=prepared_summary,
@@ -6412,7 +6403,6 @@ class SimpleEngineRunner:
             updated_summary["duplicate_complete_consumption"] = marker
             updated_summary["duplicate_cleanup"] = marker
             updated_summary["source_fate"] = str(consumed["status"])
-            updated_summary["automatic_stage"] = "duplicate_complete"
             updated_summary["automatic_terminal"] = True
             updated_summary["next_retry_seconds"] = None
             updated = replace(

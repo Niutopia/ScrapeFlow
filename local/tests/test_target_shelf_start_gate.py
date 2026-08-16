@@ -119,7 +119,9 @@ class TargetShelfStartGateTests(unittest.TestCase):
 
         The read-only reconciliation suite supplies the real ``new_work``
         identity projection.  These older planner-boundary tests intentionally
-        model records written before that projection existed.
+        model records written before that projection existed.  The explicit
+        ``automatic_stage`` key models a pre-retirement legacy record; the
+        runner no longer writes the mirror field.
         """
         pending = self.runner.create_pending_job(source)
         summary = dict(pending.summary)

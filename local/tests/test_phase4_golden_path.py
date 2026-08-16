@@ -324,7 +324,11 @@ class Phase4GoldenPathTests(unittest.TestCase):
 
     @staticmethod
     def _new_work_waiting(runner, source: str, *, job_id: str):
-        """Keep archive fixtures as legacy downstream plan-boundary records."""
+        """Keep archive fixtures as legacy downstream plan-boundary records.
+
+        The explicit ``automatic_stage`` key models a pre-retirement legacy
+        record; the runner no longer writes the mirror field.
+        """
         waiting = runner.create_pending_job(source, job_id=job_id)
         summary = dict(waiting.summary)
         summary.pop("reconciliation", None)

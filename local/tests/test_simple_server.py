@@ -132,7 +132,12 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         return payload["job"]
 
     def new_work_waiting(self, source: str = "/library/待刮削/Example"):
-        """Build a legacy downstream fixture for post-selection API tests."""
+        """Build a legacy downstream fixture for post-selection API tests.
+
+        The explicit ``automatic_stage`` key models a pre-retirement legacy
+        record; the runner no longer writes the mirror field, and the start
+        transition drops it.
+        """
         pending = self.runner.create_pending_job(source)
         summary = dict(pending.summary)
         summary.pop("reconciliation", None)
