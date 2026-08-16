@@ -2148,7 +2148,6 @@ class SimpleEngineRunner:
             if children:
                 raise EngineJobConflictError("任务仍有活动内部子任务，不能重新选择目标货架")
             summary = dict(job.summary)
-            pre_reconciliation = not reconciliation_outcome
             summary.update({
                 "automatic": True,
                 "automatic_stage": "queued",
@@ -2156,7 +2155,6 @@ class SimpleEngineRunner:
                 "ingress_source_path": source,
                 "target_shelf": selected.value,
                 "selected_target_root": selected_root,
-                "target_work_path": None,
                 "automatic_terminal": False,
                 "next_retry_seconds": None,
             })
@@ -4937,7 +4935,6 @@ class SimpleEngineRunner:
             "automatic": True,
             "target_shelf": selected_shelf.value,
             "selected_target_root": selected_root,
-            "target_work_path": summary.get("target_root"),
         })
         if original_source != request.source_path:
             summary["ingress_source_path"] = original_source
@@ -5185,7 +5182,6 @@ class SimpleEngineRunner:
                     "automatic_stage": "target_policy_conflict",
                     "target_shelf": selected_shelf.value,
                     "selected_target_root": selected_root,
-                    "target_work_path": None,
                 })
                 if archive_projection is not None:
                     # Keep the verified staging coordinates across the
@@ -5235,7 +5231,6 @@ class SimpleEngineRunner:
                     "automatic_stage": "failed_planning",
                     "target_shelf": selected_shelf.value,
                     "selected_target_root": selected_root,
-                    "target_work_path": None,
                     "automatic_terminal": True,
                     "next_retry_seconds": None,
                 })
@@ -5298,9 +5293,6 @@ class SimpleEngineRunner:
                 "automatic_stage": "formal_write",
                 "target_shelf": selected_shelf.value,
                 "selected_target_root": selected_root,
-                # Keep the historical summary/plan ``target_root`` as the
-                # concrete work path; audit and Provider rely on that scope.
-                "target_work_path": summary.get("target_root"),
                 "resource_gaps": list(
                     (body.get("scan_report") or {}).get("resource_gaps") or []
                 ) if isinstance(body.get("scan_report"), Mapping) else [],

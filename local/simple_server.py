@@ -637,21 +637,6 @@ class SimpleApplication:
             return None
         return value
 
-    @staticmethod
-    def _automatic_job_needs_dispatch(job: EngineJob) -> bool:
-        """Whether an existing intake item should be scheduled now.
-
-        A terminal failure remains visible instead of being recreated on every
-        30-second scan.  The scheduler already performs bounded retries for
-        transient failures; a genuinely exhausted source can be retried after
-        its naming/configuration problem is fixed, without turning the intake
-        monitor into an endless duplicate-job generator.
-        """
-        return job.phase in {
-            "reconciling", "queued", "analyzing", "archive_preprocessing", "identity_matching", "planning", "planned",
-            "executing", "verifying", "cleaning", "retry_wait", "failed",
-        }
-
     def _scan_inbound_once(self) -> list[str]:
         """Update the IntakeSource catalog for each direct child of ``/待刮削``.
 
