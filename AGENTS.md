@@ -33,7 +33,7 @@
 - R：根任务聚合（`root_aggregation`，`GET /api/jobs/:id/work-units`）；
 - 合规：作品名硬编码全部数据化（`engine/scrapeflow/data/release_lexicon.py`）、货架-媒体类型矩阵已删除、TMDB 匹配器统一为单一评分核心；
 - 测试：`tests/corpus/` 10 场景 + 真实 A→B→W→C→D 链路回归。
-- 存量清退（裁决②，渐进）：`target_work_path` 的新流程写入已移除（公开投影改由 plan/summary `target_root` 派生，legacy 合并交接读取保留）；死代码 `pre_reconciliation`、`_automatic_job_needs_dispatch` 已删；其余存量字段与 provider gate 机制保持冻结，继续按运行节奏清退。
+- 存量清退（裁决②，渐进）：`target_work_path` 的新流程写入已移除（公开投影改由 plan/summary `target_root` 派生，legacy 合并交接读取保留）；创建期的 `reconciliation{status:blocked_by_target_shelf}` 标记已移除（等待任务即刻展示三货架枚举，符合 S 步）；死代码 `pre_reconciliation`、`_automatic_job_needs_dispatch` 已删；其余存量字段与 provider gate 机制保持冻结，继续按运行节奏清退。
 
 ## 1. 产品边界与核心领域模型
 
