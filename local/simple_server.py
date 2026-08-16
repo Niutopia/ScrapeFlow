@@ -3601,7 +3601,7 @@ class SimpleApplication:
 
     def _queue_root_replenishment(
         self, root_task_id: str, *, delay: float = 0.0, operator: bool = False,
-    ) -> None:
+    ) -> str:
         """Queue one replenishment round for a root task with open gaps.
 
         Shares the legacy L→M admission gate (user ruling A): automatic
@@ -3609,32 +3609,36 @@ class SimpleApplication:
         the same provider worker configuration.  An explicit operator trigger
         (``operator=True``) skips the admission token but keeps every other
         gate.  Idempotent: a live future or a closed gap ledger is a no-op.
+
+        Returns a status string for observability:
+        ``queued`` / ``already-running`` / ``no-open-gaps`` / ``gated``.
         """
-        if (
-            self._closed.is_set()
-            or self.control().get("paused") is True
-            or not self._provider_auto_repair_enabled()
-            or self._provider_worker_configuration()["valid"] is not True
-        ):
-            return
+        if self._closed.is_set():
+            return "gated:closed"
+        if self.control().get("paused") is True:
+            return "gated:paused"
+        if not operator and not self._provider_auto_repair_enabled():
+            return "gated:auto-repair-disabled"
+        if self._provider_worker_configuration()["valid"] is not True:
+            return "gated:worker-config"
         with self._automatic_lock:
             if not operator and not self._provider_full_audit_admitted:
-                return
+                return "gated:not-admitted"
             queue_epoch = self._provider_admission_epoch
             existing = self._provider_futures.get(root_task_id)
             if existing is not None and not existing.done():
-                return
+                return "already-running"
         try:
             if aggregate_root_job(self.state_root, root_task_id).open_gaps <= 0:
-                return
+                return "no-open-gaps"
         except Exception:
-            return
+            return "gated:aggregate-error"
 
         def submit() -> None:
             if (
                 self._closed.is_set()
                 or self.control().get("paused") is True
-                or not self._provider_auto_repair_enabled()
+                or (not operator and not self._provider_auto_repair_enabled())
                 or self._provider_worker_configuration()["valid"] is not True
             ):
                 return
@@ -3660,6 +3664,7 @@ class SimpleApplication:
         self._schedule_timer(
             "provider", f"root-replenishment:{root_task_id}", delay, submit,
         )
+        return "queued"
 
     def _queue_root_replenishment_for_waiting_roots(self) -> None:
         """Re-arm pending replenishment work when the L gate re-opens.
@@ -3718,7 +3723,7 @@ class SimpleApplication:
         if (
             self._closed.is_set()
             or self.control().get("paused") is True
-            or not self._provider_auto_repair_enabled()
+            or (not operator and not self._provider_auto_repair_enabled())
             or self._provider_worker_configuration()["valid"] is not True
         ):
             return
@@ -3743,8 +3748,10 @@ class SimpleApplication:
             # operator trigger only, no automatic re-arm loop.
         except Exception:
             # Transient server-side failure: fail closed without legacy
-            # summary mirrors; the operator trigger remains available.
-            pass
+            # summary mirrors; the operator trigger remains available.  Keep
+            # the traceback visible in the container log for live diagnosis.
+            import traceback
+            traceback.print_exc()
         finally:
             self._provider_futures.pop(root_task_id, None)
 
@@ -3773,8 +3780,8 @@ class SimpleApplication:
             raise EngineRequestError("补源触发只允许 intake 绑定的根任务")
         if aggregate_root_job(self.state_root, job_id).open_gaps <= 0:
             raise EngineRequestError("根任务当前没有待闭环缺口")
-        self._queue_root_replenishment(job_id, operator=True)
-        return {"queued": True, "root_task_id": job_id}
+        status = self._queue_root_replenishment(job_id, operator=True)
+        return {"queued": status == "queued", "status": status, "root_task_id": job_id}
 
     def _record_replenishment_summary(self, job: EngineJob, outcome: Mapping[str, object]) -> None:
         runner = self._get_engine_runner()
