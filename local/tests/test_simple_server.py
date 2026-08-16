@@ -94,14 +94,18 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             method=method,
             headers=request_headers,
         )
+        # The loopback test client must never leak through an ambient host
+        # proxy (a fake Host header would make the proxy hang or answer).
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(request, timeout=3) as response:
+            with opener.open(request, timeout=3) as response:
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read())
 
     def test_root_serves_same_origin_dashboard_with_shelf_controls(self) -> None:
-        with urllib.request.urlopen(self.base + "/", timeout=3) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(self.base + "/", timeout=3) as response:
             body = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "text/html")
