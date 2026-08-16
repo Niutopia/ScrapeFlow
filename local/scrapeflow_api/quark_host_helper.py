@@ -894,21 +894,33 @@ if (input.operation === "encrypt") {
   }
 }
 const decrypt = () => new Promise((resolve, reject) => {
+  // Prefer the synchronous WSG decrypt: newer QuarkCloudDrive builds
+  // deliver the plain text there, while the quarkBizPrivate bridge
+  // callback changed shape (no longer carries ``.data``).
+  const wsg = globalThis.quantum && globalThis.quantum.wsg;
+  try {
+    const result = wsg && wsg.decrypt({number: 13801, cipher_b64: input.value});
+    const plain = result && (result.plain || result.plain_text || result.text);
+    if (plain) {
+      resolve(plain);
+      return;
+    }
+  } catch (error) {
+    reject(error);
+    return;
+  }
   const bridge = globalThis.chrome && globalThis.chrome.quarkBizPrivate;
   if (bridge && typeof bridge.encryptOrDecrypt === "function") {
     bridge.encryptOrDecrypt(
       {encrypt: false, data: input.value, wsgNum: 13801},
-      value => resolve(typeof value === "string" ? value : (value && value.data))
+      value => resolve(
+        typeof value === "string" ? value
+        : (value && (value.data || value.plain || value.plain_text || value.text))
+      ),
     );
     return;
   }
-  const wsg = globalThis.quantum && globalThis.quantum.wsg;
-  try {
-    const result = wsg && wsg.decrypt({number: 13801, cipher_b64: input.value});
-    resolve(result && (result.plain || result.plain_text || result.text));
-  } catch (error) {
-    reject(error);
-  }
+  resolve(null);
 });
 return decrypt().then(finish, () => finish(null));
 })()""" % encoded
@@ -1064,13 +1076,20 @@ const query = new URLSearchParams(Object.entries(input.query).map(([key, value])
 const url = input.url + (query ? "?" + query : "");
 const headers = {"Accept": "application/json, text/plain, */*", "User-Agent": %s};
 const decode = (cipher) => new Promise((resolve, reject) => {
+  // Same preference as the WSG transform: the synchronous decrypt first,
+  // the quarkBizPrivate bridge as a shape-tolerant fallback.
+  const wsg = globalThis.quantum && globalThis.quantum.wsg;
+  try {
+    const result = wsg && wsg.decrypt({number: 13801, cipher_b64: cipher});
+    const plain = result && (result.plain || result.plain_text || result.text);
+    if (plain) { resolve(plain); return; }
+  } catch (error) { reject(error); return; }
   const bridge = globalThis.chrome && globalThis.chrome.quarkBizPrivate;
   if (bridge && typeof bridge.encryptOrDecrypt === "function") {
-    bridge.encryptOrDecrypt({encrypt: false, data: cipher, wsgNum: 13801}, value => resolve(typeof value === "string" ? value : (value && value.data)));
+    bridge.encryptOrDecrypt({encrypt: false, data: cipher, wsgNum: 13801}, value => resolve(typeof value === "string" ? value : (value && (value.data || value.plain || value.plain_text || value.text))));
     return;
   }
-  const wsg = globalThis.quantum && globalThis.quantum.wsg;
-  try { const result = wsg && wsg.decrypt({number: 13801, cipher_b64: cipher}); resolve(result && (result.plain || result.plain_text || result.text)); } catch (error) { reject(error); }
+  resolve(null);
 });
 const run = async () => {
   let requestBody = undefined;
