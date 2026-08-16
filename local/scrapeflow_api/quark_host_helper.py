@@ -1195,7 +1195,9 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             if raw_code not in {None, 0, "0"} or raw_status not in {None, 200, "200"}:
                 raise QuarkHelperRemoteRejected("Quark rejected the fixed operation")
             return dict(payload)
-        raise QuarkHelperNotReady("Quark returned an invalid fixed response") from last_invalid
+        raise QuarkHelperNotReady(
+            f"Quark returned an invalid fixed response (len={len(text) if isinstance(text, str) else 'n/a'})"
+        ) from last_invalid
 
     async def _destination_fid(self, destination: str) -> str:
         mount_path, parent = self._active_mount()
