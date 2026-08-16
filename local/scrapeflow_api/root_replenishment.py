@@ -948,6 +948,14 @@ def run_root_replenishment(
                         failed_locators.add(locator)
 
     # Tier progression / waiting (contract rule 4).
+    # Candidate-locator memory is recorded FIRST so a mixed run (one
+    # infrastructure failure plus several rejected candidates) never loses
+    # the rejected locators.
+    for locator in sorted(failed_locators):
+        state = apply_tier_outcome(state, {
+            "scope": FAILURE_CANDIDATE,
+            "locator": locator,
+        })
     if hit_in_doubt:
         waiting = "waiting_reconcile"
         state = apply_tier_outcome(state, {
@@ -976,12 +984,6 @@ def run_root_replenishment(
             ),
             "unchecked_secondary_candidates": 0,
         })
-    else:
-        for locator in sorted(failed_locators):
-            state = apply_tier_outcome(state, {
-                "scope": FAILURE_CANDIDATE,
-                "locator": locator,
-            })
 
     state["updated_at"] = _now()
     state["waiting"] = waiting
