@@ -915,9 +915,12 @@ def _fetch_bytes(
 ) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "ScrapeFlow/1.0"})
     last_error: Exception | None = None
+    # When no explicit per-source proxy opener is supplied, stay direct:
+    # urllib's default opener would inherit an ambient host proxy.
+    direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for attempt in range(attempts):
         try:
-            open_request = opener.open if opener is not None else urllib.request.urlopen
+            open_request = opener.open if opener is not None else direct_opener.open
             with open_request(request, timeout=timeout) as response:
                 data = response.read(max_bytes + 1)
             if len(data) > max_bytes:
@@ -3576,6 +3579,20 @@ def _base32_infohash(hex_hash: str) -> str:
     return base64.b32encode(bytes.fromhex(hex_hash)).decode("ascii").rstrip("=").casefold()
 
 
+def _direct_download_env(base: Mapping[str, str]) -> dict[str, str]:
+    """Clone an environment with every HTTP proxy removed.
+
+    Search indexes may need the proxy; tracker announces and BT peer
+    traffic are direct connections and must never inherit it (aria2 reads
+    the ``http_proxy`` environment family for its HTTP tracker requests).
+    """
+    cleaned = dict(base)
+    for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def _payload_is_complete(
     payload_dir: Path, acquisition: Mapping[str, Any], indices: set[int],
 ) -> bool:
@@ -4066,6 +4083,12 @@ def _acquire(
                     "aria2c", "--seed-time=0", "--file-allocation=none",
                     "--allow-overwrite=true", "--auto-file-renaming=false",
                     "--summary-interval=60", "--console-log-level=notice",
+                    # In mainland deployments the HTTP proxy exists for the
+                    # blocked search indexes only; tracker announces and peer
+                    # traffic must stay direct.  DHT/PEX/LPD give the swarm a
+                    # chance even when every tracker is unreachable.
+                    "--enable-dht=true", "--enable-peer-exchange=true",
+                    "--bt-enable-lpd=true",
                     f"--bt-stop-timeout={_bounded_seconds('SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT', 600, 60, 3600)}",
                     f"--dir={payload_dir}", f"--select-file={','.join(str(i) for i in sorted(indices))}",
                     str(torrent_path),
@@ -4077,6 +4100,7 @@ def _acquire(
                         timeout=_bounded_seconds(
                             "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
                         ),
+                        env=_direct_download_env(os.environ),
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise ReplenishmentCandidateError(
