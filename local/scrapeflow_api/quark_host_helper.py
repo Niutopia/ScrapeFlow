@@ -1663,9 +1663,13 @@ def create_quark_helper_app(service: QuarkHostHelperService, *, token: str) -> w
             return _error(400, "invalid_request")
         except QuarkHelperInDoubt:
             return _error(409, "submit_in_doubt", in_doubt=True)
-        except QuarkHelperRemoteRejected:
+        except QuarkHelperRemoteRejected as exc:
+            print(f"[quark-helper] remote_rejected {action}: {exc}", flush=True)
             return _error(422, "quark_rejected")
-        except QuarkHelperNotReady:
+        except QuarkHelperNotReady as exc:
+            # Fail-closed AND diagnosable: the reason stays out of the HTTP
+            # response but lands in the container log for live forensics.
+            print(f"[quark-helper] not_ready {action}: {exc}", flush=True)
             return _error(503, "quark_not_ready")
         return _error(404, "not_found")
 
