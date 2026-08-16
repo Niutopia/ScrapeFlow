@@ -10,10 +10,12 @@ no writes outside the local state root, and never touches the formal library.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
 from .boundary_analysis import analyze_boundaries
+from .serialization import atomic_write_json
 from .source_inventory import build_source_inventory
 from .work_units import (
     WorkUnitRecord,
@@ -23,6 +25,10 @@ from .work_units import (
 
 MAX_SNAPSHOT_DIRECTORIES = 10_000
 MAX_SNAPSHOT_FILES = 200_000
+
+
+def _snapshot_path(state_root: Path, root_task_id: str) -> Path:
+    return state_root / f"work_snapshot_{root_task_id}.json"
 
 
 def walk_source_rows(alist: object, source_path: str) -> list[dict[str, Any]]:
@@ -92,9 +98,16 @@ def analyze_root_boundaries(
 
     This is the runtime B/W step: it must run before any TMDB identity work
     (contract rule 3).  The persisted ledger ``work_units_<root_task_id>.json``
-    is the input for the per-unit identity stage (C/U).
+    is the input for the per-unit identity stage (C/U); the persisted snapshot
+    ``work_snapshot_<root_task_id>.json`` lets C rebuild the exact tree that B
+    analysed without re-listing the provider.
     """
     rows = walk_source_rows(alist, source_path)
+    atomic_write_json(
+        _snapshot_path(state_root, root_task_id),
+        {"root": str(source_path).rstrip("/"), "rows": rows},
+        allow_nan=False,
+    )
     node = build_source_inventory(rows, source_path)
     candidates = analyze_boundaries(node, root_task_id=root_task_id)
     records = create_work_units_from_candidates(candidates, root_task_id)
@@ -102,9 +115,30 @@ def analyze_root_boundaries(
     return records
 
 
+def load_source_snapshot(
+    state_root: Path,
+    root_task_id: str,
+) -> dict[str, Any] | None:
+    """Load the persisted B snapshot; ``None`` when absent or malformed."""
+    try:
+        raw = json.loads(
+            _snapshot_path(state_root, root_task_id).read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    root = raw.get("root")
+    rows = raw.get("rows")
+    if not isinstance(root, str) or not root or not isinstance(rows, list):
+        return None
+    return {"root": root, "rows": [row for row in rows if isinstance(row, Mapping)]}
+
+
 __all__ = [
     "MAX_SNAPSHOT_DIRECTORIES",
     "MAX_SNAPSHOT_FILES",
     "analyze_root_boundaries",
+    "load_source_snapshot",
     "walk_source_rows",
 ]

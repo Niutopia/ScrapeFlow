@@ -5105,6 +5105,21 @@ class SimpleEngineRunner:
                 )
             except Exception:
                 pass  # Advisory in P3; the C/U stage will make it authoritative.
+            # C/U step: resolve each pending WorkUnit independently.  An
+            # ambiguous unit is parked in the ledger without blocking its
+            # siblings; durable operator overrides are never re-asked.
+            try:
+                from engine.scrapeflow.unit_identity import (
+                    resolve_work_unit_identities,
+                )
+                resolve_work_unit_identities(
+                    self.tmdb,
+                    self.state_root,
+                    job_id,
+                    prefer_animation=(selected_shelf.value == "anime"),
+                )
+            except Exception:
+                pass  # Advisory in P4; P6 planning will consume the ledger.
             try:
                 _pause_checkpoint(effective_pause)
             except EnginePauseRequested:

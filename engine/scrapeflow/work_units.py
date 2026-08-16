@@ -315,8 +315,9 @@ class WorkUnitRecord:
     source_paths: tuple[str, ...]
     source_revision: int
     role: str
-    identity_status: str  # "pending" | "confirmed" | "uncertain" | "failed"
-    identity: dict[str, Any] | None
+    media_context: str = "unknown"
+    identity_status: str = "pending"  # "pending" | "confirmed" | "uncertain" | "failed"
+    identity: dict[str, Any] | None = None
     candidate_identities: tuple[dict[str, Any], ...] = ()
     reconciliation_outcome: str | None = None
     matched_work_root: str | None = None
@@ -331,6 +332,7 @@ class WorkUnitRecord:
             "source_paths": list(self.source_paths),
             "source_revision": self.source_revision,
             "role": self.role,
+            "media_context": self.media_context,
             "identity_status": self.identity_status,
             "identity": dict(self.identity) if self.identity else None,
             "candidate_identities": [dict(c) for c in self.candidate_identities],
@@ -351,6 +353,7 @@ class WorkUnitRecord:
             source_paths=tuple(str(x) for x in raw.get("source_paths") or ()),
             source_revision=int(raw.get("source_revision", 1)),
             role=str(raw.get("role", "single_work")),
+            media_context=str(raw.get("media_context", "unknown")),
             identity_status=str(raw.get("identity_status", "pending")),
             identity=dict(ident) if isinstance(ident, Mapping) else None,
             candidate_identities=tuple(dict(c) for c in cand_list if isinstance(c, Mapping)),
@@ -378,6 +381,7 @@ def create_work_units_from_candidates(
             source_paths=cand.source_paths,
             source_revision=source_revision,
             role=cand.boundary_evidence.role.value,
+            media_context=cand.proposed_media_context,
             identity_status="pending",
             identity=None,
             candidate_identities=(),
