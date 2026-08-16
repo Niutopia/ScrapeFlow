@@ -54,7 +54,7 @@ def _recording_planner(events: list[dict[str, Any]]):
 
 
 def _merge_planner(events: list[dict[str, Any]]):
-    """Planner double that locks the target onto the existing work root."""
+    """Planner double that resolves the series dir under the given parent."""
 
     def planner(request, _alist, _tmdb) -> Plan:
         events.append({
@@ -63,16 +63,17 @@ def _merge_planner(events: list[dict[str, Any]]):
             "media_type": request.media_type,
             "tmdb_id": request.tmdb_id,
         })
+        target = f"{request.parent_path.rstrip('/')}/Fate Zero"
         return Plan(
             mode="tv" if request.media_type == "tv" else "movie",
             source_root=request.source_path,
-            target_root=request.parent_path,
+            target_root=target,
             files=[PlannedFile(
                 source_path=f"{request.source_path}/S01E11.mkv",
                 source_dir=request.source_path,
                 original_name="S01E11.mkv",
                 final_name="S01E11.mkv",
-                target_dir=request.parent_path,
+                target_dir=target,
                 media_kind="video",
                 source_size=FAKE_VIDEO_SIZE,
             )],
@@ -326,7 +327,7 @@ class RootPipelineTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "completed")
         self.assertEqual(len(merge_events), 1)
-        self.assertEqual(merge_events[0]["parent_path"], "/library/番剧/Fate Zero")
+        self.assertEqual(merge_events[0]["parent_path"], "/library/番剧")
         self.assertEqual(len(executor_events), 1)
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].reconciliation_outcome, "merge_existing")

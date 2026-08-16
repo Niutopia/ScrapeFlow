@@ -368,7 +368,12 @@ def _merge_unit(
     unit_source = _owned_unit_source(runner, record, root_job)
     payload: dict[str, object] = {
         "source_path": unit_source,
-        "parent_path": work_root,
+        # The planner derives the series directory from the TMDB title under
+        # ``parent_path``; passing the work root itself would nest a second
+        # copy (番剧/刀剑神域/刀剑神域).  Pass its parent so the planner
+        # resolves back onto the locked root, exactly like the legacy merge
+        # hand-off, and the target lock below enforces the result.
+        "parent_path": posixpath.dirname(work_root.rstrip("/")),
         "media_type": media_type,
         "tmdb_id": tmdb_id,
     }
