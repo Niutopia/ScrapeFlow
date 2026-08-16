@@ -28,6 +28,7 @@ import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import time
 from typing import Any, Protocol
 import urllib.parse
 
@@ -57,6 +58,9 @@ MAX_EXPECTED_FILES = 128
 MAX_TEXT = 512
 MAX_MAGNET_BYTES = 32 * 1024
 MAX_RENDERER_RESPONSE_BYTES = 1024 * 1024
+# How long a resolved directory fid stays warm: the staging parent chain
+# is stable across attempts, so caching cuts most of the throttled walk.
+_FID_CACHE_TTL_SECONDS = 600.0
 QUARK_DRIVE_API = "https://drive.quark.cn/1/clouddrive"
 QUARK_SHARE_API = "https://drive-pc.quark.cn/1/clouddrive"
 QUARK_UA = (
@@ -701,6 +705,7 @@ class PassiveQuarkCdp:
         # the nested acquisitions never deadlock.  Concurrent bursts against
         # Quark were live-observed to trigger truncated responses.
         self._action_lock = asyncio.Lock()
+        self._fid_cache: dict[str, tuple[float, str]] = {}
         self._delegated_session: ContextVar[DelegatedQuarkSession | None] = (
             ContextVar(f"scrapeflow_quark_session_{id(self)}", default=None)
         )
@@ -1214,14 +1219,27 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
                 "delegated Quark storage does not cover the task destination"
             )
         relative = destination[len(prefix):]
-        for component in relative.split("/"):
+        components = relative.split("/")
+        now = time.monotonic()
+        cached = self._fid_cache.get(destination)
+        if cached is not None and cached[0] > now:
+            # A warm cache skips the whole walk: only a staleness probe is
+            # needed when the caller wants it.  The cached fid is the direct
+            # answer, cutting per-action listings from N to zero here.
+            return cached[1]
+        for index, component in enumerate(components):
+            partial = mount_path.rstrip("/") + "/" + "/".join(components[:index])
+            entry = self._fid_cache.get(partial) if partial else None
+            if entry is not None and entry[0] > now:
+                parent = entry[1]
+                continue
             listing = await self._call_fixed(
                 origin=QUARK_DRIVE_API,
                 path="/file/sort",
                 method="GET",
                 query={
-                    "pdir_fid": parent, "_page": 1, "_size": 100,
-                    "_fetch_total": 1, "fetch_all_file": 1,
+                    "pdir_fid": parent, "_page": 1, "_size": 20,
+                    "_fetch_total": 1,
                 },
             )
             data = listing.get("data")
@@ -1234,6 +1252,8 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             if len(matches) != 1:
                 raise QuarkHelperNotReady("task staging folder is not uniquely available in Quark")
             parent = str(matches[0]["fid"])
+            key = mount_path.rstrip("/") + "/" + "/".join(components[: index + 1])
+            self._fid_cache[key] = (now + _FID_CACHE_TTL_SECONDS, parent)
         return parent
 
     async def assert_authenticated(self) -> None:
