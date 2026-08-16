@@ -641,9 +641,9 @@ def run_root_replenishment(
             filtered.append(copied)
     requests = filtered
     if not requests:
-        # Every remaining gap is in-flight or subtitle-channel-owned: nothing
-        # for the three video tiers to do.  Not a wait state — waiting must
-        # stay None so the caller does not re-queue a pointless loop.
+        # In-flight (in_doubt) leftovers are a real reconcile wait: re-check
+        # them later without re-submitting.  Subtitle-only leftovers are the
+        # subtitle channel's job and must not loop the video tiers.
         return {
             "tier": tier,
             "tier_before": tier,
@@ -651,7 +651,7 @@ def run_root_replenishment(
             "attempts": [],
             "gaps_closed": [],
             "state": state,
-            "waiting": None,
+            "waiting": "waiting_reconcile" if in_flight else None,
         }
 
     requests_built = len(requests)
