@@ -73,7 +73,7 @@ curl -fsS http://127.0.0.1:3010/api/health
 
 ### 代理与直连（Clash TUN 全局模式）
 
-搜索层（TMDB、字幕站点、被墙索引）允许走代理；**BT 下载一律直连**（下载子进程会清空代理环境变量并开启 DHT/PEX/LPD）。在 TUN 全局代理下，需要给 Docker 网段加 DIRECT 规则，否则容器出站下载也会被代理截走：
+搜索层（TMDB、字幕站点、被墙索引）允许走代理；**BT 下载一律直连**（下载子进程会清空代理环境变量并开启 DHT/PEX/LPD）。夸克助手的夸克 API 调用跟随 `HTTP_PROXY`（代理路径对 drive.quark.cn 更稳定），CDP 渲染器连接与下载保持直连。在 TUN 全局代理下，需要给 Docker 网段加 DIRECT 规则，否则容器出站下载也会被代理截走：
 
 ```yaml
 rules:
