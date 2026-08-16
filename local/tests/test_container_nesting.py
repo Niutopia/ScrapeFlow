@@ -178,6 +178,50 @@ class ContainerNestingTests(unittest.TestCase):
         parents = {event["parent_path"] for event in events}
         self.assertEqual(parents, {"/library/番剧/Show A"})
 
+    def test_dominant_series_owns_root_and_spinoff_nests(self) -> None:
+        files = {
+            "/incoming/刀剑神域/第一季/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/刀剑神域/第二季/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/刀剑神域/外传GGO/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/刀剑神域/序列之争/movie.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, events = self._setup(files)
+        root_id = self._root(runner, "/incoming/刀剑神域")
+        analyze_root_boundaries(
+            alist, "/incoming/刀剑神域", root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(records), 4)
+        apply_work_unit_override(
+            state_root, root_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        apply_work_unit_override(
+            state_root, root_id, records[1].work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        apply_work_unit_override(
+            state_root, root_id, records[2].work_unit_id,
+            media_type="tv", tmdb_id=78204,
+        )
+        apply_work_unit_override(
+            state_root, root_id, records[3].work_unit_id,
+            media_type="movie", tmdb_id=413594,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_id)
+
+        execute_new_work_units(runner, state_root, root_id)
+
+        self.assertEqual(len(events), 4)
+        main = [e for e in events if e["tmdb_id"] == 45782]
+        self.assertEqual({e["parent_path"] for e in main}, {"/library/番剧"})
+        # The spinoff TV and the movie nest under the main series root.
+        for event in events:
+            if event["tmdb_id"] != 45782:
+                self.assertEqual(
+                    event["parent_path"], "/library/番剧/Work (45782)",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -235,6 +235,7 @@ def _container_plan(
     if len(records) <= 1:
         return list(records), None, None
     tv_ids: list[int] = []
+    tv_counts: dict[int, int] = {}
     for record in records:
         identity = record.identity or {}
         tmdb_id = identity.get("tmdb_id")
@@ -246,8 +247,23 @@ def _container_plan(
         ):
             if tmdb_id not in tv_ids:
                 tv_ids.append(tmdb_id)
+            tv_counts[tmdb_id] = tv_counts.get(tmdb_id, 0) + 1
+    # A "main series" exists when one TV identity clearly dominates: it is
+    # either the only TV identity, or it owns several units (multiple
+    # seasons) while every other TV identity owns exactly one unit.  The
+    # dominant series then owns the container root and all other units
+    # (movies, spinoff TV) nest under its real target root.
+    main_tmdb: int | None = None
     if len(tv_ids) == 1:
         main_tmdb = tv_ids[0]
+    elif tv_ids:
+        ranked = sorted(tv_ids, key=lambda value: tv_counts.get(value, 0), reverse=True)
+        if (
+            tv_counts.get(ranked[0], 0) >= 2
+            and all(tv_counts.get(value, 0) == 1 for value in ranked[1:])
+        ):
+            main_tmdb = ranked[0]
+    if main_tmdb is not None:
         ordered = sorted(
             records,
             key=lambda record: (
