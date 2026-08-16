@@ -36,13 +36,15 @@ Provider 降级。Provider 自动补源和自动审计保持默认关闭。
 
 - **P0** 冻结 checkpoint 与基线校准 → **P1** 只读发现（零 job 创建）→ **P2** Web 创建任务（来源+货架，`POST /api/root-jobs`）→ **P3** 边界分析与 WorkUnit 拆分（`root_boundaries`）→ **P4** 逐单元身份与 durable override（`unit_identity`）→ **P5** 三库 `LibraryIndex` 五分类对账（`library_index`，跨货架查重）→ **P6** 单元驱动规划 + 唯一写器 + `WorkAcceptanceResult`（`unit_execution`）→ **P7** Gap 账本（`gap_ledger`，绑 `work_unit_id`）+ 字幕独立渠道缺陷修复 → **P8** 根任务聚合与最小确认回流（`root_aggregation`、`GET /api/jobs/:id/work-units`、`POST …/confirm`）→ **P9** 合规清理（硬编码数据化、删除货架矩阵、统一匹配器）→ **P10** `tests/corpus/` 10 场景 + 真实 A→B→W→C→D 链路回归。
 
-期间任何代码变更不得使测试通过数低于 850（310 subtests）。存量 `EngineJob.summary` 业务字段与
+**P11–P13（2026-08-16，已完成并实机验收）**：P11 实机运行回路切换（intake 绑定 RootJob 走权威单元管线
+`root_pipeline`，legacy 链仅存记录读取）；P12 单元级 E1/E2/E3 通道（`unit_e_lanes`：重复消费归档 / 既有缺口登记与空目录 hold /
+归并写入既有作品根）+ 多季绝对集数显式映射桥（`episode_map_<unit>.json`）；P13 Fate 式系列容器落盘规则（`unit_execution._container_plan`：
+主系列拥有容器根、电影与外传嵌套其下，容器命名三级兜底，主导系列判定与失败重试退役陈旧载体）。
+实机验收：真实《刀剑神域》合集 7/7 单元经 A→R 全链入库（主系列 S1–S4 合一 + 剧场版/外传嵌套），4 个 `.5` 特别篇按证据门禁留档。
+
+期间任何代码变更不得使测试通过数低于 873（310 subtests）。存量 `EngineJob.summary` 业务字段与
 provider gate 机制冻结不新增，随后续运行节奏逐步清退。三项用户裁决（2026-08-16）：创建任务时选货架；
 存量字段渐进清退；字幕保留独立渠道并修复缺陷。Web 控制台视觉语言已按 Media Engine v4 设计重绘。
-
-期间任何代码变更不得使测试通过数低于 800。存量 `EngineJob.summary` 业务字段与 provider gate 机制
-冻结不新增，随 P5–P7 迁移逐步清退。三项用户裁决（2026-08-16）：创建任务时选货架；存量字段渐进清退；
-字幕保留独立渠道并修复缺陷。
 
 ## 最少配置
 

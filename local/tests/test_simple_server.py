@@ -171,7 +171,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["mode"], "automatic")
         self.assertTrue(health["connected"])
         self.assertTrue(health["engine_configured"])
-        self.assertEqual(health["build_version"], "p11-unit-pipeline")
+        self.assertEqual(health["build_version"], "p13-container-nesting")
         self.assertIn("build_commit", health)
         self.assertIn("build_time", health)
         self.assertEqual(health["provider_capabilities"]["quark_share"]["status"], "ready")

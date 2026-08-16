@@ -666,6 +666,14 @@ def execute_new_work_units(
                 )
             except Exception:
                 pass
+            # The derived episode map is a planning artifact; drop it once
+            # the unit is accepted.
+            try:
+                map_path = state_root / f"episode_map_{record.work_unit_id}.json"
+                if map_path.exists():
+                    map_path.unlink()
+            except OSError:
+                pass
         except Exception as exc:
             # Keep writer_job_id unset so the next run re-plans the unit;
             # retire the just-planned carrier so plan_job's existing-id
