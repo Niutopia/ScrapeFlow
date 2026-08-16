@@ -313,12 +313,20 @@ class SubtitleDiscoveryService:
             data = self._http_get(url, timeout=5.0)
             html = data.decode("utf-8", errors="ignore")
             candidates = []
-            for match in re.finditer(r'<a\s+href="(/a/\d+)"[^>]*>([^<]+)</a>', html):
-                sub_path, sub_title = match.group(1), match.group(2).strip()
+            # SubHD result ids are alphanumeric now (e.g. /a/KsMHj5); the
+            # anchor text carries the subtitle title.
+            for match in re.finditer(
+                r"<a[^>]*href=['\"]/a/([A-Za-z0-9]+)['\"][^>]*>(.*?)</a>",
+                html,
+            ):
+                sub_id = match.group(1)
+                sub_title = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+                if not sub_title:
+                    continue
                 fmt = "ass" if ".ass" in sub_title.lower() else ("vtt" if ".vtt" in sub_title.lower() else "srt")
                 candidates.append({
                     "provider": PROVIDER_SUBTITLE_SUBHD,
-                    "url": f"https://subhd.tv{sub_path}",
+                    "url": f"https://subhd.tv/a/{sub_id}",
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,

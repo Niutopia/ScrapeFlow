@@ -140,6 +140,29 @@ class SubtitleProviderTests(unittest.TestCase):
         self.assertGreater(score_a, score_b, "ASS + Fansub match + CHS must score higher than generic SRT")
         self.assertGreater(score_b, score_c, "Correct episode must score higher than wrong episode")
 
+    def test_subhd_alphanumeric_result_ids_are_parsed(self) -> None:
+        html = (
+            "<html><body>"
+            "<a class='link-dark' href='/a/KsMHj5' target='_blank'>命运之夜前传 第一季</a>"
+            "<a class='link-dark' href='/a/Ab3xY9' target='_blank'>Fate Zero 720p BluRay AAC WiKi</a>"
+            "</body></html>"
+        ).encode("utf-8")
+
+        def fetcher(url: str, headers: dict[str, str]):
+            del headers
+            if "subhd.tv" in url:
+                return html
+            raise AssertionError(f"unexpected fetch: {url}")
+
+        service = SubtitleDiscoveryService(enabled=True, fetcher=fetcher)
+        rows = service._search_subhd(  # noqa: SLF001 - focused source test
+            "Fate/Zero", 1, 1, "simplified_chinese",
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["url"], "https://subhd.tv/a/KsMHj5")
+        self.assertIn("命运之夜前传", rows[0]["title"])
+        self.assertEqual(rows[1]["url"], "https://subhd.tv/a/Ab3xY9")
+
     def test_discovery_and_ranking_order(self) -> None:
         assrt_resp = json.dumps({
             "data": {
