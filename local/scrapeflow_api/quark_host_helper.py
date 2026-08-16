@@ -1001,9 +1001,13 @@ return decrypt().then(finish, () => finish(null));
         timeout = ClientTimeout(total=self.timeout_seconds)
         request_sent = False
         try:
+            # Follow the container's ambient proxy for Quark HTTPS (the live
+            # environment routes drive.quark.cn through the host proxy; the
+            # direct container path intermittently truncates responses).
+            # trust_env honors HTTP(S)_PROXY plus NO_PROXY, so internal hosts
+            # stay direct while the CDP discovery below keeps trust_env=False.
             async with ClientSession(
                 timeout=timeout,
-                trust_env=False,
                 cookie_jar=DummyCookieJar(),
             ) as session:
                 request_sent = True
