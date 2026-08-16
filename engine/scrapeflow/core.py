@@ -34,6 +34,7 @@ from . import media_policy as _media_policy
 from . import plan_artifacts as _plan_artifacts
 from . import remote_paths as _remote_paths
 from .data.release_lexicon import (
+    FRACTIONAL_SPECIAL_ALIASES,
     NORMALIZED_PARENT_ALIASES,
     RELEASE_EDITION_RULES,
     SPECIAL_CONTEXT_RELEASE_TOKENS,
@@ -971,7 +972,10 @@ class AListClient:
         raw_url, headers = self.file_link(path, refresh=True)
         request = urllib.request.Request(raw_url, headers=headers)
         opener = urllib.request.build_opener(
-            ValidatingRedirectHandler(self._validate_download_url)
+            # The AList origin is loopback; an ambient host proxy would dial
+            # its own loopback instead of this machine and hang the read.
+            urllib.request.ProxyHandler({}),
+            ValidatingRedirectHandler(self._validate_download_url),
         )
         response = opener.open(request, timeout=60)
         try:
@@ -1070,7 +1074,10 @@ class AListClient:
                     headers["Range"] = f"bytes={written}-"
                 request = urllib.request.Request(raw_url, headers=headers)
                 opener = urllib.request.build_opener(
-                    ValidatingRedirectHandler(self._validate_download_url)
+                    # Same loopback rationale as open_file_reader: never let
+                    # an ambient host proxy dial its own localhost for AList.
+                    urllib.request.ProxyHandler({}),
+                    ValidatingRedirectHandler(self._validate_download_url),
                 )
                 with opener.open(request, timeout=60) as response:
                     append = written > 0 and getattr(response, "status", 200) == 206
@@ -3574,6 +3581,15 @@ def _fractional_recap_evidence_candidates(
         or any(signature in _fractional_signatures(title) for title in localized_titles)
     }
     candidate_targets.update(special_metadata)
+    # Data-ized answer for releases whose local N.5 number never appears in
+    # any official title (e.g. 刀剑神域 [24.5] -> S00E24 第0话 Reflection).
+    lexicon_row = FRACTIONAL_SPECIAL_ALIASES.get(tmdb_id, {}).get(
+        f"{source_key.number}.{source_key.fractional_digits}"
+    )
+    lexicon_target: tuple[int, int] | None = None
+    if lexicon_row is not None:
+        lexicon_target = (0, int(str(lexicon_row[0])[4:]))
+        candidate_targets.add(lexicon_target)
     scored: list[dict[str, Any]] = []
     for target_season, target_episode in sorted(candidate_targets):
         metadata = special_metadata.get((target_season, target_episode), {})
@@ -3587,14 +3603,21 @@ def _fractional_recap_evidence_candidates(
         signatures: set[tuple[int, str]] = set()
         for alias in aliases:
             signatures.update(_fractional_signatures(alias))
-        explicit_fractional = signature in signatures
+        data_ized = lexicon_target is not None and (target_season, target_episode) == lexicon_target
+        explicit_fractional = signature in signatures or data_ized
         if target_season != 0 and not explicit_fractional:
             continue
 
         score = 1.0
         evidence = ["源文件明确使用 N.5/半集编号"]
         conflicts: list[str] = []
-        if explicit_fractional:
+        if data_ized:
+            score += 6.0
+            evidence.append("数据化官方小数集映射")
+            official_alias = str(lexicon_row[1]) if lexicon_row else ""
+            if official_alias and official_alias not in aliases:
+                aliases = (official_alias, *aliases)
+        elif explicit_fractional:
             score += 6.0
             evidence.append("官方多语言标题含相同小数集号")
         elif signatures:
@@ -3674,7 +3697,7 @@ def _fractional_recap_evidence_candidates(
             if 0 < (after_date - candidate_date).days <= 35:
                 score += 1.5
                 evidence.append("缺少 N 日期时，播出日紧邻 N+1 之前")
-        if candidate_date and regular_dates:
+        if candidate_date and regular_dates and not explicit_fractional:
             if regular_dates[0] <= candidate_date <= regular_dates[-1]:
                 score += 1.0
                 evidence.append(f"播出日落在第 {season} 季官方时间线内")

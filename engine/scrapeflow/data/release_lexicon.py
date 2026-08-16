@@ -84,9 +84,23 @@ RELEASE_EDITION_RULES: dict[str, str] = {
     ),
 }
 
+# Authoritative data for fractional specials whose local release number does
+# NOT appear in any TMDB Season 00 title.  The planner's generic evidence
+# gate cannot bridge ``[24.5]`` to ``第0话 Reflection`` on its own; this map
+# is the data-ized answer, consulted only for the exact (tmdb_id, "N.5")
+# pair and treated as explicit official evidence.
+FRACTIONAL_SPECIAL_ALIASES: dict[int, dict[str, tuple[str, str]]] = {
+    45782: {
+        "18.5": ("S00E23", "第18.5话 Recollection"),
+        "24.5": ("S00E24", "第0话 Reflection"),
+        "36.5": ("S00E25", "第12.5话 回忆"),
+    },
+}
+
 __all__ = [
     "BIDIRECTIONAL_LEXICAL_VARIANTS",
     "CROSS_SCRIPT_SEASON_ALIASES",
+    "FRACTIONAL_SPECIAL_ALIASES",
     "LEXICAL_VARIANTS",
     "NORMALIZED_PARENT_ALIASES",
     "QUERY_VARIANT_ALIASES",
