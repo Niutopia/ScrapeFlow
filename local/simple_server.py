@@ -1507,6 +1507,10 @@ class SimpleApplication:
                             if admitted:
                                 for owner_id in provider_owner_ids:
                                     self._queue_provider_job(owner_id)
+                                # P14: re-arm retry/reconcile waits for
+                                # new-path roots whose gaps were left waiting
+                                # when the L gate last closed.
+                                self._queue_root_replenishment_for_waiting_roots()
                     with self._automatic_lock:
                         self._intake_audit_timer_armed = False
                         if admission_epoch == self._provider_admission_epoch:
@@ -3008,10 +3012,15 @@ class SimpleApplication:
                 if job.phase in {"queued", "reconciliation_uncertain", "retry_wait"}:
                     try:
                         with self._automatic_lock:
-                            run_root_pipeline(
+                            final = run_root_pipeline(
                                 runner, self.state_root, job_id,
                                 pause_requested=self._pause_requested,
                             )
+                        # P14 L step: a freshly completed ingest with open
+                        # gaps hands the root to the replenishment lane (the
+                        # lane itself re-checks the global admission gate).
+                        if final.phase == "completed":
+                            self._queue_root_replenishment(job_id)
                     except EngineWorkerBusyError:
                         self._queue_automatic_job(job_id, delay=1.0)
                     except Exception as exc:
@@ -3585,6 +3594,187 @@ class SimpleApplication:
                 )
 
         self._schedule_timer("provider", job_id, delay, submit)
+
+    # ------------------------------------------------------------------
+    # P14: new-path root replenishment lane (Gap ledger -> three tiers)
+    # ------------------------------------------------------------------
+
+    def _queue_root_replenishment(
+        self, root_task_id: str, *, delay: float = 0.0, operator: bool = False,
+    ) -> None:
+        """Queue one replenishment round for a root task with open gaps.
+
+        Shares the legacy L→M admission gate (user ruling A): automatic
+        dispatch requires the intake-settled + full-audit-completed token and
+        the same provider worker configuration.  An explicit operator trigger
+        (``operator=True``) skips the admission token but keeps every other
+        gate.  Idempotent: a live future or a closed gap ledger is a no-op.
+        """
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._provider_auto_repair_enabled()
+            or self._provider_worker_configuration()["valid"] is not True
+        ):
+            return
+        with self._automatic_lock:
+            if not operator and not self._provider_full_audit_admitted:
+                return
+            queue_epoch = self._provider_admission_epoch
+            existing = self._provider_futures.get(root_task_id)
+            if existing is not None and not existing.done():
+                return
+        try:
+            if aggregate_root_job(self.state_root, root_task_id).open_gaps <= 0:
+                return
+        except Exception:
+            return
+
+        def submit() -> None:
+            if (
+                self._closed.is_set()
+                or self.control().get("paused") is True
+                or not self._provider_auto_repair_enabled()
+                or self._provider_worker_configuration()["valid"] is not True
+            ):
+                return
+            with self._automatic_lock:
+                if not operator and not self._provider_submission_admitted(queue_epoch):
+                    return
+                existing = self._provider_futures.get(root_task_id)
+                if existing is not None and not existing.done():
+                    return
+                self._provider_submission_grants[root_task_id] = queue_epoch
+                try:
+                    future = self._provider_pool().submit(
+                        self._run_root_replenishment,
+                        root_task_id,
+                        queue_epoch,
+                        operator,
+                    )
+                except Exception:
+                    self._provider_submission_grants.pop(root_task_id, None)
+                    raise
+                self._provider_futures[root_task_id] = future
+
+        self._schedule_timer(
+            "provider", f"root-replenishment:{root_task_id}", delay, submit,
+        )
+
+    def _queue_root_replenishment_for_waiting_roots(self) -> None:
+        """Re-arm pending replenishment work when the L gate re-opens.
+
+        Covers both waiting roots whose timer fired while the gate was
+        closed, and roots that completed their ingest while the gate was
+        closed (waiting is None and the three tiers are not all proven
+        exhausted).  Fully exhausted roots stay manual-only.
+        """
+        try:
+            runner = self._get_engine_runner()
+            from local.scrapeflow_api.root_pipeline import is_intake_bound_root
+            from local.scrapeflow_api.root_replenishment import (
+                load_root_replenishment_state,
+            )
+            for job in runner.list_jobs():
+                if self._is_internal_child(job):
+                    continue
+                if not is_intake_bound_root(self.state_root, job.id):
+                    continue
+                if aggregate_root_job(self.state_root, job.id).open_gaps <= 0:
+                    continue
+                state = load_root_replenishment_state(self.state_root, job.id)
+                waiting = state.get("waiting")
+                if waiting in {"retry_wait", "waiting_reconcile"}:
+                    self._queue_root_replenishment(job.id)
+                    continue
+                if waiting is not None:
+                    continue
+                proofs = state.get("exhaustion_proof_by_provider")
+                proofs = set(proofs) if isinstance(proofs, Mapping) else set()
+                if {"quark_share", "quark_magnet", "magnet"} <= proofs:
+                    continue  # tier exhaustion: explicit operator trigger only
+                self._queue_root_replenishment(job.id)
+        except Exception:
+            return
+
+    def _run_root_replenishment(
+        self,
+        root_task_id: str,
+        expected_epoch: int | None = None,
+        operator: bool = False,
+    ) -> None:
+        """Execute one P14 replenishment round for a new-path root task.
+
+        Never writes legacy summary mirrors onto new-path roots: outcomes
+        live in the gap ledger and the per-root replenishment state file.
+        Retry/reconcile waits re-arm through the same queue path; tier
+        exhaustion with open gaps stays visible in the aggregate view and
+        waits for an explicit operator trigger.
+        """
+        with self._automatic_lock:
+            granted_epoch = self._provider_submission_grants.pop(root_task_id, None)
+        if expected_epoch is None:
+            expected_epoch = granted_epoch
+        if (
+            self._closed.is_set()
+            or self.control().get("paused") is True
+            or not self._provider_auto_repair_enabled()
+            or self._provider_worker_configuration()["valid"] is not True
+        ):
+            return
+        if not operator and not self._provider_submission_admitted(expected_epoch):
+            return
+        try:
+            runner = self._get_engine_runner()
+            from local.scrapeflow_api.root_replenishment import run_root_replenishment
+            result = run_root_replenishment(
+                runner, self.state_root, root_task_id,
+                pause_requested=self._pause_requested,
+            )
+            waiting = result.get("waiting")
+            open_gaps = aggregate_root_job(self.state_root, root_task_id).open_gaps
+            if open_gaps <= 0:
+                return
+            if waiting == "retry_wait":
+                self._queue_root_replenishment(root_task_id, delay=300.0)
+            elif waiting == "waiting_reconcile":
+                self._queue_root_replenishment(root_task_id, delay=60.0)
+            # waiting is None with open gaps = tier exhaustion: manual
+            # operator trigger only, no automatic re-arm loop.
+        except Exception:
+            # Transient server-side failure: fail closed without legacy
+            # summary mirrors; the operator trigger remains available.
+            pass
+        finally:
+            self._provider_futures.pop(root_task_id, None)
+
+    def replenishment_view(self, job_id: str) -> dict[str, object]:
+        """Read-only P14 preview: aggregate, tier state and bridged requests."""
+        runner = self._get_engine_runner()
+        job = runner.get_job(job_id)
+        from local.scrapeflow_api.replenishment_bridge import gap_ledger_requests
+        from local.scrapeflow_api.root_replenishment import (
+            load_root_replenishment_state,
+        )
+        return {
+            "root_task_id": job_id,
+            "phase": job.phase,
+            "aggregate": aggregate_root_job(self.state_root, job_id).as_dict(),
+            "tier_state": load_root_replenishment_state(self.state_root, job_id),
+            "requests": gap_ledger_requests(self.state_root, job_id),
+        }
+
+    def trigger_root_replenishment(self, job_id: str) -> dict[str, object]:
+        """Operator-triggered P14 dispatch (explicit authorization)."""
+        from local.scrapeflow_api.root_pipeline import is_intake_bound_root
+        runner = self._get_engine_runner()
+        job = runner.get_job(job_id)
+        if not is_intake_bound_root(self.state_root, job_id):
+            raise EngineRequestError("补源触发只允许 intake 绑定的根任务")
+        if aggregate_root_job(self.state_root, job_id).open_gaps <= 0:
+            raise EngineRequestError("根任务当前没有待闭环缺口")
+        self._queue_root_replenishment(job_id, operator=True)
+        return {"queued": True, "root_task_id": job_id}
 
     def _record_replenishment_summary(self, job: EngineJob, outcome: Mapping[str, object]) -> None:
         runner = self._get_engine_runner()
@@ -6344,6 +6534,15 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send(200, self.application.browse(browse_path, refresh=refresh))
             elif path == "/api/library-audit/latest":
                 self._send(200, self.application.latest_library_audit())
+            elif path.startswith("/api/jobs/") and path.endswith("/replenishment"):
+                pieces = path.split("/")
+                if len(pieces) != 5:
+                    self._send(404, {"error": "not found"})
+                    return
+                job_id = urllib.parse.unquote(pieces[3])
+                if self.application.maybe_engine_job(job_id) is None:
+                    raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+                self._send(200, self.application.replenishment_view(job_id))
             elif path == "/api/intake":
                 self._send(200, {"sources": self.application.intake_catalog()})
             else:
@@ -6424,6 +6623,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(
                         200,
                         {"job": self.application.repair_public_job_artifacts(job_id, payload)},
+                    )
+                    return
+                if operation == "replenish":
+                    self._send(
+                        200,
+                        self.application.trigger_root_replenishment(job_id),
                     )
                     return
                 self._send(404, {"error": "not found"})
