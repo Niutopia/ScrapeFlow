@@ -293,3 +293,22 @@ class FailedAcceptanceRedecisionTests(unittest.TestCase):
             # fixed index now proves the duplicate.
             second = reconcile_root_work_units(alist, "/library", state_root, root_task_id)
             self.assertEqual(second[0].reconciliation_outcome, "duplicate_complete")
+
+
+class NestedWorkNfoTests(unittest.TestCase):
+    def test_nested_sub_work_nfo_does_not_override_container_identity(self) -> None:
+        files = _sample_library()
+        # A Fate-style container: the series root plus a nested movie.
+        files["/library/番剧/刀剑神域/tvshow.nfo"] = _nfo_tv(45782, "刀剑神域", "2012")
+        files["/library/番剧/刀剑神域/Season 01/S01E01.mkv"] = b"v"
+        files["/library/番剧/刀剑神域/序列之争 (2017)/序列之争 (2017).nfo"] = _nfo_movie(
+            413594, "序列之争", "2017",
+        )
+        files["/library/番剧/刀剑神域/序列之争 (2017)/序列之争 (2017).mkv"] = b"v"
+        index = build_library_index(IndexAList(files), "/library")
+        entries = index.entries_for("tv", 45782)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].work_root, "/library/番剧/刀剑神域")
+        self.assertIn("S01E01", entries[0].episode_tokens)
+        # The nested movie must not hijack the container identity.
+        self.assertEqual(index.entries_for("movie", 413594), ())
