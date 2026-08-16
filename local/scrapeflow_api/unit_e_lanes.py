@@ -39,7 +39,11 @@ from .simple_engine_runner import (
     _safe_job_id,        # noqa: PLC2701
     _safe_remote_path,   # noqa: PLC2701
 )
-from .unit_execution import _mark_internal_carrier, _unit_job_id
+from .unit_execution import (
+    _mark_internal_carrier,
+    _retire_stale_unit_carrier,
+    _unit_job_id,
+)
 
 
 def _now() -> str:
@@ -383,6 +387,9 @@ def _merge_unit(
     from .simple_engine_runner import EngineRequest
 
     request = EngineRequest.from_mapping(payload)
+    # A previous attempt may have left a terminal carrier; plan_job refuses
+    # existing ids, so retire it first (same rule as new_work units).
+    _retire_stale_unit_carrier(runner, _unit_job_id(record.work_unit_id))
     planned = _mark_internal_carrier(
         runner,
         runner.plan_job(request, job_id=_unit_job_id(record.work_unit_id)),
