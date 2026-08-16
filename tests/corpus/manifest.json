@@ -35,7 +35,8 @@
     "description": "OVA/特别篇",
     "expected_role": "single_work",
     "expected_work_count": 1,
-    "expected_media_context": "tv"
+    "expected_media_context": "tv",
+    "expected_has_specials": true
   },
   {
     "id": "movie_collection",
@@ -59,13 +60,15 @@
     "id": "gundam_container",
     "description": "高达系列容器",
     "expected_role": "series_container",
-    "expected_work_count": 2
+    "expected_work_count": 2,
+    "expected_media_context": "tv"
   },
   {
     "id": "monogatari_container",
     "description": "物语系列容器",
     "expected_role": "series_container",
-    "expected_work_count": 3
+    "expected_work_count": 3,
+    "expected_media_context": "tv"
   },
   {
     "id": "duplicate_source",

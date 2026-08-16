@@ -228,7 +228,9 @@ def analyze_boundaries(
 
     # --- Rule 3: Series container (multiple titled sub-works) -----------
     # Condition: ≥2 titled children, no season dirs at root level, no root
-    # videos that would suggest the root itself is a single work.
+    # videos that would suggest the root itself is a single work.  When every
+    # titled child is movie-shaped (exactly one large video), the container is
+    # a MOVIE_COLLECTION instead of a generic series container.
     if (
         len(titled_children) >= 2
         and len(season_children) == 0
@@ -238,14 +240,20 @@ def analyze_boundaries(
             f"发现 {len(titled_children)} 个包含视频的有名字子目录",
         ]
         competing: list[str] = []
-        # If some children look like single large movies, hint movie collection
         movie_shaped = [c for c in titled_children if _single_large_video(c)]
-        if len(movie_shaped) == len(titled_children):
+        all_movie_shaped = len(movie_shaped) == len(titled_children)
+        role = (
+            DirectoryRole.MOVIE_COLLECTION
+            if all_movie_shaped
+            else DirectoryRole.SERIES_CONTAINER
+        )
+        if all_movie_shaped:
+            reasons.append("每个子目录各含单个大视频文件（电影合集特征）")
+        else:
             competing.append(DirectoryRole.MOVIE_COLLECTION.value)
-            reasons.append("子目录各含单个大视频文件，可能是电影合集")
 
         evidence = BoundaryEvidence(
-            role=DirectoryRole.SERIES_CONTAINER,
+            role=role,
             confidence=0.85,
             reasons=tuple(reasons),
             competing_roles=tuple(competing),
@@ -260,7 +268,7 @@ def analyze_boundaries(
                 display_label=child.name,
                 proposed_media_context=child_context,
                 boundary_evidence=BoundaryEvidence(
-                    role=DirectoryRole.SERIES_CONTAINER,
+                    role=role,
                     confidence=0.85,
                     reasons=tuple(reasons),
                     competing_roles=tuple(competing),
