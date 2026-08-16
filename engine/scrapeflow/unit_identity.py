@@ -211,6 +211,10 @@ def apply_work_unit_override(
             record,
             identity_status="confirmed",
             identity=identity,
+            # A new identity invalidates any decision computed for the old
+            # one; the next D pass must re-evaluate the unit.
+            reconciliation_outcome=None,
+            matched_work_root=None,
             attention=None,
             updated_at=_now(),
         )
