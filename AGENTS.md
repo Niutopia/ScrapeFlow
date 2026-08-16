@@ -20,7 +20,7 @@
 - **禁止**创建第二套 writer 或第二套 TMDB 匹配器；
 - **必须**通过 `IntakeSource → RootJob → WorkUnit` 路径新增功能，而不是扩展 `EngineJob` phase 字段。
 
-测试基线（2026-08-16 实测）：**850 tests passed, 310 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，35 秒）。
+测试基线（2026-08-16 实测）：**854 tests passed, 310 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，35 秒）。
 任何代码变更不得使通过数减少。
 
 迁移状态：目标架构迁移 **P0–P10 已完成**（2026-08-16）：
