@@ -22,7 +22,6 @@ from local.scrapeflow_api.simple_engine_runner import (
     EngineRequest,
     EngineRequestError,
     SimpleEngineRunner,
-    TargetShelfPolicyConflictError,
     atomic_write_json,
 )
 
@@ -268,7 +267,26 @@ class TargetShelfStartGateTests(unittest.TestCase):
             self.runner.execute_job(pending.id)
         self.assertEqual(self.events, [])
 
-    def test_type_conflict_stops_before_planner_and_can_be_explicitly_reselected(self) -> None:
+    def test_type_conflict_machinery_is_retired(self) -> None:
+        # Retirement batch #3 (decision 1): the shelf is an archive location,
+        # not a media-type constraint, so the conflict class and its handler
+        # are gone.  The phase VALUE stays in the enum for legacy record
+        # reads, but nothing can enter it any more.
+        import local.scrapeflow_api.simple_engine_runner as runner_module
+
+        self.assertFalse(hasattr(runner_module, "TargetShelfPolicyConflictError"))
+        self.assertNotIn(
+            "TargetShelfPolicyConflictError",
+            runner_module.__all__,
+        )
+        from local.scrapeflow_api.simple_engine_runner import _ENGINE_PHASES
+
+        self.assertIn("target_policy_conflict", _ENGINE_PHASES)
+
+    def test_movie_identity_on_anime_shelf_plans_by_identity(self) -> None:
+        # Decision 1: the shelf routes the archive location; the identity's
+        # media type drives planning, so a movie on the anime shelf plans as
+        # a movie instead of stopping.
         pending = self._new_work_waiting()
         started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
         identity = AutomaticIdentity(
@@ -284,83 +302,18 @@ class TargetShelfStartGateTests(unittest.TestCase):
             target_shelf_root="/library/番剧",
         )
 
-        def conflict(*_args, **_kwargs):
-            raise TargetShelfPolicyConflictError(
-                target_shelf="anime", media_type="movie", identity=identity,
-            )
-
-        original = self.runner.resolve_automatic_request
-        self.runner.resolve_automatic_request = conflict  # type: ignore[method-assign]
-        try:
-            conflicted = self.runner.plan_automatic_job(started.id)
-        finally:
-            self.runner.resolve_automatic_request = original  # type: ignore[method-assign]
-
-        self.assertEqual(conflicted.phase, "target_policy_conflict")
-        self.assertEqual(conflicted.plan, {})
-        self.assertEqual(conflicted.target_shelf, "anime")
-        self.assertEqual(conflicted.summary["identity"]["media_type"], "movie")
-        self.assertEqual(self.events, ["archive"])
-        reselected = self.runner.start_automatic_job(conflicted.id, target_shelf="movie")
-        self.assertEqual(reselected.phase, "queued")
-        self.assertEqual(reselected.target_root, "/library/电影")
-
-    def test_conflict_reselection_reuses_verified_archive_projection(self) -> None:
-        preprocessor = ReusableArchivePreprocessor()
-        self.runner.archive_preprocessor = preprocessor
-        pending = self._new_work_waiting()
-        started = self.runner.start_automatic_job(pending.id, target_shelf="anime")
-        conflict_identity = AutomaticIdentity(
-            media_type="movie",
-            tmdb_id=1,
-            title="Movie",
-            year="2020",
-            confidence=0.99,
-            target_parent="/library/番剧",
-            season=None,
-            trace={},
-            target_shelf="anime",
-            target_shelf_root="/library/番剧",
-        )
-
-        def resolve(source_path, *, target_shelf):
-            shelf = target_shelf.value if hasattr(target_shelf, "value") else str(target_shelf)
-            if shelf == "anime":
-                raise TargetShelfPolicyConflictError(
-                    target_shelf="anime", media_type="movie", identity=conflict_identity,
-                )
-            request = EngineRequest.from_mapping({
-                "source_path": source_path,
-                "parent_path": "/library/电影",
-                "media_type": "movie",
-                "target_shelf": "movie",
-                "tmdb_id": 1,
-            })
-            identity = AutomaticIdentity(
-                media_type="movie",
-                tmdb_id=1,
-                title="Movie",
-                year="2020",
-                confidence=0.99,
-                target_parent="/library/电影",
-                season=None,
-                trace={},
-                target_shelf="movie",
-                target_shelf_root="/library/电影",
-            )
-            return request, identity
-
-        def valid_plan(request, *_args):
+        def movie_plan(request, *_args):
+            target_root = f"{request.parent_path}/Movie (2020)"
             return Plan(
                 mode="movie",
                 source_root=request.source_path,
-                target_root="/library/电影/Movie (2020)",
+                target_root=target_root,
                 files=[PlannedFile(
                     source_path=f"{request.source_path}/movie.mkv",
                     source_dir=request.source_path,
                     original_name="movie.mkv",
                     final_name="Movie (2020).mkv",
-                    target_dir="/library/电影/Movie (2020)",
+                    target_dir=target_root,
                     media_kind="video",
                     source_size=1,
                 )],
@@ -368,26 +321,20 @@ class TargetShelfStartGateTests(unittest.TestCase):
                 metadata={"tmdb_id": 1, "title": "Movie", "year": "2020"},
             )
 
-        original_resolver = self.runner.resolve_automatic_request
         original_planner = self.runner.planner
-        self.runner.resolve_automatic_request = resolve  # type: ignore[method-assign]
-        self.runner.planner = valid_plan
+        self.runner.planner = movie_plan
         try:
-            conflicted = self.runner.plan_automatic_job(started.id)
-            self.assertEqual(conflicted.phase, "target_policy_conflict")
-            self.assertEqual(preprocessor.calls, 1)
-            projection = conflicted.summary["archive_preprocessed"]
-            self.assertTrue(projection["source_path"].startswith("/library/ScrapeFlow/归档/"))
-
-            reselected = self.runner.start_automatic_job(conflicted.id, target_shelf="movie")
-            planned = self.runner.plan_automatic_job(reselected.id)
+            with patch(
+                "engine.scraper.auto_match_tmdb",
+                return_value=(identity, []),
+            ):
+                planned = self.runner.plan_automatic_job(started.id)
         finally:
-            self.runner.resolve_automatic_request = original_resolver  # type: ignore[method-assign]
             self.runner.planner = original_planner
 
         self.assertEqual(planned.phase, "planned")
-        self.assertEqual(preprocessor.calls, 1)
-        self.assertEqual(planned.request["source_path"], projection["source_path"])
+        self.assertEqual(planned.request["media_type"], "movie")
+        self.assertEqual(planned.plan["target_root"], "/library/番剧/Movie (2020)")
 
     def test_foreign_archive_projection_fails_closed_without_reprocessing(self) -> None:
         preprocessor = ReusableArchivePreprocessor()

@@ -77,26 +77,6 @@ class EngineJobConflictError(EngineExecutionError):
     """A valid request conflicts with durable job/source state."""
 
 
-class TargetShelfPolicyConflictError(EngineJobConflictError):
-    """TMDB media type conflicts with the user's selected target shelf."""
-
-    def __init__(
-        self,
-        *,
-        target_shelf: TargetShelf | str,
-        media_type: str,
-        identity: object | None = None,
-    ) -> None:
-        selected = parse_target_shelf(target_shelf)
-        super().__init__(
-            "TMDB 识别结果与用户选择的目标货架冲突: "
-            f"{media_type or 'unknown'} 不能进入 {selected.value}"
-        )
-        self.target_shelf = selected.value
-        self.media_type = media_type
-        self.identity = identity
-
-
 class EngineRecoveryMatrixError(EngineExecutionError):
     """A restart readback found a durable, non-retryable state conflict.
 
@@ -5121,86 +5101,55 @@ class SimpleEngineRunner:
             if cancelled is not None:
                 return cancelled
             correction = job.summary.get("manual_identity")
-            try:
-                if merge_existing and merge_identity is not None:
-                    request = self._request_from_reconciled_identity(
-                        archive_request.source_path,
-                        identity=replace(
-                            merge_identity,
-                            target_parent=selected_root,
-                            target_shelf=selected_shelf.value,
-                            target_shelf_root=selected_root,
-                        ),
-                        shelf=selected_shelf,
-                        shelf_root=selected_root,
-                    )
-                    identity = replace(
+            if merge_existing and merge_identity is not None:
+                request = self._request_from_reconciled_identity(
+                    archive_request.source_path,
+                    identity=replace(
                         merge_identity,
                         target_parent=selected_root,
                         target_shelf=selected_shelf.value,
                         target_shelf_root=selected_root,
-                    )
-                elif (
-                    reconciled_new_work
-                    and reconciled_identity is not None
-                    and not isinstance(correction, Mapping)
-                ):
-                    identity = replace(
-                        reconciled_identity,
-                        target_parent=selected_root,
-                        target_shelf=selected_shelf.value,
-                        target_shelf_root=selected_root,
-                    )
-                    request = self._request_from_reconciled_identity(
-                        archive_request.source_path,
-                        identity=identity,
-                        shelf=selected_shelf,
-                        shelf_root=selected_root,
-                    )
-                elif isinstance(correction, Mapping):
-                    request, identity = self._request_from_manual_identity(
-                        archive_request.source_path,
-                        correction,
-                        target_shelf=selected_shelf,
-                    )
-                else:
-                    request, identity = self.resolve_automatic_request(
-                        archive_request.source_path,
-                        target_shelf=selected_shelf,
-                    )
-                cancelled = self._consume_cancel_request(matching)
-                if cancelled is not None:
-                    return cancelled
-            except TargetShelfPolicyConflictError as exc:
-                summary = dict(matching.summary)
-                summary.update({
-                    "automatic": True,
-                    "automatic_stage": "target_policy_conflict",
-                    "target_shelf": selected_shelf.value,
-                    "selected_target_root": selected_root,
-                })
-                if archive_projection is not None:
-                    # Keep the verified staging coordinates across the
-                    # conflict/reselection boundary; the next /start must
-                    # consume this projection without re-extracting.
-                    summary["archive_preprocessed"] = dict(archive_projection)
-                if archive_request.source_path != original_source:
-                    summary["ingress_source_path"] = original_source
-                if isinstance(exc.identity, AutomaticIdentity):
-                    summary["identity"] = exc.identity.as_dict()
-                summary = self._without_active_operation(summary)
-                conflicted = replace(
-                    matching,
-                    phase="target_policy_conflict",
-                    updated_at=_now(),
-                    request={"source_path": original_source},
-                    plan={},
-                    summary=summary,
-                    error=redact_error(exc),
-                    execution=None,
+                    ),
+                    shelf=selected_shelf,
+                    shelf_root=selected_root,
                 )
-                atomic_write_json(self._job_path(job_id), conflicted.as_dict(), allow_nan=False)
-                return conflicted
+                identity = replace(
+                    merge_identity,
+                    target_parent=selected_root,
+                    target_shelf=selected_shelf.value,
+                    target_shelf_root=selected_root,
+                )
+            elif (
+                reconciled_new_work
+                and reconciled_identity is not None
+                and not isinstance(correction, Mapping)
+            ):
+                identity = replace(
+                    reconciled_identity,
+                    target_parent=selected_root,
+                    target_shelf=selected_shelf.value,
+                    target_shelf_root=selected_root,
+                )
+                request = self._request_from_reconciled_identity(
+                    archive_request.source_path,
+                    identity=identity,
+                    shelf=selected_shelf,
+                    shelf_root=selected_root,
+                )
+            elif isinstance(correction, Mapping):
+                request, identity = self._request_from_manual_identity(
+                    archive_request.source_path,
+                    correction,
+                    target_shelf=selected_shelf,
+                )
+            else:
+                request, identity = self.resolve_automatic_request(
+                    archive_request.source_path,
+                    target_shelf=selected_shelf,
+                )
+            cancelled = self._consume_cancel_request(matching)
+            if cancelled is not None:
+                return cancelled
             planning = replace(matching, phase="planning", updated_at=_now())
             atomic_write_json(self._job_path(job_id), planning.as_dict(), allow_nan=False)
             try:
@@ -7650,7 +7599,6 @@ __all__ = [
     "EngineRequest",
     "EngineRequestError",
     "EngineWorkerBusyError",
-    "TargetShelfPolicyConflictError",
     "recover_persisted_engine_jobs",
     "SimpleEngineError",
     "SimpleEngineRunner",
