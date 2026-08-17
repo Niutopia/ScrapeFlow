@@ -1000,6 +1000,21 @@ class AlistOfflineAutomaticMaterializer:
     _TASK_STATE_SUCCEEDED = 2
     _TASK_TERMINAL_FAILURE_STATES = frozenset({4, 5, 7})
 
+    # Terminal task errors that prove a tool/transport outage rather than a
+    # bad resource: they map onto infrastructure (same tier, retry_wait,
+    # locator NOT excluded) per the three-scope contract.
+    _TASK_INFRASTRUCTURE_ERROR_MARKERS = (
+        "connection refused",
+        "dial tcp",
+        "no route to host",
+        "tool not found",
+        "failed get tool",
+        "failed init tool",
+        "no such host",
+        "name or service not known",
+        "connection reset",
+    )
+
     _WALK_MAX_ENTRIES = 4000
 
     def __init__(
@@ -1361,6 +1376,17 @@ class AlistOfflineAutomaticMaterializer:
             if state in self._TASK_TERMINAL_FAILURE_STATES or (
                 error and state not in (None, 0, 1)
             ):
+                lowered = error.casefold()
+                if any(
+                    marker in lowered
+                    for marker in self._TASK_INFRASTRUCTURE_ERROR_MARKERS
+                ):
+                    # The download tool/transport itself is down (aria2 RPC
+                    # unreachable, tool not configured, ...): infrastructure,
+                    # never a candidate exclusion.
+                    raise AutomaticReplenishmentError(
+                        f"AList 离线工具故障: {error[:200] or state}"
+                    )
                 raise AlistOfflineCandidateError(
                     f"AList 离线任务失败: {error[:200] or state}"
                 )

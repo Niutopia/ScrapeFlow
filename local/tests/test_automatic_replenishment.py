@@ -4063,6 +4063,37 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(caught.exception.failure_scope, "candidate")
         self.assertTrue(caught.exception.exclude_candidate)
 
+    def test_alist_offline_materializer_tool_outage_is_infrastructure(self) -> None:
+        """A tool/transport outage must never exclude the reviewed candidate."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            alist = FakeAList()
+
+            def tool_outage(_seconds):
+                alist.set_task_state(
+                    "alist-task-1", 7, progress=100,
+                    error=(
+                        'Post "http://api:6800/jsonrpc": '
+                        "dial tcp 172.20.0.5:6800: connect: connection refused"
+                    ),
+                )
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=tool_outage, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AutomaticReplenishmentError) as caught:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-tool-outage",
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertFalse(getattr(caught.exception, "exclude_candidate", False))
+        self.assertNotEqual(
+            getattr(caught.exception, "failure_scope", None), "candidate",
+        )
+
     def test_alist_offline_materializer_stall_is_candidate_excluded(self) -> None:
         """A task that never advances progress is a dead candidate."""
         selection = _alist_offline_selection()
