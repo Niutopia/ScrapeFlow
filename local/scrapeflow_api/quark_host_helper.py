@@ -1,7 +1,7 @@
 """Passive typed helper for the existing Quark desktop session.
 
-This is deliberately not a Quark proxy.  Its HTTP surface is the four fixed
-actions in ``HELPER_ACTIONS`` and every cloud operation is constructed here
+This is deliberately not a Quark proxy.  Its HTTP surface is the two fixed
+actions in ``HELPER_ACTIONS`` (health and share-save) and every cloud operation is constructed here
 from a reviewed task payload.  The helper never accepts cookies, arbitrary
 URLs, arbitrary Quark paths, or DevTools commands from its HTTP caller.
 
@@ -50,8 +50,7 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency
     ) from exc
 
 
-# Fixed action contract (2026-08-17): the magnet submit/status actions were
-# removed with the quark_magnet tier; only share-save remains typed.
+# Fixed action contract (2026-08-17): only share-save remains typed.
 HELPER_ACTIONS = ("health", "share-save")
 DEFAULT_STAGING_ROOT = CANONICAL_REPLENISHMENT_STAGING_ROOT
 DEFAULT_MOUNT_PATH = "/quark"

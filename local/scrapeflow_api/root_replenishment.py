@@ -265,6 +265,21 @@ def _classify_error(error: Exception) -> tuple[str, str | None]:
     return FAILURE_INFRASTRUCTURE, None
 
 
+def _external_task_is_final(error: BaseException) -> bool:
+    """Whether an infrastructure failure proved its external task stopped.
+
+    Ordinary infrastructure failures retain an in-doubt token because the
+    remote task may still be consuming bytes or complete later.  The AList
+    transfer-deadline path supplies this marker only after a fresh confirmed
+    cancellation, which permits a same-tier retry without re-submitting a
+    still-live task.
+    """
+    return any(
+        getattr(item, "external_task_final", False) is True
+        for item in _exception_chain(error)
+    )
+
+
 def _episode_token(season: int, episodes: object) -> str | None:
     ordered = sorted({
         int(item) for item in episodes
@@ -510,6 +525,69 @@ def _append_attempt_log(
         del log[:- _MAX_ATTEMPT_LOG]
 
 
+def _root_target_shelf(runner: Any, root_task_id: str) -> str | None:
+    """Return the root's declared shelf without trusting an arbitrary value."""
+    try:
+        shelf = runner.get_job(root_task_id).target_shelf
+    except Exception:
+        return None
+    return shelf if shelf in {"movie", "anime", "us_tv"} else None
+
+
+def _search_evidence_completion(
+    tier: str,
+    evidence: Mapping[str, Any] | None,
+    *,
+    shelf: str | None,
+) -> tuple[bool, list[str]]:
+    """Validate one raw-search proof for this tier and return its sources.
+
+    ``gap_ledger_selection`` carries this evidence from the original search
+    response.  Do not turn an empty selector result into a proof here: every
+    identity request must independently show all required sources for the
+    active tier and zero unchecked candidates.  Telemetry outside that
+    required-source set is diagnostic only and cannot make this tier fail or
+    succeed.
+    """
+    if not isinstance(evidence, Mapping):
+        return False, []
+    if evidence.get("scope") != FAILURE_CANDIDATE:
+        return False, []
+    if evidence.get("search_complete_no_candidates") is not True:
+        return False, []
+    unchecked = evidence.get("unchecked_secondary_candidates")
+    if (
+        not isinstance(unchecked, int)
+        or isinstance(unchecked, bool)
+        or unchecked != 0
+    ):
+        return False, []
+    required = required_sources_for_tier(tier, shelf)
+    completed = {
+        str(value).strip().casefold()
+        for value in (evidence.get("completed_sources") or [])
+        if isinstance(value, str) and value.strip()
+    } & set(required)
+    telemetry = evidence.get("source_telemetry")
+    if isinstance(telemetry, Mapping):
+        for source in required:
+            raw = telemetry.get(source)
+            if not isinstance(raw, Mapping):
+                continue
+            failures = raw.get("infrastructure_failures")
+            if (
+                isinstance(failures, int)
+                and not isinstance(failures, bool)
+                and failures > 0
+            ):
+                return False, []
+            if raw.get("source_exhausted") is True:
+                completed.add(source)
+    if not required.issubset(completed):
+        return False, []
+    return True, sorted(completed)
+
+
 def _noop_result(state: dict[str, Any], tier: str) -> dict[str, Any]:
     return {
         "tier": tier,
@@ -667,7 +745,8 @@ def _reconcile_in_flight_tokens(
     (poll-only, never re-submit) and go through the same writer closure as a
     fresh attempt.  Failures follow the same three-scope classification:
     candidate excludes the locator and un-parks, infrastructure pins the token
-    for retry, in_doubt keeps the token parked for the next round.
+    for retry unless it proves the task was cancelled, and in_doubt keeps the
+    token parked for the next round.
     """
     in_flight = state.get(_IN_FLIGHT_KEY)
     if not isinstance(in_flight, Mapping):
@@ -790,6 +869,11 @@ def _reconcile_in_flight_tokens(
                 waiting = waiting or "waiting_reconcile"
             elif scope == FAILURE_INFRASTRUCTURE:
                 waiting = waiting or "retry_wait"
+                if _external_task_is_final(exc):
+                    # AList confirmed cancellation after a bounded transfer.
+                    # It is now safe to let the next same-tier retry create a
+                    # new task; keeping this token would deadlock recovery.
+                    removed_tokens.add(token)
             else:
                 removed_tokens.add(token)
                 _exclude_locator(state, TIER_ALIST_OFFLINE, str(locator or ""))
@@ -986,15 +1070,17 @@ def run_root_replenishment(
 
     hit_in_doubt = False
     hit_infrastructure = False
-    any_candidate = False
-    any_materialized = False
-    all_no_candidate = True
     in_doubt_task_ids: dict[str, str | None] = {}
     failed_locators: set[str] = set()
     newly_in_flight: dict[str, str | None] = {}
+    no_candidate_proofs: list[Mapping[str, Any]] = []
+    searched_requests = 0
+    paused_during_round = False
+    shelf = _root_target_shelf(runner, root_task_id)
 
     for request in requests:
         if pause():
+            paused_during_round = True
             break
         media = request.get("media") or {}
         media_type = str(media.get("media_type") or "").strip().casefold()
@@ -1023,6 +1109,12 @@ def run_root_replenishment(
             )
         except Exception as exc:  # search boundary failure
             scope, task_id = _classify_error(exc)
+            # A search exception has not inspected or submitted a concrete
+            # locator.  Even if a lower adapter labels it ``candidate``, it
+            # cannot establish no-candidate exhaustion, so retry this same
+            # tier instead of leaving an unprovable silent stop.
+            if scope == FAILURE_CANDIDATE:
+                scope = FAILURE_INFRASTRUCTURE
             for row in request.get("gaps") or []:
                 token = str(row.get("id") or "")
                 for gap in by_token.get(token, ()):
@@ -1053,37 +1145,60 @@ def run_root_replenishment(
                         newly_in_flight[token] = task_id
             elif scope == FAILURE_INFRASTRUCTURE:
                 hit_infrastructure = True
-            else:
-                any_candidate = True
-            all_no_candidate = False
             continue
 
         if not isinstance(bundle, Mapping):
             bundle = {}
+        searched_requests += 1
+        if pause():
+            # A completed read-only search is not permission to certify the
+            # request or advance the tier after the operator pauses.
+            paused_during_round = True
+            break
         selections = bundle.get("selections")
         selections = selections if isinstance(selections, list) else []
         _trace(f"selected root={root_task_id} tier={tier} tmdb={tmdb_id} selections={len(selections)}")
 
         if not selections:
-            # Candidate exhaustion evidence for this request.
+            evidence = bundle.get("search_evidence")
+            proof_complete, completed_sources = _search_evidence_completion(
+                tier,
+                evidence if isinstance(evidence, Mapping) else None,
+                shelf=shelf,
+            )
+            if proof_complete:
+                no_candidate_proofs.append({
+                    "completed_sources": completed_sources,
+                })
+            else:
+                # Search returned no selectable candidate but did not prove
+                # the active tier exhausted.  This is never a candidate
+                # exclusion: keep the tier and re-arm the same lane.
+                hit_infrastructure = True
+                _trace(
+                    f"no exhaustion proof root={root_task_id} tier={tier} "
+                    f"tmdb={tmdb_id}",
+                )
             for row in request.get("gaps") or []:
                 token = str(row.get("id") or "")
                 for gap in by_token.get(token, ()):
                     attempts.append({
                         "gap_id": gap.gap_id,
                         "tier": tier,
-                        "outcome": FAILURE_CANDIDATE,
+                        "outcome": (
+                            FAILURE_CANDIDATE
+                            if proof_complete else FAILURE_INFRASTRUCTURE
+                        ),
                     })
             continue
 
-        all_no_candidate = False
-        any_candidate = True
         materializer = factory(tier)
 
         for selection in selections:
             if not isinstance(selection, Mapping):
                 continue
             if pause():
+                paused_during_round = True
                 break
             selected_tokens = [
                 str(gid) for gid in (selection.get("selected_gap_ids") or [])
@@ -1162,7 +1277,6 @@ def run_root_replenishment(
                 elif scope == FAILURE_INFRASTRUCTURE:
                     hit_infrastructure = True
                 else:
-                    any_candidate = True
                     if locator:
                         failed_locators.add(locator)
                 continue
@@ -1184,7 +1298,6 @@ def run_root_replenishment(
                         "outcome": FAILURE_CANDIDATE,
                         **({"candidate_key": locator} if locator else {}),
                     })
-                any_candidate = True
                 if locator:
                     failed_locators.add(locator)
                 continue
@@ -1233,12 +1346,10 @@ def run_root_replenishment(
                 elif scope == FAILURE_INFRASTRUCTURE:
                     hit_infrastructure = True
                 else:
-                    any_candidate = True
                     if locator:
                         failed_locators.add(locator)
                 continue
 
-            any_materialized = True
             for gap in covered_gaps:
                 if _prove_gap_coverage(gap, by_unit, executed_plan):
                     try:
@@ -1268,19 +1379,37 @@ def run_root_replenishment(
                         "outcome": FAILURE_CANDIDATE,
                         **({"candidate_key": locator} if locator else {}),
                     })
-                    any_candidate = True
                     if locator:
                         failed_locators.add(locator)
+
+        if pause():
+            paused_during_round = True
+            break
 
     # Tier progression / waiting (contract rule 4).
     # Candidate-locator memory is recorded FIRST so a mixed run (one
     # infrastructure failure plus several rejected candidates) never loses
-    # the rejected locators.
-    for locator in sorted(failed_locators):
-        state = apply_tier_outcome(state, {
-            "scope": FAILURE_CANDIDATE,
-            "locator": locator,
-        })
+    # the rejected locators.  A pause, incomplete search proof, or in-doubt
+    # task can land after a materializer reports a candidate failure: retain
+    # that evidence, but defer the policy update so the 30-locator exhaustion
+    # threshold cannot promote a tier while the round is not fully clean.
+    if pause():
+        paused_during_round = True
+    defer_candidate_transition = (
+        paused_during_round
+        or hit_infrastructure
+        or hit_in_doubt
+        or reconcile_waiting in {"retry_wait", "waiting_reconcile"}
+    )
+    if defer_candidate_transition:
+        for locator in sorted(failed_locators):
+            _exclude_locator(state, tier, locator)
+    else:
+        for locator in sorted(failed_locators):
+            state = apply_tier_outcome(state, {
+                "scope": FAILURE_CANDIDATE,
+                "locator": locator,
+            })
     if hit_in_doubt or reconcile_waiting == "waiting_reconcile":
         waiting = "waiting_reconcile"
         if hit_in_doubt:
@@ -1295,21 +1424,37 @@ def run_root_replenishment(
     elif hit_infrastructure or reconcile_waiting == "retry_wait":
         waiting = "retry_wait"
         state = apply_tier_outcome(state, {"scope": FAILURE_INFRASTRUCTURE})
-    elif requests_built > 0 and all_no_candidate:
-        shelf = None
-        try:
-            root_job = runner.get_job(root_task_id)
-            shelf = root_job.target_shelf
-        except Exception:
-            shelf = None
-        state = apply_tier_outcome(state, {
-            "scope": FAILURE_CANDIDATE,
-            "search_complete_no_candidates": True,
-            "completed_sources": sorted(
-                required_sources_for_tier(tier, shelf),
-            ),
-            "unchecked_secondary_candidates": 0,
+    elif (
+        requests_built > 0
+        and not paused_during_round
+        and not pause()
+        and searched_requests == requests_built
+        and len(no_candidate_proofs) == requests_built
+    ):
+        # No selector result is allowed to manufacture this outcome.  Every
+        # request independently supplied a complete raw-search proof above;
+        # only then can their already-observed source evidence be aggregated
+        # into the policy transition.
+        completed_sources = sorted({
+            str(source).strip().casefold()
+            for proof in no_candidate_proofs
+            for source in (proof.get("completed_sources") or [])
+            if isinstance(source, str) and source.strip()
         })
+        # The preceding check closes the normal loop boundary; this one is
+        # deliberately adjacent to the durable state transition so a pause
+        # that arrives while the aggregate proof is being assembled cannot
+        # promote the next tier.
+        if pause():
+            paused_during_round = True
+        else:
+            state = apply_tier_outcome(state, {
+                "scope": FAILURE_CANDIDATE,
+                "search_complete_no_candidates": True,
+                "completed_sources": completed_sources,
+                "unchecked_secondary_candidates": 0,
+                **({"shelf": shelf} if shelf is not None else {}),
+            })
 
     state["updated_at"] = _now()
     state["waiting"] = waiting

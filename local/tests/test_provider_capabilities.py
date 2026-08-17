@@ -247,7 +247,12 @@ class ProviderCapabilityTests(unittest.TestCase):
         manifest = {
             "root": "Example Show",
             "infohash": "0123456789012345678901234567890123456789",
-            "files": {1: {"path": "Example.Show.S01E01.mkv", "size": 1024 * 1024}},
+            "files": {
+                1: {"path": "Example.Show.S01E01.mkv", "size": 1024 * 1024},
+                # This is not selected for the current gap, but AList still
+                # downloads it because its offline tool receives the torrent.
+                2: {"path": "Extras/source.iso", "size": 7 * 1024 * 1024},
+            },
         }
 
         rows = candidate_variants(
@@ -264,6 +269,23 @@ class ProviderCapabilityTests(unittest.TestCase):
             ACQUISITION_ALIST_OFFLINE,
         )
         self.assertEqual(rows[1]["acquisition"]["kind"], ACQUISITION_TORRENT)
+        self.assertEqual(
+            rows[1]["acquisition"]["download_bytes"],
+            8 * 1024 * 1024,
+        )
+        self.assertEqual(
+            rows[0]["acquisition"]["download_bytes"],
+            8 * 1024 * 1024,
+        )
+        self.assertEqual(
+            rows[0]["acquisition"]["expected_files"],
+            [{
+                "torrent_index": 1,
+                "path": "Example.Show.S01E01.mkv",
+                "size": 1024 * 1024,
+                "gap_ids": ["S01E01"],
+            }],
+        )
 
     def test_alist_offline_locator_does_not_preexclude_local_torrent_hash(self) -> None:
         infohash = "0123456789012345678901234567890123456789"

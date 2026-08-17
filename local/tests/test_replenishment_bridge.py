@@ -270,6 +270,42 @@ class GapLedgerSelectionTests(unittest.TestCase):
                     search_runner=lambda req: ["not", "a", "mapping"],
                 )
 
+    def test_selection_carries_raw_completion_evidence_without_inventing_it(self) -> None:
+        request = self._tv_request()
+        request["tier"] = "quark_share"
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            _seed_state(state_root)
+            missing = gap_ledger_selection(
+                state_root, "root-1", request,
+                search_runner=lambda _request: {"candidates": []},
+            )
+            complete = gap_ledger_selection(
+                state_root, "root-1", request,
+                search_runner=lambda _request: {
+                    "candidates": [],
+                    "search_complete_no_candidates": True,
+                    "completed_sources": ["PanSou"],
+                    "unchecked_secondary_candidates": 0,
+                },
+            )
+
+        self.assertEqual(missing["search_evidence"], {
+            "scope": "candidate",
+            "search_complete_no_candidates": False,
+            "completed_sources": [],
+            "unchecked_secondary_candidates": 0,
+            "source_telemetry": {},
+        })
+        self.assertEqual(complete["search_evidence"], {
+            "scope": "candidate",
+            "search_complete_no_candidates": True,
+            "completed_sources": ["pansou"],
+            "unchecked_secondary_candidates": 0,
+            "source_telemetry": {},
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

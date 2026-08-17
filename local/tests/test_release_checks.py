@@ -51,6 +51,9 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
         "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+        "SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES": "34359738368",
+        "SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES": "21474836480",
+        "SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT": "3600",
         "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
         "SCRAPEFLOW_PANSOU_ENABLED": "0",
@@ -106,6 +109,11 @@ class ReleaseCheckTests(unittest.TestCase):
             "    volumes:\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
+            "  offline-aria2:\n"
+            "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
+            "    command: [\"aria2c\", \"--no-conf\", \"--dir=/opt/alist/data/temp/aria2\", \"--file-allocation=none\"]\n"
+            "    volumes:\n"
+            "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
             "  quark-helper:\n"
             "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
             "    restart: unless-stopped\n"
@@ -281,6 +289,47 @@ class ReleaseCheckTests(unittest.TestCase):
     def test_deployment_contract_accepts_current_defaults(self) -> None:
         self.assertEqual(local_deployment_contract_issues(), [])
 
+    def test_current_operator_docs_describe_p15_contract(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        deployment = (root / "docs" / "scrapeflow-deployment-open-order.md").read_text(
+            encoding="utf-8"
+        )
+        acceptance = (root / "docs" / "scrapeflow-isolated-acceptance-record.md").read_text(
+            encoding="utf-8"
+        )
+        environment_template = (root / ".env.local.example").read_text(encoding="utf-8")
+        engine_readme = (root / "engine" / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("POST /api/root-jobs", readme)
+        self.assertIn("quark_share → alist_offline → magnet", readme)
+        self.assertIn("http://127.0.0.1:3010", readme)
+        self.assertIn("<isolated-api-port>", readme)
+        self.assertIn("两动作", readme)
+        self.assertIn("offline sibling", readme)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", readme)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT", readme)
+        self.assertNotIn("172.20.0.0/16", readme)
+        self.assertNotIn("尚未接入运行时", readme)
+        self.assertNotIn("四动作", readme)
+        self.assertIn("offline-aria2", deployment)
+        self.assertIn("http://127.0.0.1:3010", deployment)
+        self.assertIn("--file-allocation=none", deployment)
+        self.assertIn("-p scrapeflow-acceptance-<run-id>", deployment)
+        self.assertIn("POST /api/control/resume", deployment)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", deployment)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT", deployment)
+        self.assertNotIn("四动作", deployment)
+        self.assertIn("P15", acceptance)
+        self.assertIn("有效 quark_share", acceptance)
+        self.assertIn("alist_offline", acceptance)
+        self.assertIn("完整种子超 32 GiB", acceptance)
+        self.assertNotIn("SCRAPEFLOW_API_PORT=8765", environment_template)
+        self.assertIn("Setting it to 0 does not bypass", environment_template)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", environment_template)
+        self.assertIn("创建 RootJob", engine_readme)
+        self.assertNotIn("策略冲突", engine_readme)
+
     def test_deployment_contract_rejects_unpaused_env_template(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -335,6 +384,22 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertTrue(any("api.image" in issue for issue in issues))
         self.assertTrue(any("quark-helper.image" in issue for issue in issues))
         self.assertTrue(any("api.volumes" in issue for issue in issues))
+
+    def test_deployment_contract_rejects_offline_aria2_preallocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            compose_path = root / "docker-compose.yml"
+            compose_path.write_text(
+                compose_path.read_text(encoding="utf-8").replace(
+                    "--file-allocation=none", "--file-allocation=prealloc",
+                ),
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("file-allocation=none" in issue for issue in issues))
 
     def test_deployment_contract_requires_helper_pansou_and_pilot_wiring(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

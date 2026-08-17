@@ -22,6 +22,10 @@ from local.scrapeflow_api.root_replenishment import (
     run_root_replenishment,
     save_root_replenishment_state,
 )
+from local.scrapeflow_api.replenishment_tiers import (
+    EXHAUSTION_MIN_DISTINCT_LOCATORS,
+    MAGNET_REQUIRED_SOURCES,
+)
 from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
 
 from local.tests.test_library_index import IndexAList
@@ -39,6 +43,12 @@ class _InDoubtError(Exception):
 
 class _InfraError(Exception):
     failure_scope = "infrastructure"
+
+
+class _FinalInfrastructureError(_InfraError):
+    """Infrastructure failure after the external task was confirmed stopped."""
+
+    external_task_final = True
 
 
 class _CandidateError(Exception):
@@ -166,8 +176,41 @@ def _magnet_search(gap_token: str):
     return search
 
 
+def _quark_share_search(gap_token: str):
+    def search(request):
+        del request
+        return {"candidates": [{
+            "provider": "quark_share",
+            "locator": "quark_share:final-candidate",
+            "release_name": f"Fate Zero {gap_token} 1080p",
+            "title": "Fate/Zero",
+            "year": "2011",
+            "files": [f"Fate.Zero.{gap_token}.mkv"],
+            "file_coverage": [gap_token],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "share_url": "https://pan.quark.cn/s/fixture-share",
+                "file_id_by_gap": {gap_token: ["fixture-file"]},
+            },
+        }]}
+    return search
+
+
 def _empty_search(request):
     return {"candidates": []}
+
+
+def _complete_no_candidate_search(*completed_sources: str):
+    def search(request):
+        del request
+        return {
+            "candidates": [],
+            "search_complete_no_candidates": True,
+            "completed_sources": list(completed_sources),
+            "unchecked_secondary_candidates": 0,
+        }
+    return search
 
 
 def _coverage_planner(files: list[tuple[str, str]]):
@@ -342,13 +385,295 @@ class RootReplenishmentTests(unittest.TestCase):
             runner = self._runner(state_root)
             result = run_root_replenishment(
                 runner, state_root, "root-1",
-                search_runner=_empty_search,
+                search_runner=_complete_no_candidate_search("pansou"),
                 materializer_factory=lambda tier: _FakeMaterializer(),
             )
             self.assertEqual(result["tier"], "alist_offline")
             self.assertIsNone(result["waiting"])
             persisted = load_root_replenishment_state(state_root, "root-1")
             self.assertEqual(persisted["tier"], "alist_offline")
+
+    def test_empty_selection_without_raw_completion_proof_does_not_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=_empty_search,
+            )
+
+            self.assertEqual(result["tier_before"], "quark_share")
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["waiting"], "retry_wait")
+            self.assertEqual(result["attempts"][0]["outcome"], "infrastructure")
+            self.assertEqual(
+                load_root_replenishment_state(state_root, "root-1")[
+                    "exhaustion_proof_by_provider"
+                ],
+                {},
+            )
+
+    def test_search_exception_without_locator_retries_same_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+
+            def search(_request):
+                raise _CandidateError("bad source")
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=search,
+            )
+
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["waiting"], "retry_wait")
+            self.assertEqual(result["attempts"][0]["outcome"], "infrastructure")
+            self.assertEqual(
+                load_root_replenishment_state(state_root, "root-1")[
+                    "candidate_failures_by_provider"
+                ],
+                {},
+            )
+
+    def test_each_identity_needs_its_own_completion_proof_before_advancing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            save_work_unit_records(state_root, "root-1", [
+                _work_unit(
+                    "root-1", "unit-tv",
+                    media_type="tv", tmdb_id=35507, title="Fate/Zero",
+                ),
+                _work_unit(
+                    "root-1", "unit-movie",
+                    media_type="movie", tmdb_id=10378, title="The Big Short",
+                ),
+            ])
+            save_gap_ledger(state_root, "root-1", [
+                _episode_gap(
+                    "root-1", "unit-tv",
+                    media_type="tv", tmdb_id=35507, season=1, episode=2,
+                ),
+                Gap(
+                    gap_id="unit-movie::missing_media::main",
+                    root_task_id="root-1",
+                    work_unit_id="unit-movie",
+                    kind="missing_media",
+                    media_type="movie",
+                    tmdb_id=10378,
+                    season=None,
+                    episodes=(),
+                    subtitle_path=None,
+                    subtitle_language=None,
+                    status="open",
+                ),
+            ])
+
+            def search(request):
+                if request["media"]["tmdb_id"] == 35507:
+                    return _complete_no_candidate_search("pansou")(request)
+                return {"candidates": []}
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=search,
+            )
+
+            self.assertEqual(result["requests_built"], 2)
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["waiting"], "retry_wait")
+            self.assertEqual(
+                load_root_replenishment_state(state_root, "root-1")[
+                    "exhaustion_proof_by_provider"
+                ],
+                {},
+            )
+
+    def test_pause_after_search_does_not_certify_or_advance_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            paused = [False]
+
+            def search(request):
+                paused[0] = True
+                return _complete_no_candidate_search("pansou")(request)
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=search,
+                pause_requested=lambda: paused[0],
+            )
+
+            self.assertEqual(result["tier_before"], "quark_share")
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["attempts"], [])
+            self.assertEqual(
+                load_root_replenishment_state(state_root, "root-1")[
+                    "exhaustion_proof_by_provider"
+                ],
+                {},
+            )
+
+    def test_pause_after_candidate_failure_cannot_cross_exhaustion_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            state = load_root_replenishment_state(state_root, "root-1")
+            state["candidate_failures_by_provider"] = {
+                "quark_share": [
+                    f"quark_share:old-{index}"
+                    for index in range(EXHAUSTION_MIN_DISTINCT_LOCATORS - 1)
+                ],
+            }
+            save_root_replenishment_state(state_root, "root-1", state)
+            paused = [False]
+
+            class PausingCandidateMaterializer(_FakeMaterializer):
+                def acquire(self, *args, **kwargs):
+                    del args, kwargs
+                    paused[0] = True
+                    raise _CandidateError("share expired")
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=_quark_share_search("S01E02"),
+                materializer_factory=lambda tier: PausingCandidateMaterializer(),
+                pause_requested=lambda: paused[0],
+            )
+
+            self.assertEqual(result["tier"], "quark_share")
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(persisted["tier"], "quark_share")
+            self.assertEqual(
+                len(persisted["candidate_failures_by_provider"]["quark_share"]),
+                EXHAUSTION_MIN_DISTINCT_LOCATORS,
+            )
+
+    def test_incomplete_second_request_blocks_candidate_threshold_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            save_work_unit_records(state_root, "root-1", [
+                _work_unit(
+                    "root-1", "unit-tv",
+                    media_type="tv", tmdb_id=35507, title="Fate/Zero",
+                ),
+                _work_unit(
+                    "root-1", "unit-movie",
+                    media_type="movie", tmdb_id=10378, title="The Big Short",
+                ),
+            ])
+            save_gap_ledger(state_root, "root-1", [
+                _episode_gap(
+                    "root-1", "unit-tv",
+                    media_type="tv", tmdb_id=35507, season=1, episode=2,
+                ),
+                Gap(
+                    gap_id="unit-movie::missing_media::main",
+                    root_task_id="root-1",
+                    work_unit_id="unit-movie",
+                    kind="missing_media",
+                    media_type="movie",
+                    tmdb_id=10378,
+                    season=None,
+                    episodes=(),
+                    subtitle_path=None,
+                    subtitle_language=None,
+                    status="open",
+                ),
+            ])
+            state = load_root_replenishment_state(state_root, "root-1")
+            state["candidate_failures_by_provider"] = {
+                "quark_share": [
+                    f"quark_share:old-{index}"
+                    for index in range(EXHAUSTION_MIN_DISTINCT_LOCATORS - 1)
+                ],
+            }
+            save_root_replenishment_state(state_root, "root-1", state)
+
+            def search(request):
+                if request["media"]["tmdb_id"] == 35507:
+                    return _quark_share_search("S01E02")(request)
+                return {"candidates": []}  # no raw completion proof
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=search,
+                materializer_factory=lambda tier: _FakeMaterializer(
+                    error=_CandidateError("share expired"),
+                ),
+            )
+
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["waiting"], "retry_wait")
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(persisted["tier"], "quark_share")
+            self.assertEqual(
+                len(persisted["candidate_failures_by_provider"]["quark_share"]),
+                EXHAUSTION_MIN_DISTINCT_LOCATORS,
+            )
+
+    def test_alist_offline_cannot_fall_through_on_partial_raw_source_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "alist_offline")
+
+            partial = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=_complete_no_candidate_search("animetosho"),
+            )
+            self.assertEqual(partial["tier"], "alist_offline")
+            self.assertEqual(partial["waiting"], "retry_wait")
+
+            def completed_via_raw_telemetry(_request):
+                return {
+                    "candidates": [],
+                    "search_complete": True,
+                    "source_telemetry": {
+                        source: {
+                            "source_exhausted": True,
+                            "infrastructure_failures": 0,
+                        }
+                        for source in MAGNET_REQUIRED_SOURCES
+                    },
+                }
+
+            complete = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=completed_via_raw_telemetry,
+            )
+            self.assertEqual(complete["tier"], "magnet")
+
+    def test_unrelated_source_telemetry_does_not_change_share_tier_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+
+            def search(_request):
+                return {
+                    "candidates": [],
+                    "search_complete_no_candidates": True,
+                    "source_telemetry": {
+                        "PanSou": {
+                            "source_exhausted": True,
+                            "infrastructure_failures": 0,
+                        },
+                        "unrelated-diagnostic-source": {
+                            "source_exhausted": False,
+                            "infrastructure_failures": 1,
+                        },
+                    },
+                }
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=search,
+            )
+
+            self.assertEqual(result["tier_before"], "quark_share")
+            self.assertEqual(result["tier"], "alist_offline")
 
     def test_infrastructure_keeps_tier_and_waits_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -861,6 +1186,26 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(
                 persisted["in_flight_gap_ids"], {"S01E02": "task-9"},
             )
+
+    def test_reconcile_confirmed_cancel_unparks_for_same_tier_retry(self) -> None:
+        """A verified AList cancellation must not leave a permanent barrier."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_parked_attempt(state_root)
+            result = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=_empty_search,
+                materializer_factory=lambda tier: _FakeMaterializer(
+                    reconcile_error=_FinalInfrastructureError("transfer cancelled"),
+                ),
+            )
+
+            self.assertEqual(result["waiting"], "retry_wait")
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(persisted["in_flight_gap_ids"], {})
+            self.assertEqual(persisted["tier"], "alist_offline")
 
     def test_reconcile_legacy_quark_magnet_parked_token_unparks(self) -> None:
         """A token parked by the removed lane re-enters the current ladder."""

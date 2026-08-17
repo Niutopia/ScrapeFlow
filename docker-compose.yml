@@ -88,6 +88,12 @@ services:
       SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH:-0}
       SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT:-120}
       SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT:-900}
+      # AList aria2 retrieves a whole Torrent, not only the members selected
+      # for this gap. Reserve capacity on the shared host state filesystem
+      # before submitting its offline-download task.
+      SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES: ${SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES:-34359738368}
+      SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES: ${SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES:-21474836480}
+      SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT: ${SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT:-3600}
       TMDB_BASE_URL: ${TMDB_BASE_URL_DOCKER:-https://api.themoviedb.org/3}
       TMDB_PROXY_URL: ${TMDB_PROXY_URL_DOCKER:-}
       TZ: ${TZ:-Asia/Shanghai}
@@ -142,7 +148,7 @@ services:
               "--rpc-listen-port=6800", "--dir=/opt/alist/data/temp/aria2",
               "--listen-port=6881-6999", "--dht-listen-port=6881-6999",
               "--bt-enable-lpd=true", "--enable-dht=true", "--enable-dht6=false",
-              "--follow-torrent=mem", "--seed-time=0",
+              "--follow-torrent=mem", "--seed-time=0", "--file-allocation=none",
               "--max-concurrent-downloads=3", "--console-log-level=warn"]
     environment:
       HTTP_PROXY: ""

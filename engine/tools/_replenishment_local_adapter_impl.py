@@ -1724,6 +1724,20 @@ def _torrent_candidate(
         for index in values
     })
     files = manifest["files"]
+    # AList's offline task retrieves the whole Torrent, not only the media
+    # members selected to close the current gaps.  Preserve that proven total
+    # with the local candidate so the AList lane can reserve enough disk for
+    # every manifest member (including unselected extras).
+    download_bytes = 0
+    for index, row in files.items():
+        if type(index) is not int or index <= 0 or not isinstance(row, Mapping):
+            return None
+        size = row.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return None
+        download_bytes += size
+    if download_bytes <= 0:
+        return None
     candidate_paths = [str(files[index]["path"]) for index in indices]
     quality_text = " ".join([release_name, *candidate_paths[:20]]).casefold()
     resolution = (
@@ -1745,6 +1759,7 @@ def _torrent_candidate(
             "file_index_by_gap": gap_map,
             "file_size_by_index": {str(index): int(files[index]["size"]) for index in indices},
             "file_path_by_index": {str(index): str(files[index]["path"]) for index in indices},
+            "download_bytes": download_bytes,
             **({
                 "companion_subtitle_index_by_media_gap": companion_map,
             } if companion_map else {}),
@@ -1798,10 +1813,14 @@ def _alist_offline_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
     gap_map = acquisition.get("file_index_by_gap")
     size_map = acquisition.get("file_size_by_index")
     path_map = acquisition.get("file_path_by_index")
+    download_bytes = acquisition.get("download_bytes")
     if not (
         isinstance(gap_map, Mapping)
         and isinstance(size_map, Mapping)
         and isinstance(path_map, Mapping)
+        and not isinstance(download_bytes, bool)
+        and isinstance(download_bytes, int)
+        and download_bytes > 0
     ):
         return None
     expected_by_index: dict[int, dict[str, Any]] = {}
@@ -1862,6 +1881,7 @@ def _alist_offline_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
                 else None
             ),
             "expected_files": expected_files,
+            "download_bytes": download_bytes,
         },
     })
     return candidate

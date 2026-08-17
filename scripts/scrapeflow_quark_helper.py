@@ -5,7 +5,7 @@ The process may run directly against an explicit loopback CDP endpoint or as
 a Docker Compose sidecar against the one fixed Docker Desktop host bridge.
 Both modes require the local AList credentials because typed actions resolve a
 short-lived Quark Cookie/root per request.  It only starts the narrow
-four-action HTTP service: it never manages the Quark process, its windows, or
+two-action (health + share-save) HTTP service: it never manages the Quark process, its windows, or
 desktop UI.
 """
 

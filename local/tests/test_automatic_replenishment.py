@@ -9,11 +9,13 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from local.scrapeflow_api.automatic_replenishment import (
     AlistOfflineAutomaticMaterializer,
     AlistOfflineCandidateError,
+    AlistOfflineInfrastructureError,
     AlistOfflineInDoubtError,
     AutomaticReplenishmentError,
     AutomaticReplenishmentRuntime,
@@ -454,6 +456,8 @@ def _alist_offline_selection(
     include_torrent: bool = True,
     file_path: str = "Example/Example.Show.S01E01.mkv",
     size: int = 123,
+    include_download_bytes: bool = True,
+    download_bytes: object | None = None,
 ) -> dict[str, object]:
     """Build one reviewed ``alist_offline`` candidate selection."""
     acquisition: dict[str, object] = {
@@ -465,6 +469,10 @@ def _alist_offline_selection(
             "gap_ids": ["S01E01"],
         }],
     }
+    if include_download_bytes:
+        acquisition["download_bytes"] = (
+            size if download_bytes is None else download_bytes
+        )
     if include_magnet:
         acquisition["magnet_url"] = f"magnet:?xt=urn:btih:{infohash}"
     if include_torrent:
@@ -4028,6 +4036,119 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             },
         )
 
+    def test_alist_offline_rejects_missing_full_download_bytes_before_remote_side_effect(self) -> None:
+        """A projected expected-file sum is never enough to submit aria2."""
+        selection = _alist_offline_selection(include_download_bytes=False)
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-no-total"
+            alist = FakeAList()
+            materializer = AlistOfflineAutomaticMaterializer(
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_INFRASTRUCTURE)
+        self.assertEqual(alist.add_calls, [])
+        self.assertNotIn(staging, alist.tree)
+
+    def test_alist_offline_capacity_limit_rejects_without_add(self) -> None:
+        """The whole torrent cap is an infrastructure hold, never exclusion."""
+        selection = _alist_offline_selection(size=65_536, download_bytes=65_537)
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-over-cap"
+            alist = FakeAList()
+            materializer = AlistOfflineAutomaticMaterializer(
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_INFRASTRUCTURE)
+        self.assertFalse(getattr(caught.exception, "exclude_candidate", False))
+        self.assertEqual(alist.add_calls, [])
+        self.assertNotIn(staging, alist.tree)
+
+    def test_alist_offline_low_disk_rejects_before_mkdir_or_add(self) -> None:
+        """The 15% overhead plus minimum-free reservation is fail-closed."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+        # ceil(100 * 1.15) + 1000 = 1115; one byte short must reject.
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-low-disk"
+            alist = FakeAList()
+            materializer = AlistOfflineAutomaticMaterializer(
+                max_download_bytes=65_536,
+                min_free_bytes=1000,
+                disk_usage=lambda _path: SimpleNamespace(free=1114),
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_INFRASTRUCTURE)
+        self.assertEqual(alist.add_calls, [])
+        self.assertNotIn(staging, alist.tree)
+
+    def test_alist_offline_capacity_exact_threshold_is_allowed_and_persisted(self) -> None:
+        """An exact reservation boundary admits the task and records receipt."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-capacity-exact"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example/Example.Show.S01E01.mkv", size=100)
+
+            def finish(_seconds):
+                alist.set_task_state("alist-task-1", 2, progress=100, error="")
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=finish,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=1000,
+                disk_usage=lambda _path: SimpleNamespace(free=1115),
+                clock=lambda: 1000.0,
+            )
+            delivery = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(delivery["external_task_id"], "alist-task-1")
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(attempt["submission_phase"], "submitted")
+        self.assertEqual(
+            attempt["capacity_receipt"],
+            {
+                "download_bytes": 100,
+                "required_free_bytes": 1115,
+                "available_free_bytes": 1115,
+                "max_download_bytes": 65_536,
+                "min_free_bytes": 1000,
+                "checked_at": 1000.0,
+            },
+        )
+
     def test_alist_offline_materializer_terminal_failure_is_candidate_excluded(self) -> None:
         """A failed/errored AList task excludes the reviewed candidate."""
         selection = _alist_offline_selection()
@@ -4141,7 +4262,9 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             alist = FakeAList()
             sibling = alist.offline_sibling(staging)
             alist.seed_file(f"{sibling}/Example.Show.S01E01.mkv", size=123)
-            polls = iter([3, 1, 1, 1, 2])
+            # AList state 3 means ``canceling``; an in-progress transfer
+            # remains state 1 and is identified by its transfer status.
+            polls = iter([1, 1, 1, 1, 2])
 
             def drive(_seconds):
                 try:
@@ -4163,6 +4286,279 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 workspace=workspace, alist=alist,
             )
             self.assertEqual(delivery["external_task_id"], "alist-task-1")
+
+    def test_alist_offline_transfer_deadline_survives_restart_and_confirms_cancel_before_delete(self) -> None:
+        """A restart must keep the original transfer deadline, not reset it."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+
+        class ConfirmingCancelAList(FakeAList):
+            confirmation_path: Path | None = None
+            confirmation_seen_before_delete: object | None = None
+
+            def offline_download_cancel(self, task_id: str) -> None:
+                super().offline_download_cancel(task_id)
+                self.set_task_state(
+                    task_id, 4, progress=100, error="", status="cancelled",
+                )
+
+            def offline_download_delete(self, task_id: str) -> None:
+                if self.confirmation_path is not None:
+                    payload = json.loads(self.confirmation_path.read_text(encoding="utf-8"))
+                    self.confirmation_seen_before_delete = payload.get(
+                        "transfer_cancel_confirmed_at"
+                    )
+                super().offline_download_delete(task_id)
+
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-deadline-restart"
+            alist = ConfirmingCancelAList()
+            alist.confirmation_path = workspace / "alist_offline_attempt.json"
+            sleeps = [0]
+
+            def interrupt_after_transfer_started(_seconds):
+                sleeps[0] += 1
+                if sleeps[0] == 1:
+                    alist.set_task_state(
+                        "alist-task-1", 1, progress=100, error="",
+                        status="offline download completed, transferring",
+                    )
+                    return
+                raise RuntimeError("simulate process restart")
+
+            first = AlistOfflineAutomaticMaterializer(
+                sleep=interrupt_after_transfer_started,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                transfer_timeout=30,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: now[0],
+            )
+            with self.assertRaisesRegex(RuntimeError, "simulate process restart"):
+                first.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            before_restart = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(encoding="utf-8")
+            )
+
+            now[0] = 1031.0
+            second = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                transfer_timeout=30,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: now[0],
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as caught:
+                second.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+            after_final = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(encoding="utf-8")
+            )
+
+            # Model the crash window after AList accepted delete but before
+            # the outer coordinator observed ``external_task_final``.  A
+            # freshly constructed materializer must replay the final outcome
+            # from durable state rather than treat the gone row as a failed
+            # staging delivery.
+            third = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                transfer_timeout=30,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: now[0],
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as replayed:
+                third.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+
+        self.assertEqual(before_restart["transfer_started_at"], 1000.0)
+        self.assertEqual(before_restart["transfer_deadline_at"], 1030.0)
+        self.assertTrue(caught.exception.external_task_final)
+        self.assertEqual(caught.exception.external_task_id, "alist-task-1")
+        self.assertEqual(after_final["transfer_cancel_confirmed_at"], 1031.0)
+        self.assertEqual(alist.confirmation_seen_before_delete, 1031.0)
+        self.assertTrue(replayed.exception.external_task_final)
+        self.assertEqual(replayed.exception.external_task_id, "alist-task-1")
+        self.assertIn(("cancel", "alist-task-1"), alist.cleanup_calls)
+        self.assertIn(("delete", "alist-task-1"), alist.cleanup_calls)
+        self.assertLess(
+            alist.cleanup_calls.index(("cancel", "alist-task-1")),
+            alist.cleanup_calls.index(("delete", "alist-task-1")),
+        )
+
+    def test_alist_offline_transfer_timeout_without_cancel_confirmation_stays_indoubt(self) -> None:
+        """Never delete or re-submit while AList has not shown state 4."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-deadline-indoubt"
+            alist = FakeAList()
+            sleeps = [0]
+
+            def advance_to_timeout(_seconds):
+                sleeps[0] += 1
+                if sleeps[0] == 1:
+                    alist.set_task_state(
+                        "alist-task-1", 1, progress=100, error="",
+                        status="offline download completed, transferring",
+                    )
+                elif sleeps[0] == 2:
+                    now[0] = 1031.0
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=advance_to_timeout,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                transfer_timeout=30,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: now[0],
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(encoding="utf-8")
+            )
+            cleanup_before_final = list(alist.cleanup_calls)
+
+            # A later reconciliation sees AList's terminal cancellation and
+            # only then deletes the task / exposes final infrastructure.
+            alist.set_task_state(
+                "alist-task-1", 4, progress=100, error="", status="cancelled",
+            )
+            with self.assertRaises(AlistOfflineInfrastructureError) as final:
+                materializer.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_IN_DOUBT)
+        self.assertEqual(caught.exception.external_task_id, "alist-task-1")
+        self.assertIn("transfer_cancel_requested_at", attempt)
+        self.assertIn(("cancel", "alist-task-1"), alist.cleanup_calls)
+        self.assertNotIn(("delete", "alist-task-1"), cleanup_before_final)
+        self.assertTrue(final.exception.external_task_final)
+        self.assertLess(
+            alist.cleanup_calls.index(("cancel", "alist-task-1")),
+            alist.cleanup_calls.index(("delete", "alist-task-1")),
+        )
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(alist.delete_calls, ["alist-task-1"])
+
+    def test_alist_offline_canceling_state_stays_indoubt_without_delete(self) -> None:
+        """State 3 is live even if a prior cancel intent was lost on restart."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-canceling"
+            alist = FakeAList()
+            alist.undone.append({
+                "id": "alist-task-1",
+                "name": alist.offline_sibling(staging),
+                "state": 3,
+                "progress": 100,
+                "error": "",
+                # Do not rely on one English UI string to preserve the
+                # cancellation barrier; this mirrors AList's canceling state.
+                "status": "canceling",
+            })
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                transfer_timeout=30,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: 1031.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                materializer.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+
+            attempt_exists = (workspace / "alist_offline_attempt.json").exists()
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_IN_DOUBT)
+        self.assertEqual(caught.exception.external_task_id, "alist-task-1")
+        self.assertFalse(attempt_exists)
+        self.assertEqual(alist.cleanup_calls, [])
+        self.assertEqual(alist.delete_calls, [])
+        self.assertEqual(len(alist.undone), 1)
+
+    def test_alist_offline_persists_each_remote_mkdir_intent_before_call(self) -> None:
+        """All three AList mkdir calls have a durable, replay-safe intent."""
+        selection = _alist_offline_selection(size=100, download_bytes=100)
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-mkdir-intents"
+            state_path = workspace / "alist_offline_attempt.json"
+            expected = {
+                posixpath.dirname(staging): "staging_parent",
+                staging: "staging_root",
+                FakeAList.offline_sibling(staging): "offline_sibling",
+            }
+
+            class IntentCheckingAList(FakeAList):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.observed_intents: list[tuple[str, object]] = []
+
+                def mkdir(self, path: str) -> None:
+                    if path in expected:
+                        payload = json.loads(state_path.read_text(encoding="utf-8"))
+                        self.observed_intents.append((
+                            path, payload.get("remote_mkdir_intent"),
+                        ))
+                    super().mkdir(path)
+
+            alist = IntentCheckingAList()
+            alist.add_error = RuntimeError("submit response unavailable")
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                max_download_bytes=65_536,
+                min_free_bytes=0,
+                disk_usage=lambda _path: SimpleNamespace(free=1_000_000),
+                clock=lambda: 1000.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError):
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(
+            alist.observed_intents,
+            [(path, intent) for path, intent in expected.items()],
+        )
 
     def test_alist_offline_materializer_lost_submit_recovers_task_by_sibling_name(self) -> None:
         """A lost add response is recovered by a name scan, never re-submitted."""
@@ -4192,6 +4588,33 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(len(alist.add_calls), 1)
         self.assertEqual(delivery["external_task_id"], "alist-task-9")
         self.assertEqual(delivery["lane"], "alist_offline")
+
+    def test_alist_offline_materializer_lost_submit_without_visible_task_is_in_doubt(self) -> None:
+        """A response exception plus an immediate scan miss must stay ambiguous."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-lost-delayed"
+            alist = FakeAList()
+            alist.add_error = RuntimeError("offline_download_add response lost")
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+            )
+
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(caught.exception.failure_scope, FAILURE_IN_DOUBT)
+        self.assertIsNone(caught.exception.external_task_id)
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(attempt["staging_root"], staging)
+        self.assertIsNone(attempt["task_id"])
 
     def test_alist_offline_materializer_empty_add_response_without_task_is_in_doubt(self) -> None:
         """An accepted submission without a traceable task is in-doubt."""
@@ -5643,6 +6066,79 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         )
         self.assertIsNone(resolved_state["active_attempt"])
 
+    def test_final_external_task_clears_attempt_before_same_tier_retry(self) -> None:
+        """A confirmed-dead task must not make the next retry reconcile its corpse."""
+        root_job = _example_root_job("engine-final-external-task")
+
+        class FinalThenReadyMaterializer(FakeMaterializer):
+            def __init__(self, alist: MemoryAList) -> None:
+                super().__init__(alist)
+                self.attempts: list[tuple[str, Path]] = []
+
+            def acquire(self, request, selections, *, staging_root, workspace, alist):
+                self.attempts.append((staging_root, workspace))
+                if len(self.attempts) == 1:
+                    raise AlistOfflineInfrastructureError(
+                        "timeout cancellation was confirmed",
+                        task_id="alist-task-final",
+                        external_task_final=True,
+                    )
+                delivery = super().acquire(
+                    request,
+                    selections,
+                    staging_root=staging_root,
+                    workspace=workspace,
+                    alist=alist,
+                )
+                # The fixture's real selection is the second AList tier, not
+                # FakeMaterializer's historical local-torrent default.
+                delivery["lane"] = TIER_ALIST_OFFLINE
+                return delivery
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            alist = MemoryAList()
+            search = FakeSearch()
+            materializer = FinalThenReadyMaterializer(alist)
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=FakeEngine(),
+                alist=alist,
+                search=search,
+                materializer=materializer,
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
+            )
+            _seed_runtime_tier(
+                runtime,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_ALIST_OFFLINE,
+            )
+            failed = runtime.run_for_job(root_job)
+            state_path = state_root / "gaps" / root_job.id / "S01E01.json"
+            failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+            retried = runtime.run_for_job(root_job)
+            retried_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            failed["outcomes"][0]["failure_scope"], FAILURE_INFRASTRUCTURE,
+        )
+        self.assertEqual(failed_state["tier"], TIER_ALIST_OFFLINE)
+        self.assertEqual(failed_state["phase"], "retry_wait")
+        self.assertEqual(failed_state["last_error_scope"], FAILURE_INFRASTRUCTURE)
+        self.assertIsNone(failed_state["active_attempt"])
+        self.assertIsNone(failed_state["external_task_id"])
+        self.assertEqual(len(materializer.attempts), 2)
+        self.assertNotEqual(materializer.attempts[0], materializer.attempts[1])
+        self.assertEqual(
+            [request["tier"] for request in search.requests],
+            [TIER_ALIST_OFFLINE, TIER_ALIST_OFFLINE],
+        )
+        self.assertEqual(retried["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(retried_state["phase"], "waiting_reaudit")
+
     def test_in_doubt_failure_preserves_attempt_without_candidate_exclusion(self) -> None:
         """An in-doubt external task waits for reconcile and keeps staging."""
         root_job = _example_root_job("engine-in-doubt-preserve")
@@ -5702,6 +6198,101 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             alist.tree[staging],
             [{"name": "waiting.mkv", "is_dir": False, "size": 123}],
         )
+
+    def test_alist_lost_submit_response_reconciles_delayed_task_without_resubmit(self) -> None:
+        """A delayed-visible AList task resumes from durable state, not ``add``."""
+        root_job = _example_root_job("engine-alist-lost-response")
+        selection = _alist_offline_selection()
+
+        class SelectedAListSearch:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+
+            def run(self, request):
+                self.requests.append(dict(request))
+                if request["tier"] != TIER_ALIST_OFFLINE:
+                    raise AssertionError(f"unexpected tier: {request['tier']!r}")
+                return {"candidates": [dict(selection)]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            alist = FakeAList()
+            search = SelectedAListSearch()
+            engine = FakeEngine()
+            first = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=engine,
+                alist=alist,
+                search=search,
+                materializer=AlistOfflineAutomaticMaterializer(
+                    sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+                ),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
+            )
+            _seed_runtime_tier(
+                first,
+                job_id=root_job.id,
+                gap_ids=["S01E01"],
+                tier=TIER_ALIST_OFFLINE,
+            )
+            # AList accepts the operation but its response is lost before the
+            # task appears in either immediate task list.
+            alist.add_error = RuntimeError("offline_download_add response lost")
+            first_result = first.run_for_job(root_job)
+            state_path = state_root / "gaps" / root_job.id / "S01E01.json"
+            parked = json.loads(state_path.read_text(encoding="utf-8"))
+            attempt = dict(parked["active_attempt"])
+            attempt_state = json.loads(
+                (Path(attempt["workspace"]) / "alist_offline_attempt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            # The same external operation becomes visible only on the next
+            # round.  Seed its finished sibling tree as AList would have done.
+            alist.add_error = None
+            staging = str(attempt["staging_root"])
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(
+                f"{sibling}/Example/Example.Show.S01E01.mkv", size=123,
+            )
+            alist.done.append({
+                "id": "alist-task-delayed",
+                "name": sibling,
+                "state": 2,
+                "progress": 100,
+                "error": "",
+            })
+            # Recreate the coordinator to exercise only persisted state on
+            # recovery; it must reuse the reviewed candidate snapshot and use
+            # the materializer's poll-only hook.
+            second = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=engine,
+                alist=alist,
+                search=search,
+                materializer=AlistOfflineAutomaticMaterializer(
+                    sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+                ),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
+            )
+            second_result = second.run_for_job(root_job)
+            recovered = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(first_result["outcomes"][0]["failure_scope"], FAILURE_IN_DOUBT)
+        self.assertEqual(parked["phase"], "waiting_reconcile")
+        self.assertEqual(parked["tier_status"], "waiting_reconcile")
+        self.assertEqual(parked["last_error_scope"], FAILURE_IN_DOUBT)
+        self.assertIsNone(parked.get("external_task_id"))
+        self.assertIsNone(attempt_state["task_id"])
+        self.assertEqual(len(search.requests), 1)
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(second_result["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
+        self.assertEqual(recovered["phase"], "waiting_reaudit")
 
     def test_durable_candidate_exclusions_are_bounded_and_sanitized(self) -> None:
         rows = [

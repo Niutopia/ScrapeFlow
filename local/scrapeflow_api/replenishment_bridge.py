@@ -11,7 +11,9 @@ boundaries without touching either legacy path.
 Request field contract (one request per ``(media_type, tmdb_id)`` identity):
 
     {
-        "tier": "magnet",                      # local Torrent lane
+        "tier": "magnet",                      # legacy selector shape only;
+                                                 # root runtime overwrites this
+                                                 # with its durable current tier
         "media": {
             "tmdb_id": <int>,                  # positive TMDB id
             "media_type": "movie" | "tv",      # gap ledger media_type
@@ -55,6 +57,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+import re
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +83,95 @@ def _nonempty_strings(values: Sequence[Any], *, limit: int = 40) -> list[str]:
         if len(output) >= limit:
             break
     return output
+
+
+def _source_name(value: object) -> str:
+    """Normalize a search-source label to the tier-policy spelling."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _nonnegative_int(value: object, *, fallback: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return fallback
+
+
+def _search_completion_evidence(
+    result: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project raw search completion facts alongside a selection bundle.
+
+    A blank selection is not itself evidence that the current lane is
+    exhausted: it can also be caused by a disabled source, a timeout, or a
+    pause between requests.  Keep the search result's completion/telemetry
+    facts separate from selection diagnostics so the root orchestrator can
+    advance only when the *original* search actually proved no candidates.
+    """
+    # Preserve explicit completion claims and compact raw telemetry separately.
+    # The root knows the active tier's shelf-scoped required-source set; it is
+    # the only layer allowed to decide which telemetry rows count toward a
+    # transition.  In particular, an unrelated source's failure must not
+    # poison a complete proof for the current tier.
+    completed = {
+        name
+        for value in (result.get("completed_sources") or [])
+        if (name := _source_name(value))
+    } if isinstance(result.get("completed_sources"), list) else set()
+    infrastructure_failure = (
+        str(result.get("failure_scope") or "").strip().casefold()
+        not in {"", "candidate"}
+    )
+    telemetry = result.get("source_telemetry")
+    source_telemetry: dict[str, dict[str, Any]] = {}
+    if isinstance(telemetry, Mapping):
+        for source, raw in telemetry.items():
+            name = _source_name(source)
+            if not name or not isinstance(raw, Mapping):
+                continue
+            failures = _nonnegative_int(
+                raw.get("infrastructure_failures"), fallback=0,
+            )
+            facts = source_telemetry.setdefault(name, {
+                "source_exhausted": False,
+                "infrastructure_failures": 0,
+            })
+            facts["source_exhausted"] = (
+                facts["source_exhausted"] is True
+                or raw.get("source_exhausted") is True
+            )
+            facts["infrastructure_failures"] = max(
+                int(facts["infrastructure_failures"]), failures,
+            )
+
+    selector_unchecked = _nonnegative_int(
+        selection.get("unchecked_current_tier_candidate_count"), fallback=1,
+    )
+    raw_unchecked = _nonnegative_int(
+        result.get("unchecked_secondary_candidates"), fallback=selector_unchecked,
+    )
+    unchecked = max(selector_unchecked, raw_unchecked)
+    eligible = _nonnegative_int(
+        selection.get("eligible_current_tier_candidate_count"), fallback=1,
+    )
+    raw_completion = (
+        result.get("search_complete_no_candidates") is True
+        or result.get("search_complete") is True
+    )
+    return {
+        "scope": "infrastructure" if infrastructure_failure else "candidate",
+        "search_complete_no_candidates": bool(
+            raw_completion
+            and eligible == 0
+            and unchecked == 0
+            and not infrastructure_failure
+        ),
+        "completed_sources": sorted(completed),
+        "unchecked_secondary_candidates": unchecked,
+        "source_telemetry": source_telemetry,
+    }
 
 
 def _episode_gap_id(season: int, episodes: Sequence[int]) -> str | None:
@@ -274,6 +366,9 @@ def gap_ledger_selection(
     The returned bundle maps ``selected_gap_ids`` back to ledger ``gap_id`` via
     the ``SxxEyy`` token (episodes) or the whole ``gap_id`` (media/subtitle);
     the integrator resolves those back through the gap ledger to close gaps.
+    It also includes ``search_evidence`` derived from the *raw* result's
+    completion and telemetry fields.  Callers must not infer exhaustion from
+    an empty ``selections`` list alone.
     """
     del state_root, root_task_id  # reserved for the integration-phase hooks above
 
@@ -283,7 +378,9 @@ def gap_ledger_selection(
         raise TypeError("补源搜索结果必须是对象")
     raw_candidates = result.get("candidates")
     candidates = raw_candidates if isinstance(raw_candidates, list) else []
-    return select_replenishment_candidates(request, candidates)
+    selection = select_replenishment_candidates(request, candidates)
+    selection["search_evidence"] = _search_completion_evidence(result, selection)
+    return selection
 
 
 __all__ = [

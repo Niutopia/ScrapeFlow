@@ -59,6 +59,9 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+    "SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES": "34359738368",
+    "SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES": "21474836480",
+    "SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT": "3600",
     "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
@@ -78,6 +81,7 @@ REQUIRED_LOOPBACK_PORTS = {
 }
 REQUIRED_SERVICE_IMAGES = {
     "api": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
+    "offline-aria2": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
     "quark-helper": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
 }
 REQUIRED_VOLUME_BINDINGS = {
@@ -89,7 +93,16 @@ REQUIRED_VOLUME_BINDINGS = {
         "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data",
         "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow",
     ],
+    "offline-aria2": [
+        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp",
+    ],
 }
+REQUIRED_OFFLINE_ARIA2_COMMAND_TOKENS = (
+    "aria2c",
+    "--no-conf",
+    "--dir=/opt/alist/data/temp/aria2",
+    "--file-allocation=none",
+)
 REQUIRED_HELPER_ENVIRONMENT = {
     "ALIST_URL": "http://alist:5244",
     "ALIST_USERNAME": "${ALIST_USERNAME:-}",
@@ -237,6 +250,33 @@ def _service_scalar(block: list[str], key: str) -> str | None:
     return None
 
 
+def _service_inline_list(block: list[str], key: str) -> list[object] | None:
+    """Return one multiline inline YAML/Python literal list from a service block."""
+
+    marker = f"{key}:"
+    for index, line in enumerate(block):
+        if len(line) - len(line.lstrip()) != 4:
+            continue
+        stripped = line.strip()
+        if not stripped.startswith(marker):
+            continue
+        literal = stripped[len(marker):].strip()
+        if not literal.startswith("["):
+            return None
+        chunks = [literal]
+        while not chunks[-1].rstrip().endswith("]"):
+            index += 1
+            if index >= len(block):
+                return None
+            chunks.append(block[index].strip())
+        try:
+            value = ast.literal_eval(" ".join(chunks))
+        except (SyntaxError, ValueError):
+            return None
+        return value if isinstance(value, list) else None
+    return None
+
+
 def _dependency_conditions(block: list[str]) -> dict[str, str]:
     """Return long-form Compose dependency conditions for one service."""
 
@@ -367,6 +407,32 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
             issues.append(
                 f"docker-compose.yml {service}.ports must be {expected_ports!r}, got {ports!r}"
             )
+
+    offline_aria2_block = _service_block(compose_text, "offline-aria2")
+    if not offline_aria2_block:
+        issues.append("docker-compose.yml: missing offline-aria2 service")
+    else:
+        offline_aria2_command = _service_inline_list(
+            offline_aria2_block, "command",
+        )
+        if (
+            not isinstance(offline_aria2_command, list)
+            or not all(isinstance(value, str) for value in offline_aria2_command)
+        ):
+            issues.append(
+                "docker-compose.yml offline-aria2.command must be an inline string list"
+            )
+        else:
+            missing_tokens = [
+                token
+                for token in REQUIRED_OFFLINE_ARIA2_COMMAND_TOKENS
+                if token not in offline_aria2_command
+            ]
+            if missing_tokens:
+                issues.append(
+                    "docker-compose.yml offline-aria2.command must include "
+                    f"{missing_tokens!r}"
+                )
 
     helper_block = _service_block(compose_text, "quark-helper")
     if helper_block:

@@ -59,6 +59,9 @@ COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
+    "SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES": "34359738368",
+    "SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES": "21474836480",
+    "SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT": "3600",
     "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
@@ -104,6 +107,11 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "    volumes:\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
+        "  offline-aria2:\n"
+        "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
+        "    command: [\"aria2c\", \"--no-conf\", \"--dir=/opt/alist/data/temp/aria2\", \"--file-allocation=none\"]\n"
+        "    volumes:\n"
+        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
         "  quark-helper:\n"
         "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
         "    restart: unless-stopped\n"
@@ -454,9 +462,26 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("- Runtime readiness: 未提供", package)
         self.assertIn("- [ ] 隔离 preflight 通过", package)
         self.assertIn("- [ ] Runtime readiness 通过", package)
-        self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
-        self.assertIn("| 有效夸克分享 |  | 第一阶完成，后二阶未调用 | 未执行 |  |", package)
-        self.assertIn("- [ ] 三条获取线路全部真实可执行。", package)
+        self.assertIn(
+            "| 电影 |  | 创建 RootJob 时选择 movie 后入库，回读正确 | 未执行 |  |",
+            package,
+        )
+        self.assertIn(
+            "| 有效 quark_share |  | 第一阶完成，后二阶未调用 | 未执行 |  |",
+            package,
+        )
+        self.assertIn(
+            "| quark_share 完整排除、有效 alist_offline |  | AList/aria2 离线完成，本地 Torrent 未调用 | 未执行 |  |",
+            package,
+        )
+        self.assertIn(
+            "| 有效 quark_share 候选时 Helper 不可用 |  | 停在 quark_share，不降阶 | 未执行 |  |",
+            package,
+        )
+        self.assertIn(
+            "- [ ] quark_share、alist_offline、magnet 三条获取线路全部真实可执行。",
+            package,
+        )
 
     def test_package_draft_reports_static_deployment_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -525,7 +550,10 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("preflight 问题:", package)
         self.assertIn("provider_workers must be 1", package)
         self.assertIn("formal library shelf", package)
-        self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
+        self.assertIn(
+            "| 电影 |  | 创建 RootJob 时选择 movie 后入库，回读正确 | 未执行 |  |",
+            package,
+        )
 
     def test_package_uses_captured_pass_after_runtime_directories_fill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -770,7 +798,10 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("- Runtime readiness: 失败", package)
         self.assertIn("readiness 问题:", package)
         self.assertIn("operations.jobs_total must be 0 before opening acceptance", package)
-        self.assertIn("| 电影 |  | 选择 movie 后入库，回读正确 | 未执行 |  |", package)
+        self.assertIn(
+            "| 电影 |  | 创建 RootJob 时选择 movie 后入库，回读正确 | 未执行 |  |",
+            package,
+        )
 
 
 if __name__ == "__main__":

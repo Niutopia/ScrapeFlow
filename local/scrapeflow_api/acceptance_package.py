@@ -20,20 +20,23 @@ from .release_checks import local_deployment_contract_issues, project_root
 
 
 ORDINARY_SAMPLES = (
-    ("电影", "选择 movie 后入库，回读正确"),
+    ("电影", "创建 RootJob 时选择 movie 后入库，回读正确"),
     ("番剧归档", "归档预处理后入库，回读正确"),
-    ("美剧季度目录", "选择 us_tv 后入库，回读正确"),
+    ("美剧季度目录", "创建 RootJob 时选择 us_tv 后入库，回读正确"),
     ("错误密码", "停在归档错误，source 保留"),
     ("正式目标冲突", "停止，不覆盖"),
     ("cancel", "停止，source/staging 保留在本任务范围"),
     ("执行中重启", "重启后不重复写入"),
 )
 REPLENISHMENT_SAMPLES = (
-    ("有效夸克分享", "第一阶完成，后二阶未调用"),
-    ("无分享、有效 magnet", "夸克离线完成，本地 Torrent 未调用"),
-    ("前两阶完整排除后 Torrent", "本地 Torrent 完成"),
-    ("Helper 断线", "停在当前云阶，不降阶"),
-    ("Quark submit 后 API 重启", "继续同一外部 task"),
+    ("有效 quark_share", "第一阶完成，后二阶未调用"),
+    (
+        "quark_share 完整排除、有效 alist_offline",
+        "AList/aria2 离线完成，本地 Torrent 未调用",
+    ),
+    ("quark_share 与 alist_offline 完整排除后 magnet", "本地 Torrent 完成"),
+    ("有效 quark_share 候选时 Helper 不可用", "停在 quark_share，不降阶"),
+    ("AList 提交响应丢失后 API 重启", "对账同一 AList task，不重复提交"),
     ("错误候选", "不创建 Engine child"),
     ("staging 内容不符", "不进入正式库"),
     ("缺字幕", "只安装正确目标语言侧车"),
@@ -42,7 +45,7 @@ FINAL_CHECKS = (
     "普通电影、番剧、美剧均正确",
     "归档和错误密码行为正确",
     "手工审计不修改正式库",
-    "三条获取线路全部真实可执行",
+    "quark_share、alist_offline、magnet 三条获取线路全部真实可执行",
     "三条线路全部先到任务 staging",
     "三条线路全部使用同一个受限 Engine 和 writer",
     "第一阶成功时后二阶不调用",
