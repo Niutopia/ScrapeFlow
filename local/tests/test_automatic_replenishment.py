@@ -333,6 +333,8 @@ class FakeAList:
         self.move_calls: list[tuple[str, str, list[str]]] = []
         self.remove_calls: list[tuple[str, list[str]]] = []
         self.delete_calls: list[str] = []
+        self.cancel_calls: list[str] = []
+        self.cleanup_calls: list[tuple[str, str]] = []
         self.add_error: Exception | None = None
         self.add_returns_empty = False
         self.next_task_id = 1
@@ -407,8 +409,13 @@ class FakeAList:
     def offline_download_done(self) -> list[dict[str, object]]:
         return [dict(row) for row in self.done]
 
+    def offline_download_cancel(self, task_id: str) -> None:
+        self.cancel_calls.append(task_id)
+        self.cleanup_calls.append(("cancel", task_id))
+
     def offline_download_delete(self, task_id: str) -> None:
         self.delete_calls.append(task_id)
+        self.cleanup_calls.append(("delete", task_id))
         self.undone = [row for row in self.undone if str(row.get("id")) != task_id]
         self.done = [row for row in self.done if str(row.get("id")) != task_id]
 
@@ -4118,7 +4125,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.failure_scope, "candidate")
         self.assertTrue(caught.exception.exclude_candidate)
-        self.assertIn("alist-task-1", alist.delete_calls)
+        self.assertIn(("cancel", "alist-task-1"), alist.cleanup_calls)
+        self.assertIn(("delete", "alist-task-1"), alist.cleanup_calls)
+        self.assertLess(
+            alist.cleanup_calls.index(("cancel", "alist-task-1")),
+            alist.cleanup_calls.index(("delete", "alist-task-1")),
+        )
 
     def test_alist_offline_materializer_transfer_phase_is_not_a_stall(self) -> None:
         """Progress 100 (transferring) must wait for the terminal state."""

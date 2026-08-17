@@ -559,6 +559,24 @@ class AListClient:
         """Return terminal offline-download task rows (succeeded/failed/...)."""
         return self._offline_download_tasks("done")
 
+    def offline_download_cancel(self, task_id: str) -> None:
+        """Cancel one offline-download task (stops the bound tool download).
+
+        A plain ``delete`` only removes the task record; AList does not call
+        the tool's Remove in that path, so the aria2 gid keeps downloading in
+        the background.  Cancel first to stop the bytes, then delete the row.
+        """
+        if not isinstance(task_id, str) or not task_id or any(
+            char in task_id for char in ("/", "\\", "\x00", "\n", "\r")
+        ):
+            raise ApiError("AList 离线任务 id 无效")
+        self._request_json_authenticated(
+            f"{self.base_url}/api/admin/task/offline_download/cancel"
+            f"?tid={urllib.parse.quote(task_id, safe='')}",
+            method="POST",
+            json_body={},
+        )
+
     def offline_download_delete(self, task_id: str) -> None:
         """Remove one offline-download task record (no storage deletion)."""
         if not isinstance(task_id, str) or not task_id or any(

@@ -1363,9 +1363,11 @@ class AlistOfflineAutomaticMaterializer:
     def _poll_until_terminal(self, alist: object, task_id: str) -> str:
         """Poll one AList offline task; return "succeeded" or "missing".
 
-        Candidate failures raise ``AlistOfflineCandidateError`` and remove the
-        task record (AList may otherwise auto-retry an errored task in the
-        background and transfer bytes into an abandoned staging sibling);
+        Candidate failures raise ``AlistOfflineCandidateError`` and cancel +
+        remove the task record (AList may otherwise auto-retry an errored
+        task in the background — and its bare delete path never stops the
+        bound aria2 gid — transferring bytes into an abandoned staging
+        sibling);
         tool/transport failures raise the plain infrastructure error.  A task
         that makes no byte progress for ``stall_limit`` seconds is a dead
         candidate.  A task row whose ``status`` mentions transfer is held (long transfers
@@ -1376,6 +1378,16 @@ class AlistOfflineAutomaticMaterializer:
         last_advanced = time.monotonic()
 
         def drop_candidate_task(message: str) -> AlistOfflineCandidateError:
+            # Cancel BEFORE delete: AList's delete only drops the task row,
+            # while cancel stops the bound aria2 gid — otherwise the download
+            # keeps running in the background and later transfers bytes into
+            # an abandoned staging sibling.
+            cancel = getattr(alist, "offline_download_cancel", None)
+            if callable(cancel):
+                try:
+                    cancel(task_id)
+                except Exception:
+                    pass
             delete = getattr(alist, "offline_download_delete", None)
             if callable(delete):
                 try:
