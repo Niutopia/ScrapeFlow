@@ -3696,7 +3696,7 @@ class SimpleApplication:
                     continue
                 proofs = state.get("exhaustion_proof_by_provider")
                 proofs = set(proofs) if isinstance(proofs, Mapping) else set()
-                if {"quark_share", "quark_magnet", "magnet"} <= proofs:
+                if {"quark_share", "alist_offline", "magnet"} <= proofs:
                     continue  # tier exhaustion: explicit operator trigger only
                 self._queue_root_replenishment(job.id)
         except Exception:

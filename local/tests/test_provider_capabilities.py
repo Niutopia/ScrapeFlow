@@ -22,13 +22,16 @@ from local.scrapeflow_api.automatic_replenishment import (
 )
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
 from local.scrapeflow_api.replenishment_tiers import (
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
 )
 from engine.scrapeflow.provider_capabilities import (
+    ACQUISITION_ALIST_OFFLINE,
     ACQUISITION_QUARK_FAST_SAVE,
-    ACQUISITION_QUARK_MAGNET_OFFLINE,
     ACQUISITION_TORRENT,
+    ALIST_OFFLINE_REQUIRED_ACTIONS,
+    ALIST_OFFLINE_TOOL_NAME,
+    PROVIDER_ALIST_OFFLINE,
     QUARK_HELPER_NAME,
     QUARK_HELPER_REQUIRED_ACTIONS,
     provider_capability_snapshot,
@@ -76,17 +79,21 @@ def _quark_share_candidate() -> dict[str, object]:
     }
 
 
-def _quark_magnet_candidate() -> dict[str, object]:
+def _alist_offline_candidate() -> dict[str, object]:
     torrent = _torrent_candidate()
     return {
         **torrent,
-        "provider": "quark_magnet",
-        "locator": "quark_magnet:0123456789012345678901234567890123456789",
+        "provider": PROVIDER_ALIST_OFFLINE,
+        "locator": "alist_offline:0123456789012345678901234567890123456789",
         "infohash": "0123456789012345678901234567890123456789",
         "acquisition": {
-            "kind": "quark_magnet_offline",
+            "kind": ACQUISITION_ALIST_OFFLINE,
             "magnet_url": (
                 "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+            ),
+            "torrent_url": (
+                "https://storage.animetosho.org/torrent/"
+                "0123456789012345678901234567890123456789/example.torrent"
             ),
             "expected_files": [{
                 "torrent_index": 1,
@@ -116,35 +123,43 @@ def _legacy_http_candidate() -> dict[str, object]:
 class ProviderCapabilityTests(unittest.TestCase):
     def test_provider_snapshot_exposes_only_fixed_lanes(self) -> None:
         snapshot = provider_capability_snapshot()
-        self.assertEqual(set(snapshot), {"quark_share", "quark_magnet", "magnet"})
+        self.assertEqual(set(snapshot), {"quark_share", "alist_offline", "magnet"})
         self.assertEqual(snapshot["quark_share"]["status"], "ready")
         self.assertEqual(
             snapshot["quark_share"]["acquisition_kinds"],
             [ACQUISITION_QUARK_FAST_SAVE],
         )
         self.assertEqual(
-            snapshot["quark_magnet"]["acquisition_kinds"],
-            [ACQUISITION_QUARK_MAGNET_OFFLINE],
+            snapshot["alist_offline"]["acquisition_kinds"],
+            [ACQUISITION_ALIST_OFFLINE],
         )
         self.assertEqual(
-            snapshot["quark_magnet"]["status_scope"],
+            snapshot["alist_offline"]["status_scope"],
             "declared_materializer",
+        )
+        self.assertEqual(
+            snapshot["alist_offline"]["materializer"],
+            "AlistOfflineAutomaticMaterializer",
         )
         expected_helper_dependency = {
             "helper": QUARK_HELPER_NAME,
             "required_actions": list(QUARK_HELPER_REQUIRED_ACTIONS),
+        }
+        expected_alist_offline_dependency = {
+            "alist_offline_tool": ALIST_OFFLINE_TOOL_NAME,
+            "required_actions": list(ALIST_OFFLINE_REQUIRED_ACTIONS),
         }
         self.assertEqual(
             snapshot["quark_share"]["runtime_dependency"],
             expected_helper_dependency,
         )
         self.assertEqual(
-            snapshot["quark_magnet"]["runtime_dependency"],
-            expected_helper_dependency,
+            snapshot["alist_offline"]["runtime_dependency"],
+            expected_alist_offline_dependency,
         )
         self.assertIsNot(
             snapshot["quark_share"]["runtime_dependency"],
-            snapshot["quark_magnet"]["runtime_dependency"],
+            snapshot["alist_offline"]["runtime_dependency"],
         )
         self.assertEqual(snapshot["magnet"]["sfx"]["status"], "deferred")
 
@@ -185,14 +200,14 @@ class ProviderCapabilityTests(unittest.TestCase):
         share.assert_called_once()
         torrent.assert_not_called()
 
-    def test_quark_magnet_routes_to_injected_offline_executor(self) -> None:
+    def test_alist_offline_routes_to_injected_offline_executor(self) -> None:
         offline = Mock(return_value={"status": "ready"})
         torrent = Mock(return_value={"status": "ready"})
         result = acquire_selection(
-            _quark_magnet_candidate(),
+            _alist_offline_candidate(),
             "/task/staging",
             acquire_torrent=torrent,
-            acquire_quark_magnet=offline,
+            acquire_alist_offline=offline,
         )
         self.assertEqual(result["status"], "ready")
         offline.assert_called_once()
@@ -204,7 +219,7 @@ class ProviderCapabilityTests(unittest.TestCase):
                 "candidates": [
                     _legacy_http_candidate(),
                     _quark_share_candidate(),
-                    _quark_magnet_candidate(),
+                    _alist_offline_candidate(),
                     _torrent_candidate(),
                 ],
                 "lane_status": {"legacy_http": {"status": "ready"}},
@@ -213,15 +228,15 @@ class ProviderCapabilityTests(unittest.TestCase):
         result = service.run({})
         self.assertEqual(
             [row["provider"] for row in result["candidates"]],
-            ["quark_share", "quark_magnet", "magnet"],
+            ["quark_share", "alist_offline", "magnet"],
         )
         self.assertEqual(result["lane_status"]["quark_share"]["status"], "ready")
-        self.assertEqual(result["lane_status"]["quark_magnet"]["status"], "ready")
+        self.assertEqual(result["lane_status"]["alist_offline"]["status"], "ready")
         self.assertEqual(result["lane_status"]["magnet"]["status"], "ready")
         self.assertNotIn("legacy_http", result["lane_status"])
         self.assertEqual(result["provider_rejections"], {"unsupported_provider": 1})
 
-    def test_verified_torrent_manifest_projects_quark_magnet_before_local(self) -> None:
+    def test_verified_torrent_manifest_projects_alist_offline_before_local(self) -> None:
         request = {
             "media": {"tmdb_id": 1, "title": "Example Show", "aliases": ["Example Show"]},
             "gaps": [{
@@ -243,17 +258,17 @@ class ProviderCapabilityTests(unittest.TestCase):
             include_local=True,
         )
 
-        self.assertEqual([row["provider"] for row in rows], ["quark_magnet", "magnet"])
+        self.assertEqual([row["provider"] for row in rows], ["alist_offline", "magnet"])
         self.assertEqual(
             rows[0]["acquisition"]["kind"],
-            ACQUISITION_QUARK_MAGNET_OFFLINE,
+            ACQUISITION_ALIST_OFFLINE,
         )
         self.assertEqual(rows[1]["acquisition"]["kind"], ACQUISITION_TORRENT)
 
-    def test_quark_magnet_locator_does_not_preexclude_local_torrent_hash(self) -> None:
+    def test_alist_offline_locator_does_not_preexclude_local_torrent_hash(self) -> None:
         infohash = "0123456789012345678901234567890123456789"
 
-        self.assertEqual(_locator_infohash_aliases({f"quark_magnet:{infohash}"}), set())
+        self.assertEqual(_locator_infohash_aliases({f"alist_offline:{infohash}"}), set())
         self.assertIn(
             infohash,
             _locator_infohash_aliases({
@@ -291,7 +306,7 @@ class ProviderCapabilityTests(unittest.TestCase):
                 request, [
                     _legacy_http_candidate(),
                     _torrent_candidate(),
-                    _quark_magnet_candidate(),
+                    _alist_offline_candidate(),
                     _quark_share_candidate(),
                 ],
             )
@@ -304,7 +319,7 @@ class ProviderCapabilityTests(unittest.TestCase):
         )
         self.assertEqual(
             result["provider_chain_by_gap"]["S01E01"][1]["acquisition_kind"],
-            "quark_magnet_offline",
+            "alist_offline",
         )
         self.assertEqual(
             result["provider_chain_by_gap"]["S01E01"][2]["acquisition_kind"],
@@ -335,7 +350,7 @@ class ProviderCapabilityTests(unittest.TestCase):
 
     def test_selector_current_tier_never_falls_through_to_another_provider(self) -> None:
         request = {
-            "tier": TIER_QUARK_MAGNET,
+            "tier": TIER_ALIST_OFFLINE,
             "media": {
                 "tmdb_id": 1,
                 "title": "Example Show",
@@ -358,19 +373,19 @@ class ProviderCapabilityTests(unittest.TestCase):
                 request,
                 [
                     _quark_share_candidate(),
-                    _quark_magnet_candidate(),
+                    _alist_offline_candidate(),
                     _torrent_candidate(),
                 ],
             )
 
-        self.assertEqual(result["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(result["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(
             [row["provider"] for row in result["selections"]],
-            [TIER_QUARK_MAGNET],
+            [TIER_ALIST_OFFLINE],
         )
         self.assertEqual(
             [row["provider"] for row in result["provider_chain_by_gap"]["S01E01"]],
-            [TIER_QUARK_MAGNET],
+            [TIER_ALIST_OFFLINE],
         )
         self.assertEqual(result["unchecked_current_tier_candidate_count"], 0)
 
@@ -408,7 +423,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             with self.assertRaises(AutomaticReplenishmentError):
                 materializer.acquire(
                     {},
-                    [_quark_magnet_candidate()],
+                    [_alist_offline_candidate()],
                     staging_root="/library/ScrapeFlow/补源/job/attempt",
                     workspace=Path(directory),
                     alist=object(),

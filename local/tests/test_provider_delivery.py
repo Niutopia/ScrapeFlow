@@ -7,8 +7,8 @@ from local.scrapeflow_api.provider_delivery import (
     validate_provider_delivery,
 )
 from local.scrapeflow_api.replenishment_tiers import (
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
 )
 
@@ -36,7 +36,7 @@ def _delivery(lane: str) -> dict[str, object]:
 
 class ProviderDeliveryContractTests(unittest.TestCase):
     def test_three_lanes_share_one_delivery_shape(self) -> None:
-        for lane in (TIER_QUARK_SHARE, TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET):
+        for lane in (TIER_QUARK_SHARE, TIER_ALIST_OFFLINE, TIER_LOCAL_MAGNET):
             with self.subTest(lane=lane):
                 result = validate_provider_delivery(
                     _delivery(lane),
@@ -85,12 +85,12 @@ class ProviderDeliveryContractTests(unittest.TestCase):
             validate_provider_delivery(delivery, root_job_id=ROOT, attempt_id=ATTEMPT)
 
     def test_files_must_stay_inside_staging_and_bind_gap_ids(self) -> None:
-        outside = _delivery(TIER_QUARK_MAGNET)
+        outside = _delivery(TIER_ALIST_OFFLINE)
         outside["files"][0]["path"] = "/quark/影视/番剧/Example/Example.S01E01.mkv"
         with self.assertRaises(ProviderDeliveryError):
             validate_provider_delivery(outside, root_job_id=ROOT, attempt_id=ATTEMPT)
 
-        unbound = _delivery(TIER_QUARK_MAGNET)
+        unbound = _delivery(TIER_ALIST_OFFLINE)
         unbound["files"][0]["gap_ids"] = []
         with self.assertRaises(ProviderDeliveryError):
             validate_provider_delivery(unbound, root_job_id=ROOT, attempt_id=ATTEMPT)
@@ -145,7 +145,7 @@ class ProviderDeliveryContractTests(unittest.TestCase):
                 duplicate_path, root_job_id=ROOT, attempt_id=ATTEMPT,
             )
 
-        duplicate_gap = _delivery(TIER_QUARK_MAGNET)
+        duplicate_gap = _delivery(TIER_ALIST_OFFLINE)
         duplicate_gap["files"][0]["gap_ids"] = ["S01E01", "S01E01"]
         with self.assertRaises(ProviderDeliveryError):
             validate_provider_delivery(

@@ -5,7 +5,7 @@ The new architecture records precise gaps in ``gap_ledger_<root_task_id>.json``
 closes those gaps with the existing, frozen three-tier replenishment machinery:
 
     quark_share  -> QuarkFastSaveAutomaticMaterializer
-    quark_magnet -> QuarkMagnetAutomaticMaterializer
+    alist_offline -> AlistOfflineAutomaticMaterializer
     magnet       -> LocalTorrentAutomaticMaterializer
 
 It never instantiates the legacy ``AutomaticReplenishmentRuntime`` (which
@@ -27,6 +27,11 @@ Tier progression (contract rule 4) is delegated to the pure
 * ``infrastructure`` -> ``waiting == "retry_wait"`` (same tier, never downgrade);
 * ``in_doubt`` -> ``waiting == "waiting_reconcile"`` (same tier, and the in-flight
   gap ids are remembered in the durable state so they are never re-submitted).
+
+Parked ``in_doubt`` coordinates are NOT stranded: every round re-enters their
+durable attempts through the materializer's reconcile hook (poll-only, never
+re-submit) before any fresh search runs, so a finished AList offline task is
+finalized and its gaps closed by the normal writer closure.
 
 The durable state lives at ``state_root / replenishment_<root_task_id>.json``
 and is written with ``engine.scrapeflow.serialization.atomic_write_json``.  It
@@ -77,8 +82,8 @@ from .replenishment_tiers import (
     FAILURE_IN_DOUBT,
     FAILURE_INFRASTRUCTURE,
     STRICT_TIER_ORDER,
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
     apply_tier_outcome,
     initial_tier_state,
@@ -102,10 +107,10 @@ def _trace(message: str) -> None:
     print(f"[root-replenishment] {message}", flush=True)
 
 # The provider name for each tier equals the tier name (quark_share /
-# quark_magnet / magnet), which is also what the materializers validate.
+# alist_offline / magnet), which is also what the materializers validate.
 _TIER_PROVIDER = {
     TIER_QUARK_SHARE: TIER_QUARK_SHARE,
-    TIER_QUARK_MAGNET: TIER_QUARK_MAGNET,
+    TIER_ALIST_OFFLINE: TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET: TIER_LOCAL_MAGNET,
 }
 
@@ -200,9 +205,9 @@ def _default_materializer_factory(tier: str) -> Any:
     if tier == TIER_QUARK_SHARE:
         from .automatic_replenishment import QuarkFastSaveAutomaticMaterializer
         return QuarkFastSaveAutomaticMaterializer()
-    if tier == TIER_QUARK_MAGNET:
-        from .automatic_replenishment import QuarkMagnetAutomaticMaterializer
-        return QuarkMagnetAutomaticMaterializer()
+    if tier == TIER_ALIST_OFFLINE:
+        from .automatic_replenishment import AlistOfflineAutomaticMaterializer
+        return AlistOfflineAutomaticMaterializer()
     if tier == TIER_LOCAL_MAGNET:
         from .automatic_replenishment import LocalTorrentAutomaticMaterializer
         return LocalTorrentAutomaticMaterializer()
@@ -571,6 +576,286 @@ def _enrich_media_titles(runner: Any, request: dict[str, Any]) -> None:
     ])
 
 
+def _open_gaps_for_token(
+    state_root: Path,
+    root_task_id: str,
+    token: str,
+) -> list[Gap]:
+    """Return the open ledger gaps whose bridge token equals ``token``."""
+    output: list[Gap] = []
+    for gap in load_gap_ledger(state_root, root_task_id):
+        if gap.status != "open":
+            continue
+        if _bridge_token(gap) == token:
+            output.append(gap)
+    return output
+
+
+def _latest_parked_attempt(
+    gaps: Sequence[Gap],
+    recorded_task_id: str | None,
+) -> Any | None:
+    """Return the newest durable attempt that parked one of these gaps.
+
+    Only submitted/in_doubt rows are considered (those are the rows written
+    before/at the external submit); terminal outcome rows describe history.
+    When the durable in-flight map carries a task id, a candidate attempt must
+    match it — a mismatched row belongs to an older submit.
+    """
+    candidates: list[Any] = []
+    for gap in gaps:
+        for attempt in gap.attempts:
+            if attempt.status not in {"submitted", "in_doubt"}:
+                continue
+            if (
+                recorded_task_id
+                and attempt.external_task_id
+                and attempt.external_task_id != recorded_task_id
+            ):
+                continue
+            candidates.append(attempt)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.recorded_at)
+
+
+def _read_alist_offline_attempt_state(workspace: Path) -> dict[str, Any] | None:
+    """Read the durable alist_offline attempt state; ``None`` when unusable."""
+    import json as _json
+
+    path = workspace / "alist_offline_attempt.json"
+    if not path.exists():
+        return None
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    return dict(raw)
+
+
+def _exclude_locator(state: dict[str, Any], tier: str, locator: str) -> None:
+    """Add one locator to the durable per-tier candidate failure memory."""
+    if not locator:
+        return
+    failures = state.get("candidate_failures_by_provider")
+    if not isinstance(failures, dict):
+        failures = {}
+        state["candidate_failures_by_provider"] = failures
+    rows = failures.get(tier)
+    if not isinstance(rows, list):
+        rows = []
+        failures[tier] = rows
+    if locator not in rows:
+        rows.append(locator)
+
+
+def _reconcile_in_flight_tokens(
+    runner,
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    factory,
+    pause,
+) -> tuple[list[dict[str, Any]], list[str], str | None]:
+    """Re-enter parked in_doubt attempts through their durable task ids.
+
+    The removed ``quark_magnet`` lane can never reconcile: its parked tokens
+    are un-parked so the coordinate re-enters the current tier ladder.
+    ``alist_offline`` attempts re-enter the materializer's reconcile hook
+    (poll-only, never re-submit) and go through the same writer closure as a
+    fresh attempt.  Failures follow the same three-scope classification:
+    candidate excludes the locator and un-parks, infrastructure pins the token
+    for retry, in_doubt keeps the token parked for the next round.
+    """
+    in_flight = state.get(_IN_FLIGHT_KEY)
+    if not isinstance(in_flight, Mapping):
+        in_flight = {}
+        state[_IN_FLIGHT_KEY] = {}
+    attempts: list[dict[str, Any]] = []
+    closed: list[str] = []
+    waiting: str | None = None
+    parked = dict(in_flight)
+    removed_tokens: set[str] = set()
+
+    for token, recorded_task_id in sorted(parked.items()):
+        if pause():
+            break
+        gaps = _open_gaps_for_token(state_root, root_task_id, token)
+        if not gaps:
+            removed_tokens.add(token)
+            continue
+        attempt = _latest_parked_attempt(gaps, recorded_task_id)
+        if attempt is None:
+            # No durable attempt evidence: nothing provable to reconcile, and
+            # nothing keeps the coordinate parked.
+            removed_tokens.add(token)
+            continue
+        attempt_tier = str(attempt.tier or "").strip().casefold()
+        if attempt_tier == "quark_magnet":
+            # The lane that parked this token no longer exists.  Un-park so
+            # the coordinate re-enters the current tier ladder.
+            removed_tokens.add(token)
+            continue
+        if attempt_tier != TIER_ALIST_OFFLINE:
+            # Other live lanes have no reconcile hook; keep the token parked.
+            waiting = waiting or "waiting_reconcile"
+            continue
+        workspace = (
+            state_root / "replenishment_workspace" / root_task_id / attempt.attempt_id
+        )
+        attempt_state = _read_alist_offline_attempt_state(workspace)
+        if attempt_state is None:
+            # Fail closed: keep the token parked for a later round.
+            waiting = waiting or "waiting_reconcile"
+            continue
+        staging_root = attempt_state.get("staging_root")
+        acquisition = attempt_state.get("acquisition")
+        selected = attempt_state.get("selected_gap_ids")
+        locator = attempt_state.get("locator")
+        if (
+            not isinstance(staging_root, str)
+            or not staging_root
+            or not isinstance(acquisition, Mapping)
+            or not isinstance(selected, list)
+            or not selected
+        ):
+            waiting = waiting or "waiting_reconcile"
+            continue
+        selection: dict[str, Any] = {
+            "provider": str(attempt_state.get("provider") or TIER_ALIST_OFFLINE),
+            "locator": str(locator or ""),
+            "selected_gap_ids": [
+                str(gap_id) for gap_id in selected
+                if isinstance(gap_id, str) and gap_id
+            ],
+            "acquisition": dict(acquisition),
+        }
+        media_type = str(gaps[0].media_type).strip().casefold()
+        tmdb_id = gaps[0].tmdb_id
+        gap_rows: list[dict[str, Any]] = [
+            {
+                "id": token,
+                "kind": gap.kind,
+                "season": gap.season,
+                "episodes": list(gap.episodes),
+                "title": "",
+            }
+            for gap in gaps
+        ]
+        request: dict[str, Any] = {
+            "tier": TIER_ALIST_OFFLINE,
+            "media": {"media_type": media_type, "tmdb_id": tmdb_id},
+            "gaps": gap_rows,
+        }
+        by_token, by_unit = _open_gaps_by_token(
+            state_root, root_task_id, media_type, tmdb_id,
+        )
+        provider = str(attempt.provider or TIER_ALIST_OFFLINE)
+
+        def record_outcome(scope: str, task_id: str | None, error: str) -> None:
+            for gap in gaps:
+                record_attempt(
+                    state_root, root_task_id, gap.gap_id,
+                    attempt_id=attempt.attempt_id,
+                    provider=provider,
+                    tier=TIER_ALIST_OFFLINE,
+                    locator=str(locator or "") or None,
+                    status=_attempt_status(scope),
+                    external_task_id=task_id,
+                    error=error[:200] or None,
+                )
+                attempts.append({
+                    "gap_id": gap.gap_id,
+                    "tier": TIER_ALIST_OFFLINE,
+                    "outcome": scope,
+                    **({"candidate_key": str(locator)} if locator else {}),
+                })
+
+        try:
+            materializer = factory(TIER_ALIST_OFFLINE)
+            method = getattr(materializer, "reconcile_existing_task", None)
+            if not callable(method):
+                raise ValueError("AList 离线 materializer 缺少 reconcile_existing_task")
+            delivery = method(
+                request, [selection], staging_root=staging_root,
+                workspace=workspace, alist=runner.alist,
+                external_task_id=recorded_task_id,
+            )
+        except Exception as exc:
+            scope, task_id = _classify_error(exc)
+            record_outcome(scope, task_id, str(exc))
+            if scope == FAILURE_IN_DOUBT:
+                waiting = waiting or "waiting_reconcile"
+            elif scope == FAILURE_INFRASTRUCTURE:
+                waiting = waiting or "retry_wait"
+            else:
+                removed_tokens.add(token)
+                _exclude_locator(state, TIER_ALIST_OFFLINE, str(locator or ""))
+            continue
+
+        if not isinstance(delivery, Mapping):
+            removed_tokens.add(token)
+            _exclude_locator(state, TIER_ALIST_OFFLINE, str(locator or ""))
+            record_outcome(FAILURE_CANDIDATE, None, "对账 materializer 返回无效 delivery")
+            continue
+
+        # Writer closure (same as a fresh attempt).
+        try:
+            if pause():
+                break
+            child_request = _child_request(
+                runner, state_root, root_task_id, request, delivery,
+            )
+            child = runner.plan_job(
+                child_request, internal_child_of=root_task_id,
+            )
+            if pause():
+                break
+            executed = runner.execute_job(child.id)
+            executed_plan = (
+                executed.plan if isinstance(executed.plan, Mapping) else {}
+            )
+        except Exception as exc:
+            scope, task_id = _classify_error(exc)
+            record_outcome(scope, task_id, str(exc))
+            if scope == FAILURE_IN_DOUBT:
+                waiting = waiting or "waiting_reconcile"
+            elif scope == FAILURE_INFRASTRUCTURE:
+                waiting = waiting or "retry_wait"
+            else:
+                removed_tokens.add(token)
+                _exclude_locator(state, TIER_ALIST_OFFLINE, str(locator or ""))
+            continue
+
+        for gap in gaps:
+            if _prove_gap_coverage(gap, by_unit, executed_plan):
+                try:
+                    close_gap(state_root, root_task_id, gap.gap_id)
+                except KeyError:
+                    continue
+                closed.append(gap.gap_id)
+                attempts.append({
+                    "gap_id": gap.gap_id,
+                    "tier": TIER_ALIST_OFFLINE,
+                    "outcome": "closed",
+                    **({"candidate_key": str(locator)} if locator else {}),
+                })
+                removed_tokens.add(token)
+            else:
+                record_outcome(FAILURE_CANDIDATE, None, "对账执行后未证明缺口被覆盖")
+                removed_tokens.add(token)
+                _exclude_locator(state, TIER_ALIST_OFFLINE, str(locator or ""))
+
+    if removed_tokens:
+        state[_IN_FLIGHT_KEY] = {
+            key: value for key, value in parked.items()
+            if key not in removed_tokens
+        }
+    return attempts, closed, waiting
+
+
 def run_root_replenishment(
     runner,
     state_root: Path,
@@ -640,23 +925,63 @@ def run_root_replenishment(
             copied["gaps"] = rows
             filtered.append(copied)
     requests = filtered
+
+    # Reconcile parked in_doubt coordinates BEFORE any fresh search: their
+    # durable AList tasks may have finished since the last round.  This runs
+    # even when fresh requests exist — otherwise a mixed round would strand
+    # parked tokens until every other coordinate drained.
+    reconcile_attempts: list[dict[str, Any]] = []
+    reconcile_closed: list[str] = []
+    reconcile_waiting: str | None = None
+    if in_flight:
+        try:
+            (
+                reconcile_attempts,
+                reconcile_closed,
+                reconcile_waiting,
+            ) = _reconcile_in_flight_tokens(
+                runner, state_root, root_task_id, state, factory, pause,
+            )
+        except Exception:
+            # Fail closed: keep parked tokens for a later round.
+            import traceback
+            traceback.print_exc()
+            reconcile_waiting = "waiting_reconcile"
+
     if not requests:
-        # In-flight (in_doubt) leftovers are a real reconcile wait: re-check
-        # them later without re-submitting.  Subtitle-only leftovers are the
-        # subtitle channel's job and must not loop the video tiers.
+        # Subtitle-only leftovers are the subtitle channel's job and must not
+        # loop the video tiers; parked tokens were just reconciled above (the
+        # reconcile pass rewrites ``in_flight_gap_ids``, so re-read it here).
+        still_parked = bool(state.get(_IN_FLIGHT_KEY))
+        waiting = (
+            reconcile_waiting
+            if reconcile_waiting is not None
+            else ("waiting_reconcile" if still_parked else None)
+        )
+        for entry in reconcile_attempts:
+            _append_attempt_log(state, {
+                "gap_id": entry["gap_id"],
+                "tier": entry["tier"],
+                "outcome": entry["outcome"],
+                "candidate_key": entry.get("candidate_key"),
+                "recorded_at": _now(),
+            })
+        state["updated_at"] = _now()
+        state["waiting"] = waiting
+        save_root_replenishment_state(state_root, root_task_id, state)
         return {
             "tier": tier,
             "tier_before": tier,
             "requests_built": 0,
-            "attempts": [],
-            "gaps_closed": [],
+            "attempts": reconcile_attempts,
+            "gaps_closed": reconcile_closed,
             "state": state,
-            "waiting": "waiting_reconcile" if in_flight else None,
+            "waiting": waiting,
         }
 
     requests_built = len(requests)
-    attempts: list[dict[str, Any]] = []
-    gaps_closed: list[str] = []
+    attempts: list[dict[str, Any]] = list(reconcile_attempts)
+    gaps_closed: list[str] = list(reconcile_closed)
     waiting: str | None = None
 
     hit_in_doubt = False
@@ -956,17 +1281,18 @@ def run_root_replenishment(
             "scope": FAILURE_CANDIDATE,
             "locator": locator,
         })
-    if hit_in_doubt:
+    if hit_in_doubt or reconcile_waiting == "waiting_reconcile":
         waiting = "waiting_reconcile"
-        state = apply_tier_outcome(state, {
-            "scope": FAILURE_IN_DOUBT,
-            "external_task_id": next(iter(in_doubt_task_ids.values()), None),
-        })
+        if hit_in_doubt:
+            state = apply_tier_outcome(state, {
+                "scope": FAILURE_IN_DOUBT,
+                "external_task_id": next(iter(in_doubt_task_ids.values()), None),
+            })
         state[_IN_FLIGHT_KEY] = {
             **state.get(_IN_FLIGHT_KEY, {}),
             **newly_in_flight,
         }
-    elif hit_infrastructure:
+    elif hit_infrastructure or reconcile_waiting == "retry_wait":
         waiting = "retry_wait"
         state = apply_tier_outcome(state, {"scope": FAILURE_INFRASTRUCTURE})
     elif requests_built > 0 and all_no_candidate:

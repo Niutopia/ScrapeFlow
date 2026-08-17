@@ -13,15 +13,15 @@ from .provider_staging import (
     validate_provider_staging_root,
 )
 from .replenishment_tiers import (
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
 )
 
 
 ALLOWED_DELIVERY_LANES = frozenset({
     TIER_QUARK_SHARE,
-    TIER_QUARK_MAGNET,
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
 })
 ALLOWED_DELIVERY_KINDS = frozenset({"video", "subtitle"})

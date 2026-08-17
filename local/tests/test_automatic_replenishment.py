@@ -12,12 +12,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from local.scrapeflow_api.automatic_replenishment import (
+    AlistOfflineAutomaticMaterializer,
+    AlistOfflineCandidateError,
+    AlistOfflineInDoubtError,
     AutomaticReplenishmentError,
     AutomaticReplenishmentRuntime,
     FixedTierAutomaticMaterializer,
     LocalTorrentAutomaticMaterializer,
     QuarkFastSaveAutomaticMaterializer,
-    QuarkMagnetAutomaticMaterializer,
 )
 from engine.scrapeflow.replenishment_matching import (
     coverage_tokens,
@@ -42,8 +44,8 @@ from local.scrapeflow_api.replenishment_tiers import (
     FAILURE_INFRASTRUCTURE,
     FAILURE_IN_DOUBT,
     MAGNET_REQUIRED_SOURCES,
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
     apply_tier_outcome,
 )
@@ -114,7 +116,7 @@ class FakeSearch:
         tier = str(request.get("tier") or TIER_QUARK_SHARE).strip().casefold()
         acquisition_kind = {
             TIER_QUARK_SHARE: "quark_fast_save",
-            TIER_QUARK_MAGNET: "quark_magnet_offline",
+            TIER_ALIST_OFFLINE: "alist_offline",
             TIER_LOCAL_MAGNET: "torrent",
         }.get(tier, "quark_fast_save")
         return {
@@ -311,6 +313,165 @@ class FakeSubtitleEngine(FakeEngine):
         }
 
 
+class FakeAList:
+    """In-memory AList double for the AList offline-download lane.
+
+    Holds a file tree plus an offline-download task ledger.  The ledger
+    mimics the AList tache split: ``offline_download_undone`` returns
+    non-terminal rows and ``offline_download_done`` terminal rows.  The
+    first submitted task always gets id ``alist-task-1`` so tests can
+    script state transitions from the materializer's sleep hook.
+    """
+
+    def __init__(self) -> None:
+        self.tree: dict[str, list[dict[str, object]]] = {
+            "/quark/影视/ScrapeFlow/补源": [],
+        }
+        self.undone: list[dict[str, object]] = []
+        self.done: list[dict[str, object]] = []
+        self.add_calls: list[tuple[str, list[str], str]] = []
+        self.move_calls: list[tuple[str, str, list[str]]] = []
+        self.remove_calls: list[tuple[str, list[str]]] = []
+        self.delete_calls: list[str] = []
+        self.add_error: Exception | None = None
+        self.add_returns_empty = False
+        self.next_task_id = 1
+
+    @staticmethod
+    def offline_sibling(staging_root: str) -> str:
+        return (
+            f"{posixpath.dirname(staging_root.rstrip('/'))}/"
+            f"{posixpath.basename(staging_root.rstrip('/'))}__offline__"
+        )
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        return [dict(row) for row in self.tree.get(path, [])]
+
+    def mkdir(self, path: str) -> None:
+        if path in self.tree:
+            return
+        parent = posixpath.dirname(path) or "/"
+        name = posixpath.basename(path)
+        self.tree.setdefault(parent, [])
+        if not any(row.get("name") == name for row in self.tree[parent]):
+            self.tree[parent].append({"name": name, "is_dir": True})
+        self.tree[path] = []
+
+    def move(self, src_dir: str, dst_dir: str, names: list[str]) -> None:
+        self.move_calls.append((src_dir, dst_dir, list(names)))
+        self.mkdir(dst_dir)
+        for name in names:
+            rows = self.tree.get(src_dir, [])
+            row = next((item for item in rows if item.get("name") == name), None)
+            if row is None:
+                raise AssertionError(f"move source missing: {src_dir}/{name}")
+            self.tree[src_dir] = [
+                item for item in self.tree[src_dir] if item.get("name") != name
+            ]
+            destination_rows = self.tree.setdefault(dst_dir, [])
+            if not any(item.get("name") == name for item in destination_rows):
+                destination_rows.append(dict(row))
+
+    def remove(self, parent: str, names: list[str]) -> None:
+        self.remove_calls.append((parent, list(names)))
+        for name in names:
+            self.tree[parent] = [
+                row for row in self.tree.get(parent, [])
+                if row.get("name") != name
+            ]
+            self.tree.pop(posixpath.join(parent, name), None)
+
+    def offline_download_add(
+        self, path: str, urls: list[str], *, tool: str,
+    ) -> list[dict[str, object]]:
+        self.add_calls.append((path, list(urls), tool))
+        if self.add_error is not None:
+            raise self.add_error
+        if self.add_returns_empty:
+            return []
+        task: dict[str, object] = {
+            "id": f"alist-task-{self.next_task_id}",
+            "name": path,
+            "state": 0,
+            "progress": 0,
+            "error": "",
+        }
+        self.next_task_id += 1
+        self.undone.append(task)
+        return [dict(task)]
+
+    def offline_download_undone(self) -> list[dict[str, object]]:
+        return [dict(row) for row in self.undone]
+
+    def offline_download_done(self) -> list[dict[str, object]]:
+        return [dict(row) for row in self.done]
+
+    def offline_download_delete(self, task_id: str) -> None:
+        self.delete_calls.append(task_id)
+        self.undone = [row for row in self.undone if str(row.get("id")) != task_id]
+        self.done = [row for row in self.done if str(row.get("id")) != task_id]
+
+    def set_task_state(
+        self, task_id: str, state: int, *, progress: int = 100, error: str = "",
+    ) -> None:
+        row = next(
+            (row for row in [*self.undone, *self.done] if str(row.get("id")) == task_id),
+            None,
+        )
+        if row is None:
+            raise AssertionError(f"unknown offline task: {task_id}")
+        row["state"] = state
+        row["progress"] = progress
+        row["error"] = error
+        if state in {2, 4, 5, 7}:
+            self.undone = [r for r in self.undone if str(r.get("id")) != task_id]
+            if not any(str(r.get("id")) == task_id for r in self.done):
+                self.done.append(row)
+
+    def seed_file(self, path: str, *, size: int) -> None:
+        directory = posixpath.dirname(path)
+        name = posixpath.basename(path)
+        self.mkdir(directory)
+        rows = self.tree.setdefault(directory, [])
+        if not any(row.get("name") == name for row in rows):
+            rows.append({"name": name, "is_dir": False, "size": size})
+
+
+def _alist_offline_selection(
+    *,
+    infohash: str = "0123456789012345678901234567890123456789",
+    include_magnet: bool = True,
+    include_torrent: bool = True,
+    file_path: str = "Example/Example.Show.S01E01.mkv",
+    size: int = 123,
+) -> dict[str, object]:
+    """Build one reviewed ``alist_offline`` candidate selection."""
+    acquisition: dict[str, object] = {
+        "kind": "alist_offline",
+        "expected_files": [{
+            "torrent_index": 1,
+            "path": file_path,
+            "size": size,
+            "gap_ids": ["S01E01"],
+        }],
+    }
+    if include_magnet:
+        acquisition["magnet_url"] = f"magnet:?xt=urn:btih:{infohash}"
+    if include_torrent:
+        acquisition["torrent_url"] = "https://example.invalid/example.torrent"
+    return {
+        "provider": TIER_ALIST_OFFLINE,
+        "locator": f"alist_offline:{infohash}",
+        "release_name": "Example Show S01E01 1080p",
+        "title": "Example Show",
+        "year": "2020",
+        "files": [file_path],
+        "selected_gap_ids": ["S01E01"],
+        "acquisition": acquisition,
+    }
+
+
 def _example_root_job(job_id: str = "engine-cancel-root") -> EngineJob:
     plan = {
         "mode": "tv",
@@ -420,23 +581,23 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 "unchecked_current_tier_candidate_count": 0,
             }
             movie_outcome = runtime._search_tier_outcome(
-                result, bundle, tier=TIER_QUARK_MAGNET, shelf="movie",
+                result, bundle, tier=TIER_ALIST_OFFLINE, shelf="movie",
             )
             self.assertEqual(movie_outcome["shelf"], "movie")
             self.assertEqual(movie_outcome["completed_sources"], ["acg", "nyaa"])
             advanced = apply_tier_outcome(
-                {"tier": TIER_QUARK_MAGNET}, movie_outcome,
+                {"tier": TIER_ALIST_OFFLINE}, movie_outcome,
             )
             self.assertEqual(advanced["tier"], TIER_LOCAL_MAGNET)
 
             neutral_outcome = runtime._search_tier_outcome(
-                result, bundle, tier=TIER_QUARK_MAGNET,
+                result, bundle, tier=TIER_ALIST_OFFLINE,
             )
             self.assertNotIn("shelf", neutral_outcome)
             conservative = apply_tier_outcome(
-                {"tier": TIER_QUARK_MAGNET}, neutral_outcome,
+                {"tier": TIER_ALIST_OFFLINE}, neutral_outcome,
             )
-            self.assertEqual(conservative["tier"], TIER_QUARK_MAGNET)
+            self.assertEqual(conservative["tier"], TIER_ALIST_OFFLINE)
 
     def test_positive_memory_is_loaded_alongside_fresh_search_and_failed_is_excluded(self) -> None:
         root_job = _example_root_job("engine-positive-memory")
@@ -679,7 +840,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertEqual(calls[0], desired_url)
-        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        self.assertEqual([row["provider"] for row in candidates], ["alist_offline", "magnet"])
         local = next(row for row in candidates if row["provider"] == "magnet")
         self.assertEqual(local["release_name"], desired_release)
         self.assertEqual(
@@ -756,7 +917,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertEqual(calls[0], desired_torrent)
-        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        self.assertEqual([row["provider"] for row in candidates], ["alist_offline", "magnet"])
         self.assertTrue(all(row["release_name"] == desired_release for row in candidates))
 
     def test_s00_title_preflight_priority_still_requires_manifest_coverage(self) -> None:
@@ -1045,7 +1206,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             return_value=manifest,
         ):
             candidates = _search_tokyotosho(request, set(), deadline=deadline)
-        self.assertEqual([row["provider"] for row in candidates], ["quark_magnet", "magnet"])
+        self.assertEqual([row["provider"] for row in candidates], ["alist_offline", "magnet"])
         local = next(row for row in candidates if row["provider"] == "magnet")
         self.assertEqual(local["infohash"], infohash)
         self.assertEqual(
@@ -1100,7 +1261,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         ):
             nyaa = _search_nyaa(request, set(), deadline=time.monotonic() + 10)
 
-        self.assertEqual([row["provider"] for row in nyaa], ["quark_magnet", "magnet"])
+        self.assertEqual([row["provider"] for row in nyaa], ["alist_offline", "magnet"])
         nyaa_local = next(row for row in nyaa if row["provider"] == "magnet")
         self.assertEqual(nyaa_local["seeders"], 0)
         self.assertEqual(nyaa_local["leechers"], 4)
@@ -1127,7 +1288,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(
             [row["provider"] for row in animetosho],
-            ["quark_magnet", "magnet"],
+            ["alist_offline", "magnet"],
         )
         animetosho_local = next(row for row in animetosho if row["provider"] == "magnet")
         self.assertEqual(animetosho_local["seeders"], 7)
@@ -3106,7 +3267,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertTrue(outcome["outcomes"][0]["error"])
 
     def test_runtime_advances_share_only_after_complete_no_candidate_proof(self) -> None:
-        """A PanSou-complete first tier may advance exactly to Quark magnet."""
+        """A PanSou-complete first tier may advance exactly to AList offline."""
         root_job = _example_root_job("engine-share-proof-advance")
 
         class Search:
@@ -3123,15 +3284,15 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                         "completed_sources": ["pansou"],
                         "unchecked_secondary_candidates": 0,
                     }
-                if tier == TIER_QUARK_MAGNET:
+                if tier == TIER_ALIST_OFFLINE:
                     return {"candidates": [{
-                        "provider": TIER_QUARK_MAGNET,
-                        "locator": "quark_magnet:fixture",
+                        "provider": TIER_ALIST_OFFLINE,
+                        "locator": "alist_offline:fixture",
                         "release_name": "Example Show S01E01 1080p",
                         "title": "Example Show",
                         "year": "2020",
                         "files": ["Example.Show.S01E01.mkv"],
-                        "acquisition": {"kind": "quark_magnet_offline"},
+                        "acquisition": {"kind": "alist_offline"},
                     }]}
                 raise AssertionError(f"unexpected tier: {tier}")
 
@@ -3146,12 +3307,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
             outcome = runtime.run_for_job(root_job)
 
-        self.assertEqual(search.tiers, [TIER_QUARK_SHARE, TIER_QUARK_MAGNET])
+        self.assertEqual(search.tiers, [TIER_QUARK_SHARE, TIER_ALIST_OFFLINE])
         self.assertEqual(len(materializer.calls), 1)
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
 
     def test_runtime_requires_all_second_tier_sources_before_local_magnet(self) -> None:
-        """Partial Quark-magnet source telemetry cannot reach local Torrent."""
+        """Partial AList-offline source telemetry cannot reach local Torrent."""
         root_job = _example_root_job("engine-magnet-proof-advance")
 
         class Search:
@@ -3161,7 +3322,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             def run(self, request):
                 tier = str(request["tier"])
                 self.tiers.append(tier)
-                if tier == TIER_QUARK_MAGNET:
+                if tier == TIER_ALIST_OFFLINE:
                     return {
                         "candidates": [],
                         "search_complete_no_candidates": True,
@@ -3196,11 +3357,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 runtime,
                 job_id=root_job.id,
                 gap_ids=["S01E01"],
-                tier=TIER_QUARK_MAGNET,
+                tier=TIER_ALIST_OFFLINE,
             )
             outcome = runtime.run_for_job(root_job)
 
-        self.assertEqual(search.tiers, [TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET])
+        self.assertEqual(search.tiers, [TIER_ALIST_OFFLINE, TIER_LOCAL_MAGNET])
         self.assertEqual(len(materializer.calls), 1)
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
 
@@ -3228,7 +3389,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 runtime,
                 job_id=root_job.id,
                 gap_ids=["S01E01"],
-                tier=TIER_QUARK_MAGNET,
+                tier=TIER_ALIST_OFFLINE,
             )
             outcome = runtime.run_for_job(root_job)
             state = json.loads(
@@ -3238,7 +3399,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertEqual(materializer.calls, [])
-        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(state["tier_status"], "candidate_failed")
         self.assertTrue(outcome["outcomes"][0]["error"])
 
@@ -3303,7 +3464,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
         self.assertTrue(outcome["outcomes"][0]["error"])
-        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(state["tier_status"], "advanced")
         self.assertEqual(state["last_error_scope"], "candidate")
 
@@ -3477,9 +3638,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {
                     "status": "ready",
                     "authenticated": True,
-                    "actions": [
-                        "health", "share-save", "magnet-submit", "magnet-status",
-                    ],
+                    "actions": ["health", "share-save"],
                 }
 
             def share_save(self, plan):
@@ -3559,9 +3718,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {
                     "status": "ready",
                     "authenticated": True,
-                    "actions": [
-                        "health", "share-save", "magnet-submit", "magnet-status",
-                    ],
+                    "actions": ["health", "share-save"],
                 }
 
             def share_save(self, plan):
@@ -3679,9 +3836,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {
                     "status": "ready",
                     "authenticated": True,
-                    "actions": [
-                        "health", "share-save", "magnet-submit", "magnet-status",
-                    ],
+                    "actions": ["health", "share-save"],
                 }
 
             def share_save(self, *_args, **_kwargs):
@@ -3722,7 +3877,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {
                     "status": "ready",
                     "authenticated": True,
-                    "actions": ["health", "magnet-submit", "magnet-status"],
+                    "actions": ["health"],
                 }
 
             def share_save(self, _plan):
@@ -3760,9 +3915,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 return {
                     "status": "ready",
                     "authenticated": True,
-                    "actions": [
-                        "health", "share-save", "magnet-submit", "magnet-status",
-                    ],
+                    "actions": ["health", "share-save"],
                 }
 
             def share_save(self, plan):
@@ -3778,7 +3931,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             alist = MemoryAList()
             helper = TypedHelper(alist)
             with patch(
-                "engine.scrapeflow.quark_magnet_offline_bridge."
+                "engine.scrapeflow.quark_helper_client."
                 "HttpQuarkHelperClient.from_env",
                 return_value=helper,
             ) as helper_factory, patch(
@@ -3802,168 +3955,337 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         direct_transport.assert_not_called()
         self.assertEqual(delivery["external_task_id"], "share-task-1")
 
-    def test_quark_magnet_offline_wins_before_local_torrent(self) -> None:
-        root_job = _example_root_job("engine-quark-magnet-root")
-        infohash = "0123456789012345678901234567890123456789"
-
-        class MagnetFirstSearch(FakeSearch):
-            def run(self, request):
-                self.requests.append(dict(request))
-                return {"candidates": [{
-                    "provider": "quark_magnet",
-                    "locator": f"quark_magnet:{infohash}",
-                    "release_name": "Example Show S01E01 1080p",
-                    "title": "Example Show",
-                    "year": "2020",
-                    "files": ["Example/Example.Show.S01E01.mkv"],
-                    "file_coverage": ["S01E01"],
-                    "acquisition": {
-                        "kind": "quark_magnet_offline",
-                        "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
-                        "expected_files": [{
-                            "torrent_index": 1,
-                            "path": "Example/Example.Show.S01E01.mkv",
-                            "size": 123,
-                            "gap_ids": ["S01E01"],
-                        }],
-                    },
-                }, {
-                    "provider": "magnet",
-                    "locator": (
-                        "magnet:?xt=urn:btih:"
-                        "0123456789012345678901234567890123456789"
-                    ),
-                    "release_name": "Example Show S01E01 1080p",
-                    "title": "Example Show",
-                    "year": "2020",
-                    "files": ["Example.Show.S01E01.mkv"],
-                    "acquisition": {"kind": "torrent"},
-                }]}
-
-        class FakeQuarkMagnetBridge:
-            def __init__(self, alist: MemoryAList) -> None:
-                self.alist = alist
-                self.calls: list[str] = []
-
-            def execute(self, selection, destination, *, task_id=None, on_task_id=None):
-                if task_id is None and on_task_id is not None:
-                    on_task_id("quark-magnet-task-1")
-                self.calls.append(destination)
-                media_dir = f"{destination}/Example"
-                self.alist.mkdir(media_dir)
-                self.alist.tree[media_dir] = [{
-                    "name": "Example.Show.S01E01.mkv",
-                    "is_dir": False,
-                    "size": 123,
-                }]
-                return {
-                    "status": "submitted",
-                    "task_id": task_id or "quark-magnet-task-1",
-                    "expected_files": [{
-                        "path": "Example/Example.Show.S01E01.mkv",
-                        "size": 123,
-                        "gap_ids": ["S01E01"],
-                    }],
-                }
-
-        class UnexpectedLocalTorrent:
-            def acquire(self, *_args, **_kwargs):
-                raise AssertionError("local Torrent must not run after quark_magnet success")
-
+    def test_alist_offline_materializer_happy_path_submits_torrent_first(self) -> None:
+        """Submit once with the torrent URL, then move the expected file in."""
+        selection = _alist_offline_selection(include_magnet=False)
         with tempfile.TemporaryDirectory() as temporary:
-            alist = MemoryAList()
-            engine = FakeEngine()
-            bridge = FakeQuarkMagnetBridge(alist)
-            materializer = FixedTierAutomaticMaterializer(
-                quark_magnet=QuarkMagnetAutomaticMaterializer(bridge=bridge),
-                local_torrent=UnexpectedLocalTorrent(),
-            )
-            runtime = AutomaticReplenishmentRuntime(
-                Path(temporary), engine_runner=engine, alist=alist,
-                search=MagnetFirstSearch(), materializer=materializer,
-                staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
-                remote_video_probe=lambda _alist, _path: {"status": "satisfied"},
-            )
-            _seed_runtime_tier(
-                runtime,
-                job_id=root_job.id,
-                gap_ids=["S01E01"],
-                tier=TIER_QUARK_MAGNET,
-            )
-            outcome = runtime.run_for_job(root_job)
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-happy"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example/Example.Show.S01E01.mkv", size=123)
+            transitions = iter([
+                (1, 50, ""),
+                (2, 100, ""),
+            ])
 
-        self.assertEqual(outcome["unresolved_gaps"], [])
-        self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(len(bridge.calls), 1)
-        self.assertEqual(engine.executed, ["engine-child-1"])
-        self.assertTrue(engine.planned[0]["source_path"].startswith(
-            "/quark/影视/ScrapeFlow/补源/engine-quark-magnet-root/attempt-",
-        ))
+            def drive(_seconds):
+                try:
+                    state, progress, error = next(transitions)
+                except StopIteration:
+                    return
+                alist.set_task_state(
+                    "alist-task-1", state, progress=progress, error=error,
+                )
 
-    def test_quark_magnet_materializer_reuses_persisted_task_id(self) -> None:
-        infohash = "0123456789012345678901234567890123456789"
-        selection = {
-            "provider": "quark_magnet",
-            "locator": f"quark_magnet:{infohash}",
-            "release_name": "Example Show S01E01 1080p",
-            "selected_gap_ids": ["S01E01"],
-            "acquisition": {
-                "kind": "quark_magnet_offline",
-                "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
-                "expected_files": [{
-                    "torrent_index": 1,
-                    "path": "Example.Show.S01E01.mkv",
-                    "size": 123,
-                    "gap_ids": ["S01E01"],
-                }],
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=drive, poll_interval=0.1, stall_limit=0.2,
+            )
+            delivery = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+
+        self.assertEqual(
+            alist.add_calls,
+            [(sibling, ["https://example.invalid/example.torrent"], "aria2")],
+        )
+        self.assertEqual(
+            [(row["name"], row["size"]) for row in alist.list(staging)],
+            [("Example.Show.S01E01.mkv", 123)],
+        )
+        self.assertNotIn(sibling, alist.tree)
+        self.assertEqual(
+            alist.move_calls,
+            [(f"{sibling}/Example", staging, ["Example.Show.S01E01.mkv"])],
+        )
+        self.assertEqual(
+            alist.remove_calls,
+            [(posixpath.dirname(sibling), [posixpath.basename(sibling)])],
+        )
+        self.assertIn("alist-task-1", alist.delete_calls)
+        self.assertEqual(delivery["lane"], "alist_offline")
+        self.assertEqual(delivery["attempt_id"], "attempt-happy")
+        self.assertEqual(delivery["staging_root"], staging)
+        self.assertEqual(delivery["external_task_id"], "alist-task-1")
+        self.assertEqual(len(delivery["files"]), 1)
+        self.assertEqual(
+            delivery["files"][0],
+            {
+                "path": f"{staging}/Example.Show.S01E01.mkv",
+                "size": 123,
+                "kind": "video",
+                "gap_ids": ["S01E01"],
             },
-        }
+        )
 
-        class ReusingBridge:
+    def test_alist_offline_materializer_terminal_failure_is_candidate_excluded(self) -> None:
+        """A failed/errored AList task excludes the reviewed candidate."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            alist = FakeAList()
+
+            def fail_task(_seconds):
+                alist.set_task_state("alist-task-1", 7, progress=100, error="no seeders")
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=fail_task, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as caught:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-failed",
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, "candidate")
+        self.assertTrue(caught.exception.exclude_candidate)
+
+        # A succeeded state with a non-empty error is equally terminal.
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            alist = FakeAList()
+
+            def error_task(_seconds):
+                alist.set_task_state("alist-task-1", 2, progress=100, error="disk full")
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=error_task, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as caught:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-error-text",
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, "candidate")
+        self.assertTrue(caught.exception.exclude_candidate)
+
+    def test_alist_offline_materializer_stall_is_candidate_excluded(self) -> None:
+        """A task that never advances progress is a dead candidate."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            alist = FakeAList()
+
+            def keep_running(_seconds):
+                alist.set_task_state("alist-task-1", 1, progress=50, error="")
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=keep_running, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as caught:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-stall",
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, "candidate")
+        self.assertTrue(caught.exception.exclude_candidate)
+
+    def test_alist_offline_materializer_lost_submit_recovers_task_by_sibling_name(self) -> None:
+        """A lost add response is recovered by a name scan, never re-submitted."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-lost"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example/Example.Show.S01E01.mkv", size=123)
+            alist.add_error = RuntimeError("offline_download_add response lost")
+            alist.done.append({
+                "id": "alist-task-9",
+                "name": sibling,
+                "state": 2,
+                "progress": 100,
+                "error": "",
+            })
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+            )
+            delivery = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(delivery["external_task_id"], "alist-task-9")
+        self.assertEqual(delivery["lane"], "alist_offline")
+
+    def test_alist_offline_materializer_empty_add_response_without_task_is_in_doubt(self) -> None:
+        """An accepted submission without a traceable task is in-doubt."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            alist = FakeAList()
+            alist.add_returns_empty = True
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-indoubt",
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, "in_doubt")
+        self.assertIsNone(caught.exception.external_task_id)
+
+    def test_alist_offline_materializer_reconcile_existing_task_never_submits(self) -> None:
+        """Reconcile re-uses the persisted task id and never calls add."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reconcile"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example/Example.Show.S01E01.mkv", size=123)
+            alist.done.append({
+                "id": "alist-task-5",
+                "name": sibling,
+                "state": 2,
+                "progress": 100,
+                "error": "",
+            })
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+            )
+            delivery = materializer.reconcile_existing_task(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+                external_task_id="alist-task-5",
+            )
+
+            self.assertEqual(alist.add_calls, [])
+            self.assertEqual(delivery["external_task_id"], "alist-task-5")
+            self.assertEqual(delivery["lane"], "alist_offline")
+            self.assertEqual(
+                [(row["name"], row["size"]) for row in alist.list(staging)],
+                [("Example.Show.S01E01.mkv", 123)],
+            )
+            self.assertNotIn(sibling, alist.tree)
+
+        # Unknown task id: recovered by scanning task names, still no submit.
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reconcile-scan"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example/Example.Show.S01E01.mkv", size=123)
+            alist.done.append({
+                "id": "alist-task-6",
+                "name": sibling,
+                "state": 2,
+                "progress": 100,
+                "error": "",
+            })
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _s: None, poll_interval=0.1, stall_limit=0.2,
+            )
+            delivery = materializer.reconcile_existing_task(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+                external_task_id=None,
+            )
+
+            self.assertEqual(alist.add_calls, [])
+            self.assertEqual(delivery["external_task_id"], "alist-task-6")
+            self.assertEqual(delivery["lane"], "alist_offline")
+
+    def test_alist_offline_materializer_missing_expected_files_is_candidate_excluded(self) -> None:
+        """A succeeded task that did not land the expected file is excluded."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-missing"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Other.File.mkv", size=999)
+
+            def drive(_seconds):
+                alist.set_task_state("alist-task-1", 2, progress=100, error="")
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=drive, poll_interval=0.1, stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as caught:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+        self.assertEqual(caught.exception.failure_scope, "candidate")
+        self.assertTrue(caught.exception.exclude_candidate)
+
+    def test_fixed_tier_dispatches_alist_offline_for_acquire_and_reconcile(self) -> None:
+        """FixedTierAutomaticMaterializer routes the lane on both hooks."""
+        selection = _alist_offline_selection()
+
+        class RecordingAlistOffline:
             def __init__(self) -> None:
-                self.task_ids: list[str | None] = []
+                self.acquired: list[str] = []
+                self.reconciled: list[tuple[str, str]] = []
 
-            def execute(self, _selection, _destination, *, task_id=None, on_task_id=None):
-                self.task_ids.append(task_id)
-                if task_id is None:
-                    task_id = "quark-magnet-task-1"
-                    if on_task_id is not None:
-                        on_task_id(task_id)
+            def acquire(self, _request, _selections, *, staging_root, workspace, alist):
+                del workspace, alist
+                self.acquired.append(staging_root)
                 return {
-                    "status": "submitted",
-                    "task_id": task_id,
-                    "expected_files": [{
-                        "path": "Example.Show.S01E01.mkv",
-                        "size": 123,
-                        "gap_ids": ["S01E01"],
-                    }],
+                    "lane": TIER_ALIST_OFFLINE,
+                    "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+                    "staging_root": staging_root,
+                    "files": [],
                 }
+
+            def reconcile_existing_task(
+                self, _request, _selections, *, staging_root, workspace, alist,
+                external_task_id,
+            ):
+                del workspace, alist
+                self.reconciled.append((staging_root, external_task_id))
+                return {
+                    "lane": TIER_ALIST_OFFLINE,
+                    "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+                    "staging_root": staging_root,
+                    "files": [],
+                    "external_task_id": external_task_id,
+                }
+
+        class NeverRuns:
+            def acquire(self, *_args, **_kwargs):
+                raise AssertionError("alist_offline must be the only dispatched lane")
+
+            def reconcile_existing_task(self, *_args, **_kwargs):
+                raise AssertionError("alist_offline must be the only dispatched lane")
 
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary) / "workspace"
-            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-reuse"
-            bridge = ReusingBridge()
-            materializer = QuarkMagnetAutomaticMaterializer(bridge=bridge)
-            alist = MemoryAList()
-
-            first = materializer.acquire(
-                {},
-                [selection],
-                staging_root=staging,
-                workspace=workspace,
-                alist=alist,
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-fixed"
+            alist = FakeAList()
+            recording = RecordingAlistOffline()
+            materializer = FixedTierAutomaticMaterializer(
+                quark_share=NeverRuns(),
+                alist_offline=recording,
+                local_torrent=NeverRuns(),
             )
-            second = materializer.acquire(
-                {},
-                [selection],
-                staging_root=staging,
-                workspace=workspace,
-                alist=alist,
+            delivery = materializer.acquire(
+                {"tier": TIER_ALIST_OFFLINE}, [selection],
+                staging_root=staging, workspace=workspace, alist=alist,
             )
+            self.assertEqual(delivery["lane"], TIER_ALIST_OFFLINE)
+            reconciled = materializer.reconcile_existing_task(
+                {"tier": TIER_ALIST_OFFLINE}, [selection],
+                staging_root=staging, workspace=workspace, alist=alist,
+                external_task_id="alist-task-5",
+            )
+            self.assertEqual(reconciled["external_task_id"], "alist-task-5")
 
-        self.assertEqual(bridge.task_ids, [None, "quark-magnet-task-1"])
-        self.assertEqual(first["external_task_id"], "quark-magnet-task-1")
-        self.assertEqual(second["external_task_id"], "quark-magnet-task-1")
+        self.assertEqual(recording.acquired, [staging])
+        self.assertEqual(recording.reconciled, [(staging, "alist-task-5")])
+
 
     def test_partial_child_output_does_not_resolve_unwritten_episode(self) -> None:
         plan = {

@@ -232,7 +232,7 @@ def valid_runtime_readiness_report() -> dict[str, object]:
             "engine_configured": True,
             "provider_capabilities": {
                 "quark_share": {"status": "ready"},
-                "quark_magnet": {"status": "ready"},
+                "alist_offline": {"status": "ready"},
                 "magnet": {"status": "ready"},
             },
             "helper_readiness": {
@@ -724,12 +724,12 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(evidence["summary"]["control_paused"], True)
         self.assertEqual(
             evidence["summary"]["provider_lanes"],
-            "magnet, quark_magnet, quark_share",
+            "alist_offline, magnet, quark_share",
         )
         self.assertEqual(evidence["summary"]["quark_helper_status"], "ready")
         self.assertEqual(
             evidence["summary"]["quark_helper_actions"],
-            "health, share-save, magnet-submit, magnet-status",
+            "health, share-save",
         )
 
     def test_package_draft_includes_runtime_readiness_report(self) -> None:

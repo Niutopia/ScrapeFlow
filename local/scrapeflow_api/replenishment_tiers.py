@@ -13,9 +13,9 @@ from typing import Any
 
 
 TIER_QUARK_SHARE = "quark_share"
-TIER_QUARK_MAGNET = "quark_magnet"
+TIER_ALIST_OFFLINE = "alist_offline"
 TIER_LOCAL_MAGNET = "magnet"
-STRICT_TIER_ORDER = (TIER_QUARK_SHARE, TIER_QUARK_MAGNET, TIER_LOCAL_MAGNET)
+STRICT_TIER_ORDER = (TIER_QUARK_SHARE, TIER_ALIST_OFFLINE, TIER_LOCAL_MAGNET)
 
 FAILURE_CANDIDATE = "candidate"
 FAILURE_INFRASTRUCTURE = "infrastructure"
@@ -36,7 +36,7 @@ MAGNET_REQUIRED_SOURCES = frozenset({
 # for anime works must therefore cover the full anime index list, while movie
 # and US-TV works only owe the general-purpose sources: demanding completion
 # of anime-only indexes for those shelves would leave their gaps permanently
-# stuck at quark_magnet without adding any real search evidence.
+# stuck at alist_offline without adding any real search evidence.
 MAGNET_REQUIRED_SOURCES_BY_SHELF: dict[str, frozenset[str]] = {
     "anime": MAGNET_REQUIRED_SOURCES,
     "movie": frozenset({"nyaa", "acg"}),
@@ -124,7 +124,7 @@ def required_sources_for_tier(tier: str, shelf: str | None = None) -> frozenset[
     tier = _tier(tier)
     if tier == TIER_QUARK_SHARE:
         return SHARE_REQUIRED_SOURCES
-    if tier == TIER_QUARK_MAGNET:
+    if tier == TIER_ALIST_OFFLINE:
         if shelf is not None and shelf in MAGNET_REQUIRED_SOURCES_BY_SHELF:
             return MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf]
         return MAGNET_REQUIRED_SOURCES
@@ -152,7 +152,7 @@ def _tier_exhausted(state: Mapping[str, object], tier: str, outcome: Mapping[str
         if isinstance(locators, list) and len({
             value for value in locators if isinstance(value, str) and value
         }) >= EXHAUSTION_MIN_DISTINCT_LOCATORS:
-            if tier != TIER_QUARK_MAGNET:
+            if tier != TIER_ALIST_OFFLINE:
                 return True
             completed = _strings(outcome.get("completed_sources"))
             required = required_sources_for_tier(tier, _outcome_shelf(outcome))
@@ -233,8 +233,8 @@ __all__ = [
     "MAGNET_REQUIRED_SOURCES_BY_SHELF",
     "SHARE_REQUIRED_SOURCES",
     "STRICT_TIER_ORDER",
+    "TIER_ALIST_OFFLINE",
     "TIER_LOCAL_MAGNET",
-    "TIER_QUARK_MAGNET",
     "TIER_QUARK_SHARE",
     "ReplenishmentTierError",
     "apply_tier_outcome",

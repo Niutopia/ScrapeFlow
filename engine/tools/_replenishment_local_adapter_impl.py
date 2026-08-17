@@ -45,10 +45,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from engine.scraper import AListClient, ApiError, ScraperError, join_remote, split_remote
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
-    ACQUISITION_QUARK_MAGNET_OFFLINE,
+    ACQUISITION_ALIST_OFFLINE,
     ACQUISITION_TORRENT,
+    PROVIDER_ALIST_OFFLINE,
     PROVIDER_LOCAL_MAGNET,
-    PROVIDER_QUARK_MAGNET,
     candidate_capability_error,
     provider_capability_snapshot,
 )
@@ -1768,23 +1768,23 @@ def _torrent_candidate_variants(
     manifest: Mapping[str, Any], *, include_local: bool = True,
     swarm: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return Quark-offline plus the optional local Torrent candidate."""
+    """Return AList-offline plus the optional local Torrent candidate."""
     local = _torrent_candidate(
         request, release_name, torrent_url, manifest, swarm=swarm,
     )
     if local is None:
         return []
     variants: list[dict[str, Any]] = []
-    quark = _quark_magnet_candidate(local)
-    if quark is not None:
-        variants.append(quark)
+    alist_offline = _alist_offline_candidate(local)
+    if alist_offline is not None:
+        variants.append(alist_offline)
     if include_local:
         variants.append(local)
     return variants
 
 
-def _quark_magnet_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Project one verified Torrent manifest into the Quark magnet lane."""
+def _alist_offline_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project one verified Torrent manifest into the AList offline lane."""
     acquisition = local.get("acquisition")
     if (
         str(local.get("provider") or "").strip().casefold() != PROVIDER_LOCAL_MAGNET
@@ -1850,12 +1850,17 @@ def _quark_magnet_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     candidate = dict(local)
     candidate.update({
-        "provider": PROVIDER_QUARK_MAGNET,
-        "locator": f"{PROVIDER_QUARK_MAGNET}:{infohash}",
+        "provider": PROVIDER_ALIST_OFFLINE,
+        "locator": f"{PROVIDER_ALIST_OFFLINE}:{infohash}",
         "files": [str(row["path"]) for row in expected_files],
         "acquisition": {
-            "kind": ACQUISITION_QUARK_MAGNET_OFFLINE,
+            "kind": ACQUISITION_ALIST_OFFLINE,
             "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
+            "torrent_url": (
+                acquisition.get("url")
+                if isinstance(acquisition.get("url"), str) and acquisition.get("url")
+                else None
+            ),
             "expected_files": expected_files,
         },
     })
@@ -1875,9 +1880,9 @@ def _catalog_torrent_candidate_variants(
         and candidate_capability_error(local) is None
     ):
         variants: list[dict[str, Any]] = []
-        quark = _quark_magnet_candidate(local)
-        if quark is not None:
-            variants.append(quark)
+        alist_offline = _alist_offline_candidate(local)
+        if alist_offline is not None:
+            variants.append(alist_offline)
         if include_local:
             variants.append(local)
         return variants

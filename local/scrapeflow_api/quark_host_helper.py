@@ -50,13 +50,14 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI dependency
     ) from exc
 
 
-HELPER_ACTIONS = ("health", "share-save", "magnet-submit", "magnet-status")
+# Fixed action contract (2026-08-17): the magnet submit/status actions were
+# removed with the quark_magnet tier; only share-save remains typed.
+HELPER_ACTIONS = ("health", "share-save")
 DEFAULT_STAGING_ROOT = CANONICAL_REPLENISHMENT_STAGING_ROOT
 DEFAULT_MOUNT_PATH = "/quark"
 MAX_BODY_BYTES = 256 * 1024
 MAX_EXPECTED_FILES = 128
 MAX_TEXT = 512
-MAX_MAGNET_BYTES = 32 * 1024
 MAX_RENDERER_RESPONSE_BYTES = 1024 * 1024
 # How long a resolved directory fid stays warm: the staging parent chain
 # is stable across attempts, so caching cuts most of the throttled walk.
@@ -117,9 +118,6 @@ class QuarkSessionPort(Protocol):
 
     async def share_save(self, payload: Mapping[str, object]) -> Mapping[str, object]: ...
 
-    async def magnet_submit(self, payload: Mapping[str, object]) -> Mapping[str, object]: ...
-
-    async def magnet_status(self, task_id: str) -> Mapping[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -357,40 +355,6 @@ def validate_share_save_payload(
         output["task_id"] = _safe_identifier(value.get("task_id"), label="task_id")
     return output
 
-
-def validate_magnet_submit_payload(
-    value: Mapping[str, object], *, staging_root: str,
-) -> dict[str, object]:
-    """Validate one reviewed magnet submission, keeping the URL non-generic."""
-
-    _reject_unknown_keys(value, allowed=frozenset({
-        "destination", "magnet_url", "infohash", "selected_gap_ids", "expected_files", "title",
-    }))
-    destination, _attempt_id = _validate_attempt_destination(
-        value.get("destination"), staging_root=staging_root,
-    )
-    magnet_url = value.get("magnet_url")
-    if not isinstance(magnet_url, str) or not magnet_url.startswith("magnet:?") or len(magnet_url.encode()) > MAX_MAGNET_BYTES:
-        raise QuarkHelperValidationError("magnet_url is invalid")
-    query = urllib.parse.parse_qs(urllib.parse.urlsplit(magnet_url).query, keep_blank_values=False)
-    xt = query.get("xt", [""])[0]
-    if not isinstance(xt, str) or not xt.casefold().startswith("urn:btih:"):
-        raise QuarkHelperValidationError("magnet_url lacks a BTIH")
-    infohash = _safe_text(value.get("infohash"), label="infohash", maximum=64).casefold()
-    if not _INFOHASH_RE.fullmatch(infohash) or xt.split(":", 2)[-1].casefold() != infohash:
-        raise QuarkHelperValidationError("infohash does not match magnet_url")
-    selected = _selected_gaps(value.get("selected_gap_ids"))
-    files = _validate_expected_files(value.get("expected_files"), selected_gap_ids=selected, share=False)
-    output: dict[str, object] = {
-        "destination": destination,
-        "magnet_url": magnet_url,
-        "infohash": infohash,
-        "selected_gap_ids": selected,
-        "expected_files": files,
-    }
-    if value.get("title") is not None:
-        output["title"] = _safe_text(value.get("title"), label="title")
-    return output
 
 
 def _safe_task_id(value: object) -> str:
@@ -1495,98 +1459,6 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             tokens.append(token)
         return tokens
 
-    async def magnet_submit(self, payload: Mapping[str, object]) -> Mapping[str, object]:
-        destination = str(payload["destination"])
-        async with self._session_scope(destination):
-            return await self._magnet_submit_in_session(payload)
-
-    async def _magnet_submit_in_session(
-        self, payload: Mapping[str, object]
-    ) -> Mapping[str, object]:
-        try:
-            destination = str(payload["destination"])
-            target_fid = await self._destination_fid(destination)
-            parsed = await self._call_fixed(
-                origin=QUARK_DRIVE_API,
-                path="/offline/download/parse",
-                method="POST",
-                body={"url": payload["magnet_url"]},
-                retryable=True,  # parse is idempotent: safe to retry truncation
-            )
-            parsed_data = parsed.get("data")
-            if not isinstance(parsed_data, Mapping):
-                raise QuarkHelperRemoteRejected("Quark rejected the magnet")
-            selected_files = payload.get("expected_files")
-            if not isinstance(selected_files, list):  # impossible after validation
-                raise QuarkHelperValidationError("magnet expected files are invalid")
-            indexes = []
-            for row in selected_files:
-                index = row.get("torrent_index") if isinstance(row, Mapping) else None
-                if type(index) is not int or index <= 0:
-                    raise QuarkHelperValidationError("magnet expected file lacks a precise torrent index")
-                indexes.append(index)
-            # Quark's offline endpoint uses the parse token and task-facing fields
-            # returned by the already-authenticated renderer.  The caller supplies
-            # only a reviewed magnet and exact indexes; no API URL/cookie/body is
-            # accepted from it.
-            submit_body: dict[str, object] = {
-                "url": payload["magnet_url"],
-                "to_pdir_fid": target_fid,
-                "selected_file_index": indexes,
-            }
-            parse_token = parsed_data.get("token")
-            if not isinstance(parse_token, str) or not parse_token:
-                raise QuarkHelperNotReady("Quark magnet parse response lacks a submit token")
-            submit_body["token"] = parse_token
-        except QuarkHelperLostResponse as exc:
-            raise QuarkHelperNotReady("Quark became unavailable before magnet submit") from exc
-        try:
-            result = await self._call_fixed(
-                origin=QUARK_DRIVE_API,
-                path="/offline/download/submit",
-                method="POST",
-                body=submit_body,
-            )
-        except QuarkHelperRemoteRejected:
-            raise
-        except QuarkHelperNotReady:
-            raise
-        except QuarkHelperLostResponse as exc:
-            raise QuarkHelperInDoubt("magnet submit outcome is unknown") from exc
-        except QuarkHelperError as exc:
-            raise QuarkHelperInDoubt("magnet submit outcome is unknown") from exc
-        data = result.get("data")
-        task_id = data.get("task_id") if isinstance(data, Mapping) else None
-        if not isinstance(task_id, str) or not task_id:
-            raise QuarkHelperInDoubt("magnet submit response did not contain a task id")
-        return {"status": "submitted", "task_id": _safe_task_id(task_id)}
-
-    async def magnet_status(self, task_id: str) -> Mapping[str, object]:
-        # A task id has no mount component.  Provider tasks are fixed below the
-        # staging root, which supplies the narrow storage-selection anchor.
-        async with self._session_scope(self.staging_root):
-            return await self._magnet_status_in_session(task_id)
-
-    async def _magnet_status_in_session(self, task_id: str) -> Mapping[str, object]:
-        response = await self._call_fixed(
-            origin=QUARK_DRIVE_API,
-            path="/offline/save_to/progress",
-            method="GET",
-            query={"task_id": task_id},
-        )
-        data = response.get("data")
-        raw_state = ""
-        if isinstance(data, Mapping):
-            raw_state = str(data.get("status") or data.get("state") or "").casefold()
-        if raw_state in {"2", "success", "finished", "done", "completed"}:
-            status = "finished"
-        elif raw_state in {"3", "4", "failed", "error", "rejected"}:
-            status = "failed"
-        else:
-            status = "running"
-        return {"status": status, "task_id": task_id}
-
-
 class QuarkHostHelperService:
     """Narrow service facade which owns all request validation."""
 
@@ -1618,27 +1490,6 @@ class QuarkHostHelperService:
         except Exception as exc:
             raise QuarkHelperInDoubt("share save outcome is unknown") from exc
         return self._mutation_result(result)
-
-    async def magnet_submit(self, payload: Mapping[str, object]) -> dict[str, object]:
-        normalized = validate_magnet_submit_payload(payload, staging_root=self.staging_root)
-        try:
-            result = await self.session.magnet_submit(normalized)
-        except QuarkHelperInDoubt:
-            raise
-        except (QuarkHelperNotReady, QuarkHelperRemoteRejected):
-            raise
-        except Exception as exc:
-            raise QuarkHelperInDoubt("magnet submit outcome is unknown") from exc
-        return self._mutation_result(result)
-
-    async def magnet_status(self, task_id: object) -> dict[str, object]:
-        result = await self.session.magnet_status(_safe_task_id(task_id))
-        if not isinstance(result, Mapping):
-            raise QuarkHelperNotReady("Quark task status is invalid")
-        status = str(result.get("status") or "").casefold()
-        if status not in {"running", "finished", "failed"}:
-            raise QuarkHelperNotReady("Quark task status is invalid")
-        return {"status": status, "task_id": _safe_task_id(result.get("task_id"))}
 
     @staticmethod
     def _mutation_result(value: Mapping[str, object]) -> dict[str, object]:
@@ -1694,14 +1545,6 @@ def create_quark_helper_app(service: QuarkHostHelperService, *, token: str) -> w
             body = await _read_json_body(request)
             if action == "share-save":
                 return web.json_response(await service.share_save(body), headers={"Cache-Control": "no-store"})
-            if action == "magnet-submit":
-                return web.json_response(await service.magnet_submit(body), headers={"Cache-Control": "no-store"})
-            if action == "magnet-status":
-                _reject_unknown_keys(body, allowed=frozenset({"task_id"}))
-                return web.json_response(
-                    await service.magnet_status(body.get("task_id")),
-                    headers={"Cache-Control": "no-store"},
-                )
         except QuarkHelperValidationError:
             return _error(400, "invalid_request")
         except QuarkHelperInDoubt:
@@ -1722,19 +1565,11 @@ def create_quark_helper_app(service: QuarkHostHelperService, *, token: str) -> w
     async def share_save_handler(request: web.Request) -> web.Response:
         return await guarded(request, "share-save")
 
-    async def magnet_submit_handler(request: web.Request) -> web.Response:
-        return await guarded(request, "magnet-submit")
-
-    async def magnet_status_handler(request: web.Request) -> web.Response:
-        return await guarded(request, "magnet-status")
-
     async def not_found_handler(_request: web.Request) -> web.Response:
         return _error(404, "not_found")
 
     app.router.add_get("/health", health_handler, allow_head=False)
     app.router.add_post("/v1/share-save", share_save_handler)
-    app.router.add_post("/v1/magnet-submit", magnet_submit_handler)
-    app.router.add_post("/v1/magnet-status", magnet_status_handler)
     app.router.add_route("*", "/{tail:.*}", not_found_handler)
     return app
 
@@ -1805,7 +1640,6 @@ __all__ = [
     "create_quark_helper_app",
     "load_helper_token",
     "serve_quark_helper",
-    "validate_magnet_submit_payload",
     "validate_share_save_payload",
     "validate_staging_root",
 ]

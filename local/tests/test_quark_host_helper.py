@@ -28,7 +28,6 @@ from local.scrapeflow_api.quark_host_helper import (
     QuarkHostHelperService,
     _cdp_websocket_url,
     create_quark_helper_app,
-    validate_magnet_submit_payload,
     validate_share_save_payload,
     validate_staging_root,
 )
@@ -36,7 +35,6 @@ from local.scrapeflow_api.quark_host_helper import (
 
 TOKEN = "t" * 32
 DESTINATION = "/quark/影视/ScrapeFlow/补源/root-1/attempt-1"
-INFOHASH = "a" * 40
 ALIST_CONFIG = {
     "alist_url": "http://127.0.0.1:5244",
     "alist_username": "admin",
@@ -64,30 +62,10 @@ def share_payload(**changes: object) -> dict[str, object]:
     return payload
 
 
-def magnet_payload(**changes: object) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "destination": DESTINATION,
-        "magnet_url": f"magnet:?xt=urn:btih:{INFOHASH}",
-        "infohash": INFOHASH,
-        "selected_gap_ids": ["gap-1"],
-        "expected_files": [{
-            "path": "Season 1/episode-01.mkv",
-            "size": 1_024,
-            "gap_ids": ["gap-1"],
-            "torrent_index": 1,
-        }],
-        "title": "fixture",
-    }
-    payload.update(changes)
-    return payload
-
-
 class FakeSession:
     def __init__(self) -> None:
         self.ready_error: Exception | None = None
         self.share_result: object = {"status": "submitted", "task_id": "share-task-1"}
-        self.magnet_result: object = {"status": "submitted", "task_id": "magnet-task-1"}
-        self.magnet_status_result: object = {"status": "running", "task_id": "magnet-task-1"}
         self.calls: list[tuple[str, object]] = []
 
     async def assert_authenticated(self) -> None:
@@ -100,18 +78,6 @@ class FakeSession:
         if isinstance(self.share_result, Exception):
             raise self.share_result
         return self.share_result
-
-    async def magnet_submit(self, payload: object) -> object:
-        self.calls.append(("magnet-submit", payload))
-        if isinstance(self.magnet_result, Exception):
-            raise self.magnet_result
-        return self.magnet_result
-
-    async def magnet_status(self, task_id: str) -> object:
-        self.calls.append(("magnet-status", task_id))
-        if isinstance(self.magnet_status_result, Exception):
-            raise self.magnet_status_result
-        return self.magnet_status_result
 
 
 class HelperValidationTests(unittest.TestCase):
@@ -137,19 +103,6 @@ class HelperValidationTests(unittest.TestCase):
             "file_id": "file-1",
             "name": "episode-01.mkv",
         }])
-
-    def test_magnet_contract_rejects_generic_urls_and_unselected_indexes(self) -> None:
-        for changes in (
-            {"url": "https://example.invalid"},
-            {"magnet_url": "https://example.invalid"},
-            {"infohash": "b" * 40},
-            {"expected_files": [{
-                "path": "episode-01.mkv", "size": 1_024,
-                "gap_ids": ["gap-1"], "torrent_index": 0,
-            }]},
-        ):
-            with self.subTest(changes=changes), self.assertRaises(QuarkHelperValidationError):
-                validate_magnet_submit_payload(magnet_payload(**changes), staging_root=DEFAULT_STAGING_ROOT)
 
     def test_staging_root_refuses_a_formal_library_subtree(self) -> None:
         for root in (
@@ -309,7 +262,7 @@ class HelperValidationTests(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
-        self.assertNotIn("/v1/", source.replace("/v1/share-save", "").replace("/v1/magnet-submit", "").replace("/v1/magnet-status", ""))
+        self.assertNotIn("/v1/", source.replace("/v1/share-save", ""))
 
 
 class AListDelegationTests(unittest.IsolatedAsyncioTestCase):
@@ -541,22 +494,6 @@ class HelperHttpTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertNotIn("cookie", payload)
         self.assertNotIn("endpoint", payload)
-
-    async def test_submit_unknown_result_returns_contractual_in_doubt(self) -> None:
-        self.session.magnet_result = QuarkHelperInDoubt("lost response")
-        status, body = await self.request("POST", "/v1/magnet-submit", body=magnet_payload())
-        self.assertEqual((status, body), (409, {
-            "status": "error", "error": "submit_in_doubt", "in_doubt": True,
-        }))
-
-    async def test_magnet_status_accepts_only_task_id(self) -> None:
-        status, body = await self.request("POST", "/v1/magnet-status", body={"task_id": "magnet-task-1"})
-        self.assertEqual((status, body), (200, {"status": "running", "task_id": "magnet-task-1"}))
-        status, body = await self.request("POST", "/v1/magnet-status", body={
-            "task_id": "magnet-task-1", "destination": DESTINATION,
-        })
-        self.assertEqual((status, body["error"]), (400, "invalid_request"))
-
 
 class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
     async def _select_from_discovery_rows(self, rows_factory, observed_headers=None):
@@ -902,23 +839,22 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
                     origin=QUARK_DRIVE_API, path="/file/sort", method="GET",
                 )
 
-    async def test_pre_submit_loss_is_not_ready_for_both_lanes(self) -> None:
+    async def test_pre_submit_loss_is_not_ready_for_share_save(self) -> None:
         session = PassiveQuarkCdp(
             cdp_url="http://127.0.0.1:9222/json/list",
             staging_root=DEFAULT_STAGING_ROOT,
             mount_path="/quark",
             root_fid="0",
         )
-        for method, payload in ((session.share_save, share_payload()), (session.magnet_submit, magnet_payload())):
-            with self.subTest(method=method.__name__), mock.patch.object(
-                session,
-                "_destination_fid",
-                new=mock.AsyncMock(side_effect=QuarkHelperLostResponse("pre-submit")),
-            ):
-                with self.assertRaises(QuarkHelperNotReady):
-                    await method(payload)
+        with mock.patch.object(
+            session,
+            "_destination_fid",
+            new=mock.AsyncMock(side_effect=QuarkHelperLostResponse("pre-submit")),
+        ):
+            with self.assertRaises(QuarkHelperNotReady):
+                await session.share_save(share_payload())
 
-    async def test_post_submit_loss_is_in_doubt_for_both_lanes(self) -> None:
+    async def test_post_submit_loss_is_in_doubt_for_share_save(self) -> None:
         session = PassiveQuarkCdp(
             cdp_url="http://127.0.0.1:9222/json/list",
             staging_root=DEFAULT_STAGING_ROOT,
@@ -937,17 +873,6 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
                 ):
             with self.assertRaises(QuarkHelperInDoubt):
                 await session.share_save(share_payload())
-        with mock.patch.object(session, "_destination_fid", new=mock.AsyncMock(return_value="stage-fid")), \
-                mock.patch.object(
-                    session,
-                    "_call_fixed",
-                    new=mock.AsyncMock(side_effect=[
-                        {"data": {"token": "parse-token"}},
-                        QuarkHelperLostResponse("post-magnet-submit"),
-                    ]),
-                ):
-            with self.assertRaises(QuarkHelperInDoubt):
-                await session.magnet_submit(magnet_payload())
 
     async def test_nested_share_source_reentry_reads_flattened_staging_name(self) -> None:
         session = PassiveQuarkCdp(

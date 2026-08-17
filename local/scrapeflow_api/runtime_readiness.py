@@ -16,7 +16,7 @@ from engine.scrapeflow.provider_capabilities import (
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "quark_magnet", "magnet"})
+EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "alist_offline", "magnet"})
 
 
 class RuntimeReadinessError(RuntimeError):

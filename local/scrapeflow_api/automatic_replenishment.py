@@ -59,8 +59,8 @@ from .replenishment_tiers import (
     FAILURE_IN_DOUBT,
     ReplenishmentTierError,
     STRICT_TIER_ORDER,
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
     apply_tier_outcome,
     initial_tier_state,
@@ -464,7 +464,7 @@ class QuarkFastSaveAutomaticMaterializer:
 
     def _helper(self) -> object:
         if self.helper is None:
-            from engine.scrapeflow.quark_magnet_offline_bridge import (
+            from engine.scrapeflow.quark_helper_client import (
                 HttpQuarkHelperClient,
             )
 
@@ -487,17 +487,15 @@ class QuarkFastSaveAutomaticMaterializer:
             raise AutomaticReplenishmentError("夸克 Helper 未就绪")
         # Readiness already validates the exact action set before a pilot.  A
         # materializer also fails closed when a host helper advertises a
-        # partial contract, so a magnet-only endpoint cannot silently become a
-        # share-save implementation.
+        # partial contract, so a share-only endpoint cannot silently become a
+        # wider provider surface.
         actions = payload.get("actions")
         if actions is not None:
             if (
                 not isinstance(actions, list)
                 or any(not isinstance(action, str) for action in actions)
                 or len(actions) != len(set(actions))
-                or set(actions) != {
-                    "health", "share-save", "magnet-submit", "magnet-status",
-                }
+                or set(actions) != {"health", "share-save"}
             ):
                 raise AutomaticReplenishmentError("夸克 Helper actions 不符合固定合同")
         else:
@@ -964,22 +962,56 @@ def _safe_relative_delivery_path(value: object) -> str:
     return value
 
 
-class QuarkMagnetAutomaticMaterializer:
-    """Use Quark cloud offline download to place files in task staging."""
+class AlistOfflineCandidateError(AutomaticReplenishmentError):
+    """The reviewed offline candidate could not be delivered (excluded)."""
 
-    _STATE_FILE = "quark_magnet_attempt.json"
+    failure_scope = FAILURE_CANDIDATE
+    exclude_candidate = True
 
-    def __init__(self, bridge: object | None = None) -> None:
-        self.bridge = bridge
 
-    def _bridge(self) -> object:
-        if self.bridge is None:
-            from engine.scrapeflow.quark_magnet_offline_bridge import (
-                HttpQuarkHelperClient,
-                QuarkMagnetOfflineBridge,
-            )
-            self.bridge = QuarkMagnetOfflineBridge(HttpQuarkHelperClient.from_env())
-        return self.bridge
+class AlistOfflineInDoubtError(AutomaticReplenishmentError):
+    """An offline task may already exist; reconcile instead of re-submitting."""
+
+    failure_scope = FAILURE_IN_DOUBT
+
+    def __init__(self, message: str, *, task_id: str | None = None) -> None:
+        super().__init__(message)
+        self.external_task_id = task_id
+
+
+class AlistOfflineAutomaticMaterializer:
+    """Use AList offline download (aria2 tool + local relay) into task staging.
+
+    The lane rides AList's generic offline-download tool framework: the
+    dedicated ``offline-aria2`` compose service downloads direct (no ambient
+    proxy), AList transfers the finished tree into a task-owned sibling of the
+    staging root, and this materializer moves exactly the expected files into
+    the staging root before the writer closure.  Submissions are durable (the
+    attempt state carries the AList task id); a lost submit response is
+    recovered by a task-name scan, never by re-submitting.
+    """
+
+    _STATE_FILE = "alist_offline_attempt.json"
+    _OFFLINE_SUBDIR_SUFFIX = "__offline__"
+
+    # AList offline-download task states (tache enum, AList v3.62): 0 pending,
+    # 1 running, 2 succeeded, 3 canceling, 4 canceled, 5 errored, 6 failing,
+    # 7 failed.  The undone list holds non-terminal rows; done holds the rest.
+    _TASK_STATE_SUCCEEDED = 2
+    _TASK_TERMINAL_FAILURE_STATES = frozenset({4, 5, 7})
+
+    _WALK_MAX_ENTRIES = 4000
+
+    def __init__(
+        self,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        poll_interval: float = 10.0,
+        stall_limit: float = 900.0,
+    ) -> None:
+        self.sleep = sleep
+        self.poll_interval = max(0.1, float(poll_interval))
+        self.stall_limit = max(1.0, float(stall_limit))
 
     @classmethod
     def _state_path(cls, workspace: Path) -> Path:
@@ -997,19 +1029,21 @@ class QuarkMagnetAutomaticMaterializer:
         return None
 
     @classmethod
-    def _read_attempt_state(cls, workspace: Path, staging_root: str) -> dict[str, object]:
+    def _read_attempt_state(
+        cls, workspace: Path, staging_root: str,
+    ) -> dict[str, object]:
         path = cls._state_path(workspace)
         if not path.exists():
             return {}
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AutomaticReplenishmentError("夸克磁力 attempt 状态不可读") from exc
+            raise AutomaticReplenishmentError("AList 离线 attempt 状态不可读") from exc
         if not isinstance(raw, Mapping):
-            raise AutomaticReplenishmentError("夸克磁力 attempt 状态无效")
+            raise AutomaticReplenishmentError("AList 离线 attempt 状态无效")
         state = dict(raw)
         if state.get("staging_root") != staging_root:
-            raise AutomaticReplenishmentError("夸克磁力 attempt 状态不属于当前 staging")
+            raise AutomaticReplenishmentError("AList 离线 attempt 状态不属于当前 staging")
         return state
 
     @classmethod
@@ -1019,30 +1053,478 @@ class QuarkMagnetAutomaticMaterializer:
         *,
         staging_root: str,
         selection: Mapping[str, object],
-        task_id: str,
+        task_id: str | None,
     ) -> None:
-        safe_task = cls._safe_task_id(task_id)
-        if safe_task is None:
-            raise AutomaticReplenishmentError("夸克磁力 task_id 无效")
+        safe_task = cls._safe_task_id(task_id) if task_id is not None else None
         selected = selection.get("selected_gap_ids")
         gap_ids = [
             str(gap_id) for gap_id in selected
             if isinstance(gap_id, str) and gap_id
         ] if isinstance(selected, list) else []
+        acquisition = selection.get("acquisition")
+        safe_acquisition = (
+            dict(acquisition)
+            if isinstance(acquisition, Mapping)
+            else {}
+        )
         workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_write_json(
             cls._state_path(workspace),
             {
-                "provider": TIER_QUARK_MAGNET,
+                "provider": TIER_ALIST_OFFLINE,
                 "attempt_id": posixpath.basename(staging_root.rstrip("/")),
                 "staging_root": staging_root,
                 "task_id": safe_task,
                 "locator": str(selection.get("locator") or ""),
                 "selected_gap_ids": gap_ids,
+                "acquisition": safe_acquisition,
                 "updated_at": _now(),
             },
             allow_nan=False,
         )
+
+    @staticmethod
+    def _plan(
+        selection: Mapping[str, object], staging_root: str,
+    ) -> dict[str, object]:
+        """Validate one alist_offline selection into a submission/finalize plan."""
+        acquisition = selection.get("acquisition")
+        if (
+            str(selection.get("provider") or "").strip().casefold()
+            != TIER_ALIST_OFFLINE
+            or not isinstance(acquisition, Mapping)
+            or str(acquisition.get("kind") or "").strip().casefold()
+            != "alist_offline"
+        ):
+            raise AutomaticReplenishmentError(
+                "AList 离线 materializer 只接受 alist_offline 候选"
+            )
+        magnet = acquisition.get("magnet_url")
+        torrent = acquisition.get("torrent_url")
+        urls: list[str] = []
+        if isinstance(torrent, str) and torrent.startswith(("https://", "http://")):
+            urls.append(torrent)
+        if isinstance(magnet, str) and magnet.startswith("magnet:?"):
+            urls.append(magnet)
+        if not urls:
+            raise AlistOfflineCandidateError("AList 离线候选缺少可用下载地址")
+        infohash = ""
+        locator = str(selection.get("locator") or "")
+        prefix, separator, payload = locator.partition(":")
+        if (
+            separator
+            and prefix.casefold() == TIER_ALIST_OFFLINE
+            and re.fullmatch(r"[0-9a-f]{40}|[a-z2-7]{32}", payload.casefold())
+        ):
+            infohash = payload.casefold()
+        if not infohash and isinstance(magnet, str):
+            match = _BTIH_TOKEN.search(magnet)
+            if match is not None:
+                infohash = match.group(1).casefold()
+        selected = selection.get("selected_gap_ids")
+        selected_gap_ids = [
+            str(gap_id) for gap_id in selected
+            if isinstance(gap_id, str) and gap_id
+        ] if isinstance(selected, list) else []
+        if not selected_gap_ids:
+            raise AlistOfflineCandidateError("AList 离线候选缺少 selected_gap_ids")
+        rows = acquisition.get("expected_files")
+        if not isinstance(rows, list) or not rows:
+            raise AlistOfflineCandidateError("AList 离线候选缺少 expected_files")
+        selected_set = set(selected_gap_ids)
+        expected: list[dict[str, object]] = []
+        covered: set[str] = set()
+        seen_basenames: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise AlistOfflineCandidateError("AList 离线 expected_files 项无效")
+            try:
+                relative = _safe_relative_delivery_path(row.get("path"))
+            except AutomaticReplenishmentError as exc:
+                raise AlistOfflineCandidateError(
+                    "AList 离线 expected_files 路径无效"
+                ) from exc
+            size = row.get("size")
+            gaps = row.get("gap_ids")
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size <= 0
+                or not isinstance(gaps, list)
+                or not gaps
+            ):
+                raise AlistOfflineCandidateError("AList 离线 expected_files 清单无效")
+            kept = [str(gap_id) for gap_id in gaps
+                    if isinstance(gap_id, str) and gap_id in selected_set]
+            if not kept:
+                continue
+            covered.update(kept)
+            basename = posixpath.basename(relative)
+            previous = seen_basenames.get(basename)
+            if previous is not None and previous != size:
+                raise AlistOfflineCandidateError(
+                    "AList 离线 expected_files 同名文件大小冲突"
+                )
+            seen_basenames[basename] = size
+            expected.append({
+                "path": relative,
+                "size": size,
+                "gap_ids": sorted(set(kept)),
+            })
+        if covered != selected_set:
+            raise AlistOfflineCandidateError(
+                "AList 离线 expected_files 未覆盖所选缺口"
+            )
+        return {
+            "urls": urls,
+            "infohash": infohash,
+            "selected_gap_ids": selected_gap_ids,
+            "expected_files": expected,
+        }
+
+    @classmethod
+    def _offline_sibling(cls, staging_root: str) -> str:
+        return (
+            f"{posixpath.dirname(staging_root.rstrip('/'))}/"
+            f"{posixpath.basename(staging_root.rstrip('/'))}"
+            f"{cls._OFFLINE_SUBDIR_SUFFIX}"
+        )
+
+    @classmethod
+    def _walk_remote(
+        cls,
+        alist: object,
+        root: str,
+        *,
+        max_entries: int = _WALK_MAX_ENTRIES,
+    ) -> dict[str, int]:
+        """Fresh-list a remote tree; return ``{relative_path: size}`` files."""
+        listing = getattr(alist, "list", None)
+        if not callable(listing):
+            raise AutomaticReplenishmentError("AList 客户端缺少 list，无法验证离线转存")
+        output: dict[str, int] = {}
+        pending = [root]
+        while pending and len(output) < max_entries:
+            current = pending.pop()
+            try:
+                rows = listing(current, refresh=True)
+            except TypeError:
+                rows = listing(current)
+            if not isinstance(rows, list):
+                raise AutomaticReplenishmentError("AList 离线转存目录列表无效")
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                name = row.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                child = f"{current}/{name}"
+                if row.get("is_dir") is True:
+                    pending.append(child)
+                    continue
+                size = row.get("size")
+                if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+                    output[posixpath.relpath(child, root)] = size
+        if pending and len(output) >= max_entries:
+            raise AutomaticReplenishmentError("AList 离线转存条目超限")
+        return output
+
+    @classmethod
+    def _task_rows(cls, alist: object, scope: str) -> list[Mapping[str, object]]:
+        getter = getattr(alist, f"offline_download_{scope}", None)
+        if not callable(getter):
+            raise AutomaticReplenishmentError(
+                f"AList 客户端缺少 offline_download_{scope}"
+            )
+        rows = getter()
+        if not isinstance(rows, list):
+            raise AutomaticReplenishmentError("AList 离线任务列表无效")
+        return [row for row in rows if isinstance(row, Mapping)]
+
+    @classmethod
+    def _row_by_id(
+        cls, alist: object, task_id: str,
+    ) -> Mapping[str, object] | None:
+        for scope in ("undone", "done"):
+            for row in cls._task_rows(alist, scope):
+                if str(row.get("id") or "") == task_id:
+                    return row
+        return None
+
+    @classmethod
+    def _scan_task_id(
+        cls,
+        alist: object,
+        *,
+        staging_root: str,
+        infohash: str,
+    ) -> str | None:
+        """Recover an accepted task id by its destination path or BTIH name."""
+        needle = cls._offline_sibling(staging_root)
+        lowered_infohash = infohash.casefold()
+        for scope in ("undone", "done"):
+            for row in cls._task_rows(alist, scope):
+                name = str(row.get("name") or "")
+                lowered = name.casefold()
+                if needle in name or (
+                    lowered_infohash and lowered_infohash in lowered
+                ):
+                    task_id = cls._safe_task_id(row.get("id"))
+                    if task_id is not None:
+                        return task_id
+        return None
+
+    def _submit(
+        self,
+        alist: object,
+        staging_root: str,
+        plan: Mapping[str, object],
+        workspace: Path,
+        selection: Mapping[str, object],
+    ) -> str:
+        add = getattr(alist, "offline_download_add", None)
+        if not callable(add):
+            raise AutomaticReplenishmentError("AList 客户端缺少 offline_download_add")
+        sibling = self._offline_sibling(staging_root)
+        mkdir = getattr(alist, "mkdir", None)
+        if not callable(mkdir):
+            raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建离线转存目录")
+        mkdir(sibling)
+        try:
+            tasks = add(sibling, list(plan["urls"]), tool="aria2")
+        except Exception as exc:
+            # The add request may have been accepted with a lost response.
+            # Never re-submit blindly: scan the task lists by the destination
+            # path first.  Persist the reviewed plan either way so a later
+            # reconcile round can recover by name scan or finalize bytes that
+            # still land.  No trace means AList rejected the submission (tool
+            # or destination problem) — an infrastructure failure.
+            recovered = self._scan_task_id(
+                alist, staging_root=staging_root, infohash=str(plan["infohash"] or ""),
+            )
+            if recovered is not None:
+                self._write_attempt_state(
+                    workspace, staging_root=staging_root,
+                    selection=selection, task_id=recovered,
+                )
+                return recovered
+            self._write_attempt_state(
+                workspace, staging_root=staging_root,
+                selection=selection, task_id=None,
+            )
+            raise AutomaticReplenishmentError(
+                f"AList 离线任务提交失败: {exc}"
+            ) from exc
+        rows = [row for row in tasks if isinstance(row, Mapping)]
+        task_id = self._safe_task_id(rows[0].get("id") if rows else None)
+        if task_id is None:
+            # Accepted without a usable id: reconcile by scan, never re-submit.
+            recovered = self._scan_task_id(
+                alist, staging_root=staging_root, infohash=str(plan["infohash"] or ""),
+            )
+            if recovered is not None:
+                self._write_attempt_state(
+                    workspace, staging_root=staging_root,
+                    selection=selection, task_id=recovered,
+                )
+                return recovered
+            self._write_attempt_state(
+                workspace, staging_root=staging_root,
+                selection=selection, task_id=None,
+            )
+            raise AlistOfflineInDoubtError(
+                "AList 离线提交未返回任务 id，先对账再重试"
+            )
+        self._write_attempt_state(
+            workspace, staging_root=staging_root,
+            selection=selection, task_id=task_id,
+        )
+        return task_id
+
+    def _poll_until_terminal(self, alist: object, task_id: str) -> str:
+        """Poll one AList offline task; return "succeeded" or "missing".
+
+        Candidate failures raise ``AlistOfflineCandidateError``; AList API
+        failures propagate unchanged (infrastructure).  A task that makes no
+        byte progress for ``stall_limit`` seconds is a dead candidate.
+        """
+        last_progress: object = None
+        last_advanced = time.monotonic()
+        while True:
+            row = self._row_by_id(alist, task_id)
+            if row is None:
+                return "missing"
+            state = row.get("state")
+            error = str(row.get("error") or "")
+            if state == self._TASK_STATE_SUCCEEDED and not error:
+                return "succeeded"
+            if state in self._TASK_TERMINAL_FAILURE_STATES or (
+                error and state not in (None, 0, 1)
+            ):
+                raise AlistOfflineCandidateError(
+                    f"AList 离线任务失败: {error[:200] or state}"
+                )
+            progress = row.get("progress")
+            if (
+                isinstance(progress, (int, float))
+                and not isinstance(progress, bool)
+                and progress != last_progress
+            ):
+                last_progress = progress
+                last_advanced = time.monotonic()
+            elif time.monotonic() - last_advanced > self.stall_limit:
+                raise AlistOfflineCandidateError("AList 离线下载长期无进度")
+            self.sleep(self.poll_interval)
+
+    def _finalize_delivery(
+        self,
+        alist: object,
+        staging_root: str,
+        plan: Mapping[str, object],
+        selection: Mapping[str, object],
+        task_id: str | None,
+    ) -> Mapping[str, object]:
+        expected_files = plan["expected_files"]
+        expected_files = [
+            row for row in expected_files if isinstance(row, Mapping)
+        ]
+        sibling = self._offline_sibling(staging_root)
+
+        # First pass: move the expected files out of the offline sibling (if
+        # it still holds any) into the staging root, flattened by basename.
+        landed = self._walk_remote(alist, sibling)
+        if landed:
+            matched: list[tuple[str, Mapping[str, object]]] = []
+            missing: list[str] = []
+            for expected in expected_files:
+                relative = str(expected.get("path") or "")
+                size = expected.get("size")
+                pick = None
+                if relative in landed and landed[relative] == size:
+                    pick = relative
+                else:
+                    basename = posixpath.basename(relative)
+                    for candidate, candidate_size in landed.items():
+                        if (
+                            posixpath.basename(candidate) == basename
+                            and candidate_size == size
+                        ):
+                            pick = candidate
+                            break
+                if pick is None:
+                    missing.append(relative)
+                    continue
+                matched.append((pick, expected))
+            if missing:
+                raise AlistOfflineCandidateError(
+                    "AList 转存缺少预期文件: " + ", ".join(missing[:6])
+                )
+            mkdir = getattr(alist, "mkdir", None)
+            move = getattr(alist, "move", None)
+            remove = getattr(alist, "remove", None)
+            if not callable(move) or not callable(remove):
+                raise AutomaticReplenishmentError(
+                    "AList 客户端缺少 move/remove，无法收拢离线转存"
+                )
+            for relative, expected in matched:
+                name = posixpath.basename(relative)
+                size = expected.get("size")
+                destination = f"{staging_root}/{name}"
+                destination_size = _remote_file_size(alist, destination)
+                if destination_size == size:
+                    continue
+                if destination_size is not None:
+                    raise AlistOfflineCandidateError(
+                        f"AList 离线转存目标冲突: {name}"
+                    )
+                source_dir = posixpath.dirname(f"{sibling}/{relative}")
+                move(source_dir, staging_root, [name])
+                if _remote_file_size(alist, destination) != size:
+                    raise AutomaticReplenishmentError(
+                        "AList 离线转存移动后回读不一致"
+                    )
+            try:
+                remove(posixpath.dirname(sibling), [posixpath.basename(sibling)])
+            except Exception as exc:
+                raise AutomaticReplenishmentError(
+                    f"AList 离线转存目录清理失败: {exc}"
+                ) from exc
+
+        # Second pass: the staging root must now contain exactly the expected
+        # files (sizes included).  Anything else must never reach the planner.
+        expected_by_name = {
+            posixpath.basename(str(row.get("path") or "")): row
+            for row in expected_files
+        }
+        listing = getattr(alist, "list", None)
+        if not callable(listing):
+            raise AutomaticReplenishmentError("AList 客户端缺少 list，无法验证离线转存")
+        try:
+            rows = listing(staging_root, refresh=True)
+        except TypeError:
+            rows = listing(staging_root)
+        if not isinstance(rows, list):
+            raise AutomaticReplenishmentError("AList staging 目录列表无效")
+        staged: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            name = row.get("name")
+            if not isinstance(name, str) or not name or row.get("is_dir") is True:
+                continue
+            size = row.get("size")
+            if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+                staged[name] = size
+        unexpected = sorted(
+            name for name, size in staged.items()
+            if name not in expected_by_name
+            or expected_by_name[name].get("size") != size
+        )
+        if unexpected:
+            raise AutomaticReplenishmentError(
+                "AList 离线 staging 残留未预期文件: " + ", ".join(unexpected[:6])
+            )
+        files: list[dict[str, object]] = []
+        for name, expected in expected_by_name.items():
+            if staged.get(name) != expected.get("size"):
+                raise AutomaticReplenishmentError(
+                    f"AList 离线转存文件回读缺失: {name}"
+                )
+            gap_ids = expected.get("gap_ids")
+            if not isinstance(gap_ids, list) or not gap_ids:
+                raise AutomaticReplenishmentError("AList 离线文件 gap_ids 无效")
+            files.append({
+                "path": f"{staging_root}/{name}",
+                "size": int(expected.get("size")),
+                "kind": _delivery_kind_from_name(name),
+                "gap_ids": [
+                    str(gap_id) for gap_id in gap_ids
+                    if isinstance(gap_id, str) and gap_id
+                ],
+            })
+        if not files:
+            raise AlistOfflineCandidateError("AList 离线转存没有可用文件")
+        files = _isolate_cloud_delivery_videos(
+            files, staging_root=staging_root, alist=alist,
+        )
+        # The task record is no longer needed once its bytes are verified in
+        # staging; best-effort removal keeps the AList task lists clean.
+        if task_id is not None:
+            delete = getattr(alist, "offline_download_delete", None)
+            if callable(delete):
+                try:
+                    delete(task_id)
+                except Exception:
+                    pass
+        delivery: dict[str, object] = {
+            "lane": TIER_ALIST_OFFLINE,
+            "attempt_id": posixpath.basename(staging_root.rstrip("/")),
+            "staging_root": staging_root,
+            "files": files,
+        }
+        if task_id is not None:
+            delivery["external_task_id"] = task_id
+        return delivery
 
     def acquire(
         self,
@@ -1055,120 +1537,59 @@ class QuarkMagnetAutomaticMaterializer:
     ) -> Mapping[str, object]:
         del request
         if len(selections) != 1:
-            raise AutomaticReplenishmentError("夸克磁力离线一次只接受一个候选")
+            raise AutomaticReplenishmentError("AList 离线一次只接受一个候选")
         selection = selections[0]
-        acquisition = selection.get("acquisition")
-        if (
-            str(selection.get("provider") or "").strip().casefold()
-            != TIER_QUARK_MAGNET
-            or not isinstance(acquisition, Mapping)
-            or str(acquisition.get("kind") or "").strip().casefold()
-            != "quark_magnet_offline"
-        ):
-            raise AutomaticReplenishmentError(
-                "夸克磁力 materializer 只接受 quark_magnet/quark_magnet_offline 候选"
-            )
+        plan = self._plan(selection, staging_root)
         mkdir = getattr(alist, "mkdir", None)
         if not callable(mkdir):
             raise AutomaticReplenishmentError("AList 客户端缺少 mkdir，无法创建夸克 staging")
         mkdir(posixpath.dirname(staging_root))
         mkdir(staging_root)
-        # Settle window: Quark rate-limits the same account when the AList
-        # mkdir (direct egress) and the Helper's follow-up fixed requests
-        # burst in the same seconds; a short pause decorrelates them.
-        time.sleep(4.0)
-        execute = getattr(self._bridge(), "execute", None)
-        if not callable(execute):
-            raise AutomaticReplenishmentError("夸克磁力 materializer 缺少 execute")
         state = self._read_attempt_state(workspace, staging_root)
-        existing_task_id = self._safe_task_id(state.get("task_id"))
-
-        def save_task_id(task_id: str) -> None:
-            self._write_attempt_state(
-                workspace,
-                staging_root=staging_root,
-                selection=selection,
-                task_id=task_id,
+        task_id = self._safe_task_id(state.get("task_id"))
+        if task_id is None:
+            task_id = self._submit(
+                alist, staging_root, plan, workspace, selection,
             )
-
-        result = execute(
-            selection,
-            staging_root,
-            task_id=existing_task_id,
-            on_task_id=None if existing_task_id is not None else save_task_id,
+        self._poll_until_terminal(alist, task_id)
+        return self._finalize_delivery(
+            alist, staging_root, plan, selection, task_id,
         )
-        if not isinstance(result, Mapping):
-            raise AutomaticReplenishmentError("夸克磁力离线返回无效")
-        result_task_id = self._safe_task_id(result.get("task_id"))
-        if result_task_id is not None:
-            save_task_id(result_task_id)
-        rows = result.get("expected_files")
-        if not isinstance(rows, list) or not rows:
-            raise AutomaticReplenishmentError("夸克磁力离线缺少 expected_files")
-        files: list[dict[str, object]] = []
-        for raw in rows:
-            if not isinstance(raw, Mapping):
-                raise AutomaticReplenishmentError("夸克磁力 expected_files 项无效")
-            relative = _safe_relative_delivery_path(raw.get("path"))
-            size = raw.get("size")
-            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-                raise AutomaticReplenishmentError("夸克磁力文件大小无效")
-            gap_ids = raw.get("gap_ids")
-            if not isinstance(gap_ids, list) or not gap_ids:
-                raise AutomaticReplenishmentError("夸克磁力文件缺少 gap_ids")
-            files.append({
-                "path": f"{staging_root}/{relative}",
-                "size": size,
-                "kind": _delivery_kind_from_name(relative),
-                "gap_ids": [
-                    str(gap_id) for gap_id in gap_ids
-                    if isinstance(gap_id, str) and gap_id
-                ],
-            })
-        if any(not row["gap_ids"] for row in files):
-            raise AutomaticReplenishmentError("夸克磁力文件 gap_ids 无效")
-        files = _isolate_cloud_delivery_videos(
-            files, staging_root=staging_root, alist=alist,
-        )
-        delivery: dict[str, object] = {
-            "lane": TIER_QUARK_MAGNET,
-            "attempt_id": posixpath.basename(staging_root.rstrip("/")),
-            "staging_root": staging_root,
-            "files": files,
-        }
-        task_id = result.get("task_id")
-        if isinstance(task_id, str) and task_id:
-            delivery["external_task_id"] = task_id
-        return delivery
 
     def reconcile_existing_task(
         self, request, selections, *, staging_root, workspace, alist, external_task_id,
     ) -> Mapping[str, object]:
-        """Re-enter ``execute(task_id=...)``; never submit a second magnet."""
-        task_id = self._safe_task_id(external_task_id)
-        if task_id is None:
-            raise AutomaticReplenishmentError("夸克磁力 external_task_id 无效")
+        """Re-enter an existing AList offline task; never submit a new one."""
+        del request
         if len(selections) != 1 or not isinstance(selections[0], Mapping):
-            raise AutomaticReplenishmentError("夸克磁力已有任务恢复候选无效")
+            raise AutomaticReplenishmentError("AList 离线已有任务恢复候选无效")
         selection = selections[0]
-        state_path = self._state_path(workspace)
-        if state_path.exists():
-            state = self._read_attempt_state(workspace, staging_root)
-            existing = self._safe_task_id(state.get("task_id"))
-            if existing != task_id:
-                raise AutomaticReplenishmentError(
-                    "夸克磁力已有 task_id 与本地 attempt 不一致"
-                )
-        else:
-            self._write_attempt_state(
-                workspace,
-                staging_root=staging_root,
-                selection=selection,
-                task_id=task_id,
+        plan = self._plan(selection, staging_root)
+        state = self._read_attempt_state(workspace, staging_root)
+        task_id = (
+            self._safe_task_id(external_task_id)
+            or self._safe_task_id(state.get("task_id"))
+        )
+        if task_id is None:
+            # The submission response was lost: recover the task by its
+            # destination path or BTIH name.  No trace anywhere means the
+            # submission never survived — the caller may then re-enter the
+            # strict tier with a fresh candidate, but this hook never submits.
+            task_id = self._scan_task_id(
+                alist, staging_root=staging_root, infohash=str(plan["infohash"] or ""),
             )
-        return self.acquire(
-            request, selections, staging_root=staging_root, workspace=workspace,
-            alist=alist,
+            if task_id is not None:
+                self._write_attempt_state(
+                    workspace, staging_root=staging_root,
+                    selection=selection, task_id=task_id,
+                )
+            else:
+                return self._finalize_delivery(
+                    alist, staging_root, plan, selection, task_id=None,
+                )
+        self._poll_until_terminal(alist, task_id)
+        return self._finalize_delivery(
+            alist, staging_root, plan, selection, task_id,
         )
 
 
@@ -1179,11 +1600,11 @@ class FixedTierAutomaticMaterializer:
         self,
         *,
         quark_share: AutomaticMaterializer | None = None,
-        quark_magnet: AutomaticMaterializer | None = None,
+        alist_offline: AutomaticMaterializer | None = None,
         local_torrent: AutomaticMaterializer | None = None,
     ) -> None:
         self.quark_share = quark_share or QuarkFastSaveAutomaticMaterializer()
-        self.quark_magnet = quark_magnet or QuarkMagnetAutomaticMaterializer()
+        self.alist_offline = alist_offline or AlistOfflineAutomaticMaterializer()
         self.local_torrent = local_torrent or LocalTorrentAutomaticMaterializer()
 
     def acquire(
@@ -1211,8 +1632,8 @@ class FixedTierAutomaticMaterializer:
                 request, selections, staging_root=staging_root,
                 workspace=workspace, alist=alist,
             )
-        if providers == {TIER_QUARK_MAGNET}:
-            return self.quark_magnet.acquire(
+        if providers == {TIER_ALIST_OFFLINE}:
+            return self.alist_offline.acquire(
                 request, selections, staging_root=staging_root,
                 workspace=workspace, alist=alist,
             )
@@ -1232,7 +1653,7 @@ class FixedTierAutomaticMaterializer:
         }
         delegate = (
             self.quark_share if providers == {TIER_QUARK_SHARE}
-            else self.quark_magnet if providers == {TIER_QUARK_MAGNET}
+            else self.alist_offline if providers == {TIER_ALIST_OFFLINE}
             else self.local_torrent if providers == {TIER_LOCAL_MAGNET}
             else None
         )
@@ -5704,7 +6125,7 @@ __all__ = [
     "FixedTierAutomaticMaterializer",
     "LocalTorrentAutomaticMaterializer",
     "QuarkFastSaveAutomaticMaterializer",
-    "QuarkMagnetAutomaticMaterializer",
+    "AlistOfflineAutomaticMaterializer",
     "StagingFile",
     "reconcile_interrupted_gap_states",
 ]

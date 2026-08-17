@@ -18,7 +18,7 @@ def healthy_payload(*, commit: str = "abc1234", jobs_total: int = 0) -> dict[str
         "build_commit": commit,
         "provider_capabilities": {
             "quark_share": {"status": "ready"},
-            "quark_magnet": {"status": "ready"},
+            "alist_offline": {"status": "ready"},
             "magnet": {"status": "ready"},
         },
         "helper_readiness": {
@@ -179,7 +179,7 @@ class RuntimeReadinessTests(unittest.TestCase):
         health = healthy_payload()
         helper = health["helper_readiness"]["quark"]
         helper["authenticated"] = False
-        helper["actions"] = ["health", "magnet-submit"]
+        helper["actions"] = ["health"]
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
@@ -192,7 +192,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
     def test_lane_status_is_only_a_capability_declaration(self) -> None:
         health = healthy_payload()
-        health["provider_capabilities"]["quark_magnet"]["status"] = "unavailable"
+        health["provider_capabilities"]["alist_offline"]["status"] = "unavailable"
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",

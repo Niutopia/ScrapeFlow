@@ -98,11 +98,6 @@ services:
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow
-      # Path-aligned with AList's /opt/alist/data/temp: AList tells aria2 to
-      # download into ITS temp dir (an absolute path), so the same host dir
-      # must appear at the same container path here or the transfer step
-      # cannot see the downloaded files.
-      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -136,6 +131,32 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  offline-aria2:
+    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
+    restart: unless-stopped
+    init: true
+    # Direct-only downloader (user rule): the ambient proxy env must never
+    # reach aria2, and --no-conf skips any image-default config.
+    command: ["aria2c", "--no-conf", "--enable-rpc", "--rpc-listen-all=true",
+              "--rpc-listen-port=6800", "--dir=/opt/alist/data/temp/aria2",
+              "--listen-port=6881-6999", "--dht-listen-port=6881-6999",
+              "--bt-enable-lpd=true", "--enable-dht=true", "--enable-dht6=false",
+              "--follow-torrent=mem", "--seed-time=0",
+              "--max-concurrent-downloads=3", "--console-log-level=warn"]
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      ALL_PROXY: ""
+      no_proxy: "*"
+      NO_PROXY: "*"
+    volumes:
+      # Path-aligned with AList's temp dir: AList passes its absolute temp
+      # path to aria2, so the same host dir must appear at the same path
+      # here for the transfer step to see the files.
+      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
 
   quark-helper:
     image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}

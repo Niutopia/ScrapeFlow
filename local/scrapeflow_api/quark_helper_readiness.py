@@ -17,7 +17,7 @@ from engine.scrapeflow.provider_capabilities import (
     QUARK_HELPER_NAME,
     QUARK_HELPER_REQUIRED_ACTIONS,
 )
-from engine.scrapeflow.quark_magnet_offline_bridge import (
+from engine.scrapeflow.quark_helper_client import (
     DEFAULT_QUARK_HELPER_URL,
     HttpQuarkHelperClient,
 )

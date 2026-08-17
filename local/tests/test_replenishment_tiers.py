@@ -9,8 +9,8 @@ from local.scrapeflow_api.replenishment_tiers import (
     FAILURE_INFRASTRUCTURE,
     MAGNET_REQUIRED_SOURCES,
     MAGNET_REQUIRED_SOURCES_BY_SHELF,
+    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
-    TIER_QUARK_MAGNET,
     TIER_QUARK_SHARE,
     apply_tier_outcome,
     initial_tier_state,
@@ -42,7 +42,7 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
                 _candidate(f"quark-share://{index}"),
             )
 
-        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier"], TIER_ALIST_OFFLINE)
         self.assertNotEqual(state["tier"], TIER_LOCAL_MAGNET)
 
     def test_no_candidate_proof_requires_completed_required_source(self) -> None:
@@ -65,21 +65,21 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
 
         self.assertEqual(incomplete["tier"], TIER_QUARK_SHARE)
         self.assertEqual(incomplete["exhaustion_proof_by_provider"], {})
-        self.assertEqual(complete["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(complete["tier"], TIER_ALIST_OFFLINE)
 
     def test_second_tier_count_alone_cannot_enter_local_torrent(self) -> None:
-        state = {**initial_tier_state(), "tier": TIER_QUARK_MAGNET}
+        state = {**initial_tier_state(), "tier": TIER_ALIST_OFFLINE}
         for index in range(EXHAUSTION_MIN_DISTINCT_LOCATORS):
             state = apply_tier_outcome(
                 state,
                 _candidate(f"magnet:?xt=urn:btih:{index:040d}"),
             )
 
-        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(state["status"], "candidate_failed")
 
     def test_second_tier_requires_all_sources_and_no_unchecked_candidates(self) -> None:
-        state = {**initial_tier_state(), "tier": TIER_QUARK_MAGNET}
+        state = {**initial_tier_state(), "tier": TIER_ALIST_OFFLINE}
         blocked = apply_tier_outcome(
             state,
             {
@@ -99,23 +99,23 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(blocked["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(blocked["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(advanced["tier"], TIER_LOCAL_MAGNET)
 
     def test_cloud_and_local_failures_keep_same_infohash_separate(self) -> None:
         locator = "magnet:?xt=urn:btih:" + "a" * 40
-        state = {**initial_tier_state(), "tier": TIER_QUARK_MAGNET}
+        state = {**initial_tier_state(), "tier": TIER_ALIST_OFFLINE}
         state = apply_tier_outcome(state, _candidate(locator))
         state["tier"] = TIER_LOCAL_MAGNET
         state = apply_tier_outcome(state, _candidate(locator))
 
         failures = state["candidate_failures_by_provider"]
-        self.assertEqual(failures[TIER_QUARK_MAGNET], [locator])
+        self.assertEqual(failures[TIER_ALIST_OFFLINE], [locator])
         self.assertEqual(failures[TIER_LOCAL_MAGNET], [locator])
 
     def test_in_doubt_waits_for_reconcile_without_excluding_or_degrading(self) -> None:
         state = apply_tier_outcome(
-            {**initial_tier_state(), "tier": TIER_QUARK_MAGNET},
+            {**initial_tier_state(), "tier": TIER_ALIST_OFFLINE},
             {
                 "scope": FAILURE_IN_DOUBT,
                 "locator": "magnet:?xt=urn:btih:" + "b" * 40,
@@ -123,28 +123,28 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(state["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(state["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(state["status"], "waiting_reconcile")
         self.assertEqual(state["candidate_failures_by_provider"], {})
         self.assertEqual(state["external_task_id"], "quark-task-1")
 
     def test_required_magnet_sources_are_shelf_aware(self) -> None:
         self.assertEqual(
-            required_sources_for_tier(TIER_QUARK_MAGNET, "anime"),
+            required_sources_for_tier(TIER_ALIST_OFFLINE, "anime"),
             MAGNET_REQUIRED_SOURCES,
         )
         for shelf in ("movie", "us_tv"):
-            required = required_sources_for_tier(TIER_QUARK_MAGNET, shelf)
+            required = required_sources_for_tier(TIER_ALIST_OFFLINE, shelf)
             self.assertEqual(required, MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf])
             self.assertTrue(required.issubset(MAGNET_REQUIRED_SOURCES))
             self.assertTrue(required)
         # Unknown or missing shelves keep the conservative full list.
         self.assertEqual(
-            required_sources_for_tier(TIER_QUARK_MAGNET, None),
+            required_sources_for_tier(TIER_ALIST_OFFLINE, None),
             MAGNET_REQUIRED_SOURCES,
         )
         self.assertEqual(
-            required_sources_for_tier(TIER_QUARK_MAGNET, "music"),
+            required_sources_for_tier(TIER_ALIST_OFFLINE, "music"),
             MAGNET_REQUIRED_SOURCES,
         )
         # The share tier requirement does not vary by shelf.
@@ -154,7 +154,7 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
         )
 
     def test_movie_shelf_proof_advances_without_anime_only_sources(self) -> None:
-        state = {**initial_tier_state(), "tier": TIER_QUARK_MAGNET}
+        state = {**initial_tier_state(), "tier": TIER_ALIST_OFFLINE}
         outcome = {
             "scope": FAILURE_CANDIDATE,
             "search_complete_no_candidates": True,
@@ -171,9 +171,9 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
 
         # Without a validated shelf claim the anime-only sources stay
         # required, so the proof must not advance the tier.
-        self.assertEqual(conservative["tier"], TIER_QUARK_MAGNET)
-        self.assertEqual(unknown_shelf["tier"], TIER_QUARK_MAGNET)
-        self.assertEqual(anime["tier"], TIER_QUARK_MAGNET)
+        self.assertEqual(conservative["tier"], TIER_ALIST_OFFLINE)
+        self.assertEqual(unknown_shelf["tier"], TIER_ALIST_OFFLINE)
+        self.assertEqual(anime["tier"], TIER_ALIST_OFFLINE)
         self.assertEqual(movie["tier"], TIER_LOCAL_MAGNET)
         self.assertEqual(movie["status"], "advanced")
 

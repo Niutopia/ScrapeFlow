@@ -506,6 +506,72 @@ class AListClient:
             raise ApiError("AList storage list returned an invalid payload")
         return [dict(row) for row in content]
 
+    def offline_download_add(
+        self,
+        path: str,
+        urls: list[str],
+        *,
+        tool: str = "aria2",
+        delete_policy: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Submit one offline-download task through AList's tool framework.
+
+        The generic tool path downloads into the AList temp dir (bound to the
+        dedicated aria2 RPC service) and then transfers the tree to ``path``
+        on the target storage.  The returned task rows carry the durable task
+        ``id`` used for status polling and reconciliation.
+        """
+        if not isinstance(urls, list) or not urls or not all(
+            isinstance(url, str) and url for url in urls
+        ):
+            raise ApiError("AList 离线下载 urls 无效")
+        body: dict[str, Any] = {"path": path, "urls": urls, "tool": tool}
+        if delete_policy is not None:
+            body["delete_policy"] = delete_policy
+        response = self._request_json_authenticated(
+            f"{self.base_url}/api/fs/add_offline_download",
+            method="POST",
+            json_body=body,
+        )
+        data = self._require_success(response, "AList 离线下载提交").get("data")
+        tasks = data.get("tasks") if isinstance(data, Mapping) else None
+        if not isinstance(tasks, list):
+            raise ApiError("AList 离线下载提交未返回任务")
+        return [dict(row) for row in tasks if isinstance(row, dict)]
+
+    def _offline_download_tasks(self, scope: str) -> list[dict[str, Any]]:
+        if scope not in {"undone", "done"}:
+            raise ApiError(f"AList 离线任务范围无效: {scope}")
+        response = self._request_json_authenticated(
+            f"{self.base_url}/api/admin/task/offline_download/{scope}",
+            method="GET",
+        )
+        data = self._require_success(response, f"AList 离线任务 {scope}").get("data")
+        if not isinstance(data, list):
+            raise ApiError(f"AList 离线任务 {scope} 返回无效")
+        return [dict(row) for row in data if isinstance(row, dict)]
+
+    def offline_download_undone(self) -> list[dict[str, Any]]:
+        """Return non-terminal offline-download task rows (pending/running)."""
+        return self._offline_download_tasks("undone")
+
+    def offline_download_done(self) -> list[dict[str, Any]]:
+        """Return terminal offline-download task rows (succeeded/failed/...)."""
+        return self._offline_download_tasks("done")
+
+    def offline_download_delete(self, task_id: str) -> None:
+        """Remove one offline-download task record (no storage deletion)."""
+        if not isinstance(task_id, str) or not task_id or any(
+            char in task_id for char in ("/", "\\", "\x00", "\n", "\r")
+        ):
+            raise ApiError("AList 离线任务 id 无效")
+        self._request_json_authenticated(
+            f"{self.base_url}/api/admin/task/offline_download/delete"
+            f"?tid={urllib.parse.quote(task_id, safe='')}",
+            method="POST",
+            json_body={},
+        )
+
     def list(self, path: str, refresh: bool = False) -> list[dict[str, Any]]:
         """完整列出目录内容，显式处理 AList 的分页响应。"""
         normalized = normalize_remote_path(path)
