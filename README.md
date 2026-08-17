@@ -40,12 +40,15 @@ Provider 降级。Provider 自动补源和自动审计保持默认关闭。
 `root_pipeline`，legacy 链仅存记录读取）；P12 单元级 E1/E2/E3 通道（`unit_e_lanes`：重复消费归档 / 既有缺口登记与空目录 hold /
 归并写入既有作品根）+ 多季绝对集数显式映射桥（`episode_map_<unit>.json`）；P13 Fate 式系列容器落盘规则（`unit_execution._container_plan`：
 主系列拥有容器根、电影与外传嵌套其下，容器命名三级兜底，主导系列判定与失败重试退役陈旧载体）；P14 新路径补源接线（`root_replenishment`
-+ `replenishment_bridge`：Gap 账本 → 三阶 lane `quark_share → quark_magnet → magnet`，durable tier 状态 `replenishment_<root>.json`，
++ `replenishment_bridge`：Gap 账本 → 三阶 lane `quark_share → alist_offline → magnet`，durable tier 状态 `replenishment_<root>.json`，
 staging → 同一 Planner/写器 → 覆盖证明后核销；预览 `GET /api/jobs/:id/replenishment`、手动触发 `POST /api/jobs/:id/replenish`；
-字幕缺口走独立渠道不进视频三阶）。
+字幕缺口走独立渠道不进视频三阶）。P15 三阶重构（2026-08-17，用户指令）：删除被夸克账号级限流卡死的 `quark_magnet` 阶，改由 AList
+离线下载工具框架承接（`add_offline_download` + 专用 `offline-aria2` 服务直连下载本地中转，`AlistOfflineAutomaticMaterializer`
+提交+轮询+精确收拢验证）；waiting_reconcile 升级为真实对账回路（`reconcile_existing_task` 只轮询不重交）；助手合同缩为
+`health + share-save`。
 实机验收：真实《刀剑神域》合集 7/7 单元经 A→R 全链入库（主系列 S1–S4 合一 + 剧场版/外传嵌套），4 个 `.5` 特别篇按证据门禁留档。
 
-期间任何代码变更不得使测试通过数低于 918（310 subtests）。存量 `EngineJob.summary` 业务字段与
+期间任何代码变更不得使测试通过数低于 909（296 subtests，2026-08-17 三阶重构后基线；数量差来自删除的 quark_magnet 阶专属测试）。存量 `EngineJob.summary` 业务字段与
 provider gate 机制冻结不新增，随后续运行节奏逐步清退。三项用户裁决（2026-08-16）：创建任务时选货架；
 存量字段渐进清退；字幕保留独立渠道并修复缺陷。Web 控制台视觉语言已按 Media Engine v4 设计重绘。
 
@@ -192,7 +195,7 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 python3 scripts/scrapeflow_release_check.py
 ```
 
-日常跑测试用带 pytest 的解释器（当前基线 883 tests + 310 subtests）：
+日常跑测试用带 pytest 的解释器（当前基线 909 tests + 296 subtests）：
 
 ```sh
 /opt/homebrew/bin/python3.12 -m pytest local/tests/ -q
