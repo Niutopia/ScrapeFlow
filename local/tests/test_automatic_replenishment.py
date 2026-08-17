@@ -4116,6 +4116,38 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.failure_scope, "candidate")
         self.assertTrue(caught.exception.exclude_candidate)
+        self.assertIn("alist-task-1", alist.delete_calls)
+
+    def test_alist_offline_materializer_transfer_phase_is_not_a_stall(self) -> None:
+        """Progress 100 (transferring) must wait for the terminal state."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-transfer"
+            alist = FakeAList()
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(f"{sibling}/Example.Show.S01E01.mkv", size=123)
+            polls = iter([3, 1, 1, 1, 2])
+
+            def drive(_seconds):
+                try:
+                    state = next(polls)
+                except StopIteration:
+                    return
+                alist.set_task_state(
+                    "alist-task-1", state, progress=100, error="",
+                )
+
+            # stall_limit far below the number of polls executed: a wrong
+            # stall classification would raise candidate before the success.
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=drive, poll_interval=0.1, stall_limit=0.05,
+            )
+            delivery = materializer.acquire(
+                {}, [selection], staging_root=staging,
+                workspace=workspace, alist=alist,
+            )
+            self.assertEqual(delivery["external_task_id"], "alist-task-1")
 
     def test_alist_offline_materializer_lost_submit_recovers_task_by_sibling_name(self) -> None:
         """A lost add response is recovered by a name scan, never re-submitted."""

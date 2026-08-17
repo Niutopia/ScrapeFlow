@@ -1359,12 +1359,27 @@ class AlistOfflineAutomaticMaterializer:
     def _poll_until_terminal(self, alist: object, task_id: str) -> str:
         """Poll one AList offline task; return "succeeded" or "missing".
 
-        Candidate failures raise ``AlistOfflineCandidateError``; AList API
-        failures propagate unchanged (infrastructure).  A task that makes no
-        byte progress for ``stall_limit`` seconds is a dead candidate.
+        Candidate failures raise ``AlistOfflineCandidateError`` and remove the
+        task record (AList may otherwise auto-retry an errored task in the
+        background and transfer bytes into an abandoned staging sibling);
+        tool/transport failures raise the plain infrastructure error.  A task
+        that makes no byte progress for ``stall_limit`` seconds is a dead
+        candidate.  Progress at or above 100 means the download finished and
+        the transfer is running, so the stall clock is held — long transfers
+        must never be mistaken for a dead download.
         """
         last_progress: object = None
         last_advanced = time.monotonic()
+
+        def drop_candidate_task(message: str) -> AlistOfflineCandidateError:
+            delete = getattr(alist, "offline_download_delete", None)
+            if callable(delete):
+                try:
+                    delete(task_id)
+                except Exception:
+                    pass
+            return AlistOfflineCandidateError(message)
+
         while True:
             row = self._row_by_id(alist, task_id)
             if row is None:
@@ -1387,11 +1402,19 @@ class AlistOfflineAutomaticMaterializer:
                     raise AutomaticReplenishmentError(
                         f"AList 离线工具故障: {error[:200] or state}"
                     )
-                raise AlistOfflineCandidateError(
+                raise drop_candidate_task(
                     f"AList 离线任务失败: {error[:200] or state}"
                 )
             progress = row.get("progress")
-            if (
+            finished_download = (
+                isinstance(progress, (int, float))
+                and not isinstance(progress, bool)
+                and progress >= 100
+            )
+            if finished_download:
+                # Transferring: wait for the terminal state.
+                last_advanced = time.monotonic()
+            elif (
                 isinstance(progress, (int, float))
                 and not isinstance(progress, bool)
                 and progress != last_progress
@@ -1399,7 +1422,7 @@ class AlistOfflineAutomaticMaterializer:
                 last_progress = progress
                 last_advanced = time.monotonic()
             elif time.monotonic() - last_advanced > self.stall_limit:
-                raise AlistOfflineCandidateError("AList 离线下载长期无进度")
+                raise drop_candidate_task("AList 离线下载长期无进度")
             self.sleep(self.poll_interval)
 
     def _finalize_delivery(
