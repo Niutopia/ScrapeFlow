@@ -414,6 +414,7 @@ class FakeAList:
 
     def set_task_state(
         self, task_id: str, state: int, *, progress: int = 100, error: str = "",
+        status: str = "",
     ) -> None:
         row = next(
             (row for row in [*self.undone, *self.done] if str(row.get("id")) == task_id),
@@ -424,6 +425,7 @@ class FakeAList:
         row["state"] = state
         row["progress"] = progress
         row["error"] = error
+        row["status"] = status
         if state in {2, 4, 5, 7}:
             self.undone = [r for r in self.undone if str(r.get("id")) != task_id]
             if not any(str(r.get("id")) == task_id for r in self.done):
@@ -4136,6 +4138,7 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     return
                 alist.set_task_state(
                     "alist-task-1", state, progress=100, error="",
+                    status="offline download completed, maybe transferring",
                 )
 
             # stall_limit far below the number of polls executed: a wrong

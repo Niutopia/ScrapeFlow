@@ -1116,10 +1116,14 @@ class AlistOfflineAutomaticMaterializer:
             )
         magnet = acquisition.get("magnet_url")
         torrent = acquisition.get("torrent_url")
+        # Exactly ONE URL per submission: AList creates one task per URL, and
+        # submitting both the torrent and its magnet would double-download the
+        # same content.  The direct torrent URL is preferred (HTTPS metadata
+        # resolves instantly; magnet-only candidates depend on DHT).
         urls: list[str] = []
         if isinstance(torrent, str) and torrent.startswith(("https://", "http://")):
             urls.append(torrent)
-        if isinstance(magnet, str) and magnet.startswith("magnet:?"):
+        elif isinstance(magnet, str) and magnet.startswith("magnet:?"):
             urls.append(magnet)
         if not urls:
             raise AlistOfflineCandidateError("AList 离线候选缺少可用下载地址")
@@ -1364,9 +1368,9 @@ class AlistOfflineAutomaticMaterializer:
         background and transfer bytes into an abandoned staging sibling);
         tool/transport failures raise the plain infrastructure error.  A task
         that makes no byte progress for ``stall_limit`` seconds is a dead
-        candidate.  Progress at or above 100 means the download finished and
-        the transfer is running, so the stall clock is held — long transfers
-        must never be mistaken for a dead download.
+        candidate.  A task row whose ``status`` mentions transfer is held (long transfers
+        must never be mistaken for a dead download); progress alone cannot
+        prove transfer because AList coerces NaN progress to 100.
         """
         last_progress: object = None
         last_advanced = time.monotonic()
@@ -1406,13 +1410,14 @@ class AlistOfflineAutomaticMaterializer:
                     f"AList 离线任务失败: {error[:200] or state}"
                 )
             progress = row.get("progress")
-            finished_download = (
-                isinstance(progress, (int, float))
-                and not isinstance(progress, bool)
-                and progress >= 100
-            )
-            if finished_download:
-                # Transferring: wait for the terminal state.
+            status_text = str(row.get("status") or "").casefold()
+            if "transfer" in status_text:
+                # The download finished and AList is transferring the tree to
+                # the target storage: wait for the terminal state instead of
+                # running the stall clock (a long upload is not a dead
+                # download).  Progress alone cannot prove this — AList coerces
+                # NaN progress to 100, which is exactly what a magnet that is
+                # still fetching DHT metadata shows.
                 last_advanced = time.monotonic()
             elif (
                 isinstance(progress, (int, float))
