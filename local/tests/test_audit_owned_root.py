@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from engine.scrapeflow.serialization import atomic_write_json
 from local.simple_server import ApplicationError, SimpleApplication
+from local.scrapeflow_api.root_job_pilot import unrestricted_scope
 from local.scrapeflow_api.simple_engine_runner import (
     EngineJob,
     EngineRequestError,
@@ -304,7 +305,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
-            app.set_paused(True, "read-only")
+            app.set_paused(True, "read-only", automatic_scope=unrestricted_scope())
             subtitle = _subtitle_gap()
             semantic = {
                 "gaps": [subtitle],
@@ -346,7 +347,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
-            app.set_paused(True, "read-only")
+            app.set_paused(True, "read-only", automatic_scope=unrestricted_scope())
             subtitle = _subtitle_gap(path="/library/番剧/Other/Season 01/Show S01E02.mkv")
             semantic = {
                 "gaps": [subtitle], "unknowns": [],
@@ -376,7 +377,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 engine_runner=runner,
                 enforce_engine_roots=False,
             )
-            app.set_paused(True, "test")
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             try:
                 gap = _gap()
                 app._apply_audit_gaps(
@@ -443,6 +444,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             unknown = {
                 "kind": "unknown_subtitle_evidence",
                 "work": "tmdb:42",
@@ -539,6 +541,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             unknowns = [
                 {
                     "kind": "unknown_episode_catalog",
@@ -636,7 +639,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
-            app.set_paused(True, "read-only scan")
+            app.set_paused(True, "read-only scan", automatic_scope=unrestricted_scope())
             try:
                 with patch.object(app, "_apply_audit_gaps") as apply_gaps:
                     result = app.run_library_audit()
@@ -718,7 +721,11 @@ class AuditOwnedRootTests(unittest.TestCase):
                     state_root=root, remote_root="/library", remote=remote,
                     engine_runner=runner, enforce_engine_roots=False,
                 )
-                app.set_paused(True, "keep provider queue out of this lifecycle test")
+                app.set_paused(
+                    True,
+                    "keep provider queue out of this lifecycle test",
+                    automatic_scope=unrestricted_scope(),
+                )
                 try:
                     with patch.object(
                         app,
@@ -752,7 +759,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=EmptyAList(),
                 engine_runner=runner, enforce_engine_roots=False,
             )
-            app.set_paused(True, "test")
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             try:
                 queued = runner.create_automatic_job("/library/待刮削/Show")
                 with patch.dict(os.environ, {"SCRAPEFLOW_AUTOMATIC_RETRY_LIMIT": "0"}), \
@@ -798,10 +805,14 @@ class AuditOwnedRootTests(unittest.TestCase):
                     engine_runner=runner, enforce_engine_roots=False,
                 )
                 if paused:
-                    app.set_paused(True, "read-only scan")
+                    app.set_paused(
+                        True,
+                        "read-only scan",
+                        automatic_scope=unrestricted_scope(),
+                    )
                 else:
                     with patch.object(app, "_start_startup_thread"):
-                        app.set_paused(False)
+                        app.set_paused(False, automatic_scope=unrestricted_scope())
                 calls: list[str] = []
                 runner.repair_automatic_artifacts = lambda job_id: calls.append(job_id)  # type: ignore[method-assign]
                 repair_gap = {
@@ -855,7 +866,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                     "_run_automatic_replenishment",
                     side_effect=lambda job_id: (called.append(job_id), ran.set()),
                 ), patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                     app._resume_automatic_jobs()
                     self.assertTrue(ran.wait(2.0))
@@ -930,7 +941,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                     runtime.assert_not_called()
 
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                 self._admit_provider(app)
                 with patch.dict(
                     os.environ,
@@ -960,6 +971,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             pending: Future[object] = Future()
             captured: list[tuple[object, tuple[object, ...]]] = []
@@ -973,7 +985,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 with patch.object(app, "_start_startup_thread"), patch.object(
                     app, "_scan_inbound_once", return_value=[],
                 ):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                 self._admit_provider(app)
                 with patch.object(app, "_provider_pool", return_value=Pool()), patch.object(
                     app, "_schedule_timer",
@@ -1030,7 +1042,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                 self._admit_provider(app)
                 with app._automatic_lock:  # noqa: SLF001
                     app._provider_submission_grants[job.id] = app._provider_admission_epoch  # noqa: SLF001
@@ -1073,7 +1085,11 @@ class AuditOwnedRootTests(unittest.TestCase):
                     return future
 
             try:
-                with patch.object(app, "control", return_value={"paused": False}), patch.object(
+                with patch.object(
+                    app,
+                    "control",
+                    return_value={"paused": False, "automatic_scope": unrestricted_scope()},
+                ), patch.object(
                     app, "_audit_auto_repair_enabled", return_value=True,
                 ), patch.object(
                     app, "_full_audit_ready_for_provider", return_value=True,
@@ -1181,6 +1197,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 signature = SimpleApplication._provider_gap_signature([_gap()])
@@ -1238,6 +1255,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 app._record_replenishment_progress(
@@ -1252,7 +1270,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 # Avoid scheduling a second resume scan in this unit test;
                 # this isolates the fresh-audit queue operation below.
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                 self._admit_provider(app)
                 app._apply_audit_gaps(
                     {"semantic": {
@@ -1322,7 +1340,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 # recovery; avoid a concurrent resume thread touching state.
                 with patch.object(app, "_start_startup_thread"), \
                      patch.object(app, "_run_library_audit_background", side_effect=fake_audit):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     app._queue_library_audit()
                     self.assertTrue(first_started.wait(timeout=2))
                     app._queue_library_audit(delay=0.0, rerun_if_busy=True)
@@ -1394,7 +1412,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"), \
                      patch.object(app, "_run_library_audit_once", side_effect=fake_once):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     app._queue_library_audit()
                     self.assertTrue(second_finished.wait(timeout=4))
                     self.assertFalse(third_started.wait(timeout=1))
@@ -1445,10 +1463,14 @@ class AuditOwnedRootTests(unittest.TestCase):
             try:
                 with patch.object(app, "_start_startup_thread"), \
                      patch.object(app, "_run_library_audit_once", side_effect=fake_once):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     app._queue_library_audit()
                     self.assertTrue(first_started.wait(timeout=2))
-                    app.set_paused(True, "test pause")
+                    app.set_paused(
+                        True,
+                        "test pause",
+                        automatic_scope=unrestricted_scope(),
+                    )
                     release_first.set()
                     self.assertTrue(first_finished.wait(timeout=2))
                     self.assertFalse(second_started.wait(timeout=1))
@@ -1520,7 +1542,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             worker = threading.Thread(target=run_direct, daemon=True)
             try:
                 with patch.object(app, "_run_library_audit_once", side_effect=fake_once):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     worker.start()
                     self.assertTrue(first_started.wait(timeout=2))
                     self.assertTrue(app.health()["operations"]["audit_running"])
@@ -1568,10 +1590,11 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 app._record_replenishment_progress(
                     job, "retry_wait", {"error": "old child failed", "terminal": False},
@@ -1613,6 +1636,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            app.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 app._record_replenishment_summary(job, {
@@ -1652,6 +1676,7 @@ class AuditOwnedRootTests(unittest.TestCase):
                 state_root=root, remote_root="/library", remote=remote,
                 engine_runner=runner, enforce_engine_roots=False,
             )
+            first.set_paused(True, "test", automatic_scope=unrestricted_scope())
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 first._record_replenishment_progress(job, "acquiring", {"round": 1})
@@ -1715,7 +1740,7 @@ class AuditOwnedRootTests(unittest.TestCase):
             job = runner.create_audit_owned_root(_project(_gap()))
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                 self._admit_provider(app)
 
                 class CancelledRuntime:
@@ -1779,7 +1804,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=CandidateRuntime(),
@@ -1832,7 +1857,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=InDoubtRuntime(),
@@ -1893,7 +1918,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=ExhaustedRuntime(),
@@ -1955,7 +1980,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment",
@@ -2007,7 +2032,7 @@ class AuditOwnedRootTests(unittest.TestCase):
 
             try:
                 with patch.object(app, "_start_startup_thread"):
-                    app.set_paused(False)
+                    app.set_paused(False, automatic_scope=unrestricted_scope())
                     self._admit_provider(app)
                 with patch.object(
                     app, "_get_automatic_replenishment", return_value=InfrastructureRuntime(),

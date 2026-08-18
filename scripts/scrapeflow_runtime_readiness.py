@@ -24,8 +24,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--expected-commit",
-        default="",
-        help="expected build commit from /api/health; prefix matches are accepted",
+        required=True,
+        help=(
+            "required expected lowercase Git SHA build ID (at least seven "
+            "hex characters, optional -dirty); only an actual ID beginning "
+            "with this SHA prefix is accepted"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -46,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = runtime_readiness_report(
         api_url=args.api_url,
-        expected_commit=args.expected_commit or None,
+        expected_commit=args.expected_commit,
         timeout=args.timeout,
         allow_existing_jobs=args.allow_existing_jobs,
     )

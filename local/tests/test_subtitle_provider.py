@@ -20,6 +20,7 @@ from engine.tools.replenishment_adapter import (
     SubtitleDiscoveryService,
     SubtitleInfrastructureError,
     SubtitleMaterializer,
+    SubtitlePauseRequested,
     SubtitleProviderError,
 )
 
@@ -292,6 +293,61 @@ class SubtitleProviderTests(unittest.TestCase):
                 len(content), "application/x-subrip", False,
             )],
         )
+
+    def test_materializer_stops_after_download_before_any_staging_write(self) -> None:
+        """A scope withdrawn by the HTTP fetch cannot create/upload a sidecar."""
+        content = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "字幕下载后立即撤销试运行范围。\n"
+        ).encode("utf-8")
+        paused = {"value": False}
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt", "url": "https://example.test/sub.srt",
+            "format": "srt",
+        }]
+
+        def fetch(_url: str) -> bytes:
+            paused["value"] = True
+            return content
+
+        class RecordingAList(MockAList):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mkdir_calls: list[str] = []
+                self.upload_calls: list[str] = []
+
+            def mkdir(self, path: str) -> None:
+                self.mkdir_calls.append(path)
+                super().mkdir(path)
+
+            def upload_bytes(self, remote_dir: str, name: str, data: bytes) -> None:
+                self.upload_calls.append(remote_dir)
+                super().upload_bytes(remote_dir, name, data)
+
+        materializer = SubtitleMaterializer(discovery=discovery, downloader=fetch)
+        alist = RecordingAList()
+        gap = {
+            "id": "missing_subtitle:pause",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaises(SubtitlePauseRequested):
+            materializer.acquire_subtitles(
+                {"media": {"title": "Show"}},
+                [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/pause/attempt",
+                workspace=Path(tmpdir),
+                alist=alist,
+                pause_requested=lambda: paused["value"],
+            )
+            # The workspace root itself is allowed to exist because scope was
+            # open before the HTTP request.  No subtitle file or remote write
+            # may follow the callback flip.
+        self.assertEqual(alist.mkdir_calls, [])
+        self.assertEqual(alist.upload_calls, [])
+        self.assertEqual(list(Path(tmpdir).glob("*.srt")), [])
 
     def test_runtime_handles_no_subtitles_found_as_completed_with_gaps(self) -> None:
         discovery = SubtitleDiscoveryService(

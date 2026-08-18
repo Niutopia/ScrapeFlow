@@ -103,6 +103,30 @@ class ReplenishmentInfrastructureError(RuntimeError):
         self.failure_stage = stage
 
 
+class ReplenishmentPauseRequested(RuntimeError):
+    """A caller withdrew its RootJob scope before a local provider effect."""
+
+    pause_requested = True
+
+
+def _pause_checkpoint(pause_requested: Callable[[], bool] | None) -> None:
+    """Fail closed immediately before a provider-owned external operation."""
+    if pause_requested is None:
+        return
+    try:
+        paused = bool(pause_requested())
+    except Exception as exc:
+        if getattr(exc, "pause_requested", False) is True:
+            raise
+        raise ReplenishmentPauseRequested(
+            "补源暂停状态不可确认，已在外部操作前停止",
+        ) from exc
+    if paused:
+        raise ReplenishmentPauseRequested(
+            "补源已暂停或不在当前 RootJob 试运行范围",
+        )
+
+
 @contextmanager
 def _workspace_lease(root: Path, workspace_key: str):
     """Prevent two retries from mutating one deterministic workspace at once."""
@@ -3440,24 +3464,30 @@ def _repair_nyaa_land_torrent_comment(data: bytes, mirror_url: str) -> bytes:
 def _download_torrent(
     url: str, destination: Path, *, timeout: int = 60, attempts: int = 4,
     opener: Any | None = None,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     if not url.startswith("https://"):
         raise ValueError("torrent 地址需要使用 HTTPS")
     try:
+        _pause_checkpoint(pause_requested)
         data = _fetch_bytes(
             url, max_bytes=MAX_TORRENT_BYTES, timeout=timeout,
             attempts=attempts, opener=opener,
         )
+    except ReplenishmentPauseRequested:
+        raise
     except (OSError, RuntimeError, TimeoutError):
         mirror_url = _nyaa_torrent_mirror_url(url)
         if mirror_url is None:
             raise
+        _pause_checkpoint(pause_requested)
         data = _fetch_bytes(
             mirror_url, max_bytes=MAX_TORRENT_BYTES, timeout=timeout,
             attempts=attempts, opener=opener,
         )
         data = _repair_nyaa_land_torrent_comment(data, mirror_url)
     manifest = _torrent_manifest(data)
+    _pause_checkpoint(pause_requested)
     destination.write_bytes(data)
     return manifest
 
@@ -3653,6 +3683,7 @@ def _assert_payload_has_no_incomplete_markers(payload_dir: Path) -> None:
 def _preflight(
     selection_wrapper: Mapping[str, Any], workspace: Path,
     *, resume_workspace: Path | None = None,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     bundle = selection_wrapper.get("selection")
     selections = bundle.get("selections") if isinstance(bundle, Mapping) else None
@@ -3674,12 +3705,14 @@ def _preflight(
         raise ReplenishmentInfrastructureError(
             "运行环境缺少 aria2c", stage="local_dependency",
         )
+    _pause_checkpoint(pause_requested)
     workspace.mkdir(parents=True, exist_ok=True)
     selected_bytes = 0
     selected_files = 0
     reusable_bytes = 0
     verified: list[dict[str, Any]] = []
     for offset, selection in enumerate(selections, start=1):
+        _pause_checkpoint(pause_requested)
         if not isinstance(selection, Mapping):
             raise ValueError("selection 项格式无效")
         acquisition = selection.get("acquisition")
@@ -3688,8 +3721,17 @@ def _preflight(
             raise ValueError("选中候选缺少 torrent URL")
         torrent_path = workspace / f"candidate-{offset:02d}.torrent"
         try:
-            manifest = _download_torrent(url, torrent_path)
+            if pause_requested is None:
+                manifest = _download_torrent(url, torrent_path)
+            else:
+                manifest = _download_torrent(
+                    url,
+                    torrent_path,
+                    pause_requested=pause_requested,
+                )
             indices, _by_index = _verify_manifest(selection, manifest)
+        except ReplenishmentPauseRequested:
+            raise
         except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
             raise ReplenishmentCandidateError(
                 str(exc), stage="candidate_preflight", candidate=selection,
@@ -3765,6 +3807,7 @@ def _wrapper_for_selections(
 
 def _preflight_dispatch(
     wrapper: Mapping[str, Any], workspace: Path, *, resume_workspace: Path | None = None,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     bundle = wrapper.get("selection")
     rows = bundle.get("selections") if isinstance(bundle, Mapping) else None
@@ -3781,11 +3824,17 @@ def _preflight_dispatch(
             "本地适配器只接受可执行的 magnet/torrent selection",
             stage="artifact_validation",
         )
-    return _preflight(
+    _pause_checkpoint(pause_requested)
+    arguments = (
         _wrapper_for_selections(wrapper, [dict(row) for row in rows]),
         workspace / "torrent",
-        resume_workspace=(resume_workspace / "torrent" if resume_workspace else None),
     )
+    keyword_arguments = {
+        "resume_workspace": resume_workspace / "torrent" if resume_workspace else None,
+    }
+    if pause_requested is not None:
+        keyword_arguments["pause_requested"] = pause_requested
+    return _preflight(*arguments, **keyword_arguments)
 
 
 def _ffprobe_archive_video(path: Path) -> dict[str, Any]:
@@ -3833,6 +3882,7 @@ def _acquire_dispatch(
     *,
     automatic: bool = True,
     client: AListClient | None = None,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Dispatch only exact Torrent selections to the local materializer."""
     bundle = wrapper.get("selection")
@@ -3855,7 +3905,13 @@ def _acquire_dispatch(
             "补源必须由自动调度器创建任务 staging",
             stage="automatic_route_required",
         )
-    return _acquire(wrapper, workspace, client=client)
+    _pause_checkpoint(pause_requested)
+    return _acquire(
+        wrapper,
+        workspace,
+        client=client,
+        pause_requested=pause_requested,
+    )
 
 
 def _safe_name(value: str, *, limit: int = 180) -> str:
@@ -3865,7 +3921,11 @@ def _safe_name(value: str, *, limit: int = 180) -> str:
 
 
 def _verify_remote_uploads(
-    client: AListClient, remote_root: str, uploaded: list[dict[str, Any]],
+    client: AListClient,
+    remote_root: str,
+    uploaded: list[dict[str, Any]],
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Wait for cloud-backed AList listings to expose committed uploads.
 
@@ -3881,6 +3941,7 @@ def _verify_remote_uploads(
     deadline = time.monotonic() + timeout
     last_files: dict[str, int] = {}
     while True:
+        _pause_checkpoint(pause_requested)
         rows = client.list(remote_root, refresh=True)
         last_files = {
             str(row.get("name")): int(row.get("size") or 0)
@@ -3914,6 +3975,8 @@ def _automatic_upload(
     client: AListClient,
     remote_root: str,
     row: dict[str, Any],
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Upload one file from task-owned staging and verify its exact size."""
     remote_name = str(row["remote_name"])
@@ -3924,6 +3987,7 @@ def _automatic_upload(
             f"自动补源本地文件大小无效: {source}", stage="candidate_payload_validation",
         )
     target = join_remote(remote_root, remote_name)
+    _pause_checkpoint(pause_requested)
     existing = client.exact_file_info(target)
     if existing is not None:
         existing_size = int(existing.get("size") or 0)
@@ -3938,6 +4002,7 @@ def _automatic_upload(
         ".ssa": "text/x-ssa",
         ".vtt": "text/vtt",
     }.get(source.suffix.casefold(), "application/octet-stream")
+    _pause_checkpoint(pause_requested)
     client.upload_file(target, source, content_type)
 
 
@@ -3958,6 +4023,8 @@ def _ensure_automatic_staging_root(
     client: AListClient,
     remote_parent: str,
     remote_root: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Create the known task-owned staging path one level at a time."""
     parent = remote_parent.rstrip("/")
@@ -3974,6 +4041,7 @@ def _ensure_automatic_staging_root(
     for directory in dict.fromkeys(
         path for path in (parent, job_root, root) if path
     ):
+        _pause_checkpoint(pause_requested)
         client.mkdir(directory)
 
 
@@ -3982,6 +4050,7 @@ def _acquire(
     workspace: Path,
     *,
     client: AListClient | None = None,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     request = selection_wrapper.get("request") if isinstance(selection_wrapper.get("request"), Mapping) else {}
     media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
@@ -4068,13 +4137,23 @@ def _acquire(
             if isinstance(gap, Mapping) and isinstance(gap.get("id"), str)
             and gap.get("id")
         }
-        preflight = _preflight(
-            selection_wrapper, workspace / "preflight", resume_workspace=workspace,
-        )
+        _pause_checkpoint(pause_requested)
+        if pause_requested is None:
+            preflight = _preflight(
+                selection_wrapper, workspace / "preflight", resume_workspace=workspace,
+            )
+        else:
+            preflight = _preflight(
+                selection_wrapper,
+                workspace / "preflight",
+                resume_workspace=workspace,
+                pause_requested=pause_requested,
+            )
         bundle = selection_wrapper["selection"]
         for offset, selection in enumerate(bundle["selections"], start=1):
             candidate_dir = workspace / f"download-{offset:02d}"
             payload_dir = candidate_dir / "payload"
+            _pause_checkpoint(pause_requested)
             payload_dir.mkdir(parents=True, exist_ok=True)
             verified = preflight["candidates"][offset - 1]
             manifest = verified["manifest"]
@@ -4120,6 +4199,7 @@ def _acquire(
                 ]
                 print(f"[replenishment] 下载候选 {offset}/{len(bundle['selections'])}: {selection.get('release_name')}", flush=True)
                 try:
+                    _pause_checkpoint(pause_requested)
                     completed = subprocess.run(
                         command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         timeout=_bounded_seconds(
@@ -4243,12 +4323,22 @@ def _acquire(
             )
         payload_verified = True
         delivery_stage = "delivery_connect"
+        _pause_checkpoint(pause_requested)
         client = client or _alist_client()
         login = getattr(client, "login", None)
         if callable(login) and not getattr(client, "token", None):
+            _pause_checkpoint(pause_requested)
             login()
         delivery_stage = "delivery_prepare"
-        _ensure_automatic_staging_root(client, remote_parent, remote_root)
+        if pause_requested is None:
+            _ensure_automatic_staging_root(client, remote_parent, remote_root)
+        else:
+            _ensure_automatic_staging_root(
+                client,
+                remote_parent,
+                remote_root,
+                pause_requested=pause_requested,
+            )
         has_video = any(row.get("kind") == "video" for row in uploaded)
         has_subtitle = any(row.get("kind") == "subtitle" for row in uploaded)
         # A mixed provider candidate must never expose its subtitle members
@@ -4261,7 +4351,9 @@ def _acquire(
         media_staging_root = join_remote(remote_root, "media") if mixed_delivery else remote_root
         subtitle_staging_root = join_remote(remote_root, "subtitles") if mixed_delivery else remote_root
         if mixed_delivery:
+            _pause_checkpoint(pause_requested)
             client.mkdir(media_staging_root)
+            _pause_checkpoint(pause_requested)
             client.mkdir(subtitle_staging_root)
         for row in uploaded:
             row["delivery_root"] = (
@@ -4271,14 +4363,30 @@ def _acquire(
         delivery_stage = "delivery_upload"
         for offset, row in enumerate(uploaded, start=1):
             print(f"[replenishment] 上传 {offset}/{len(uploaded)}: {row['remote_name']}", flush=True)
-            _automatic_upload(client, str(row["delivery_root"]), row)
+            if pause_requested is None:
+                _automatic_upload(client, str(row["delivery_root"]), row)
+            else:
+                _automatic_upload(
+                    client,
+                    str(row["delivery_root"]),
+                    row,
+                    pause_requested=pause_requested,
+                )
         delivery_stage = "delivery_visibility"
         grouped_uploads: dict[str, list[dict[str, Any]]] = {}
         for row in uploaded:
             delivery_root = str(row["delivery_root"])
             grouped_uploads.setdefault(delivery_root, []).append(row)
         for delivery_root, rows in grouped_uploads.items():
-            _verify_remote_uploads(client, delivery_root, rows)
+            if pause_requested is None:
+                _verify_remote_uploads(client, delivery_root, rows)
+            else:
+                _verify_remote_uploads(
+                    client,
+                    delivery_root,
+                    rows,
+                    pause_requested=pause_requested,
+                )
         delivery_files: list[dict[str, Any]] = []
         for row in uploaded:
             delivery_files.append({
@@ -4297,6 +4405,8 @@ def _acquire(
             "files": delivery_files,
         }
     except BaseException as exc:
+        if getattr(exc, "pause_requested", False) is True:
+            raise
         delivery_failure = payload_verified and isinstance(exc, Exception)
         # Never recursively remove the deterministic remote delivery root on
         # an ambiguous failure. It may already contain a verified object from
@@ -4312,6 +4422,7 @@ def _acquire(
         # Capacity/dependency/orchestration failures do not invalidate bytes
         # retained by a previous attempt. Candidate failures do.
         if not isinstance(exc, ReplenishmentInfrastructureError):
+            _pause_checkpoint(pause_requested)
             shutil.rmtree(workspace, ignore_errors=True)
         raise
 

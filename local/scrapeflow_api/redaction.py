@@ -15,7 +15,8 @@ _SENSITIVE_FIELD_NAMES = frozenset({
 })
 _SECRET_ENV_SUFFIXES = ("_password", "_token", "_api_key", "_secret")
 _SPACED_SECRET_FIELD_RE = re.compile(
-    r'(?i)(\b(?:api[\s_-]?key|archive[\s_-]?pass(?:word)?|access[\s_-]?token)\s*[:=]\s*)'
+    r'(?i)(\b(?:api[\s_-]?key|archive[\s_-]?pass(?:word)?|access[\s_-]?token|'
+    r'aria2[\s_-]?secret|secret|token|pass(?:word)?)\s*[:=]\s*)'
     r'("?)([^"\s,;&}]+)("?)'
 )
 

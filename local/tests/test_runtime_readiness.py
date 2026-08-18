@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from engine.scrapeflow.provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
 from local.scrapeflow_api.runtime_readiness import runtime_readiness_report
+from scripts.scrapeflow_runtime_readiness import main as runtime_readiness_main
 
 
-def healthy_payload(*, commit: str = "abc1234", jobs_total: int = 0) -> dict[str, object]:
+def healthy_payload(
+    *,
+    commit: str = "abc1234",
+    jobs_total: int = 0,
+    jobs_active: int = 0,
+) -> dict[str, object]:
     return {
         "ok": True,
         "mode": "automatic",
@@ -16,6 +23,7 @@ def healthy_payload(*, commit: str = "abc1234", jobs_total: int = 0) -> dict[str
         "tmdb_configured": True,
         "engine_configured": True,
         "build_commit": commit,
+        "build_time": "2026-08-18T00:00:00Z",
         "provider_capabilities": {
             "quark_share": {"status": "ready"},
             "alist_offline": {"status": "ready"},
@@ -39,7 +47,7 @@ def healthy_payload(*, commit: str = "abc1234", jobs_total: int = 0) -> dict[str
         "intake": {"enabled": False},
         "operations": {
             "jobs_total": jobs_total,
-            "jobs_active": 0,
+            "jobs_active": jobs_active,
             "formal_write_workers": 0,
             "provider_workers": 0,
             "provider_active": 0,
@@ -56,18 +64,38 @@ def paused_control() -> dict[str, object]:
     }
 
 
+def ready_offline_readiness() -> dict[str, object]:
+    return {
+        "status": "ready",
+        "verified": True,
+        "configured": True,
+        "read_only": True,
+        "checked_at": "2026-08-18T00:00:00Z",
+        "checks": {
+            "client": {"verified": True},
+            "aria2": {"verified": True},
+            "transfer": {"verified": True},
+        },
+        "issues": [],
+    }
+
+
 def fake_fetcher(
     health: dict[str, object] | None = None,
     control: dict[str, object] | None = None,
+    alist_offline: dict[str, object] | None = None,
 ):
     health_payload = healthy_payload() if health is None else health
     control_payload = paused_control() if control is None else control
+    offline_payload = ready_offline_readiness() if alist_offline is None else alist_offline
 
     def fetch(url: str, timeout: float) -> tuple[int, object]:
         if url.endswith("/api/health"):
             return 200, health_payload
         if url.endswith("/api/control"):
             return 200, control_payload
+        if url.endswith("/api/readiness/alist-offline"):
+            return 200, offline_payload
         return 404, {}
 
     return fetch
@@ -111,6 +139,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         report = runtime_readiness_report(
             api_url="http://localhost:8765",
+            expected_commit="abc1234",
             fetch_json=fake_fetcher(health=health),
         )
 
@@ -126,6 +155,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             fetch_json=fake_fetcher(control=control),
         )
 
@@ -144,20 +174,26 @@ class RuntimeReadinessTests(unittest.TestCase):
         self.assertTrue(any("build_commit" in issue for issue in report["issues"]))
 
     def test_existing_jobs_fail_unless_explicitly_allowed(self) -> None:
-        fetch = fake_fetcher(health=healthy_payload(jobs_total=2))
+        # A reused but paused deployment can retain queued RootJobs.  It must
+        # still be rejected by default, while the explicit flag retains the
+        # zero-worker / paused invariants and allows that known-safe state.
+        fetch = fake_fetcher(health=healthy_payload(jobs_total=2, jobs_active=2))
 
         blocked = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             fetch_json=fetch,
         )
         allowed = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             allow_existing_jobs=True,
             fetch_json=fetch,
         )
 
         self.assertEqual(blocked["status"], "失败")
         self.assertTrue(any("jobs_total" in issue for issue in blocked["issues"]))
+        self.assertTrue(any("jobs_active" in issue for issue in blocked["issues"]))
         self.assertEqual(allowed["status"], "通过")
 
     def test_static_lane_status_cannot_substitute_for_helper_readiness(self) -> None:
@@ -166,6 +202,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             fetch_json=fake_fetcher(health=health),
         )
 
@@ -183,6 +220,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             fetch_json=fake_fetcher(health=health),
         )
 
@@ -196,10 +234,85 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
             fetch_json=fake_fetcher(health=health),
         )
 
         self.assertEqual(report["status"], "通过")
+
+    def test_unverified_offline_preflight_fails_even_when_health_is_green(self) -> None:
+        offline = ready_offline_readiness()
+        offline["status"] = "unverified"
+        offline["verified"] = False
+        offline["checks"]["aria2"]["verified"] = False
+        offline["issues"] = ["configuration incomplete"]
+
+        report = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
+            fetch_json=fake_fetcher(alist_offline=offline),
+        )
+
+        self.assertEqual(report["status"], "失败")
+        self.assertIn("alist_offline.status must be ready", report["issues"])
+        self.assertIn("verified must be true", " ".join(report["issues"]))
+
+    def test_build_identity_requires_expected_id_and_utc_time(self) -> None:
+        no_expected = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            fetch_json=fake_fetcher(),
+        )
+        unrecorded = healthy_payload(commit="unrecorded")
+        unrecorded["build_time"] = "unrecorded"
+        invalid_metadata = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
+            fetch_json=fake_fetcher(health=unrecorded),
+        )
+
+        self.assertEqual(no_expected["status"], "失败")
+        self.assertIn("expected_commit", " ".join(no_expected["issues"]))
+        self.assertEqual(invalid_metadata["status"], "失败")
+        self.assertIn("health.build_commit", " ".join(invalid_metadata["issues"]))
+        self.assertIn("health.build_time", " ".join(invalid_metadata["issues"]))
+
+    def test_build_id_prefix_only_matches_from_expected_to_actual(self) -> None:
+        full_actual = healthy_payload(commit="abc1234deadbeef")
+        accepted = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
+            fetch_json=fake_fetcher(health=full_actual),
+        )
+        truncated_actual = healthy_payload(commit="abc1234")
+        rejected = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234deadbeef",
+            fetch_json=fake_fetcher(health=truncated_actual),
+        )
+        dirty_actual = healthy_payload(commit="0b53bcd-dirty")
+        dirty = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="0b53bcd-dirty",
+            fetch_json=fake_fetcher(health=dirty_actual),
+        )
+
+        self.assertEqual(accepted["status"], "通过")
+        self.assertEqual(rejected["status"], "失败")
+        self.assertEqual(dirty["status"], "通过")
+
+    def test_cli_requires_explicit_expected_build_id(self) -> None:
+        with self.assertRaises(SystemExit) as missing:
+            runtime_readiness_main([])
+        self.assertEqual(missing.exception.code, 2)
+
+        with patch(
+            "scripts.scrapeflow_runtime_readiness.runtime_readiness_report",
+            return_value={"status": "通过", "issues": []},
+        ) as readiness:
+            result = runtime_readiness_main(["--expected-commit", "0b53bcd-dirty"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(readiness.call_args.kwargs["expected_commit"], "0b53bcd-dirty")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,10 @@ from engine.scrapeflow.unit_identity import apply_work_unit_override
 from engine.scrapeflow.work_units import load_work_unit_records
 
 from local.scrapeflow_api.library_index import reconcile_root_work_units
-from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+from local.scrapeflow_api.simple_engine_runner import (
+    EnginePauseRequested,
+    SimpleEngineRunner,
+)
 from local.scrapeflow_api.unit_execution import (
     _register_unit_episode_gaps,
     _request_for_unit,
@@ -254,6 +257,61 @@ class UnitExecutionTests(unittest.TestCase):
         )
         self.assertEqual(len(planner_events), 1)
         self.assertEqual(len(executor_events), 1)
+
+    def test_root_scope_pause_after_plan_blocks_unit_formal_writer(self) -> None:
+        """F/G/H must pass the root predicate into the child executor."""
+        files = {"/incoming/one/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, _runner, planner_events, executor_events = self._setup(files)
+        root_task_id = "root-pause-after-plan"
+        paused = {"value": False}
+
+        class PauseAfterPlanRunner(SimpleEngineRunner):
+            def plan_job(self, *args, **kwargs):
+                planned = super().plan_job(*args, **kwargs)
+                paused["value"] = True
+                return planned
+
+        runner = PauseAfterPlanRunner(
+            state_root,
+            alist=alist,
+            tmdb=object(),
+            planner=_recording_planner(planner_events),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: (
+                executor_events.append(str(plan.target_root)) or {"ok": True}
+            ),
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root,
+            root_task_id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+
+        with self.assertRaises(EnginePauseRequested):
+            execute_new_work_units(
+                runner,
+                state_root,
+                root_task_id,
+                pause_requested=lambda: paused["value"],
+            )
+
+        self.assertEqual(executor_events, [])
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        self.assertIsNotNone(record.writer_job_id)
+        self.assertEqual(runner.get_job(record.writer_job_id).phase, "planned")
+        self.assertFalse(
+            any(row.outcome == "failed" for row in load_work_acceptance(state_root, root_task_id)),
+        )
 
 
     def test_accepted_tv_unit_registers_precise_episode_gaps(self) -> None:

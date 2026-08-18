@@ -13,6 +13,7 @@ from .subtitle_provider import (
     SubtitleDiscoveryService,
     SubtitleInfrastructureError,
     SubtitleMaterializer,
+    SubtitlePauseRequested,
     SubtitleProviderError,
     score_subtitle_candidate,
 )
@@ -30,9 +31,9 @@ __all__ = [
     "SubtitleDiscoveryService",
     "SubtitleInfrastructureError",
     "SubtitleMaterializer",
+    "SubtitlePauseRequested",
     "SubtitleProviderError",
     "score_subtitle_candidate",
 ]
-
 
 

@@ -29,6 +29,8 @@ class ReleaseCheckTests(unittest.TestCase):
         "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_AUTO_REPAIR_ENABLED": "0",
         "SCRAPEFLOW_PROVIDER_WORKERS": "1",
+        "SCRAPEFLOW_ROOT_JOB_PILOT": "",
+        "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET": "",
         "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
         "SCRAPEFLOW_QUARK_HELPER_TOKEN": (
             "replace-with-a-random-helper-token-at-least-24-characters"
@@ -86,6 +88,7 @@ class ReleaseCheckTests(unittest.TestCase):
         api_env = "\n".join(
             f"      {key}: ${{{key}:-{value}}}"
             for key, value in compose_values.items()
+            if key != "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET"
         )
         api_ports_yaml = "\n".join(f'      - "{port}"' for port in api_port_values)
         (root / "docker-compose.yml").write_text(
@@ -97,6 +100,9 @@ class ReleaseCheckTests(unittest.TestCase):
             "    volumes:\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
+            "    networks:\n"
+            "      - default\n"
+            "      - alist-offline\n"
             "  api:\n"
             "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
             "    environment:\n"
@@ -109,11 +115,18 @@ class ReleaseCheckTests(unittest.TestCase):
             "    volumes:\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
+            "    networks:\n"
+            "      - default\n"
+            "      - alist-offline\n"
             "  offline-aria2:\n"
             "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
-            "    command: [\"aria2c\", \"--no-conf\", \"--dir=/opt/alist/data/temp/aria2\", \"--file-allocation=none\"]\n"
+            "    command: [\"/bin/sh\", \"-ec\", \"umask 077; mkdir -p /run/scrapeflow; printf '%s\\\\n' \\\"rpc-secret=$${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\\\" > /run/scrapeflow/aria2.conf; exec aria2c --conf-path=/run/scrapeflow/aria2.conf --dir=/opt/alist/data/temp/aria2 --file-allocation=none\"]\n"
+            "    environment:\n"
+            "      SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET: ${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\n"
             "    volumes:\n"
             "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
+            "    networks:\n"
+            "      - alist-offline\n"
             "  quark-helper:\n"
             "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
             "    restart: unless-stopped\n"
@@ -131,6 +144,14 @@ class ReleaseCheckTests(unittest.TestCase):
             "        condition: service_started\n"
             "        restart: true\n"
             "    network_mode: service:api\n",
+            encoding="utf-8",
+        )
+        compose_path = root / "docker-compose.yml"
+        compose_path.write_text(
+            compose_path.read_text(encoding="utf-8")
+            + "networks:\n"
+            "  alist-offline:\n"
+            "    driver: bridge\n",
             encoding="utf-8",
         )
         (root / "Dockerfile.api").write_text(
@@ -309,6 +330,8 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIn("offline sibling", readme)
         self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", readme)
         self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT", readme)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET", readme)
+        self.assertIn("verified=true", readme)
         self.assertNotIn("172.20.0.0/16", readme)
         self.assertNotIn("尚未接入运行时", readme)
         self.assertNotIn("四动作", readme)
@@ -319,6 +342,8 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIn("POST /api/control/resume", deployment)
         self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", deployment)
         self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT", deployment)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET", deployment)
+        self.assertIn("alist-offline", deployment)
         self.assertNotIn("四动作", deployment)
         self.assertIn("P15", acceptance)
         self.assertIn("有效 quark_share", acceptance)
@@ -327,6 +352,7 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertNotIn("SCRAPEFLOW_API_PORT=8765", environment_template)
         self.assertIn("Setting it to 0 does not bypass", environment_template)
         self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES", environment_template)
+        self.assertIn("SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET=", environment_template)
         self.assertIn("创建 RootJob", engine_readme)
         self.assertNotIn("策略冲突", engine_readme)
 
@@ -401,6 +427,32 @@ class ReleaseCheckTests(unittest.TestCase):
 
         self.assertTrue(any("file-allocation=none" in issue for issue in issues))
 
+    def test_deployment_contract_requires_authenticated_private_offline_aria2(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_deployment_contract_files(root)
+            compose_path = root / "docker-compose.yml"
+            compose_path.write_text(
+                compose_path.read_text(encoding="utf-8")
+                .replace(
+                    "${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set "
+                    "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}",
+                    "${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:-}",
+                )
+                .replace(
+                    "    networks:\n"
+                    "      - alist-offline\n"
+                    "  quark-helper:",
+                    "  quark-helper:",
+                ),
+                encoding="utf-8",
+            )
+
+            issues = local_deployment_contract_issues(root)
+
+        self.assertTrue(any("offline-aria2.environment" in issue for issue in issues))
+        self.assertTrue(any("offline-aria2.networks" in issue for issue in issues))
+
     def test_deployment_contract_requires_helper_pansou_and_pilot_wiring(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -410,6 +462,7 @@ class ReleaseCheckTests(unittest.TestCase):
                 "\n".join(
                     line for line in env_path.read_text(encoding="utf-8").splitlines()
                     if not line.startswith("SCRAPEFLOW_QUARK_HELPER_TOKEN=")
+                    and not line.startswith("SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET=")
                 ) + "\n",
                 encoding="utf-8",
             )
@@ -418,6 +471,7 @@ class ReleaseCheckTests(unittest.TestCase):
                 "\n".join(
                     line for line in compose_path.read_text(encoding="utf-8").splitlines()
                     if "SCRAPEFLOW_PROVIDER_PILOT_GAP" not in line
+                    and "SCRAPEFLOW_ROOT_JOB_PILOT" not in line
                     and "SCRAPEFLOW_PANSOU_MAX_LINKS" not in line
                 ) + "\n",
                 encoding="utf-8",
@@ -426,7 +480,9 @@ class ReleaseCheckTests(unittest.TestCase):
             issues = local_deployment_contract_issues(root)
 
         self.assertTrue(any("SCRAPEFLOW_QUARK_HELPER_TOKEN" in issue for issue in issues))
+        self.assertTrue(any("SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET" in issue for issue in issues))
         self.assertTrue(any("SCRAPEFLOW_PROVIDER_PILOT_GAP" in issue for issue in issues))
+        self.assertTrue(any("SCRAPEFLOW_ROOT_JOB_PILOT" in issue for issue in issues))
         self.assertTrue(any("SCRAPEFLOW_PANSOU_MAX_LINKS" in issue for issue in issues))
 
     def test_deployment_contract_rejects_sidecar_topology_drift(self) -> None:

@@ -39,7 +39,7 @@ from engine.scrapeflow.work_units import load_work_unit_records
 from .library_index import reconcile_root_work_units
 from .redaction import redact_error, redact_value
 from .root_aggregation import aggregate_root_job
-from .simple_engine_runner import EngineJob, SimpleEngineRunner
+from .simple_engine_runner import EngineJob, EnginePauseRequested, SimpleEngineRunner
 from .unit_e_lanes import compute_known_gap_tokens, execute_unit_e_lanes
 from .unit_execution import execute_new_work_units
 
@@ -138,6 +138,8 @@ def _cleanup_empty_source_shells(
     state_root: Path,
     root_task_id: str,
     source: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Remove only verifiably empty dirs in a completed root's own intake tree.
 
@@ -179,7 +181,18 @@ def _cleanup_empty_source_shells(
 
     removed: list[str] = []
 
+    def paused() -> bool:
+        """Fail closed if the composition-root pause state is unavailable."""
+        if not callable(pause_requested):
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            return True
+
     def visit(directory: str) -> None:
+        if paused():
+            return
         for item in rows(directory):
             name = item.get("name")
             if (
@@ -192,7 +205,16 @@ def _cleanup_empty_source_shells(
                 raise RuntimeError(f"AList 源目录出现不安全条目: {directory}")
             if item.get("is_dir") is True:
                 visit(posixpath.join(directory, name))
+                if paused():
+                    return
+        if paused():
+            return
         if rows(directory):
+            return
+        # This is the exact remote-delete boundary.  A completion check at
+        # the caller is insufficient because a root-scoped pilot can close
+        # while the recursive fresh listing is still in progress.
+        if paused():
             return
         deleted = remove_empty(directory)
         parent = posixpath.dirname(directory) or "/"
@@ -212,6 +234,10 @@ def _cleanup_empty_source_shells(
             try:
                 remove = getattr(runner.alist, "remove", None)
                 if callable(remove):
+                    # The fallback is a separate remote delete and needs its
+                    # own checkpoint even though remove_empty just ran.
+                    if paused():
+                        return
                     remove(parent, [name])
                     parent_rows = rows(parent)
                     if not any(item.get("name") == name for item in parent_rows):
@@ -306,6 +332,10 @@ def run_root_pipeline(
             execute_unit_e_lanes(
                 runner, state_root, root_task_id, pause_requested=pause_requested,
             )
+        except EnginePauseRequested:
+            # A paused E lane deliberately leaves its durable ledger/carrier
+            # for fresh-state recovery.  It is not a business failure.
+            return job
         except Exception as exc:
             return _persist_root(
                 runner, job, "failed",
@@ -324,7 +354,15 @@ def run_root_pipeline(
     ]
     if new_work_records:
         # F/G/H/J: single planner, single writer, typed acceptance, gap ledger.
-        results = execute_new_work_units(runner, state_root, root_task_id)
+        try:
+            results = execute_new_work_units(
+                runner,
+                state_root,
+                root_task_id,
+                pause_requested=pause_requested,
+            )
+        except EnginePauseRequested:
+            return job
         failed = [result for result in results if result.outcome == "failed"]
         if failed:
             return _persist_root(
@@ -350,7 +388,11 @@ def run_root_pipeline(
     if not (callable(pause_requested) and pause_requested()):
         try:
             _cleanup_empty_source_shells(
-                runner, state_root, root_task_id, source,
+                runner,
+                state_root,
+                root_task_id,
+                source,
+                pause_requested=pause_requested,
             )
         except Exception:
             pass
@@ -363,4 +405,3 @@ __all__ = [
     "is_intake_bound_root",
     "run_root_pipeline",
 ]
-

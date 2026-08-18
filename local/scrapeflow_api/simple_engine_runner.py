@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from engine.scrapeflow.archive import ArchivePasswordError
+from engine.scrapeflow.archive_preprocessing import ArchivePauseRequested
 from engine.scrapeflow.errors import FormalTargetConflictError
 from engine.scrapeflow.media_quality import (
     is_production_test_media_path,
@@ -71,6 +72,11 @@ class EnginePauseRequested(EngineExecutionError):
     Pause is deliberately distinct from cancellation: the current durable
     operation remains resumable and is not converted to a terminal state.
     """
+
+    # Composition layers recognize this marker without importing the engine
+    # module. A root-scoped pause during child plan/write is not an
+    # infrastructure outage and must not schedule a retry as one.
+    pause_requested = True
 
 
 class EngineJobConflictError(EngineExecutionError):
@@ -254,6 +260,45 @@ def _pause_checkpoint(checker: Callable[[], bool] | None) -> None:
         raise EnginePauseRequested("暂停状态不可确认，已安全停止") from exc
     if paused:
         raise EnginePauseRequested("全局暂停已生效；当前阶段保持可恢复")
+
+
+class _PauseCheckedArchivePort:
+    """Proxy every archive-adapter AList operation through the root fence.
+
+    Archive adapters intentionally receive a small AList-shaped port rather
+    than the runner itself.  Guarding that port preserves old adapter
+    signatures while closing the check->download/mkdir/upload race that a
+    single preprocessor-entry checkpoint cannot cover.
+    """
+
+    def __init__(
+        self,
+        target: object,
+        pause_requested: Callable[[], bool] | None,
+    ) -> None:
+        self._target = target
+        self._pause_requested = pause_requested
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        def guarded(*args: object, **kwargs: object) -> object:
+            try:
+                if self._pause_requested is not None and self._pause_requested():
+                    raise ArchivePauseRequested(
+                        "暂停已生效，归档远端操作已安全停止",
+                    )
+            except ArchivePauseRequested:
+                raise
+            except Exception as exc:
+                raise ArchivePauseRequested(
+                    "暂停状态不可确认，归档远端操作已安全停止",
+                ) from exc
+            return value(*args, **kwargs)
+
+        return guarded
 
 
 _ENGINE_PHASES = frozenset({
@@ -990,6 +1035,7 @@ class SimplePlanExecutor:
             return
         ensure = getattr(self.alist, "ensure_directory", None)
         if callable(ensure):
+            _cancellation_checkpoint()
             ensure(path)
             return
         mkdir = getattr(self.alist, "mkdir", None)
@@ -998,6 +1044,7 @@ class SimplePlanExecutor:
         current = "/"
         for segment in path.strip("/").split("/"):
             current = posixpath.join(current, segment)
+            _cancellation_checkpoint()
             mkdir(current)
 
     def _check_size(self, path: str, expected: int | None) -> Mapping[str, object]:
@@ -1050,7 +1097,10 @@ class SimplePlanExecutor:
                     # visible or becomes a recoverable failure.
                     return
                 try:
+                    _cancellation_checkpoint()
                     rename(full_path, new_name)
+                except (EnginePauseRequested, EngineCancellationRequested):
+                    raise
                 except Exception as exc:
                     last_error = exc
                     rename_submitted = True
@@ -1069,8 +1119,10 @@ class SimplePlanExecutor:
 
         if source_dir == target_dir:
             if original != final:
+                _cancellation_checkpoint()
                 rename_with_visibility_retry(posixpath.join(source_dir, original), final)
             return
+        _cancellation_checkpoint()
         self._ensure_dir(target_dir)
         move = getattr(self.alist, "move", None)
         if not callable(move):
@@ -1098,10 +1150,13 @@ class SimplePlanExecutor:
                     # make one refreshed destination check before retrying.
                     move_submitted = True
                     continue
+                _cancellation_checkpoint()
                 move(source_dir, target_dir, [original])
                 move_submitted = True
                 if self._visible_exact(intermediate_path) is not None:
                     break
+            except (EnginePauseRequested, EngineCancellationRequested):
+                raise
             except Exception as exc:
                 last_move_error = exc
                 move_submitted = True
@@ -1121,6 +1176,7 @@ class SimplePlanExecutor:
         # short provider visibility retry in ``_check_size``.
         existing = self._exact(target)
         if existing is None:
+            _cancellation_checkpoint()
             uploader(target, data, content_type, overwrite=False)
         elif int(existing["size"]) != len(data):
             raise EngineExecutionError(f"目标元数据已存在但大小不同，拒绝覆盖: {target}")
@@ -1145,6 +1201,8 @@ class SimplePlanExecutor:
         self._ensure_dir(posixpath.dirname(target) or "/")
         try:
             return self._upload_bytes(target, data, content_type)
+        except (EnginePauseRequested, EngineCancellationRequested):
+            raise
         except Exception:
             raced = self._exact(target)
             if raced is not None:
@@ -1213,6 +1271,7 @@ class SimplePlanExecutor:
             raise EngineExecutionError(f"字幕 staging 源不可见或大小不符: {source}")
         source_dir = posixpath.dirname(source) or "/"
         target_dir = posixpath.dirname(target) or "/"
+        _cancellation_checkpoint()
         self._move_file(source_dir, target_dir, posixpath.basename(source), posixpath.basename(target))
         observed = self._check_size(target, expected_size)
         self._verify_source_absent(source)
@@ -1284,7 +1343,10 @@ class SimplePlanExecutor:
             if rows(directory):
                 return
             try:
+                _cancellation_checkpoint()
                 deleted = remove_empty(directory)
+            except (EnginePauseRequested, EngineCancellationRequested):
+                raise
             except Exception as exc:
                 raise EngineExecutionError(f"无法清理空源目录: {directory}: {exc}") from exc
             if deleted is False:
@@ -1324,6 +1386,7 @@ class SimplePlanExecutor:
                 original = str(getattr(item, "original_name"))
                 if self._exact(source_path) is None:
                     continue
+                _cancellation_checkpoint()
                 remove(source_dir, [original])
                 if self._exact(source_path) is not None:
                     raise EngineExecutionError(f"最终清理后源文件仍存在: {source_path}")
@@ -1459,6 +1522,7 @@ class SimplePlanExecutor:
                     _cancellation_checkpoint()
                     if not callable(downloader):
                         raise EngineExecutionError("计划包含海报，但 TMDB 客户端没有 download_poster")
+                    _cancellation_checkpoint()
                     data = downloader(image_path)
                     if not isinstance(data, (bytes, bytearray)):
                         raise EngineExecutionError(f"TMDB 海报响应无效: {image_path}")
@@ -1743,31 +1807,47 @@ class SimpleEngineRunner:
         video_path: str | None = None,
         subtitle_language: str | None = None,
         subtitle_validator: Callable[..., object] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         """Install one subtitle member under the single formal write lock."""
         with self.worker_lock():
+            effective_pause = (
+                pause_requested
+                if pause_requested is not None
+                else self._pause_requested
+            )
+            _pause_checkpoint(effective_pause)
+            pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
             installer = getattr(self.executor, "install_subtitle_sidecar", None)
-            if not callable(installer):
-                raise EngineExecutionError("当前 Engine executor 不支持字幕侧挂写入")
-            kwargs: dict[str, object] = {
-                "expected_size": expected_size,
-                "video_path": video_path,
-            }
-            if subtitle_language is not None:
-                kwargs["subtitle_language"] = subtitle_language
-            if subtitle_validator is not None:
-                kwargs["subtitle_validator"] = subtitle_validator
             try:
-                return dict(installer(source_path, target_path, **kwargs))
-            except TypeError as exc:
-                # Focused legacy executors may not yet accept the optional
-                # language keyword.  Do not hide a real write TypeError; only
-                # retry when the signature itself rejected that keyword.
-                if subtitle_language is None or "subtitle_language" not in str(exc):
-                    raise
-                kwargs.pop("subtitle_language", None)
-                kwargs.pop("subtitle_validator", None)
-                return dict(installer(source_path, target_path, **kwargs))
+                if not callable(installer):
+                    raise EngineExecutionError("当前 Engine executor 不支持字幕侧挂写入")
+                kwargs: dict[str, object] = {
+                    "expected_size": expected_size,
+                    "video_path": video_path,
+                }
+                if subtitle_language is not None:
+                    kwargs["subtitle_language"] = subtitle_language
+                if subtitle_validator is not None:
+                    kwargs["subtitle_validator"] = subtitle_validator
+                try:
+                    return dict(installer(source_path, target_path, **kwargs))
+                except TypeError as exc:
+                    # Focused legacy executors may not yet accept the optional
+                    # language keyword.  Do not hide a real write TypeError;
+                    # only retry when the signature itself rejected that
+                    # keyword.  A scoped invocation never retries unguarded.
+                    if (
+                        effective_pause is not None
+                        or subtitle_language is None
+                        or "subtitle_language" not in str(exc)
+                    ):
+                        raise
+                    kwargs.pop("subtitle_language", None)
+                    kwargs.pop("subtitle_validator", None)
+                    return dict(installer(source_path, target_path, **kwargs))
+            finally:
+                _PAUSE_REQUEST_CHECK.reset(pause_token)
 
     def validate_subtitle_source_content(
         self,
@@ -4366,6 +4446,7 @@ class SimpleEngineRunner:
         *,
         job_id: str,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> tuple[EngineRequest, Mapping[str, object] | None]:
         """Let an injected archive adapter replace only a source with staging.
 
@@ -4379,26 +4460,52 @@ class SimpleEngineRunner:
         method = getattr(adapter, "prepare_ordinary_request", None)
         if not callable(method):
             return request, None
+        effective_pause = (
+            pause_requested
+            if pause_requested is not None
+            else self._pause_requested
+        )
+        _pause_checkpoint(effective_pause)
         # Archive inspection may perform the first remote listing/download;
-        # authenticate at this post-start boundary before invoking it.
-        self._ensure_authenticated(self.alist)
+        # authenticate through the same guarded port before invoking it.  A
+        # raw ``self.alist.login`` here would leave a root-scope race between
+        # the checkpoint and the authentication request.
+        guarded_alist = _PauseCheckedArchivePort(self.alist, effective_pause)
+        self._ensure_authenticated(guarded_alist)
+        _pause_checkpoint(effective_pause)
         local_staging, remote_staging = self._archive_task_roots(job_id)
         kwargs = {
-            "alist": self.alist,
+            "alist": guarded_alist,
             "task_staging": local_staging,
             "remote_staging_root": remote_staging,
+            "pause_requested": effective_pause,
         }
         if retry_password is not None:
             kwargs["retry_password"] = retry_password
         try:
-            prepared = method(asdict(request), **kwargs)
-        except TypeError:
             try:
-                # Small migration/test adapters may accept ``alist`` but not
-                # concrete staging kwargs.
-                prepared = method(asdict(request), alist=self.alist)
+                prepared = method(asdict(request), **kwargs)
             except TypeError:
-                prepared = method(asdict(request))
+                try:
+                    # Small migration/test adapters may accept ``alist`` but
+                    # not concrete staging/pause kwargs.  The guarded port
+                    # still fences every remote call they make.
+                    _pause_checkpoint(effective_pause)
+                    prepared = method(asdict(request), alist=guarded_alist)
+                except TypeError:
+                    # A legacy adapter with no port contract cannot expose
+                    # per-operation hooks.  A scoped automatic root cannot
+                    # safely invoke it because its remote operations would be
+                    # invisible to the RootJob fence.
+                    if pause_requested is not None:
+                        raise EngineRequestError(
+                            "归档预处理器不支持受控 AList port，拒绝在 RootJob 试运行范围执行"
+                        )
+                    _pause_checkpoint(effective_pause)
+                    prepared = method(asdict(request))
+        except ArchivePauseRequested as exc:
+            raise EnginePauseRequested("归档预处理已响应暂停请求") from exc
+        _pause_checkpoint(effective_pause)
         if not isinstance(prepared, Mapping):
             raise EngineRequestError("归档预处理返回无效请求")
         source = prepared.get("source_path", request.source_path)
@@ -4454,13 +4561,17 @@ class SimpleEngineRunner:
         return replace(request, source_path=normalized_source), dict(raw)
 
     def _preprocess_ordinary_request(
-        self, request: EngineRequest, *, job_id: str | None = None,
+        self,
+        request: EngineRequest,
+        *,
+        job_id: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> EngineRequest:
         """Compatibility wrapper for focused callers of the old private hook."""
         if job_id is None:
             job_id = f"preprocess-{uuid.uuid4().hex}"
         result, _projection = self._preprocess_ordinary_request_details(
-            request, job_id=job_id,
+            request, job_id=job_id, pause_requested=pause_requested,
         )
         return result
 
@@ -4771,6 +4882,7 @@ class SimpleEngineRunner:
         job_id: str | None = None,
         internal_child_of: str | None = None,
         skip_archive_preprocessing: bool = False,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> EngineJob:
         """Build and persist one plan.
 
@@ -4779,6 +4891,12 @@ class SimpleEngineRunner:
         in which a planned child existed but had not yet been marked hidden
         from the public root queue.
         """
+        effective_pause = (
+            pause_requested
+            if pause_requested is not None
+            else self._pause_requested
+        )
+        _pause_checkpoint(effective_pause)
         request = request if isinstance(request, EngineRequest) else EngineRequest.from_mapping(request)
         selected_shelf: TargetShelf | None = None
         selected_root: str | None = None
@@ -4799,9 +4917,13 @@ class SimpleEngineRunner:
         archive_projection: Mapping[str, object] | None = None
         if internal_child_of is None and not skip_archive_preprocessing:
             request, archive_projection = self._preprocess_ordinary_request_details(
-                request, job_id=job_id,
+                request,
+                job_id=job_id,
+                pause_requested=effective_pause,
             )
+        _pause_checkpoint(effective_pause)
         plan = self._build_plan(request)
+        _pause_checkpoint(effective_pause)
         if selected_root is not None:
             self._require_plan_target_shelf_containment(
                 plan,
@@ -4849,6 +4971,7 @@ class SimpleEngineRunner:
             target_root=selected_root,
             selected_at=now if selected_shelf is not None else None,
         )
+        _pause_checkpoint(effective_pause)
         atomic_write_json(self._job_path(job_id), job.as_dict(), allow_nan=False)
         return job
 
@@ -5014,7 +5137,10 @@ class SimpleEngineRunner:
                 archive_request, archive_projection = self._reusable_archive_projection(job, intake)
                 if archive_projection is None:
                     archive_request, archive_projection = self._preprocess_ordinary_request_details(
-                        intake, job_id=job_id, retry_password=retry_password,
+                        intake,
+                        job_id=job_id,
+                        retry_password=retry_password,
+                        pause_requested=effective_pause,
                     )
                 cancelled = self._consume_cancel_request(archiving)
                 if cancelled is not None:
@@ -5545,10 +5671,12 @@ class SimpleEngineRunner:
             return {"status": "already_consumed", "source": source}
         ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
         if callable(ensure):
+            _cancellation_checkpoint()
             ensure(processed_root)
         move = getattr(self.alist, "move", None)
         if not callable(move):
             raise EngineExecutionError("AList 客户端缺少 move 接口，无法隔离原始归档")
+        _cancellation_checkpoint()
         move(parent, processed_root, [name])
         return {
             "status": "moved_to_processed",
@@ -6100,6 +6228,7 @@ class SimpleEngineRunner:
             if self._consume_cancel_request(self._read(job_id)) is not None:
                 return self._read(job_id)
             if hold_kind == "missing":
+                _pause_checkpoint(effective_pause)
                 ensure(hold_root)
                 if self._remote_entry_kind(hold_root) != "directory":
                     raise EngineExecutionError("existing_gap hold 根创建后回读失败")
@@ -6139,6 +6268,7 @@ class SimpleEngineRunner:
             )
             atomic_write_json(self._job_path(job.id), prepared.as_dict(), allow_nan=False)
             latest = self._read(job_id)
+            _pause_checkpoint(effective_pause)
             move(parent, hold_root, [name])
             target_rows: list[object] | None = None
             listing_after_move = getattr(self.alist, "list", None)
@@ -6348,6 +6478,7 @@ class SimpleEngineRunner:
                     _pause_checkpoint(effective_pause)
                     if self._consume_cancel_request(self._read(job_id)) is not None:
                         return self._read(job_id)
+                    _pause_checkpoint(effective_pause)
                     ensure(processed_root)
                     if self._remote_entry_kind(processed_root) != "directory":
                         raise EngineExecutionError("processed 目录创建后回读失败")
@@ -6359,6 +6490,7 @@ class SimpleEngineRunner:
                     latest = self._read(job_id)
                     if self._consume_cancel_request(latest) is not None:
                         return self._read(job_id)
+                    _pause_checkpoint(effective_pause)
                     move(parent, processed_root, [name])
                     if (
                         self._remote_entry_kind(source) != "missing"
@@ -6483,7 +6615,12 @@ class SimpleEngineRunner:
         """Execute or retry an automatic job."""
         return self.execute_job(job_id, pause_requested=pause_requested)
 
-    def repair_automatic_artifacts(self, job_id: str) -> EngineJob:
+    def repair_automatic_artifacts(
+        self,
+        job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
         """Re-run only a completed plan's deterministic metadata/artwork.
 
         A full-library audit may discover that a poster or NFO disappeared
@@ -6494,6 +6631,12 @@ class SimpleEngineRunner:
         """
         with self.worker_lock():
             job = self._read(job_id)
+            effective_pause = (
+                pause_requested
+                if pause_requested is not None
+                else self._pause_requested
+            )
+            _pause_checkpoint(effective_pause)
             if job.phase != "executed":
                 raise SimpleEngineError(f"Engine job {job_id} 当前不能修复元数据: {job.phase}")
             if job.summary.get("audit_owned") is True:
@@ -6510,6 +6653,7 @@ class SimpleEngineRunner:
                     job.summary.get("automatic") is True
                     and job.summary.get("internal_child") is not True
                 ),
+                pause_requested=effective_pause,
             )
             summary = dict(job.summary)
             summary["last_artifact_repair_at"] = _now()
@@ -6994,7 +7138,10 @@ class SimpleEngineRunner:
             if not parent or not name:
                 raise EngineExecutionError(f"归档 staging 路径无效: {path}")
             try:
+                _cancellation_checkpoint()
                 deleted = remove_empty(path)
+            except (EnginePauseRequested, EngineCancellationRequested):
+                raise
             except Exception as exc:
                 raise EngineExecutionError(f"无法清理空归档 staging 目录: {path}: {exc}") from exc
             if deleted is False:
@@ -7006,7 +7153,10 @@ class SimpleEngineRunner:
             # The directory was just proven empty, so delete that exact
             # basename through the ordinary remove endpoint and read it back.
             try:
+                _cancellation_checkpoint()
                 remove(parent, [name])
+            except (EnginePauseRequested, EngineCancellationRequested):
+                raise
             except Exception as exc:
                 raise EngineExecutionError(f"无法删除空归档 staging 目录: {path}: {exc}") from exc
             if not directory_missing(path):
@@ -7028,7 +7178,10 @@ class SimpleEngineRunner:
                     removed.append(child)
                     continue
                 try:
+                    _cancellation_checkpoint()
                     remove(directory, [name])
+                except (EnginePauseRequested, EngineCancellationRequested):
+                    raise
                 except Exception as exc:
                     raise EngineExecutionError(f"无法清理归档 staging 文件: {child}: {exc}") from exc
                 if any(row.get("name") == name for row in rows(directory)):

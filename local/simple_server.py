@@ -60,6 +60,10 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
 )
+from local.scrapeflow_api.alist_offline_readiness import (
+    alist_offline_readiness,
+    unverified_alist_offline_readiness,
+)
 from local.scrapeflow_api.control_state import PersistentControlState
 from local.scrapeflow_api.quark_helper_readiness import (
     quark_helper_readiness_from_env,
@@ -67,6 +71,13 @@ from local.scrapeflow_api.quark_helper_readiness import (
 from local.scrapeflow_api.provider_staging import (
     ProviderStagingPathError,
     replenishment_staging_root_for_media_root,
+)
+from local.scrapeflow_api.root_job_pilot import (
+    RootJobPilotError,
+    environment_root_job_pilot,
+    normalize_root_job_id,
+    root_job_allowed,
+    single_root_scope,
 )
 from local.scrapeflow_api.redaction import redact_error, redact_value
 from local.scrapeflow_api.replenishment_tiers import (
@@ -242,6 +253,11 @@ class SimpleApplication:
         self._control_path = self.state_root / "global-control.json"
         self._control_state = PersistentControlState(self._control_path)
         self._control_lock = threading.Lock()
+        # Health must remain a no-network liveness projection.  Cache the
+        # explicit no-write offline-lane preflight here; GET readiness and a
+        # pilot resume refresh it deliberately.
+        self._offline_readiness_lock = threading.Lock()
+        self._offline_readiness = unverified_alist_offline_readiness()
         # A persisted ``paused=False`` records the last operator decision; it
         # is not a startup authorization.  Every API process begins behind a
         # fresh in-memory pause fence and remains there until this process
@@ -416,6 +432,251 @@ class SimpleApplication:
             )
 
     # ------------------------------------------------------------------
+    # RootJob pilot scope + no-write AList offline preflight
+    # ------------------------------------------------------------------
+
+    def _automatic_root_allowed(self, root_job_id: object) -> bool:
+        """Return whether the current durable/deployment scope admits a root.
+
+        This is deliberately evaluated at *every* scheduler boundary rather
+        than only when an operator arms the pilot.  A changed/malformed scope
+        or environment selector therefore stops delayed futures safely before
+        their next effectful operation.
+        """
+        try:
+            return root_job_allowed(
+                self.control().get("automatic_scope"),
+                root_job_id,
+                environment_root_job_id=environment_root_job_pilot(),
+            )
+        except (RootJobPilotError, TypeError, ValueError):
+            return False
+
+    def _automatic_global_audit_allowed(
+        self,
+        *,
+        pilot_root_job_id: object | None = None,
+    ) -> bool:
+        """Whether an automatic audit may run under the current root scope.
+
+        A full-library automatic audit can create ownership/progress records
+        for roots unrelated to the selected pilot.  It is therefore forbidden
+        for ``none``/invalid scopes *and* for a single-root pilot.  The latter
+        may use the explicit report-only audit endpoint, but automatic audit
+        projection/retry is intentionally held until a broader, separately
+        authorized run.
+        """
+        del pilot_root_job_id
+        scope = self._pilot_scope_view()
+        # A Compose-level exact RootJob ceiling is a hard bound too.  A
+        # full-library audit can create audit-owned roots and lifecycle state
+        # before a Provider worker reaches its own per-root gate, so it must
+        # stay closed whenever that ceiling is present.
+        return (
+            scope.get("mode") == "all"
+            and scope.get("environment_root_job_id") is None
+        )
+
+    def _pilot_scope_view(self) -> dict[str, object]:
+        """Return the effective scope as a small health-safe projection."""
+        try:
+            scope = self.control().get("automatic_scope")
+            environment_root_job_id = environment_root_job_pilot()
+            # ``root_job_allowed`` validates scope as a side effect only when
+            # it receives an id.  Keep the public status conservative if a
+            # damaged document somehow escaped PersistentControlState.
+            if not isinstance(scope, Mapping):
+                raise RootJobPilotError("scope is not a mapping")
+            mode = scope.get("mode")
+            root_job_id = scope.get("root_job_id")
+            if mode == "single_root":
+                normalized = normalize_root_job_id(root_job_id)
+                return {
+                    "mode": "single_root",
+                    "root_job_id": normalized,
+                    "environment_root_job_id": environment_root_job_id,
+                    "enforced": True,
+                    "automatic_global_audit": "blocked",
+                }
+            if mode == "all" and root_job_id is None:
+                return {
+                    "mode": "all",
+                    "root_job_id": None,
+                    "environment_root_job_id": environment_root_job_id,
+                    "enforced": environment_root_job_id is not None,
+                    "automatic_global_audit": (
+                        "blocked"
+                        if environment_root_job_id is not None
+                        else "allowed"
+                    ),
+                }
+            return {
+                "mode": "none",
+                "root_job_id": None,
+                "environment_root_job_id": environment_root_job_id,
+                "enforced": True,
+                "automatic_global_audit": "blocked",
+            }
+        except (RootJobPilotError, TypeError, ValueError):
+            return {
+                "mode": "invalid",
+                "root_job_id": None,
+                "environment_root_job_id": None,
+                "enforced": True,
+                "automatic_global_audit": "blocked",
+            }
+
+    def _validate_pilot_root_job(self, root_job_id: object) -> str:
+        """Prove that an armed selector is a real intake-bound RootJob."""
+        try:
+            normalized = normalize_root_job_id(root_job_id)
+        except RootJobPilotError as exc:
+            raise EngineRequestError(str(exc)) from exc
+        try:
+            configured = environment_root_job_pilot()
+        except RootJobPilotError as exc:
+            raise ApplicationError(str(exc)) from exc
+        if configured is not None and configured != normalized:
+            raise EngineRequestError(
+                "RootJob 与 SCRAPEFLOW_ROOT_JOB_PILOT 部署范围不一致"
+            )
+        runner = self._get_engine_runner()
+        job = runner.get_job(normalized)
+        if self._is_internal_child(job):
+            raise EngineRequestError("试运行范围必须是公开 RootJob，不能是内部 child")
+        from local.scrapeflow_api.root_pipeline import is_intake_bound_root
+        if not is_intake_bound_root(self.state_root, normalized):
+            raise EngineRequestError("试运行范围必须是 IntakeSource 绑定的 RootJob")
+        return normalized
+
+    def alist_offline_readiness(self) -> dict[str, object]:
+        """Run and cache the explicit no-write AList offline preflight."""
+        client = self._alist_client
+        if client is None and self._engine_runner is not None:
+            client = getattr(self._engine_runner, "alist", None)
+        report = alist_offline_readiness(client, media_root=self.remote_root)
+        with self._offline_readiness_lock:
+            self._offline_readiness = report
+        return report
+
+    def _cached_alist_offline_readiness(self) -> dict[str, object]:
+        with self._offline_readiness_lock:
+            # The report is JSON-shaped.  A shallow top-level copy is enough
+            # for internal callers and prevents replacement of our cache.
+            return dict(self._offline_readiness)
+
+    def arm_root_job_pilot(self, root_job_id: object) -> dict[str, object]:
+        """Persist a single RootJob scope while keeping the process paused."""
+        # Take a durable snapshot under the application lock, then release it
+        # for the local RootJob lookup.  The compare-and-set below rejects a
+        # concurrent pause/resume/scope change instead of overwriting it.
+        with self._control_lock:
+            snapshot = self._control_state.read()
+            startup_paused = self._startup_paused
+            # ``_startup_paused`` is process-local. A second API process has
+            # it set even while another process is actively running the
+            # durable pilot, so it must never be used to soften this durable
+            # boundary. Scope changes are legal only after the shared record
+            # itself has been explicitly paused.
+            if snapshot.get("paused") is not True:
+                raise EngineExecutionError("只能在 paused 状态预设单 RootJob 试运行范围")
+        normalized = self._validate_pilot_root_job(root_job_id)
+        with self._control_lock:
+            if self._startup_paused is not startup_paused:
+                raise EngineExecutionError("预设期间控制状态已变更；请重新确认 paused 状态")
+            payload = self._control_state.compare_and_set_paused(
+                expected_revision=snapshot.get("revision"),
+                expected_paused=bool(snapshot.get("paused")),
+                expected_scope=snapshot.get("automatic_scope"),
+                paused=True,
+                reason="single RootJob pilot armed",
+                automatic_scope=single_root_scope(normalized),
+            )
+            if payload is None:
+                raise EngineExecutionError("预设期间控制状态已变更；请重新确认 paused 状态")
+            self._startup_paused = True
+        return payload
+
+    def _resume_after_control_open(self) -> None:
+        """Start only pause-aware scheduler observers after a CAS resume."""
+        if self._closed.is_set():
+            return
+        # A fresh process intentionally has no inherited L→M admission token.
+        # Only a persisted Provider retry needs an immediate passive A
+        # observation on resume; scanning every ordinary intake on every
+        # resume would unexpectedly dispatch reconciliation work and race the
+        # operator's next explicit action.
+        if self._restart_provider_retry_needs_fresh_full_audit():
+            try:
+                self._scan_inbound_once()
+            except Exception:
+                # Resume remains available when AList is temporarily
+                # unreadable; the monitor or the next explicit action will
+                # surface the bounded read-only error without opening a
+                # Provider lane.
+                pass
+        self._start_startup_thread(
+            self._resume_automatic_jobs,
+            name="scrapeflow-resume",
+        )
+        self._intake_wake.set()
+
+    def resume_root_job_pilot(self, root_job_id: object | None = None) -> dict[str, object]:
+        """Preflight then CAS-resume exactly one durable RootJob.
+
+        A caller can pass a selector for an atomic arm+resume, or arm it in a
+        prior paused-only request and omit it here.  A broad/missing scope is
+        never upgraded by this public operation.  Because the no-write
+        preflight can be slow, its initial control snapshot is never written
+        back unconditionally: another pause, arm, or resume wins and this
+        request returns a conflict while leaving the scheduler paused.
+        """
+        with self._control_lock:
+            snapshot = self._control_state.read()
+            startup_paused = self._startup_paused
+            # See ``arm_root_job_pilot``: a fresh process-local startup fence
+            # cannot authorize changing/reopening a durable unpaused pilot.
+            if snapshot.get("paused") is not True:
+                raise EngineExecutionError("系统已运行；请先 pause 后才能变更 RootJob 试运行范围")
+            persisted_scope = snapshot.get("automatic_scope")
+            if root_job_id is None:
+                if (
+                    not isinstance(persisted_scope, Mapping)
+                    or persisted_scope.get("mode") != "single_root"
+                ):
+                    raise EngineRequestError(
+                        "恢复试运行前必须先预设一个 RootJob（root_job_id）"
+                    )
+                root_job_id = persisted_scope.get("root_job_id")
+        normalized = self._validate_pilot_root_job(root_job_id)
+        report = self.alist_offline_readiness()
+        if report.get("verified") is not True:
+            raise ApplicationError(
+                "AList 离线下载只读预检未通过；保持 paused，详见 /api/readiness/alist-offline"
+            )
+        with self._control_lock:
+            try:
+                configured_root = environment_root_job_pilot()
+            except RootJobPilotError as exc:
+                raise ApplicationError(str(exc)) from exc
+            if configured_root is not None and configured_root != normalized:
+                raise EngineExecutionError("预检期间部署 RootJob 范围已变更；保持 paused")
+            if self._startup_paused is not startup_paused:
+                raise EngineExecutionError("预检期间控制状态已变更；保持 paused")
+            payload = self._control_state.compare_and_set_paused(
+                expected_revision=snapshot.get("revision"),
+                expected_paused=bool(snapshot.get("paused")),
+                expected_scope=snapshot.get("automatic_scope"),
+                paused=False,
+                automatic_scope=single_root_scope(normalized),
+            )
+            if payload is None:
+                raise EngineExecutionError("预检期间控制状态已变更；保持 paused")
+            self._startup_paused = False
+        self._resume_after_control_open()
+        return payload
+
+    # ------------------------------------------------------------------
     # Phase 1: Intake catalog
     # ------------------------------------------------------------------
 
@@ -444,31 +705,109 @@ class SimpleApplication:
             result.append(d)
         return result
 
+    def refresh_intake_catalog(self) -> dict[str, object]:
+        """Freshly read ``/待刮削`` from AList for an operator-requested refresh.
+
+        This is deliberately narrower than an ordinary monitor heartbeat: it
+        updates only the local IntakeSource catalog and returns the new view.
+        It never creates a RootJob, performs identity matching, starts a
+        download, or queues the post-intake audit.  A new source observation
+        may still revoke an old provider-admission token, which is the
+        fail-closed safety behavior shared with the monitor.
+        """
+        registered = self._scan_inbound_once(
+            refresh_settlement=False,
+            mark_missing_waiting_sources=False,
+        )
+        with self._automatic_lock:
+            # ``last_scan_at`` is written only after the fresh AList root
+            # listing completes.  Returning it lets the Web UI distinguish a
+            # real catalog refresh from its own local render time.
+            refreshed_at = self._intake_status.get("last_scan_at")
+        return {
+            "sources": self.intake_catalog(),
+            "registered": registered,
+            "refreshed_at": refreshed_at,
+        }
+
     def health(self) -> dict[str, object]:
         operations = self._operations_summary()
         provider_workers = self._provider_worker_configuration()
+        offline_readiness = self._cached_alist_offline_readiness()
+        pilot_scope = self._pilot_scope_view()
+        alist_configured = self.remote_configured
+        tmdb_configured = bool(os.getenv("TMDB_API_KEY", "").strip())
+        helper_readiness = quark_helper_readiness_from_env()
+        helper_verified = (
+            helper_readiness.get("status") == "ready"
+            and helper_readiness.get("reachable") is True
+            and helper_readiness.get("authenticated") is True
+        )
+        dependencies = {
+            # A constructed client is only configuration evidence.  /health
+            # deliberately never turns this into an AList network operation.
+            "alist": {
+                "status": "configured" if alist_configured else "not_configured",
+                "configured": alist_configured,
+                "verified": False,
+                "read_only": True,
+                "reason": "API liveness 不执行 AList 远端探测",
+            },
+            # This keeps the existing authenticated, read-only Helper probe
+            # separate from both API liveness and static lane declarations.
+            "quark": {
+                **helper_readiness,
+                "verified": helper_verified,
+                "read_only": True,
+            },
+            "tmdb": {
+                "status": "configured" if tmdb_configured else "not_configured",
+                "configured": tmdb_configured,
+                "verified": False,
+                "read_only": True,
+                "reason": "API liveness 不执行 TMDB 远端探测",
+            },
+            # The offline report is populated only by the explicit no-write
+            # preflight.  Preserve it verbatim so callers can inspect its
+            # evidence and limitations without confusing it with liveness.
+            "alist_offline": offline_readiness,
+        }
         with self._automatic_lock:
             intake = dict(self._intake_status)
         return {
+            "liveness": {
+                "status": "alive",
+                "alive": True,
+                "scope": "api_process",
+                "message": "API 可响应；外部依赖需单独检查 dependencies。",
+            },
             # A widened Provider pool violates the single-writer runtime
             # contract even if the HTTP process itself is still reachable.
             "ok": provider_workers["valid"] is True,
+            "ok_scope": "runtime_configuration",
             "mode": "automatic",
-            "connected": self.remote_configured,
-            "tmdb_configured": bool(os.getenv("TMDB_API_KEY", "").strip()),
+            "connected": alist_configured,
+            "tmdb_configured": tmdb_configured,
             "engine_configured": self.engine_configured,
-            "build_version": os.getenv("SCRAPEFLOW_BUILD_VERSION", "").strip() or "p13-container-nesting",
-            "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or None,
-            "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or None,
+            "build_version": os.getenv("SCRAPEFLOW_BUILD_VERSION", "").strip() or "p15",
+            "build_commit": os.getenv("SCRAPEFLOW_BUILD_COMMIT", "").strip() or "unrecorded",
+            "build_time": os.getenv("SCRAPEFLOW_BUILD_TIME", "").strip() or "unrecorded",
             "provider_capabilities": provider_capability_snapshot(),
             # Provider capability declarations describe which adapters are
             # installed.  They are deliberately not substituted for an
             # authenticated health probe of the out-of-process Quark Helper.
-            "helper_readiness": {"quark": quark_helper_readiness_from_env()},
+            "helper_readiness": {"quark": helper_readiness},
+            # This cached shape is deliberately distinct from service
+            # liveness: it is populated only by GET readiness or a requested
+            # pilot resume, both of which use no task/file mutations.
+            "offline_readiness": offline_readiness,
+            "dependencies": dependencies,
+            "automatic_scope": pilot_scope,
             "lane_gates": {
                 "provider_auto_repair_enabled": self._provider_auto_repair_enabled(),
                 "audit_auto_repair_enabled": self._audit_auto_repair_enabled(),
                 "provider_workers": provider_workers,
+                "root_job_scope": pilot_scope,
             },
             "intake_monitoring": self._intake_monitor_enabled(),
             "intake": {
@@ -478,11 +817,7 @@ class SimpleApplication:
                 **intake,
             },
             "operations": operations,
-            "message": (
-                "全自动单用户运行时已启动"
-                if self.remote_configured
-                else "全自动运行时已启动；设置 ALIST_PASSWORD 后才能交付远端文件"
-            ),
+            "message": "API 可响应；AList、Quark Helper、aria2 与传输链路状态见 dependencies。",
         }
 
     def _operations_summary(self) -> dict[str, object]:
@@ -637,7 +972,12 @@ class SimpleApplication:
             return None
         return value
 
-    def _scan_inbound_once(self) -> list[str]:
+    def _scan_inbound_once(
+        self,
+        *,
+        refresh_settlement: bool = True,
+        mark_missing_waiting_sources: bool = True,
+    ) -> list[str]:
         """Update the IntakeSource catalog for each direct child of ``/待刮削``.
 
         Discovery is a passive observation: it records the source with real
@@ -785,7 +1125,7 @@ class SimpleApplication:
         # delete/retry/recreate it. Persist a clear error only after a
         # successful narrow listing of the intake root.
         marker = getattr(runner, "mark_waiting_source_missing", None)
-        if callable(marker):
+        if mark_missing_waiting_sources and callable(marker):
             for source, job in existing.items():
                 if (
                     job.phase in {"awaiting_target_shelf", "reconciling"}
@@ -848,9 +1188,11 @@ class SimpleApplication:
         # Empty intake is only the first half of the barrier.  The helper
         # performs a second local-state check for ordinary roots, provider
         # children, held staging and in-doubt attempts before queuing the
-        # report-only full-library pass.  It is deliberately gate-controlled;
-        # a read-only scan never turns on automatic repair by itself.
-        self._refresh_intake_settlement()
+        # report-only full-library pass.  An operator pressing the Web refresh
+        # button intentionally skips that scheduling projection: its contract
+        # is a fresh AList listing and catalog update only.
+        if refresh_settlement:
+            self._refresh_intake_settlement()
         return registered
 
     def _barrier_children_by_root(
@@ -1392,6 +1734,11 @@ class SimpleApplication:
             self._closed.is_set()
             or self.control().get("paused") is True
             or not self._audit_auto_repair_enabled()
+            # L is a full-library projection.  During a bounded RootJob pilot
+            # it could discover/assign work outside the selected root, so the
+            # pilot deliberately leaves automatic L closed.  An operator can
+            # still request the report-only audit endpoint while paused.
+            or not self._automatic_global_audit_allowed()
         ):
             return
         with self._automatic_lock:
@@ -1548,6 +1895,8 @@ class SimpleApplication:
 
     def _defer_provider_dispatch(self, job_id: str, *, reason: str) -> None:
         """Persist a visible retry_wait when a queued Provider is gate-deferred."""
+        if not self._automatic_root_allowed(job_id):
+            return
         try:
             runner = self._get_engine_runner()
             # This projection races child completion and terminal cleanup.
@@ -1665,6 +2014,10 @@ class SimpleApplication:
             return self.control().get("paused") is not False
         except Exception:
             return True
+
+    def _root_pause_requested(self, root_job_id: object) -> bool:
+        """Extend the pause fence with the durable RootJob pilot boundary."""
+        return self._pause_requested() or not self._automatic_root_allowed(root_job_id)
 
     def _automatic_pool(self) -> ThreadPoolExecutor:
         with self._automatic_lock:
@@ -1880,6 +2233,8 @@ class SimpleApplication:
         state so `/retry {}` or an explicit post-restart resume can invoke the
         same holder, never ``finalize_automatic_lifecycle``.
         """
+        if not self._automatic_root_allowed(job_id):
+            return
         try:
             runner = self._get_engine_runner()
             with runner.worker_lock():
@@ -2080,6 +2435,8 @@ class SimpleApplication:
         try:
             if self._closed.is_set():
                 return True
+            if not self._automatic_root_allowed(job.id):
+                return True
             return not self._provider_job_allowed(job)
         except Exception:
             return True
@@ -2101,6 +2458,8 @@ class SimpleApplication:
         this while unpaused or while this process owns a live future: both
         cases may describe real work rather than an orphan.
         """
+        if not self._automatic_root_allowed(job.id):
+            return job
         try:
             with self._automatic_lock:
                 # The startup thread may race an operator resume. Re-check
@@ -2526,6 +2885,8 @@ class SimpleApplication:
         lane must never turn known unresolved evidence into permission to
         consume the source.
         """
+        if not self._automatic_root_allowed(job.id):
+            return True
         if self._audit_auto_repair_enabled() or self._provider_auto_repair_enabled():
             return False
         if self._closed.is_set() or self.control().get("paused") is True:
@@ -2593,7 +2954,10 @@ class SimpleApplication:
                 cleanup_ready=True,
                 reason="audit_and_provider_auto_repair_disabled",
             )
-            runner.finalize_automatic_lifecycle(decided.id)
+            runner.finalize_automatic_lifecycle(
+                decided.id,
+                pause_requested=lambda: self._root_pause_requested(decided.id),
+            )
         except (EngineWorkerBusyError, EngineExecutionError, EngineRequestError):
             # The finalizer persists its own failed_cleanup record.  A busy
             # worker/restart will revisit the same idempotent decision; never
@@ -2630,7 +2994,7 @@ class SimpleApplication:
 
     def _queue_automatic_job(self, job_id: str, *, delay: float = 0.0) -> None:
         """Run one persisted plan from the automatic scheduler."""
-        if self._closed.is_set():
+        if self._closed.is_set() or not self._automatic_root_allowed(job_id):
             return
         try:
             queued_job = self._get_engine_runner().get_job(job_id)
@@ -2643,7 +3007,7 @@ class SimpleApplication:
             return
 
         def submit() -> None:
-            if self._closed.is_set():
+            if self._closed.is_set() or not self._automatic_root_allowed(job_id):
                 return
             try:
                 current = self._get_engine_runner().get_job(job_id)
@@ -2654,6 +3018,8 @@ class SimpleApplication:
             # never use that old snapshot to bypass a newly effective pause.
             current_is_read_only = current.phase == "reconciling"
             if not current_is_read_only and self.control().get("paused") is True:
+                return
+            if not self._automatic_root_allowed(current.id):
                 return
             if (
                 not current_is_read_only
@@ -2694,6 +3060,9 @@ class SimpleApplication:
         stage: str | None = None,
     ) -> None:
         """Persist bounded retry state for the automatic scheduler."""
+        if not self._automatic_root_allowed(job_id):
+            self._cancel_job_timers(job_id)
+            return
         runner = self._get_engine_runner()
         phase: str | None = None
         retry_delay: float | None = None
@@ -2990,9 +3359,11 @@ class SimpleApplication:
     def _run_automatic_job(self, job_id: str) -> None:
         """Reconcile first, then execute only the still-missing plan work."""
         try:
+            if not self._automatic_root_allowed(job_id):
+                return
             runner = self._get_engine_runner()
             job = runner.get_job(job_id)
-            if self._is_internal_child(job):
+            if self._is_internal_child(job) or not self._automatic_root_allowed(job.id):
                 return
             # Pause blocks the next external side effect, not the bounded
             # read-only reconciliation that can only update this task's local
@@ -3014,7 +3385,7 @@ class SimpleApplication:
                         with self._automatic_lock:
                             final = run_root_pipeline(
                                 runner, self.state_root, job_id,
-                                pause_requested=self._pause_requested,
+                                pause_requested=lambda: self._root_pause_requested(job_id),
                             )
                         # P14 L step: a freshly completed ingest with open
                         # gaps hands the root to the replenishment lane (the
@@ -3068,7 +3439,7 @@ class SimpleApplication:
                     if callable(hold):
                         try:
                             self._hold_existing_gap_source(
-                                hold, job_id, self._pause_requested,
+                                hold, job_id, lambda: self._root_pause_requested(job_id),
                             )
                         except (EnginePauseRequested, EngineCancellationRequested):
                             return
@@ -3091,7 +3462,7 @@ class SimpleApplication:
                     if callable(consume):
                         try:
                             self._consume_duplicate_source(
-                                consume, job_id, self._pause_requested,
+                                consume, job_id, lambda: self._root_pause_requested(job_id),
                             )
                         except EngineWorkerBusyError:
                             raise
@@ -3154,12 +3525,20 @@ class SimpleApplication:
                 job.phase == "retry_wait" and not job.plan
             ):
                 try:
+                    root_pause = lambda: self._root_pause_requested(job_id)
                     with self._automatic_lock:
                         retry_password = self._retry_archive_passwords.get(job_id)
                         job = (
-                            runner.plan_automatic_job(job_id, retry_password=retry_password)
+                            runner.plan_automatic_job(
+                                job_id,
+                                retry_password=retry_password,
+                                pause_requested=root_pause,
+                            )
                             if retry_password is not None
-                            else runner.plan_automatic_job(job_id)
+                            else runner.plan_automatic_job(
+                                job_id,
+                                pause_requested=root_pause,
+                            )
                         )
                     if retry_password is not None:
                         with self._automatic_lock:
@@ -3192,11 +3571,16 @@ class SimpleApplication:
                         self._queue_provider_job(job.id)
                     target = self._job_audit_target(job)
                     if isinstance(target, str):
-                        self._queue_scoped_library_audit([target], delay=0.5)
+                        self._queue_scoped_library_audit(
+                            [target], delay=0.5, pilot_root_job_id=job.id,
+                        )
                     return
             if job.phase not in {"planned", "retry_wait", "failed", "failed_write", "failed_verification"}:
                 return
-            done = runner.execute_automatic(job_id)
+            done = runner.execute_automatic(
+                job_id,
+                pause_requested=lambda: self._root_pause_requested(job_id),
+            )
             if done.phase in {"executing", "archive_preprocessing", "identity_matching", "planning"}:
                 # Pause preserves an in-flight durable operation for recovery;
                 # do not sync/settle or schedule another side effect here.
@@ -3212,6 +3596,7 @@ class SimpleApplication:
             if isinstance(target, str):
                 self._queue_scoped_library_audit(
                     [target], delay=0.5, rerun_if_busy=True,
+                    pilot_root_job_id=done.id,
                 )
             # A committed provider child must always have the durable root
             # coordinates above.  Missing coordinates are not permission to
@@ -3232,6 +3617,12 @@ class SimpleApplication:
             for job in runner.list_jobs():
                 if self._is_internal_child(job):
                     continue
+                # Startup recovery is a scheduler entrance too.  In
+                # particular, do not let an old retry/holder bypass the
+                # single-root scope just because it was persisted before the
+                # pilot was armed.
+                if not self._automatic_root_allowed(job.id):
+                    continue
                 if job.phase == "reconciling":
                     # Reconciliation is a bounded read-only phase and may
                     # still establish a user-visible five-way result while
@@ -3246,7 +3637,7 @@ class SimpleApplication:
                     if callable(hold):
                         try:
                             self._hold_existing_gap_source(
-                                hold, job.id, self._pause_requested,
+                                hold, job.id, lambda: self._root_pause_requested(job.id),
                             )
                         except (EnginePauseRequested, EngineCancellationRequested):
                             continue
@@ -3272,7 +3663,7 @@ class SimpleApplication:
                         if callable(consume):
                             try:
                                 self._consume_duplicate_source(
-                                    consume, job.id, self._pause_requested,
+                                    consume, job.id, lambda: self._root_pause_requested(job.id),
                                 )
                             except EngineWorkerBusyError:
                                 continue
@@ -3297,7 +3688,7 @@ class SimpleApplication:
                         if callable(hold):
                             try:
                                 self._hold_existing_gap_source(
-                                    hold, job.id, self._pause_requested,
+                                    hold, job.id, lambda: self._root_pause_requested(job.id),
                                 )
                             except (EnginePauseRequested, EngineCancellationRequested):
                                 continue
@@ -3348,11 +3739,15 @@ class SimpleApplication:
                         # inventory. Re-audit only this root's work scope.
                         target = self._job_audit_target(job)
                         if isinstance(target, str):
-                            self._queue_scoped_library_audit([target], delay=0.5)
+                            self._queue_scoped_library_audit(
+                                [target], delay=0.5, pilot_root_job_id=job.id,
+                            )
                     if self._audit_needs_retry(job):
                         target = self._job_audit_target(job)
                         if isinstance(target, str):
-                            self._queue_scoped_library_audit([target], delay=1.0)
+                            self._queue_scoped_library_audit(
+                                [target], delay=1.0, pilot_root_job_id=job.id,
+                            )
         except Exception:
             # Health/status endpoints remain available while a network or
             # credential issue is repaired; an explicit resume/retry will
@@ -3434,6 +3829,7 @@ class SimpleApplication:
     def _queue_provider_job(self, job_id: str, *, delay: float = 0.0) -> None:
         if (
             self._closed.is_set()
+            or not self._automatic_root_allowed(job_id)
             or self.control().get("paused") is True
             or not self._provider_auto_repair_enabled()
             or self._provider_worker_configuration()["valid"] is not True
@@ -3471,7 +3867,11 @@ class SimpleApplication:
             current = self._get_engine_runner().get_job(job_id)
         except Exception:
             return
-        if self._is_internal_child(current) or not self._provider_job_allowed(current):
+        if (
+            self._is_internal_child(current)
+            or not self._automatic_root_allowed(current.id)
+            or not self._provider_job_allowed(current)
+        ):
             return
 
         # Publish the non-green provider stage before submitting the worker.
@@ -3534,6 +3934,7 @@ class SimpleApplication:
         def submit() -> None:
             if (
                 self._closed.is_set()
+                or not self._automatic_root_allowed(job_id)
                 or self.control().get("paused") is True
                 or not self._provider_auto_repair_enabled()
                 or self._provider_worker_configuration()["valid"] is not True
@@ -3565,7 +3966,11 @@ class SimpleApplication:
                         current = self._get_engine_runner().get_job(job_id)
                     except Exception:
                         return
-                    if self._is_internal_child(current) or not self._provider_job_allowed(current):
+                    if (
+                        self._is_internal_child(current)
+                        or not self._automatic_root_allowed(current.id)
+                        or not self._provider_job_allowed(current)
+                    ):
                         return
                     existing = self._provider_futures.get(job_id)
                     if existing is not None and not existing.done():
@@ -3615,6 +4020,8 @@ class SimpleApplication:
         """
         if self._closed.is_set():
             return "gated:closed"
+        if not self._automatic_root_allowed(root_task_id):
+            return "gated:root-scope"
         if self.control().get("paused") is True:
             return "gated:paused"
         if not operator and not self._provider_auto_repair_enabled():
@@ -3637,6 +4044,7 @@ class SimpleApplication:
         def submit() -> None:
             if (
                 self._closed.is_set()
+                or not self._automatic_root_allowed(root_task_id)
                 or self.control().get("paused") is True
                 or (not operator and not self._provider_auto_repair_enabled())
                 or self._provider_worker_configuration()["valid"] is not True
@@ -3683,6 +4091,8 @@ class SimpleApplication:
             for job in runner.list_jobs():
                 if self._is_internal_child(job):
                     continue
+                if not self._automatic_root_allowed(job.id):
+                    continue
                 if not is_intake_bound_root(self.state_root, job.id):
                     continue
                 if aggregate_root_job(self.state_root, job.id).open_gaps <= 0:
@@ -3722,6 +4132,7 @@ class SimpleApplication:
             expected_epoch = granted_epoch
         if (
             self._closed.is_set()
+            or not self._automatic_root_allowed(root_task_id)
             or self.control().get("paused") is True
             or (not operator and not self._provider_auto_repair_enabled())
             or self._provider_worker_configuration()["valid"] is not True
@@ -3734,7 +4145,7 @@ class SimpleApplication:
             from local.scrapeflow_api.root_replenishment import run_root_replenishment
             result = run_root_replenishment(
                 runner, self.state_root, root_task_id,
-                pause_requested=self._pause_requested,
+                pause_requested=lambda: self._root_pause_requested(root_task_id),
             )
         except Exception:
             # Transient server-side failure: fail closed without legacy
@@ -3793,6 +4204,8 @@ class SimpleApplication:
         from local.scrapeflow_api.root_pipeline import is_intake_bound_root
         runner = self._get_engine_runner()
         job = runner.get_job(job_id)
+        if not self._automatic_root_allowed(job.id):
+            raise EngineRequestError("当前单 RootJob 试运行范围不允许该补源任务")
         if not is_intake_bound_root(self.state_root, job_id):
             raise EngineRequestError("补源触发只允许 intake 绑定的根任务")
         if aggregate_root_job(self.state_root, job_id).open_gaps <= 0:
@@ -3801,6 +4214,8 @@ class SimpleApplication:
         return {"queued": status == "queued", "status": status, "root_task_id": job_id}
 
     def _record_replenishment_summary(self, job: EngineJob, outcome: Mapping[str, object]) -> None:
+        if not self._automatic_root_allowed(job.id):
+            return
         runner = self._get_engine_runner()
         current = runner.get_job(job.id)
         summary = dict(current.summary)
@@ -3845,6 +4260,8 @@ class SimpleApplication:
         Engine's durable ``executed`` fact and therefore cannot make a
         partially written child look complete.
         """
+        if not self._automatic_root_allowed(job.id):
+            return
         try:
             runner = self._get_engine_runner()
             current = runner.get_job(job.id)
@@ -3988,6 +4405,7 @@ class SimpleApplication:
         self._provider_pilot_tmdb()
         if (
             self._closed.is_set()
+            or not self._automatic_root_allowed(job_id)
             or self.control().get("paused") is True
             or not self._provider_auto_repair_enabled()
             or self._provider_worker_configuration()["valid"] is not True
@@ -4003,7 +4421,7 @@ class SimpleApplication:
         try:
             runner = self._get_engine_runner()
             job = runner.get_job(job_id)
-            if self._is_internal_child(job):
+            if self._is_internal_child(job) or not self._automatic_root_allowed(job.id):
                 return
             # Re-check the durable terminal boundary after the future starts;
             # a provider timer may have been queued just before another worker
@@ -4017,6 +4435,7 @@ class SimpleApplication:
             provider_job = self._provider_pilot_job(job)
             if (
                 self._closed.is_set()
+                or not self._automatic_root_allowed(job.id)
                 or self.control().get("paused") is True
                 or self._provider_worker_configuration()["valid"] is not True
             ):
@@ -4027,6 +4446,7 @@ class SimpleApplication:
             # provider, so a pause during that setup cannot start a queued root.
             if (
                 self._closed.is_set()
+                or not self._automatic_root_allowed(job.id)
                 or self.control().get("paused") is True
                 or self._provider_worker_configuration()["valid"] is not True
             ):
@@ -4036,6 +4456,7 @@ class SimpleApplication:
             self._record_replenishment_progress(job, "provider_searching", {})
             if (
                 self._closed.is_set()
+                or not self._automatic_root_allowed(job.id)
                 or self.control().get("paused") is True
                 or self._provider_worker_configuration()["valid"] is not True
             ):
@@ -4047,7 +4468,7 @@ class SimpleApplication:
                         reason="全库门禁在 Provider 调用前关闭，等待下一次成功只读审计",
                     )
                 return
-            if not self._provider_job_allowed(job):
+            if not self._automatic_root_allowed(job.id) or not self._provider_job_allowed(job):
                 return
             outcome = runtime.run_for_job(provider_job)
             summary_before = dict(job.summary)
@@ -4244,6 +4665,7 @@ class SimpleApplication:
             if isinstance(target, str):
                 self._queue_scoped_library_audit(
                     [target], delay=0.5, rerun_if_busy=True,
+                    pilot_root_job_id=job.id,
                 )
             # Missing root coordinates fail closed; never widen a provider
             # completion callback into a formal-library scan.
@@ -4389,7 +4811,11 @@ class SimpleApplication:
         return future
 
     def _queue_library_audit(
-        self, *, delay: float = 0.0, rerun_if_busy: bool = False,
+        self,
+        *,
+        delay: float = 0.0,
+        rerun_if_busy: bool = False,
+        pilot_root_job_id: object | None = None,
     ) -> None:
         """Schedule a read-only full-library scan after ordinary mutations.
 
@@ -4402,6 +4828,9 @@ class SimpleApplication:
             self._closed.is_set()
             or self.control().get("paused") is True
             or not self._audit_auto_repair_enabled()
+            or not self._automatic_global_audit_allowed(
+                pilot_root_job_id=pilot_root_job_id,
+            )
         ):
             return
 
@@ -4410,6 +4839,9 @@ class SimpleApplication:
                 self._closed.is_set()
                 or self.control().get("paused") is True
                 or not self._audit_auto_repair_enabled()
+                or not self._automatic_global_audit_allowed(
+                    pilot_root_job_id=pilot_root_job_id,
+                )
             ):
                 return
             with self._audit_lock:
@@ -4427,6 +4859,7 @@ class SimpleApplication:
         *,
         delay: float = 0.0,
         rerun_if_busy: bool = False,
+        pilot_root_job_id: object | None = None,
     ) -> None:
         """Coalesce a bounded audit to the affected work roots."""
         formal_roots = tuple(
@@ -4453,7 +4886,11 @@ class SimpleApplication:
             return
         with self._audit_lock:
             self._pending_audit_roots.update(normalized)
-        self._queue_library_audit(delay=delay, rerun_if_busy=rerun_if_busy)
+        self._queue_library_audit(
+            delay=delay,
+            rerun_if_busy=rerun_if_busy,
+            pilot_root_job_id=pilot_root_job_id,
+        )
 
     def _run_library_audit_background(
         self,
@@ -4729,7 +5166,10 @@ class SimpleApplication:
         the worker still performs its own fresh staging/readback checks before
         any remote write.
         """
-        if runner is None:
+        # This method persists provider/lifecycle projections and may create
+        # audit-owned roots.  It is never an escape hatch around the durable
+        # RootJob scope merely because its scanner was read-only.
+        if runner is None or not self._automatic_global_audit_allowed():
             return ()
         semantic = report.get("semantic") if isinstance(report.get("semantic"), Mapping) else {}
         raw_gaps = semantic.get("gaps") if isinstance(semantic, Mapping) else []
@@ -5124,6 +5564,7 @@ class SimpleApplication:
                             actionable_gap_ids=actionable_ids,
                             audit_uncertain=bool(relevant_unknowns),
                             unidentified_actionable_gap=unidentified_actionable,
+                            pause_requested=lambda: self._root_pause_requested(job.id),
                         )
                         post_acquisition_cleanup = (
                             dict(result) if isinstance(result, Mapping) else None
@@ -5228,7 +5669,12 @@ class SimpleApplication:
                         reason=lifecycle_reason,
                     )
                     if lifecycle_ready:
-                        runner.finalize_automatic_lifecycle(lifecycle_job.id)
+                        runner.finalize_automatic_lifecycle(
+                            lifecycle_job.id,
+                            pause_requested=lambda: self._root_pause_requested(
+                                lifecycle_job.id,
+                            ),
+                        )
                 except (EngineWorkerBusyError, EngineExecutionError, EngineRequestError):
                     # A cleanup race or a remote transient remains durable as
                     # pending/failed state; it must never cause a writer or
@@ -5690,6 +6136,8 @@ class SimpleApplication:
         if set(payload) != {"target_shelf"}:
             raise EngineRequestError("启动请求只接受 target_shelf")
         runner = self._get_engine_runner()
+        if not self._automatic_root_allowed(job_id):
+            raise EngineRequestError("当前 RootJob 试运行范围不允许启动该任务")
         selected = runner.start_automatic_job(
             job_id,
             target_shelf=payload.get("target_shelf"),
@@ -5786,13 +6234,20 @@ class SimpleApplication:
         engine_job = self._engine_job_or_none(job_id)
         if engine_job is None:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
-        repaired = self._get_engine_runner().repair_automatic_artifacts(job_id)
+        if not self._automatic_root_allowed(engine_job.id):
+            raise EngineRequestError("当前 RootJob 试运行范围不允许修复该任务")
+        repaired = self._get_engine_runner().repair_automatic_artifacts(
+            job_id,
+            pause_requested=lambda: self._root_pause_requested(job_id),
+        )
         return self.public_engine_job(repaired)
 
     def retry_public_job(self, job_id: str, payload: Mapping[str, object]) -> dict[str, object]:
         engine_job = self._engine_job_or_none(job_id)
         if engine_job is None:
             raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        if not self._automatic_root_allowed(engine_job.id):
+            raise EngineRequestError("当前 RootJob 试运行范围不允许重试该任务")
         if not isinstance(payload, Mapping):
             raise EngineRequestError("重试请求必须是 JSON 对象")
         from local.scrapeflow_api.root_pipeline import is_intake_bound_root
@@ -5837,7 +6292,7 @@ class SimpleApplication:
                 raise EngineRequestError("当前 Engine 缺少 duplicate source 消费入口")
             try:
                 retried = self._consume_duplicate_source(
-                    consume, job_id, self._pause_requested,
+                    consume, job_id, lambda: self._root_pause_requested(job_id),
                 )
             except (EnginePauseRequested, EngineCancellationRequested):
                 return self.public_engine_job(runner.get_job(job_id))
@@ -5862,7 +6317,7 @@ class SimpleApplication:
                 )
             try:
                 retried = self._hold_existing_gap_source(
-                    hold, job_id, self._pause_requested,
+                    hold, job_id, lambda: self._root_pause_requested(job_id),
                 )
             except (EnginePauseRequested, EngineCancellationRequested):
                 return self.public_engine_job(runner.get_job(job_id))
@@ -5933,7 +6388,10 @@ class SimpleApplication:
                 error=None,
             )
             marked = self._persist_retry_transition(engine_job, marked)
-            retried = self._get_engine_runner().finalize_automatic_lifecycle(job_id)
+            retried = self._get_engine_runner().finalize_automatic_lifecycle(
+                job_id,
+                pause_requested=lambda: self._root_pause_requested(job_id),
+            )
             return self.public_engine_job(retried)
         error_text = str(engine_job.error or "").casefold()
         archive_failure = (
@@ -6365,35 +6823,27 @@ class SimpleApplication:
                 payload["reason"] = "startup_pause"
             return payload
 
-    def set_paused(self, paused: bool, reason: str | None = None) -> dict[str, object]:
+    def set_paused(
+        self,
+        paused: bool,
+        reason: str | None = None,
+        *,
+        automatic_scope: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
         if not isinstance(paused, bool):
             raise TypeError("paused must be boolean")
         with self._control_lock:
-            payload = self._control_state.set_paused(paused, reason)
+            payload = self._control_state.set_paused(
+                paused,
+                reason,
+                automatic_scope=automatic_scope,
+            )
             # Only an explicit transition in this process may open the lane.
             # In particular, a previous process' persisted ``False`` does not
             # clear the startup fence by itself.
             self._startup_paused = paused
-        if not paused and not self._closed.is_set():
-            # A fresh process intentionally has no inherited L→M admission
-            # token.  Only a persisted Provider retry needs an immediate
-            # passive A observation on resume; scanning every ordinary intake
-            # on every resume would unexpectedly dispatch reconciliation work
-            # and race the operator's next explicit action.
-            if self._restart_provider_retry_needs_fresh_full_audit():
-                try:
-                    self._scan_inbound_once()
-                except Exception:
-                    # Resume remains available when AList is temporarily
-                    # unreadable; the monitor or the next explicit action will
-                    # surface the bounded read-only error without opening a
-                    # Provider lane.
-                    pass
-            self._start_startup_thread(
-                self._resume_automatic_jobs,
-                name="scrapeflow-resume",
-            )
-            self._intake_wake.set()
+        if not paused:
+            self._resume_after_control_open()
         return payload
 
     def close(self) -> None:
@@ -6536,6 +6986,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send_html(200, dashboard_html())
             elif path == "/api/health":
                 self._send(200, self.application.health())
+            elif path == "/api/readiness/alist-offline":
+                # Explicitly requested, authenticated AList/aria2 probe.  It
+                # is read-only by contract and never queues/resumes a task.
+                self._send(200, self.application.alist_offline_readiness())
             elif path == "/api/control":
                 self._send(200, self.application.control())
             elif path == "/api/jobs":
@@ -6593,10 +7047,24 @@ class SimpleHandler(BaseHTTPRequestHandler):
             elif path == "/api/root-jobs":
                 job = self.application.create_root_task(payload)
                 self._send(201, {"job": self.application.public_engine_job(job)})
+            elif path == "/api/intake/refresh":
+                self._send(200, self.application.refresh_intake_catalog())
             elif path == "/api/control/pause":
                 self._send(200, self.application.set_paused(True, self._optional_reason(payload)))
+            elif path == "/api/control/pilot":
+                self._send(
+                    200,
+                    self.application.arm_root_job_pilot(
+                        self._pilot_root_job_id(payload, required=True),
+                    ),
+                )
             elif path == "/api/control/resume":
-                self._send(200, self.application.set_paused(False))
+                self._send(
+                    200,
+                    self.application.resume_root_job_pilot(
+                        self._pilot_root_job_id(payload, required=False),
+                    ),
+                )
             elif path == "/api/library-audit/run":
                 self._send(200, self.application.run_library_audit())
             elif path.startswith("/api/jobs/") and path.endswith("/confirm"):
@@ -6692,6 +7160,25 @@ class SimpleHandler(BaseHTTPRequestHandler):
         if not isinstance(reason, str):
             raise ValueError("reason must be a string")
         return reason[:500]
+
+    @staticmethod
+    def _pilot_root_job_id(
+        payload: Mapping[str, object],
+        *,
+        required: bool,
+    ) -> str | None:
+        """Parse the deliberately tiny pilot/resume request surface."""
+        unknown = set(payload) - {"root_job_id"}
+        if unknown:
+            raise ValueError("试运行请求只接受 root_job_id")
+        value = payload.get("root_job_id")
+        if value is None:
+            if required:
+                raise ValueError("试运行预设必须提供 root_job_id")
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("root_job_id 必须是非空字符串")
+        return value
 
     def _handle_error(self, exc: Exception) -> None:
         if isinstance(exc, EngineJobNotFoundError):

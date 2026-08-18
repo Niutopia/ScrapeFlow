@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import math
@@ -136,9 +137,105 @@ class AutomaticReplenishmentError(RuntimeError):
 class AutomaticReplenishmentCancelled(AutomaticReplenishmentError):
     """A cooperative control boundary stopped an in-flight provider run."""
 
+    # Lower-level archive/Torrent adapters use this marker to preserve the
+    # control stop instead of wrapping it as a candidate/provider failure.
+    pause_requested = True
+
 
 class AutomaticReplenishmentPaused(AutomaticReplenishmentCancelled):
     """Pause stopped a child at a resumable boundary; do not cancel the child."""
+
+    # Shared lower-level adapters cannot import this API module without
+    # creating a dependency cycle.  This marker lets them preserve a pause
+    # rather than reclassifying it as a failed provider delivery.
+    pause_requested = True
+
+
+def _provider_pause_checkpoint(
+    pause_requested: Callable[[], bool] | None,
+) -> None:
+    """Fence a provider-owned side effect on the current RootJob scope.
+
+    A failing control callback is indistinguishable from an unreadable pause
+    state, so it intentionally stops the attempt.  The callback is evaluated
+    immediately before the port call rather than only once at materializer
+    entry; a pilot scope can be withdrawn while a downloader is validating a
+    manifest or while AList is polling a completed transfer.
+    """
+    if pause_requested is None:
+        return
+    try:
+        paused = bool(pause_requested())
+    except AutomaticReplenishmentPaused:
+        raise
+    except Exception as exc:
+        raise AutomaticReplenishmentPaused(
+            "补源暂停状态不可确认，已在外部操作前安全停止",
+        ) from exc
+    if paused:
+        raise AutomaticReplenishmentPaused(
+            "补源已暂停或不在当前 RootJob 试运行范围",
+        )
+
+
+class _PauseCheckedProviderPort:
+    """Proxy every AList call through one cooperative RootJob checkpoint."""
+
+    def __init__(
+        self,
+        target: object,
+        pause_requested: Callable[[], bool] | None,
+    ) -> None:
+        self._target = target
+        self._pause_requested = pause_requested
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        @functools.wraps(value)
+        def guarded(*args: object, **kwargs: object) -> object:
+            _provider_pause_checkpoint(self._pause_requested)
+            return value(*args, **kwargs)
+
+        return guarded
+
+
+def _accepts_keyword(method: object, keyword: str) -> bool:
+    """Return whether a callable can safely receive one named callback.
+
+    This deliberately avoids the old ``except TypeError: retry without
+    callback`` pattern: an implementation's real TypeError must never cause a
+    second unguarded provider call.
+    """
+    if not callable(method):
+        return False
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in parameters
+    )
+
+
+def _call_with_pause(
+    method: Callable[..., object],
+    *args: object,
+    pause_requested: Callable[[], bool] | None,
+    **kwargs: object,
+) -> object:
+    """Call a provider boundary without silently dropping its scope fence."""
+    if pause_requested is None:
+        return method(*args, **kwargs)
+    if not _accepts_keyword(method, "pause_requested"):
+        raise AutomaticReplenishmentError(
+            "补源边界不支持 pause_requested；拒绝在 RootJob 试运行范围执行",
+        )
+    return method(*args, pause_requested=pause_requested, **kwargs)
 
 
 class _CandidateRoundLimitError(AutomaticReplenishmentError):
@@ -226,6 +323,8 @@ def _remote_file_size(alist: object, path: str) -> int | None:
     if callable(exact):
         try:
             row = exact(path)
+        except AutomaticReplenishmentPaused:
+            raise
         except Exception:
             row = None
         size = row.get("size") if isinstance(row, Mapping) else None
@@ -241,6 +340,8 @@ def _remote_file_size(alist: object, path: str) -> int | None:
             rows = listing(parent, refresh=True)
         except TypeError:
             rows = listing(parent)
+    except AutomaticReplenishmentPaused:
+        raise
     except Exception:
         return None
     matches = [
@@ -322,7 +423,8 @@ class AutomaticMaterializer(Protocol):
         *,
         staging_root: str,
         workspace: Path,
-            alist: object,
+        alist: object,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]: ...
 
     # Optional recovery hook.  Implementations query a persisted external
@@ -338,6 +440,7 @@ class AutomaticMaterializer(Protocol):
         workspace: Path,
         alist: object,
         external_task_id: str | None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]: ...
 
 
@@ -379,7 +482,9 @@ class LocalTorrentAutomaticMaterializer:
         staging_root: str,
         workspace: Path,
         alist: object,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
+        _provider_pause_checkpoint(pause_requested)
         for selection in selections:
             acquisition = selection.get("acquisition")
             if (
@@ -404,7 +509,15 @@ class LocalTorrentAutomaticMaterializer:
             # a user-selectable staging path.
             "automatic_staging_parent": posixpath.dirname(posixpath.dirname(staging_root)),
         }
-        result = method(wrapper, workspace, automatic=True, client=alist)
+        guarded_alist = _PauseCheckedProviderPort(alist, pause_requested)
+        result = _call_with_pause(
+            method,
+            wrapper,
+            workspace,
+            automatic=True,
+            client=guarded_alist,
+            pause_requested=pause_requested,
+        )
         if not isinstance(result, Mapping):
             raise AutomaticReplenishmentError("Torrent materializer 返回无效")
         delivery = dict(result)
@@ -414,18 +527,22 @@ class LocalTorrentAutomaticMaterializer:
             return self._with_delivery_contract_defaults(
                 delivery, staging_root=staging_root,
             )
-        try:
-            prepared = preprocess(
+        _provider_pause_checkpoint(pause_requested)
+        if pause_requested is None and not _accepts_keyword(preprocess, "request"):
+            # Retain a tiny positional compatibility shape for focused legacy
+            # test doubles only when there is no active RootJob fence.  A
+            # scoped call must never retry without its callback.
+            prepared = preprocess(delivery)
+        else:
+            prepared = _call_with_pause(
+                preprocess,
                 delivery,
                 request=dict(request),
                 staging_root=staging_root,
                 workspace=workspace,
-                alist=alist,
+                alist=guarded_alist,
+                pause_requested=pause_requested,
             )
-        except TypeError:
-            # Retain a tiny positional compatibility shape for a focused test
-            # double; production uses the keyword-only shared adapter.
-            prepared = preprocess(delivery)
         if not isinstance(prepared, Mapping):
             raise AutomaticReplenishmentError("归档预处理返回无效 delivery")
         return self._with_delivery_contract_defaults(
@@ -434,8 +551,9 @@ class LocalTorrentAutomaticMaterializer:
 
     def reconcile_existing_task(
         self, request, selections, *, staging_root, workspace, alist, external_task_id,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
-        del request, selections, staging_root, workspace, alist, external_task_id
+        del request, selections, staging_root, workspace, alist, external_task_id, pause_requested
         raise AutomaticReplenishmentError(
             "本地 Torrent 没有可查询的 external_task_id；必须重新进入严格 tier"
         )
@@ -787,7 +905,10 @@ class QuarkFastSaveAutomaticMaterializer:
         staging_root: str,
         workspace: Path,
         alist: object,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
+        _provider_pause_checkpoint(pause_requested)
+        alist = _PauseCheckedProviderPort(alist, pause_requested)
         del request
         if len(selections) != 1:
             raise AutomaticReplenishmentError("夸克分享快转一次只接受一个候选")
@@ -818,6 +939,7 @@ class QuarkFastSaveAutomaticMaterializer:
         # mkdir (direct egress) and the Helper's follow-up fixed requests
         # burst in the same seconds; a short pause decorrelates them.
         time.sleep(4.0)
+        _provider_pause_checkpoint(pause_requested)
         helper = self._helper()
         self._require_helper_ready(helper)
         persisted_task_id = existing_task_id
@@ -829,6 +951,7 @@ class QuarkFastSaveAutomaticMaterializer:
             destination=staging_root,
             task_id=existing_task_id,
         )
+        _provider_pause_checkpoint(pause_requested)
         save_result = share_save(plan)
         if not isinstance(save_result, Mapping):
             raise AutomaticReplenishmentError("夸克分享快转返回无效")
@@ -909,6 +1032,7 @@ class QuarkFastSaveAutomaticMaterializer:
 
     def reconcile_existing_task(
         self, request, selections, *, staging_root, workspace, alist, external_task_id,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         """Query the persisted Quark share task through the existing bridge."""
         task_id = self._safe_task_id(external_task_id)
@@ -940,7 +1064,7 @@ class QuarkFastSaveAutomaticMaterializer:
             )
         return self.acquire(
             request, selections, staging_root=staging_root, workspace=workspace,
-            alist=alist,
+            alist=alist, pause_requested=pause_requested,
         )
 
 
@@ -971,6 +1095,20 @@ class AlistOfflineCandidateError(AutomaticReplenishmentError):
 
     failure_scope = FAILURE_CANDIDATE
     exclude_candidate = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        task_id: str | None = None,
+        external_task_final: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.external_task_id = task_id
+        # This marker is only set after a fresh AList terminal-state read has
+        # been made durable.  It lets a restart distinguish a safely retired
+        # task from one whose cancellation response was lost.
+        self.external_task_final = bool(external_task_final)
 
 
 class AlistOfflineInDoubtError(AutomaticReplenishmentError):
@@ -1028,6 +1166,11 @@ class AlistOfflineAutomaticMaterializer:
     # 7 failed.  The undone list holds non-terminal rows; done holds the rest.
     _TASK_STATE_SUCCEEDED = 2
     _TASK_TERMINAL_FAILURE_STATES = frozenset({4, 5, 7})
+    _TASK_STOPPED_STATES = frozenset({2, 4, 5, 7})
+    _TASK_TERMINAL_FAILURE_SCOPES = frozenset({
+        FAILURE_CANDIDATE,
+        FAILURE_INFRASTRUCTURE,
+    })
 
     # Terminal task errors that prove a tool/transport outage rather than a
     # bad resource: they map onto infrastructure (same tier, retry_wait,
@@ -1324,38 +1467,92 @@ class AlistOfflineAutomaticMaterializer:
                 raise AlistOfflineInfrastructureError(
                     "AList 离线转存取消状态缺少时限"
                 )
-            return metadata
-        safe_started = cls._safe_epoch(started)
-        safe_deadline = cls._safe_epoch(deadline)
-        if (
-            safe_started is None
-            or safe_deadline is None
-            or safe_deadline < safe_started
-        ):
-            raise AlistOfflineInfrastructureError(
-                "AList 离线转存时限状态无效"
-            )
-        metadata["transfer_started_at"] = safe_started
-        metadata["transfer_deadline_at"] = safe_deadline
-        if cancel_requested_at is not None:
-            safe_cancel_requested_at = cls._safe_epoch(cancel_requested_at)
-            if safe_cancel_requested_at is None:
-                raise AlistOfflineInfrastructureError(
-                    "AList 离线转存取消状态无效"
-                )
-            metadata["transfer_cancel_requested_at"] = safe_cancel_requested_at
-        if cancel_confirmed_at is not None:
-            safe_cancel_confirmed_at = cls._safe_epoch(cancel_confirmed_at)
-            requested_at = metadata.get("transfer_cancel_requested_at")
+        else:
+            safe_started = cls._safe_epoch(started)
+            safe_deadline = cls._safe_epoch(deadline)
             if (
-                safe_cancel_confirmed_at is None
-                or not isinstance(requested_at, float)
-                or safe_cancel_confirmed_at < requested_at
+                safe_started is None
+                or safe_deadline is None
+                or safe_deadline < safe_started
             ):
                 raise AlistOfflineInfrastructureError(
-                    "AList 离线转存确认取消状态无效"
+                    "AList 离线转存时限状态无效"
                 )
-            metadata["transfer_cancel_confirmed_at"] = safe_cancel_confirmed_at
+            metadata["transfer_started_at"] = safe_started
+            metadata["transfer_deadline_at"] = safe_deadline
+            if cancel_requested_at is not None:
+                safe_cancel_requested_at = cls._safe_epoch(cancel_requested_at)
+                if safe_cancel_requested_at is None:
+                    raise AlistOfflineInfrastructureError(
+                        "AList 离线转存取消状态无效"
+                    )
+                metadata["transfer_cancel_requested_at"] = safe_cancel_requested_at
+            if cancel_confirmed_at is not None:
+                safe_cancel_confirmed_at = cls._safe_epoch(cancel_confirmed_at)
+                requested_at = metadata.get("transfer_cancel_requested_at")
+                if (
+                    safe_cancel_confirmed_at is None
+                    or not isinstance(requested_at, float)
+                    or safe_cancel_confirmed_at < requested_at
+                ):
+                    raise AlistOfflineInfrastructureError(
+                        "AList 离线转存确认取消状态无效"
+                    )
+                metadata["transfer_cancel_confirmed_at"] = safe_cancel_confirmed_at
+
+        # A generic cancellation (for example an aria2 task that stops
+        # reporting byte progress) is distinct from the bounded transfer
+        # timeout above.  Its durable intent prevents a restart from treating
+        # a missing/slow AList response as permission to submit another task.
+        task_cancel_requested_at = state.get("task_cancel_requested_at")
+        task_terminal_confirmed_at = state.get("task_terminal_confirmed_at")
+        task_terminal_state = state.get("task_terminal_state")
+        task_terminal_failure_scope = state.get("task_terminal_failure_scope")
+        if task_cancel_requested_at is not None:
+            safe_task_cancel_requested_at = cls._safe_epoch(task_cancel_requested_at)
+            if safe_task_cancel_requested_at is None:
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务取消状态无效"
+                )
+            metadata["task_cancel_requested_at"] = safe_task_cancel_requested_at
+        terminal_values = (
+            task_terminal_confirmed_at,
+            task_terminal_state,
+            task_terminal_failure_scope,
+        )
+        if any(value is not None for value in terminal_values):
+            if any(value is None for value in terminal_values):
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务终态确认状态不完整"
+                )
+            safe_terminal_confirmed_at = cls._safe_epoch(
+                task_terminal_confirmed_at
+            )
+            if (
+                safe_terminal_confirmed_at is None
+                or not isinstance(task_terminal_state, int)
+                or isinstance(task_terminal_state, bool)
+                or task_terminal_state not in cls._TASK_STOPPED_STATES
+                or not isinstance(task_terminal_failure_scope, str)
+                or task_terminal_failure_scope
+                not in cls._TASK_TERMINAL_FAILURE_SCOPES
+            ):
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务终态确认状态无效"
+                )
+            requested_at = metadata.get("task_cancel_requested_at")
+            if (
+                isinstance(requested_at, float)
+                and safe_terminal_confirmed_at < requested_at
+            ):
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务终态确认早于取消意图"
+                )
+            metadata["task_terminal_confirmed_at"] = safe_terminal_confirmed_at
+            metadata["task_terminal_state"] = task_terminal_state
+            metadata["task_terminal_failure_scope"] = (
+                task_terminal_failure_scope
+            )
         return metadata
 
     @classmethod
@@ -1379,7 +1576,10 @@ class AlistOfflineAutomaticMaterializer:
         # stuck transfer unbounded after a process restart.
         self_metadata = cls._attempt_metadata(state)
         if (
-            self_metadata.get("transfer_cancel_confirmed_at") is not None
+            (
+                self_metadata.get("transfer_cancel_confirmed_at") is not None
+                or self_metadata.get("task_terminal_confirmed_at") is not None
+            )
             and cls._safe_task_id(state.get("task_id")) is None
         ):
             raise AlistOfflineInfrastructureError(
@@ -1404,6 +1604,10 @@ class AlistOfflineAutomaticMaterializer:
         transfer_deadline_at: float | None = None,
         transfer_cancel_requested_at: float | None = None,
         transfer_cancel_confirmed_at: float | None = None,
+        task_cancel_requested_at: float | None = None,
+        task_terminal_confirmed_at: float | None = None,
+        task_terminal_state: int | None = None,
+        task_terminal_failure_scope: str | None = None,
     ) -> dict[str, object]:
         safe_task = cls._safe_task_id(task_id) if task_id is not None else None
         selected = selection.get("selected_gap_ids")
@@ -1469,8 +1673,53 @@ class AlistOfflineAutomaticMaterializer:
                     "AList 离线转存确认取消状态无效"
                 )
             persisted["transfer_cancel_confirmed_at"] = safe_cancel_confirmed_at
+        if task_cancel_requested_at is not None:
+            safe_task_cancel_requested_at = cls._safe_epoch(task_cancel_requested_at)
+            if safe_task_cancel_requested_at is None:
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务取消状态无效"
+                )
+            persisted["task_cancel_requested_at"] = safe_task_cancel_requested_at
+        terminal_values = (
+            task_terminal_confirmed_at,
+            task_terminal_state,
+            task_terminal_failure_scope,
+        )
+        if any(value is not None for value in terminal_values):
+            if any(value is None for value in terminal_values):
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务终态确认状态不完整"
+                )
+            safe_terminal_confirmed_at = cls._safe_epoch(
+                task_terminal_confirmed_at
+            )
+            requested_at = persisted.get("task_cancel_requested_at")
+            if (
+                safe_terminal_confirmed_at is None
+                or not isinstance(task_terminal_state, int)
+                or isinstance(task_terminal_state, bool)
+                or task_terminal_state not in cls._TASK_STOPPED_STATES
+                or not isinstance(task_terminal_failure_scope, str)
+                or task_terminal_failure_scope
+                not in cls._TASK_TERMINAL_FAILURE_SCOPES
+                or (
+                    isinstance(requested_at, float)
+                    and safe_terminal_confirmed_at < requested_at
+                )
+            ):
+                raise AlistOfflineInfrastructureError(
+                    "AList 离线任务终态确认状态无效"
+                )
+            persisted["task_terminal_confirmed_at"] = safe_terminal_confirmed_at
+            persisted["task_terminal_state"] = task_terminal_state
+            persisted["task_terminal_failure_scope"] = (
+                task_terminal_failure_scope
+            )
         if (
-            persisted.get("transfer_cancel_confirmed_at") is not None
+            (
+                persisted.get("transfer_cancel_confirmed_at") is not None
+                or persisted.get("task_terminal_confirmed_at") is not None
+            )
             and safe_task is None
         ):
             raise AlistOfflineInfrastructureError(
@@ -1803,6 +2052,273 @@ class AlistOfflineAutomaticMaterializer:
             )
         return task_id
 
+    def _confirmed_task_terminal_failure(
+        self,
+        state: Mapping[str, object],
+        *,
+        external_task_id: object | None = None,
+    ) -> tuple[str, int, str] | None:
+        """Return one durably observed, stopped task failure.
+
+        This is deliberately separate from the transfer-deadline cancellation
+        receipt.  A stalled task can be cancelled at any phase; before its
+        row is dropped, a fresh AList terminal state must be written here so
+        a restart never mistakes the resulting missing row for a failed
+        submission that may be safely repeated.
+        """
+        metadata = self._attempt_metadata(state)
+        if metadata.get("task_terminal_confirmed_at") is None:
+            return None
+        task_id = self._safe_task_id(state.get("task_id"))
+        if task_id is None:
+            raise AlistOfflineInfrastructureError(
+                "AList 离线终态确认缺少任务 id"
+            )
+        requested = self._safe_task_id(external_task_id)
+        if requested is not None and requested != task_id:
+            raise AlistOfflineInfrastructureError(
+                "AList 离线终态确认任务与恢复任务不一致"
+            )
+        terminal_state = metadata.get("task_terminal_state")
+        scope = metadata.get("task_terminal_failure_scope")
+        if (
+            not isinstance(terminal_state, int)
+            or isinstance(terminal_state, bool)
+            or terminal_state not in self._TASK_STOPPED_STATES
+            or not isinstance(scope, str)
+            or scope not in self._TASK_TERMINAL_FAILURE_SCOPES
+        ):
+            raise AlistOfflineInfrastructureError(
+                "AList 离线终态确认状态无效"
+            )
+        return scope, terminal_state, task_id
+
+    @staticmethod
+    def _terminal_failure_scope(error: str) -> str:
+        lowered = error.casefold()
+        markers = AlistOfflineAutomaticMaterializer._TASK_INFRASTRUCTURE_ERROR_MARKERS
+        if any(marker in lowered for marker in markers):
+            return FAILURE_INFRASTRUCTURE
+        return FAILURE_CANDIDATE
+
+    @staticmethod
+    def _delete_confirmed_task_row(alist: object, task_id: str) -> None:
+        """Best-effort deletion only after durable terminal confirmation."""
+        delete = getattr(alist, "offline_download_delete", None)
+        if callable(delete):
+            try:
+                delete(task_id)
+            except AutomaticReplenishmentPaused:
+                raise
+            except Exception:
+                # The durable terminal proof is authoritative.  A stale AList
+                # row is housekeeping debt, not a reason to recreate a task
+                # barrier or to submit another download.
+                pass
+
+    def _raise_confirmed_task_terminal_failure(
+        self,
+        alist: object,
+        *,
+        task_id: str,
+        scope: str,
+        terminal_state: int,
+    ) -> None:
+        """Forget a task row only after its stopped state is durable."""
+        self._delete_confirmed_task_row(alist, task_id)
+        if scope == FAILURE_INFRASTRUCTURE:
+            raise AlistOfflineInfrastructureError(
+                "AList 离线任务已确认终态，等待同阶基础设施重试 "
+                f"(state {terminal_state})",
+                task_id=task_id,
+                external_task_final=True,
+            )
+        raise AlistOfflineCandidateError(
+            f"AList 离线任务已确认终态失败 (state {terminal_state})",
+            task_id=task_id,
+            external_task_final=True,
+        )
+
+    def _confirm_task_terminal_failure(
+        self,
+        alist: object,
+        task_id: str,
+        *,
+        workspace: Path,
+        staging_root: str,
+        selection: Mapping[str, object],
+        terminal_state: int,
+        error: str,
+    ) -> None:
+        """Persist a fresh terminal task read before deleting its row."""
+        scope = self._terminal_failure_scope(error)
+        attempt_state = self._read_attempt_state(workspace, staging_root)
+        confirmed = self._confirmed_task_terminal_failure(
+            attempt_state, external_task_id=task_id,
+        )
+        if confirmed is not None:
+            confirmed_scope, confirmed_state, confirmed_task_id = confirmed
+            if (
+                confirmed_scope != scope
+                or confirmed_state != terminal_state
+                or confirmed_task_id != task_id
+            ):
+                raise AlistOfflineInDoubtError(
+                    "AList 离线任务 fresh 终态与持久化确认不一致",
+                    task_id=task_id,
+                )
+        else:
+            try:
+                self._write_attempt_state(
+                    workspace,
+                    staging_root=staging_root,
+                    selection=selection,
+                    task_id=task_id,
+                    state=attempt_state,
+                    task_terminal_confirmed_at=self._clock_now(),
+                    task_terminal_state=terminal_state,
+                    task_terminal_failure_scope=scope,
+                )
+            except Exception as exc:
+                # A terminal state observed only in memory must not permit
+                # deletion: preserve the task id through the outer
+                # waiting_reconcile state instead.
+                raise AlistOfflineInDoubtError(
+                    "AList 离线任务终态无法持久化，继续等待重对账",
+                    task_id=task_id,
+                ) from exc
+        self._raise_confirmed_task_terminal_failure(
+            alist,
+            task_id=task_id,
+            scope=scope,
+            terminal_state=terminal_state,
+        )
+
+    def _has_task_cancel_intent(
+        self, workspace: Path, staging_root: str,
+    ) -> bool:
+        state = self._read_attempt_state(workspace, staging_root)
+        metadata = self._attempt_metadata(state)
+        return metadata.get("task_cancel_requested_at") is not None
+
+    def _request_task_cancel_and_confirm(
+        self,
+        alist: object,
+        task_id: str,
+        *,
+        workspace: Path,
+        staging_root: str,
+        selection: Mapping[str, object],
+    ) -> str:
+        """Request cancellation, then retain the task until AList proves it stopped.
+
+        ``offline_download_delete`` only removes AList bookkeeping.  It must
+        never be called from this path until a fresh task row reports a
+        terminal stopped state.  A missing row is also inconclusive: AList
+        may lag list visibility while its bound aria2 gid remains active.
+        """
+        attempt_state = self._read_attempt_state(workspace, staging_root)
+        confirmed = self._confirmed_task_terminal_failure(
+            attempt_state, external_task_id=task_id,
+        )
+        if confirmed is not None:
+            scope, terminal_state, confirmed_task_id = confirmed
+            self._raise_confirmed_task_terminal_failure(
+                alist,
+                task_id=confirmed_task_id,
+                scope=scope,
+                terminal_state=terminal_state,
+            )
+
+        def observe(row: Mapping[str, object] | None) -> str | None:
+            if row is None:
+                return None
+            state = row.get("state")
+            error = str(row.get("error") or "")
+            if state == self._TASK_STATE_SUCCEEDED and not error:
+                return "succeeded"
+            if state in self._TASK_TERMINAL_FAILURE_STATES or (
+                error and state not in (None, 0, 1, 3)
+            ):
+                if not isinstance(state, int) or isinstance(state, bool):
+                    raise AlistOfflineInDoubtError(
+                        "AList 离线任务终态值无效，继续等待重对账",
+                        task_id=task_id,
+                    )
+                self._confirm_task_terminal_failure(
+                    alist,
+                    task_id,
+                    workspace=workspace,
+                    staging_root=staging_root,
+                    selection=selection,
+                    terminal_state=state,
+                    error=error,
+                )
+            return None
+
+        # A reconciliation begins with a fresh status read.  This lets a
+        # cancellation race that completed while the process was down resolve
+        # without issuing a second cancel request.
+        try:
+            row_before_cancel = self._row_by_id(alist, task_id)
+        except AutomaticReplenishmentPaused:
+            raise
+        except Exception as exc:
+            raise AlistOfflineInDoubtError(
+                "AList 离线取消前状态不可读，继续等待重对账",
+                task_id=task_id,
+            ) from exc
+        observed = observe(row_before_cancel)
+        if observed is not None:
+            return observed
+
+        metadata = self._attempt_metadata(attempt_state)
+        if metadata.get("task_cancel_requested_at") is None:
+            try:
+                attempt_state = self._write_attempt_state(
+                    workspace,
+                    staging_root=staging_root,
+                    selection=selection,
+                    task_id=task_id,
+                    state=attempt_state,
+                    task_cancel_requested_at=self._clock_now(),
+                )
+            except Exception as exc:
+                raise AlistOfflineInDoubtError(
+                    "AList 离线取消意图无法持久化，继续等待重对账",
+                    task_id=task_id,
+                ) from exc
+        cancel = getattr(alist, "offline_download_cancel", None)
+        if not callable(cancel):
+            raise AlistOfflineInDoubtError(
+                "AList 客户端缺少 offline_download_cancel，继续等待重对账",
+                task_id=task_id,
+            )
+        try:
+            cancel(task_id)
+        except AutomaticReplenishmentPaused:
+            raise
+        except Exception as exc:
+            raise AlistOfflineInDoubtError(
+                f"AList 离线取消结果未确认: {exc}", task_id=task_id,
+            ) from exc
+        try:
+            row_after_cancel = self._row_by_id(alist, task_id)
+        except AutomaticReplenishmentPaused:
+            raise
+        except Exception as exc:
+            raise AlistOfflineInDoubtError(
+                "AList 离线取消后状态不可读，继续等待重对账",
+                task_id=task_id,
+            ) from exc
+        observed = observe(row_after_cancel)
+        if observed is not None:
+            return observed
+        raise AlistOfflineInDoubtError(
+            "AList 离线取消尚未确认，继续等待重对账",
+            task_id=task_id,
+        )
+
     @staticmethod
     def _raise_confirmed_transfer_cancel(alist: object, task_id: str) -> None:
         """Best-effort row cleanup after a *durably* confirmed cancellation."""
@@ -1810,6 +2326,8 @@ class AlistOfflineAutomaticMaterializer:
         if callable(delete):
             try:
                 delete(task_id)
+            except AutomaticReplenishmentPaused:
+                raise
             except Exception:
                 # The state-4 fact was already made durable.  A stale row is
                 # cleanup debt, not a reason to recreate the external barrier.
@@ -1864,6 +2382,8 @@ class AlistOfflineAutomaticMaterializer:
         )
         try:
             tasks = add(sibling, list(plan["urls"]), tool="aria2")
+        except AutomaticReplenishmentPaused:
+            raise
         except Exception as exc:
             # The add request may have been accepted with a lost response.
             # Never re-submit blindly: scan the task lists by the destination
@@ -1987,12 +2507,16 @@ class AlistOfflineAutomaticMaterializer:
             )
         try:
             cancel(task_id)
+        except AutomaticReplenishmentPaused:
+            raise
         except Exception as exc:
             raise AlistOfflineInDoubtError(
                 f"AList 离线转存超时，取消结果未确认: {exc}", task_id=task_id,
             ) from exc
         try:
             row = self._row_by_id(alist, task_id)
+        except AutomaticReplenishmentPaused:
+            raise
         except Exception as exc:
             raise AlistOfflineInDoubtError(
                 f"AList 离线转存超时，取消后状态不可读: {exc}", task_id=task_id,
@@ -2063,13 +2587,13 @@ class AlistOfflineAutomaticMaterializer:
         staging_root: str,
         selection: Mapping[str, object],
     ) -> str:
-        """Poll one AList offline task; return "succeeded" or "missing".
+        """Poll one AList offline task; return only a fresh "succeeded".
 
-        Candidate failures raise ``AlistOfflineCandidateError`` and cancel +
-        remove the task record (AList may otherwise auto-retry an errored
-        task in the background — and its bare delete path never stops the
-        bound aria2 gid — transferring bytes into an abandoned staging
-        sibling);
+        Candidate failures raise ``AlistOfflineCandidateError`` only after a
+        fresh AList terminal state has been written to the durable attempt
+        record.  A stalled task first records cancellation intent, then waits
+        in ``AlistOfflineInDoubtError`` until AList proves its aria2 work has
+        stopped; its bare delete path is never treated as that proof.
         tool/transport failures raise the plain infrastructure error.  A task
         that makes no byte progress for ``stall_limit`` seconds is a dead
         candidate.  A task row whose ``status`` mentions transfer is held from
@@ -2083,27 +2607,27 @@ class AlistOfflineAutomaticMaterializer:
         )
         if confirmed_task_id is not None:
             self._raise_confirmed_transfer_cancel(alist, confirmed_task_id)
+        confirmed_terminal_failure = self._confirmed_task_terminal_failure(
+            attempt_state, external_task_id=task_id,
+        )
+        if confirmed_terminal_failure is not None:
+            scope, terminal_state, confirmed_task_id = confirmed_terminal_failure
+            self._raise_confirmed_task_terminal_failure(
+                alist,
+                task_id=confirmed_task_id,
+                scope=scope,
+                terminal_state=terminal_state,
+            )
+        if self._has_task_cancel_intent(workspace, staging_root):
+            return self._request_task_cancel_and_confirm(
+                alist,
+                task_id,
+                workspace=workspace,
+                staging_root=staging_root,
+                selection=selection,
+            )
         last_progress: object = None
         last_advanced = time.monotonic()
-
-        def drop_candidate_task(message: str) -> AlistOfflineCandidateError:
-            # Cancel BEFORE delete: AList's delete only drops the task row,
-            # while cancel stops the bound aria2 gid — otherwise the download
-            # keeps running in the background and later transfers bytes into
-            # an abandoned staging sibling.
-            cancel = getattr(alist, "offline_download_cancel", None)
-            if callable(cancel):
-                try:
-                    cancel(task_id)
-                except Exception:
-                    pass
-            delete = getattr(alist, "offline_download_delete", None)
-            if callable(delete):
-                try:
-                    delete(task_id)
-                except Exception:
-                    pass
-            return AlistOfflineCandidateError(message)
 
         while True:
             row = self._row_by_id(alist, task_id)
@@ -2113,7 +2637,15 @@ class AlistOfflineAutomaticMaterializer:
                         "AList 离线转存取消尚未确认，任务行不可见",
                         task_id=task_id,
                     )
-                return "missing"
+                # AList list visibility is not an aria2 lifecycle receipt.
+                # In particular, a task can temporarily disappear while the
+                # bound gid still consumes disk.  Do not let the caller move
+                # staged bytes, delete the bookkeeping row, or clear its
+                # external-task barrier without a fresh terminal row.
+                raise AlistOfflineInDoubtError(
+                    "AList 离线任务行不可见，未取得终态证明，继续等待重对账",
+                    task_id=task_id,
+                )
             state = row.get("state")
             error = str(row.get("error") or "")
             if state == self._TASK_STATE_SUCCEEDED and not error:
@@ -2148,19 +2680,19 @@ class AlistOfflineAutomaticMaterializer:
             if state in self._TASK_TERMINAL_FAILURE_STATES or (
                 error and state not in (None, 0, 1)
             ):
-                lowered = error.casefold()
-                if any(
-                    marker in lowered
-                    for marker in self._TASK_INFRASTRUCTURE_ERROR_MARKERS
-                ):
-                    # The download tool/transport itself is down (aria2 RPC
-                    # unreachable, tool not configured, ...): infrastructure,
-                    # never a candidate exclusion.
-                    raise AutomaticReplenishmentError(
-                        f"AList 离线工具故障: {error[:200] or state}"
+                if not isinstance(state, int) or isinstance(state, bool):
+                    raise AlistOfflineInDoubtError(
+                        "AList 离线任务终态值无效，继续等待重对账",
+                        task_id=task_id,
                     )
-                raise drop_candidate_task(
-                    f"AList 离线任务失败: {error[:200] or state}"
+                self._confirm_task_terminal_failure(
+                    alist,
+                    task_id,
+                    workspace=workspace,
+                    staging_root=staging_root,
+                    selection=selection,
+                    terminal_state=state,
+                    error=error,
                 )
             progress = row.get("progress")
             status_text = str(row.get("status") or "").casefold()
@@ -2196,7 +2728,15 @@ class AlistOfflineAutomaticMaterializer:
                 last_progress = progress
                 last_advanced = time.monotonic()
             elif time.monotonic() - last_advanced > self.stall_limit:
-                raise drop_candidate_task("AList 离线下载长期无进度")
+                outcome = self._request_task_cancel_and_confirm(
+                    alist,
+                    task_id,
+                    workspace=workspace,
+                    staging_root=staging_root,
+                    selection=selection,
+                )
+                if outcome == "succeeded":
+                    return outcome
             self.sleep(self.poll_interval)
 
     def _finalize_delivery(
@@ -2268,6 +2808,8 @@ class AlistOfflineAutomaticMaterializer:
                     )
             try:
                 remove(posixpath.dirname(sibling), [posixpath.basename(sibling)])
+            except AutomaticReplenishmentPaused:
+                raise
             except Exception as exc:
                 raise AutomaticReplenishmentError(
                     f"AList 离线转存目录清理失败: {exc}"
@@ -2337,6 +2879,8 @@ class AlistOfflineAutomaticMaterializer:
             if callable(delete):
                 try:
                     delete(task_id)
+                except AutomaticReplenishmentPaused:
+                    raise
                 except Exception:
                     pass
         delivery: dict[str, object] = {
@@ -2357,7 +2901,10 @@ class AlistOfflineAutomaticMaterializer:
         staging_root: str,
         workspace: Path,
         alist: object,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
+        _provider_pause_checkpoint(pause_requested)
+        alist = _PauseCheckedProviderPort(alist, pause_requested)
         del request
         if len(selections) != 1:
             raise AutomaticReplenishmentError("AList 离线一次只接受一个候选")
@@ -2366,8 +2913,33 @@ class AlistOfflineAutomaticMaterializer:
         confirmed_task_id = self._confirmed_cancel_task_id(state)
         if confirmed_task_id is not None:
             self._raise_confirmed_transfer_cancel(alist, confirmed_task_id)
+        confirmed_terminal_failure = self._confirmed_task_terminal_failure(state)
+        if confirmed_terminal_failure is not None:
+            scope, terminal_state, confirmed_task_id = confirmed_terminal_failure
+            self._raise_confirmed_task_terminal_failure(
+                alist,
+                task_id=confirmed_task_id,
+                scope=scope,
+                terminal_state=terminal_state,
+            )
         plan = self._plan(selection, staging_root)
         task_id = self._safe_task_id(state.get("task_id"))
+        if task_id is not None and self._has_task_cancel_intent(workspace, staging_root):
+            outcome = self._request_task_cancel_and_confirm(
+                alist,
+                task_id,
+                workspace=workspace,
+                staging_root=staging_root,
+                selection=selection,
+            )
+            if outcome == "succeeded":
+                return self._finalize_delivery(
+                    alist, staging_root, plan, selection, task_id,
+                )
+            raise AlistOfflineInDoubtError(
+                "AList 离线取消结果未确认，继续等待重对账",
+                task_id=task_id,
+            )
         capacity_receipt: Mapping[str, object] | None = None
         if task_id is None:
             submission_phase = state.get("submission_phase")
@@ -2432,40 +3004,86 @@ class AlistOfflineAutomaticMaterializer:
                 alist, staging_root, plan, workspace, selection, state,
                 capacity_receipt=capacity_receipt,
             )
-        self._poll_until_terminal(
+        outcome = self._poll_until_terminal(
             alist, task_id,
             workspace=workspace, staging_root=staging_root, selection=selection,
         )
+        if outcome != "succeeded":
+            raise AlistOfflineInDoubtError(
+                "AList 离线任务未取得成功终态，继续等待重对账",
+                task_id=task_id,
+            )
         return self._finalize_delivery(
             alist, staging_root, plan, selection, task_id,
         )
 
     def reconcile_existing_task(
         self, request, selections, *, staging_root, workspace, alist, external_task_id,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         """Re-enter an existing AList offline task; never submit a new one."""
+        _provider_pause_checkpoint(pause_requested)
+        alist = _PauseCheckedProviderPort(alist, pause_requested)
         del request
         if len(selections) != 1 or not isinstance(selections[0], Mapping):
             raise AutomaticReplenishmentError("AList 离线已有任务恢复候选无效")
         selection = selections[0]
         state = self._read_attempt_state(workspace, staging_root)
+        persisted_task_id = self._safe_task_id(state.get("task_id"))
+        requested_task_id = self._safe_task_id(external_task_id)
+        if (
+            persisted_task_id is not None
+            and requested_task_id is not None
+            and persisted_task_id != requested_task_id
+        ):
+            # A root-level token and the task-owned attempt record must name
+            # the same AList task.  Choosing either one would let a restart
+            # cancel/delete somebody else's live task or orphan the original
+            # aria2 gid, so retain both records for manual reconciliation.
+            raise AlistOfflineInDoubtError(
+                "AList 离线恢复任务 id 与持久化 attempt 不一致，继续等待人工核对"
+            )
         confirmed_task_id = self._confirmed_cancel_task_id(
             state, external_task_id=external_task_id,
         )
         if confirmed_task_id is not None:
             self._raise_confirmed_transfer_cancel(alist, confirmed_task_id)
         plan = self._plan(selection, staging_root)
-        task_id = (
-            self._safe_task_id(external_task_id)
-            or self._safe_task_id(state.get("task_id"))
+        task_id = requested_task_id or persisted_task_id
+        confirmed_terminal_failure = self._confirmed_task_terminal_failure(
+            state, external_task_id=external_task_id,
         )
+        if confirmed_terminal_failure is not None:
+            scope, terminal_state, confirmed_task_id = confirmed_terminal_failure
+            self._raise_confirmed_task_terminal_failure(
+                alist,
+                task_id=confirmed_task_id,
+                scope=scope,
+                terminal_state=terminal_state,
+            )
+        if task_id is not None and self._has_task_cancel_intent(workspace, staging_root):
+            outcome = self._request_task_cancel_and_confirm(
+                alist,
+                task_id,
+                workspace=workspace,
+                staging_root=staging_root,
+                selection=selection,
+            )
+            if outcome == "succeeded":
+                return self._finalize_delivery(
+                    alist, staging_root, plan, selection, task_id,
+                )
+            raise AlistOfflineInDoubtError(
+                "AList 离线取消结果未确认，继续等待重对账",
+                task_id=task_id,
+            )
         if task_id is None:
             # The submission response was lost: recover the task by its
             # destination path or BTIH name.  A task can become visible after
             # the first scan, so no trace anywhere is not permission to enter
-            # ``acquire`` again.  If finalized bytes are already present, the
-            # normal delivery verifier may close the attempt; otherwise leave
-            # it durable/in-doubt for another poll-only reconciliation round.
+            # ``acquire`` again or to treat staged bytes as a completion
+            # receipt.  Leave it durable/in-doubt for another poll-only
+            # reconciliation round.
             task_id = self._scan_task_id(
                 alist, staging_root=staging_root, infohash=str(plan["infohash"] or ""),
             )
@@ -2475,23 +3093,22 @@ class AlistOfflineAutomaticMaterializer:
                     selection=selection, task_id=task_id, state=state,
                 )
             else:
-                try:
-                    return self._finalize_delivery(
-                        alist, staging_root, plan, selection, task_id=None,
-                    )
-                except Exception as exc:
-                    # With no durable task id or terminal task row, incomplete
-                    # sibling/staging contents cannot prove a candidate
-                    # failure.  The external submit remains ambiguous; retain
-                    # its reviewed selection and do not let a later automatic
-                    # round submit the same locator again.
-                    raise AlistOfflineInDoubtError(
-                        "AList 离线任务尚未在任务表或 staging 中可验证，继续对账"
-                    ) from exc
-        self._poll_until_terminal(
+                # Expected files can be only a subset of the full torrent.
+                # Their presence in staging therefore cannot prove that an
+                # unknown AList/aria2 task has stopped.  Keep the ambiguous
+                # submission in reconcile even when those bytes look usable.
+                raise AlistOfflineInDoubtError(
+                    "AList 离线任务尚未在任务表取得终态 task id，继续等待重对账"
+                )
+        outcome = self._poll_until_terminal(
             alist, task_id,
             workspace=workspace, staging_root=staging_root, selection=selection,
         )
+        if outcome != "succeeded":
+            raise AlistOfflineInDoubtError(
+                "AList 离线任务未取得成功终态，继续等待重对账",
+                task_id=task_id,
+            )
         return self._finalize_delivery(
             alist, staging_root, plan, selection, task_id,
         )
@@ -2519,6 +3136,7 @@ class FixedTierAutomaticMaterializer:
         staging_root: str,
         workspace: Path,
         alist: object,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         providers = {
             str(row.get("provider") or "").strip().casefold()
@@ -2532,24 +3150,28 @@ class FixedTierAutomaticMaterializer:
                     "补源 bundle 必须只包含当前 tier 的候选"
                 )
         if providers == {TIER_QUARK_SHARE}:
-            return self.quark_share.acquire(
+            return _call_with_pause(
+                self.quark_share.acquire,
                 request, selections, staging_root=staging_root,
-                workspace=workspace, alist=alist,
+                workspace=workspace, alist=alist, pause_requested=pause_requested,
             )
         if providers == {TIER_ALIST_OFFLINE}:
-            return self.alist_offline.acquire(
+            return _call_with_pause(
+                self.alist_offline.acquire,
                 request, selections, staging_root=staging_root,
-                workspace=workspace, alist=alist,
+                workspace=workspace, alist=alist, pause_requested=pause_requested,
             )
         if providers == {TIER_LOCAL_MAGNET}:
-            return self.local_torrent.acquire(
+            return _call_with_pause(
+                self.local_torrent.acquire,
                 request, selections, staging_root=staging_root,
-                workspace=workspace, alist=alist,
+                workspace=workspace, alist=alist, pause_requested=pause_requested,
             )
         raise AutomaticReplenishmentError("单次补源 attempt 必须只使用一个固定 lane")
 
     def reconcile_existing_task(
         self, request, selections, *, staging_root, workspace, alist, external_task_id,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         providers = {
             str(row.get("provider") or "").strip().casefold()
@@ -2564,9 +3186,11 @@ class FixedTierAutomaticMaterializer:
         method = getattr(delegate, "reconcile_existing_task", None)
         if not callable(method):
             raise AutomaticReplenishmentError("当前补源 materializer 不支持 external_task_id 恢复")
-        return method(
+        return _call_with_pause(
+            method,
             request, selections, staging_root=staging_root, workspace=workspace,
             alist=alist, external_task_id=external_task_id,
+            pause_requested=pause_requested,
         )
 
 
@@ -2813,17 +3437,65 @@ class AutomaticReplenishmentRuntime:
                            cancellation_boundary=boundary)
             raise AutomaticReplenishmentPaused(message)
 
+    def _provider_pause_callback(
+        self,
+        job: EngineJob,
+        *,
+        round_number: int,
+        boundary: str,
+    ) -> Callable[[], bool] | None:
+        """Adapt runtime control to provider/archive callback shape.
+
+        The provider port asks this callback immediately before its own AList,
+        local-staging, downloader, or archive effect.  It combines the global
+        pause fence and the root/pilot cancellation fence; supplying only the
+        former would let a withdrawn single-root pilot continue mutating its
+        task staging.
+        """
+        if self.pause_requested is None and self.cancel_requested is None:
+            return None
+
+        def checkpoint() -> bool:
+            try:
+                self._raise_if_cancelled(
+                    job,
+                    round_number=round_number,
+                    boundary=boundary,
+                )
+            except AutomaticReplenishmentCancelled:
+                # The lower provider/engine protocols use a boolean result.
+                # The durable helper above already recorded why it stopped;
+                # returning True preserves that control signal at every
+                # downstream boundary instead of reclassifying it as a
+                # provider failure.
+                return True
+            return False
+
+        return checkpoint
+
     def _plan_internal_child(
         self,
         request: Mapping[str, object],
         *,
         root_job_id: str,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> EngineJob:
         """Persist a provider attempt as an internal child of the root job."""
         planner = getattr(self.engine_runner, "plan_job", None)
         if not callable(planner):
             raise AutomaticReplenishmentError("Engine runner 不支持 child plan")
-        child = planner(request, internal_child_of=root_job_id)
+        if pause_requested is None:
+            child = planner(request, internal_child_of=root_job_id)
+        elif _accepts_keyword(planner, "pause_requested"):
+            child = planner(
+                request,
+                internal_child_of=root_job_id,
+                pause_requested=pause_requested,
+            )
+        else:
+            raise AutomaticReplenishmentError(
+                "Engine child planner 不支持 pause_requested；拒绝在 RootJob 试运行范围执行",
+            )
         if not isinstance(child, EngineJob):
             raise AutomaticReplenishmentError("Engine child plan 返回无效")
         return child
@@ -4404,17 +5076,24 @@ class AutomaticReplenishmentRuntime:
                 job, "subtitle_installing", gap_id=str(spec.get("gap_id") or ""),
                 target=target, companion=True,
             )
+            writer_pause = self._provider_pause_callback(
+                job,
+                round_number=round_number,
+                boundary="companion_subtitle_write",
+            )
             try:
-                result = installer(
+                result = _call_with_pause(
+                    installer,
                     source, target, expected_size=size, video_path=video_target,
                     subtitle_language=str(language),
+                    pause_requested=writer_pause,
                 )
             except TypeError as exc:
                 # Focused legacy test executors may not expose the optional
                 # language keyword.  Production runner/executor does; only
                 # retry when the signature, rather than the write itself,
                 # rejected that keyword.
-                if "subtitle_language" not in str(exc):
+                if writer_pause is not None or "subtitle_language" not in str(exc):
                     raise
                 result = installer(
                     source, target, expected_size=size, video_path=video_target,
@@ -4553,12 +5232,18 @@ class AutomaticReplenishmentRuntime:
         else:
             state.pop(_POST_ACQUISITION_REAUDIT_KEY, None)
 
-    def _fresh_list(self, path: str) -> list[Mapping[str, object]]:
-        listing = getattr(self.alist, "list", None)
+    def _fresh_list(
+        self,
+        path: str,
+        *,
+        alist: object | None = None,
+    ) -> list[Mapping[str, object]]:
+        client = self.alist if alist is None else alist
+        listing = getattr(client, "list", None)
         if not callable(listing):
             raise AutomaticReplenishmentError("AList 客户端缺少 list")
-        login = getattr(self.alist, "login", None)
-        if callable(login) and not getattr(self.alist, "token", None):
+        login = getattr(client, "login", None)
+        if callable(login) and not getattr(client, "token", None):
             login()
         try:
             rows = listing(path, refresh=True)
@@ -4828,13 +5513,20 @@ class AutomaticReplenishmentRuntime:
             self._validate_subtitle_source_content(
                 source, language, installer=installer,
             )
+            writer_pause = self._provider_pause_callback(
+                job,
+                round_number=round_number,
+                boundary="subtitle_write",
+            )
             try:
-                result = installer(
+                result = _call_with_pause(
+                    installer,
                     source, target, expected_size=size, video_path=video_path,
                     subtitle_language=str(language),
+                    pause_requested=writer_pause,
                 )
             except TypeError as exc:
-                if "subtitle_language" not in str(exc):
+                if writer_pause is not None or "subtitle_language" not in str(exc):
                     raise
                 result = installer(source, target, expected_size=size, video_path=video_path)
             if not isinstance(result, Mapping) or int(result.get("size") or 0) != size:
@@ -4845,13 +5537,20 @@ class AutomaticReplenishmentRuntime:
             raise AutomaticReplenishmentError("字幕补源未覆盖所有 gap")
         return installed
 
-    def _remove_staging(self, staging_root: str) -> None:
+    def _remove_staging(
+        self,
+        staging_root: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> None:
         """Delete only one verified task-owned staging tree and read it back."""
+        _provider_pause_checkpoint(pause_requested)
         root = _safe_path(staging_root, label="staging cleanup path")
         if root == self.staging_root or not root.startswith(self.staging_root + "/"):
             raise AutomaticReplenishmentError("拒绝清理任务 staging 根以外的目录")
-        remove = getattr(self.alist, "remove", None)
-        remove_empty = getattr(self.alist, "remove_empty_dir", None)
+        alist = _PauseCheckedProviderPort(self.alist, pause_requested)
+        remove = getattr(alist, "remove", None)
+        remove_empty = getattr(alist, "remove_empty_dir", None)
         if not callable(remove):
             raise AutomaticReplenishmentError("AList 客户端缺少 remove")
 
@@ -4865,7 +5564,7 @@ class AutomaticReplenishmentRuntime:
             misleading ``staging cleanup failed`` outcome.
             """
             try:
-                return self._fresh_list(path)
+                return self._fresh_list(path, alist=alist)
             except Exception as exc:
                 message = str(exc).casefold()
                 if "object not found" in message:
@@ -4962,7 +5661,13 @@ class AutomaticReplenishmentRuntime:
                 break
             current = current_parent
 
-    def _remove_local_attempt_workspace(self, *, job_id: str, attempt_id: str) -> None:
+    def _remove_local_attempt_workspace(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> None:
         """Delete exactly one post-audit local provider workspace.
 
         The workspace can contain a persisted Quark task id needed for
@@ -4987,10 +5692,12 @@ class AutomaticReplenishmentRuntime:
             return
         if not attempt_root.is_dir():
             raise AutomaticReplenishmentError("本地补源 attempt 不是目录")
+        _provider_pause_checkpoint(pause_requested)
         shutil.rmtree(attempt_root)
         if attempt_root.exists():
             raise AutomaticReplenishmentError("本地补源 attempt 清理后仍存在")
         try:
+            _provider_pause_checkpoint(pause_requested)
             job_root.rmdir()
         except FileNotFoundError:
             return
@@ -5162,6 +5869,7 @@ class AutomaticReplenishmentRuntime:
         actionable_gap_ids: Sequence[str] | set[str],
         audit_uncertain: bool,
         unidentified_actionable_gap: bool = False,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         """Clean successful attempt staging only after a later scoped audit.
 
@@ -5256,9 +5964,13 @@ class AutomaticReplenishmentRuntime:
                 blocked.append({"attempt_id": attempt_id, "reason": "selected_gap_still_actionable"})
                 continue
             try:
-                self._remove_staging(staging_root)
+                self._remove_staging(
+                    staging_root,
+                    pause_requested=pause_requested,
+                )
                 self._remove_local_attempt_workspace(
                     job_id=safe_job_id, attempt_id=attempt_id,
+                    pause_requested=pause_requested,
                 )
                 self._update_post_acquisition_reaudit_group(
                     group,
@@ -5270,6 +5982,8 @@ class AutomaticReplenishmentRuntime:
                     },
                     phase="resolved",
                 )
+            except AutomaticReplenishmentCancelled:
+                raise
             except Exception as exc:
                 cleanup_attempts = marker.get("cleanup_attempts")
                 attempts = (
@@ -5324,6 +6038,7 @@ class AutomaticReplenishmentRuntime:
         actionable_gap_ids: Sequence[str] | set[str],
         audit_uncertain: bool,
         unidentified_actionable_gap: bool = False,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         """Run the state-only post-audit cleanup without provider setup.
 
@@ -5348,6 +6063,7 @@ class AutomaticReplenishmentRuntime:
             actionable_gap_ids=actionable_gap_ids,
             audit_uncertain=audit_uncertain,
             unidentified_actionable_gap=unidentified_actionable_gap,
+            pause_requested=pause_requested,
         )
 
     @staticmethod
@@ -6056,22 +6772,31 @@ class AutomaticReplenishmentRuntime:
                 selected_rows = [
                     dict(row) for row in selections if isinstance(row, Mapping)
                 ]
+                provider_pause = self._provider_pause_callback(
+                    job,
+                    round_number=round_number,
+                    boundary="provider_materializer",
+                )
                 if reuse_existing_task:
-                    acquisition = self.materializer.reconcile_existing_task(
+                    acquisition = _call_with_pause(
+                        self.materializer.reconcile_existing_task,
                         request_body,
                         selected_rows,
                         staging_root=staging,
                         workspace=workspace,
                         alist=self.alist,
                         external_task_id=restored_task_id,
+                        pause_requested=provider_pause,
                     )
                 else:
-                    acquisition = self.materializer.acquire(
+                    acquisition = _call_with_pause(
+                        self.materializer.acquire,
                         request_body,
                         selected_rows,
                         staging_root=staging,
                         workspace=workspace,
                         alist=self.alist,
+                        pause_requested=provider_pause,
                     )
                 if not isinstance(acquisition, Mapping):
                     raise AutomaticReplenishmentError("provider delivery 不是对象")
@@ -6180,7 +6905,15 @@ class AutomaticReplenishmentRuntime:
                             raise AutomaticReplenishmentError(
                                 "补源 child 请求未继承根任务的目标货架，拒绝规划"
                             )
-                        child = self._plan_internal_child(child_request, root_job_id=job.id)
+                        child = self._plan_internal_child(
+                            child_request,
+                            root_job_id=job.id,
+                            pause_requested=self._provider_pause_callback(
+                                job,
+                                round_number=round_number,
+                                boundary="child_plan",
+                            ),
+                        )
                         if not self._child_inherits_target_shelf(job, child):
                             raise AutomaticReplenishmentError(
                                 "补源 child 未继承根任务的目标货架，拒绝写入"
@@ -6201,25 +6934,20 @@ class AutomaticReplenishmentRuntime:
                         self._raise_if_cancelled(
                             job, round_number=round_number, boundary="child_write",
                         )
-                        try:
-                            child_pause = (
-                                lambda: bool(self.pause_requested(job))
-                                if self.pause_requested is not None
-                                else None
-                            )
-                            completed_child = self.engine_runner.execute_automatic(
-                                child.id,
-                                **({"pause_requested": child_pause}
-                                   if child_pause is not None else {}),
-                            )
-                        except TypeError as exc:
-                            # Small injected test runners may still expose the
-                            # legacy one-argument protocol. Preserve that
-                            # compatibility; production SimpleEngineRunner
-                            # accepts the cooperative pause predicate.
-                            if "pause_requested" not in str(exc):
-                                raise
-                            completed_child = self.engine_runner.execute_automatic(child.id)
+                        # The shared adapter combines global pause and the
+                        # root/pilot cancellation fence.  It is ``None`` only
+                        # for unscoped library/test callers; a scoped runtime
+                        # must prove that the child writer accepts it.
+                        child_pause = self._provider_pause_callback(
+                            job,
+                            round_number=round_number,
+                            boundary="child_write",
+                        )
+                        completed_child = _call_with_pause(
+                            self.engine_runner.execute_automatic,
+                            child.id,
+                            pause_requested=child_pause,
+                        )
                         if completed_child.phase != "executed":
                             self._raise_if_paused(
                                 job, round_number=round_number,
@@ -6360,10 +7088,21 @@ class AutomaticReplenishmentRuntime:
                 if self._cleanup_attempt_after_error(attempt_error, candidate_exclusions):
                     try:
                         self._progress(job, "cleaning", round=round_number, staging_root=staging)
-                        self._remove_staging(staging)
+                        cleanup_pause = self._provider_pause_callback(
+                            job,
+                            round_number=round_number,
+                            boundary="candidate_cleanup",
+                        )
+                        self._remove_staging(
+                            staging,
+                            pause_requested=cleanup_pause,
+                        )
                         self._remove_local_attempt_workspace(
                             job_id=job.id, attempt_id=attempt_id,
+                            pause_requested=cleanup_pause,
                         )
+                    except AutomaticReplenishmentCancelled:
+                        raise
                     except Exception as cleanup_exc:
                         if attempt_error is None:
                             attempt_error = cleanup_exc
@@ -6658,16 +7397,27 @@ class AutomaticReplenishmentRuntime:
         attempt_error: Exception | None = None
         acquisition: Mapping[str, object] | None = None
         try:
-            acquisition = self.subtitle_materializer.acquire_subtitles(
+            provider_pause = self._provider_pause_callback(
+                job,
+                round_number=1,
+                boundary="subtitle_materializer",
+            )
+            acquisition = _call_with_pause(
+                self.subtitle_materializer.acquire_subtitles,
                 request_body,
                 request_gaps,
                 staging_root=staging,
                 workspace=workspace,
-                alist=self.alist,
+                alist=_PauseCheckedProviderPort(self.alist, provider_pause),
+                pause_requested=provider_pause,
             )
         except AutomaticReplenishmentCancelled:
             raise
         except Exception as exc:
+            if getattr(exc, "pause_requested", False) is True:
+                raise AutomaticReplenishmentPaused(
+                    "字幕补源在暂停边界安全停止",
+                ) from exc
             attempt_error = exc
 
         delivered_files = (
@@ -6833,9 +7583,18 @@ class AutomaticReplenishmentRuntime:
                     self._raise_if_cancelled(
                         job, round_number=1, boundary="subtitle_cleanup",
                     )
-                    self._remove_staging(staging)
+                    cleanup_pause = self._provider_pause_callback(
+                        job,
+                        round_number=1,
+                        boundary="subtitle_cleanup",
+                    )
+                    self._remove_staging(
+                        staging,
+                        pause_requested=cleanup_pause,
+                    )
                     self._remove_local_attempt_workspace(
                         job_id=job.id, attempt_id=attempt_id,
+                        pause_requested=cleanup_pause,
                     )
                 except AutomaticReplenishmentCancelled:
                     raise

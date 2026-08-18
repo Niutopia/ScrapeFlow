@@ -34,6 +34,7 @@ from engine.scrapeflow.work_units import (
 
 from .simple_engine_runner import (
     EngineExecutionError,
+    EnginePauseRequested,
     SimpleEngineRunner,
     _pause_checkpoint,   # noqa: PLC2701 - shared runner primitive
     _safe_job_id,        # noqa: PLC2701
@@ -349,6 +350,8 @@ def _merge_unit(
     state_root: Path,
     record: WorkUnitRecord,
     root_job,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> WorkUnitRecord:
     """E3: plan into the locked existing work root and write with no-overwrite."""
     if record.lane_status == "merge_done" and record.writer_job_id:
@@ -389,12 +392,55 @@ def _merge_unit(
     request = EngineRequest.from_mapping(payload)
     # A previous attempt may have left a terminal carrier; plan_job refuses
     # existing ids, so retire it first (same rule as new_work units).
-    _retire_stale_unit_carrier(runner, _unit_job_id(record.work_unit_id))
-    planned = _mark_internal_carrier(
-        runner,
-        runner.plan_job(request, job_id=_unit_job_id(record.work_unit_id)),
-        root_job.id,
+    carrier_id = _unit_job_id(record.work_unit_id)
+    _pause_checkpoint(pause_requested)
+    try:
+        existing = runner.get_job(carrier_id)
+    except Exception:
+        existing = None
+    existing_summary = (
+        existing.summary if existing is not None and isinstance(existing.summary, Mapping) else {}
     )
+    owns_existing = (
+        existing is not None
+        and existing_summary.get("internal_child") is True
+        and existing_summary.get("root_job_id") == root_job.id
+    )
+    if owns_existing and existing.phase in {"executing", "verifying", "cleaning", "retry_wait"}:
+        # A pause can land inside the formal writer after its internal carrier
+        # is durable but before the WorkUnit ledger is updated.  Reconcile the
+        # same plan on resume; never create a second merge carrier.
+        _pause_checkpoint(pause_requested)
+        recovered = (
+            runner.recover_job(existing.id)
+            if existing.phase in {"executing", "verifying", "cleaning"}
+            else existing
+        )
+        if recovered.phase == "retry_wait":
+            recovered = runner.execute_job(
+                recovered.id,
+                pause_requested=pause_requested,
+            )
+        if recovered.phase in {"executing", "verifying", "cleaning"}:
+            raise EnginePauseRequested("归并写入在暂停边界保持可恢复")
+        if recovered.phase != "executed":
+            raise EngineExecutionError("归并载体恢复未完成")
+        planned = recovered
+    elif owns_existing and existing.phase == "executed":
+        # The formal write completed before the process saw its return; finish
+        # only the ledger transition after the same locked plan is validated.
+        planned = existing
+    else:
+        _retire_stale_unit_carrier(runner, carrier_id)
+        planned = _mark_internal_carrier(
+            runner,
+            runner.plan_job(
+                request,
+                job_id=carrier_id,
+                pause_requested=pause_requested,
+            ),
+            root_job.id,
+        )
     plan_body = dict(planned.plan or {})
     planned_root = plan_body.get("target_root")
     if not isinstance(planned_root, str) or (
@@ -413,8 +459,18 @@ def _merge_unit(
         raise EngineExecutionError("归并计划身份与既有作品不一致")
     if str(plan_body.get("mode") or "").casefold() != media_type:
         raise EngineExecutionError("归并计划媒体类型与既有作品不一致")
-    executed = runner.execute_job(planned.id)
+    # ``plan_job`` may have performed archive preprocessing.  Recheck after
+    # validating the plan and pass the same root predicate into the formal
+    # writer so a pilot scope cannot close in this plan->execute gap.
+    _pause_checkpoint(pause_requested)
+    executed = (
+        planned
+        if planned.phase == "executed"
+        else runner.execute_job(planned.id, pause_requested=pause_requested)
+    )
     if executed.phase != "executed":
+        if executed.phase in {"executing", "verifying", "cleaning"}:
+            raise EnginePauseRequested("归并写入在暂停边界保持可恢复")
         raise EngineExecutionError("归并写入未完成")
     return replace(
         record,
@@ -438,25 +494,51 @@ def execute_unit_e_lanes(
     records = load_work_unit_records(state_root, root_task_id)
     updated: list[WorkUnitRecord] = []
     changed = False
-    for record in records:
-        outcome = record.reconciliation_outcome
-        if outcome == "duplicate_complete":
-            next_record = _consume_duplicate_unit(
-                runner, record, root_job, pause_requested=pause_requested,
-            )
-        elif outcome == "existing_gap":
-            next_record = _register_and_hold_existing_gap_unit(
-                runner, state_root, record, root_job,
-                pause_requested=pause_requested,
-            )
-        elif outcome == "merge_existing":
-            next_record = _merge_unit(runner, state_root, record, root_job)
-        else:
-            next_record = record
-        changed = changed or next_record.as_dict() != record.as_dict()
-        updated.append(next_record)
+
+    def persist_completed_lanes() -> None:
+        """Keep earlier mutations durable if a later unit observes pause.
+
+        The E lanes can safely stop between units, but an E1/E2 move or an
+        E3 write from a preceding unit must not lose its ledger marker merely
+        because the next unit reaches a pause checkpoint.
+        """
+        by_id = {item.work_unit_id: item for item in updated}
+        save_work_unit_records(
+            state_root,
+            root_task_id,
+            [by_id.get(record.work_unit_id, record) for record in records],
+        )
+
+    try:
+        for record in records:
+            outcome = record.reconciliation_outcome
+            if outcome == "duplicate_complete":
+                next_record = _consume_duplicate_unit(
+                    runner, record, root_job, pause_requested=pause_requested,
+                )
+            elif outcome == "existing_gap":
+                next_record = _register_and_hold_existing_gap_unit(
+                    runner, state_root, record, root_job,
+                    pause_requested=pause_requested,
+                )
+            elif outcome == "merge_existing":
+                next_record = _merge_unit(
+                    runner,
+                    state_root,
+                    record,
+                    root_job,
+                    pause_requested=pause_requested,
+                )
+            else:
+                next_record = record
+            changed = changed or next_record.as_dict() != record.as_dict()
+            updated.append(next_record)
+    except EnginePauseRequested:
+        if changed:
+            persist_completed_lanes()
+        raise
     if changed:
-        save_work_unit_records(state_root, root_task_id, updated)
+        persist_completed_lanes()
     return updated
 
 

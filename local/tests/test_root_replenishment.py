@@ -26,7 +26,10 @@ from local.scrapeflow_api.replenishment_tiers import (
     EXHAUSTION_MIN_DISTINCT_LOCATORS,
     MAGNET_REQUIRED_SOURCES,
 )
-from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+from local.scrapeflow_api.simple_engine_runner import (
+    EnginePauseRequested,
+    SimpleEngineRunner,
+)
 
 from local.tests.test_library_index import IndexAList
 from local.tests.test_simple_engine_runner import FAKE_VIDEO_SIZE
@@ -77,7 +80,17 @@ class _FakeMaterializer:
         self.reconcile_error = reconcile_error
         self.reconcile_events = reconcile_events
 
-    def acquire(self, request, selections, *, staging_root, workspace, alist):
+    def acquire(
+        self,
+        request,
+        selections,
+        *,
+        staging_root,
+        workspace,
+        alist,
+        pause_requested=None,
+    ):
+        del pause_requested
         if self.on_acquire is not None:
             self.on_acquire(staging_root)
         if self.events is not None:
@@ -94,8 +107,10 @@ class _FakeMaterializer:
         }
 
     def reconcile_existing_task(
-        self, request, selections, *, staging_root, workspace, alist, external_task_id,
+        self, request, selections, *, staging_root, workspace, alist,
+        external_task_id, pause_requested=None,
     ):
+        del pause_requested
         if self.reconcile_events is not None:
             self.reconcile_events.append({
                 "staging_root": staging_root,
@@ -774,6 +789,119 @@ class RootReplenishmentTests(unittest.TestCase):
                 if g.gap_id == "unit-tv::missing_episode::S01E02"
             )
             self.assertEqual(gap.status, "closed")
+
+    def test_child_plan_and_write_receive_the_root_pause_predicate(self) -> None:
+        """A root-scope closure must reach both provider child boundaries."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            plan_checks: list[object] = []
+            execute_checks: list[object] = []
+            original_plan = runner.plan_job
+            original_execute = runner.execute_job
+
+            def recording_plan(*args, **kwargs):
+                plan_checks.append(kwargs.get("pause_requested"))
+                return original_plan(*args, **kwargs)
+
+            def recording_execute(*args, **kwargs):
+                execute_checks.append(kwargs.get("pause_requested"))
+                return original_execute(*args, **kwargs)
+
+            runner.plan_job = recording_plan  # type: ignore[method-assign]
+            runner.execute_job = recording_execute  # type: ignore[method-assign]
+            pause = lambda: False
+            result = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda tier: _FakeMaterializer(),
+                pause_requested=pause,
+            )
+
+        self.assertEqual(result["gaps_closed"], ["unit-tv::missing_episode::S01E02"])
+        self.assertEqual(len(plan_checks), 1)
+        self.assertEqual(len(execute_checks), 1)
+        self.assertIs(plan_checks[0], execute_checks[0])
+        self.assertTrue(callable(plan_checks[0]))
+        self.assertFalse(plan_checks[0]())
+
+    def test_paused_child_writer_cannot_close_gap_from_its_plan(self) -> None:
+        """Coverage is accepted only after the child reaches executed."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            paused = {"value": False}
+
+            def pausing_executor(_plan):
+                paused["value"] = True
+                raise EnginePauseRequested("fixture pause during child writer")
+
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            runner.executor = pausing_executor
+            result = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda tier: _FakeMaterializer(),
+                pause_requested=lambda: paused["value"],
+            )
+            gap = next(
+                row for row in load_gap_ledger(state_root, "root-1")
+                if row.gap_id == "unit-tv::missing_episode::S01E02"
+            )
+
+        self.assertEqual(result["gaps_closed"], [])
+        self.assertEqual(gap.status, "open")
+        self.assertEqual(result["attempts"], [])
+        self.assertNotIn("closed", [row["outcome"] for row in result["attempts"]])
+
+    def test_pause_raised_inside_child_plan_stops_without_retry_classification(self) -> None:
+        """A plan-time pause is a clean round stop, not infrastructure evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            paused = {"value": False}
+            runner = self._runner(
+                state_root,
+                planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            planned_children: list[object] = []
+
+            def pausing_plan(*_args, **_kwargs):
+                planned_children.append(object())
+                paused["value"] = True
+                raise EnginePauseRequested("fixture pause during child plan")
+
+            runner.plan_job = pausing_plan  # type: ignore[method-assign]
+            result = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda _tier: _FakeMaterializer(),
+                pause_requested=lambda: paused["value"],
+            )
+            gap = next(
+                row for row in load_gap_ledger(state_root, "root-1")
+                if row.gap_id == "unit-tv::missing_episode::S01E02"
+            )
+
+        self.assertEqual(len(planned_children), 1)
+        self.assertEqual(result["gaps_closed"], [])
+        self.assertEqual(result["attempts"], [])
+        self.assertEqual(result["tier"], "magnet")
+        self.assertEqual(gap.status, "open")
 
     def test_missing_coverage_leaves_gap_open_records_candidate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

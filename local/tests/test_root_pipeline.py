@@ -16,7 +16,10 @@ from local.scrapeflow_api.root_pipeline import (
     is_intake_bound_root,
     run_root_pipeline,
 )
-from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+from local.scrapeflow_api.simple_engine_runner import (
+    EnginePauseRequested,
+    SimpleEngineRunner,
+)
 from local.scrapeflow_api.unit_execution import load_work_acceptance
 
 from local.tests.test_library_index import IndexAList, _sample_library
@@ -357,6 +360,106 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(records[0].reconciliation_outcome, "new_work")
         self.assertIsNone(records[0].writer_job_id)
 
+    def test_merge_lane_pause_after_plan_keeps_formal_writer_idle(self) -> None:
+        """E3 passes the root callback through planning and execution."""
+        files = {"/incoming/Fate Zero/S01E11.mkv": FAKE_VIDEO_BYTES}
+        paused = {"value": False}
+        merge_events: list[dict[str, Any]] = []
+        base_planner = _merge_planner(merge_events)
+
+        def pausing_merge_planner(request, alist, tmdb):
+            plan = base_planner(request, alist, tmdb)
+            paused["value"] = True
+            return plan
+
+        state_root, alist, runner, _planner, executor_events = self._setup(
+            files,
+            library_files=_sample_library(),
+            planner=pausing_merge_planner,
+        )
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        analyze_root_boundaries(
+            alist,
+            "/incoming/Fate Zero",
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, job.id)[0]
+        apply_work_unit_override(
+            state_root,
+            job.id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=35507,
+            season=1,
+        )
+
+        final = run_root_pipeline(
+            runner,
+            state_root,
+            job.id,
+            pause_requested=lambda: paused["value"],
+        )
+
+        self.assertEqual(final.phase, "queued")
+        self.assertEqual(len(merge_events), 1)
+        self.assertEqual(executor_events, [])
+        record = load_work_unit_records(state_root, job.id)[0]
+        self.assertEqual(record.reconciliation_outcome, "merge_existing")
+        self.assertNotEqual(record.lane_status, "merge_done")
+
+    def test_merge_lane_pause_inside_writer_remains_resumable_not_failed(self) -> None:
+        """A pause returned by G must not turn E3 into a failed root."""
+        files = {"/incoming/Fate Zero/S01E11.mkv": FAKE_VIDEO_BYTES}
+        paused = {"value": False}
+        executor_events: list[str] = []
+
+        def pausing_executor(plan):
+            executor_events.append(str(plan.target_root))
+            paused["value"] = True
+            raise EnginePauseRequested("fixture pause during formal write")
+
+        state_root, alist, runner, _planner, _default_events = self._setup(
+            files,
+            library_files=_sample_library(),
+            planner=_merge_planner([]),
+        )
+        runner.executor = pausing_executor
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        analyze_root_boundaries(
+            alist,
+            "/incoming/Fate Zero",
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, job.id)[0]
+        apply_work_unit_override(
+            state_root,
+            job.id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=35507,
+            season=1,
+        )
+
+        final = run_root_pipeline(
+            runner,
+            state_root,
+            job.id,
+            pause_requested=lambda: paused["value"],
+        )
+
+        self.assertEqual(final.phase, "queued")
+        self.assertEqual(len(executor_events), 1)
+        record = load_work_unit_records(state_root, job.id)[0]
+        self.assertNotEqual(record.lane_status, "merge_done")
+        carrier = runner.get_job(f"unit-{record.work_unit_id}")
+        self.assertEqual(carrier.phase, "executing")
+
     def test_pipeline_rerun_is_idempotent(self) -> None:
         files = {
             "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
@@ -624,6 +727,45 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertEqual(len(alist.remove_calls), 2)
         self.assertNotIn("/incoming/My Show", alist.dirs)
         self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
+
+    def test_pause_after_remove_empty_blocks_fallback_explicit_delete(self) -> None:
+        """Each remote delete gets its own root-scoped pause checkpoint."""
+        from local.scrapeflow_api.root_pipeline import _cleanup_empty_source_shells
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = NoopRemoveEmptyAList({})
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=lambda _plan: {"ok": True},
+        )
+        alist.dirs.update({"/incoming/My Show", "/incoming/My Show/Extras"})
+        root_task_id = self._root(runner, "/incoming/My Show")
+        checks = {"count": 0}
+
+        def pause_after_first_delete_boundary() -> bool:
+            checks["count"] += 1
+            # visit(source), visit(extras), post-listing checks, then the
+            # explicit-remove checkpoint after remove_empty_dir.
+            return checks["count"] >= 5
+
+        _cleanup_empty_source_shells(
+            runner,
+            state_root,
+            root_task_id,
+            "/incoming/My Show",
+            pause_requested=pause_after_first_delete_boundary,
+        )
+
+        self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
+        self.assertEqual(alist.remove_calls, [])
+        self.assertIn("/incoming/My Show/Extras", alist.dirs)
 
 
 if __name__ == "__main__":

@@ -575,6 +575,47 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(job.plan["source_root"], "/incoming/movie")
         self.assertEqual(len(adapter.calls), 1)
 
+    def test_plan_job_fences_legacy_adapter_remote_call_when_scope_closes(self) -> None:
+        """The runner proxy protects adapters that ignore the new callback."""
+        paused = {"value": False}
+
+        class RecordingAList(FakeAList):
+            def __init__(self):
+                super().__init__()
+                self.mkdir_calls: list[str] = []
+
+            def mkdir(self, path: str) -> None:
+                self.mkdir_calls.append(path)
+
+        class ScopeClosingAdapter:
+            def prepare_ordinary_request(self, request, *, alist, **_kwargs):
+                paused["value"] = True
+                # This adapter intentionally ignores `pause_requested` to
+                # exercise the runner-owned AList proxy.
+                alist.mkdir("/quark/影视/ScrapeFlow/归档/should-not-exist")
+                return request
+
+        alist = RecordingAList()
+        alist.files["/incoming/movie/source.mkv"] = FAKE_VIDEO_BYTES
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            archive_preprocessor=ScopeClosingAdapter(),
+        )
+
+        with self.assertRaises(EnginePauseRequested):
+            runner.plan_job(
+                self.request,
+                job_id="archive-scope-fence",
+                pause_requested=lambda: paused["value"],
+            )
+
+        self.assertEqual(alist.mkdir_calls, [])
+        self.assertFalse((runner.jobs_root / "archive-scope-fence.json").exists())
+
     def test_automatic_archive_precedes_identity_and_planning(self) -> None:
         events: list[str] = []
         adapter = OrderedArchivePreprocessor(events)
@@ -1804,6 +1845,45 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(self.alist.files[target], b"subtitle")
         self.assertEqual(self.alist.files[video], b"video")
 
+    def test_subtitle_sidecar_scope_flip_after_validation_starts_no_formal_write(self) -> None:
+        """The sidecar writer rechecks scope immediately before mkdir/move."""
+        video = "/library/Show/Season 01/Show.S01E01.mkv"
+        source = "/quark/影视/ScrapeFlow/补源/root/attempt-1/Show.S01E01.zh.srt"
+        target = "/library/Show/Season 01/Show.S01E01.zh.srt"
+        paused = {"value": False}
+
+        class ScopeFlipAList(FakeAList):
+            def exact_file_info(self, path: str) -> dict[str, object] | None:
+                result = super().exact_file_info(path)
+                if path == source and result is not None:
+                    paused["value"] = True
+                return result
+
+        alist = ScopeFlipAList()
+        alist.files[video] = b"video"
+        alist.files[source] = b"subtitle"
+        runner = SimpleEngineRunner(
+            self.root / "sidecar-scope",
+            alist=alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+        )
+
+        with self.assertRaises(EnginePauseRequested):
+            runner.install_subtitle_sidecar(
+                source,
+                target,
+                expected_size=len(b"subtitle"),
+                video_path=video,
+                pause_requested=lambda: paused["value"],
+            )
+
+        self.assertEqual(alist.moves, [])
+        self.assertEqual(alist.renames, [])
+        self.assertNotIn(target, alist.files)
+        self.assertIn(source, alist.files)
+
     def test_subtitle_sidecar_refuses_to_write_without_its_audited_video(self) -> None:
         source = "/quark/影视/ScrapeFlow/补源/root/attempt-1/Show.S01E01.zh.srt"
         self.alist.files[source] = b"subtitle"
@@ -1932,8 +2012,14 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         started = threading.Event()
         release = threading.Event()
 
-        def blocking_preprocessor(request, *, job_id=None, retry_password=None):
-            del job_id, retry_password
+        def blocking_preprocessor(
+            request,
+            *,
+            job_id=None,
+            retry_password=None,
+            pause_requested=None,
+        ):
+            del job_id, retry_password, pause_requested
             started.set()
             self.assertTrue(release.wait(timeout=3))
             return request, None

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
 import json
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -17,6 +19,7 @@ from engine.scrapeflow.provider_capabilities import (
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "alist_offline", "magnet"})
+_BUILD_ID_RE = re.compile(r"(?P<sha>[0-9a-f]{7,64})(?P<dirty>-dirty)?\Z")
 
 
 class RuntimeReadinessError(RuntimeError):
@@ -73,14 +76,53 @@ def _int_value(value: object) -> int | None:
     return None
 
 
-def _commit_matches(actual: object, expected: str | None) -> bool:
-    if not expected:
-        return True
-    if not isinstance(actual, str) or not actual.strip():
+def _parse_build_id(value: object) -> tuple[str, bool] | None:
+    """Return a reviewed build identifier without accepting placeholders.
+
+    A production image carries either a lowercase Git SHA (full or a
+    human-recorded prefix of at least seven hexadecimal characters), or that
+    identifier with the explicit ``-dirty`` suffix.  In particular, empty
+    strings and the Dockerfile's safe ``unrecorded`` fallback are evidence of
+    an unknown image, not a version identifier.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _BUILD_ID_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    return match.group("sha"), match.group("dirty") == "-dirty"
+
+
+def _build_id_matches(actual: object, expected: object) -> bool:
+    """Match only in the safe direction: actual begins with expected SHA.
+
+    A short expected SHA is a deliberate operator assertion, so an image
+    carrying the full SHA may satisfy it.  The reverse is never accepted: a
+    truncated or unrelated image must not satisfy a longer expected ID.  A
+    ``-dirty`` marker is part of the identity and must agree on both sides.
+    """
+    parsed_actual = _parse_build_id(actual)
+    parsed_expected = _parse_build_id(expected)
+    if parsed_actual is None or parsed_expected is None:
         return False
-    left = actual.strip()
-    right = expected.strip()
-    return left == right or left.startswith(right) or right.startswith(left)
+    actual_sha, actual_dirty = parsed_actual
+    expected_sha, expected_dirty = parsed_expected
+    return actual_dirty == expected_dirty and actual_sha.startswith(expected_sha)
+
+
+def _is_utc_build_time(value: object) -> bool:
+    """Accept an explicit ISO-8601 UTC timestamp, never a placeholder."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if "T" not in text or not (text.endswith("Z") or text.endswith("+00:00")):
+        return False
+    normalized = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
 
 
 def _check_quark_helper_readiness(
@@ -148,8 +190,12 @@ def _check_health(
     _expect_bool(health, "connected", True, issues)
     _expect_bool(health, "tmdb_configured", True, issues)
     _expect_bool(health, "engine_configured", True, issues)
-    if not _commit_matches(health.get("build_commit"), expected_commit):
+    if _parse_build_id(health.get("build_commit")) is None:
+        issues.append("health.build_commit must be a recorded lowercase Git SHA build ID")
+    elif not _build_id_matches(health.get("build_commit"), expected_commit):
         issues.append("health.build_commit does not match expected commit")
+    if not _is_utc_build_time(health.get("build_time")):
+        issues.append("health.build_time must be a recorded ISO-8601 UTC timestamp")
 
     lanes = health.get("provider_capabilities")
     if not isinstance(lanes, Mapping):
@@ -193,7 +239,13 @@ def _check_health(
     if operations.get("audit_running") is not False:
         issues.append("operations.audit_running must be false")
     active_jobs = _int_value(operations.get("jobs_active"))
-    if active_jobs != 0:
+    # ``jobs_active`` is the durable open-job count, not a live worker count:
+    # a paused, already-used installation can legitimately retain queued
+    # RootJobs.  The three worker counters above, the audit flag, and the
+    # durable control pause still prove that no effectful operation is in
+    # flight.  Keep the strict empty-environment rule unless the operator has
+    # explicitly opted into that already-used, paused deployment mode.
+    if active_jobs != 0 and not allow_existing_jobs:
         issues.append("operations.jobs_active must be 0")
     if not allow_existing_jobs:
         total_jobs = _int_value(operations.get("jobs_total"))
@@ -207,6 +259,72 @@ def _check_control(control: Mapping[str, object], issues: list[str]) -> None:
     _expect_bool(control, "persistent", True, issues)
 
 
+def _check_alist_offline_readiness(
+    readiness: Mapping[str, object],
+    issues: list[str],
+) -> None:
+    """Require the real no-write AList/aria2 preflight proof.
+
+    ``/api/health`` intentionally remains a liveness/configuration surface;
+    its cached offline detail cannot prove that the AList tool, credentials,
+    aria2 RPC and staging route are usable now.  Acceptance therefore fetches
+    and validates the dedicated endpoint directly.
+    """
+    if readiness.get("status") != "ready":
+        issues.append("alist_offline.status must be ready")
+    _expect_bool(readiness, "verified", True, issues)
+    _expect_bool(readiness, "configured", True, issues)
+    _expect_bool(readiness, "read_only", True, issues)
+    checks = readiness.get("checks")
+    if not isinstance(checks, Mapping) or not checks:
+        issues.append("alist_offline.checks must be a non-empty object")
+    else:
+        for name, row in checks.items():
+            if not isinstance(name, str) or not isinstance(row, Mapping):
+                issues.append("alist_offline.checks must contain named objects")
+                break
+            if row.get("verified") is not True:
+                issues.append(f"alist_offline.checks.{name}.verified must be true")
+    remote_issues = readiness.get("issues")
+    if isinstance(remote_issues, list) and remote_issues:
+        # Do not reflect the remote text here: the endpoint redacts its own
+        # diagnostics, but acceptance evidence should not duplicate any
+        # potentially sensitive transport error either.
+        issues.append("alist_offline.issues must be empty")
+
+
+def runtime_readiness_evidence_issues(report: Mapping[str, object]) -> list[str]:
+    """Validate the irreducible proof fields of a saved readiness report.
+
+    The acceptance-package generator consumes a JSON artifact, which may have
+    been created by an older checker or edited manually.  Re-check the image
+    identity and dedicated AList preflight here so a textual ``通过`` claim
+    cannot turn into acceptance evidence without those proofs.
+    """
+    issues: list[str] = []
+    expected = report.get("expected_commit")
+    if _parse_build_id(expected) is None:
+        issues.append("expected_commit must be an explicit lowercase Git SHA build ID")
+    health = report.get("health")
+    if not isinstance(health, Mapping):
+        issues.append("health must be an object")
+    else:
+        if _parse_build_id(health.get("build_commit")) is None:
+            issues.append("health.build_commit must be a recorded lowercase Git SHA build ID")
+        elif _parse_build_id(expected) is not None and not _build_id_matches(
+            health.get("build_commit"), expected,
+        ):
+            issues.append("health.build_commit does not match expected commit")
+        if not _is_utc_build_time(health.get("build_time")):
+            issues.append("health.build_time must be a recorded ISO-8601 UTC timestamp")
+    offline = report.get("alist_offline")
+    if not isinstance(offline, Mapping):
+        issues.append("alist_offline must be an object")
+    else:
+        _check_alist_offline_readiness(offline, issues)
+    return issues
+
+
 def runtime_readiness_report(
     *,
     api_url: str,
@@ -215,20 +333,26 @@ def runtime_readiness_report(
     allow_existing_jobs: bool = False,
     fetch_json: FetchJson = _fetch_json,
 ) -> dict[str, Any]:
-    """Fetch health/control and return a read-only readiness report."""
+    """Fetch health/control/AList preflight and return a read-only report."""
     issues: list[str] = []
+    expected = expected_commit.strip() if isinstance(expected_commit, str) else ""
+    if _parse_build_id(expected) is None:
+        issues.append("expected_commit must be an explicit lowercase Git SHA build ID")
     if not _is_loopback_api_url(api_url):
         return {
             "status": "失败",
             "api_url": api_url,
+            "expected_commit": expected,
             "issues": ["api_url must be an HTTP(S) loopback URL"],
             "health": None,
             "control": None,
+            "alist_offline": None,
         }
 
     endpoints = {
         "health": _endpoint(api_url, "/api/health"),
         "control": _endpoint(api_url, "/api/control"),
+        "alist_offline": _endpoint(api_url, "/api/readiness/alist-offline"),
     }
     payloads: dict[str, object] = {}
     for name, url in endpoints.items():
@@ -249,26 +373,31 @@ def runtime_readiness_report(
     if isinstance(health, Mapping):
         _check_health(
             health,
-            expected_commit=expected_commit,
+            expected_commit=expected,
             allow_existing_jobs=allow_existing_jobs,
             issues=issues,
         )
     control = payloads.get("control")
     if isinstance(control, Mapping):
         _check_control(control, issues)
+    alist_offline = payloads.get("alist_offline")
+    if isinstance(alist_offline, Mapping):
+        _check_alist_offline_readiness(alist_offline, issues)
 
     return {
         "status": "通过" if not issues else "失败",
         "api_url": api_url,
-        "expected_commit": expected_commit or "",
+        "expected_commit": expected,
         "allow_existing_jobs": allow_existing_jobs,
         "issues": issues,
         "health": health,
         "control": control,
+        "alist_offline": alist_offline,
     }
 
 
 __all__ = [
     "RuntimeReadinessError",
+    "runtime_readiness_evidence_issues",
     "runtime_readiness_report",
 ]

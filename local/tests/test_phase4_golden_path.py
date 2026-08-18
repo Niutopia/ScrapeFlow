@@ -27,6 +27,7 @@ from local.scrapeflow_api.simple_engine_runner import (
     SimplePlanExecutor,
 )
 from local.simple_server import SimpleApplication
+from local.scrapeflow_api.root_job_pilot import unrestricted_scope
 
 
 VIDEO = b"v" * (1024 * 1024)
@@ -409,7 +410,7 @@ class Phase4GoldenPathTests(unittest.TestCase):
                 enforce_engine_roots=False,
             )
         try:
-            application.set_paused(False)
+            application.set_paused(False, automatic_scope=unrestricted_scope())
             rescan_jobs = application._scan_inbound_once()  # noqa: SLF001 - golden intake boundary
         finally:
             application.close()

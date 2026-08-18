@@ -196,6 +196,10 @@ class RecoveryMatrixTests(unittest.TestCase):
         runner.recover_job.return_value = terminal
         application = object.__new__(SimpleApplication)
         application.control = lambda: {"paused": False}  # type: ignore[method-assign]
+        # This focused legacy matrix does not construct a persistent pilot
+        # document; model the explicit all-root test scope at the scheduler
+        # boundary so it can exercise recovery rather than the new gate.
+        application._automatic_root_allowed = lambda _job_id: True  # type: ignore[method-assign]
         application._get_engine_runner = lambda: runner  # type: ignore[method-assign]
         application._cancel_job_timers = Mock()  # type: ignore[method-assign]
 

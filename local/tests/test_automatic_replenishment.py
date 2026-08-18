@@ -54,6 +54,7 @@ from local.scrapeflow_api.replenishment_tiers import (
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.tools._replenishment_local_adapter_impl import (
     ReplenishmentCandidateError,
+    ReplenishmentPauseRequested,
     _acquire,
     _bencode,
     _download_torrent,
@@ -69,6 +70,7 @@ from engine.tools._replenishment_local_adapter_impl import (
     _search_tokyotosho,
     _torrent_candidate,
     _torrent_manifest,
+    _preflight,
     _verify_manifest,
 )
 
@@ -186,8 +188,11 @@ class FakeMaterializer:
         self.alist = alist
         self.calls: list[str] = []
 
-    def acquire(self, request, selections, *, staging_root, workspace, alist):
-        del request, selections, workspace, alist
+    def acquire(
+        self, request, selections, *, staging_root, workspace, alist,
+        pause_requested=None,
+    ):
+        del request, selections, workspace, alist, pause_requested
         self.calls.append(staging_root)
         parent = posixpath.dirname(staging_root)
         self.alist.mkdir(parent)
@@ -217,8 +222,9 @@ class FakeStandaloneSubtitleMaterializer:
 
     def acquire_subtitles(
         self, request, gaps, *, staging_root, workspace, alist,
+        pause_requested=None,
     ):
-        del workspace, alist
+        del workspace, alist, pause_requested
         rows = [dict(gap) for gap in gaps]
         if not rows or any(gap.get("kind") != "missing_subtitle" for gap in rows):
             raise AssertionError("subtitle materializer received a media gap")
@@ -256,7 +262,14 @@ class FakeEngine:
         self.internal_children: list[tuple[str, str]] = []
         self.counter = 0
 
-    def plan_job(self, request, *, internal_child_of: str | None = None):
+    def plan_job(
+        self,
+        request,
+        *,
+        internal_child_of: str | None = None,
+        pause_requested=None,
+    ):
+        del pause_requested
         self.counter += 1
         self.planned.append(dict(request))
         job_id = f"engine-child-{self.counter}"
@@ -273,7 +286,8 @@ class FakeEngine:
             request=dict(request), plan={}, summary=summary,
         )
 
-    def execute_automatic(self, job_id):
+    def execute_automatic(self, job_id, *, pause_requested=None):
+        del pause_requested
         self.executed.append(job_id)
         return EngineJob(
             id=job_id, phase="executed",
@@ -1185,6 +1199,68 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), valid)
         self.assertEqual(calls, [source_url, mirror_url])
         self.assertEqual(manifest["infohash"], _torrent_manifest(valid)["infohash"])
+
+    def test_torrent_pause_after_primary_fetch_skips_mirror_and_local_write(self) -> None:
+        """A withdrawn pilot cannot start a fallback fetch or persist its torrent."""
+        source_url = "https://nyaa.si/view/2143012/torrent"
+        paused = {"value": False}
+        calls: list[str] = []
+
+        def fetch(url: str, **_kwargs: object) -> bytes:
+            calls.append(url)
+            paused["value"] = True
+            raise OSError("origin unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candidate.torrent"
+            with patch(
+                "engine.tools._replenishment_local_adapter_impl._fetch_bytes",
+                side_effect=fetch,
+            ), self.assertRaises(ReplenishmentPauseRequested):
+                _download_torrent(
+                    source_url,
+                    destination,
+                    timeout=1,
+                    attempts=1,
+                    pause_requested=lambda: paused["value"],
+                )
+            self.assertFalse(destination.exists())
+        self.assertEqual(calls, [source_url])
+
+    def test_preflight_passes_root_pause_to_each_torrent_fetch(self) -> None:
+        """The preflight loop cannot start its next candidate after scope withdrawal."""
+        paused = {"value": False}
+        seen_callbacks: list[object] = []
+        selection = {
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "torrent",
+                "url": "https://example.test/S01E01.torrent",
+                "file_index_by_gap": {"S01E01": [1]},
+                "file_size_by_index": {"1": 123},
+                "file_path_by_index": {"1": "Example.Show.S01E01.mkv"},
+            },
+        }
+
+        def stop_fetch(_url, _destination, *, pause_requested=None, **_kwargs):
+            seen_callbacks.append(pause_requested)
+            paused["value"] = True
+            raise ReplenishmentPauseRequested("fixture scope closed")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "engine.tools._replenishment_local_adapter_impl.shutil.which",
+            return_value="aria2c",
+        ), patch(
+            "engine.tools._replenishment_local_adapter_impl._download_torrent",
+            side_effect=stop_fetch,
+        ), self.assertRaises(ReplenishmentPauseRequested):
+            _preflight(
+                {"selection": {"selections": [selection]}},
+                Path(directory) / "preflight",
+                pause_requested=lambda: paused["value"],
+            )
+        self.assertEqual(len(seen_callbacks), 1)
+        self.assertTrue(callable(seen_callbacks[0]))
 
     def test_tokyotosho_nyaa_view_link_needs_matching_feed_btih(self) -> None:
         """A Nyaa ``/view/.../torrent`` row is safe only when its BTIH agrees."""
@@ -4193,6 +4269,86 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(caught.exception.failure_scope, "candidate")
         self.assertTrue(caught.exception.exclude_candidate)
 
+    def test_alist_offline_terminal_failure_is_durable_before_delete_and_restart(self) -> None:
+        """A fresh AList failure state is durable proof before row cleanup."""
+        selection = _alist_offline_selection()
+
+        class TerminalProofAList(FakeAList):
+            proof_path: Path | None = None
+            proofs_before_delete: list[dict[str, object]]
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.proofs_before_delete = []
+
+            def offline_download_delete(self, task_id: str) -> None:
+                if self.proof_path is not None:
+                    payload = json.loads(self.proof_path.read_text(encoding="utf-8"))
+                    self.proofs_before_delete.append({
+                        key: payload.get(key)
+                        for key in (
+                            "task_terminal_confirmed_at",
+                            "task_terminal_state",
+                            "task_terminal_failure_scope",
+                        )
+                    })
+                super().offline_download_delete(task_id)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-terminal-proof"
+            state_path = workspace / "alist_offline_attempt.json"
+            alist = TerminalProofAList()
+            alist.proof_path = state_path
+
+            def fail_task(_seconds):
+                alist.set_task_state(
+                    "alist-task-1", 7, progress=100, error="no seeders",
+                )
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=fail_task,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 3000.0,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as initial:
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            durable_proof = json.loads(state_path.read_text(encoding="utf-8"))
+
+            # Simulate a restart after delete accepted but before the caller
+            # cleared its outer durable token.  The recorded final fact must
+            # replay as candidate failure, never scan/submit again.
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 3001.0,
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as replayed:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+
+        self.assertTrue(initial.exception.external_task_final)
+        self.assertTrue(replayed.exception.external_task_final)
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(durable_proof["task_terminal_state"], 7)
+        self.assertEqual(durable_proof["task_terminal_failure_scope"], "candidate")
+        self.assertEqual(
+            alist.proofs_before_delete[0],
+            {
+                "task_terminal_confirmed_at": 3000.0,
+                "task_terminal_state": 7,
+                "task_terminal_failure_scope": "candidate",
+            },
+        )
+
     def test_alist_offline_materializer_tool_outage_is_infrastructure(self) -> None:
         """A tool/transport outage must never exclude the reviewed candidate."""
         selection = _alist_offline_selection()
@@ -4224,34 +4380,373 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             getattr(caught.exception, "failure_scope", None), "candidate",
         )
 
-    def test_alist_offline_materializer_stall_is_candidate_excluded(self) -> None:
-        """A task that never advances progress is a dead candidate."""
+    def test_alist_offline_materializer_stall_waits_for_confirmed_cancel(self) -> None:
+        """A stalled task remains durable until AList fresh-reads state 4."""
         selection = _alist_offline_selection()
+
+        class TerminalProofAList(FakeAList):
+            proof_path: Path | None = None
+            proof_seen_before_delete: dict[str, object] | None = None
+            cancel_intents_before_cancel: list[object]
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancel_intents_before_cancel = []
+
+            def offline_download_cancel(self, task_id: str) -> None:
+                if self.proof_path is not None:
+                    payload = json.loads(self.proof_path.read_text(encoding="utf-8"))
+                    self.cancel_intents_before_cancel.append(
+                        payload.get("task_cancel_requested_at")
+                    )
+                super().offline_download_cancel(task_id)
+
+            def offline_download_delete(self, task_id: str) -> None:
+                if self.proof_path is not None:
+                    payload = json.loads(self.proof_path.read_text(encoding="utf-8"))
+                    self.proof_seen_before_delete = {
+                        key: payload.get(key)
+                        for key in (
+                            "task_cancel_requested_at",
+                            "task_terminal_confirmed_at",
+                            "task_terminal_state",
+                            "task_terminal_failure_scope",
+                        )
+                    }
+                super().offline_download_delete(task_id)
+
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary) / "workspace"
-            alist = FakeAList()
+            state_path = workspace / "alist_offline_attempt.json"
+            alist = TerminalProofAList()
+            alist.proof_path = state_path
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-stall"
 
             def keep_running(_seconds):
                 alist.set_task_state("alist-task-1", 1, progress=50, error="")
 
             materializer = AlistOfflineAutomaticMaterializer(
                 sleep=keep_running, poll_interval=0.1, stall_limit=0.2,
+                clock=lambda: 1000.0,
             )
-            with self.assertRaises(AlistOfflineCandidateError) as caught:
+            with self.assertRaises(AlistOfflineInDoubtError) as waiting:
                 materializer.acquire(
                     {}, [selection],
-                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-stall",
+                    staging_root=staging,
                     workspace=workspace, alist=alist,
                 )
+            waiting_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(alist.delete_calls, [])
+            self.assertEqual(len(alist.add_calls), 1)
+            self.assertEqual(waiting.exception.external_task_id, "alist-task-1")
+            self.assertIn("task_cancel_requested_at", waiting_state)
+            self.assertNotIn("task_terminal_confirmed_at", waiting_state)
 
-        self.assertEqual(caught.exception.failure_scope, "candidate")
-        self.assertTrue(caught.exception.exclude_candidate)
+            # A process restart must reconcile the same task id only.  While
+            # AList still reports it live, another cancel is harmless but a
+            # second aria2 submission or a bookkeeping delete is forbidden.
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 1001.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as resumed_waiting:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+            self.assertEqual(resumed_waiting.exception.external_task_id, "alist-task-1")
+            self.assertEqual(len(alist.add_calls), 1)
+            self.assertEqual(alist.delete_calls, [])
+
+            # Only a fresh terminal cancellation lets the durable record be
+            # cleared and the candidate be excluded.
+            alist.set_task_state(
+                "alist-task-1", 4, progress=100, error="", status="cancelled",
+            )
+            with self.assertRaises(AlistOfflineCandidateError) as final:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(final.exception.failure_scope, "candidate")
+        self.assertTrue(final.exception.exclude_candidate)
+        self.assertTrue(final.exception.external_task_final)
+        self.assertEqual(final.exception.external_task_id, "alist-task-1")
+        self.assertEqual(len(alist.add_calls), 1)
         self.assertIn(("cancel", "alist-task-1"), alist.cleanup_calls)
         self.assertIn(("delete", "alist-task-1"), alist.cleanup_calls)
         self.assertLess(
             alist.cleanup_calls.index(("cancel", "alist-task-1")),
             alist.cleanup_calls.index(("delete", "alist-task-1")),
         )
+        self.assertEqual(final_state["task_terminal_state"], 4)
+        self.assertEqual(final_state["task_terminal_failure_scope"], "candidate")
+        self.assertEqual(alist.cancel_intents_before_cancel, [1000.0, 1000.0])
+        self.assertEqual(
+            alist.proof_seen_before_delete,
+            {
+                "task_cancel_requested_at": 1000.0,
+                "task_terminal_confirmed_at": 1001.0,
+                "task_terminal_state": 4,
+                "task_terminal_failure_scope": "candidate",
+            },
+        )
+
+    def test_alist_offline_materializer_missing_cancel_row_stays_indoubt_after_restart(self) -> None:
+        """A disappearing AList row is not proof that aria2 has stopped."""
+        selection = _alist_offline_selection()
+
+        class DisappearingCancelAList(FakeAList):
+            def offline_download_cancel(self, task_id: str) -> None:
+                super().offline_download_cancel(task_id)
+                # Model an AList list-visibility race.  This deliberately
+                # does not call delete; the hidden task may still own aria2.
+                self.undone = [
+                    row for row in self.undone
+                    if str(row.get("id")) != task_id
+                ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            state_path = workspace / "alist_offline_attempt.json"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-cancel-missing"
+            alist = DisappearingCancelAList()
+
+            def keep_running(_seconds):
+                if alist.undone:
+                    alist.set_task_state(
+                        "alist-task-1", 1, progress=50, error="",
+                    )
+
+            materializer = AlistOfflineAutomaticMaterializer(
+                sleep=keep_running,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 2000.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError):
+                materializer.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            first_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 2001.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as resumed:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+            second_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(resumed.exception.external_task_id, "alist-task-1")
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(alist.delete_calls, [])
+        self.assertEqual(alist.cancel_calls, ["alist-task-1", "alist-task-1"])
+        self.assertIn("task_cancel_requested_at", first_state)
+        self.assertNotIn("task_terminal_confirmed_at", first_state)
+        self.assertEqual(second_state["task_id"], "alist-task-1")
+        self.assertNotIn("task_terminal_confirmed_at", second_state)
+
+    def test_alist_offline_materializer_invisible_live_row_stays_indoubt(self) -> None:
+        """A normal poll must not finalize a task merely hidden from lists."""
+        selection = _alist_offline_selection()
+
+        class HiddenLiveTaskAList(FakeAList):
+            def offline_download_undone(self) -> list[dict[str, object]]:
+                return []
+
+            def offline_download_done(self) -> list[dict[str, object]]:
+                return []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-hidden-live"
+            alist = HiddenLiveTaskAList()
+            sibling = alist.offline_sibling(staging)
+            # The expected member may already be visible while a whole-torrent
+            # task remains hidden and live; it is not a terminal receipt.
+            alist.seed_file(
+                f"{sibling}/Example/Example.Show.S01E01.mkv", size=123,
+            )
+            first = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as initial:
+                first.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as replayed:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-1",
+                )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            hidden_task_ids = {
+                str(row.get("id")) for row in alist.undone
+            }
+
+        self.assertEqual(initial.exception.external_task_id, "alist-task-1")
+        self.assertEqual(replayed.exception.external_task_id, "alist-task-1")
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(alist.cancel_calls, [])
+        self.assertEqual(alist.delete_calls, [])
+        self.assertEqual(alist.move_calls, [])
+        self.assertEqual(hidden_task_ids, {"alist-task-1"})
+        self.assertEqual(attempt["task_id"], "alist-task-1")
+        self.assertNotIn("task_terminal_confirmed_at", attempt)
+        self.assertNotIn("transfer_cancel_confirmed_at", attempt)
+
+    def test_alist_offline_materializer_reconcile_rejects_mismatched_task_ids(self) -> None:
+        """A stale root token must not cancel/delete a different AList task."""
+        selection = _alist_offline_selection()
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-id-conflict"
+            alist = FakeAList()
+            alist.undone.extend([
+                {
+                    "id": "alist-task-attempt",
+                    "name": alist.offline_sibling(staging),
+                    "state": 1,
+                    "progress": 50,
+                    "error": "",
+                },
+                {
+                    "id": "alist-task-stale-root",
+                    "name": "/quark/影视/ScrapeFlow/补源/other__offline__",
+                    "state": 1,
+                    "progress": 50,
+                    "error": "",
+                },
+            ])
+            seed = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 1000.0,
+            )
+            seed._write_attempt_state(
+                workspace,
+                staging_root=staging,
+                selection=selection,
+                task_id="alist-task-attempt",
+                task_cancel_requested_at=1000.0,
+            )
+
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+                clock=lambda: 1001.0,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id="alist-task-stale-root",
+                )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertIsNone(caught.exception.external_task_id)
+        self.assertEqual(alist.add_calls, [])
+        self.assertEqual(alist.cancel_calls, [])
+        self.assertEqual(alist.delete_calls, [])
+        self.assertEqual(attempt["task_id"], "alist-task-attempt")
+        self.assertEqual(attempt["task_cancel_requested_at"], 1000.0)
+        self.assertNotIn("task_terminal_confirmed_at", attempt)
+
+    def test_alist_offline_materializer_unknown_task_with_staging_stays_indoubt(self) -> None:
+        """Expected staging bytes cannot close a lost-response AList submit."""
+        selection = _alist_offline_selection()
+
+        class LostResponseHiddenTaskAList(FakeAList):
+            def offline_download_add(self, path, urls, *, tool):
+                super().offline_download_add(path, urls, tool=tool)
+                raise RuntimeError("offline_download_add response lost")
+
+            def offline_download_undone(self) -> list[dict[str, object]]:
+                return []
+
+            def offline_download_done(self) -> list[dict[str, object]]:
+                return []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            staging = "/quark/影视/ScrapeFlow/补源/root/attempt-lost-staged"
+            alist = LostResponseHiddenTaskAList()
+            first = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError):
+                first.acquire(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                )
+            sibling = alist.offline_sibling(staging)
+            alist.seed_file(
+                f"{sibling}/Example/Example.Show.S01E01.mkv", size=123,
+            )
+
+            restarted = AlistOfflineAutomaticMaterializer(
+                sleep=lambda _seconds: None,
+                poll_interval=0.1,
+                stall_limit=0.2,
+            )
+            with self.assertRaises(AlistOfflineInDoubtError) as caught:
+                restarted.reconcile_existing_task(
+                    {}, [selection], staging_root=staging,
+                    workspace=workspace, alist=alist,
+                    external_task_id=None,
+                )
+            attempt = json.loads(
+                (workspace / "alist_offline_attempt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            hidden_task_ids = {
+                str(row.get("id")) for row in alist.undone
+            }
+
+        self.assertIsNone(caught.exception.external_task_id)
+        self.assertEqual(len(alist.add_calls), 1)
+        self.assertEqual(alist.cancel_calls, [])
+        self.assertEqual(alist.delete_calls, [])
+        self.assertEqual(alist.move_calls, [])
+        self.assertEqual(hidden_task_ids, {"alist-task-1"})
+        self.assertIsNone(attempt["task_id"])
 
     def test_alist_offline_materializer_transfer_phase_is_not_a_stall(self) -> None:
         """Progress 100 (transferring) must wait for the terminal state."""
@@ -5687,7 +6182,11 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         paused = {"value": False}
 
         class FailingMaterializer(FakeMaterializer):
-            def acquire(self, request, selections, *, staging_root, workspace, alist):
+            def acquire(
+                self, request, selections, *, staging_root, workspace, alist,
+                pause_requested=None,
+            ):
+                del request, selections, workspace, alist, pause_requested
                 self.calls.append(staging_root)
                 paused["value"] = True
                 raise RuntimeError("aria2 stopped by operator")
@@ -5721,10 +6220,14 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         paused = {"value": False}
 
         class PausingMaterializer(FakeMaterializer):
-            def acquire(self, request, selections, *, staging_root, workspace, alist):
+            def acquire(
+                self, request, selections, *, staging_root, workspace, alist,
+                pause_requested=None,
+            ):
                 result = super().acquire(
                     request, selections, staging_root=staging_root,
                     workspace=workspace, alist=alist,
+                    pause_requested=pause_requested,
                 )
                 paused["value"] = True
                 return result
@@ -5761,9 +6264,14 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 super().__init__()
                 self.cancelled: list[str] = []
 
-            def plan_job(self, request, *, internal_child_of=None):
+            def plan_job(
+                self, request, *, internal_child_of=None,
+                pause_requested=None,
+            ):
                 child = super().plan_job(
-                    request, internal_child_of=internal_child_of,
+                    request,
+                    internal_child_of=internal_child_of,
+                    pause_requested=pause_requested,
                 )
                 paused["value"] = True
                 return child
@@ -5792,6 +6300,53 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(engine.executed, [])
         self.assertEqual(engine.cancelled, ["engine-child-1"])
         self.assertEqual(state["phase"], "retry_wait")
+
+    def test_root_scope_closure_reaches_legacy_provider_child_writer(self) -> None:
+        """The child writer combines global pause and root cancellation scope."""
+        root_job = _example_root_job("engine-child-root-scope")
+        scope = {"closed": False}
+
+        class ScopeClosingEngine(FakeEngine):
+            def __init__(self):
+                super().__init__()
+                self.callback_blocked = False
+
+            def execute_automatic(self, job_id, *, pause_requested=None):
+                # The pre-write cancellation check was already false. Close
+                # the root scope at the check->writer race and require the
+                # callback passed to the Engine to stop the child.
+                scope["closed"] = True
+                if pause_requested is not None and pause_requested():
+                    self.callback_blocked = True
+                    return EngineJob(
+                        id=job_id,
+                        phase="planned",
+                        created_at="2026-08-07T00:00:00Z",
+                        updated_at="2026-08-07T00:00:00Z",
+                        request=self.planned[-1],
+                        plan={},
+                        summary={"mode": "tv"},
+                    )
+                return super().execute_automatic(job_id)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            engine = ScopeClosingEngine()
+            runtime = AutomaticReplenishmentRuntime(
+                Path(temporary),
+                engine_runner=engine,
+                alist=alist,
+                search=FakeSearch(),
+                materializer=FakeMaterializer(alist),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+                max_candidate_rounds=1,
+                cancel_requested=lambda _job: scope["closed"],
+            )
+            outcome = runtime.run_for_job(root_job)
+
+        self.assertTrue(engine.callback_blocked)
+        self.assertEqual(engine.executed, [])
+        self.assertTrue(outcome["cancelled"])
 
     def test_candidate_failure_exclusion_survives_runtime_recreation(self) -> None:
         """A failed no-peer release is not retried after an API recreation."""

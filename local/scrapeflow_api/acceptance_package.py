@@ -17,6 +17,8 @@ from .isolated_preflight import (
     validate_isolated_preflight_report,
 )
 from .release_checks import local_deployment_contract_issues, project_root
+from .release_checks import OFFLINE_ARIA2_RPC_SECRET_ENV
+from .runtime_readiness import runtime_readiness_evidence_issues
 
 
 ORDINARY_SAMPLES = (
@@ -129,6 +131,10 @@ def compose_evidence(root: Path | None = None, runner: CommandRunner = _run_comm
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
         "SCRAPEFLOW_HOST_STATE_ROOT": "/tmp/scrapeflow-state",
+        # This read-only Compose rendering needs a value solely to satisfy
+        # required interpolation. Never include the resolved environment in
+        # the evidence package.
+        OFFLINE_ARIA2_RPC_SECRET_ENV: "acceptance-compose-placeholder-only",
     }
     result = runner(("docker", "compose", "config", "--format", "json"), base, env)
     if result.returncode != 0:
@@ -331,6 +337,9 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
         for issue in issues
         if isinstance(issue, str) and issue.strip()
     ] if isinstance(issues, list) else []
+    for issue in runtime_readiness_evidence_issues(payload):
+        if issue not in normalized_issues:
+            normalized_issues.append(issue)
     health = payload.get("health")
     control = payload.get("control")
     health_map = dict(health) if isinstance(health, Mapping) else {}
@@ -355,13 +364,24 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
         for action in helper_actions
         if isinstance(action, str) and action.strip()
     ] if isinstance(helper_actions, list) else []
+    offline = payload.get("alist_offline")
+    offline_map = dict(offline) if isinstance(offline, Mapping) else {}
     return {
-        "status": str(payload.get("status") or ("失败" if normalized_issues else "通过")),
+        "status": (
+            "失败"
+            if normalized_issues or payload.get("status") != "通过"
+            else "通过"
+        ),
         "issues": normalized_issues,
         "summary": {
             "api_url": payload.get("api_url", ""),
             "expected_commit": payload.get("expected_commit", ""),
+            "build_version": health_map.get("build_version", ""),
             "build_commit": health_map.get("build_commit", ""),
+            "build_time": health_map.get("build_time", ""),
+            "alist_offline_status": offline_map.get("status", ""),
+            "alist_offline_verified": offline_map.get("verified", ""),
+            "alist_offline_checked_at": offline_map.get("checked_at", ""),
             "connected": health_map.get("connected", ""),
             "tmdb_configured": health_map.get("tmdb_configured", ""),
             "engine_configured": health_map.get("engine_configured", ""),
@@ -707,7 +727,7 @@ def build_acceptance_package(
     if readiness["status"] == "未提供":
         lines.extend([
             "- 状态: 未提供",
-            "- 生成命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`",
+            "- 生成命令: `python3 scripts/scrapeflow_runtime_readiness.py --expected-commit <build-id> --json > readiness.json`",
             "",
         ])
     elif isinstance(readiness_summary, Mapping):
@@ -735,7 +755,7 @@ def build_acceptance_package(
         "`python3 scripts/scrapeflow_isolated_preflight.py declaration.json "
         f"--report preflight-report.json`，当前记录: {preflight['status']} "
         f"({preflight_mode})",
-        f"- [ ] Runtime readiness 通过，命令: `python3 scripts/scrapeflow_runtime_readiness.py --json > readiness.json`，当前记录: {readiness['status']}",
+        f"- [ ] Runtime readiness 通过，命令: `python3 scripts/scrapeflow_runtime_readiness.py --expected-commit <build-id> --json > readiness.json`，当前记录: {readiness['status']}",
         "- [ ] 离线备份 `verify` 通过。",
         "- [ ] 隔离恢复 `restore` 通过，恢复状态仍为 paused。",
         "- [ ] `/api/health` 显示预期 commit 或 build version。",

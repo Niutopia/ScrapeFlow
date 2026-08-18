@@ -506,6 +506,63 @@ class AListClient:
             raise ApiError("AList storage list returned an invalid payload")
         return [dict(row) for row in content]
 
+    def offline_download_tools(self) -> list[str]:
+        """Read the installed AList offline-download tool names.
+
+        This is AList's public, read-only capability endpoint.  It only
+        proves that a tool is registered; callers that need pilot admission
+        must additionally verify the configured aria2 RPC endpoint.
+        """
+        response = self.http.request_json(
+            f"{self.base_url}/api/public/offline_download_tools",
+            method="GET",
+            url_validator=self._validate_api_url,
+        )
+        data = self._require_success(response, "AList 离线下载工具列表").get("data")
+        if (
+            not isinstance(data, list)
+            or any(not isinstance(item, str) or not item.strip() for item in data)
+        ):
+            raise ApiError("AList 离线下载工具列表返回无效")
+        return [item.strip() for item in data]
+
+    def offline_download_aria2_settings(self) -> dict[str, str]:
+        """Read only the in-memory aria2 endpoint settings needed for a probe.
+
+        The RPC secret is returned solely to the in-process readiness caller;
+        it must never be persisted, logged, or exposed in an API response.
+        """
+        # This endpoint may include the RPC credential in a remote validation
+        # error.  Collapse every transport/protocol failure to one fixed
+        # message before it reaches the readiness report or HTTP health view.
+        try:
+            response = self._request_json_authenticated(
+                f"{self.base_url}/api/admin/setting/get?keys=aria2_uri,aria2_secret",
+                method="GET",
+            )
+            data = self._require_success(response, "AList aria2 设置读取").get("data")
+            if not isinstance(data, list):
+                raise ApiError("AList aria2 设置返回无效")
+            rows: dict[str, str] = {}
+            for row in data:
+                if not isinstance(row, Mapping):
+                    raise ApiError("AList aria2 设置项无效")
+                key = row.get("key")
+                value = row.get("value")
+                if key not in {"aria2_uri", "aria2_secret"} or not isinstance(value, str):
+                    raise ApiError("AList aria2 设置项无效")
+                if key in rows:
+                    raise ApiError("AList aria2 设置项重复")
+                rows[key] = value
+            if "aria2_uri" not in rows or "aria2_secret" not in rows:
+                raise ApiError("AList 缺少 aria2 设置")
+            return {"aria2_uri": rows["aria2_uri"], "aria2_secret": rows["aria2_secret"]}
+        except Exception:
+            # Never chain the remote response: some callers stringify the
+            # exception, and the original AList payload is not trusted to be
+            # credential-free.
+            raise ApiError("AList aria2 设置读取失败") from None
+
     def offline_download_add(
         self,
         path: str,

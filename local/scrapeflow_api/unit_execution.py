@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 import posixpath
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from engine.scrapeflow.media_policy import is_video_filename
 from engine.scrapeflow.root_boundaries import load_source_snapshot
@@ -33,7 +33,12 @@ from engine.scrapeflow.work_units import (
 )
 
 from .redaction import redact_error
-from .simple_engine_runner import EngineJob, EngineRequest, SimpleEngineRunner
+from .simple_engine_runner import (
+    EngineJob,
+    EnginePauseRequested,
+    EngineRequest,
+    SimpleEngineRunner,
+)
 from .simple_library_audit import TmdbEpisodeCatalog
 
 
@@ -578,6 +583,8 @@ def execute_new_work_units(
     runner: SimpleEngineRunner,
     state_root: Path,
     root_task_id: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> list[WorkAcceptanceResult]:
     """Plan + write every confirmed ``new_work`` unit of one root task.
 
@@ -616,7 +623,54 @@ def execute_new_work_units(
     results: list[WorkAcceptanceResult] = []
     updated: list[WorkUnitRecord] = []
     changed = False
+
+    def paused() -> bool:
+        if not callable(pause_requested):
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            # A root scope that cannot be checked must never authorize a
+            # formal-library write.
+            return True
+
+    def persist_updates() -> None:
+        """Preserve completed-unit facts without dropping untouched rows."""
+        by_id = {item.work_unit_id: item for item in updated}
+        save_work_unit_records(
+            state_root,
+            root_task_id,
+            [by_id.get(record.work_unit_id, record) for record in records],
+        )
+
+    def persist_acceptance(*, retain_existing: bool) -> None:
+        if not retain_existing:
+            save_work_acceptance(state_root, root_task_id, results)
+            return
+        merged = {
+            item.work_unit_id: item
+            for item in load_work_acceptance(state_root, root_task_id)
+        }
+        merged.update({item.work_unit_id: item for item in results})
+        save_work_acceptance(state_root, root_task_id, list(merged.values()))
+
+    def accepted(record: WorkUnitRecord, carrier: EngineJob) -> WorkAcceptanceResult:
+        return WorkAcceptanceResult(
+            work_unit_id=record.work_unit_id,
+            outcome="accepted",
+            writer_job_id=carrier.id,
+            phase=carrier.phase,
+            target_root=str((carrier.plan.get("target_root")) or ""),
+            planned_files=len(carrier.plan.get("files") or []),
+            error=carrier.error,
+            recorded_at=_now(),
+        )
+
+    paused_during_run = False
     for record in ordered:
+        if paused():
+            paused_during_run = True
+            break
         if record.reconciliation_outcome != "new_work":
             results.append(WorkAcceptanceResult(
                 work_unit_id=record.work_unit_id,
@@ -633,6 +687,34 @@ def execute_new_work_units(
         if record.writer_job_id is not None:
             # Already planned and executed; re-verify the carrier state.
             carrier = runner.get_job(record.writer_job_id)
+            if carrier.phase in {"executing", "verifying", "cleaning"}:
+                # A pause can arrive after the formal writer began.  Keep the
+                # exact carrier, fresh-read it on a later unpaused pass, and
+                # never create a second plan for the same WorkUnit.
+                if paused():
+                    updated.append(record)
+                    paused_during_run = True
+                    break
+                carrier = runner.recover_job(carrier.id)
+                if carrier.phase in {"retry_wait", "failed"}:
+                    try:
+                        carrier = runner.execute_job(
+                            carrier.id,
+                            pause_requested=pause_requested,
+                        )
+                    except EnginePauseRequested:
+                        updated.append(record)
+                        paused_during_run = True
+                        break
+                if carrier.phase == "executed":
+                    results.append(accepted(record, carrier))
+                    updated.append(record)
+                    continue
+                # Preserve the active carrier for restart/readback.  It is
+                # unsafe to retire or replace it until that recovery closes.
+                updated.append(record)
+                paused_during_run = True
+                break
             if carrier.phase not in {"executed"}:
                 # A terminal carrier is a stale plan from a previous failed
                 # attempt.  Retire it and fall through to re-plan from the
@@ -656,6 +738,7 @@ def execute_new_work_units(
                 continue
         base_record = record
         carrier_id = _unit_job_id(record.work_unit_id)
+        planned: EngineJob | None = None
         try:
             identity = record.identity or {}
             is_main_tv = (
@@ -683,6 +766,7 @@ def execute_new_work_units(
                 runner.plan_job(
                     request,
                     job_id=carrier_id,
+                    pause_requested=pause_requested,
                 ),
                 root_task_id,
             )
@@ -690,7 +774,20 @@ def execute_new_work_units(
                 main_target_root = (
                     str(planned.plan.get("target_root") or "") or None
                 )
-            executed = runner.execute_job(planned.id)
+            executed = runner.execute_job(
+                planned.id,
+                pause_requested=pause_requested,
+            )
+            if executed.phase != "executed":
+                # EnginePauseRequested raised from inside the executor is
+                # converted by the runner into an active carrier.  Record
+                # that carrier instead of falsely accepting it or retrying a
+                # second writer on the next pass.
+                record = replace(record, writer_job_id=planned.id)
+                changed = True
+                updated.append(record)
+                paused_during_run = True
+                break
             plan_files = len(executed.plan.get("files") or [])
             record = replace(record, writer_job_id=planned.id)
             changed = True
@@ -721,6 +818,19 @@ def execute_new_work_units(
                     map_path.unlink()
             except OSError:
                 pass
+        except EnginePauseRequested:
+            # ``plan_job`` and ``execute_job`` use this distinct signal when
+            # the root-scoped predicate closes.  A plan that was already
+            # persisted remains an internal carrier for the normal fresh
+            # readback path; pause is never reported as a failed WorkUnit.
+            if planned is not None:
+                record = replace(record, writer_job_id=planned.id)
+                changed = True
+            else:
+                record = base_record
+            updated.append(record)
+            paused_during_run = True
+            break
         except Exception as exc:
             # Keep writer_job_id unset so the next run re-plans the unit;
             # retire the just-planned carrier so plan_job's existing-id
@@ -742,8 +852,10 @@ def execute_new_work_units(
             ))
         updated.append(record)
     if changed:
-        save_work_unit_records(state_root, root_task_id, updated)
-    save_work_acceptance(state_root, root_task_id, results)
+        persist_updates()
+    persist_acceptance(retain_existing=paused_during_run)
+    if paused_during_run:
+        raise EnginePauseRequested("根任务暂停已在单元写入边界生效")
     return results
 
 

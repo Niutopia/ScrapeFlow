@@ -13,6 +13,7 @@ from unittest.mock import patch
 from engine.scrapeflow.identity_matching import AutoMatchAmbiguityError
 from engine.scrapeflow.models import Plan, PlannedFile
 from local.simple_server import SimpleApplication
+from local.scrapeflow_api.root_job_pilot import unrestricted_scope
 from local.scrapeflow_api.simple_engine_runner import (
     EngineJobConflictError,
     EnginePauseRequested,
@@ -387,7 +388,7 @@ class ReconciliationEntryTests(unittest.TestCase):
         with patch.object(application, "_scan_inbound_once", return_value=[]), patch.object(
             application, "_start_startup_thread"
         ):
-            application.set_paused(False, "test")
+            application.set_paused(False, "test", automatic_scope=unrestricted_scope())
         with patch.object(runner, "executor", lambda _plan: (_ for _ in ()).throw(AssertionError("writer called"))):
             retried = application.retry_public_job(blocked.id, {})
         self.assertEqual(retried["phase"], "completed")
@@ -490,7 +491,7 @@ class ReconciliationEntryTests(unittest.TestCase):
         with patch.object(application, "_scan_inbound_once", return_value=[]), patch.object(
             application, "_start_startup_thread"
         ):
-            application.set_paused(False, "test")
+            application.set_paused(False, "test", automatic_scope=unrestricted_scope())
         retried = application.retry_public_job(interrupted.id, {})
 
         self.assertEqual(retried["engine_phase"], "completed")
@@ -512,7 +513,7 @@ class ReconciliationEntryTests(unittest.TestCase):
         with patch.object(application, "_scan_inbound_once", return_value=[]), patch.object(
             application, "_start_startup_thread"
         ):
-            application.set_paused(False, "test")
+            application.set_paused(False, "test", automatic_scope=unrestricted_scope())
         with patch.object(runner, "finalize_automatic_lifecycle") as finalizer:
             application._record_existing_gap_hold_failure(  # noqa: SLF001
                 reconciled.id,
@@ -1084,7 +1085,7 @@ class ReconciliationEntryTests(unittest.TestCase):
                 remote=client,
                 engine_runner=runner,
             )
-            application.set_paused(False, "test")
+            application.set_paused(False, "test", automatic_scope=unrestricted_scope())
         self.addCleanup(application.close)
         reconciled = [
             replace(
@@ -1141,8 +1142,9 @@ class ReconciliationEntryTests(unittest.TestCase):
                 remote_root=self.library_root,
                 remote=client,
                 engine_runner=runner,
-            )
+        )
         self.addCleanup(application.close)
+        application.set_paused(True, "test", automatic_scope=unrestricted_scope())
         self.assertTrue(application.control()["paused"])
 
         with patch.object(runner, "get_job", return_value=pending), patch.object(
@@ -1176,8 +1178,9 @@ class ReconciliationEntryTests(unittest.TestCase):
                 remote_root=self.library_root,
                 remote=client,
                 engine_runner=runner,
-            )
+        )
         self.addCleanup(application.close)
+        application.set_paused(True, "test", automatic_scope=unrestricted_scope())
         self.assertTrue(application.control()["paused"])
 
         with patch("engine.scraper.auto_match_tmdb", return_value=(
@@ -1238,7 +1241,7 @@ class ReconciliationEntryTests(unittest.TestCase):
                 remote=client,
                 engine_runner=runner,
             )
-            application.set_paused(False, "test")
+            application.set_paused(False, "test", automatic_scope=unrestricted_scope())
         self.addCleanup(application.close)
         self.assertTrue(application._ordinary_job_has_confirmed_selection(queued))  # noqa: SLF001
         # The ordinary queue guard must treat the durable reconciliation
@@ -1263,8 +1266,16 @@ class ReconciliationEntryTests(unittest.TestCase):
 
         reconcile.assert_called_once_with(pending.id)
         prepare.assert_called_once_with(pending.id)
-        plan.assert_called_once_with(pending.id)
-        execute.assert_called_once_with(pending.id)
+        plan.assert_called_once()
+        plan_args, plan_kwargs = plan.call_args
+        self.assertEqual(plan_args, (pending.id,))
+        self.assertTrue(callable(plan_kwargs.get("pause_requested")))
+        self.assertFalse(plan_kwargs["pause_requested"]())
+        execute.assert_called_once()
+        execute_args, execute_kwargs = execute.call_args
+        self.assertEqual(execute_args, (pending.id,))
+        self.assertTrue(callable(execute_kwargs.get("pause_requested")))
+        self.assertFalse(execute_kwargs["pause_requested"]())
         sync.assert_called_once_with(executed)
         settle.assert_called_once_with(executed)
         provider.assert_not_called()

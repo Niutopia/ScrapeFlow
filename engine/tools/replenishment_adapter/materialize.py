@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import engine.tools._replenishment_local_adapter_impl as _impl
 
@@ -49,6 +49,7 @@ class LocalTorrentMaterializer:
         *,
         automatic: bool = False,
         client: Any | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         # There is one materialization path; the argument is kept until all
         # callers use the final service signature.
@@ -59,6 +60,7 @@ class LocalTorrentMaterializer:
             workspace,
             automatic=True,
             client=client,
+            pause_requested=pause_requested,
         )
         if not isinstance(delivery, Mapping):
             raise TypeError("补源 materializer 返回结果必须是对象")

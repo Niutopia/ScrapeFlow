@@ -55,6 +55,7 @@ scopes.
 
 from __future__ import annotations
 
+import inspect
 import posixpath
 import uuid
 from datetime import UTC, datetime
@@ -200,7 +201,11 @@ def save_root_replenishment_state(
     )
 
 
-def _default_materializer_factory(tier: str) -> Any:
+def _default_materializer_factory(
+    tier: str,
+    *,
+    archive_preprocessor: object | None = None,
+) -> Any:
     """Map one tier to its real per-tier materializer class instance."""
     if tier == TIER_QUARK_SHARE:
         from .automatic_replenishment import QuarkFastSaveAutomaticMaterializer
@@ -210,7 +215,9 @@ def _default_materializer_factory(tier: str) -> Any:
         return AlistOfflineAutomaticMaterializer()
     if tier == TIER_LOCAL_MAGNET:
         from .automatic_replenishment import LocalTorrentAutomaticMaterializer
-        return LocalTorrentAutomaticMaterializer()
+        return LocalTorrentAutomaticMaterializer(
+            archive_preprocessor=archive_preprocessor,
+        )
     raise ValueError(f"补源 tier 无效: {tier!r}")
 
 
@@ -263,6 +270,41 @@ def _classify_error(error: Exception) -> tuple[str, str | None]:
         if task_id is not None:
             return FAILURE_IN_DOUBT, task_id
     return FAILURE_INFRASTRUCTURE, None
+
+
+def _is_pause_error(error: BaseException) -> bool:
+    """Recognize the lower provider boundary's resumable stop signal."""
+    return any(
+        getattr(item, "pause_requested", False) is True
+        for item in _exception_chain(error)
+    )
+
+
+def _call_materializer_with_pause(
+    method: Callable[..., object],
+    *args: object,
+    pause_requested: Callable[[], bool] | None,
+    **kwargs: object,
+) -> object:
+    """Never silently call a scoped provider boundary without its fence."""
+    if pause_requested is None:
+        return method(*args, **kwargs)
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "补源 materializer 无法证明支持 pause_requested，已安全停止",
+        ) from exc
+    accepts_pause = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "pause_requested"
+        for parameter in parameters
+    )
+    if not accepts_pause:
+        raise RuntimeError(
+            "补源 materializer 不支持 pause_requested，拒绝在 RootJob 试运行范围执行",
+        )
+    return method(*args, pause_requested=pause_requested, **kwargs)
 
 
 def _external_task_is_final(error: BaseException) -> bool:
@@ -736,6 +778,7 @@ def _reconcile_in_flight_tokens(
     state: dict[str, Any],
     factory,
     pause,
+    materializer_pause: Callable[[], bool] | None,
 ) -> tuple[list[dict[str, Any]], list[str], str | None]:
     """Re-enter parked in_doubt attempts through their durable task ids.
 
@@ -857,12 +900,17 @@ def _reconcile_in_flight_tokens(
             method = getattr(materializer, "reconcile_existing_task", None)
             if not callable(method):
                 raise ValueError("AList 离线 materializer 缺少 reconcile_existing_task")
-            delivery = method(
+            delivery = _call_materializer_with_pause(
+                method,
                 request, [selection], staging_root=staging_root,
                 workspace=workspace, alist=runner.alist,
                 external_task_id=recorded_task_id,
+                pause_requested=materializer_pause,
             )
         except Exception as exc:
+            if _is_pause_error(exc):
+                waiting = waiting or "retry_wait"
+                break
             scope, task_id = _classify_error(exc)
             record_outcome(scope, task_id, str(exc))
             if scope == FAILURE_IN_DOUBT:
@@ -893,15 +941,30 @@ def _reconcile_in_flight_tokens(
                 runner, state_root, root_task_id, request, delivery,
             )
             child = runner.plan_job(
-                child_request, internal_child_of=root_task_id,
+                child_request,
+                internal_child_of=root_task_id,
+                pause_requested=pause,
             )
             if pause():
                 break
-            executed = runner.execute_job(child.id)
+            executed = runner.execute_job(child.id, pause_requested=pause)
+            if executed.phase != "executed":
+                # A cooperative pause inside the writer returns its durable
+                # active carrier.  Its plan is not acceptance evidence and
+                # must never close a gap before fresh recovery completes.
+                if pause():
+                    break
+                raise RuntimeError("补源 internal child 未完成")
             executed_plan = (
                 executed.plan if isinstance(executed.plan, Mapping) else {}
             )
         except Exception as exc:
+            if _is_pause_error(exc):
+                # The child may have reached a cooperative plan/write fence.
+                # It is not provider infrastructure and must not create a
+                # new attempt or advance the parked token.
+                waiting = waiting or "retry_wait"
+                break
             scope, task_id = _classify_error(exc)
             record_outcome(scope, task_id, str(exc))
             if scope == FAILURE_IN_DOUBT:
@@ -957,8 +1020,27 @@ def run_root_replenishment(
     waits pin the tier and never re-submit an in-flight gap.
     """
     state_root = Path(state_root)
-    pause = pause_requested if pause_requested is not None else (lambda: False)
-    factory = materializer_factory if materializer_factory is not None else _default_materializer_factory
+
+    def pause() -> bool:
+        """Read the root fence defensively; unknown control means stopped."""
+        if pause_requested is None:
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            return True
+
+    materializer_pause = pause if pause_requested is not None else None
+    if materializer_factory is None:
+        archive_preprocessor = getattr(runner, "archive_preprocessor", None)
+
+        def factory(tier: str):
+            return _default_materializer_factory(
+                tier,
+                archive_preprocessor=archive_preprocessor,
+            )
+    else:
+        factory = materializer_factory
 
     state = load_root_replenishment_state(state_root, root_task_id)
     tier = str(state.get("tier") or TIER_QUARK_SHARE)
@@ -1025,6 +1107,7 @@ def run_root_replenishment(
                 reconcile_waiting,
             ) = _reconcile_in_flight_tokens(
                 runner, state_root, root_task_id, state, factory, pause,
+                materializer_pause,
             )
         except Exception:
             # Fail closed: keep parked tokens for a later round.
@@ -1225,6 +1308,12 @@ def run_root_replenishment(
                 state_root / "replenishment_workspace"
                 / root_task_id / attempt_id
             )
+            # Creating an attempt workspace is also a provider-owned local
+            # mutation.  Do not allocate a new staging directory once the
+            # root/pilot fence was withdrawn between selection and submit.
+            if pause():
+                paused_during_round = True
+                break
             try:
                 workspace.mkdir(parents=True, exist_ok=True)
             except OSError:
@@ -1243,14 +1332,19 @@ def run_root_replenishment(
             state["last_attempt_at"] = _now()
 
             try:
-                delivery = materializer.acquire(
+                delivery = _call_materializer_with_pause(
+                    materializer.acquire,
                     request,
                     [selection],
                     staging_root=staging_root,
                     workspace=workspace,
                     alist=runner.alist,
+                    pause_requested=materializer_pause,
                 )
             except Exception as exc:
+                if _is_pause_error(exc):
+                    paused_during_round = True
+                    break
                 scope, task_id = _classify_error(exc)
                 for gap in covered_gaps:
                     record_attempt(
@@ -1311,15 +1405,30 @@ def run_root_replenishment(
                     runner, state_root, root_task_id, request, delivery,
                 )
                 child = runner.plan_job(
-                    child_request, internal_child_of=root_task_id,
+                    child_request,
+                    internal_child_of=root_task_id,
+                    pause_requested=pause,
                 )
                 if pause():
                     break
-                executed = runner.execute_job(child.id)
+                executed = runner.execute_job(child.id, pause_requested=pause)
+                if executed.phase != "executed":
+                    # See the reconciliation path above: an active paused
+                    # child has no proof of delivered coverage yet.
+                    if pause():
+                        break
+                    raise RuntimeError("补源 internal child 未完成")
                 executed_plan = (
                     executed.plan if isinstance(executed.plan, Mapping) else {}
                 )
             except Exception as exc:
+                if _is_pause_error(exc):
+                    # A child plan/write pause has no acceptance evidence and
+                    # no failed candidate/infrastructure evidence. Stop this
+                    # round without writing a retry attempt or trying another
+                    # provider selection.
+                    paused_during_round = True
+                    break
                 scope, task_id = _classify_error(exc)
                 for gap in covered_gaps:
                     record_attempt(

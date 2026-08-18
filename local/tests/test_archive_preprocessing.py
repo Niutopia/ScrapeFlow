@@ -3,11 +3,19 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from engine.scrapeflow.archive import ArchiveLimits
+from engine.scrapeflow.archive import (
+    AListArchiveSource,
+    ArchiveExtractor,
+    ArchiveInspector,
+    ArchiveLimits,
+)
 from engine.scrapeflow.archive_preprocessing import (
     ArchivePreprocessingAdapter,
     ArchivePreprocessingError,
     ArchiveMultiplicityError,
+    ArchivePauseRequested,
+    _ensure_local_staging,
+    _fresh_child,
     prepare_ordinary_archive,
     prepare_provider_archive,
 )
@@ -168,6 +176,166 @@ class ArchivePreprocessingTests(unittest.TestCase):
                 )
         self.assertEqual(port.download_calls, [])
         self.assertEqual(port.remote, {})
+
+    def test_pause_after_archive_listing_blocks_local_extraction_subprocess(self):
+        """A pause between `7z l` and `7z x` must not create payload files."""
+        paused = {"value": False}
+
+        class PauseAfterListingRunner(FakeRunner):
+            def run(self, args, **kwargs):
+                result = super().run(args, **kwargs)
+                if args[0] == "l":
+                    paused["value"] = True
+                return result
+
+        adapter = self._adapter(PauseAfterListingRunner())
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            source = self._archive(root)
+            staging = Path(temp) / "task"
+            with self.assertRaises(ArchivePauseRequested):
+                adapter.prepare_ordinary_local(
+                    source,
+                    staging,
+                    pause_requested=lambda: paused["value"],
+                )
+
+        self.assertEqual(
+            [args[0] for args, _password in adapter.runner.calls],
+            ["l"],
+        )
+
+    def test_pause_after_remote_prefix_blocks_download_and_staging_upload(self):
+        """The remote adapter checks again before its download/upload steps."""
+        paused = {"value": False}
+
+        class PauseAfterPrefixPort(RemoteArchivePort):
+            def read_file_prefix(self, path: str, *, max_bytes: int):
+                value = super().read_file_prefix(path, max_bytes=max_bytes)
+                if path.endswith("movie.7z"):
+                    paused["value"] = True
+                return value
+
+        port = PauseAfterPrefixPort(b"7z\xbc\xaf'\x1cfixture")
+        adapter = self._adapter(
+            staging_root_validator=(
+                lambda path: path == "/tasks/job/attempt"
+                or path.startswith("/tasks/job/attempt/")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ArchivePauseRequested):
+                adapter.prepare_ordinary_remote(
+                    "/incoming/movie.7z",
+                    port,
+                    Path(temp) / "task",
+                    remote_staging_root="/tasks/job/attempt",
+                    pause_requested=lambda: paused["value"],
+                )
+
+        self.assertEqual(port.download_calls, [])
+        self.assertEqual(port.mkdir_calls, [])
+        self.assertEqual(port.remote, {})
+
+    def test_pause_inside_local_staging_helpers_creates_no_directory(self):
+        """A callback flip at the actual local mkdir boundary is fail-closed."""
+        with tempfile.TemporaryDirectory() as temp:
+            staging = Path(temp) / "task"
+            with self.assertRaises(ArchivePauseRequested):
+                _ensure_local_staging(staging, pause_requested=lambda: True)
+            self.assertFalse(staging.exists())
+
+            staging.mkdir()
+            with self.assertRaises(ArchivePauseRequested):
+                _fresh_child(
+                    staging,
+                    "archive/movie",
+                    pause_requested=lambda: True,
+                )
+            self.assertFalse((staging / "archive").exists())
+
+    def test_remote_inspector_pause_before_input_mkdir_creates_no_staging(self):
+        """The input-root helper rechecks after metadata reads, before mkdir."""
+        port = RemoteArchivePort(b"7z\xbc\xaf'\x1cfixture")
+        checks = {"count": 0}
+
+        def pause_checkpoint() -> None:
+            checks["count"] += 1
+            if checks["count"] == 4:
+                raise ArchivePauseRequested("scope withdrawn")
+
+        inspector = ArchiveInspector(
+            FakeRunner(), limits=ArchiveLimits(min_free_bytes=0),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            staging = Path(temp) / "input"
+            with self.assertRaises(ArchivePauseRequested):
+                inspector.inspect_remote(
+                    AListArchiveSource(port),
+                    "/incoming/movie.7z",
+                    staging,
+                    pause_checkpoint=pause_checkpoint,
+                )
+            self.assertFalse(staging.exists())
+        self.assertEqual(port.download_calls, [])
+
+    def test_remote_inspector_pause_inside_download_helper_skips_download(self):
+        """A scope flip after input-root creation cannot start the transfer."""
+        port = RemoteArchivePort(b"7z\xbc\xaf'\x1cfixture")
+        checks = {"count": 0}
+
+        def pause_checkpoint() -> None:
+            checks["count"] += 1
+            if checks["count"] == 6:
+                raise ArchivePauseRequested("scope withdrawn")
+
+        inspector = ArchiveInspector(
+            FakeRunner(), limits=ArchiveLimits(min_free_bytes=0),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            staging = Path(temp) / "input"
+            with self.assertRaises(ArchivePauseRequested):
+                inspector.inspect_remote(
+                    AListArchiveSource(port),
+                    "/incoming/movie.7z",
+                    staging,
+                    pause_checkpoint=pause_checkpoint,
+                )
+            self.assertTrue(staging.is_dir())
+            self.assertEqual(list(staging.iterdir()), [])
+        self.assertEqual(port.download_calls, [])
+
+    def test_extractor_pause_inside_output_root_helper_skips_7z_and_mkdir(self):
+        """Extraction rechecks at its own output-root mkdir boundary."""
+        runner = FakeRunner()
+        inspector = ArchiveInspector(runner, limits=ArchiveLimits(min_free_bytes=0))
+        extractor = ArchiveExtractor(
+            runner,
+            limits=ArchiveLimits(min_free_bytes=0),
+            video_validator=lambda *_args: True,
+        )
+        checks = {"count": 0}
+
+        def pause_checkpoint() -> None:
+            checks["count"] += 1
+            if checks["count"] == 2:
+                raise ArchivePauseRequested("scope withdrawn")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            source = self._archive(root)
+            listing = inspector.inspect(source)
+            staging = Path(temp) / "output"
+            with self.assertRaises(ArchivePauseRequested):
+                extractor.extract(
+                    listing,
+                    staging,
+                    pause_checkpoint=pause_checkpoint,
+                )
+            self.assertFalse(staging.exists())
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l"])
 
     def test_ordinary_unknown_residual_is_passthrough_but_provider_rejects_it(self):
         with tempfile.TemporaryDirectory() as temp:

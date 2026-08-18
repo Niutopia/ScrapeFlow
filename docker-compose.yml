@@ -14,6 +14,11 @@ services:
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
+    # AList needs the private bridge to submit jobs to offline-aria2; it also
+    # remains on the default network for the API and normal Compose services.
+    networks:
+      - default
+      - alist-offline
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5244/api/public/settings"]
       interval: 10s
@@ -30,6 +35,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
+      args:
+        SCRAPEFLOW_BUILD_VERSION: ${SCRAPEFLOW_BUILD_VERSION:-p15}
+        SCRAPEFLOW_BUILD_COMMIT: ${SCRAPEFLOW_BUILD_COMMIT:-unrecorded}
+        SCRAPEFLOW_BUILD_TIME: ${SCRAPEFLOW_BUILD_TIME:-unrecorded}
     restart: unless-stopped
     init: true
     command: ["python3", "-m", "local.simple_server"]
@@ -49,10 +58,15 @@ services:
       SCRAPEFLOW_API_HOST: 0.0.0.0
       SCRAPEFLOW_STATE_DIR: /data
       SCRAPEFLOW_MIN_VIDEO_BYTES: ${SCRAPEFLOW_MIN_VIDEO_BYTES:-1048576}
-      SCRAPEFLOW_BUILD_COMMIT: ${SCRAPEFLOW_BUILD_COMMIT:-}
-      SCRAPEFLOW_BUILD_TIME: ${SCRAPEFLOW_BUILD_TIME:-}
+      # Build identity is baked into the image by Dockerfile.api.  Do not add
+      # empty runtime substitutions here: they would erase the image identity
+      # when a later `docker compose up` lacks the original build variables.
       SCRAPEFLOW_MEDIA_ROOT: ${SCRAPEFLOW_MEDIA_ROOT:-/quark/影视}
       SCRAPEFLOW_START_PAUSED: ${SCRAPEFLOW_START_PAUSED:-1}
+      # Optional deployment-level ceiling.  A non-empty value must equal the
+      # one durable RootJob selected through /api/control/pilot; it can never
+      # widen a persisted scope.
+      SCRAPEFLOW_ROOT_JOB_PILOT: ${SCRAPEFLOW_ROOT_JOB_PILOT:-}
       SCRAPEFLOW_INTAKE_MONITOR: ${SCRAPEFLOW_INTAKE_MONITOR:-0}
       SCRAPEFLOW_INTAKE_SCAN_SECONDS: ${SCRAPEFLOW_INTAKE_SCAN_SECONDS:-30}
       SCRAPEFLOW_AUTOMATIC_AUDIT: ${SCRAPEFLOW_AUTOMATIC_AUDIT:-0}
@@ -104,6 +118,11 @@ services:
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow
+    # The API performs the no-write aria2 RPC preflight on this bridge, while
+    # keeping its normal dependencies on the default Compose network.
+    networks:
+      - default
+      - alist-offline
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -123,7 +142,9 @@ services:
   # trust a row until the delegated Quark session has listed the real share.
   # No published port — the API reaches it on the Compose network alone.
   pansou:
-    image: ghcr.io/fish2018/pansou:latest
+    # Pin the reviewed image content; updating this digest is an explicit
+    # deployment change rather than an implicit pull of `latest`.
+    image: ghcr.io/fish2018/pansou@sha256:9627039c1f081e9a5668f7897ff52c32a79cd7e8422349d659f4192e317bf693
     restart: unless-stopped
     init: true
     environment:
@@ -143,13 +164,9 @@ services:
     restart: unless-stopped
     init: true
     # Direct-only downloader (user rule): the ambient proxy env must never
-    # reach aria2, and --no-conf skips any image-default config.
-    command: ["aria2c", "--no-conf", "--enable-rpc", "--rpc-listen-all=true",
-              "--rpc-listen-port=6800", "--dir=/opt/alist/data/temp/aria2",
-              "--listen-port=6881-6999", "--dht-listen-port=6881-6999",
-              "--bt-enable-lpd=true", "--enable-dht=true", "--enable-dht6=false",
-              "--follow-torrent=mem", "--seed-time=0", "--file-allocation=none",
-              "--max-concurrent-downloads=3", "--console-log-level=warn"]
+    # reach aria2.  The generated 0600 config contains only rpc-secret, so
+    # the credential never appears in the aria2 argv, health, or logs.
+    command: ["/bin/sh", "-ec", "umask 077; mkdir -p /run/scrapeflow; printf '%s\\n' \"rpc-secret=$${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\" > /run/scrapeflow/aria2.conf; exec aria2c --conf-path=/run/scrapeflow/aria2.conf --enable-rpc --rpc-listen-all=true --rpc-listen-port=6800 --dir=/opt/alist/data/temp/aria2 --listen-port=6881-6999 --dht-listen-port=6881-6999 --bt-enable-lpd=true --enable-dht=true --enable-dht6=false --follow-torrent=mem --seed-time=0 --file-allocation=none --max-concurrent-downloads=3 --console-log-level=warn"]
     environment:
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
@@ -158,11 +175,23 @@ services:
       ALL_PROXY: ""
       no_proxy: "*"
       NO_PROXY: "*"
+      # Required at Compose interpolation time. It must exactly equal the
+      # AList offline aria2_secret, but is intentionally not passed to API.
+      SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET: ${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}
     volumes:
       # Path-aligned with AList's temp dir: AList passes its absolute temp
       # path to aria2, so the same host dir must appear at the same path
       # here for the transfer step to see the files.
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
+    # Keep RPC off the default network. Only AList/API (and the helper sharing
+    # API's network namespace) can reach this non-internal bridge; aria2 still
+    # has public egress for direct downloads.
+    networks:
+      - alist-offline
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   quark-helper:
     image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
@@ -195,3 +224,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  # Do not mark this internal: offline-aria2 requires public direct egress.
+  alist-offline:
+    driver: bridge

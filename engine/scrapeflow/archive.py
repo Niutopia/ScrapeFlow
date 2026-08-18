@@ -61,6 +61,25 @@ class ArchiveError(Exception):
             self.code = code
 
 
+class ArchivePauseRequested(ArchiveError):
+    """A caller-owned pause fence stopped an archive operation safely.
+
+    The archive domain is intentionally unaware of the application control
+    state.  Composition layers may nevertheless pass a checkpoint callback
+    before a subprocess, local-staging creation, or remote archive operation.
+    Keeping the signal here lets those layers preserve it through archive
+    helpers instead of accidentally translating a safe pause into a failed
+    archive.
+    """
+
+    code = "archive_pause_requested"
+    # Keep the cooperative control signal recognizable by the composition
+    # layers which cannot import the API runtime without forming a cycle.
+    # In particular, root replenishment must not classify this as an
+    # infrastructure outage and retry it as a fresh provider attempt.
+    pause_requested = True
+
+
 class ArchiveFormatError(ArchiveError):
     code = "archive_format_invalid"
 
@@ -1128,6 +1147,7 @@ class ArchiveInspector:
         *,
         password_candidates: Iterable[PasswordCandidate | str] | None = None,
         password: str | None = None,
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> ArchiveListing:
         """List one local archive, retrying only a bounded candidate set."""
 
@@ -1191,6 +1211,8 @@ class ArchiveInspector:
         )
         last_result: RunnerResult | None = None
         for candidate_index, candidate in enumerate(candidates[: self.limits.max_password_candidates]):
+            if pause_checkpoint is not None:
+                pause_checkpoint()
             result = _run_archive_tool(
                 self.runner,
                 args,
@@ -1232,6 +1254,7 @@ class ArchiveInspector:
         *,
         password_candidates: Iterable[PasswordCandidate | str] | None = None,
         password: str | None = None,
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> ArchiveListing:
         """Download source volumes into task staging, then inspect locally."""
 
@@ -1244,12 +1267,18 @@ class ArchiveInspector:
         # after download, so a remote adapter cannot substitute bytes between
         # the two boundaries.
         try:
+            if pause_checkpoint is not None:
+                pause_checkpoint()
             prefix = source.read_prefix(remote, max_bytes=self.limits.max_magic_scan_bytes)
+        except ArchivePauseRequested:
+            raise
         except Exception as exc:
             raise ArchiveFormatError("archive source prefix cannot be read") from exc
         if not isinstance(prefix, (bytes, bytearray, memoryview)):
             raise ArchiveFormatError("archive source prefix is invalid")
         _require_archive_magic(bytes(prefix)[: self.limits.max_magic_scan_bytes], filename=name)
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         entries = list(source.list(parent or "/"))
         if len(entries) > self.limits.max_source_entries:
             raise ArchiveBudgetError("archive source directory listing exceeds limit")
@@ -1285,27 +1314,49 @@ class ArchiveInspector:
         # Downloaded inputs themselves consume the same local task disk as
         # later extraction.  Reserve capacity before the first volume rather
         # than discovering a full disk halfway through a split archive.
-        staging = _prepare_remote_input_root(Path(task_staging))
+        if pause_checkpoint is not None:
+            pause_checkpoint()
+        staging = _prepare_remote_input_root(
+            Path(task_staging),
+            pause_checkpoint=pause_checkpoint,
+        )
         _check_disk_budget(staging, total_size, self.limits)
         local_paths: list[Path] = []
         for volume_name, size in downloads:
+            if pause_checkpoint is not None:
+                pause_checkpoint()
             local = staging / volume_name
-            _download_source(source, posixpath.join(parent or "/", volume_name), local, size)
+            _download_source(
+                source,
+                posixpath.join(parent or "/", volume_name),
+                local,
+                size,
+                pause_checkpoint=pause_checkpoint,
+            )
             local_paths.append(local)
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         return self.inspect(
             local_paths[0],
             password_candidates=password_candidates,
             password=password,
+            pause_checkpoint=pause_checkpoint,
         )
 
 
-def _prepare_remote_input_root(root: Path) -> Path:
+def _prepare_remote_input_root(
+    root: Path,
+    *,
+    pause_checkpoint: Callable[[], None] | None = None,
+) -> Path:
     if root.exists():
         if root.is_symlink() or not root.is_dir():
             raise ArchivePathError("task staging input root is not a directory")
         if any(root.iterdir()):
             raise ArchivePathError("task staging input root must be empty")
     else:
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         root.mkdir(parents=True, mode=0o700)
     return root
 
@@ -1322,7 +1373,16 @@ def _normalize_remote_path(value: str) -> str:
     return normalized
 
 
-def _download_source(source: "ArchiveSource", remote_path: str, destination: Path, expected_size: int) -> None:
+def _download_source(
+    source: "ArchiveSource",
+    remote_path: str,
+    destination: Path,
+    expected_size: int,
+    *,
+    pause_checkpoint: Callable[[], None] | None = None,
+) -> None:
+    if pause_checkpoint is not None:
+        pause_checkpoint()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and destination.is_symlink():
         raise ArchivePathError("task staging destination is a symbolic link")
@@ -1331,9 +1391,16 @@ def _download_source(source: "ArchiveSource", remote_path: str, destination: Pat
         method = getattr(source, "download_file_to_path", None)
     if method is None:
         raise ArchiveToolError("archive source has no bounded download method")
+    if pause_checkpoint is not None:
+        pause_checkpoint()
     try:
         method(remote_path, destination, expected_size=expected_size)
     except TypeError:
+        # Keep the old positional compatibility form, but never replay a
+        # download after a RootJob fence has changed while the first call was
+        # rejected for its signature.
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         method(remote_path, destination, expected_size)
     try:
         actual = destination.stat().st_size
@@ -1555,6 +1622,7 @@ class ArchiveExtractor:
         *,
         selected: Sequence[str | ArchiveMember] | None = None,
         password: str | None = None,
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> ArchiveExtractionResult:
         if not isinstance(listing, ArchiveListing) or not listing.volumes:
             raise ArchiveExtractionError("archive listing is invalid")
@@ -1601,8 +1669,14 @@ class ArchiveExtractor:
             archive_size=actual_archive_size,
         )
         chosen = select_media_members(validated_members, selected)
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         staging = Path(staging_root).resolve(strict=False)
-        _prepare_extraction_root(staging, archive_path)
+        _prepare_extraction_root(
+            staging,
+            archive_path,
+            pause_checkpoint=pause_checkpoint,
+        )
         expected_bytes = sum(member.size for member in chosen)
         if expected_bytes > self.limits.max_expanded_bytes:
             raise ArchiveBudgetError("selected archive output exceeds expansion limit")
@@ -1624,6 +1698,8 @@ class ArchiveExtractor:
             max_candidates=self.limits.max_password_candidates,
         )
         for candidate_index, candidate in enumerate(candidates):
+            if pause_checkpoint is not None:
+                pause_checkpoint()
             result = _run_archive_tool(
                 self.runner,
                 args,
@@ -1670,17 +1746,29 @@ class ArchiveExtractor:
         selected: Sequence[str | ArchiveMember] | None = None,
         password_candidates: Iterable[PasswordCandidate | str] | None = None,
         password: str | None = None,
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> ArchiveExtractionResult:
         inspector = ArchiveInspector(self.runner, limits=self.limits)
         listing = inspector.inspect(
             archive_path,
             password_candidates=password_candidates,
             password=password,
+            pause_checkpoint=pause_checkpoint,
         )
-        return self.extract(listing, staging_root, selected=selected)
+        return self.extract(
+            listing,
+            staging_root,
+            selected=selected,
+            pause_checkpoint=pause_checkpoint,
+        )
 
 
-def _prepare_extraction_root(root: Path, archive_path: Path) -> None:
+def _prepare_extraction_root(
+    root: Path,
+    archive_path: Path,
+    *,
+    pause_checkpoint: Callable[[], None] | None = None,
+) -> None:
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise ArchivePathError("task staging root is not a directory")
     archive_resolved = archive_path.resolve(strict=False)
@@ -1697,6 +1785,8 @@ def _prepare_extraction_root(root: Path, archive_path: Path) -> None:
         if any(root.iterdir()):
             raise ArchiveExtractionError("task staging root must be empty")
     else:
+        if pause_checkpoint is not None:
+            pause_checkpoint()
         root.mkdir(parents=True, mode=0o700)
 
 
@@ -1797,6 +1887,7 @@ __all__ = [
     "ArchivePasswordConflict",
     "ArchivePasswordError",
     "ArchivePathError",
+    "ArchivePauseRequested",
     "ArchiveRunner",
     "ArchiveSource",
     "ArchiveToolError",

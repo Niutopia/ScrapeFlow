@@ -86,6 +86,36 @@ class SubtitleInfrastructureError(SubtitleProviderError):
     exclude_candidate = False
 
 
+class SubtitlePauseRequested(SubtitleProviderError):
+    """A caller withdrew automatic scope before a subtitle side effect.
+
+    This module deliberately does not import the API runtime's control
+    exception.  The marker is sufficient for that runtime (and the P14
+    boundary) to preserve a resumable pause rather than downgrade it to a
+    provider/candidate failure.
+    """
+
+    pause_requested = True
+
+
+def _pause_checkpoint(pause_requested: Callable[[], bool] | None) -> None:
+    """Fail closed immediately before a subtitle provider side effect."""
+    if pause_requested is None:
+        return
+    try:
+        paused = bool(pause_requested())
+    except Exception as exc:
+        if getattr(exc, "pause_requested", False) is True:
+            raise
+        raise SubtitlePauseRequested(
+            "字幕补源暂停状态不可确认，已在外部操作前停止",
+        ) from exc
+    if paused:
+        raise SubtitlePauseRequested(
+            "字幕补源已暂停或不在当前 RootJob 试运行范围",
+        )
+
+
 def extract_fansub_groups(text: str) -> set[str]:
     """Extract known fansub / release group names from filename or title."""
     found: set[str] = set()
@@ -648,6 +678,7 @@ class SubtitleMaterializer:
         sub_filename: str,
         raw_bytes: bytes,
         content_type: str,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> None:
         """Upload one sidecar using the production AList path contract.
 
@@ -667,10 +698,12 @@ class SubtitleMaterializer:
                 and names[2].casefold() in {"data", "content", "payload"}
             )
             if legacy_shape:
+                _pause_checkpoint(pause_requested)
                 upload_bytes(staging_root, sub_filename, raw_bytes)
             else:
                 # AListClient.upload_bytes(target_path, data, content_type,
                 # *, overwrite=False) is the production contract.
+                _pause_checkpoint(pause_requested)
                 upload_bytes(staging_sub_path, raw_bytes, content_type)
             return
 
@@ -682,19 +715,23 @@ class SubtitleMaterializer:
                 and names[2].casefold() in {"name", "filename"}
             )
             if legacy_shape:
+                _pause_checkpoint(pause_requested)
                 upload_file(staging_root, str(local_sub_path), sub_filename)
             else:
                 # The real client streams from a Path and takes the complete
                 # remote target path plus an explicit MIME type.
+                _pause_checkpoint(pause_requested)
                 upload_file(staging_sub_path, local_sub_path, content_type)
             return
 
         put_file = getattr(alist, "put_file", None)
         if callable(put_file):
+            _pause_checkpoint(pause_requested)
             put_file(staging_sub_path, raw_bytes)
             return
         write_file_bytes = getattr(alist, "write_file_bytes", None)
         if callable(write_file_bytes):
+            _pause_checkpoint(pause_requested)
             write_file_bytes(staging_sub_path, raw_bytes)
             return
         raise SubtitleInfrastructureError("AList 客户端缺少字幕上传接口")
@@ -707,17 +744,23 @@ class SubtitleMaterializer:
         staging_root: str,
         workspace: Path,
         alist: Any,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Download, validate, and stage subtitles for the requested missing_subtitle gaps."""
+        _pause_checkpoint(pause_requested)
         workspace.mkdir(parents=True, exist_ok=True)
         files_out: list[dict[str, Any]] = []
         used_staging_names: set[str] = set()
 
         for gap in gaps:
+            _pause_checkpoint(pause_requested)
             gap_id = str(gap.get("id") or "")
             if str(gap.get("kind") or "") != "missing_subtitle":
                 continue
 
+            # Search is read-only, but it can perform a network request; it
+            # must not start a new request after a withdrawn RootJob scope.
+            _pause_checkpoint(pause_requested)
             candidates = self.discovery.search_gap(gap, request)
             if not candidates:
                 continue
@@ -726,11 +769,13 @@ class SubtitleMaterializer:
             last_err: Exception | None = None
 
             for candidate in candidates:
+                _pause_checkpoint(pause_requested)
                 download_url = candidate.get("url")
                 if not download_url:
                     continue
 
                 try:
+                    _pause_checkpoint(pause_requested)
                     raw_bytes = self._fetch_bytes(download_url)
                     if len(raw_bytes) < MIN_SUBTITLE_BYTES:
                         raise SubtitleProviderError(f"下载的字幕文件过小 ({len(raw_bytes)} bytes)")
@@ -765,6 +810,7 @@ class SubtitleMaterializer:
                     used_staging_names.add(sub_filename)
 
                     local_sub_path = workspace / sub_filename
+                    _pause_checkpoint(pause_requested)
                     local_sub_path.write_bytes(raw_bytes)
 
                     staging_sub_path = f"{staging_root.rstrip('/')}/{sub_filename}"
@@ -774,7 +820,9 @@ class SubtitleMaterializer:
                             # Match the existing media materializers: create
                             # the parent and attempt directory before the
                             # first PUT.
+                            _pause_checkpoint(pause_requested)
                             mkdir(posixpath.dirname(staging_root))
+                            _pause_checkpoint(pause_requested)
                             mkdir(staging_root)
                         self._upload_staged_file(
                             alist,
@@ -784,7 +832,10 @@ class SubtitleMaterializer:
                             sub_filename=sub_filename,
                             raw_bytes=raw_bytes,
                             content_type=self._content_type(fmt),
+                            pause_requested=pause_requested,
                         )
+                    except SubtitlePauseRequested:
+                        raise
                     except SubtitleInfrastructureError:
                         raise
                     except Exception as exc:
@@ -800,6 +851,8 @@ class SubtitleMaterializer:
                         "provider": candidate.get("provider"),
                     }
                     break
+                except SubtitlePauseRequested:
+                    raise
                 except SubtitleInfrastructureError:
                     raise
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:

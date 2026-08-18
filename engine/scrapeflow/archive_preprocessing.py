@@ -31,6 +31,7 @@ from .archive import (
     ArchiveLimits,
     ArchiveMagicError,
     ArchiveMember,
+    ArchivePauseRequested,
     ArchiveSource,
     PasswordCandidate,
     Subprocess7zRunner,
@@ -64,6 +65,18 @@ class ArchiveStagingConflict(ArchivePreprocessingError):
 
 class ArchiveMultiplicityError(ArchivePreprocessingError):
     code = "archive_multiple_inputs"
+
+
+def _pause_checkpoint(checker: Callable[[], bool] | None) -> None:
+    """Fail closed before archive staging or subprocess side effects."""
+    if checker is None:
+        return
+    try:
+        paused = bool(checker())
+    except Exception as exc:
+        raise ArchivePauseRequested("暂停状态不可确认，归档预处理已安全停止") from exc
+    if paused:
+        raise ArchivePauseRequested("暂停已生效，归档预处理保持可恢复")
 
 
 class ArchiveRemotePort(Protocol):
@@ -328,10 +341,14 @@ def _password_candidates_for_remote(
     retry_password: str | None,
     max_candidates: int,
     source_tree_markers: Iterable[str] = (),
+    pause_requested: Callable[[], bool] | None = None,
 ) -> tuple[PasswordCandidate, ...]:
     parent, _name = split_remote(remote_path)
     try:
+        _pause_checkpoint(pause_requested)
         rows = list(source.list(parent))
+    except ArchivePauseRequested:
+        raise
     except Exception as exc:
         raise ArchivePreprocessingError("无法读取归档同目录提示") from exc
     names: list[str] = []
@@ -349,10 +366,13 @@ def _password_candidates_for_remote(
         if size is None or size > 64 * 1024:
             continue
         try:
+            _pause_checkpoint(pause_requested)
             prefix = source.read_prefix(
                 join_remote(parent, name),
                 max_bytes=min(size, 64 * 1024),
             )
+        except ArchivePauseRequested:
+            raise
         except Exception:
             continue
         marker = _decode_marker_prefix(prefix)
@@ -394,20 +414,34 @@ def _path_marker_values(value: str | Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(extract_password_markers(str(value))))
 
 
-def _ensure_local_staging(root: Path) -> Path:
+def _ensure_local_staging(
+    root: Path,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> Path:
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise ArchivePreprocessingError("task staging root is not a directory")
+    # The caller may have inspected archive metadata for a while before it
+    # reaches this local write.  Check again at the actual mkdir boundary so
+    # a withdrawn RootJob pilot cannot allocate a new staging tree.
+    _pause_checkpoint(pause_requested)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
 
 
-def _fresh_child(root: Path, name: str) -> Path:
+def _fresh_child(
+    root: Path,
+    name: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> Path:
     """Create a fresh child without deleting an existing task-owned tree."""
 
     base = root / name
     candidate = base
     for index in range(100):
         if not candidate.exists():
+            _pause_checkpoint(pause_requested)
             candidate.mkdir(mode=0o700, parents=True)
             return candidate
         if candidate.is_symlink() or not candidate.is_dir():
@@ -496,6 +530,7 @@ class ArchivePreprocessingAdapter:
         selected: Sequence[str | ArchiveMember] | None = None,
         retry_password: str | None = None,
         reject_unknown: bool = False,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_local_file(
             source,
@@ -504,6 +539,7 @@ class ArchivePreprocessingAdapter:
             selected=selected,
             retry_password=retry_password,
             reject_unknown=reject_unknown,
+            pause_requested=pause_requested,
         )
 
     def prepare_provider_local(
@@ -513,6 +549,7 @@ class ArchivePreprocessingAdapter:
         *,
         selected: Sequence[str | ArchiveMember] | None = None,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_local_file(
             source,
@@ -521,6 +558,7 @@ class ArchivePreprocessingAdapter:
             selected=selected,
             retry_password=retry_password,
             reject_unknown=True,
+            pause_requested=pause_requested,
         )
 
     def prepare_ordinary_tree(
@@ -530,6 +568,7 @@ class ArchivePreprocessingAdapter:
         *,
         selected_by_archive: Mapping[str, Sequence[str | ArchiveMember]] | None = None,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_local_tree(
             source_root,
@@ -538,6 +577,7 @@ class ArchivePreprocessingAdapter:
             selected_by_archive=selected_by_archive,
             retry_password=retry_password,
             reject_unknown=False,
+            pause_requested=pause_requested,
         )
 
     def prepare_provider_tree(
@@ -547,6 +587,7 @@ class ArchivePreprocessingAdapter:
         *,
         selected_by_archive: Mapping[str, Sequence[str | ArchiveMember]] | None = None,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_local_tree(
             source_root,
@@ -555,6 +596,7 @@ class ArchivePreprocessingAdapter:
             selected_by_archive=selected_by_archive,
             retry_password=retry_password,
             reject_unknown=True,
+            pause_requested=pause_requested,
         )
 
     def prepare_ordinary_remote(
@@ -567,6 +609,7 @@ class ArchivePreprocessingAdapter:
         selected: Sequence[str | ArchiveMember] | None = None,
         retry_password: str | None = None,
         source_tree_markers: Iterable[str] = (),
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_remote_file(
             source,
@@ -578,6 +621,7 @@ class ArchivePreprocessingAdapter:
             retry_password=retry_password,
             source_tree_markers=source_tree_markers,
             reject_unknown=False,
+            pause_requested=pause_requested,
         )
 
     def prepare_ordinary_remote_tree(
@@ -589,6 +633,7 @@ class ArchivePreprocessingAdapter:
         remote_staging_root: str,
         selected_by_archive: Mapping[str, Sequence[str | ArchiveMember]] | None = None,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         """Preprocess one archive-only ordinary source directory.
 
@@ -598,6 +643,7 @@ class ArchivePreprocessingAdapter:
         planner/intake behavior.
         """
 
+        _pause_checkpoint(pause_requested)
         root = normalize_remote_path(source_root)
         self._validate_remote_staging_root(remote_staging_root)
         source_adapter = source_port
@@ -609,6 +655,7 @@ class ArchivePreprocessingAdapter:
         stack = [root]
         visited: set[str] = set()
         while stack:
+            _pause_checkpoint(pause_requested)
             current = stack.pop()
             if current in visited:
                 continue
@@ -617,11 +664,14 @@ class ArchivePreprocessingAdapter:
             visited.add(current)
             try:
                 rows = list(source_adapter.list(current))
+            except ArchivePauseRequested:
+                raise
             except Exception as exc:
                 raise ArchivePreprocessingError("无法扫描普通入站目录") from exc
             if len(rows) > self.limits.max_members:
                 raise ArchivePreprocessingError("来源目录条目数超过归档扫描上限")
             for raw in rows:
+                _pause_checkpoint(pause_requested)
                 if not isinstance(raw, Mapping):
                     continue
                 name = _entry_name(raw)
@@ -635,6 +685,8 @@ class ArchivePreprocessingAdapter:
                     prefix = source_adapter.read_prefix(
                         full, max_bytes=self.limits.max_magic_scan_bytes,
                     )
+                except ArchivePauseRequested:
+                    raise
                 except Exception as exc:
                     raise ArchivePreprocessingError("无法读取来源文件前缀") from exc
                 detection = detect_magic(prefix, filename=name)
@@ -682,6 +734,7 @@ class ArchivePreprocessingAdapter:
             selected=selected,
             retry_password=retry_password,
             source_tree_markers=marker_texts,
+            pause_requested=pause_requested,
         )
 
     def prepare_provider_remote(
@@ -694,6 +747,7 @@ class ArchivePreprocessingAdapter:
         selected: Sequence[str | ArchiveMember] | None = None,
         retry_password: str | None = None,
         source_tree_markers: Iterable[str] = (),
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
         return self._prepare_remote_file(
             source,
@@ -705,6 +759,7 @@ class ArchivePreprocessingAdapter:
             retry_password=retry_password,
             source_tree_markers=source_tree_markers,
             reject_unknown=True,
+            pause_requested=pause_requested,
         )
 
     def prepare_ordinary_request(
@@ -715,6 +770,7 @@ class ArchivePreprocessingAdapter:
         task_staging: str | Path | None = None,
         remote_staging_root: str | None = None,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, Any]:
         """Optional runner hook used before ordinary Engine planning.
 
@@ -724,6 +780,7 @@ class ArchivePreprocessingAdapter:
         behavior remains byte-for-byte unchanged.
         """
 
+        _pause_checkpoint(pause_requested)
         if not isinstance(request, Mapping) or task_staging is None:
             return request
         source = request.get("source_path")
@@ -735,12 +792,14 @@ class ArchivePreprocessingAdapter:
                 local,
                 task_staging,
                 retry_password=retry_password,
+                pause_requested=pause_requested,
             )
         elif local.is_dir():
             prepared = self.prepare_ordinary_tree(
                 local,
                 task_staging,
                 retry_password=retry_password,
+                pause_requested=pause_requested,
             )
         elif alist is not None and remote_staging_root:
             # A user can submit either an inbound directory or a single file.
@@ -754,6 +813,8 @@ class ArchivePreprocessingAdapter:
                     candidate = exact(source)
                     if isinstance(candidate, Mapping):
                         info = candidate
+                except ArchivePauseRequested:
+                    raise
                 except Exception:
                     info = None
             if info is not None and info.get("is_dir") is not True:
@@ -763,6 +824,7 @@ class ArchivePreprocessingAdapter:
                     task_staging,
                     remote_staging_root=remote_staging_root,
                     retry_password=retry_password,
+                    pause_requested=pause_requested,
                 )
             else:
                 # The ordinary intake contract is normally a source
@@ -775,6 +837,7 @@ class ArchivePreprocessingAdapter:
                     task_staging,
                     remote_staging_root=remote_staging_root,
                     retry_password=retry_password,
+                    pause_requested=pause_requested,
                 )
         else:
             return request
@@ -793,6 +856,7 @@ class ArchivePreprocessingAdapter:
         workspace: str | Path,
         alist: Any,
         retry_password: str | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> Mapping[str, Any]:
         """Preprocess explicitly marked provider archive rows in place.
 
@@ -815,6 +879,7 @@ class ArchivePreprocessingAdapter:
         output = dict(acquisition)
         output_rows: list[dict[str, Any]] = []
         for raw in rows:
+            _pause_checkpoint(pause_requested)
             if not isinstance(raw, Mapping) or raw.get("archive_source") is not True:
                 output_rows.append(dict(raw) if isinstance(raw, Mapping) else raw)
                 continue
@@ -834,6 +899,7 @@ class ArchivePreprocessingAdapter:
                 remote_staging_root=staging_root,
                 selected=selected,
                 retry_password=retry_password,
+                pause_requested=pause_requested,
             )
             for file in prepared.files:
                 output_rows.append({
@@ -858,12 +924,18 @@ class ArchivePreprocessingAdapter:
         retry_password: str | None,
         source_tree_markers: Iterable[str] = (),
         reject_unknown: bool,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
+        _pause_checkpoint(pause_requested)
         ingress = _as_ingress(ingress)
         source_path = Path(source)
         if source_path.is_symlink() or not source_path.is_file():
             raise ArchivePreprocessingError("archive source is not a regular file")
-        staging = _ensure_local_staging(Path(task_staging).resolve())
+        _pause_checkpoint(pause_requested)
+        staging = _ensure_local_staging(
+            Path(task_staging).resolve(),
+            pause_requested=pause_requested,
+        )
         self._validate_local_staging_root(staging, source_path.resolve())
         prefix = _read_local_prefix(source_path, self.limits.max_magic_scan_bytes)
         detection = detect_magic(prefix, filename=source_path.name)
@@ -907,10 +979,29 @@ class ArchivePreprocessingAdapter:
             max_candidates=self.limits.max_password_candidates,
             source_tree_markers=source_tree_markers,
         )
-        listing = self.inspector.inspect(source_path, password_candidates=candidates)
+        # ``inspect`` and ``extract`` invoke the archive subprocess and may
+        # create task-owned staging.  Fence each independently so a pause
+        # that arrives during password discovery cannot start either one.
+        _pause_checkpoint(pause_requested)
+        listing = self.inspector.inspect(
+            source_path,
+            password_candidates=candidates,
+            pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
+        )
         chosen = selected
-        extraction_root = _fresh_child(staging, f"archive/{_safe_slug(source_path.name)}")
-        extracted = self.extractor.extract(listing, extraction_root, selected=chosen)
+        _pause_checkpoint(pause_requested)
+        extraction_root = _fresh_child(
+            staging,
+            f"archive/{_safe_slug(source_path.name)}",
+            pause_requested=pause_requested,
+        )
+        _pause_checkpoint(pause_requested)
+        extracted = self.extractor.extract(
+            listing,
+            extraction_root,
+            selected=chosen,
+            pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
+        )
         candidate_values = _password_values(candidates)
         files = _prepared_from_extraction(
             extraction_root,
@@ -937,12 +1028,18 @@ class ArchivePreprocessingAdapter:
         selected_by_archive: Mapping[str, Sequence[str | ArchiveMember]] | None,
         retry_password: str | None,
         reject_unknown: bool,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
+        _pause_checkpoint(pause_requested)
         ingress = _as_ingress(ingress)
         root = Path(source_root)
         if root.is_symlink() or not root.is_dir():
             raise ArchivePreprocessingError("archive source root is not a directory")
-        staging = _ensure_local_staging(Path(task_staging).resolve())
+        _pause_checkpoint(pause_requested)
+        staging = _ensure_local_staging(
+            Path(task_staging).resolve(),
+            pause_requested=pause_requested,
+        )
         self._validate_local_staging_root(staging, root.resolve())
         files = _local_tree_regular_files(root)
         if len(files) > self.limits.max_members:
@@ -991,6 +1088,7 @@ class ArchivePreprocessingAdapter:
         for item in direct:
             secrets.extend(item._password_values)
         for archive_path in archive_candidates:
+            _pause_checkpoint(pause_requested)
             selected = (
                 selected_by_archive.get(str(archive_path))
                 if isinstance(selected_by_archive, Mapping)
@@ -1003,6 +1101,7 @@ class ArchivePreprocessingAdapter:
                 selected=selected,
                 retry_password=retry_password,
                 reject_unknown=reject_unknown,
+                pause_requested=pause_requested,
             )
             extracted_files.extend(result.files)
             labels.extend(result.archives)
@@ -1039,19 +1138,28 @@ class ArchivePreprocessingAdapter:
         retry_password: str | None,
         source_tree_markers: Iterable[str] = (),
         reject_unknown: bool,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> ArchivePreprocessResult:
+        _pause_checkpoint(pause_requested)
         ingress = _as_ingress(ingress)
         remote = normalize_remote_path(source)
         self._validate_remote_staging_root(remote_staging_root)
-        staging = _ensure_local_staging(Path(task_staging).resolve())
+        _pause_checkpoint(pause_requested)
+        staging = _ensure_local_staging(
+            Path(task_staging).resolve(),
+            pause_requested=pause_requested,
+        )
         self._validate_local_staging_root(staging, None)
         source_adapter = source_port
         if not all(hasattr(source_adapter, name) for name in ("list", "read_prefix", "download")):
             source_adapter = AListArchiveSource(source_port)
         try:
+            _pause_checkpoint(pause_requested)
             prefix = source_adapter.read_prefix(
                 remote, max_bytes=self.limits.max_magic_scan_bytes,
             )
+        except ArchivePauseRequested:
+            raise
         except Exception as exc:
             raise ArchivePreprocessingError("无法读取远端归档前缀") from exc
         detection = detect_magic(prefix, filename=Path(remote).name)
@@ -1061,6 +1169,7 @@ class ArchivePreprocessingAdapter:
                 kind = _kind_for_path(remote)
                 if kind is None:
                     raise ArchiveMagicError("远端来源媒体后缀不受支持")
+                _pause_checkpoint(pause_requested)
                 info = self._remote_exact(source_port, remote)
                 size = int(info.get("size") or 0) if info else 0
                 if size <= 0:
@@ -1097,16 +1206,35 @@ class ArchivePreprocessingAdapter:
             retry_password=retry_password,
             max_candidates=self.limits.max_password_candidates,
             source_tree_markers=source_tree_markers,
+            pause_requested=pause_requested,
         )
-        input_root = _fresh_child(staging, f"archive-input/{_safe_slug(Path(remote).name)}")
+        _pause_checkpoint(pause_requested)
+        input_root = _fresh_child(
+            staging,
+            f"archive-input/{_safe_slug(Path(remote).name)}",
+            pause_requested=pause_requested,
+        )
+        _pause_checkpoint(pause_requested)
         listing = self.inspector.inspect_remote(
             source_adapter,
             remote,
             input_root,
             password_candidates=candidates,
+            pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
         )
-        extraction_root = _fresh_child(staging, f"archive/{_safe_slug(Path(remote).name)}")
-        extracted = self.extractor.extract(listing, extraction_root, selected=selected)
+        _pause_checkpoint(pause_requested)
+        extraction_root = _fresh_child(
+            staging,
+            f"archive/{_safe_slug(Path(remote).name)}",
+            pause_requested=pause_requested,
+        )
+        _pause_checkpoint(pause_requested)
+        extracted = self.extractor.extract(
+            listing,
+            extraction_root,
+            selected=selected,
+            pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
+        )
         candidate_values = _password_values(candidates)
         local_files = _prepared_from_extraction(
             extraction_root,
@@ -1122,6 +1250,7 @@ class ArchivePreprocessingAdapter:
             extraction_root,
             remote_root,
             source_port,
+            pause_requested=pause_requested,
         )
         return ArchivePreprocessResult(
             ingress=ingress,
@@ -1184,6 +1313,8 @@ class ArchivePreprocessingAdapter:
         extraction_root: Path,
         remote_root: str,
         sink: Any,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> tuple[PreparedArchiveFile, ...]:
         root = normalize_remote_path(remote_root)
         validator = self.staging_root_validator
@@ -1194,9 +1325,11 @@ class ArchivePreprocessingAdapter:
         exact = getattr(sink, "exact_file_info", None)
         if not all(callable(item) for item in (mkdir, upload, exact)):
             raise ArchivePreprocessingError("archive staging sink lacks create/readback methods")
+        _pause_checkpoint(pause_requested)
         mkdir(root)
         output: list[PreparedArchiveFile] = []
         for item in files:
+            _pause_checkpoint(pause_requested)
             local = Path(item.path)
             relative = normalize_member_path(item.relative_path)
             target = join_remote(root, relative)
@@ -1210,7 +1343,9 @@ class ArchivePreprocessingAdapter:
                 parts = root.strip("/").split("/")
                 target_parts = parent.strip("/").split("/")
                 for end in range(len(parts) + 1, len(target_parts) + 1):
+                    _pause_checkpoint(pause_requested)
                     mkdir("/" + "/".join(target_parts[:end]))
+            _pause_checkpoint(pause_requested)
             existing = exact(target)
             if existing is not None:
                 existing_size = existing.get("size")
@@ -1221,7 +1356,9 @@ class ArchivePreprocessingAdapter:
                 if existing_size != item.size:
                     raise ArchiveStagingConflict("task staging target exists with a different size")
             else:
+                _pause_checkpoint(pause_requested)
                 upload(target, local, _content_type(local.name))
+            _pause_checkpoint(pause_requested)
             observed = exact(target)
             if observed is None:
                 raise ArchivePreprocessingError("archive staging upload is not visible")
@@ -1277,6 +1414,7 @@ def prepare_provider_archive(
 
 __all__ = [
     "ArchiveMultiplicityError",
+    "ArchivePauseRequested",
     "ArchivePreprocessResult",
     "ArchivePreprocessingAdapter",
     "ArchivePreprocessingError",

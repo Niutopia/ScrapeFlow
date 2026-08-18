@@ -31,7 +31,7 @@ quark_share → alist_offline → magnet
 
 `EngineJob` 仍是内部兼容执行载体，不再是顶层业务模型。`POST /api/jobs` 与 `/api/jobs/:id/start` 仅为 legacy 兼容入口；新功能应使用 RootJob/WorkUnit 路径。
 
-每个 API 进程都会以 paused 状态启动，只有显式 `POST /api/control/resume` 才会允许新的外部副作用。模板中的 intake、自动审计和自动补源 gate 均默认关闭；手动补源仍受 pause 和 worker 门禁约束。
+每个 API 进程都会以 paused 状态启动。恢复自动执行前必须持久化一个精确 RootJob：先在 paused 时 `POST /api/control/pilot`，再由 `POST /api/control/resume` 执行只读 AList/aria2 preflight；空 selector、预检失败或预检期间控制状态变更都保持暂停。若进程重启前的持久记录仍是 unpaused，新进程的内存 startup fence 虽会显示 paused，仍须先 `POST /api/control/pause` 把**共享持久记录**写回 paused，才可 arm 或 resume；这避免第二个 API 进程改变正在运行的 pilot。`SCRAPEFLOW_ROOT_JOB_PILOT` 可作为 Compose 级的第二道精确 RootJob ceiling，与持久 scope 取交集，不能扩大范围，并会关闭全库自动审计。预检核对实际 AddURL offline sibling（`<staging>__offline__`）的最长 AList storage 挂载、启用/work 状态和已审阅的 Quark 上传能力；不会提交样本任务，所以 ready 仍不是传输成功证据。模板中的 intake、自动审计和自动补源 gate 均默认关闭；手动补源仍受 pause、scope 和 worker 门禁约束。
 
 ## 最少配置
 
@@ -51,10 +51,28 @@ cp .env.local.example .env.local
 启动服务：
 
 ```sh
+SCRAPEFLOW_BUILD_COMMIT="$(git rev-parse HEAD)" \
+SCRAPEFLOW_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose --env-file .env.local build api
 docker compose --env-file .env.local up -d alist api pansou offline-aria2 quark-helper
-curl -fsS http://127.0.0.1:3010/api/health
+python3 scripts/scrapeflow_runtime_readiness.py \
+  --expected-commit <the-build-id-used-above>
 ```
+
+构建命令会把提交号和 UTC 构建时间写入镜像 OCI labels 与 API 运行时；
+`/api/health` 中的 build 字段与 `docker image inspect` 均可复核。未按上述方式
+构建的镜像会明确显示 `unrecorded`，不能作为已验证版本使用。readiness 命令必须
+显式给出 build id：使用至少 7 位小写 Git SHA（允许明确的 `-dirty` 后缀），且只接受
+health 中以该 SHA 前缀开始、dirty 标记一致的实际 build id；空值、`unrecorded` 和无效
+UTC build_time 都会失败。
+
+在第一次启动 `offline-aria2` 前，操作者还必须在本机 `.env.local` 设置一个随机、非空的
+`SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET`，并在 AList 的 offline-download `aria2`
+工具配置中填入**完全相同**的 `aria2_secret`（地址为
+`http://offline-aria2:6800/jsonrpc`）。该值仅传给 aria2 sidecar；不会进入 API 环境、
+health 或 acceptance 证据。该 sidecar 位于专用 Compose bridge，只有 AList/API（及共享
+API network namespace 的 Helper）能连接 RPC；bridge 不设 `internal`，以保留 aria2 的直连
+下载出网能力。
 
 ### 代理与直连（Clash TUN 全局模式）
 
@@ -92,9 +110,11 @@ API 只暴露当前自动服务所需的操作：
 
 ```text
 GET  /api/health
+GET  /api/readiness/alist-offline
 GET  /api/control
 POST /api/control/pause
-POST /api/control/resume
+POST /api/control/pilot            {"root_job_id":"<root-job-id>"}
+POST /api/control/resume           {"root_job_id":"<root-job-id>"}  # 或已 arm 后 {}
 GET  /api/intake
 POST /api/root-jobs               {"path":"/quark/影视/待刮削/作品目录","target_shelf":"movie|anime|us_tv"}
 GET  /api/jobs
@@ -115,6 +135,8 @@ GET  /api/browse?path=...&refresh=1
 POST /api/jobs                    {"path":"/quark/影视/待刮削/作品目录"}
 POST /api/jobs/:id/start          {"target_shelf":"movie|anime|us_tv"}
 ```
+
+`GET /api/readiness/alist-offline` 只读取 AList 离线工具、管理员认证/task-manager、aria2 RPC/临时目录和目标 storage 路由；它不会创建目录、提交任务、下载、转存或删除任务。因此 `ready` 证明配置与可达性，**不**证明已完成真实文件传输。该诊断端点会以 HTTP 200 返回 `not_ready`/`unverified` 报告，故绝不能把 `curl -f` 的退出码当作就绪证明；必须使用上面的 runtime-readiness 命令，它要求 `status=ready` 和 `verified=true`。单任务试运行应在保持 paused 时先调用 `POST /api/control/pilot {"root_job_id":"…"}`；随后检查该 GET 和 `/api/health` 的 `automatic_scope`，只有 preflight 为 verified 才能 resume。自动全库审计投影在 single_root pilot 中保持关闭，避免它为非白名单根创建 Provider/retry 工作。
 
 POST /api/root-jobs 是 A→P 合同的 S 步入口：一次提交来源与货架，创建或激活唯一 RootJob（同一来源幂等返回同一任务，已选货架不可更改），也是 Web 控制台“创建任务”面板调用的接口。已匹配的正式作品始终沿用既有货架/作品根；target_shelf 只为新作品规划提供受限目标。POST /api/jobs 与 POST /api/jobs/:id/start 仅保留为 legacy 兼容入口。
 
@@ -183,8 +205,8 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
   该报告原子固化当时的空目录检查；启动后目录非空不会把已固化的通过误判为失败。
   报告属于本机 self-attested evidence：验收包会校验目录身份、备份 manifest
   完整性并记录报告 SHA-512，但它不是外部签名或密码学不可伪造证明。
-- 隔离 API 启动后的只读核对可用
-  `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:<isolated-api-port> --expected-commit <git-commit>`；
+- 隔离 API 启动后的只读核对必须显式给出已构建的 build id：
+  `python3 scripts/scrapeflow_runtime_readiness.py --api-url http://127.0.0.1:<isolated-api-port> --expected-commit <build-id>`；
   `<isolated-api-port>` 必须是该隔离 Compose project 的 `SCRAPEFLOW_API_PORT`，不能沿用生产默认 `3010`。
 
 文档权威层级如下：[`AGENTS.md`](AGENTS.md) 是唯一的长期产品与工程合同（含目标架构与 A→P 主流程）；当前实现事实与已知差距以源码、测试和 Git 工作树证据核对。本 README、[部署与开启顺序](docs/scrapeflow-deployment-open-order.md) 和[验收记录模板](docs/scrapeflow-isolated-acceptance-record.md)是当前操作入口，但不覆盖 AGENTS。明确标为“历史参考”的收敛计划、旧目标货架计划、RC 与阶段快照只保留史料，不授权解除全局暂停或开放自动执行。
