@@ -3530,12 +3530,17 @@ class AutomaticReplenishmentTests(unittest.TestCase):
     def test_quark_share_materializer_persists_and_reuses_task_id(self) -> None:
         selection = {
             "provider": "quark_share",
-            "locator": "quark_share:fixture-share",
+            # The live candidate may carry both a signed locator and a share
+            # passcode.  The real materializer may use the passcode for this
+            # one Helper call, but its durable workspace receipt must retain
+            # neither value (including fragment credentials).
+            "locator": "quark_share:fixture-share?token=workspace-token#passcode=workspace-fragment",
             "release_name": "Example Show S01E01 1080p",
             "selected_gap_ids": ["S01E01"],
             "acquisition": {
                 "kind": "quark_fast_save",
                 "share_id": "fixture-share",
+                "passcode": "live-share-passcode",
                 "file_id_by_gap": {"S01E01": ["share-fid"]},
                 "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
                 "file_size_by_id": {"share-fid": 123},
@@ -3582,25 +3587,31 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 workspace=workspace, alist=alist,
             )
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            durable_text = state_path.read_text(encoding="utf-8")
 
         self.assertEqual(helper.task_ids, [None, "quark-share-task-1"])
         self.assertEqual(first["external_task_id"], "quark-share-task-1")
         self.assertEqual(second["external_task_id"], "quark-share-task-1")
         self.assertEqual(set(state), {
             "provider", "attempt_id", "staging_root", "task_id",
-            "locator", "selected_gap_ids", "updated_at",
+            "selected_gap_ids", "updated_at",
         })
         self.assertEqual(state["provider"], TIER_QUARK_SHARE)
         self.assertEqual(state["attempt_id"], "attempt-reuse")
         self.assertEqual(state["staging_root"], staging)
         self.assertEqual(state["task_id"], "quark-share-task-1")
-        self.assertEqual(state["locator"], "quark_share:fixture-share")
         self.assertEqual(state["selected_gap_ids"], ["S01E01"])
         self.assertTrue(str(state["updated_at"]).endswith("Z"))
         self.assertEqual(
             helper.plans[1]["task_id"],
             "quark-share-task-1",
         )
+        # The value is present only in the in-memory typed Helper request.
+        self.assertEqual(helper.plans[0]["passcode"], "live-share-passcode")
+        for secret in (
+            "workspace-token", "workspace-fragment", "live-share-passcode",
+        ):
+            self.assertNotIn(secret, durable_text)
 
     def test_quark_share_materializer_rejects_corrupt_or_wrong_attempt_state(self) -> None:
         selection = {
@@ -3640,7 +3651,6 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 "attempt_id": "attempt-other",
                 "staging_root": staging,
                 "task_id": "quark-share-task-1",
-                "locator": "quark_share:fixture-share",
                 "selected_gap_ids": ["S01E01"],
                 "updated_at": "2026-08-10T00:00:00Z",
             }), encoding="utf-8")
@@ -3649,6 +3659,121 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     {}, [selection], staging_root=staging,
                     workspace=workspace, alist=alist,
                 )
+
+    def test_quark_workspace_rejects_credentialed_task_id_without_receipt(self) -> None:
+        """A Helper task URL is not a durable external task identifier."""
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture?token=locator-token#passcode=locator-pass",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "passcode": "live-passcode",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
+        }
+
+        class UnsafeTaskHelper:
+            def health(self):
+                return {
+                    "status": "ready",
+                    "authenticated": True,
+                    "actions": ["health", "share-save"],
+                }
+
+            def share_save(self, _plan):
+                return {
+                    "status": "finished",
+                    "task_id": "share-task?token=task-token#passcode=task-pass",
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            state_path = workspace / "quark_share_attempt.json"
+            with patch("local.scrapeflow_api.automatic_replenishment.time.sleep"):
+                with self.assertRaisesRegex(Exception, "缺少 task_id"):
+                    QuarkFastSaveAutomaticMaterializer(
+                        helper=UnsafeTaskHelper(),
+                    ).acquire(
+                        {},
+                        [selection],
+                        staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-unsafe-task",
+                        workspace=workspace,
+                        alist=MemoryAList(),
+                    )
+
+            self.assertFalse(state_path.exists())
+            durable = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in workspace.rglob("*.json")
+            )
+
+        for secret in (
+            "locator-token", "locator-pass", "live-passcode",
+            "task-token", "task-pass",
+        ):
+            self.assertNotIn(secret, durable)
+
+    def test_automatic_gap_json_drops_credentialed_selection_task_and_error(self) -> None:
+        """Automatic recovery state cannot become a credential replay cache."""
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            runtime = AutomaticReplenishmentRuntime(
+                state_root,
+                engine_runner=FakeEngine(),
+                alist=MemoryAList(),
+                search=FakeSearch(),
+                materializer=object(),
+                staging_root="/quark/影视/ScrapeFlow/补源",
+            )
+            selection = {
+                "provider": "quark_share",
+                "locator": "quark_share:fixture?token=selection-token#passcode=selection-pass",
+                "selected_gap_ids": ["S01E01"],
+                "acquisition": {
+                    "kind": "quark_fast_save",
+                    "passcode": "selection-live-passcode",
+                },
+            }
+            active = runtime._active_attempt_record(  # noqa: SLF001 - durable boundary
+                job_id="engine-secret-state",
+                attempt_id="attempt-secret-state",
+                staging_root=(
+                    "/quark/影视/ScrapeFlow/补源/engine-secret-state/"
+                    "attempt-secret-state"
+                ),
+                workspace=state_root / "staging" / "engine-secret-state" / "attempt-secret-state",
+                selections=[selection],
+                external_task_id="task?token=active-task-token#passcode=active-task-pass",
+            )
+            state_path = runtime._gap_path(  # noqa: SLF001 - durable boundary
+                job_id="engine-secret-state", gap_id="S01E01",
+            )
+            runtime._write_gap(  # noqa: SLF001 - durable boundary
+                {
+                    "id": "S01E01",
+                    "job_id": "engine-secret-state",
+                    "active_attempt": active,
+                    "external_task_id": "task?token=state-task-token#passcode=state-task-pass",
+                    "error": "provider https://example.test/?token=error-token#passcode=error-pass",
+                },
+                state_path,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            durable = state_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("selections", state["active_attempt"])
+        self.assertEqual(state["active_attempt"]["locators"], [])
+        self.assertIsNone(state["external_task_id"])
+        for secret in (
+            "selection-token", "selection-pass", "selection-live-passcode",
+            "active-task-token", "active-task-pass", "state-task-token",
+            "state-task-pass", "error-token", "error-pass",
+        ):
+            self.assertNotIn(secret, durable)
 
     def test_quark_share_materializer_preserves_in_doubt_failure_scope(self) -> None:
         selection = {

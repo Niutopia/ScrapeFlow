@@ -100,9 +100,31 @@ class _FakeMaterializer:
             })
         if self.error is not None:
             raise self.error
-        return self.delivery if self.delivery is not None else {
+        if self.delivery is not None:
+            return self.delivery
+
+        # The production root path now proves a fresh staging inventory before
+        # planning a child.  Keep this fake honest: a successful provider
+        # delivery means the exact declared media files actually exist in the
+        # fake AList, rather than merely returning metadata for them.
+        files: list[dict[str, Any]] = []
+        for selection in selections:
+            for gap_id in selection.get("selected_gap_ids") or []:
+                if not isinstance(gap_id, str) or not gap_id:
+                    continue
+                path = f"{staging_root}/{gap_id}.mkv"
+                alist.files[path] = b"v" * FAKE_VIDEO_SIZE
+                files.append({
+                    "path": path,
+                    "size": FAKE_VIDEO_SIZE,
+                    "kind": "video",
+                    "gap_ids": [gap_id],
+                })
+        return {
+            "lane": str(selections[0].get("provider") or ""),
+            "attempt_id": staging_root.rsplit("/", 1)[-1],
             "staging_root": staging_root,
-            "files": [],
+            "files": files,
         }
 
     def reconcile_existing_task(
@@ -944,13 +966,20 @@ class RootReplenishmentTests(unittest.TestCase):
             acquire_calls: list[str] = []
 
             class SuccessfulDelivery:
-                def acquire(self, _request, _selections, *, staging_root, **_kwargs):
+                def acquire(self, _request, _selections, *, staging_root, alist, **_kwargs):
                     acquire_calls.append("acquire")
+                    path = f"{staging_root}/S01E02.mkv"
+                    alist.files[path] = b"v" * FAKE_VIDEO_SIZE
                     return {
                         "lane": "magnet",
                         "attempt_id": staging_root.rsplit("/", 1)[-1],
                         "staging_root": staging_root,
-                        "files": [],
+                        "files": [{
+                            "path": path,
+                            "size": FAKE_VIDEO_SIZE,
+                            "kind": "video",
+                            "gap_ids": ["S01E02"],
+                        }],
                         "external_task_id": "torrent-task-1",
                     }
 
@@ -1045,14 +1074,21 @@ class RootReplenishmentTests(unittest.TestCase):
             def protected_search(request):
                 result = _quark_share_search("S01E02")(request)
                 candidate = result["candidates"][0]
-                candidate["locator"] = "quark_share:fixture?token=secret-token"
+                candidate["locator"] = (
+                    "quark_share:fixture?token=secret-token"
+                    "#passcode=fragment-passcode"
+                )
                 candidate["acquisition"]["passcode"] = "vault-passcode"
                 return result
 
             first = run_root_replenishment(
                 runner, state_root, "root-1", search_runner=protected_search,
                 materializer_factory=lambda _tier: _FakeMaterializer(
-                    events=events, error=_InDoubtError("quark-task-1"),
+                    events=events,
+                    error=_InDoubtError(
+                        "quark-task?token=unsafe-task-token"
+                        "#passcode=unsafe-task-passcode",
+                    ),
                 ),
             )
             self.assertEqual(first["waiting"], "waiting_reconcile")
@@ -1061,8 +1097,11 @@ class RootReplenishmentTests(unittest.TestCase):
             persisted = load_root_replenishment_state(state_root, "root-1")
             self.assertFalse(next(iter(persisted["video_intents"].values()))["recovery_safe"])
             disk = "\n".join(path.read_text(encoding="utf-8") for path in state_root.rglob("*.json"))
-            self.assertNotIn("vault-passcode", disk)
-            self.assertNotIn("secret-token", disk)
+            for secret in (
+                "vault-passcode", "secret-token", "fragment-passcode",
+                "unsafe-task-token", "unsafe-task-passcode",
+            ):
+                self.assertNotIn(secret, disk)
 
             second = run_root_replenishment(
                 runner, state_root, "root-1",
@@ -1212,6 +1251,160 @@ class RootReplenishmentTests(unittest.TestCase):
             }],
         }
         self.assertIsNone(root_replenishment._video_delivery(delivery, intent))
+
+    def test_video_delivery_requires_exact_one_ordinary_file_per_gap(self) -> None:
+        """Provider metadata cannot turn packs, sidecars, or partials into media."""
+        intent = {
+            "tier": "magnet",
+            "attempt_id": "attempt-1",
+            "staging_root": "/library/ScrapeFlow/补源/root-1/attempt-1",
+            "selected_gap_ids": ["S01E01", "S01E02"],
+        }
+        root = intent["staging_root"]
+
+        def delivery(files: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "lane": "magnet",
+                "attempt_id": "attempt-1",
+                "staging_root": root,
+                "files": files,
+            }
+
+        exact = [
+            {
+                "path": f"{root}/S01E01.mkv", "size": 123,
+                "kind": "video", "gap_ids": ["S01E01"],
+            },
+            {
+                "path": f"{root}/S01E02.mkv", "size": 456,
+                "kind": "video", "gap_ids": ["S01E02"],
+            },
+        ]
+        self.assertIsNotNone(root_replenishment._video_delivery(delivery(exact), intent))
+        # One selected coordinate must never mean a season pack/multi-episode
+        # file, nor may a non-video suffix masquerade as kind=video.
+        malformed = [
+            exact[:1],
+            [{
+                "path": f"{root}/S01E01-02.mkv", "size": 123,
+                "kind": "video", "gap_ids": ["S01E01", "S01E02"],
+            }],
+            [
+                exact[0],
+                {
+                    "path": f"{root}/S01E02.zh.srt", "size": 456,
+                    "kind": "video", "gap_ids": ["S01E02"],
+                },
+            ],
+            [
+                exact[0],
+                {
+                    "path": f"{root}/S01E02.zip", "size": 456,
+                    "kind": "video", "gap_ids": ["S01E02"],
+                },
+            ],
+            [exact[0], exact[0]],
+        ]
+        for files in malformed:
+            self.assertIsNone(root_replenishment._video_delivery(delivery(files), intent))
+
+    def test_rogue_staging_file_holds_attempt_without_child_or_resubmit(self) -> None:
+        """A directory-only child must never see unreported staging siblings."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            acquire_calls: list[str] = []
+            child_requests: list[object] = []
+            child_writes: list[object] = []
+
+            class RogueDelivery:
+                def acquire(self, _request, _selections, *, staging_root, alist, **_kwargs):
+                    acquire_calls.append(staging_root)
+                    accepted = f"{staging_root}/S01E02.mkv"
+                    alist.files[accepted] = b"v" * FAKE_VIDEO_SIZE
+                    alist.files[f"{staging_root}/unreported-extra.mkv"] = b"x" * FAKE_VIDEO_SIZE
+                    return {
+                        "lane": "magnet",
+                        "attempt_id": staging_root.rsplit("/", 1)[-1],
+                        "staging_root": staging_root,
+                        "files": [{
+                            "path": accepted,
+                            "size": FAKE_VIDEO_SIZE,
+                            "kind": "video",
+                            "gap_ids": ["S01E02"],
+                        }],
+                    }
+
+            def forbidden_child(*args, **_kwargs):
+                child_requests.append(args[0] if args else object())
+                raise AssertionError("rogue staging must not reach child planner")
+
+            runner.plan_job = forbidden_child  # type: ignore[method-assign]
+            runner.executor = lambda plan: child_writes.append(plan) or {"ok": True}
+            first = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda _tier: RogueDelivery(),
+            )
+            self.assertEqual(first["waiting"], "waiting_reconcile")
+            self.assertEqual(child_requests, [])
+            self.assertEqual(child_writes, [])
+            self.assertEqual(len(acquire_calls), 1)
+
+            second = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("uncertain delivery must not search again"),
+                ),
+                materializer_factory=lambda _tier: RogueDelivery(),
+            )
+            self.assertEqual(second["waiting"], "waiting_reconcile")
+            self.assertEqual(child_requests, [])
+            self.assertEqual(child_writes, [])
+            self.assertEqual(len(acquire_calls), 1)
+
+    def test_child_receives_only_isolated_exact_video_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            observed: list[tuple[str, dict[str, int] | None]] = []
+            original_plan = runner.plan_job
+
+            def inspect_child(request, *args, **kwargs):
+                observed.append((
+                    request.source_path,
+                    root_replenishment._fresh_video_staging_inventory(
+                        runner, request.source_path,
+                    ),
+                ))
+                return original_plan(request, *args, **kwargs)
+
+            runner.plan_job = inspect_child  # type: ignore[method-assign]
+            result = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda _tier: _FakeMaterializer(),
+            )
+
+        self.assertEqual(result["gaps_closed"], ["unit-tv::missing_episode::S01E02"])
+        self.assertEqual(len(observed), 1)
+        source_root, inventory = observed[0]
+        self.assertTrue(source_root.endswith("/__scrapeflow_media__"))
+        self.assertEqual(inventory, {f"{source_root}/S01E02.mkv": FAKE_VIDEO_SIZE})
 
     def test_close_gap_only_after_coverage_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -75,6 +75,14 @@ _BTIH_TOKEN = re.compile(r"(?i)\bbtih:([0-9a-f]{40}|[a-z2-7]{32})\b")
 _INFOHASH_TOKEN = re.compile(r"(?i)^(?:[0-9a-f]{40}|[a-z2-7]{32})$")
 _ATTEMPT_ID_TOKEN = re.compile(r"^attempt-[a-zA-Z0-9._-]{1,96}$")
 _JOB_ID_TOKEN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+_SAFE_EXTERNAL_TASK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+_DURABLE_SECRET_KEY_PARTS = frozenset({
+    "password", "passcode", "token", "cookie", "authorization", "secret", "pwd",
+})
+_DURABLE_SECRET_QUERY = re.compile(
+    r"([?&#][^=&?#]*(?:password|passcode|token|cookie|authorization|secret|pwd)[^=&?#]*=)[^&#]*",
+    re.IGNORECASE,
+)
 _SELECTION_SNAPSHOT_FILE = "selected_candidate.json"
 _SELECTION_SNAPSHOT_MAX_BYTES = 256 * 1024
 _CANDIDATE_MEMORY_FILE = "replenishment-candidate-memory.json"
@@ -134,6 +142,98 @@ class AutomaticReplenishmentPaused(AutomaticReplenishmentCancelled):
     # creating a dependency cycle.  This marker lets them preserve a pause
     # rather than reclassifying it as a failed provider delivery.
     pause_requested = True
+
+
+def _durable_secret_key(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = "".join(char for char in value.casefold() if char.isalnum())
+    return any(part in normalized for part in _DURABLE_SECRET_KEY_PARTS)
+
+
+def _durable_text(value: object) -> tuple[str, bool]:
+    """Project one diagnostic string without retaining locator credentials."""
+    projected = redact_value(value)
+    text = projected if isinstance(projected, str) else str(projected)
+    redacted = _DURABLE_SECRET_QUERY.sub(r"\1<redacted>", text)
+    return redacted, redacted == text and "<redacted>" not in text
+
+
+def _durable_selection_snapshot_value(value: object) -> tuple[object, bool]:
+    """Copy a candidate only when it contains no recoverable credential.
+
+    Legacy automatic state can use a candidate snapshot to query an existing
+    provider task after restart.  A passcode/signed locator is allowed for the
+    initial in-memory submit, but it must not be written as a half-redacted
+    selection that a later process could accidentally replay.  Returning
+    ``safe=False`` makes the existing recovery path stop at its manual
+    reconcile barrier instead.
+    """
+    if isinstance(value, Mapping):
+        output: dict[object, object] = {}
+        safe = True
+        for key, item in value.items():
+            if _durable_secret_key(key):
+                safe = False
+                continue
+            copied, item_safe = _durable_selection_snapshot_value(item)
+            output[key] = copied
+            safe &= item_safe
+        return output, safe
+    if isinstance(value, list):
+        output: list[object] = []
+        safe = True
+        for item in value:
+            copied, item_safe = _durable_selection_snapshot_value(item)
+            output.append(copied)
+            safe &= item_safe
+        return output, safe
+    if isinstance(value, tuple):
+        copied, safe = _durable_selection_snapshot_value(list(value))
+        return copied, safe
+    if isinstance(value, str):
+        return _durable_text(value)
+    return value, True
+
+
+def _durable_gap_value(value: object) -> object:
+    """Project generic automatic gap JSON through the same secret boundary.
+
+    Selection snapshots have their own stricter recovery rule above, but gap
+    records also retain diagnostic candidate/error state.  Apply query and
+    fragment redaction there too so an old or unexpected call site cannot
+    write a signed locator into durable JSON.  Provider task ids are opaque
+    identifiers, never URLs: reject an unsafe one instead of preserving a
+    redacted value that a later recovery could mistake for reusable evidence.
+    """
+    if isinstance(value, Mapping):
+        output: dict[object, object] = {}
+        for key, item in value.items():
+            normalized = (
+                "".join(char for char in key.casefold() if char.isalnum())
+                if isinstance(key, str) else ""
+            )
+            if _durable_secret_key(key):
+                output[key] = "<redacted>" if item is not None else None
+            elif normalized in {"taskid", "externaltaskid"}:
+                output[key] = (
+                    item
+                    if isinstance(item, str)
+                    and _SAFE_EXTERNAL_TASK_ID.fullmatch(item)
+                    else None
+                )
+            else:
+                output[key] = _durable_gap_value(item)
+        return output
+    if isinstance(value, list):
+        return [_durable_gap_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_durable_gap_value(item) for item in value]
+    if isinstance(value, BaseException):
+        return _durable_text(redact_error(value))[0]
+    if isinstance(value, str):
+        return _durable_text(value)[0]
+    return redact_value(value)
 
 
 def _provider_pause_checkpoint(
@@ -551,7 +651,6 @@ class QuarkFastSaveAutomaticMaterializer:
         "attempt_id",
         "staging_root",
         "task_id",
-        "locator",
         "selected_gap_ids",
         "updated_at",
     })
@@ -748,26 +847,9 @@ class QuarkFastSaveAutomaticMaterializer:
 
     @staticmethod
     def _safe_task_id(value: object) -> str | None:
-        if (
-            isinstance(value, str)
-            and value
-            and len(value) <= 256
-            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
-        ):
+        if isinstance(value, str) and _SAFE_EXTERNAL_TASK_ID.fullmatch(value):
             return value
         return None
-
-    @staticmethod
-    def _selection_locator(selection: Mapping[str, object]) -> str:
-        value = selection.get("locator")
-        if (
-            not isinstance(value, str)
-            or not value
-            or len(value) > _DURABLE_CANDIDATE_LOCATOR_LIMIT
-            or any(char in value for char in ("\x00", "\n", "\r"))
-        ):
-            raise AutomaticReplenishmentError("夸克分享候选 locator 无效")
-        return value
 
     @staticmethod
     def _selection_gap_ids(selection: Mapping[str, object]) -> list[str]:
@@ -825,14 +907,12 @@ class QuarkFastSaveAutomaticMaterializer:
             raise AutomaticReplenishmentError("夸克分享 attempt 状态结构无效")
         state = dict(raw)
         expected_attempt_id = cls._attempt_id(staging_root)
-        expected_locator = cls._selection_locator(selection)
         expected_gap_ids = cls._selection_gap_ids(selection)
         task_id = cls._safe_task_id(state.get("task_id"))
         if (
             state.get("provider") != TIER_QUARK_SHARE
             or state.get("attempt_id") != expected_attempt_id
             or state.get("staging_root") != staging_root
-            or state.get("locator") != expected_locator
             or state.get("selected_gap_ids") != expected_gap_ids
             or task_id is None
             or not cls._valid_updated_at(state.get("updated_at"))
@@ -860,7 +940,6 @@ class QuarkFastSaveAutomaticMaterializer:
             "attempt_id": cls._attempt_id(staging_root),
             "staging_root": staging_root,
             "task_id": safe_task_id,
-            "locator": cls._selection_locator(selection),
             "selected_gap_ids": cls._selection_gap_ids(selection),
             "updated_at": _now(),
         }
@@ -1505,7 +1584,7 @@ class AutomaticReplenishmentRuntime:
             job_id = str(state.get("job_id") or "job")
             path = self.gaps_root / _GAP_SLUG.sub("-", job_id).strip(".-") / _gap_file_name(gap_id)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        redacted = redact_value(dict(state))
+        redacted = _durable_gap_value(dict(state))
         atomic_write_json(
             path,
             dict(redacted) if isinstance(redacted, Mapping) else dict(state),
@@ -1526,12 +1605,7 @@ class AutomaticReplenishmentRuntime:
 
     @staticmethod
     def _safe_external_task_id(value: object) -> str | None:
-        if (
-            isinstance(value, str)
-            and value
-            and len(value) <= 256
-            and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
-        ):
+        if isinstance(value, str) and _SAFE_EXTERNAL_TASK_ID.fullmatch(value):
             return value
         return None
 
@@ -1687,12 +1761,17 @@ class AutomaticReplenishmentRuntime:
         for provider, rows in value.items():
             if provider not in STRICT_TIER_ORDER or not isinstance(rows, list):
                 continue
-            locators = [
-                item for item in rows
-                if isinstance(item, str)
-                and item
-                and len(item) <= _DURABLE_CANDIDATE_LOCATOR_LIMIT
-            ]
+            locators: list[str] = []
+            for item in rows:
+                if (
+                    not isinstance(item, str)
+                    or not item
+                    or len(item) > _DURABLE_CANDIDATE_LOCATOR_LIMIT
+                ):
+                    continue
+                marker, safe = _durable_text(item)
+                if safe:
+                    locators.append(marker)
             if locators:
                 output[str(provider)] = sorted(set(locators))[-_DURABLE_CANDIDATE_EXCLUSION_LIMIT:]
         return output
@@ -1952,9 +2031,11 @@ class AutomaticReplenishmentRuntime:
             if normalized is None:
                 continue
             value = normalized.get("infohash") or normalized.get("locator")
-            if isinstance(value, str) and value and value not in seen:
-                seen.add(value)
-                markers.append(value)
+            if isinstance(value, str) and value:
+                marker, safe = _durable_text(value)
+                if safe and marker not in seen:
+                    seen.add(marker)
+                    markers.append(marker)
         record: dict[str, object] = {
             "attempt_id": attempt_id,
             "staging_root": staging_root,
@@ -1991,6 +2072,12 @@ class AutomaticReplenishmentRuntime:
             if not isinstance(raw, Mapping):
                 continue
             candidate = {key: raw[key] for key in allowed if key in raw}
+            candidate, safe = _durable_selection_snapshot_value(candidate)
+            if not safe or not isinstance(candidate, Mapping):
+                # This initial in-memory candidate may contain a share
+                # passcode/signed locator.  Do not retain a weakened copy:
+                # restart will fail closed at existing-task reconciliation.
+                continue
             try:
                 encoded = json.dumps(candidate, ensure_ascii=False, allow_nan=False)
             except (TypeError, ValueError):
@@ -2255,14 +2342,11 @@ class AutomaticReplenishmentRuntime:
         raw_locators = value.get("locators")
         if isinstance(raw_locators, list):
             for item in raw_locators:
-                if (
-                    isinstance(item, str)
-                    and item
-                    and len(item) <= _DURABLE_CANDIDATE_LOCATOR_LIMIT
-                    and item not in seen
-                ):
-                    seen.add(item)
-                    locators.append(item)
+                if isinstance(item, str) and item and len(item) <= _DURABLE_CANDIDATE_LOCATOR_LIMIT:
+                    marker, safe = _durable_text(item)
+                    if safe and marker not in seen:
+                        seen.add(marker)
+                        locators.append(marker)
         record: dict[str, object] = {
             "attempt_id": attempt_id,
             "staging_root": staging,
@@ -3558,6 +3642,13 @@ class AutomaticReplenishmentRuntime:
         locator = raw_locator.strip() if isinstance(raw_locator, str) else ""
         if len(locator) > _DURABLE_CANDIDATE_LOCATOR_LIMIT:
             return None
+        if locator:
+            locator, locator_safe = _durable_text(locator)
+            if not locator_safe:
+                # A credential-bearing locator is valid only in the live
+                # selection passed to the current provider call.  It cannot
+                # become durable candidate/exclusion evidence.
+                locator = ""
 
         raw_infohash = selection.get("infohash")
         infohash = (

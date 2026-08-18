@@ -74,6 +74,7 @@ from engine.scrapeflow.gap_ledger import (
     load_gap_ledger,
     record_attempt,
 )
+from engine.scrapeflow.media_policy import VIDEO_EXTENSIONS
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.subtitle_content import (
@@ -103,6 +104,7 @@ from .replenishment_tiers import (
     required_sources_for_tier,
 )
 from .simple_engine_runner import EngineRequest
+from .redaction import redact_error
 
 _STATE_FILE_PREFIX = "replenishment_"
 _STATE_SUFFIX = ".json"
@@ -134,9 +136,17 @@ _VIDEO_SECRET_KEY_PARTS = frozenset({
     "password", "passcode", "token", "cookie", "authorization", "secret", "pwd",
 })
 _LOCATOR_SECRET_QUERY = re.compile(
-    r"([?&][^=&?#]*(?:password|passcode|token|cookie|authorization|secret|pwd)[^=&?#]*=)[^&#]*",
+    # Locators are provider-controlled opaque strings, not necessarily URLs.
+    # Match ordinary query strings *and* URL fragments because some share/CDN
+    # providers put a passcode or token after ``#``.  Durable state may retain
+    # a redacted locator for diagnostics, but never a credential value.
+    r"([?&#][^=&?#]*(?:password|passcode|token|cookie|authorization|secret|pwd)[^=&?#]*=)[^&#]*",
     re.IGNORECASE,
 )
+_SAFE_DURABLE_TASK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+_VIDEO_MEDIA_SUBROOT = "__scrapeflow_media__"
+_MAX_VIDEO_STAGING_NODES = 512
+_MAX_VIDEO_STAGING_DEPTH = 16
 
 _KNOWN_FAILURE_SCOPES = frozenset({
     FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE, FAILURE_IN_DOUBT,
@@ -200,6 +210,19 @@ def _bounded_path(value: object) -> str | None:
 def _redact_sensitive_text(value: str) -> tuple[str, bool]:
     redacted = _LOCATOR_SECRET_QUERY.sub(r"\1<redacted>", value)
     return redacted, redacted == value and "<redacted>" not in value
+
+
+def _safe_durable_error(value: object, *, fallback: str = "补源操作失败") -> str:
+    """Return a bounded error projection safe for JSON state and ledgers.
+
+    Provider exceptions can echo a share URL, a task URL, or a passcode.  The
+    root state and Gap ledger are durable forensic records, so they must never
+    receive a raw ``str(exc)`` even when the caller only intends a diagnostic.
+    ``redact_error`` covers configured/structured secrets; the locator pass
+    also covers query and fragment credentials in opaque provider text.
+    """
+    text, _safe = _redact_sensitive_text(redact_error(value))
+    return (text or fallback)[:200]
 
 
 def _durable_locator(value: object) -> tuple[str | None, bool]:
@@ -474,9 +497,17 @@ def save_root_replenishment_state(
     state_root: Path, root_task_id: str, state: Mapping[str, Any],
 ) -> None:
     """Persist the durable tier/orchestration state atomically."""
+    # Every state writer goes through this last JSON projection.  Normal paths
+    # already build non-secret rows, but this prevents an exception/debug
+    # payload from bypassing the durable redaction boundary in a future call
+    # site.  A value that cannot be represented safely is a local failure,
+    # never a reason to write a partial replacement state.
+    projected, _safe = _durable_mapping(state)
+    if projected is None:
+        raise ValueError("补源状态无法安全持久化")
     atomic_write_json(
         _state_path(Path(state_root), root_task_id),
-        dict(state),
+        projected,
         allow_nan=False,
     )
 
@@ -508,12 +539,7 @@ def _exception_chain(error: BaseException):
 
 
 def _safe_task_id(value: object) -> str | None:
-    if (
-        isinstance(value, str)
-        and value
-        and len(value) <= 256
-        and not any(char in value for char in ("/", "\\", "\x00", "\n", "\r"))
-    ):
+    if isinstance(value, str) and _SAFE_DURABLE_TASK_ID.fullmatch(value):
         return value
     return None
 
@@ -790,6 +816,7 @@ def _child_request(
     state_root: Path,
     root_task_id: str,
     request: Mapping[str, Any],
+    intent: Mapping[str, Any],
     delivery: Mapping[str, Any],
 ) -> EngineRequest:
     media = request.get("media") or {}
@@ -801,9 +828,7 @@ def _child_request(
         or tmdb_id <= 0
     ):
         raise ValueError("补源请求缺少有效 tmdb_id")
-    staging_root = str(delivery.get("staging_root") or "")
-    if not staging_root:
-        raise ValueError("补源 materializer 未返回 staging_root")
+    staging_root = _video_child_source_root(intent, delivery)
     payload: dict[str, Any] = {
         "source_path": staging_root,
         "parent_path": _work_parent(runner, state_root, root_task_id, request),
@@ -1398,7 +1423,7 @@ def _record_subtitle_attempt(
         locator=None,
         status=status,
         staged_paths=staged_paths or [],
-        error=(str(error)[:200] if error else None),
+        error=(_safe_durable_error(error) if error else None),
     )
 
 
@@ -1613,7 +1638,9 @@ def _finish_subtitle_intent(
             attempt_id=attempt_id,
             status="in_doubt",
             staged_paths=[source],
-            error=str(verdict.get("reason") or "subtitle_content_unproven"),
+            error=_safe_durable_error(
+                verdict.get("reason") or "subtitle_content_unproven",
+            ),
         )
         return {"outcome": "waiting_reconcile", "gap_id": gap.gap_id}
 
@@ -1675,7 +1702,7 @@ def _finish_subtitle_intent(
         )
         return {
             "outcome": "waiting_reconcile", "gap_id": gap.gap_id,
-            "error": str(exc)[:200],
+            "error": _safe_durable_error(exc),
         }
 
     if (
@@ -1988,7 +2015,7 @@ def _run_root_subtitle_channel(
                     _record_subtitle_attempt(
                         state_root, root_task_id, gap_records[gap_id],
                         attempt_id=attempt_id, status="candidate_failed",
-                        error=str(exc),
+                        error=_safe_durable_error(exc),
                     )
                     result["subtitle_attempts"].append({
                         "gap_id": gap_id, "tier": _SUBTITLE_TIER,
@@ -2006,7 +2033,8 @@ def _run_root_subtitle_channel(
                 intents[gap_id]["updated_at"] = _now()
                 _record_subtitle_attempt(
                     state_root, root_task_id, gap_records[gap_id],
-                    attempt_id=attempt_id, status="in_doubt", error=str(exc),
+                    attempt_id=attempt_id, status="in_doubt",
+                    error=_safe_durable_error(exc),
                 )
                 result["subtitle_attempts"].append({
                     "gap_id": gap_id, "tier": _SUBTITLE_TIER,
@@ -2028,7 +2056,7 @@ def _run_root_subtitle_channel(
                 delivery_error = None
             except ValueError as exc:
                 delivered = {}
-                delivery_error = str(exc)
+                delivery_error = _safe_durable_error(exc)
 
         valid: dict[str, dict[str, Any]] = {}
         for gap_id, entry in delivered.items():
@@ -2239,9 +2267,11 @@ def _video_delivery(value: object, intent: Mapping[str, Any]) -> dict[str, Any] 
         return None
     files = delivery.get("files", [])
     selected = set(intent["selected_gap_ids"])
-    if not isinstance(files, list):
+    if not isinstance(files, list) or not files:
         return None
     normalized: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    covered: dict[str, int] = {gap_id: 0 for gap_id in selected}
     for row in files:
         if not isinstance(row, Mapping):
             return None
@@ -2253,11 +2283,27 @@ def _video_delivery(value: object, intent: Mapping[str, Any]) -> dict[str, Any] 
             # sidecar through the staging root.  RootJob's independent
             # subtitle transaction is the sole automatic subtitle writer,
             # including its exact bilingual validation.
-            or kind != "video" or not isinstance(gap_ids, list)
-            or not gap_ids or any(not isinstance(item, str) or item not in selected for item in gap_ids)
+            or kind != "video"
+            # ``kind`` is provider-controlled metadata.  Require an actual
+            # normal video suffix too, otherwise a subtitle/archive can call
+            # itself ``video`` and reach the child planner.
+            or posixpath.splitext(path)[1].casefold() not in VIDEO_EXTENSIONS
+            or path in seen_paths
+            or not isinstance(gap_ids, list)
+            # One selected media coordinate means one ordinary file.  A
+            # season pack, a multi-episode file, or a duplicate mapping is
+            # not precise replenishment and must remain out of the writer.
+            or len(gap_ids) != 1
+            or not isinstance(gap_ids[0], str)
+            or gap_ids[0] not in selected
         ):
             return None
-        normalized.append({"path": path, "size": size, "kind": kind, "gap_ids": list(gap_ids)})
+        gap_id = gap_ids[0]
+        seen_paths.add(path)
+        covered[gap_id] = covered.get(gap_id, 0) + 1
+        normalized.append({"path": path, "size": size, "kind": kind, "gap_ids": [gap_id]})
+    if set(covered) != selected or any(count != 1 for count in covered.values()):
+        return None
     output = {"lane": intent["tier"], "attempt_id": intent["attempt_id"], "staging_root": intent["staging_root"], "files": normalized}
     task_id = delivery.get("external_task_id")
     if task_id is not None:
@@ -2265,6 +2311,225 @@ def _video_delivery(value: object, intent: Mapping[str, Any]) -> dict[str, Any] 
         if task_id is None:
             return None
         output["external_task_id"] = task_id
+    return output
+
+
+class _VideoDeliveryPaused(RuntimeError):
+    """Pause reached a staging isolation boundary before a remote move."""
+
+    pause_requested = True
+
+
+def _video_pause_checkpoint(
+    pause_requested: Callable[[], bool] | None,
+) -> None:
+    if pause_requested is None:
+        return
+    try:
+        paused = bool(pause_requested())
+    except Exception as exc:
+        raise _VideoDeliveryPaused("补源暂停状态不可确认") from exc
+    if paused:
+        raise _VideoDeliveryPaused("补源已暂停")
+
+
+def _safe_video_inventory_name(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        return None
+    return value
+
+
+def _fresh_video_staging_inventory(
+    runner: Any,
+    staging_root: str,
+) -> dict[str, int] | None:
+    """Freshly enumerate a bounded task staging subtree.
+
+    Delivery metadata is an assertion from a provider, not proof that no
+    other file was staged.  The child planner has a directory-only request
+    surface, so prove the whole source tree contains precisely the selected
+    members before it ever sees that directory.  An unreadable or unusually
+    large tree is deliberately unknown rather than treated as empty.
+    """
+    listing = getattr(runner.alist, "list", None)
+    if not callable(listing):
+        return None
+    root = posixpath.normpath(staging_root)
+    if not root.startswith("/") or root == "/":
+        return None
+    queue: list[tuple[str, int]] = [(root, 0)]
+    visited_dirs: set[str] = set()
+    files: dict[str, int] = {}
+    nodes = 0
+    while queue:
+        directory, depth = queue.pop(0)
+        if directory in visited_dirs or depth > _MAX_VIDEO_STAGING_DEPTH:
+            return None
+        visited_dirs.add(directory)
+        try:
+            try:
+                rows = listing(directory, refresh=True)
+            except TypeError:
+                rows = listing(directory)
+        except Exception:
+            return None
+        if not isinstance(rows, list):
+            return None
+        names: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                return None
+            name = _safe_video_inventory_name(row.get("name"))
+            if name is None or name in names:
+                return None
+            names.add(name)
+            nodes += 1
+            if nodes > _MAX_VIDEO_STAGING_NODES:
+                return None
+            path = posixpath.join(directory, name)
+            if not _path_under(path, root) or path == root:
+                return None
+            if row.get("is_dir") is True:
+                queue.append((path, depth + 1))
+                continue
+            size = row.get("size")
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size <= 0
+                or path in files
+            ):
+                return None
+            files[path] = size
+    return files
+
+
+def _video_media_root(intent: Mapping[str, Any]) -> str:
+    staging = _bounded_path(intent.get("staging_root"))
+    if staging is None or not staging.startswith("/"):
+        raise ValueError("视频补源 staging_root 无效")
+    return f"{staging.rstrip('/')}/{_VIDEO_MEDIA_SUBROOT}"
+
+
+def _video_child_source_root(
+    intent: Mapping[str, Any],
+    delivery: Mapping[str, Any],
+) -> str:
+    """Return only the isolated directory containing accepted video files."""
+    media_root = _video_media_root(intent)
+    files = delivery.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("视频补源 delivery 缺少已隔离文件")
+    for row in files:
+        if not isinstance(row, Mapping):
+            raise ValueError("视频补源 delivery 文件无效")
+        path = _bounded_path(row.get("path"))
+        if path is None or posixpath.dirname(path) != media_root:
+            raise ValueError("视频补源文件未隔离到受控媒体目录")
+    return media_root
+
+
+def _prepare_video_delivery_for_child(
+    runner: Any,
+    intent: Mapping[str, Any],
+    delivery: Mapping[str, Any],
+    *,
+    pause_requested: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    """Prove and isolate exactly the delivered videos before child planning.
+
+    Moves occur only inside the current attempt's staging root.  The operation
+    is idempotent across a crash: each source is accepted only if its original
+    location or its deterministic isolated destination has the exact declared
+    size, never both and never an unrelated sibling.  A caller persists the
+    original delivery before entering this function, so any uncertainty stays
+    recoverable as ``waiting_reconcile`` without a provider replay.
+    """
+    checked = _video_delivery(delivery, intent)
+    if checked is None:
+        raise ValueError("视频补源 delivery 合同无效")
+    media_root = _video_media_root(intent)
+    rows = checked["files"]
+    assert isinstance(rows, list)  # proven by _video_delivery
+    destinations: dict[str, tuple[dict[str, Any], str]] = {}
+    for row in rows:
+        assert isinstance(row, dict)
+        source = str(row["path"])
+        name = posixpath.basename(source)
+        destination = f"{media_root}/{name}"
+        if name in destinations:
+            raise ValueError("视频补源隔离文件名冲突")
+        destinations[name] = (row, destination)
+
+    # Before the first staging move, every visible file must be one of the
+    # declared originals or deterministic destinations left by an interrupted
+    # earlier isolation.  This prevents a rogue provider sidecar/extra video
+    # from entering the directory-only child planner.
+    inventory = _fresh_video_staging_inventory(runner, str(intent["staging_root"]))
+    if inventory is None:
+        raise ValueError("视频补源 staging 清单无法证明")
+    allowed_paths = {
+        path
+        for row, destination in destinations.values()
+        for path in (str(row["path"]), destination)
+    }
+    if set(inventory) - allowed_paths:
+        raise ValueError("视频补源 staging 含有未声明文件")
+    for row, destination in destinations.values():
+        source = str(row["path"])
+        size = int(row["size"])
+        source_size = inventory.get(source)
+        destination_size = inventory.get(destination)
+        if source == destination:
+            if source_size != size:
+                raise ValueError("视频补源隔离文件大小无法证明")
+        elif (source_size is None) == (destination_size is None):
+            # Neither path means data is absent; both paths means a partial
+            # copy/duplicate that must not be handed to the child.
+            raise ValueError("视频补源隔离状态不唯一")
+        elif source_size not in {None, size} or destination_size not in {None, size}:
+            raise ValueError("视频补源隔离文件大小不匹配")
+
+    mkdir = getattr(runner.alist, "ensure_directory", None)
+    if not callable(mkdir):
+        mkdir = getattr(runner.alist, "mkdir", None)
+    move = getattr(runner.alist, "move", None)
+    if not callable(mkdir) or not callable(move):
+        raise ValueError("AList 客户端缺少视频 staging 隔离能力")
+    for row, destination in destinations.values():
+        source = str(row["path"])
+        if source == destination or inventory.get(destination) == row["size"]:
+            continue
+        _video_pause_checkpoint(pause_requested)
+        mkdir(media_root)
+        _video_pause_checkpoint(pause_requested)
+        move(posixpath.dirname(source), media_root, [posixpath.basename(source)])
+
+    isolated = _fresh_video_staging_inventory(runner, media_root)
+    expected = {
+        destination: int(row["size"])
+        for row, destination in destinations.values()
+    }
+    if isolated != expected:
+        raise ValueError("视频补源隔离 staging 回读不精确")
+    output = dict(checked)
+    output["files"] = [
+        {
+            "path": destination,
+            "size": row["size"],
+            "kind": "video",
+            "gap_ids": list(row["gap_ids"]),
+        }
+        for row, destination in destinations.values()
+    ]
     return output
 
 
@@ -2296,7 +2561,24 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
     if pause_requested is not None and pause_requested():
         return {"outcome": "paused", "attempts": [], "gaps_closed": []}
     pending = dict(intent)
-    pending.update({"phase": "installing", "delivery": delivery})
+    try:
+        delivery = _prepare_video_delivery_for_child(
+            runner,
+            pending,
+            delivery,
+            pause_requested=pause_requested,
+        )
+    except Exception as exc:
+        if _is_pause_error(exc):
+            return {"outcome": "paused", "attempts": [], "gaps_closed": []}
+        _wait_video_intent(state_root, root_task_id, state, pending)
+        return {"outcome": "waiting_reconcile", "attempts": [], "gaps_closed": []}
+    # Persist the deterministic isolated paths before the child is planned.
+    # A crash during the staging moves leaves the prior (source-path) delivery
+    # intact; the next round re-proves/moves only the missing members.
+    pending.update({"phase": "staged", "delivery": delivery})
+    _write_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]), pending)
+    pending["phase"] = "installing"
     _write_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]), pending)
     try:
         try:
@@ -2304,7 +2586,7 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
         except Exception:
             child = None
         if child is None:
-            child = runner.plan_job(_child_request(runner, state_root, root_task_id, pending["request"], delivery), job_id=pending["child_job_id"], internal_child_of=root_task_id, pause_requested=pause_requested)
+            child = runner.plan_job(_child_request(runner, state_root, root_task_id, pending["request"], pending, delivery), job_id=pending["child_job_id"], internal_child_of=root_task_id, pause_requested=pause_requested)
         if getattr(child, "phase", None) == "executed":
             executed = child
         elif getattr(child, "phase", None) in {"planned", "retry_wait"}:
@@ -2623,7 +2905,7 @@ def run_root_replenishment(
                         locator=None,
                         status=_attempt_status(scope),
                         external_task_id=task_id,
-                        error=str(exc)[:200] or None,
+                        error=_safe_durable_error(exc),
                     )
                     attempts.append({
                         "gap_id": gap.gap_id,
