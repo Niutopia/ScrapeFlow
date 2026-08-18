@@ -1,6 +1,6 @@
-# ScrapeFlow 受控部署与开启顺序（P15）
+# ScrapeFlow 受控部署与开启顺序
 
-本文件是当前部署 runbook，不是生产授权书；自动审计和自动补源是否开启，必须由用户在真实验收后单独决定。长期行为以 [AGENTS.md](../AGENTS.md) 为准。P15 视频补源固定为 `quark_share → alist_offline → magnet`：Helper 只有 `health` 与 `share-save` 两个动作，第二阶由 AList 的 `aria2` offline-download tool 和专用 `offline-aria2` 服务执行。
+本文件是当前部署 runbook，不是生产授权书；自动审计和自动补源是否开启，必须由用户在真实验收后单独决定。长期行为以 [AGENTS.md](../AGENTS.md) 为准。视频补源固定为 `quark_share → magnet`：Helper 只有 `health` 与 `share-save` 两个动作。本项目已撤除 AList 离线下载，因为 AList v3 不暴露 `select-file` 且提交时会重新拉取 URL，无法证明“只下载缺口成员”。
 
 ## 构建
 
@@ -36,14 +36,13 @@ docker compose --env-file .env.local build api
 9. 若本机夸克尚未纳入固定 CDP 生命周期，先确认已有 API 为 paused 且活动操作归零，再由操作者执行 `python3 scripts/scrapeflow_quark_lifecycle.py --install-launch-agent --replace-running`。它通过 AppKit 正常退出当前的单一夸克主进程，然后由 Aqua LaunchAgent 直接以固定 `127.0.0.1:19222` 参数启动夸克。
 10. 用 `python3 scripts/scrapeflow_quark_lifecycle.py --status` 和只读 CDP 核验确认只有一个夸克主进程，且 `127.0.0.1:19222` 的 listener 归属该 PID。
 11. 在本机 `.env.local` 中配置 AList 管理员账号，并为 API 和 `quark-helper` sidecar 配置同一个至少 24 个字符的 Bearer token；不记录或提交真实值。Sidecar 只通过 Compose 内部 `http://alist:5244` 读取匹配 `/quark` 的 storage，`addition.cookie` 与 AList v3.62 的 `root_folder_id`（兼容旧 `root_id`）只在每次 `share-save` 期间保存在内存，不进入 env、health 响应、日志或验收证据。
-12. 生产实例使用 `docker compose --env-file .env.local up -d alist api pansou offline-aria2 quark-helper` 启动。隔离验收使用 `docker compose -p scrapeflow-acceptance-<run-id> --env-file .env.local up -d alist api pansou offline-aria2 quark-helper`；后续 `ps`、日志、停止和清理命令必须复用同一个 `-p`。Helper 与 API 共享网络命名空间，只监听共享 `127.0.0.1:18765`，不发布宿主端口；API 不等待 Helper ready 才启动。Compose 显式重建 API 时必须同步重建 sidecar，不允许它留在旧 network namespace。验收 AList 必须全新初始化，只含一个挂载 `/quark` 的专用 Quark storage；其 `root_folder_id` 必须指向验收专用的物理目录，绝不克隆或启动生产 AList 数据。
-13. 在本机 `.env.local` 生成并设置随机、非空的 `SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET`（不提交、不复制到 URL、日志或证据）。在 AList 中确认已实际配置可用的离线下载工具 `aria2`，其 RPC 地址必须为 `http://offline-aria2:6800/jsonrpc`，`aria2_secret` 必须与该环境值**完全相同**。Compose 只启动受认证的 aria2 daemon，不会替 AList 写入 tool 配置；它不接 default network，只接供 AList/API 使用的 `alist-offline` bridge，且 bridge 不设 `internal` 以保留直连下载出网。确认 `offline-aria2` 直连运行并带 `--file-allocation=none`。这个设置只影响之后创建的 aria2 任务，不能追溯改变已有 GID 的预分配方式。真实 AList 交付必须先落在 attempt 专属 offline sibling，materializer 只将已验证的预期文件收进 staging。提交前容量门禁按完整 Torrent（含本次不收拢的 extras）计算：默认每任务至多 32 GiB，并要求共享 `SCRAPEFLOW_HOST_STATE_ROOT` 文件系统保留 `ceil(完整种子 × 1.15) + 20 GiB`。仅在已核验空间后才调整 `SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES` 或 `SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES`；缺大小、超上限或空间不足必须同阶 retry，不得提交后清盘。转存 total deadline 默认 3600 秒（`SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT`）；取消未被 AList 确认时保持 in-doubt，对账而不重提。
-14. Helper 只被动连接宿主已存在的 `host.docker.internal:19222/json/list` CDP；renderer 仅提供 WSG 能力，sidecar 只发出 `share-save`，不启动、重启、激活或点击夸克，也不提交或查询夸克磁力离线任务。CDP/WSG 不可用时，`quark_share` 必须 fail-closed 并停在原阶。
-15. 对隔离验收，将 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`；API 与 Provider 会共同派生 `<media-root>/ScrapeFlow/补源`，不能用任意路径替代。该逻辑根必须经上述专用 AList storage 映射到独立物理媒体根。
-16. 确认本次**构建**已写入完整 `SCRAPEFLOW_BUILD_COMMIT` 和 UTC `SCRAPEFLOW_BUILD_TIME`；启动不以空 runtime env 覆盖镜像标识。启动后必须使用 `--expected-commit <本次 build id>` 核验 health，并核对 build_time。build id 必须是至少 7 位小写 SHA（可带 `-dirty`）；检查只允许 health 的实际 SHA 以前述 expected SHA 为前缀，绝不反向模糊匹配；空值、`unrecorded` 或无效 UTC 时间都拒绝验收。
-17. 不恢复旧 backlog。
-18. 不批量 retry。
-19. 不批量 cleanup。
+12. 生产实例使用 `docker compose --env-file .env.local up -d alist api pansou quark-helper` 启动。隔离验收使用 `docker compose -p scrapeflow-acceptance-<run-id> --env-file .env.local up -d alist api pansou quark-helper`；后续 `ps`、日志、停止和清理命令必须复用同一个 `-p`。Helper 与 API 共享网络命名空间，只监听共享 `127.0.0.1:18765`，不发布宿主端口；API 不等待 Helper ready 才启动。Compose 显式重建 API 时必须同步重建 sidecar，不允许它留在旧 network namespace。验收 AList 必须全新初始化，只含一个挂载 `/quark` 的专用 Quark storage；其 `root_folder_id` 必须指向验收专用的物理目录，绝不克隆或启动生产 AList 数据。
+13. Helper 只被动连接宿主已存在的 `host.docker.internal:19222/json/list` CDP；renderer 仅提供 WSG 能力，sidecar 只发出 `share-save`，不启动、重启、激活或点击夸克，也不提交或查询夸克磁力离线任务。CDP/WSG 不可用时，`quark_share` 必须 fail-closed 并停在原阶。
+14. 对隔离验收，将 `SCRAPEFLOW_MEDIA_ROOT` 设为精确的 `/quark/影视/ScrapeFlow/验收/<run-id>`；API 与 Provider 会共同派生 `<media-root>/ScrapeFlow/补源`，不能用任意路径替代。该逻辑根必须经上述专用 AList storage 映射到独立物理媒体根。
+15. 确认本次**构建**已写入完整 `SCRAPEFLOW_BUILD_COMMIT` 和 UTC `SCRAPEFLOW_BUILD_TIME`；启动不以空 runtime env 覆盖镜像标识。启动后必须使用 `--expected-commit <本次 build id>` 核验 health，并核对 build_time。build id 必须是至少 7 位小写 SHA（可带 `-dirty`）；检查只允许 health 的实际 SHA 以该 expected SHA 为前缀，绝不反向模糊匹配；空值、`unrecorded` 或无效 UTC 时间都拒绝验收。
+16. 不恢复旧 backlog。
+17. 不批量 retry。
+18. 不批量 cleanup。
 
 ## 启动后核对
 
@@ -58,14 +57,10 @@ curl -fsS http://127.0.0.1:3010/api/control
 # 且只对与 -p scrapeflow-acceptance-<run-id> 对应的 API 执行检查。
 ```
 
-上述 runtime readiness 会实际请求 `/api/readiness/alist-offline` 并要求
-`status=ready`、`verified=true`。该 endpoint 出于诊断目的对 `not_ready` 也返回 HTTP
-200，因此单独运行 `curl -f` 不是 acceptance evidence。
-
 必须确认：
 
 - API 只暴露在本机入口。
-- Compose 服务列表包含 `alist`、`api`、`pansou`、`offline-aria2` 和无发布端口的 `quark-helper`。
+- Compose 服务列表包含 `alist`、`api`、`pansou` 和无发布端口的 `quark-helper`。
 - health 中的 build 信息符合本次 commit。
 - AList 可用。
 - TMDB 可用。
@@ -75,7 +70,7 @@ curl -fsS http://127.0.0.1:3010/api/control
 - health 的 `automatic_scope` 为 `none`，或为本次唯一 RootJob 的 `single_root`；`SCRAPEFLOW_ROOT_JOB_PILOT` 非空时必须与后者相同。
 - intake、audit、provider 自动 gate 均关闭。
 - provider worker 为 1。
-- AList 离线容量参数与本机可用空间符合本次隔离样本；不得仅按被选中的缺口文件估算。
+- 本地 Magnet 候选已证明每个缺口只映射到所选 torrent 成员；不得因整季包或花絮扩大下载范围。
 
 ## 开启顺序
 
@@ -84,19 +79,18 @@ curl -fsS http://127.0.0.1:3010/api/control
 3. 只开启自动审计，Provider 仍关闭。
 4. 在仍然 paused 时创建/确认唯一 RootJob，记录它的 id；如使用 Compose ceiling，确认 `.env.local` 的 `SCRAPEFLOW_ROOT_JOB_PILOT` 与该 id 完全相同后重建仍 paused 的 API。
 5. 预设而不恢复：`POST /api/control/pilot {"root_job_id":"<root-job-id>"}`。随后核对 `/api/control` 与 `/api/health` 都显示这个 exact scope；其他 RootJob 不得 queue、retry 或进入 Provider。
-6. 执行 `GET /api/readiness/alist-offline`。它只读验证 AList tool/认证/task-manager、共享 Compose `offline-aria2` RPC 临时目录，以及实际 AddURL offline sibling（`<staging>__offline__`）的最长 storage 挂载、启用/work 状态和已审阅的 Quark 上传能力；不创建目录、不提交任务、不下载、不转存，因此 ready 不是传输成功证据。预检期间任何 pause/scope 变更都会令 resume 返回冲突并保持 paused。
-7. 只有得到单独授权且该 preflight `verified=true` 后，才向**隔离实例**的 `POST /api/control/resume` 放行实际样本；这不是环境变量开关。每个样本结束、修改配置或进入回退前都重新 `POST /api/control/pause`。
-8. 验证 `quark_share → alist_offline → magnet` 的三阶补源样本和负例。
-9. 用户确认后，才允许移除 pilot 限制。
-10. 用户再次确认后，才允许全局 Provider。
+6. 只有得到单独授权后，才向**隔离实例**的 `POST /api/control/resume` 放行实际样本；这不是环境变量开关。每个样本结束、修改配置或进入回退前都重新 `POST /api/control/pause`。
+7. 验证 `quark_share → magnet` 的补源样本和负例，确认 Magnet 只选择当前缺口对应的 torrent 成员。
+8. 用户确认后，才允许移除 pilot 限制。
+9. 用户再次确认后，才允许全局 Provider。
 
 ## 禁止事项
 
 - 不在 paused 状态下启动自动 backlog。
 - 不把旧 gap/staging 批量删除成“干净状态”。
-- 不在 quark_share/Helper 故障时推进到 alist_offline 或本地 Torrent；AList 或 Torrent 的基础设施故障同样保持原阶。
+- 不在 quark_share/Helper 故障时推进到本地 Torrent；Torrent 基础设施故障同样保持原阶。
 - 不在 in-doubt 状态重复提交。
-- 不让 Provider、Helper 或 aria2 决定正式库位置。
+- 不让 Provider、Helper 或下载器决定正式库位置。
 - 不让审计扫描修复 NFO 或海报。
 - 不在活动操作尚未归零时重启夸克；正常 `--restart` 失败时也不自动升级为 `--force-restart`。
 
@@ -104,7 +98,7 @@ curl -fsS http://127.0.0.1:3010/api/control
 
 1. 对正确的生产或隔离 API endpoint pause；隔离实例的 Compose 操作继续使用它启动时的同一个 `-p`。
 2. 等待活动操作归零。
-3. 停 `quark-helper`、`offline-aria2` 和 `pansou`。
+3. 停 `quark-helper` 和 `pansou`。
 4. 停 API。
 5. 停 AList。
 6. 如需停止宿主夸克生命周期，执行 `python3 scripts/scrapeflow_quark_lifecycle.py --uninstall-launch-agent`；该操作只卸载精确 label 和 plist。

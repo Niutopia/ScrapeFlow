@@ -33,7 +33,6 @@ ENV_TEMPLATE_DEFAULTS = {
     "ALIST_PASSWORD": "replace-with-your-alist-password",
     "SCRAPEFLOW_START_PAUSED": "1",
     "SCRAPEFLOW_ROOT_JOB_PILOT": "",
-    "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET": "",
     "SCRAPEFLOW_INTAKE_MONITOR": "0",
     "SCRAPEFLOW_AUTOMATIC_AUDIT": "0",
     "SCRAPEFLOW_AUDIT_AUTO_REPAIR_ENABLED": "0",
@@ -53,11 +52,7 @@ ENV_TEMPLATE_DEFAULTS = {
     "SCRAPEFLOW_PROVIDER_PILOT_GAP": "",
 }
 COMPOSE_DEFAULTS = {
-    **{
-        key: value
-        for key, value in ENV_TEMPLATE_DEFAULTS.items()
-        if key != "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET"
-    },
+    **ENV_TEMPLATE_DEFAULTS,
     "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH": "0",
@@ -65,9 +60,6 @@ COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-    "SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES": "34359738368",
-    "SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES": "21474836480",
-    "SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT": "3600",
     "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
@@ -95,15 +87,11 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
     (root / "docker-compose.yml").write_text(
         "name: scrapeflow\n"
         "services:\n"
-        "  alist:\n"
+            "  alist:\n"
         "    ports:\n"
         '      - "127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"\n'
         "    volumes:\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data\n"
-        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
-        "    networks:\n"
-        "      - default\n"
-        "      - alist-offline\n"
         "  api:\n"
         "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
         "    environment:\n"
@@ -116,19 +104,7 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "    volumes:\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data\n"
         "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow\n"
-        "    networks:\n"
-        "      - default\n"
-        "      - alist-offline\n"
-        "  offline-aria2:\n"
-        "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
-        "    command: [\"/bin/sh\", \"-ec\", \"umask 077; mkdir -p /run/scrapeflow; printf '%s\\\\n' \\\"rpc-secret=$${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\\\" > /run/scrapeflow/aria2.conf; exec aria2c --conf-path=/run/scrapeflow/aria2.conf --dir=/opt/alist/data/temp/aria2 --file-allocation=none\"]\n"
-        "    environment:\n"
-        "      SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET: ${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\n"
-        "    volumes:\n"
-        "      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp\n"
-        "    networks:\n"
-        "      - alist-offline\n"
-        "  quark-helper:\n"
+            "  quark-helper:\n"
         "    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}\n"
         "    restart: unless-stopped\n"
         "    command: [\"python3\", \"scripts/scrapeflow_quark_helper.py\", \"--docker-sidecar\"]\n"
@@ -144,10 +120,7 @@ def write_contract_files(root: Path, *, provider_gate: str = "0") -> None:
         "      api:\n"
         "        condition: service_started\n"
         "        restart: true\n"
-        "    network_mode: service:api\n"
-        "networks:\n"
-        "  alist-offline:\n"
-        "    driver: bridge\n",
+            "    network_mode: service:api\n",
         encoding="utf-8",
     )
     (root / "Dockerfile.api").write_text(
@@ -261,7 +234,6 @@ def valid_runtime_readiness_report() -> dict[str, object]:
             "engine_configured": True,
             "provider_capabilities": {
                 "quark_share": {"status": "ready"},
-                "alist_offline": {"status": "ready"},
                 "magnet": {"status": "ready"},
             },
             "helper_readiness": {
@@ -292,19 +264,6 @@ def valid_runtime_readiness_report() -> dict[str, object]:
             "paused": True,
             "scheduler_paused": True,
             "persistent": True,
-        },
-        "alist_offline": {
-            "status": "ready",
-            "verified": True,
-            "configured": True,
-            "read_only": True,
-            "checked_at": "2026-08-18T00:00:00Z",
-            "checks": {
-                "client": {"verified": True},
-                "aria2": {"verified": True},
-                "transfer": {"verified": True},
-            },
-            "issues": [],
         },
     }
 
@@ -501,11 +460,11 @@ class AcceptancePackageTests(unittest.TestCase):
             package,
         )
         self.assertIn(
-            "| 有效 quark_share |  | 第一阶完成，后二阶未调用 | 未执行 |  |",
+            "| 有效 quark_share |  | 第一阶完成，本地 Torrent 未调用 | 未执行 |  |",
             package,
         )
         self.assertIn(
-            "| quark_share 完整排除、有效 alist_offline |  | AList/aria2 离线完成，本地 Torrent 未调用 | 未执行 |  |",
+            "| quark_share 完整排除后 magnet |  | 本地 Torrent 精确选文件完成 | 未执行 |  |",
             package,
         )
         self.assertIn(
@@ -513,7 +472,7 @@ class AcceptancePackageTests(unittest.TestCase):
             package,
         )
         self.assertIn(
-            "- [ ] quark_share、alist_offline、magnet 三条获取线路全部真实可执行。",
+            "- [ ] quark_share、magnet 两条获取线路全部真实可执行。",
             package,
         )
 
@@ -786,29 +745,24 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertEqual(evidence["summary"]["control_paused"], True)
         self.assertEqual(
             evidence["summary"]["provider_lanes"],
-            "alist_offline, magnet, quark_share",
+            "magnet, quark_share",
         )
         self.assertEqual(evidence["summary"]["quark_helper_status"], "ready")
-        self.assertEqual(evidence["summary"]["alist_offline_status"], "ready")
-        self.assertTrue(evidence["summary"]["alist_offline_verified"])
         self.assertEqual(
             evidence["summary"]["quark_helper_actions"],
             "health, share-save",
         )
 
-    def test_runtime_readiness_evidence_rejects_forged_offline_or_build_proof(self) -> None:
+    def test_runtime_readiness_evidence_rejects_forged_build_proof(self) -> None:
         report = valid_runtime_readiness_report()
         report["health"]["build_commit"] = "unrecorded"
         report["health"]["build_time"] = "unrecorded"
-        report["alist_offline"]["verified"] = False
-        report["alist_offline"]["status"] = "unverified"
 
         evidence = runtime_readiness_evidence(report)
 
         self.assertEqual(evidence["status"], "失败")
         self.assertIn("health.build_commit", " ".join(evidence["issues"]))
         self.assertIn("health.build_time", " ".join(evidence["issues"]))
-        self.assertIn("alist_offline.status", " ".join(evidence["issues"]))
 
     def test_package_draft_includes_runtime_readiness_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -828,8 +782,6 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn("| build_version | p15 |", package)
         self.assertIn("| build_commit | abc1234 |", package)
         self.assertIn("| build_time | 2026-08-17T00:00:00Z |", package)
-        self.assertIn("| alist_offline_status | ready |", package)
-        self.assertIn("| alist_offline_verified | True |", package)
         self.assertIn("| control_paused | True |", package)
         self.assertIn("| quark_helper_status | ready |", package)
         self.assertIn("当前记录: 通过", package)

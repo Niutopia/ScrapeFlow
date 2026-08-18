@@ -2,7 +2,7 @@
 
 ScrapeFlow 是单用户、本机运行的 AList 影视库管理服务。长期产品与工程合同（A→P 主流程、门禁和补源纪律）以 [`AGENTS.md`](AGENTS.md) 为准；本 README 只说明当前操作入口。
 
-## 当前运行模型（P15）
+## 当前运行模型
 
 目标领域模型已经接入运行时：
 
@@ -11,7 +11,7 @@ IntakeSource（只读发现）
   → RootJob（用户以来源 + 一级货架授权）
     → WorkUnit（独立作品单元）
       → 身份识别 → 三库五分类对账 → Planner / 单写器 / 精确回读
-      → Gap 账本 → 严格三阶补源 → 同一 writer 闭环
+      → Gap 账本 → 严格两阶补源 → 同一 writer 闭环
 ```
 
 标准入口分两步：
@@ -21,17 +21,17 @@ IntakeSource（只读发现）
 
 对账结果是 `duplicate_complete`、`existing_gap`、`merge_existing`、`new_work` 或 `uncertain`。已有正式作品始终沿用已经验证的货架与作品根；RootJob 的货架只为新作品规划提供受限目标。身份或对账不确定时，只挂起相应 WorkUnit，不猜测身份、目标路径或删除动作。
 
-P0–P14 的单元管线和根任务聚合均已接入。P15 的视频补源顺序固定为：
+单元管线和根任务聚合均已接入。当前视频补源顺序固定为：
 
 ```text
-quark_share → alist_offline → magnet
+quark_share → magnet
 ```
 
-`quark_share` 只使用夸克分享快转；`alist_offline` 通过 AList 的 `aria2` offline-download tool 和专用 `offline-aria2` sidecar 直连下载，先转存到该 attempt 专属的 offline sibling，再由 materializer 只收拢已验证的预期文件到任务 staging；`magnet` 是本地 Torrent 兜底。Helper 不提供磁力提交或状态接口。所有补源产物都必须先进入任务专属 staging，再经过同一 Planner、单写器和回读验证；字幕缺口不占视频三阶。
+`quark_share` 只使用夸克分享快转；`magnet` 是本地 Torrent 兜底，并且只能向 aria2c 传递已证明一对一覆盖当前缺口的 `--select-file` 成员。无法证明精确映射的候选在下载前拒绝。Helper 不提供磁力提交或状态接口。所有补源产物都必须先进入任务专属 staging，再经过同一 Planner、单写器和回读验证；字幕缺口不占视频补源带宽。
 
 `EngineJob` 仍是内部兼容执行载体，不再是顶层业务模型。`POST /api/jobs` 与 `/api/jobs/:id/start` 仅为 legacy 兼容入口；新功能应使用 RootJob/WorkUnit 路径。
 
-每个 API 进程都会以 paused 状态启动。恢复自动执行前必须持久化一个精确 RootJob：先在 paused 时 `POST /api/control/pilot`，再由 `POST /api/control/resume` 执行只读 AList/aria2 preflight；空 selector、预检失败或预检期间控制状态变更都保持暂停。若进程重启前的持久记录仍是 unpaused，新进程的内存 startup fence 虽会显示 paused，仍须先 `POST /api/control/pause` 把**共享持久记录**写回 paused，才可 arm 或 resume；这避免第二个 API 进程改变正在运行的 pilot。`SCRAPEFLOW_ROOT_JOB_PILOT` 可作为 Compose 级的第二道精确 RootJob ceiling，与持久 scope 取交集，不能扩大范围，并会关闭全库自动审计。预检核对实际 AddURL offline sibling（`<staging>__offline__`）的最长 AList storage 挂载、启用/work 状态和已审阅的 Quark 上传能力；不会提交样本任务，所以 ready 仍不是传输成功证据。模板中的 intake、自动审计和自动补源 gate 均默认关闭；手动补源仍受 pause、scope 和 worker 门禁约束。
+每个 API 进程都会以 paused 状态启动。恢复自动执行前必须持久化一个精确 RootJob：先在 paused 时 `POST /api/control/pilot`，再由得到单独授权的 `POST /api/control/resume` 放行；空 selector 或恢复期间控制状态变更都保持暂停。若进程重启前的持久记录仍是 unpaused，新进程的内存 startup fence 虽会显示 paused，仍须先 `POST /api/control/pause` 把**共享持久记录**写回 paused，才可 arm 或 resume；这避免第二个 API 进程改变正在运行的 pilot。`SCRAPEFLOW_ROOT_JOB_PILOT` 可作为 Compose 级的第二道精确 RootJob ceiling，与持久 scope 取交集，不能扩大范围，并会关闭全库自动审计。模板中的 intake、自动审计和自动补源 gate 均默认关闭；手动补源仍受 pause、scope 和 worker 门禁约束。
 
 ## 最少配置
 
@@ -54,7 +54,7 @@ cp .env.local.example .env.local
 SCRAPEFLOW_BUILD_COMMIT="$(git rev-parse HEAD)" \
 SCRAPEFLOW_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose --env-file .env.local build api
-docker compose --env-file .env.local up -d alist api pansou offline-aria2 quark-helper
+docker compose --env-file .env.local up -d alist api pansou quark-helper
 python3 scripts/scrapeflow_runtime_readiness.py \
   --expected-commit <the-build-id-used-above>
 ```
@@ -65,14 +65,6 @@ python3 scripts/scrapeflow_runtime_readiness.py \
 显式给出 build id：使用至少 7 位小写 Git SHA（允许明确的 `-dirty` 后缀），且只接受
 health 中以该 SHA 前缀开始、dirty 标记一致的实际 build id；空值、`unrecorded` 和无效
 UTC build_time 都会失败。
-
-在第一次启动 `offline-aria2` 前，操作者还必须在本机 `.env.local` 设置一个随机、非空的
-`SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET`，并在 AList 的 offline-download `aria2`
-工具配置中填入**完全相同**的 `aria2_secret`（地址为
-`http://offline-aria2:6800/jsonrpc`）。该值仅传给 aria2 sidecar；不会进入 API 环境、
-health 或 acceptance 证据。该 sidecar 位于专用 Compose bridge，只有 AList/API（及共享
-API network namespace 的 Helper）能连接 RPC；bridge 不设 `internal`，以保留 aria2 的直连
-下载出网能力。
 
 ### 代理与直连（Clash TUN 全局模式）
 
@@ -88,9 +80,9 @@ Compose 没有固定 Docker 子网；先用 `docker network inspect <compose-pro
 
 Compose 的 API 进程入口是 `python3 -m local.simple_server`。容器内固定监听 `8765`，Compose 默认仅把它映射到宿主 <http://127.0.0.1:3010>；可用 `SCRAPEFLOW_API_PORT` 改宿主端口。API 容器连接 Compose 内部的 AList；媒体库根目录由 `SCRAPEFLOW_MEDIA_ROOT` 指定，默认是 `/quark/影视`。
 
-同一镜像还会启动两动作 `quark-helper` sidecar：`health` 与 `share-save`。它只服务 `quark_share` 阶，与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。每次 `share-save` 才从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和当前 AList 的 `root_folder_id`（兼容旧 `root_id`）；两者只保留在内存，不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。第二阶由 AList 的 `aria2` offline-download tool 与专用 `offline-aria2` 服务完成：该服务直连下载，AList 先转存到 attempt 专属 offline sibling，materializer 再精确验证并把预期文件收进 staging。
+同一镜像还会启动两动作 `quark-helper` sidecar：`health` 与 `share-save`。它只服务 `quark_share` 阶，与 API 共享网络命名空间，只监听共享的 `127.0.0.1:18765`，不发布第二个宿主端口。每次 `share-save` 才从匹配 `/quark` 的启用状态 Quark storage 临时解析 `addition.cookie` 和当前 AList 的 `root_folder_id`（兼容旧 `root_id`）；两者只保留在内存，不作为 Compose 环境变量、不落盘，也不出现在 health 响应、日志或验收证据中。Compose 会在 sidecar 异常退出时重拉，也会在显式重建 API 容器时同步重建 sidecar，避免它留在旧网络命名空间。
 
-提交第二阶前，API 会按**整个已核验 Torrent**的 `download_bytes`（不是本次缺口所需的文件和）检查与 `SCRAPEFLOW_HOST_STATE_ROOT` 共用的文件系统：默认单任务最多 32 GiB，且必须保留 `ceil(完整种子 × 1.15) + 20 GiB` 的可用空间。缺少完整大小、超上限或空间不足都会以同阶 infrastructure 停下，绝不先提交再赌磁盘；可通过 `SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES` 与 `SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES` 在确认磁盘余量后调整。转存进入 transfer 状态后，默认 3600 秒总时限会持久化到 attempt；到期只有确认 AList 已取消后才删除任务并允许同阶重试，无法确认时保持 `waiting_reconcile`，不会重复提交。可用 `SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT` 调整该时限。
+本地 Magnet 使用 aria2c 的精确成员选择：每个视频缺口必须先对应到一个唯一 torrent 成员，且下载后的 staging 清单必须再次精确回读。整季包、花絮、压缩包或无法证明映射的候选不会作为“补几集”的下载。为避免 AList v3 不暴露 `select-file` 且会在提交时重新拉取 URL 的不可证明边界，AList 离线下载功能已撤除；AList 仍只承担媒体库和夸克存储访问。
 
 显式设置 `SCRAPEFLOW_INTAKE_MONITOR=1` 后，服务会按 `SCRAPEFLOW_INTAKE_SCAN_SECONDS` 轮询 `/quark/影视/待刮削/`，但只维护被动的 `IntakeSource` 目录清单：不创建 Job、不请求 TMDB、不做对账或写入。默认模板保持关闭；当前标准入口是用户通过 `POST /api/root-jobs` 为来源选择货架并授权 RootJob。
 
@@ -110,7 +102,6 @@ API 只暴露当前自动服务所需的操作：
 
 ```text
 GET  /api/health
-GET  /api/readiness/alist-offline
 GET  /api/control
 POST /api/control/pause
 POST /api/control/pilot            {"root_job_id":"<root-job-id>"}
@@ -136,7 +127,7 @@ POST /api/jobs                    {"path":"/quark/影视/待刮削/作品目录"
 POST /api/jobs/:id/start          {"target_shelf":"movie|anime|us_tv"}
 ```
 
-`GET /api/readiness/alist-offline` 只读取 AList 离线工具、管理员认证/task-manager、aria2 RPC/临时目录和目标 storage 路由；它不会创建目录、提交任务、下载、转存或删除任务。因此 `ready` 证明配置与可达性，**不**证明已完成真实文件传输。该诊断端点会以 HTTP 200 返回 `not_ready`/`unverified` 报告，故绝不能把 `curl -f` 的退出码当作就绪证明；必须使用上面的 runtime-readiness 命令，它要求 `status=ready` 和 `verified=true`。单任务试运行应在保持 paused 时先调用 `POST /api/control/pilot {"root_job_id":"…"}`；随后检查该 GET 和 `/api/health` 的 `automatic_scope`，只有 preflight 为 verified 才能 resume。自动全库审计投影在 single_root pilot 中保持关闭，避免它为非白名单根创建 Provider/retry 工作。
+单任务试运行应在保持 paused 时先调用 `POST /api/control/pilot {"root_job_id":"…"}`，随后检查 `/api/control` 和 `/api/health` 的 `automatic_scope`。自动全库审计投影在 single_root pilot 中保持关闭，避免它为非白名单根创建 Provider/retry 工作。
 
 POST /api/root-jobs 是 A→P 合同的 S 步入口：一次提交来源与货架，创建或激活唯一 RootJob（同一来源幂等返回同一任务，已选货架不可更改），也是 Web 控制台“创建任务”面板调用的接口。已匹配的正式作品始终沿用既有货架/作品根；target_shelf 只为新作品规划提供受限目标。POST /api/jobs 与 POST /api/jobs/:id/start 仅保留为 legacy 兼容入口。
 
@@ -146,7 +137,7 @@ GET /api/jobs/:id/replenishment 是只读预览。POST /api/jobs/:id/replenish �
 
 POST /api/jobs/:id/repair-artifacts 只接受空 JSON 对象，并只重放已完成任务的确定性 NFO/海报计划；全库审计不会触发该写操作。
 
-严格补源的第一阶只读取 PanSou 的 POST /api/search，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。PanSou 是 Compose 内部服务，不发布宿主端口，只在内部网络以 http://pansou:8888 可达；模板默认仍是 SCRAPEFLOW_PANSOU_ENABLED=0，本机启用时在 .env.local 设 SCRAPEFLOW_PANSOU_ENABLED=1 与 SCRAPEFLOW_PANSOU_URL=http://pansou:8888。配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 quark_share，不会伪造“没有候选”或推进到 alist_offline 或 magnet。
+严格补源的第一阶只读取 PanSou 的 POST /api/search，随后用当前 AList 的夸克会话做只读递归清单核验；搜索结果本身不会直接成为可写候选。PanSou 是 Compose 内部服务，不发布宿主端口，只在内部网络以 http://pansou:8888 可达；模板默认仍是 SCRAPEFLOW_PANSOU_ENABLED=0，本机启用时在 .env.local 设 SCRAPEFLOW_PANSOU_ENABLED=1 与 SCRAPEFLOW_PANSOU_URL=http://pansou:8888。配置缺失、接口/会话失败、查询或链接被上限截断都会让任务停在 quark_share，不会伪造“没有候选”或推进到 magnet。
 
 容器出口代理用 SCRAPEFLOW_HTTP_PROXY / SCRAPEFLOW_HTTPS_PROXY 配置，不继承宿主的 HTTP_PROXY：宿主值通常是 http://127.0.0.1:<port>，在容器内指向容器自身，会静默切断 TMDB 与 Torrent 搜索索引的全部出口，而 /api/health 仍报告 tmdb_configured: true。需要代理时填 http://host.docker.internal:<port>。
 
@@ -182,7 +173,7 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 - 补源 child 是 media-only：只回投视频，不新建或覆盖每集 NFO、海报；正式库已有的作品/季度元数据保持不动。
 - 当显式开启 Provider/audit lane 时，`SCRAPEFLOW_REQUIRED_SUBTITLE_LANGUAGE`（默认示例为 `zh`）才会把侧车和内嵌字幕都缺少目标语言的情况交给补源流程；已有目标语言字幕不会重复写入。
 - 内嵌字幕探针按次审计使用有界单调时间预算（默认 120 秒、最多 4 个并发）；预算内未完成的证据标记为 `unknown_subtitle_evidence`，不会误判为缺字幕。相同的字幕未知不会每 30 秒重复全库扫描，而是在新媒体提交或手动审计时再次核对。可用 `SCRAPEFLOW_SUBTITLE_PROBE_BUDGET_SECONDS`、`SCRAPEFLOW_SUBTITLE_PROBE_WORKERS` 和 `SCRAPEFLOW_SUBTITLE_PROBE_MAX_FILES` 调整。
-- AList 离线任务按完整 Torrent 容量预检，默认最多 32 GiB，并在 15% 传输余量之外保留 20 GiB 空间；未通过容量预检不创建 AList 离线任务。转存 deadline 跨 API 重启保持有效，取消未获确认的任务保持 in-doubt，绝不当作可以重提。
+- AList 不参与补源下载、提交、预检或任务恢复；它仅承担媒体库与夸克存储访问。本地 Magnet 的范围由已证明的一对一缺口成员映射和 staging 回读共同约束。
 - 新对象短暂不可见时，只对相关读取执行有界重试。
 - 任务重启时会先根据 AList 当前状态重新核对，再继续或进入可重试的失败状态。
 - 正式媒体库、AList 数据库和其他任务不属于当前任务的清理范围。

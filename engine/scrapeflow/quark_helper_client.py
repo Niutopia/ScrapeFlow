@@ -9,7 +9,7 @@ internally and uses the desktop renderer only for passive WSG transforms.
 The fixed action contract is ``health`` + ``share-save`` (2026-08-17): the
 magnet submit/status impersonation path was removed with the ``quark_magnet``
 tier, which Quark account-level rate-limiting made unusable in production.
-Offline acquisition now rides the AList offline-download tool lane instead.
+Video fallback now uses the local Torrent lane with exact selected members.
 """
 
 from __future__ import annotations

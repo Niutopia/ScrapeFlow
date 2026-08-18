@@ -221,7 +221,6 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["build_commit"], "a" * 40)
         self.assertEqual(health["build_time"], "2026-08-17T00:00:00Z")
         self.assertEqual(health["provider_capabilities"]["quark_share"]["status"], "ready")
-        self.assertEqual(health["provider_capabilities"]["alist_offline"]["status"], "ready")
         self.assertEqual(health["provider_capabilities"]["magnet"]["status"], "ready")
         self.assertEqual(health["helper_readiness"]["quark"]["status"], "not_configured")
         self.assertFalse(health["helper_readiness"]["quark"]["configured"])
@@ -229,11 +228,9 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["dependencies"]["alist"]["status"], "configured")
         self.assertFalse(health["dependencies"]["quark"]["verified"])
         self.assertEqual(health["dependencies"]["quark"]["status"], "not_configured")
-        self.assertFalse(health["dependencies"]["alist_offline"]["verified"])
-        self.assertEqual(health["dependencies"]["alist_offline"]["status"], "unverified")
         self.assertEqual(
             set(health["provider_capabilities"]),
-            {"quark_share", "alist_offline", "magnet"},
+            {"quark_share", "magnet"},
         )
 
         status, control = self.request("GET", "/api/control")
@@ -479,19 +476,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         return str(payload["job"]["id"])
 
-    @staticmethod
-    def _ready_offline_report() -> dict[str, object]:
-        return {
-            "status": "ready",
-            "verified": True,
-            "configured": True,
-            "read_only": True,
-            "checks": {},
-            "issues": [],
-            "limitations": ["fixture"],
-        }
-
-    def test_pilot_can_be_armed_while_paused_then_resumed_only_after_preflight(self) -> None:
+    def test_pilot_can_be_armed_while_paused_then_resumed_with_explicit_scope(self) -> None:
         root_id = self._create_bound_root("/library/待刮削/Example")
 
         status, armed = self.request(
@@ -509,54 +494,39 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["automatic_scope"]["root_job_id"], root_id)
         self.assertEqual(health["automatic_scope"]["automatic_global_audit"], "blocked")
 
-        not_ready = {
-            **self._ready_offline_report(),
-            "status": "not_ready",
-            "verified": False,
-            "issues": ["fixture failure"],
-        }
-        with patch.object(self.application, "alist_offline_readiness", return_value=not_ready):
-            status, rejected = self.request("POST", "/api/control/resume", {})
-        self.assertEqual(status, 503)
-        self.assertIn("预检", rejected["error"])
-        self.assertTrue(self.application.control()["paused"])
-
-        with patch.object(
-            self.application,
-            "alist_offline_readiness",
-            return_value=self._ready_offline_report(),
-        ) as preflight, patch.object(self.application, "_start_startup_thread") as startup:
+        with patch.object(self.application, "_start_startup_thread") as startup:
             status, resumed = self.request("POST", "/api/control/resume", {})
         self.assertEqual(status, 200)
         self.assertFalse(resumed["paused"])
         self.assertEqual(resumed["automatic_scope"]["root_job_id"], root_id)
-        preflight.assert_called_once_with()
         startup.assert_called_once()
 
-    def test_pilot_resume_cas_rejects_control_change_during_preflight(self) -> None:
+    def test_pilot_resume_cas_rejects_control_change_during_validation(self) -> None:
         root_id = self._create_bound_root("/library/待刮削/Example")
         status, _armed = self.request(
             "POST", "/api/control/pilot", {"root_job_id": root_id},
         )
         self.assertEqual(status, 200)
 
-        def preflight_that_observes_another_pause() -> dict[str, object]:
+        original_validate = self.application._validate_pilot_root_job  # noqa: SLF001
+
+        def validation_that_observes_another_pause(root_job_id: object) -> str:
             self.application.set_paused(
                 True,
                 "intervening pause",
                 automatic_scope=single_root_scope(root_id),
             )
-            return self._ready_offline_report()
+            return original_validate(root_job_id)
 
         with patch.object(
             self.application,
-            "alist_offline_readiness",
-            side_effect=preflight_that_observes_another_pause,
+            "_validate_pilot_root_job",
+            side_effect=validation_that_observes_another_pause,
         ), patch.object(self.application, "_start_startup_thread") as startup:
             status, response = self.request("POST", "/api/control/resume", {})
 
         self.assertEqual(status, 409)
-        self.assertIn("预检期间控制状态已变更", response["error"])
+        self.assertIn("恢复期间控制状态已变更", response["error"])
         self.assertTrue(self.application.control()["paused"])
         self.assertEqual(
             self.application.control()["automatic_scope"],
@@ -571,11 +541,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             "POST", "/api/control/pilot", {"root_job_id": first_root},
         )
         self.assertEqual(status, 200)
-        with patch.object(
-            self.application,
-            "alist_offline_readiness",
-            return_value=self._ready_offline_report(),
-        ), patch.object(self.application, "_start_startup_thread"):
+        with patch.object(self.application, "_start_startup_thread"):
             status, resumed = self.request("POST", "/api/control/resume", {})
         self.assertEqual(status, 200)
         self.assertFalse(resumed["paused"])
@@ -599,10 +565,8 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EngineExecutionError, "paused"):
             second_application.arm_root_job_pilot(second_root)
-        with patch.object(second_application, "alist_offline_readiness") as preflight:
-            with self.assertRaisesRegex(EngineExecutionError, "先 pause"):
-                second_application.resume_root_job_pilot(second_root)
-        preflight.assert_not_called()
+        with self.assertRaisesRegex(EngineExecutionError, "先 pause"):
+            second_application.resume_root_job_pilot(second_root)
 
         durable = self.application._control_state.read()  # noqa: SLF001
         self.assertFalse(durable["paused"])
@@ -652,18 +616,10 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             self.application._resume_automatic_jobs()  # noqa: SLF001
         queued.assert_not_called()
 
-    def test_readiness_endpoint_is_explicit_no_write_probe(self) -> None:
-        report = self._ready_offline_report()
-        with patch.object(
-            self.application,
-            "alist_offline_readiness",
-            return_value=report,
-        ) as preflight:
-            status, payload = self.request("GET", "/api/readiness/alist-offline")
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, report)
-        preflight.assert_called_once_with()
-        self.assertTrue(self.application.control()["paused"])
+    def test_retired_alist_offline_readiness_endpoint_is_not_exposed(self) -> None:
+        status, payload = self.request("GET", "/api/readiness/alist-offline")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "not found")
 
     def test_root_job_creation_rejects_bad_shelf_and_bad_path(self) -> None:
         self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]

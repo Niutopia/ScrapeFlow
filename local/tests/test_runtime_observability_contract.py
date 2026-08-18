@@ -34,15 +34,15 @@ class RuntimeObservabilityContractTests(unittest.TestCase):
         self.assertNotIn("SCRAPEFLOW_BUILD_COMMIT: ${SCRAPEFLOW_BUILD_COMMIT:-}", compose)
         self.assertNotIn("SCRAPEFLOW_BUILD_TIME: ${SCRAPEFLOW_BUILD_TIME:-}", compose)
 
-    def test_compose_bounds_aria2_logs_and_pins_pansou_content(self) -> None:
+    def test_compose_removes_offline_aria2_and_pins_pansou_content(self) -> None:
         compose = (self.root / "docker-compose.yml").read_text(encoding="utf-8")
-        offline_block = compose.split("  offline-aria2:\n", 1)[1].split("  quark-helper:\n", 1)[0]
-        pansou_block = compose.split("  pansou:\n", 1)[1].split("  offline-aria2:\n", 1)[0]
+        pansou_block = compose.split("  pansou:\n", 1)[1].split("  quark-helper:\n", 1)[0]
 
-        self.assertIn('max-size: "10m"', offline_block)
-        self.assertIn('max-file: "3"', offline_block)
         self.assertIn("image: ghcr.io/fish2018/pansou@sha256:", pansou_block)
         self.assertNotIn("pansou:latest", pansou_block)
+        self.assertNotIn("offline-aria2", compose)
+        self.assertNotIn("alist-offline", compose)
+        self.assertNotIn("SCRAPEFLOW_ALIST_OFFLINE", compose)
 
 
 if __name__ == "__main__":  # pragma: no cover

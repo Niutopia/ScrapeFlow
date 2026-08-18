@@ -21,7 +21,7 @@ def _provider_neutral(result: Mapping[str, Any]) -> dict[str, Any]:
 
     Search is an evidence boundary, not a promise that every historical
     source can be delivered.  Cloud-share/HTTP rows are intentionally dropped
-    here; only fixed Quark share, AList offline, and local Torrent shapes remain.
+    here; only fixed Quark share and local Torrent shapes remain.
     """
     output = dict(result)
     candidates = []

@@ -17,7 +17,6 @@ from .isolated_preflight import (
     validate_isolated_preflight_report,
 )
 from .release_checks import local_deployment_contract_issues, project_root
-from .release_checks import OFFLINE_ARIA2_RPC_SECRET_ENV
 from .runtime_readiness import runtime_readiness_evidence_issues
 
 
@@ -31,14 +30,9 @@ ORDINARY_SAMPLES = (
     ("执行中重启", "重启后不重复写入"),
 )
 REPLENISHMENT_SAMPLES = (
-    ("有效 quark_share", "第一阶完成，后二阶未调用"),
-    (
-        "quark_share 完整排除、有效 alist_offline",
-        "AList/aria2 离线完成，本地 Torrent 未调用",
-    ),
-    ("quark_share 与 alist_offline 完整排除后 magnet", "本地 Torrent 完成"),
+    ("有效 quark_share", "第一阶完成，本地 Torrent 未调用"),
+    ("quark_share 完整排除后 magnet", "本地 Torrent 精确选文件完成"),
     ("有效 quark_share 候选时 Helper 不可用", "停在 quark_share，不降阶"),
-    ("AList 提交响应丢失后 API 重启", "对账同一 AList task，不重复提交"),
     ("错误候选", "不创建 Engine child"),
     ("staging 内容不符", "不进入正式库"),
     ("缺字幕", "只安装正确目标语言侧车"),
@@ -47,11 +41,10 @@ FINAL_CHECKS = (
     "普通电影、番剧、美剧均正确",
     "归档和错误密码行为正确",
     "手工审计不修改正式库",
-    "quark_share、alist_offline、magnet 三条获取线路全部真实可执行",
-    "三条线路全部先到任务 staging",
-    "三条线路全部使用同一个受限 Engine 和 writer",
-    "第一阶成功时后二阶不调用",
-    "第二阶成功时本地 Torrent 不调用",
+    "quark_share、magnet 两条获取线路全部真实可执行",
+    "两条线路全部先到任务 staging",
+    "两条线路全部使用同一个受限 Engine 和 writer",
+    "第一阶成功时本地 Torrent 不调用",
     "基础设施故障绝不降阶",
     "in-doubt 不重复提交",
     "不进行媒体内容指纹校验",
@@ -131,10 +124,6 @@ def compose_evidence(root: Path | None = None, runner: CommandRunner = _run_comm
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
         "SCRAPEFLOW_HOST_STATE_ROOT": "/tmp/scrapeflow-state",
-        # This read-only Compose rendering needs a value solely to satisfy
-        # required interpolation. Never include the resolved environment in
-        # the evidence package.
-        OFFLINE_ARIA2_RPC_SECRET_ENV: "acceptance-compose-placeholder-only",
     }
     result = runner(("docker", "compose", "config", "--format", "json"), base, env)
     if result.returncode != 0:
@@ -364,8 +353,6 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
         for action in helper_actions
         if isinstance(action, str) and action.strip()
     ] if isinstance(helper_actions, list) else []
-    offline = payload.get("alist_offline")
-    offline_map = dict(offline) if isinstance(offline, Mapping) else {}
     return {
         "status": (
             "失败"
@@ -379,9 +366,6 @@ def runtime_readiness_evidence(report: Mapping[str, object] | None) -> dict[str,
             "build_version": health_map.get("build_version", ""),
             "build_commit": health_map.get("build_commit", ""),
             "build_time": health_map.get("build_time", ""),
-            "alist_offline_status": offline_map.get("status", ""),
-            "alist_offline_verified": offline_map.get("verified", ""),
-            "alist_offline_checked_at": offline_map.get("checked_at", ""),
             "connected": health_map.get("connected", ""),
             "tmdb_configured": health_map.get("tmdb_configured", ""),
             "engine_configured": health_map.get("engine_configured", ""),

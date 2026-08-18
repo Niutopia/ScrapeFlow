@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from engine.scrapeflow.gap_ledger import (
-    AcquisitionAttempt,
     Gap,
     load_gap_ledger,
     save_gap_ledger,
@@ -18,6 +17,7 @@ from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 
 from local.scrapeflow_api.root_replenishment import (
+    PreUpgradeAListStateError,
     load_root_replenishment_state,
     run_root_replenishment,
     save_root_replenishment_state,
@@ -46,12 +46,6 @@ class _InDoubtError(Exception):
 
 class _InfraError(Exception):
     failure_scope = "infrastructure"
-
-
-class _FinalInfrastructureError(_InfraError):
-    """Infrastructure failure after the external task was confirmed stopped."""
-
-    external_task_final = True
 
 
 class _CandidateError(Exception):
@@ -320,13 +314,13 @@ class RootReplenishmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             state = load_root_replenishment_state(state_root, "root-1")
-            state["tier"] = "alist_offline"
+            state["tier"] = "magnet"
             state["waiting"] = "retry_wait"
             state["last_attempt_at"] = "2026-01-01T00:00:00Z"
-            state["attempt_log"] = [{"gap_id": "g", "tier": "alist_offline", "outcome": "candidate"}]
+            state["attempt_log"] = [{"gap_id": "g", "tier": "magnet", "outcome": "candidate"}]
             save_root_replenishment_state(state_root, "root-1", state)
             loaded = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(loaded["tier"], "alist_offline")
+            self.assertEqual(loaded["tier"], "magnet")
             self.assertEqual(loaded["waiting"], "retry_wait")
             self.assertEqual(loaded["last_attempt_at"], "2026-01-01T00:00:00Z")
             self.assertEqual(loaded["attempt_log"][0]["gap_id"], "g")
@@ -403,10 +397,10 @@ class RootReplenishmentTests(unittest.TestCase):
                 search_runner=_complete_no_candidate_search("pansou"),
                 materializer_factory=lambda tier: _FakeMaterializer(),
             )
-            self.assertEqual(result["tier"], "alist_offline")
+            self.assertEqual(result["tier"], "magnet")
             self.assertIsNone(result["waiting"])
             persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(persisted["tier"], "alist_offline")
+            self.assertEqual(persisted["tier"], "magnet")
 
     def test_empty_selection_without_raw_completion_proof_does_not_advance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -629,17 +623,17 @@ class RootReplenishmentTests(unittest.TestCase):
                 EXHAUSTION_MIN_DISTINCT_LOCATORS,
             )
 
-    def test_alist_offline_cannot_fall_through_on_partial_raw_source_proof(self) -> None:
+    def test_magnet_requires_complete_raw_source_proof_before_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             self._seed_tv_gap(state_root)
-            self._set_tier(state_root, "root-1", "alist_offline")
+            self._set_tier(state_root, "root-1", "magnet")
 
             partial = run_root_replenishment(
                 self._runner(state_root), state_root, "root-1",
                 search_runner=_complete_no_candidate_search("animetosho"),
             )
-            self.assertEqual(partial["tier"], "alist_offline")
+            self.assertEqual(partial["tier"], "magnet")
             self.assertEqual(partial["waiting"], "retry_wait")
 
             def completed_via_raw_telemetry(_request):
@@ -660,6 +654,7 @@ class RootReplenishmentTests(unittest.TestCase):
                 search_runner=completed_via_raw_telemetry,
             )
             self.assertEqual(complete["tier"], "magnet")
+            self.assertEqual(complete["state"]["status"], "exhausted")
 
     def test_unrelated_source_telemetry_does_not_change_share_tier_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -688,7 +683,7 @@ class RootReplenishmentTests(unittest.TestCase):
             )
 
             self.assertEqual(result["tier_before"], "quark_share")
-            self.assertEqual(result["tier"], "alist_offline")
+            self.assertEqual(result["tier"], "magnet")
 
     def test_infrastructure_keeps_tier_and_waits_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1133,225 +1128,28 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(gap.attempts, ())
 
 
-    # --- waiting_reconcile re-entry ----------------------------------------
+    # --- pre-upgrade AList state refusal -----------------------------------
 
-    def _seed_parked_attempt(
-        self,
-        state_root: Path,
-        *,
-        root_task_id: str = "root-1",
-        token: str = "S01E02",
-        season: int = 1,
-        episode: int = 2,
-        attempt_tier: str = "alist_offline",
-        attempt_id: str = "attempt-9",
-        task_id: str = "task-9",
-        locator: str = "alist_offline:0123456789012345678901234567890123456789",
-    ) -> str:
-        """Seed a parked in_doubt attempt: open gap + ledger attempt + durable
-        materializer state + the in-flight token.  Returns the staging root."""
-        save_work_unit_records(state_root, root_task_id, [
-            _work_unit(
-                root_task_id, "unit-tv",
-                media_type="tv", tmdb_id=35507, title="Fate/Zero",
-            ),
-        ])
-        gap = _episode_gap(
-            root_task_id, "unit-tv",
-            media_type="tv", tmdb_id=35507, season=season, episode=episode,
-        )
-        gap = Gap(
-            gap_id=gap.gap_id,
-            root_task_id=gap.root_task_id,
-            work_unit_id=gap.work_unit_id,
-            kind=gap.kind,
-            media_type=gap.media_type,
-            tmdb_id=gap.tmdb_id,
-            season=gap.season,
-            episodes=gap.episodes,
-            subtitle_path=None,
-            subtitle_language=None,
-            status=gap.status,
-            attempts=(
-                AcquisitionAttempt(
-                    attempt_id=attempt_id,
-                    provider=attempt_tier,
-                    tier=attempt_tier,
-                    locator=locator,
-                    status="in_doubt",
-                    external_task_id=task_id,
-                ),
-            ),
-        )
-        save_gap_ledger(state_root, root_task_id, [gap])
-        staging = f"/library/ScrapeFlow/补源/{root_task_id}/{attempt_id}"
-        workspace = state_root / "replenishment_workspace" / root_task_id / attempt_id
-        workspace.mkdir(parents=True, exist_ok=True)
-        (workspace / "alist_offline_attempt.json").write_text(json.dumps({
-            "provider": attempt_tier,
-            "attempt_id": attempt_id,
-            "staging_root": staging,
-            "task_id": task_id,
-            "locator": locator,
-            "selected_gap_ids": [token],
-            "acquisition": {
-                "kind": "alist_offline",
-                "magnet_url": (
-                    "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
-                ),
-                "torrent_url": "https://example.test/example.torrent",
-                "expected_files": [{
-                    "path": f"Fate.Zero.{token}.mkv",
-                    "size": FAKE_VIDEO_SIZE,
-                    "gap_ids": [token],
-                }],
-            },
-            "updated_at": "2026-01-01T00:00:00Z",
-        }))
-        state = load_root_replenishment_state(state_root, root_task_id)
-        state["tier"] = "alist_offline"
-        state["in_flight_gap_ids"] = {token: task_id}
-        save_root_replenishment_state(state_root, root_task_id, state)
-        return staging
-
-    def test_reconcile_closes_parked_gap_and_unparks_token(self) -> None:
-        """A finished AList task finalizes through the writer closure."""
+    def test_pre_upgrade_alist_state_is_refused_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
-            staging = self._seed_parked_attempt(state_root)
-            reconcile_events: list[dict[str, Any]] = []
-            delivery = {
-                "lane": "alist_offline",
-                "attempt_id": "attempt-9",
-                "staging_root": staging,
-                "files": [{
-                    "path": f"{staging}/Fate.Zero.S01E02.mkv",
-                    "size": FAKE_VIDEO_SIZE,
-                    "kind": "video",
-                    "gap_ids": ["S01E02"],
-                }],
-                "external_task_id": "task-9",
-            }
-            result = run_root_replenishment(
-                self._runner(
-                    state_root, planner=_coverage_planner([
-                        ("Fate.Zero.S01E02.mkv", "video"),
-                    ]),
-                ),
-                state_root, "root-1",
-                search_runner=_empty_search,
-                materializer_factory=lambda tier: _FakeMaterializer(
-                    reconcile_delivery=delivery,
-                    reconcile_events=reconcile_events,
-                ),
-            )
-            self.assertEqual(reconcile_events, [{
-                "staging_root": staging,
-                "external_task_id": "task-9",
-                "selections": [{
-                    "provider": "alist_offline",
-                    "locator": "alist_offline:0123456789012345678901234567890123456789",
-                    "selected_gap_ids": ["S01E02"],
-                    "acquisition": {
-                        "kind": "alist_offline",
-                        "magnet_url": (
-                            "magnet:?xt=urn:btih:"
-                            "0123456789012345678901234567890123456789"
-                        ),
-                        "torrent_url": "https://example.test/example.torrent",
-                        "expected_files": [{
-                            "path": "Fate.Zero.S01E02.mkv",
-                            "size": FAKE_VIDEO_SIZE,
-                            "gap_ids": ["S01E02"],
-                        }],
-                    },
-                }],
-            }])
-            self.assertEqual(result["requests_built"], 0)
-            self.assertEqual(result["gaps_closed"], ["unit-tv::missing_episode::S01E02"])
-            self.assertIsNone(result["waiting"])
-            persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(persisted["in_flight_gap_ids"], {})
-            gap = next(iter(load_gap_ledger(state_root, "root-1")))
-            self.assertEqual(gap.status, "closed")
+            self._seed_tv_gap(state_root)
+            state = load_root_replenishment_state(state_root, "root-1")
+            state["tier"] = "alist_offline"
+            save_root_replenishment_state(state_root, "root-1", state)
+            calls: list[str] = []
 
-    def test_reconcile_candidate_failure_unparks_and_excludes_locator(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            locator = "alist_offline:0123456789012345678901234567890123456789"
-            self._seed_parked_attempt(state_root, locator=locator)
-            result = run_root_replenishment(
-                self._runner(state_root),
-                state_root, "root-1",
-                search_runner=_empty_search,
-                materializer_factory=lambda tier: _FakeMaterializer(
-                    reconcile_error=_CandidateError("任务失败"),
-                ),
-            )
-            self.assertIsNone(result["waiting"])
-            self.assertEqual(result["gaps_closed"], [])
-            persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(persisted["in_flight_gap_ids"], {})
-            self.assertEqual(
-                persisted["candidate_failures_by_provider"]["alist_offline"],
-                [locator],
-            )
-
-    def test_reconcile_infrastructure_keeps_token_parked_with_retry_wait(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            self._seed_parked_attempt(state_root)
-            result = run_root_replenishment(
-                self._runner(state_root),
-                state_root, "root-1",
-                search_runner=_empty_search,
-                materializer_factory=lambda tier: _FakeMaterializer(
-                    reconcile_error=_InfraError("AList 不可达"),
-                ),
-            )
-            self.assertEqual(result["waiting"], "retry_wait")
-            persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(
-                persisted["in_flight_gap_ids"], {"S01E02": "task-9"},
-            )
-
-    def test_reconcile_confirmed_cancel_unparks_for_same_tier_retry(self) -> None:
-        """A verified AList cancellation must not leave a permanent barrier."""
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            self._seed_parked_attempt(state_root)
-            result = run_root_replenishment(
-                self._runner(state_root),
-                state_root,
-                "root-1",
-                search_runner=_empty_search,
-                materializer_factory=lambda tier: _FakeMaterializer(
-                    reconcile_error=_FinalInfrastructureError("transfer cancelled"),
-                ),
-            )
-
-            self.assertEqual(result["waiting"], "retry_wait")
-            persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(persisted["in_flight_gap_ids"], {})
-            self.assertEqual(persisted["tier"], "alist_offline")
-
-    def test_reconcile_legacy_quark_magnet_parked_token_unparks(self) -> None:
-        """A token parked by the removed lane re-enters the current ladder."""
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            self._seed_parked_attempt(state_root, attempt_tier="quark_magnet")
-            events: list[dict[str, Any]] = []
-            result = run_root_replenishment(
-                self._runner(state_root),
-                state_root, "root-1",
-                search_runner=_empty_search,
-                materializer_factory=lambda tier: _FakeMaterializer(events=events),
-            )
-            self.assertEqual(events, [])
-            self.assertIsNone(result["waiting"])
-            persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(persisted["in_flight_gap_ids"], {})
-
+            with self.assertRaisesRegex(PreUpgradeAListStateError, "人工确认并清理"):
+                run_root_replenishment(
+                    self._runner(state_root),
+                    state_root,
+                    "root-1",
+                    search_runner=lambda _request: (_ for _ in ()).throw(
+                        AssertionError("retired state must not search"),
+                    ),
+                    materializer_factory=lambda tier: calls.append(tier),
+                )
+            self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

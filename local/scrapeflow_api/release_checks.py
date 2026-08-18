@@ -11,9 +11,6 @@ import sys
 from typing import TextIO
 
 
-OFFLINE_ARIA2_RPC_SECRET_ENV = "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET"
-
-
 REQUIRED_ENV_TEMPLATE_VALUES = {
     # The sidecar resolves a fresh Quark Cookie/root from local AList storage
     # for every typed action.
@@ -29,9 +26,6 @@ REQUIRED_ENV_TEMPLATE_VALUES = {
     # A blank deployment ceiling is fail-closed together with the durable
     # control scope; a real one-root pilot supplies the exact RootJob id.
     "SCRAPEFLOW_ROOT_JOB_PILOT": "",
-    # A blank template value is intentional: Compose requires a real random
-    # value at startup and an untouched copy must fail closed.
-    OFFLINE_ARIA2_RPC_SECRET_ENV: "",
     # The typed sidecar shares the API network namespace and listens only on
     # that namespace's loopback.  The blank token, rather than an invented
     # credential, keeps Compose fail-closed without `.env.local`.
@@ -59,7 +53,7 @@ REQUIRED_COMPOSE_DEFAULTS = {
     **{
         key: value
         for key, value in REQUIRED_ENV_TEMPLATE_VALUES.items()
-        if not key.startswith("ALIST_") and key != OFFLINE_ARIA2_RPC_SECRET_ENV
+        if not key.startswith("ALIST_")
     },
     "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH": "0",
@@ -68,9 +62,6 @@ REQUIRED_COMPOSE_DEFAULTS = {
     "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
     "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
-    "SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES": "34359738368",
-    "SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES": "21474836480",
-    "SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT": "3600",
     "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
     "SCRAPEFLOW_QUARK_HELPER_TOKEN": "",
     "SCRAPEFLOW_PANSOU_ENABLED": "0",
@@ -87,44 +78,20 @@ REQUIRED_LOOPBACK_PORTS = {
     "api": ["127.0.0.1:${SCRAPEFLOW_API_PORT:-3010}:8765"],
     # The Helper is reachable only through the API network namespace.
     "quark-helper": [],
-    # aria2 RPC must not be published on the host.
-    "offline-aria2": [],
 }
 REQUIRED_SERVICE_IMAGES = {
     "api": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
-    "offline-aria2": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
     "quark-helper": "${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}",
 }
 REQUIRED_VOLUME_BINDINGS = {
     "alist": [
         "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data",
-        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp",
     ],
     "api": [
         "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data",
         "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow",
     ],
-    "offline-aria2": [
-        "${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp",
-    ],
 }
-REQUIRED_OFFLINE_ARIA2_COMMAND_TOKENS = (
-    "/bin/sh",
-    "aria2c",
-    "rpc-secret=$${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}",
-    "--conf-path=/run/scrapeflow/aria2.conf",
-    "--dir=/opt/alist/data/temp/aria2",
-    "--file-allocation=none",
-)
-REQUIRED_OFFLINE_ARIA2_ENVIRONMENT = {
-    OFFLINE_ARIA2_RPC_SECRET_ENV: (
-        "${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set "
-        "SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}"
-    ),
-}
-REQUIRED_PRIVATE_NETWORK = "alist-offline"
-REQUIRED_API_ALIST_NETWORKS = ["default", REQUIRED_PRIVATE_NETWORK]
-REQUIRED_OFFLINE_ARIA2_NETWORKS = [REQUIRED_PRIVATE_NETWORK]
 REQUIRED_HELPER_ENVIRONMENT = {
     "ALIST_URL": "http://alist:5244",
     "ALIST_USERNAME": "${ALIST_USERNAME:-}",
@@ -272,33 +239,6 @@ def _service_scalar(block: list[str], key: str) -> str | None:
     return None
 
 
-def _service_inline_list(block: list[str], key: str) -> list[object] | None:
-    """Return one multiline inline YAML/Python literal list from a service block."""
-
-    marker = f"{key}:"
-    for index, line in enumerate(block):
-        if len(line) - len(line.lstrip()) != 4:
-            continue
-        stripped = line.strip()
-        if not stripped.startswith(marker):
-            continue
-        literal = stripped[len(marker):].strip()
-        if not literal.startswith("["):
-            return None
-        chunks = [literal]
-        while not chunks[-1].rstrip().endswith("]"):
-            index += 1
-            if index >= len(block):
-                return None
-            chunks.append(block[index].strip())
-        try:
-            value = ast.literal_eval(" ".join(chunks))
-        except (SyntaxError, ValueError):
-            return None
-        return value if isinstance(value, list) else None
-    return None
-
-
 def _dependency_conditions(block: list[str]) -> dict[str, str]:
     """Return long-form Compose dependency conditions for one service."""
 
@@ -418,11 +358,6 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
             issues.append(
                 f"docker-compose.yml api.environment: {key} must default to {required!r}, got {actual!r}"
             )
-    if OFFLINE_ARIA2_RPC_SECRET_ENV in api_env:
-        issues.append(
-            "docker-compose.yml api.environment must not receive the offline aria2 RPC secret"
-        )
-
     for service, expected_ports in REQUIRED_LOOPBACK_PORTS.items():
         block = _service_block(compose_text, service)
         if not block:
@@ -434,68 +369,19 @@ def local_deployment_contract_issues(root: Path | None = None) -> list[str]:
                 f"docker-compose.yml {service}.ports must be {expected_ports!r}, got {ports!r}"
             )
 
-    offline_aria2_block = _service_block(compose_text, "offline-aria2")
-    if not offline_aria2_block:
-        issues.append("docker-compose.yml: missing offline-aria2 service")
-    else:
-        offline_aria2_command = _service_inline_list(
-            offline_aria2_block, "command",
-        )
-        if (
-            not isinstance(offline_aria2_command, list)
-            or not all(isinstance(value, str) for value in offline_aria2_command)
+    for relative, text in (
+        (".env.local.example", env_text),
+        ("docker-compose.yml", compose_text),
+    ):
+        for marker in (
+            "SCRAPEFLOW_ALIST_OFFLINE",
+            "offline-aria2",
+            "alist-offline",
         ):
-            issues.append(
-                "docker-compose.yml offline-aria2.command must be an inline string list"
-            )
-        else:
-            offline_aria2_command_text = "\n".join(offline_aria2_command)
-            missing_tokens = [
-                token
-                for token in REQUIRED_OFFLINE_ARIA2_COMMAND_TOKENS
-                if token not in offline_aria2_command_text
-            ]
-            if missing_tokens:
+            if marker in text:
                 issues.append(
-                    "docker-compose.yml offline-aria2.command must include "
-                    f"{missing_tokens!r}"
+                    f"{relative} must not declare retired AList offline-download marker {marker!r}"
                 )
-        offline_aria2_env = _mapping_block_values(offline_aria2_block, "environment")
-        for key, expected in REQUIRED_OFFLINE_ARIA2_ENVIRONMENT.items():
-            actual = offline_aria2_env.get(key)
-            if actual != expected:
-                issues.append(
-                    f"docker-compose.yml offline-aria2.environment: {key} must be "
-                    f"{expected!r}, got {actual!r}"
-                )
-        networks = _list_block_values(offline_aria2_block, "networks")
-        if networks != REQUIRED_OFFLINE_ARIA2_NETWORKS:
-            issues.append(
-                "docker-compose.yml offline-aria2.networks must be "
-                f"{REQUIRED_OFFLINE_ARIA2_NETWORKS!r}, got {networks!r}"
-            )
-
-    for service in ("alist", "api"):
-        block = _service_block(compose_text, service)
-        networks = _list_block_values(block, "networks")
-        if networks != REQUIRED_API_ALIST_NETWORKS:
-            issues.append(
-                f"docker-compose.yml {service}.networks must be "
-                f"{REQUIRED_API_ALIST_NETWORKS!r}, got {networks!r}"
-            )
-    network_tail = compose_text.split("\nnetworks:\n", 1)[-1]
-    required_network_definition = (
-        f"  {REQUIRED_PRIVATE_NETWORK}:\n"
-        "    driver: bridge"
-    )
-    if "\nnetworks:\n" not in compose_text or required_network_definition not in network_tail:
-        issues.append(
-            "docker-compose.yml must define the dedicated alist-offline bridge network"
-        )
-    if "internal: true" in network_tail:
-        issues.append(
-            "docker-compose.yml alist-offline must not be internal because aria2 needs direct egress"
-        )
 
     helper_block = _service_block(compose_text, "quark-helper")
     if helper_block:
@@ -659,10 +545,6 @@ def release_commands(*, include_docker: bool = True) -> list[ReleaseCommand]:
                     "PATH": os.environ.get("PATH", ""),
                     "HOME": os.environ.get("HOME", ""),
                     "SCRAPEFLOW_HOST_STATE_ROOT": "/tmp/scrapeflow-state",
-                    # Compose interpolation needs a nonempty value, but the
-                    # resolved config is deliberately never printed by this
-                    # gate. This is a non-production placeholder only.
-                    OFFLINE_ARIA2_RPC_SECRET_ENV: "release-check-placeholder-only",
                 },
                 isolated_env=True,
             ),

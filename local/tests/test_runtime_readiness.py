@@ -26,7 +26,6 @@ def healthy_payload(
         "build_time": "2026-08-18T00:00:00Z",
         "provider_capabilities": {
             "quark_share": {"status": "ready"},
-            "alist_offline": {"status": "ready"},
             "magnet": {"status": "ready"},
         },
         "helper_readiness": {
@@ -64,38 +63,18 @@ def paused_control() -> dict[str, object]:
     }
 
 
-def ready_offline_readiness() -> dict[str, object]:
-    return {
-        "status": "ready",
-        "verified": True,
-        "configured": True,
-        "read_only": True,
-        "checked_at": "2026-08-18T00:00:00Z",
-        "checks": {
-            "client": {"verified": True},
-            "aria2": {"verified": True},
-            "transfer": {"verified": True},
-        },
-        "issues": [],
-    }
-
-
 def fake_fetcher(
     health: dict[str, object] | None = None,
     control: dict[str, object] | None = None,
-    alist_offline: dict[str, object] | None = None,
 ):
     health_payload = healthy_payload() if health is None else health
     control_payload = paused_control() if control is None else control
-    offline_payload = ready_offline_readiness() if alist_offline is None else alist_offline
 
     def fetch(url: str, timeout: float) -> tuple[int, object]:
         if url.endswith("/api/health"):
             return 200, health_payload
         if url.endswith("/api/control"):
             return 200, control_payload
-        if url.endswith("/api/readiness/alist-offline"):
-            return 200, offline_payload
         return 404, {}
 
     return fetch
@@ -230,7 +209,7 @@ class RuntimeReadinessTests(unittest.TestCase):
 
     def test_lane_status_is_only_a_capability_declaration(self) -> None:
         health = healthy_payload()
-        health["provider_capabilities"]["alist_offline"]["status"] = "unavailable"
+        health["provider_capabilities"]["magnet"]["status"] = "unavailable"
 
         report = runtime_readiness_report(
             api_url="http://127.0.0.1:8765",
@@ -239,23 +218,6 @@ class RuntimeReadinessTests(unittest.TestCase):
         )
 
         self.assertEqual(report["status"], "通过")
-
-    def test_unverified_offline_preflight_fails_even_when_health_is_green(self) -> None:
-        offline = ready_offline_readiness()
-        offline["status"] = "unverified"
-        offline["verified"] = False
-        offline["checks"]["aria2"]["verified"] = False
-        offline["issues"] = ["configuration incomplete"]
-
-        report = runtime_readiness_report(
-            api_url="http://127.0.0.1:8765",
-            expected_commit="abc1234",
-            fetch_json=fake_fetcher(alist_offline=offline),
-        )
-
-        self.assertEqual(report["status"], "失败")
-        self.assertIn("alist_offline.status must be ready", report["issues"])
-        self.assertIn("verified must be true", " ".join(report["issues"]))
 
     def test_build_identity_requires_expected_id_and_utc_time(self) -> None:
         no_expected = runtime_readiness_report(

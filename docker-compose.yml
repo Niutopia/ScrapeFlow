@@ -13,12 +13,6 @@ services:
       - "127.0.0.1:${SCRAPEFLOW_ALIST_PORT:-5244}:5244"
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-data:/opt/alist/data
-      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
-    # AList needs the private bridge to submit jobs to offline-aria2; it also
-    # remains on the default network for the API and normal Compose services.
-    networks:
-      - default
-      - alist-offline
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5244/api/public/settings"]
       interval: 10s
@@ -102,12 +96,6 @@ services:
       SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH: ${SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH:-0}
       SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT:-120}
       SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT: ${SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT:-900}
-      # AList aria2 retrieves a whole Torrent, not only the members selected
-      # for this gap. Reserve capacity on the shared host state filesystem
-      # before submitting its offline-download task.
-      SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES: ${SCRAPEFLOW_ALIST_OFFLINE_MAX_DOWNLOAD_BYTES:-34359738368}
-      SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES: ${SCRAPEFLOW_ALIST_OFFLINE_MIN_FREE_BYTES:-21474836480}
-      SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT: ${SCRAPEFLOW_ALIST_OFFLINE_TRANSFER_TIMEOUT:-3600}
       TMDB_BASE_URL: ${TMDB_BASE_URL_DOCKER:-https://api.themoviedb.org/3}
       TMDB_PROXY_URL: ${TMDB_PROXY_URL_DOCKER:-}
       TZ: ${TZ:-Asia/Shanghai}
@@ -118,11 +106,6 @@ services:
     volumes:
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/scrapeflow-data:/data
       - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/api-temp:/var/tmp/scrapeflow
-    # The API performs the no-write aria2 RPC preflight on this bridge, while
-    # keeping its normal dependencies on the default Compose network.
-    networks:
-      - default
-      - alist-offline
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -159,40 +142,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  offline-aria2:
-    image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
-    restart: unless-stopped
-    init: true
-    # Direct-only downloader (user rule): the ambient proxy env must never
-    # reach aria2.  The generated 0600 config contains only rpc-secret, so
-    # the credential never appears in the aria2 argv, health, or logs.
-    command: ["/bin/sh", "-ec", "umask 077; mkdir -p /run/scrapeflow; printf '%s\\n' \"rpc-secret=$${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}\" > /run/scrapeflow/aria2.conf; exec aria2c --conf-path=/run/scrapeflow/aria2.conf --enable-rpc --rpc-listen-all=true --rpc-listen-port=6800 --dir=/opt/alist/data/temp/aria2 --listen-port=6881-6999 --dht-listen-port=6881-6999 --bt-enable-lpd=true --enable-dht=true --enable-dht6=false --follow-torrent=mem --seed-time=0 --file-allocation=none --max-concurrent-downloads=3 --console-log-level=warn"]
-    environment:
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
-      ALL_PROXY: ""
-      no_proxy: "*"
-      NO_PROXY: "*"
-      # Required at Compose interpolation time. It must exactly equal the
-      # AList offline aria2_secret, but is intentionally not passed to API.
-      SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET: ${SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET:?set SCRAPEFLOW_ALIST_OFFLINE_ARIA2_RPC_SECRET}
-    volumes:
-      # Path-aligned with AList's temp dir: AList passes its absolute temp
-      # path to aria2, so the same host dir must appear at the same path
-      # here for the transfer step to see the files.
-      - ${SCRAPEFLOW_HOST_STATE_ROOT:?set SCRAPEFLOW_HOST_STATE_ROOT}/alist-temp:/opt/alist/data/temp
-    # Keep RPC off the default network. Only AList/API (and the helper sharing
-    # API's network namespace) can reach this non-internal bridge; aria2 still
-    # has public egress for direct downloads.
-    networks:
-      - alist-offline
-    logging:
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   quark-helper:
     image: ${SCRAPEFLOW_API_IMAGE:-scrapeflow-api:local}
     restart: unless-stopped
@@ -224,8 +173,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-networks:
-  # Do not mark this internal: offline-aria2 requires public direct egress.
-  alist-offline:
-    driver: bridge

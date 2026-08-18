@@ -60,10 +60,6 @@ from local.scrapeflow_api.automatic_replenishment import (
     LocalTorrentAutomaticMaterializer,
     reconcile_interrupted_gap_states,
 )
-from local.scrapeflow_api.alist_offline_readiness import (
-    alist_offline_readiness,
-    unverified_alist_offline_readiness,
-)
 from local.scrapeflow_api.control_state import PersistentControlState
 from local.scrapeflow_api.quark_helper_readiness import (
     quark_helper_readiness_from_env,
@@ -253,11 +249,6 @@ class SimpleApplication:
         self._control_path = self.state_root / "global-control.json"
         self._control_state = PersistentControlState(self._control_path)
         self._control_lock = threading.Lock()
-        # Health must remain a no-network liveness projection.  Cache the
-        # explicit no-write offline-lane preflight here; GET readiness and a
-        # pilot resume refresh it deliberately.
-        self._offline_readiness_lock = threading.Lock()
-        self._offline_readiness = unverified_alist_offline_readiness()
         # A persisted ``paused=False`` records the last operator decision; it
         # is not a startup authorization.  Every API process begins behind a
         # fresh in-memory pause fence and remains there until this process
@@ -432,7 +423,7 @@ class SimpleApplication:
             )
 
     # ------------------------------------------------------------------
-    # RootJob pilot scope + no-write AList offline preflight
+    # RootJob pilot scope
     # ------------------------------------------------------------------
 
     def _automatic_root_allowed(self, root_job_id: object) -> bool:
@@ -549,22 +540,6 @@ class SimpleApplication:
             raise EngineRequestError("试运行范围必须是 IntakeSource 绑定的 RootJob")
         return normalized
 
-    def alist_offline_readiness(self) -> dict[str, object]:
-        """Run and cache the explicit no-write AList offline preflight."""
-        client = self._alist_client
-        if client is None and self._engine_runner is not None:
-            client = getattr(self._engine_runner, "alist", None)
-        report = alist_offline_readiness(client, media_root=self.remote_root)
-        with self._offline_readiness_lock:
-            self._offline_readiness = report
-        return report
-
-    def _cached_alist_offline_readiness(self) -> dict[str, object]:
-        with self._offline_readiness_lock:
-            # The report is JSON-shaped.  A shallow top-level copy is enough
-            # for internal callers and prevents replacement of our cache.
-            return dict(self._offline_readiness)
-
     def arm_root_job_pilot(self, root_job_id: object) -> dict[str, object]:
         """Persist a single RootJob scope while keeping the process paused."""
         # Take a durable snapshot under the application lock, then release it
@@ -626,10 +601,8 @@ class SimpleApplication:
 
         A caller can pass a selector for an atomic arm+resume, or arm it in a
         prior paused-only request and omit it here.  A broad/missing scope is
-        never upgraded by this public operation.  Because the no-write
-        preflight can be slow, its initial control snapshot is never written
-        back unconditionally: another pause, arm, or resume wins and this
-        request returns a conflict while leaving the scheduler paused.
+        never upgraded by this public operation.  The compare-and-set keeps a
+        concurrent pause, arm, or resume from reopening a different scope.
         """
         with self._control_lock:
             snapshot = self._control_state.read()
@@ -649,20 +622,15 @@ class SimpleApplication:
                     )
                 root_job_id = persisted_scope.get("root_job_id")
         normalized = self._validate_pilot_root_job(root_job_id)
-        report = self.alist_offline_readiness()
-        if report.get("verified") is not True:
-            raise ApplicationError(
-                "AList 离线下载只读预检未通过；保持 paused，详见 /api/readiness/alist-offline"
-            )
         with self._control_lock:
             try:
                 configured_root = environment_root_job_pilot()
             except RootJobPilotError as exc:
                 raise ApplicationError(str(exc)) from exc
             if configured_root is not None and configured_root != normalized:
-                raise EngineExecutionError("预检期间部署 RootJob 范围已变更；保持 paused")
+                raise EngineExecutionError("恢复期间部署 RootJob 范围已变更；保持 paused")
             if self._startup_paused is not startup_paused:
-                raise EngineExecutionError("预检期间控制状态已变更；保持 paused")
+                raise EngineExecutionError("恢复期间控制状态已变更；保持 paused")
             payload = self._control_state.compare_and_set_paused(
                 expected_revision=snapshot.get("revision"),
                 expected_paused=bool(snapshot.get("paused")),
@@ -671,7 +639,7 @@ class SimpleApplication:
                 automatic_scope=single_root_scope(normalized),
             )
             if payload is None:
-                raise EngineExecutionError("预检期间控制状态已变更；保持 paused")
+                raise EngineExecutionError("恢复期间控制状态已变更；保持 paused")
             self._startup_paused = False
         self._resume_after_control_open()
         return payload
@@ -733,7 +701,6 @@ class SimpleApplication:
     def health(self) -> dict[str, object]:
         operations = self._operations_summary()
         provider_workers = self._provider_worker_configuration()
-        offline_readiness = self._cached_alist_offline_readiness()
         pilot_scope = self._pilot_scope_view()
         alist_configured = self.remote_configured
         tmdb_configured = bool(os.getenv("TMDB_API_KEY", "").strip())
@@ -767,10 +734,6 @@ class SimpleApplication:
                 "read_only": True,
                 "reason": "API liveness 不执行 TMDB 远端探测",
             },
-            # The offline report is populated only by the explicit no-write
-            # preflight.  Preserve it verbatim so callers can inspect its
-            # evidence and limitations without confusing it with liveness.
-            "alist_offline": offline_readiness,
         }
         with self._automatic_lock:
             intake = dict(self._intake_status)
@@ -797,10 +760,6 @@ class SimpleApplication:
             # installed.  They are deliberately not substituted for an
             # authenticated health probe of the out-of-process Quark Helper.
             "helper_readiness": {"quark": helper_readiness},
-            # This cached shape is deliberately distinct from service
-            # liveness: it is populated only by GET readiness or a requested
-            # pilot resume, both of which use no task/file mutations.
-            "offline_readiness": offline_readiness,
             "dependencies": dependencies,
             "automatic_scope": pilot_scope,
             "lane_gates": {
@@ -817,7 +776,7 @@ class SimpleApplication:
                 **intake,
             },
             "operations": operations,
-            "message": "API 可响应；AList、Quark Helper、aria2 与传输链路状态见 dependencies。",
+            "message": "API 可响应；AList、Quark Helper 与 TMDB 状态见 dependencies。",
         }
 
     def _operations_summary(self) -> dict[str, object]:
@@ -4106,7 +4065,7 @@ class SimpleApplication:
                     continue
                 proofs = state.get("exhaustion_proof_by_provider")
                 proofs = set(proofs) if isinstance(proofs, Mapping) else set()
-                if {"quark_share", "alist_offline", "magnet"} <= proofs:
+                if {"quark_share", "magnet"} <= proofs:
                     continue  # tier exhaustion: explicit operator trigger only
                 self._queue_root_replenishment(job.id)
         except Exception:
@@ -6986,10 +6945,6 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send_html(200, dashboard_html())
             elif path == "/api/health":
                 self._send(200, self.application.health())
-            elif path == "/api/readiness/alist-offline":
-                # Explicitly requested, authenticated AList/aria2 probe.  It
-                # is read-only by contract and never queues/resumes a task.
-                self._send(200, self.application.alist_offline_readiness())
             elif path == "/api/control":
                 self._send(200, self.application.control())
             elif path == "/api/jobs":

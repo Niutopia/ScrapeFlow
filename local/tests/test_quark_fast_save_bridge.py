@@ -58,6 +58,25 @@ def _selection() -> dict[str, object]:
 
 
 class QuarkFastSaveBridgeTests(unittest.TestCase):
+    def test_rejects_one_share_file_id_for_multiple_selected_gaps(self) -> None:
+        selection = _selection()
+        selection["selected_gap_ids"] = ["S01E01", "S01E02"]
+        acquisition = selection["acquisition"]
+        assert isinstance(acquisition, dict)
+        acquisition["file_id_by_gap"] = {
+            "S01E01": ["share-fid"],
+            "S01E02": ["share-fid"],
+        }
+
+        with self.assertRaisesRegex(
+            QuarkBridgeError,
+            "cannot satisfy multiple selected gaps",
+        ):
+            QuarkFastSaveBridge.dry_run(
+                selection,
+                "/quark/影视/ScrapeFlow/补源/root/attempt",
+            )
+
     def test_dry_run_never_returns_passcode(self) -> None:
         plan = QuarkFastSaveBridge.dry_run(
             _selection(),

@@ -1,6 +1,6 @@
-# ScrapeFlow 隔离真实验收记录（P15）
+# ScrapeFlow 隔离真实验收记录
 
-本记录用于当前 P15 的真实隔离验收。不要在没有独立 AList、独立存储、独立状态目录、独立媒体根和真实恢复点时填写通过结论。补源顺序固定为 `quark_share → alist_offline → magnet`；它不是旧 Quark 磁力离线流程的验收表。
+本记录用于当前真实隔离验收。不要在没有独立 AList、独立存储、独立状态目录、独立媒体根和真实恢复点时填写通过结论。补源顺序固定为 `quark_share → magnet`；AList 离线下载已撤除，不属于本验收表。
 
 ## 环境
 
@@ -52,13 +52,10 @@
 
 | 样本 | 输入 gap | 预期 | 结果 | 证据 |
 | --- | --- | --- | --- | --- |
-| 有效 quark_share |  | 第一阶完成，后二阶未调用 | 未执行 |  |
-| quark_share 完整排除、有效 alist_offline |  | AList/aria2 离线完成，本地 Torrent 未调用 | 未执行 |  |
-| quark_share 与 alist_offline 完整排除后 magnet |  | 本地 Torrent 完成 | 未执行 |  |
+| 有效 quark_share |  | 第一阶完成，本地 Torrent 未调用 | 未执行 |  |
+| quark_share 完整排除后 magnet |  | 本地 Torrent 仅选择当前缺口对应成员 | 未执行 |  |
 | 有效 quark_share 候选时 Helper 不可用 |  | 停在 quark_share，不降阶 | 未执行 |  |
-| AList 提交响应丢失后 API 重启 |  | 对账同一 AList task，不重复提交 | 未执行 |  |
-| AList 完整种子超 32 GiB 或剩余空间不足 |  | 提交前同阶 infrastructure；没有 AList/aria2 新任务 | 未执行 |  |
-| AList transfer 超过总时限 |  | 已确认取消才同阶 retry；未确认则 in-doubt 对账、不重复提交 | 未执行 |  |
+| Torrent 含整季、花絮或压缩包但当前只缺部分成员 |  | 仅选择已映射成员；映射不完整则拒绝下载 | 未执行 |  |
 | 错误候选 |  | 不创建 Engine child | 未执行 |  |
 | staging 内容不符 |  | 不进入正式库 | 未执行 |  |
 | 缺字幕 |  | 只安装正确目标语言侧车 | 未执行 |  |
@@ -81,15 +78,13 @@
 - [ ] 普通电影、番剧、美剧均正确。
 - [ ] 归档和错误密码行为正确。
 - [ ] 手工审计不修改正式库。
-- [ ] quark_share、alist_offline、magnet 三条获取线路全部真实可执行。
-- [ ] 三条线路全部先到任务 staging。
-- [ ] 三条线路全部使用同一个受限 Engine 和 writer。
-- [ ] 第一阶成功时后二阶不调用。
-- [ ] 第二阶成功时本地 Torrent 不调用。
+- [ ] quark_share、magnet 两条获取线路全部真实可执行。
+- [ ] 两条线路全部先到任务 staging。
+- [ ] 两条线路全部使用同一个受限 Engine 和 writer。
+- [ ] 第一阶成功时本地 Torrent 不调用。
 - [ ] 基础设施故障绝不降阶。
 - [ ] in-doubt 不重复提交。
-- [ ] AList 完整 Torrent 容量门禁在提交前生效，未按 selected files 低估。
-- [ ] AList transfer deadline 跨重启不重置；取消未确认时保持 in-doubt。
+- [ ] 本地 Magnet 只接受已证明映射到当前缺口的成员；整季包、花絮和压缩包不扩大下载范围。
 - [ ] 不进行媒体内容指纹校验。
 - [ ] 正式目标不覆盖。
 - [ ] restart 不重复写入。

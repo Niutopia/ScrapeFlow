@@ -21,7 +21,7 @@
 - **必须**通过 `IntakeSource → RootJob → WorkUnit` 路径新增功能，而不是扩展 `EngineJob` phase 字段。
 
 测试基线（2026-08-17 实测，三阶重构后）：**909 tests passed, 296 subtests passed, 0 failed**（`python3 -m pytest local/tests/ -q`，约 68 秒）。
-任何代码变更不得使通过数减少；2026-08-17 用户指令删除 quark_magnet 阶，其专属测试随代码一并删除（桥接测试文件整体移除、磁力段重写为 alist_offline 段），数量差全部来自该清退项并有新 lane/对账测试替代。
+任何代码变更不得使通过数减少；2026-08-17 用户指令删除 quark_magnet 阶。其后曾短暂采用 AList 离线下载作为中间阶；2026-08-18 用户再次裁决撤除该阶，相关运行配置、预检与测试必须同步清退。
 
 迁移状态：目标架构迁移 **P0–P10 已完成**（2026-08-16）：
 
@@ -33,8 +33,8 @@
 - R：根任务聚合（`root_aggregation`，`GET /api/jobs/:id/work-units`）；
 - P11：实机运行回路已切换（2026-08-16，`root_pipeline`）：intake 目录绑定的 RootJob 由调度器分派到权威单元管线（B/W 快照边界 → C/U 逐单元身份 → D 三库对账 → `execute_new_work_units` 驱动 F/G/H/J → R 聚合落 durable phase）；legacy 自动链保留为存量记录读取，不再接管新路径任务；身份/对账不确定单元保持 fail-closed 挂起，人工确认后重新分派（`/confirm` 触发）；
 - P12：单元级 E1/E2/E3 通道已接入（2026-08-16，`unit_e_lanes`）：duplicate_complete 单元整边界移动至任务专属 `ScrapeFlow/归档/<root>/processed`（不写正式库，写后精确回读）；existing_gap 单元把 D 判定的未覆盖缺口坐标登记进 Gap 账本（绑 work_unit_id），空边界目录 hold 至 `existing-gap-hold`，非空来源保留并置 attention；merge_existing 单元以既有作品根为锁定目标走唯一 Planner/写器（目标根与身份双重校验、不覆盖）并记 `WorkAcceptanceResult` 语义；全部 lane 状态持久化在 WorkUnit 账本（`lane_status`），不动 `EngineJob.summary`；管线已知缺口坐标来自全部 Gap 账本聚合（`compute_known_gap_tokens`），单元载体标 `internal_child` 不出现为第二公开任务；多季绝对集数块（如 `[01]..[47]` 对 S3+S4）由管线从 B 快照+TMDB 官方季结构推导显式集号映射文件（`episode_map_<unit>.json`），仅内部请求携带路径，HTTP 载荷不接受该字段；根任务 completed 后清理本任务 intake 源树中经 fresh listing 验证为空的目录壳（`_cleanup_empty_source_shells`：目录绑定门禁、只删真空目录、pause 感知、失败不回滚完成态）；入站监视器在每次成功 fresh listing 后把已消失的 intake 目录条目置 `present=False`（不删记录、保留历史与 root_task_id 绑定，同路径重建自动复活）；
-- P14：新路径补源接线（2026-08-16，`root_replenishment` + `replenishment_bridge`）：Gap 账本 → 运行时 request 形状（桥接，每 `(media_type,tmdb_id)` 一个 request）→ 严格三阶 lane（durable tier 状态文件 `replenishment_<root>.json`，进阶由 `replenishment_tiers.apply_tier_outcome` 驱动，candidate/infrastructure/in_doubt 三分类：infrastructure 原阶 retry_wait、in_doubt waiting_reconcile 且绝不重复提交同一坐标）→ 任务专属 staging → 同一 Planner/写器（internal child）→ 按执行计划文件证明缺口坐标已覆盖后才 `close_gap`，每次提交前先 `record_attempt`；`missing_subtitle` 缺口留在独立字幕渠道、不进视频三阶；L 步门禁复用 admission token（用户裁决 A）；服务端自动派发（管线完成后、门禁重开 sweep 覆盖 waiting 与未排root、三阶耗尽后仅人工触发）+ `GET /api/jobs/:id/replenishment` 只读预览 + `POST /api/jobs/:id/replenish` 手动触发；
-- P15：补源三阶重构（2026-08-17，用户指令）：`quark_magnet` 阶（CDP/WSG 替身直连夸克离线接口）被夸克账号级突发限流卡死，实机证明不可用，**整体删除**；三阶变为 **`quark_share → alist_offline → magnet`**。`alist_offline` 阶走 AList 通用离线下载工具框架（`add_offline_download`，显式 `tool: aria2`）：专用 `offline-aria2` compose 服务直连下载（剥离代理 + `--no-conf` + 路径对齐挂载 `state/alist-temp:/opt/alist/data/temp`）→ AList 转存到任务专属 sibling 目录 → `AlistOfflineAutomaticMaterializer` 只把预期文件收进 staging root（sibling 整树清理、staging 精确验证后才交付）→ 同一 Planner/写器闭环；提交先持久化 attempt 状态（task id + acquisition 全量），丢响应按任务名/BTIH 扫描恢复、绝不重复提交；轮询 undone/done 任务表，进度停滞超限判 candidate、任务终态失败判 candidate 排除、成功转存后回读验证；助手合同缩为 `health + share-save`（magnet-submit/magnet-status 端点与校验删除，`quark_magnet_offline_bridge` 由 `quark_helper_client` 替代）；新路径 waiting_reconcile 从"永久挂起"升级为真实对账回路：每轮先经 `reconcile_existing_task` 重入既有 AList 任务（只轮询不提交）→ 交付后走同一写器闭环关缺口；candidate 排除 locator 并解挂、infrastructure 原阶 retry_wait 保持挂起、in_doubt 继续等待；存量 quark_magnet 挂起 token 自动解挂进入新阶梯。下载仍走直连纪律（离线下载与本地 Torrent 共用 aria2 直连，搜索层才允许代理）；
+- P14：新路径补源接线（2026-08-16，`root_replenishment` + `replenishment_bridge`）：Gap 账本 → 运行时 request 形状（桥接，每 `(media_type,tmdb_id)` 一个 request）→ 严格两阶 lane（durable tier 状态文件 `replenishment_<root>.json`，进阶由 `replenishment_tiers.apply_tier_outcome` 驱动，candidate/infrastructure/in_doubt 三分类：infrastructure 原阶 retry_wait、in_doubt waiting_reconcile 且绝不重复提交同一坐标）→ 任务专属 staging → 同一 Planner/写器（internal child）→ 按执行计划文件证明缺口坐标已覆盖后才 `close_gap`，每次提交前先 `record_attempt`；`missing_subtitle` 缺口留在独立字幕渠道、不进视频补源 lane；L 步门禁复用 admission token（用户裁决 A）；服务端自动派发（管线完成后、门禁重开 sweep 覆盖 waiting 与未排 root、两阶耗尽后仅人工触发）+ `GET /api/jobs/:id/replenishment` 只读预览 + `POST /api/jobs/:id/replenish` 手动触发；
+- P15（历史迁移与现行裁决）：`quark_magnet` 阶被夸克账号级突发限流卡死，已删除。2026-08-18 用户又要求删除曾作为中间阶的 `alist_offline`：AList v3 不暴露 aria2 `select-file`，且提交时会重新获取 URL，无法证明它仍是已核验的精确成员清单。当前视频补源固定为 **`quark_share → magnet`**。本地 Torrent 只允许已证明逐缺口映射的 `--select-file` 成员；整季包、花絮、压缩包或映射不完整的候选在下载前拒绝。AList 保留为媒体库与夸克存储访问，不再提交、预检或声明离线下载。此前部署已核验为空，旧本地任务记录已移除；ScrapeFlow 不保留 AList 离线任务 API、恢复或清理路径。未来人工审计若发现外部遗留离线任务，必须先在升级前人工取消并移除。下载仍走直连纪律（本地 Torrent 使用 aria2，搜索层才允许代理）；
 - J 步正确性修正（2026-08-16，实机核验发现）：`_register_unit_episode_gaps` 只登记本单元自有季（执行计划视频 token + 裸季目录行 + durable identity 季），整目录移动计划回退 B 快照取实际覆盖，无法证明覆盖的季 fail-closed 不登记；`discover_episode_gaps` 按 (media_type,tmdb_id,season,episode) 跨单元去重；`gap_reaudit.reaudit_open_gaps` 对库内 fresh listing 证明已存在的缺口坐标做定向核销（`run_root_replenishment` 每次触发前先跑，幻影缺口绝不进入获取 lane）；
 - 合规：作品名硬编码全部数据化（`engine/scrapeflow/data/release_lexicon.py`）、货架-媒体类型矩阵已删除、TMDB 匹配器统一为单一评分核心；
 - 测试：`tests/corpus/` 10 场景 + 真实 A→B→W→C→D 链路回归。
@@ -119,7 +119,7 @@ flowchart TD
 
     R --> L{"存在待闭环缺口<br/>且全局门禁开放？"}
     L -->|否| M["M 入库完成阶段结束 (ingest_completed)"]
-    L -->|是| N["N 严格三阶补源子系统<br/>Quark 分享 → AList 离线 → 本地 Torrent<br/>专属 staging → 同一 Engine/Writer → scoped audit 闭环"]
+    L -->|是| N["N 严格两阶补源子系统<br/>Quark 分享 → 本地 Torrent（精确 select-file）<br/>专属 staging → 同一 Engine/Writer → scoped audit 闭环"]
     N --> M
 ```
 
@@ -164,14 +164,14 @@ flowchart TD
 - **任务所有权隔离 (两个任务绝不重叠 claim 同一来源对象)**；
 - **敏感信息脱敏 (密码、token、cookie 绝不落盘与入日志)**。
 
-## 4. 补源三阶纪律与 Staging 隔离
+## 4. 补源两阶纪律与 Staging 隔离
 
-- 层级顺序固定：`quark_share → alist_offline（AList 离线下载，aria2 直连本地中转）→ magnet(本地 Torrent)`，不得跳级（2026-08-17 用户指令以 alist_offline 替换已删除的 quark_magnet 阶）；
-- 失败三分类：`candidate`（资源问题，排除）、`infrastructure`（网络/认证/AList 故障，原阶 `retry_wait`，绝不降阶）、`in_doubt`（可能已提交，`waiting_reconcile`，绝不重复提交）；
+- 层级顺序固定：`quark_share → magnet(本地 Torrent)`，不得跳级；`magnet` 只下载已证明映射到当前 Gap 的 `--select-file` 成员；
+- 失败三分类：`candidate`（资源问题，排除）、`infrastructure`（网络/认证/本地下载器故障，原阶 `retry_wait`，绝不降阶）、`in_doubt`（可能已提交，`waiting_reconcile`，绝不重复提交）；
 - Provider 永不直接写正式库，永不决定正式库路径；
 - 补源产物落入任务专属 staging，通过同一 Engine 和单写器正式入库。
 - 字幕缺口走独立字幕渠道（字幕站点直搜；混合候选中只提取字幕成员，不下载整集视频），
-  不占用视频三阶带宽；该渠道同样遵守 staging 隔离、失败三分类（candidate/infrastructure/in_doubt）
+  不占用视频补源带宽；该渠道同样遵守 staging 隔离、失败三分类（candidate/infrastructure/in_doubt）
   与同一 writer 闭环（2026-08-16 用户裁决）。
 
 ## 5. 暂停与可恢复性

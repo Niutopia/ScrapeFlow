@@ -45,9 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from engine.scraper import AListClient, ApiError, ScraperError, join_remote, split_remote
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
-    ACQUISITION_ALIST_OFFLINE,
     ACQUISITION_TORRENT,
-    PROVIDER_ALIST_OFFLINE,
     PROVIDER_LOCAL_MAGNET,
     candidate_capability_error,
     provider_capability_snapshot,
@@ -1748,10 +1746,10 @@ def _torrent_candidate(
         for index in values
     })
     files = manifest["files"]
-    # AList's offline task retrieves the whole Torrent, not only the media
-    # members selected to close the current gaps.  Preserve that proven total
-    # with the local candidate so the AList lane can reserve enough disk for
-    # every manifest member (including unselected extras).
+    # Preserve both the complete manifest total and the exact member subset.
+    # The local aria2 path receives the subset through ``--select-file``;
+    # keeping both receipts prevents a future caller from confusing a small
+    # selected-file total with the source torrent's whole-pack size.
     download_bytes = 0
     for index, row in files.items():
         if type(index) is not int or index <= 0 or not isinstance(row, Mapping):
@@ -1761,6 +1759,9 @@ def _torrent_candidate(
             return None
         download_bytes += size
     if download_bytes <= 0:
+        return None
+    selected_download_bytes = sum(int(files[index]["size"]) for index in indices)
+    if selected_download_bytes <= 0:
         return None
     candidate_paths = [str(files[index]["path"]) for index in indices]
     quality_text = " ".join([release_name, *candidate_paths[:20]]).casefold()
@@ -1784,6 +1785,9 @@ def _torrent_candidate(
             "file_size_by_index": {str(index): int(files[index]["size"]) for index in indices},
             "file_path_by_index": {str(index): str(files[index]["path"]) for index in indices},
             "download_bytes": download_bytes,
+            "manifest_member_count": len(files),
+            "selected_member_count": len(indices),
+            "selected_download_bytes": selected_download_bytes,
             **({
                 "companion_subtitle_index_by_media_gap": companion_map,
             } if companion_map else {}),
@@ -1807,114 +1811,27 @@ def _torrent_candidate_variants(
     manifest: Mapping[str, Any], *, include_local: bool = True,
     swarm: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return AList-offline plus the optional local Torrent candidate."""
+    """Return only the exact local-Torrent candidate.
+
+    AList's offline-download API cannot carry aria2's ``select-file`` option
+    and fetches the torrent URL again after ScrapeFlow has inspected it.  It
+    therefore cannot prove that it will acquire only the selected members.
+    Automatic replenishment deliberately has no AList projection; the local
+    Torrent materializer is the sole torrent lane and passes exact member
+    indexes to aria2.
+    """
     local = _torrent_candidate(
         request, release_name, torrent_url, manifest, swarm=swarm,
     )
     if local is None:
         return []
-    variants: list[dict[str, Any]] = []
-    alist_offline = _alist_offline_candidate(local)
-    if alist_offline is not None:
-        variants.append(alist_offline)
-    if include_local:
-        variants.append(local)
-    return variants
-
-
-def _alist_offline_candidate(local: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Project one verified Torrent manifest into the AList offline lane."""
-    acquisition = local.get("acquisition")
-    if (
-        str(local.get("provider") or "").strip().casefold() != PROVIDER_LOCAL_MAGNET
-        or not isinstance(acquisition, Mapping)
-        or str(acquisition.get("kind") or "").strip().casefold() != ACQUISITION_TORRENT
-    ):
-        return None
-    infohash = str(local.get("infohash") or "").strip().casefold()
-    if not re.fullmatch(r"[0-9a-f]{40}|[a-z2-7]{32}", infohash):
-        return None
-    gap_map = acquisition.get("file_index_by_gap")
-    size_map = acquisition.get("file_size_by_index")
-    path_map = acquisition.get("file_path_by_index")
-    download_bytes = acquisition.get("download_bytes")
-    if not (
-        isinstance(gap_map, Mapping)
-        and isinstance(size_map, Mapping)
-        and isinstance(path_map, Mapping)
-        and not isinstance(download_bytes, bool)
-        and isinstance(download_bytes, int)
-        and download_bytes > 0
-    ):
-        return None
-    expected_by_index: dict[int, dict[str, Any]] = {}
-    for raw_gap_id, raw_indices in gap_map.items():
-        if not isinstance(raw_gap_id, str) or not raw_gap_id:
-            continue
-        if not isinstance(raw_indices, list):
-            continue
-        for raw_index in raw_indices:
-            if type(raw_index) is not int or raw_index <= 0:
-                continue
-            path = path_map.get(str(raw_index), path_map.get(raw_index))
-            size = size_map.get(str(raw_index), size_map.get(raw_index))
-            if (
-                not isinstance(path, str)
-                or not path
-                or path.startswith("/")
-                or "\\" in path
-                or any(part in {"", ".", ".."} for part in path.split("/"))
-                or isinstance(size, bool)
-                or not isinstance(size, int)
-                or size <= 0
-            ):
-                return None
-            row = expected_by_index.setdefault(
-                raw_index,
-                {
-                    "torrent_index": raw_index,
-                    "path": path,
-                    "size": size,
-                    "gap_ids": [],
-                },
-            )
-            if row["path"] != path or row["size"] != size:
-                return None
-            row["gap_ids"].append(raw_gap_id)
-    expected_files = [
-        {
-            **row,
-            "gap_ids": sorted(set(row["gap_ids"])),
-        }
-        for _index, row in sorted(expected_by_index.items())
-        if row["gap_ids"]
-    ]
-    if not expected_files:
-        return None
-    candidate = dict(local)
-    candidate.update({
-        "provider": PROVIDER_ALIST_OFFLINE,
-        "locator": f"{PROVIDER_ALIST_OFFLINE}:{infohash}",
-        "files": [str(row["path"]) for row in expected_files],
-        "acquisition": {
-            "kind": ACQUISITION_ALIST_OFFLINE,
-            "magnet_url": f"magnet:?xt=urn:btih:{infohash}",
-            "torrent_url": (
-                acquisition.get("url")
-                if isinstance(acquisition.get("url"), str) and acquisition.get("url")
-                else None
-            ),
-            "expected_files": expected_files,
-            "download_bytes": download_bytes,
-        },
-    })
-    return candidate
+    return [local] if include_local else []
 
 
 def _catalog_torrent_candidate_variants(
     candidate: Mapping[str, Any], *, include_local: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return fixed-lane variants for one catalog Torrent candidate."""
+    """Return the exact local-Torrent variant for one catalog candidate."""
     local = dict(candidate)
     acquisition = local.get("acquisition")
     if (
@@ -1923,13 +1840,7 @@ def _catalog_torrent_candidate_variants(
         and str(acquisition.get("kind") or "").strip().casefold() == ACQUISITION_TORRENT
         and candidate_capability_error(local) is None
     ):
-        variants: list[dict[str, Any]] = []
-        alist_offline = _alist_offline_candidate(local)
-        if alist_offline is not None:
-            variants.append(alist_offline)
-        if include_local:
-            variants.append(local)
-        return variants
+        return [local] if include_local else []
     return []
 
 

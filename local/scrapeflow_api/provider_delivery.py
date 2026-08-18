@@ -13,7 +13,6 @@ from .provider_staging import (
     validate_provider_staging_root,
 )
 from .replenishment_tiers import (
-    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
     TIER_QUARK_SHARE,
 )
@@ -21,7 +20,6 @@ from .replenishment_tiers import (
 
 ALLOWED_DELIVERY_LANES = frozenset({
     TIER_QUARK_SHARE,
-    TIER_ALIST_OFFLINE,
     TIER_LOCAL_MAGNET,
 })
 ALLOWED_DELIVERY_KINDS = frozenset({"video", "subtitle"})
@@ -91,7 +89,7 @@ def validate_provider_delivery(
 ) -> dict[str, object]:
     """Validate and normalize a materializer delivery result.
 
-    This is the shared boundary for all three acquisition lanes.  A delivery
+    This is the shared boundary for both acquisition lanes.  A delivery
     may describe only task-owned staging bytes; it must not carry any formal
     library destination, because Engine remains the sole naming/planning
     authority after admission.

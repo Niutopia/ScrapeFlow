@@ -168,8 +168,8 @@ class SubtitleProviderTests(unittest.TestCase):
         assrt_resp = json.dumps({
             "data": {
                 "subs": [
-                    {"id": 1, "url": "http://sub1.com", "native_name": "Show - 01 [繁体]", "format": "srt", "download_count": 10},
-                    {"id": 2, "url": "http://sub2.com", "native_name": "[Kamigami] Show - 01 [简中特效]", "format": "ass", "download_count": 500},
+                    {"id": 1, "url": "http://sub1.com/Show.S01E01.zh-TW.srt", "native_name": "Show - 01 [繁体]", "format": "srt", "download_count": 10},
+                    {"id": 2, "url": "http://sub2.com/Show.S01E01.zh-CN.ass", "native_name": "[Kamigami] Show - 01 [简中特效]", "format": "ass", "download_count": 500},
                 ]
             }
         }).encode("utf-8")
@@ -190,7 +190,7 @@ class SubtitleProviderTests(unittest.TestCase):
         results = service.search_gap(gap, {})
         self.assertEqual(len(results), 2)
         # Winner must be candidate #2 because of Kamigami match + ASS + Simplified Chinese
-        self.assertEqual(results[0]["url"], "http://sub2.com")
+        self.assertEqual(results[0]["url"], "http://sub2.com/Show.S01E01.zh-CN.ass")
         self.assertIn("Kamigami", results[0]["title"])
 
     def test_materializer_failover_to_second_candidate_on_content_failure(self) -> None:
@@ -206,8 +206,8 @@ class SubtitleProviderTests(unittest.TestCase):
 
         mock_discovery = MagicMock()
         mock_discovery.search_gap.return_value = [
-            {"provider": "assrt", "url": "http://example.com/bad.srt", "format": "srt", "weight_score": 200.0},
-            {"provider": "assrt", "url": "http://example.com/good.ass", "format": "ass", "weight_score": 150.0},
+            {"provider": "assrt", "url": "http://example.com/Show.S01E01.bad.srt", "direct_file": True, "format": "srt", "title": "Show S01E01 中文字幕", "weight_score": 200.0},
+            {"provider": "assrt", "url": "http://example.com/Show.S01E01.good.srt", "direct_file": True, "format": "srt", "title": "Show S01E01 中文字幕", "weight_score": 150.0},
         ]
         materializer = SubtitleMaterializer(
             discovery=mock_discovery,
@@ -234,8 +234,8 @@ class SubtitleProviderTests(unittest.TestCase):
             )
 
         self.assertEqual(len(acquisition["files"]), 1)
-        # Verify that candidate 2 (.ass) was installed after candidate 1 failed language check
-        self.assertIn("/quark/影视/ScrapeFlow/补源/test-root/subtitles/Show S01E01.zh-CN.ass", alist.files)
+        # Verify that candidate 2 was installed after candidate 1 failed language check.
+        self.assertIn("/quark/影视/ScrapeFlow/补源/test-root/subtitles/Show S01E01.zh-CN.srt", alist.files)
 
     def test_materializer_uses_production_alist_upload_signature(self) -> None:
         """The real AList client receives one complete target path and MIME."""
@@ -264,8 +264,8 @@ class SubtitleProviderTests(unittest.TestCase):
 
         discovery = MagicMock()
         discovery.search_gap.return_value = [{
-            "provider": "assrt", "url": "https://example.test/sub.srt",
-            "format": "srt",
+            "provider": "assrt", "url": "https://example.test/Show.S01E01.zh.srt",
+            "direct_file": True, "format": "srt", "title": "Show S01E01 中文字幕",
         }]
         materializer = SubtitleMaterializer(
             discovery=discovery,
@@ -294,6 +294,136 @@ class SubtitleProviderTests(unittest.TestCase):
             )],
         )
 
+    def test_materializer_refuses_season_pack_before_subtitle_download(self) -> None:
+        """A missing sidecar must never fetch an ambiguous season package."""
+        downloads: list[str] = []
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/show-season.zip",
+            "direct_file": True,
+            "format": "srt",
+            "title": "Show S01 完整字幕包",
+        }]
+        materializer = SubtitleMaterializer(
+            discovery=discovery,
+            downloader=lambda url: downloads.append(url) or b"not reached",
+        )
+        gap = {
+            "id": "missing_subtitle:pack",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        alist = MockAList()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                {"media": {"title": "Show"}}, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/pack/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(downloads, [])
+        self.assertEqual(alist.files, {})
+
+    def test_materializer_rejects_archive_payload_without_staging_it(self) -> None:
+        """An opaque endpoint returning a zip cannot become a subtitle sidecar."""
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/download/opaque-id",
+            "direct_file": True,
+            "format": "srt",
+            "title": "Show S01E01 中文字幕",
+        }]
+        downloads: list[str] = []
+        alist = MockAList()
+        gap = {
+            "id": "missing_subtitle:archive",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = SubtitleMaterializer(
+                discovery=discovery,
+                downloader=lambda url: downloads.append(url) or b"PK\x03\x04not-a-sidecar",
+            ).acquire_subtitles(
+                {"media": {"title": "Show"}}, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/archive/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(downloads, [])
+        self.assertEqual(alist.files, {})
+
+    def test_materializer_rejects_wrong_episode_before_subtitle_download(self) -> None:
+        """Ranking must never turn S01E02 into a sidecar for missing S01E01."""
+        downloads: list[str] = []
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/Show.S01E02.zh.srt",
+            "direct_file": True,
+            "format": "srt",
+            "title": "Show S01E02 中文字幕",
+        }]
+        alist = MockAList()
+        gap = {
+            "id": "missing_subtitle:wrong-episode",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = SubtitleMaterializer(
+                discovery=discovery,
+                downloader=lambda url: downloads.append(url) or b"not reached",
+            ).acquire_subtitles(
+                {"media": {"title": "Show"}}, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/wrong-episode/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(downloads, [])
+        self.assertEqual(alist.files, {})
+
+    def test_materializer_rejects_declared_format_mismatch_without_staging(self) -> None:
+        """The bytes must corroborate the candidate's exact sidecar extension."""
+        content = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是简体中文字幕，但候选假称为 ASS。\n"
+        ).encode("utf-8")
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/Show.S01E01.zh.ass",
+            "direct_file": True,
+            "format": "ass",
+            "title": "Show S01E01 中文字幕",
+        }]
+        alist = MockAList()
+        gap = {
+            "id": "missing_subtitle:format-mismatch",
+            "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = SubtitleMaterializer(
+                discovery=discovery, downloader=lambda _url: content,
+            ).acquire_subtitles(
+                {"media": {"title": "Show"}}, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/format-mismatch/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(alist.files, {})
+
     def test_materializer_stops_after_download_before_any_staging_write(self) -> None:
         """A scope withdrawn by the HTTP fetch cannot create/upload a sidecar."""
         content = (
@@ -303,8 +433,8 @@ class SubtitleProviderTests(unittest.TestCase):
         paused = {"value": False}
         discovery = MagicMock()
         discovery.search_gap.return_value = [{
-            "provider": "assrt", "url": "https://example.test/sub.srt",
-            "format": "srt",
+            "provider": "assrt", "url": "https://example.test/Show.S01E01.zh.srt",
+            "direct_file": True, "format": "srt", "title": "Show S01E01 中文字幕",
         }]
 
         def fetch(_url: str) -> bytes:
@@ -416,7 +546,7 @@ class SubtitleProviderTests(unittest.TestCase):
         mock_assrt = json.dumps({
             "data": {
                 "subs": [
-                    {"id": 100, "url": "http://example.com/sub.srt", "format": "srt", "download_count": 10}
+                    {"id": 100, "url": "http://example.com/Show.S01E01.zh.srt", "format": "srt", "native_name": "Show S01E01 中文字幕", "download_count": 10}
                 ]
             }
         }).encode("utf-8")

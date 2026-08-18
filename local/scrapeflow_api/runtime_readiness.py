@@ -9,7 +9,7 @@ import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from engine.scrapeflow.provider_capabilities import (
     QUARK_HELPER_NAME,
@@ -18,7 +18,7 @@ from engine.scrapeflow.provider_capabilities import (
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "alist_offline", "magnet"})
+EXPECTED_PROVIDER_LANES = frozenset({"quark_share", "magnet"})
 _BUILD_ID_RE = re.compile(r"(?P<sha>[0-9a-f]{7,64})(?P<dirty>-dirty)?\Z")
 
 
@@ -203,7 +203,7 @@ def _check_health(
     else:
         actual_lanes = {key for key in lanes if isinstance(key, str)}
         if actual_lanes != EXPECTED_PROVIDER_LANES:
-            issues.append("health.provider_capabilities must expose exactly the fixed three lanes")
+            issues.append("health.provider_capabilities must expose exactly the fixed lanes")
         for lane in EXPECTED_PROVIDER_LANES:
             row = lanes.get(lane)
             if not isinstance(row, Mapping):
@@ -259,47 +259,13 @@ def _check_control(control: Mapping[str, object], issues: list[str]) -> None:
     _expect_bool(control, "persistent", True, issues)
 
 
-def _check_alist_offline_readiness(
-    readiness: Mapping[str, object],
-    issues: list[str],
-) -> None:
-    """Require the real no-write AList/aria2 preflight proof.
-
-    ``/api/health`` intentionally remains a liveness/configuration surface;
-    its cached offline detail cannot prove that the AList tool, credentials,
-    aria2 RPC and staging route are usable now.  Acceptance therefore fetches
-    and validates the dedicated endpoint directly.
-    """
-    if readiness.get("status") != "ready":
-        issues.append("alist_offline.status must be ready")
-    _expect_bool(readiness, "verified", True, issues)
-    _expect_bool(readiness, "configured", True, issues)
-    _expect_bool(readiness, "read_only", True, issues)
-    checks = readiness.get("checks")
-    if not isinstance(checks, Mapping) or not checks:
-        issues.append("alist_offline.checks must be a non-empty object")
-    else:
-        for name, row in checks.items():
-            if not isinstance(name, str) or not isinstance(row, Mapping):
-                issues.append("alist_offline.checks must contain named objects")
-                break
-            if row.get("verified") is not True:
-                issues.append(f"alist_offline.checks.{name}.verified must be true")
-    remote_issues = readiness.get("issues")
-    if isinstance(remote_issues, list) and remote_issues:
-        # Do not reflect the remote text here: the endpoint redacts its own
-        # diagnostics, but acceptance evidence should not duplicate any
-        # potentially sensitive transport error either.
-        issues.append("alist_offline.issues must be empty")
-
-
 def runtime_readiness_evidence_issues(report: Mapping[str, object]) -> list[str]:
     """Validate the irreducible proof fields of a saved readiness report.
 
     The acceptance-package generator consumes a JSON artifact, which may have
     been created by an older checker or edited manually.  Re-check the image
-    identity and dedicated AList preflight here so a textual ``通过`` claim
-    cannot turn into acceptance evidence without those proofs.
+    identity here so a textual ``通过`` claim cannot turn into acceptance
+    evidence without that proof.
     """
     issues: list[str] = []
     expected = report.get("expected_commit")
@@ -317,11 +283,6 @@ def runtime_readiness_evidence_issues(report: Mapping[str, object]) -> list[str]
             issues.append("health.build_commit does not match expected commit")
         if not _is_utc_build_time(health.get("build_time")):
             issues.append("health.build_time must be a recorded ISO-8601 UTC timestamp")
-    offline = report.get("alist_offline")
-    if not isinstance(offline, Mapping):
-        issues.append("alist_offline must be an object")
-    else:
-        _check_alist_offline_readiness(offline, issues)
     return issues
 
 
@@ -333,7 +294,7 @@ def runtime_readiness_report(
     allow_existing_jobs: bool = False,
     fetch_json: FetchJson = _fetch_json,
 ) -> dict[str, Any]:
-    """Fetch health/control/AList preflight and return a read-only report."""
+    """Fetch health/control and return a read-only startup report."""
     issues: list[str] = []
     expected = expected_commit.strip() if isinstance(expected_commit, str) else ""
     if _parse_build_id(expected) is None:
@@ -346,13 +307,11 @@ def runtime_readiness_report(
             "issues": ["api_url must be an HTTP(S) loopback URL"],
             "health": None,
             "control": None,
-            "alist_offline": None,
         }
 
     endpoints = {
         "health": _endpoint(api_url, "/api/health"),
         "control": _endpoint(api_url, "/api/control"),
-        "alist_offline": _endpoint(api_url, "/api/readiness/alist-offline"),
     }
     payloads: dict[str, object] = {}
     for name, url in endpoints.items():
@@ -380,10 +339,6 @@ def runtime_readiness_report(
     control = payloads.get("control")
     if isinstance(control, Mapping):
         _check_control(control, issues)
-    alist_offline = payloads.get("alist_offline")
-    if isinstance(alist_offline, Mapping):
-        _check_alist_offline_readiness(alist_offline, issues)
-
     return {
         "status": "通过" if not issues else "失败",
         "api_url": api_url,
@@ -392,7 +347,6 @@ def runtime_readiness_report(
         "issues": issues,
         "health": health,
         "control": control,
-        "alist_offline": alist_offline,
     }
 
 

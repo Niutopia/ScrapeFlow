@@ -63,6 +63,28 @@ _SUBTITLE_CONTENT_TYPES = {
 
 _EPISODE_REGEX = re.compile(r"(?i)\bS0*(\d{1,3})[ ._-]*E0*(\d{1,4})\b|第0*(\d{1,4})[集话話]|\[0*(\d{1,4})[vV\d]*\]|\bEP0*(\d{1,4})\b")
 _SEASON_REGEX = re.compile(r"(?i)\bS0*(\d{1,3})\b|第0*(\d{1,3})季|\bSeason\s*0*(\d{1,3})\b")
+_DIRECT_EPISODE_PATH_RE = re.compile(
+    r"(?i)\bS0*(\d{1,3})[ ._-]*E0*(\d{1,4})\b"
+)
+_BARE_EPISODE_RE = re.compile(r"(?<![A-Za-z0-9])0*(\d{1,3})(?!\d)")
+_SUBTITLE_PACK_RE = re.compile(
+    r"(?i)(?:\b(?:complete|batch|collection|pack)\b|"
+    r"\bseason\s*\d+\s*(?:complete|pack)\b|"
+    r"全集|全\s*\d+\s*[集話话]|合集|合輯|整季|季包|字幕包|"
+    r"压缩包|壓縮包)"
+)
+_SUBTITLE_RANGE_RE = re.compile(
+    r"(?i)(?:S0*\d{1,3}[ ._-]*E?0*\d{1,4}|"
+    r"EP?0*\d{1,4}|第0*\d{1,4}[集話话])\s*(?:-|~|至|到)\s*"
+    r"(?:E?P?0*\d{1,4}|第0*\d{1,4}[集話话])"
+)
+_ARCHIVE_SUFFIXES = frozenset({
+    ".7z", ".bz2", ".gz", ".rar", ".tar", ".tgz", ".xz", ".zip",
+})
+_ARCHIVE_MAGIC_PREFIXES = (
+    b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"Rar!\x1a\x07",
+    b"7z\xbc\xaf\x27\x1c", b"\x1f\x8b",
+)
 
 _KNOWN_FANSUB_GROUPS = frozenset({
     "vcb-studio", "kamigami", "sweetsub", "lilith-raws", "airota", "moozzi2",
@@ -138,6 +160,199 @@ def extract_episode_numbers(text: str) -> set[int]:
             if g and g.isdigit():
                 numbers.add(int(g))
     return numbers
+
+
+def _candidate_episode_numbers(text: str) -> set[int]:
+    """Extract episode values without mistaking ``S01`` for episode 1."""
+    numbers: set[int] = set()
+    for match in _EPISODE_REGEX.finditer(text):
+        # The first alternative is SxxEyy: group 1 is its season and group 2
+        # is its episode.  The remaining alternatives each expose only one
+        # episode group.
+        if match.group(2):
+            numbers.add(int(match.group(2)))
+            continue
+        for value in match.groups()[2:]:
+            if value and value.isdigit():
+                numbers.add(int(value))
+    return numbers
+
+
+def _subtitle_identity_key(value: object) -> str:
+    return re.sub(
+        r"[^a-z0-9\u3400-\u9fff]+", "", str(value or "").casefold(),
+    )
+
+
+def _subtitle_identity_is_trusted(
+    candidate_title: str,
+    gap: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> bool:
+    """Require a meaningful work-title overlap before fetching one sidecar."""
+    media = gap.get("media") if isinstance(gap.get("media"), Mapping) else (
+        request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    )
+    values = [media.get("title"), *(
+        media.get("aliases") if isinstance(media.get("aliases"), list) else []
+    )]
+    title_key = _subtitle_identity_key(candidate_title)
+    for value in values:
+        key = _subtitle_identity_key(value)
+        han_count = sum("\u3400" <= char <= "\u9fff" for char in key)
+        if key and (len(key) >= 4 or han_count >= 2) and key in title_key:
+            return True
+    return False
+
+
+def _gap_episode_coordinate(gap: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    """Read the audited coordinate, using its formal video path only as fallback."""
+    season = gap.get("season")
+    episode = gap.get("episode")
+    parsed_season = season if type(season) is int and season >= 0 else None
+    parsed_episode = episode if type(episode) is int and episode > 0 else None
+    if parsed_episode is not None:
+        return parsed_season, parsed_episode
+    match = _DIRECT_EPISODE_PATH_RE.search(str(gap.get("path") or ""))
+    if match is None:
+        return parsed_season, None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _candidate_url_is_archive(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return True
+    path = urllib.parse.unquote(parsed.path).casefold()
+    return any(path.endswith(suffix) for suffix in _ARCHIVE_SUFFIXES)
+
+
+def _candidate_url_is_direct_sidecar(value: object, expected_format: object) -> bool:
+    """Require a typed direct subtitle-member URL, not an opaque download page.
+
+    A content-disposition filename or an archive manifest is only knowable
+    *after* fetching an opaque endpoint.  That is too late for the exact
+    acquisition contract: a provider could already have transferred a whole
+    season pack.  Restrict this lane to URLs whose member extension is visible
+    up front and agrees with the provider's declared format.
+    """
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    suffix = posixpath.splitext(urllib.parse.unquote(parsed.path))[1].casefold()
+    declared = str(expected_format or "").casefold().lstrip(".")
+    return (
+        suffix in SUPPORTED_SUBTITLE_EXTENSIONS
+        and suffix.lstrip(".") == declared
+    )
+
+
+def _subtitle_url_exactly_matches_gap(
+    value: object,
+    gap: Mapping[str, Any],
+) -> bool:
+    """Require the direct sidecar filename to corroborate the audited episode.
+
+    A title can be stale or copied from a release page.  For episodic gaps,
+    the URL-visible member filename must independently name one—and only
+    one—matching episode.  This deliberately declines opaque provider
+    downloads and generic ``subtitle.srt`` links rather than guessing.
+    """
+    if not isinstance(value, str):
+        return False
+    path = urllib.parse.unquote(urllib.parse.urlsplit(value).path)
+    filename = posixpath.basename(path)
+    if not filename:
+        return False
+    if (
+        _SUBTITLE_PACK_RE.search(filename) is not None
+        or _SUBTITLE_RANGE_RE.search(filename) is not None
+    ):
+        return False
+    season, episode = _gap_episode_coordinate(gap)
+    if episode is None:
+        return True
+    advertised_episodes = _candidate_episode_numbers(filename)
+    if advertised_episodes:
+        if advertised_episodes != {episode}:
+            return False
+    else:
+        bare = {int(item) for item in _BARE_EPISODE_RE.findall(filename)}
+        if bare != {episode}:
+            return False
+    advertised_seasons = {
+        int(item)
+        for match in _SEASON_REGEX.finditer(filename)
+        for item in match.groups()
+        if item is not None
+    }
+    return not advertised_seasons or season is None or advertised_seasons == {season}
+
+
+def _subtitle_payload_is_archive(value: bytes) -> bool:
+    stripped = value.lstrip().lower()
+    return (
+        value.startswith(_ARCHIVE_MAGIC_PREFIXES)
+        or stripped.startswith((b"<", b"{"))
+    )
+
+
+def subtitle_candidate_exactly_matches_gap(
+    candidate: Mapping[str, Any],
+    gap: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> bool:
+    """Return whether one remote sidecar is safe to fetch for one open gap.
+
+    Ranking is deliberately not proof.  This gate requires a work identity,
+    an exact episode coordinate (where the audit has one), no pack/range
+    markers, and a direct non-archive URL.  Any uncertainty leaves the gap
+    open for a later exact candidate rather than downloading a season bundle.
+    """
+    if str(gap.get("kind") or "") != "missing_subtitle":
+        return False
+    title = str(candidate.get("title") or "").strip()
+    declared_format = str(candidate.get("format") or "srt").casefold().lstrip(".")
+    if (
+        candidate.get("direct_file") is not True
+        or not title
+        or _candidate_url_is_archive(candidate.get("url"))
+        or not _candidate_url_is_direct_sidecar(
+            candidate.get("url"), declared_format,
+        )
+        or not _subtitle_url_exactly_matches_gap(candidate.get("url"), gap)
+        or _SUBTITLE_PACK_RE.search(title) is not None
+        or _SUBTITLE_RANGE_RE.search(title) is not None
+        or not _subtitle_identity_is_trusted(title, gap, request)
+    ):
+        return False
+    season, episode = _gap_episode_coordinate(gap)
+    if episode is None:
+        # A movie sidecar has no episode coordinate, but it still needs the
+        # title proof above and must not advertise a multi-episode package.
+        return True
+    advertised_episodes = _candidate_episode_numbers(title)
+    if advertised_episodes:
+        if advertised_episodes != {episode}:
+            return False
+    else:
+        # Common fansub names use ``Show - 02`` rather than S01E02.  Allow
+        # only that single, delimiter-bounded ordinal after the work identity
+        # gate; broad numbers or ranges never become an implicit season pack.
+        bare = {int(value) for value in _BARE_EPISODE_RE.findall(title)}
+        if bare != {episode}:
+            return False
+    advertised_seasons = {
+        int(value)
+        for match in _SEASON_REGEX.finditer(title)
+        for value in match.groups()
+        if value is not None
+    }
+    return not advertised_seasons or season is None or advertised_seasons == {season}
 
 
 def score_subtitle_candidate(
@@ -316,10 +531,17 @@ class SubtitleDiscoveryService:
                     sub_id = item.get("id") or item.get("sub_id")
                     file_url = item.get("url") or (f"https://api.assrt.net/v1/sub/detail?id={sub_id}" if sub_id else None)
                     if file_url:
+                        fmt = str(item.get("format") or "srt").lower().lstrip(".")
                         candidates.append({
                             "provider": PROVIDER_SUBTITLE_ASSRT,
                             "url": str(file_url),
-                            "format": str(item.get("format") or "srt").lower().lstrip("."),
+                            # A provider-supplied URL is still not enough:
+                            # it must visibly name one raw subtitle member,
+                            # rather than an opaque detail/download page.
+                            "direct_file": _candidate_url_is_direct_sidecar(
+                                file_url, fmt,
+                            ),
+                            "format": fmt,
                             "language": lang,
                             "title": str(item.get("native_name") or item.get("videoname") or title),
                             "downloads": int(item.get("download_count") or 0),
@@ -358,6 +580,10 @@ class SubtitleDiscoveryService:
                 candidates.append({
                     "provider": PROVIDER_SUBTITLE_SUBHD,
                     "url": f"https://subhd.tv/a/{sub_id}",
+                    # Search pages are useful evidence but not a subtitle
+                    # member URL.  Do not materialize them until the source
+                    # exposes typed direct-file metadata.
+                    "direct_file": False,
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
@@ -386,6 +612,7 @@ class SubtitleDiscoveryService:
                 candidates.append({
                     "provider": PROVIDER_SUBTITLE_ZIMUKU,
                     "url": f"https://zimuku.org{sub_path}",
+                    "direct_file": False,
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
@@ -414,6 +641,7 @@ class SubtitleDiscoveryService:
                 candidates.append({
                     "provider": PROVIDER_SUBTITLE_A4K,
                     "url": f"https://a4k.net{sub_path}",
+                    "direct_file": False,
                     "format": fmt,
                     "language": lang,
                     "title": sub_title,
@@ -445,6 +673,9 @@ class SubtitleDiscoveryService:
                     candidates.append({
                         "provider": PROVIDER_SUBTITLE_ANIMETOSHO,
                         "url": sub_url,
+                        "direct_file": _candidate_url_is_direct_sidecar(
+                            sub_url, ext.lstrip("."),
+                        ),
                         "format": ext.lstrip("."),
                         "language": lang,
                         "title": sub_title,
@@ -486,6 +717,11 @@ class SubtitleDiscoveryService:
                         candidates.append({
                             "provider": PROVIDER_SUBTITLE_OPENSUBTITLES,
                             "url": f"https://api.opensubtitles.com/api/v1/download/{file_id}",
+                            # This endpoint is intentionally opaque.  It may
+                            # negotiate/archive a payload, so it is search
+                            # evidence only until the provider exposes a
+                            # typed, direct sidecar URL.
+                            "direct_file": False,
                             "format": str(attr.get("format") or "srt").lower().lstrip("."),
                             "language": lang,
                             "title": str(attr.get("release") or attr.get("movie_name") or ""),
@@ -613,7 +849,9 @@ class SubtitleDiscoveryService:
         deduped: dict[str, dict[str, Any]] = {}
         for item in raw_candidates:
             url_key = str(item.get("url") or "")
-            if not url_key:
+            if not url_key or not subtitle_candidate_exactly_matches_gap(
+                item, gap, request,
+            ):
                 continue
             item["gap_id"] = str(gap.get("id") or "")
             computed_score = score_subtitle_candidate(item, gap, request)
@@ -771,7 +1009,12 @@ class SubtitleMaterializer:
             for candidate in candidates:
                 _pause_checkpoint(pause_requested)
                 download_url = candidate.get("url")
-                if not download_url:
+                if (
+                    not download_url
+                    or not subtitle_candidate_exactly_matches_gap(
+                        candidate, gap, request,
+                    )
+                ):
                     continue
 
                 try:
@@ -781,6 +1024,10 @@ class SubtitleMaterializer:
                         raise SubtitleProviderError(f"下载的字幕文件过小 ({len(raw_bytes)} bytes)")
                     if len(raw_bytes) > MAX_SUBTITLE_BYTES:
                         raise SubtitleProviderError(f"下载的字幕文件过大 ({len(raw_bytes)} bytes)")
+                    if _subtitle_payload_is_archive(raw_bytes):
+                        raise SubtitleProviderError(
+                            "字幕候选是网页或压缩包，拒绝整包下载"
+                        )
 
                     fmt = str(candidate.get("format") or "srt").lower().lstrip(".")
                     if f".{fmt}" not in SUPPORTED_SUBTITLE_EXTENSIONS:
@@ -788,8 +1035,15 @@ class SubtitleMaterializer:
 
                     target_lang = normalize_subtitle_language(gap.get("subtitle_language") or "zh") or "simplified_chinese"
                     verdict = classify_subtitle_content(raw_bytes, target_lang)
-                    if str(verdict.get("status") or "").casefold() == "missing":
-                        raise SubtitleProviderError(f"字幕内容未通过目标语言 ({target_lang}) 校验")
+                    if str(verdict.get("status") or "").casefold() != "satisfied":
+                        raise SubtitleProviderError(
+                            f"字幕内容未能证明目标语言 ({target_lang})"
+                        )
+                    detected_format = str(verdict.get("format") or "").casefold()
+                    if detected_format != fmt:
+                        raise SubtitleProviderError(
+                            "字幕内容格式与候选声明不一致"
+                        )
 
                     # Name staging file to match video stem
                     video_path = str(gap.get("path") or "")

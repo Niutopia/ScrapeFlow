@@ -239,15 +239,21 @@ def normalize_quark_fast_save_selection(selection: Mapping[str, Any]) -> dict[st
         if not name or name in {".", ".."} or "/" in name or "\\" in name:
             raise QuarkBridgeError("Quark file path has no safe basename")
         file_name_by_gap[gap] = name
-        row = by_id.setdefault(file_id, {
+        row = by_id.get(file_id)
+        if row is not None:
+            # A single share member cannot close two independently audited
+            # gaps.  The discovery adapter already avoids this for ordinary
+            # episode candidates, but the bridge is also the replay/manual
+            # candidate boundary and must not merge an old or edited mapping.
+            raise QuarkBridgeError(
+                "one Quark file id cannot satisfy multiple selected gaps"
+            )
+        by_id[file_id] = {
             "file_id": file_id,
             "name": name,
             "size": raw_size,
-            "gap_ids": [],
-        })
-        if row["name"] != name or row["size"] != raw_size:
-            raise QuarkBridgeError("Quark file id has conflicting manifest metadata")
-        row["gap_ids"].append(gap)
+            "gap_ids": [gap],
+        }
     names = [str(row["name"]) for row in by_id.values()]
     if len(names) != len(set(names)):
         raise QuarkBridgeError("Quark selected files collide at destination basename")

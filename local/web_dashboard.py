@@ -472,7 +472,7 @@ button:focus-visible,[role="button"]:focus-visible{
     pending:"等待处理",running:"处理中"
   };
   var shelfLabels = {movie:"电影",anime:"番剧",us_tv:"美剧"};
-  var tierLabels = {quark_share:"夸克分享",alist_offline:"AList 离线",magnet:"本地磁力"};
+  var tierLabels = {quark_share:"夸克分享",magnet:"本地磁力"};
 
   function number(value){ return typeof value === "number" && isFinite(value) ? value : 0; }
   function jobTitle(job){
