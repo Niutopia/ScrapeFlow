@@ -701,6 +701,7 @@ class SimpleApplication:
     def health(self) -> dict[str, object]:
         operations = self._operations_summary()
         provider_workers = self._provider_worker_configuration()
+        control = self.control()
         pilot_scope = self._pilot_scope_view()
         alist_configured = self.remote_configured
         tmdb_configured = bool(os.getenv("TMDB_API_KEY", "").strip())
@@ -761,6 +762,13 @@ class SimpleApplication:
             # authenticated health probe of the out-of-process Quark Helper.
             "helper_readiness": {"quark": helper_readiness},
             "dependencies": dependencies,
+            # The compact console needs the effective pause fence to separate
+            # a deliberately parked RootJob from a stalled or failed one.
+            # This is only control state, not a second readiness report.
+            "control": {
+                "paused": control.get("paused") is not False,
+                "reason": str(control.get("reason") or ""),
+            },
             "automatic_scope": pilot_scope,
             "lane_gates": {
                 "provider_auto_repair_enabled": self._provider_auto_repair_enabled(),
@@ -2766,6 +2774,16 @@ class SimpleApplication:
                     )
                 if provider_status == "failed" and replenishment.get("terminal") is True:
                     return "failed_provider", str(replenishment.get("error") or "自动补源未能收口媒体缺口")
+                if provider_status == "needs_attention":
+                    # A legacy subtitle-only EngineJob is deliberately not
+                    # routed into the new RootJob writer.  It is terminal for
+                    # automation, but still needs an operator migration; do
+                    # not let the audit-owned completion projection paint it
+                    # green just because it has no retry timer.
+                    return "needs_attention", str(
+                        replenishment.get("error")
+                        or "旧字幕任务需要迁移到 RootJob 字幕通道"
+                    )
                 if provider_status == "retry_wait":
                     return "retry_wait", str(
                         replenishment.get("error") or "补源已排队，等待下一次自动重试"
@@ -4432,6 +4450,64 @@ class SimpleApplication:
             outcome = runtime.run_for_job(provider_job)
             summary_before = dict(job.summary)
             outcome = dict(outcome)
+            raw_legacy_subtitle_ids = outcome.get(
+                "legacy_subtitle_migration_gap_ids"
+            )
+            legacy_subtitle_migration_ids = {
+                gap_id
+                for gap_id in raw_legacy_subtitle_ids
+                if isinstance(gap_id, str) and gap_id
+            } if isinstance(raw_legacy_subtitle_ids, list) else set()
+            raw_legacy_companion_ids = outcome.get(
+                "legacy_companion_subtitle_migration_gap_ids"
+            )
+            legacy_companion_migration_ids = {
+                gap_id
+                for gap_id in raw_legacy_companion_ids
+                if isinstance(gap_id, str) and gap_id
+            } if isinstance(raw_legacy_companion_ids, list) else set()
+            all_legacy_subtitle_migration_ids = (
+                legacy_subtitle_migration_ids | legacy_companion_migration_ids
+            )
+            if all_legacy_subtitle_migration_ids:
+                # The legacy EngineJob subtitle lane intentionally has no
+                # write/retry path.  Preserve this explicit migration stop
+                # across repeated scheduler observations instead of letting
+                # an empty ``outcomes`` list turn the root green.
+                legacy_direct_migration_ids = (
+                    all_legacy_subtitle_migration_ids
+                    - legacy_companion_migration_ids
+                )
+                if legacy_direct_migration_ids and legacy_companion_migration_ids:
+                    migration_error = (
+                        "检测到已停用的旧字幕补源状态；请通过 RootJob 字幕通道"
+                        "重新触发或重新审计"
+                    )
+                elif legacy_companion_migration_ids:
+                    migration_error = (
+                        "历史媒体补源携带的字幕成员未作为字幕交付；"
+                        "请通过 RootJob 字幕通道重新审计"
+                    )
+                else:
+                    migration_error = (
+                        "旧字幕自动通道已停用；请通过 RootJob 字幕通道重新触发"
+                    )
+                outcome.update({
+                    "status": "needs_attention",
+                    "terminal": True,
+                    "next_retry_seconds": None,
+                    "migration_required": True,
+                    "legacy_subtitle_migration_gap_ids": sorted(
+                        all_legacy_subtitle_migration_ids
+                    ),
+                    "legacy_companion_subtitle_migration_gap_ids": sorted(
+                        legacy_companion_migration_ids
+                    ),
+                    "error": migration_error,
+                })
+                self._record_replenishment_summary(job, outcome)
+                self._cancel_job_timers(job_id)
+                return
             cancelled = outcome.get("cancelled") is True or any(
                 isinstance(row, Mapping) and row.get("cancelled") is True
                 for row in outcome.get("outcomes", [])
@@ -6650,6 +6726,8 @@ class SimpleApplication:
         if display_phase == "failed_verification" and audit_message:
             provider_message = audit_message
         elif display_phase == "failed_provider" and audit_message:
+            provider_message = audit_message
+        elif display_phase == "needs_attention" and audit_message:
             provider_message = audit_message
         elif display_phase == "retry_wait" and audit_message:
             provider_message = audit_message

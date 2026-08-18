@@ -3,9 +3,12 @@ from __future__ import annotations
 import unittest
 
 from engine.scrapeflow.subtitle_content import (
+    classify_bilingual_subtitle_content,
     classify_subtitle_content,
     extract_subtitle_body,
+    merge_bilingual_subtitle,
     normalize_subtitle_language,
+    parse_subtitle_document,
 )
 
 
@@ -73,7 +76,161 @@ class SubtitleContentTests(unittest.TestCase):
         self.assertEqual(normalize_subtitle_language("zh"), "simplified_chinese")
         self.assertEqual(normalize_subtitle_language("zh-Hant"), "traditional_chinese")
         self.assertEqual(normalize_subtitle_language("ja"), "japanese")
+        self.assertEqual(normalize_subtitle_language("en-US"), "english")
+        self.assertEqual(normalize_subtitle_language("ko"), "korean")
         self.assertIsNone(normalize_subtitle_language("xx"))
+
+    def test_strict_srt_merge_puts_chinese_then_original_in_one_file(self) -> None:
+        chinese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "这是一个简体中文测试。\n\n"
+            "2\n00:00:04,000 --> 00:00:06,000\n"
+            "我们现在开始。\n"
+        )
+        japanese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "これはテストです。\n\n"
+            "2\n00:00:04,000 --> 00:00:06,000\n"
+            "いま始めます。\n"
+        )
+        result = merge_bilingual_subtitle(chinese, japanese, "ja")
+        self.assertEqual(result["status"], "satisfied")
+        self.assertEqual(result["format"], "srt")
+        self.assertEqual(result["cue_count"], 2)
+        merged = result["content"]
+        self.assertIsInstance(merged, bytes)
+        text = merged.decode("utf-8")
+        self.assertIn("这是一个简体中文测试。\nこれはテストです。", text)
+        self.assertIn("我们现在开始。\nいま始めます。", text)
+        self.assertEqual(
+            classify_bilingual_subtitle_content(merged, "ja")["status"],
+            "satisfied",
+        )
+
+    def test_strict_vtt_merge_preserves_timing_settings_and_utf8_output(self) -> None:
+        chinese = _utf8(
+            "WEBVTT\n\n"
+            "cue-1\n00:01.000 --> 00:03.000 line:80%\n"
+            "这是简体中文字幕。\n"
+        )
+        english = _utf8(
+            "WEBVTT\n\n"
+            "cue-1\n00:01.000 --> 00:03.000 line:20%\n"
+            "This is a subtitle, and it will show you the words.\n"
+        )
+        result = merge_bilingual_subtitle(chinese, english, "en")
+        self.assertEqual(result["status"], "satisfied")
+        self.assertEqual(result["format"], "vtt")
+        text = result["content"].decode("utf-8")
+        self.assertIn("00:00:01.000 --> 00:00:03.000 line:80%", text)
+        self.assertIn("这是简体中文字幕。\nThis is a subtitle", text)
+        self.assertEqual(text.count("-->") , 1)
+
+    def test_merge_rejects_timing_or_count_mismatch_without_bytes(self) -> None:
+        chinese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n"
+        )
+        shifted = _utf8(
+            "1\n00:00:01,001 --> 00:00:03,000\nこれはテストです。\n"
+        )
+        shifted_result = merge_bilingual_subtitle(chinese, shifted, "ja")
+        self.assertEqual(shifted_result["status"], "unknown")
+        self.assertEqual(shifted_result["reason"], "subtitle_timing_mismatch")
+        self.assertNotIn("content", shifted_result)
+
+        extra = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\nこれはテストです。\n\n"
+            "2\n00:00:04,000 --> 00:00:05,000\nもう一つです。\n"
+        )
+        count_result = merge_bilingual_subtitle(chinese, extra, "ja")
+        self.assertEqual(count_result["reason"], "subtitle_cue_count_mismatch")
+        self.assertNotIn("content", count_result)
+
+    def test_merge_rejects_multiline_source_or_reversed_bilingual_cues(self) -> None:
+        chinese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n第二行\n"
+        )
+        japanese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\nこれはテストです。\n"
+        )
+        result = merge_bilingual_subtitle(chinese, japanese, "ja")
+        self.assertEqual(result["reason"], "subtitle_multiline_cue_unsupported")
+        self.assertNotIn("content", result)
+
+        reversed_lines = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "これはテストです。\n这是简体中文字幕。\n"
+        )
+        verdict = classify_bilingual_subtitle_content(reversed_lines, "ja")
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertEqual(verdict["reason"], "bilingual_cue_language_order_not_proven")
+
+    def test_bilingual_validator_proves_each_cue_not_just_the_aggregate(self) -> None:
+        mixed = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "这是简体中文字幕。\nこれはテストです。\n\n"
+            "2\n00:00:04,000 --> 00:00:06,000\n"
+            "This line is only English, and it has enough words.\n"
+            "This line is only English, and it has enough words.\n"
+        )
+
+        verdict = classify_bilingual_subtitle_content(mixed, "ja")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertEqual(verdict["reason"], "bilingual_cue_language_order_not_proven")
+
+    def test_merge_rejects_format_mismatch_and_unproven_languages(self) -> None:
+        chinese = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n"
+        )
+        japanese_vtt = _utf8(
+            "WEBVTT\n\n00:01.000 --> 00:03.000\nこれはテストです。\n"
+        )
+        result = merge_bilingual_subtitle(chinese, japanese_vtt, "ja")
+        self.assertEqual(result["reason"], "subtitle_format_mismatch")
+        self.assertNotIn("content", result)
+
+        wrong_language = merge_bilingual_subtitle(
+            chinese,
+            _utf8("1\n00:00:01,000 --> 00:00:03,000\n這是繁體中文字幕。\n"),
+            "ja",
+        )
+        self.assertEqual(wrong_language["reason"], "original_language_not_proven")
+        self.assertNotIn("content", wrong_language)
+
+    def test_merge_rejects_vtt_style_or_region_blocks_without_rewriting_them(self) -> None:
+        chinese = _utf8(
+            "WEBVTT\n\nSTYLE\n::cue { color: yellow; }\n\n"
+            "00:01.000 --> 00:03.000\n这是简体中文字幕。\n"
+        )
+        japanese = _utf8(
+            "WEBVTT\n\n00:01.000 --> 00:03.000\nこれはテストです。\n"
+        )
+        result = merge_bilingual_subtitle(chinese, japanese, "ja")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "subtitle_decode_or_format_unknown")
+        self.assertNotIn("content", result)
+
+    def test_parser_rejects_archive_and_malformed_payloads(self) -> None:
+        self.assertIsNone(parse_subtitle_document(b"PK\x03\x04not a subtitle"))
+        self.assertIsNone(parse_subtitle_document(
+            _utf8("1\n00:00:01,000 --> 00:00:03,000\n")
+        ))
+
+    def test_ass_merge_is_strict_and_uses_ass_line_break(self) -> None:
+        chinese = _utf8(
+            "[Script Info]\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,这是简体中文字幕。\n"
+        )
+        japanese = _utf8(
+            "[Script Info]\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,これはテストです。\n"
+        )
+        result = merge_bilingual_subtitle(chinese, japanese, "ja")
+        self.assertEqual(result["status"], "satisfied")
+        self.assertIn("这是简体中文字幕。\\Nこれはテストです。", result["content"].decode())
 
 
 if __name__ == "__main__":

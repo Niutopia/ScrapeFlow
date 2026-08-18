@@ -7,17 +7,20 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from engine.scrapeflow.gap_ledger import (
     Gap,
     load_gap_ledger,
     save_gap_ledger,
 )
+from engine.scrapeflow.subtitle_content import DEFAULT_MAX_PREFIX_BYTES
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 
 from local.scrapeflow_api.root_replenishment import (
     PreUpgradeAListStateError,
+    _validate_root_subtitle_content,
     load_root_replenishment_state,
     run_root_replenishment,
     save_root_replenishment_state,
@@ -114,6 +117,72 @@ class _FakeMaterializer:
         if self.reconcile_error is not None:
             raise self.reconcile_error
         return self.reconcile_delivery
+
+
+class _FakeSubtitleMaterializer:
+    """Direct-sidecar double for the RootJob subtitle branch."""
+
+    def __init__(
+        self,
+        *,
+        payload: bytes | None = None,
+        bilingual: bool = False,
+        original_language: str | None = None,
+        error: Exception | None = None,
+        events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.payload = payload
+        self.bilingual = bilingual
+        self.original_language = original_language
+        self.error = error
+        self.events = events
+
+    def acquire_subtitles(
+        self,
+        request,
+        gaps,
+        *,
+        staging_root,
+        workspace,
+        alist,
+        pause_requested=None,
+    ):
+        del workspace
+        if pause_requested is not None and pause_requested():
+            error = RuntimeError("paused")
+            error.pause_requested = True  # type: ignore[attr-defined]
+            raise error
+        if self.events is not None:
+            self.events.append({
+                "request": dict(request),
+                "gaps": [dict(row) for row in gaps],
+                "staging_root": staging_root,
+            })
+        if self.error is not None:
+            raise self.error
+        if self.payload is None:
+            return {"delivery_kind": "subtitle_delivery", "files": []}
+        gap = dict(gaps[0])
+        path = f"{staging_root}/subtitle.srt"
+        alist.files[path] = self.payload
+        return {
+            "delivery_kind": "subtitle_delivery",
+            "files": [{
+                "path": path,
+                "size": len(self.payload),
+                "gap_ids": [gap["id"]],
+                "kind": "subtitle",
+                "bilingual": self.bilingual,
+                **({"original_language": self.original_language}
+                   if self.original_language else {}),
+                **({"subtitle_marker": {
+                    "japanese": "zh-CN-bilingual-ja",
+                    "english": "zh-CN-bilingual-en",
+                    "korean": "zh-CN-bilingual-ko",
+                }.get(self.original_language or "")}
+                   if self.bilingual else {}),
+            }],
+        }
 
 
 def _work_unit(
@@ -284,6 +353,29 @@ class RootReplenishmentTests(unittest.TestCase):
             ),
         ])
 
+    def _seed_subtitle_gap(self, state_root: Path) -> None:
+        save_work_unit_records(state_root, "root-1", [
+            _work_unit(
+                "root-1", "unit-tv", media_type="tv", tmdb_id=35507,
+                title="Fate/Zero",
+            ),
+        ])
+        save_gap_ledger(state_root, "root-1", [
+            Gap(
+                gap_id="unit-tv::missing_subtitle::zh",
+                root_task_id="root-1",
+                work_unit_id="unit-tv",
+                kind="missing_subtitle",
+                media_type="tv",
+                tmdb_id=35507,
+                season=None,
+                episodes=(),
+                subtitle_path="/library/番剧/Fate Zero/S01E01.mkv",
+                subtitle_language="zh",
+                status="open",
+            ),
+        ])
+
     def _runner(self, state_root: Path, *, planner=None):
         return SimpleEngineRunner(
             state_root,
@@ -299,6 +391,55 @@ class RootReplenishmentTests(unittest.TestCase):
         state = load_root_replenishment_state(state_root, root_task_id)
         state["tier"] = tier
         save_root_replenishment_state(state_root, root_task_id, state)
+
+    def test_root_subtitle_full_read_rejects_invalid_tail_past_normal_audit_prefix(self) -> None:
+        """Writer proof must not accept a Chinese prefix plus unrelated tail."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            source = "/library/staging/large.zh-CN.srt"
+            chinese_body = "这是一个简体中文字幕内容我们继续观看。" * (
+                DEFAULT_MAX_PREFIX_BYTES // len("这是一个简体中文字幕内容我们继续观看。".encode("utf-8")) + 2
+            )
+            payload = (
+                "1\n00:00:00,000 --> 00:00:02,000\n"
+                + chinese_body + "\n\n"
+                +
+                "999\n00:00:03,000 --> 00:00:05,000\n"
+                "This tail is not a Simplified Chinese subtitle.\n"
+            ).encode("utf-8")
+            self.assertGreater(len(payload), DEFAULT_MAX_PREFIX_BYTES)
+            runner = self._runner(state_root)
+            runner.alist.files[source] = payload
+
+            verdict = _validate_root_subtitle_content(
+                runner, source, expected_size=len(payload), bilingual=False,
+                original_language=None,
+            )
+
+            self.assertEqual(verdict["status"], "unknown")
+            self.assertEqual(verdict["reason"], "subtitle_cue_language_not_proven")
+
+    def test_root_subtitle_full_read_accepts_large_pure_chinese_sidecar(self) -> None:
+        """The full-read fence is stricter, not an accidental 512 KiB limit."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            source = "/library/staging/large-pure.zh-CN.srt"
+            chinese_body = "这是一个简体中文字幕内容我们继续观看。" * (
+                DEFAULT_MAX_PREFIX_BYTES // len("这是一个简体中文字幕内容我们继续观看。".encode("utf-8")) + 2
+            )
+            payload = (
+                "1\n00:00:00,000 --> 00:00:02,000\n" + chinese_body + "\n"
+            ).encode("utf-8")
+            self.assertGreater(len(payload), DEFAULT_MAX_PREFIX_BYTES)
+            runner = self._runner(state_root)
+            runner.alist.files[source] = payload
+
+            verdict = _validate_root_subtitle_content(
+                runner, source, expected_size=len(payload), bilingual=False,
+                original_language=None,
+            )
+
+            self.assertEqual(verdict["status"], "satisfied")
 
     # --- state / no-op / bridge integration ---------------------------------
 
@@ -765,6 +906,47 @@ class RootReplenishmentTests(unittest.TestCase):
                 ),
             )
 
+    def test_root_video_materializer_never_receives_torrent_companion_subtitle(self) -> None:
+        """Only the RootJob subtitle channel may select a sidecar member."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            events: list[dict[str, Any]] = []
+            selection = {
+                "provider": "magnet",
+                "locator": "torrent:https://example.test/show.torrent",
+                "release_name": "Fate Zero S01E02",
+                "selected_gap_ids": ["S01E02"],
+                "acquisition": {
+                    "kind": "torrent",
+                    "file_index_by_gap": {"S01E02": [1]},
+                    "companion_subtitle_index_by_media_gap": {"S01E02": [2]},
+                    "file_size_by_index": {"1": 123, "2": 321},
+                    "file_path_by_index": {
+                        "1": "Fate.Zero.S01E02.mkv",
+                        "2": "Fate.Zero.S01E02.zh-CN.srt",
+                    },
+                },
+            }
+            with patch(
+                "local.scrapeflow_api.root_replenishment.gap_ledger_selection",
+                return_value={"selections": [selection], "search_evidence": {}},
+            ):
+                run_root_replenishment(
+                    runner,
+                    state_root,
+                    "root-1",
+                    materializer_factory=lambda _tier: _FakeMaterializer(events=events),
+                )
+
+            self.assertEqual(len(events), 1)
+            acquisition = events[0]["selections"][0]["acquisition"]
+            self.assertNotIn("companion_subtitle_index_by_media_gap", acquisition)
+
     def test_close_gap_only_after_coverage_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
@@ -1083,7 +1265,7 @@ class RootReplenishmentTests(unittest.TestCase):
             ]
             self.assertIn("torrent:https://example.test/S01E02.torrent", excluded)
 
-    def test_subtitle_gaps_never_enter_the_video_tiers(self) -> None:
+    def test_subtitle_gap_installs_one_tmdb_verified_bilingual_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             save_work_unit_records(state_root, "root-1", [
@@ -1108,24 +1290,246 @@ class RootReplenishmentTests(unittest.TestCase):
                 ),
             ])
             self._set_tier(state_root, "root-1", "magnet")
-            events: list[dict[str, Any]] = []
+            video_events: list[dict[str, Any]] = []
+            subtitle_events: list[dict[str, Any]] = []
+            runner = self._runner(state_root)
+            alist = runner.alist
+            alist.files["/library/番剧/Fate Zero/S01E01.mkv"] = b"video"
+
+            class DetailsTMDB:
+                def get(self, path, **_kwargs):
+                    return {
+                        "/tv/35507": {
+                            "name": "Fate/Zero",
+                            "original_name": "Fate/Zero",
+                            "original_language": "ja",
+                        },
+                    }.get(path)
+
+            runner.tmdb = DetailsTMDB()
+
+            def install(
+                source, target, *, expected_size, video_path=None,
+                subtitle_language=None, subtitle_validator=None,
+                pause_requested=None,
+            ):
+                self.assertEqual(video_path, "/library/番剧/Fate Zero/S01E01.mkv")
+                self.assertEqual(subtitle_language, "zh")
+                self.assertTrue(target.endswith(".zh-CN-bilingual-ja.srt"))
+                self.assertNotIn(".ja.", target)
+                self.assertIsNotNone(subtitle_validator)
+                self.assertEqual(
+                    subtitle_validator(source, "zh")["status"], "satisfied",
+                )
+                self.assertFalse(pause_requested and pause_requested())
+                payload = alist.files.pop(source)
+                self.assertEqual(len(payload), expected_size)
+                alist.files[target] = payload
+                return {"size": len(payload), "target": target}
+
+            runner.install_subtitle_sidecar = install  # type: ignore[method-assign]
+            bilingual_srt = (
+                "1\n00:00:00,000 --> 00:00:02,000\n"
+                "这是一个测试字幕内容我们现在开始吧\n"
+                "これはてすとじまくです\n\n"
+                "2\n00:00:03,000 --> 00:00:05,000\n"
+                "这个故事现在继续进行我们一起看看\n"
+                "ここからつづきます\n"
+            ).encode("utf-8")
             result = run_root_replenishment(
-                self._runner(state_root),
+                runner,
                 state_root, "root-1",
                 search_runner=_magnet_search("S01E01"),
-                materializer_factory=lambda tier: _FakeMaterializer(events=events),
+                materializer_factory=lambda tier: _FakeMaterializer(events=video_events),
+                subtitle_materializer_factory=lambda: _FakeSubtitleMaterializer(
+                    payload=bilingual_srt,
+                    bilingual=True,
+                    original_language="japanese",
+                    events=subtitle_events,
+                ),
             )
-            # The subtitle channel owns subtitle gaps; the video tiers must
-            # never search or acquire for them.
-            self.assertEqual(events, [])
+            # The subtitle channel owns subtitle gaps; video providers do not
+            # search/acquire them, and only one Chinese-named final file exists.
+            self.assertEqual(video_events, [])
+            self.assertEqual(len(subtitle_events), 1)
+            media = subtitle_events[0]["request"]["media"]
+            self.assertEqual(media["original_language"], "japanese")
+            self.assertIs(media["original_language_verified_by_tmdb"], True)
             self.assertEqual(result["requests_built"], 0)
             self.assertEqual(result["gaps_closed"], [])
+            self.assertEqual(result["subtitle_gaps_closed"], [
+                "unit-tv::missing_subtitle::zh",
+            ])
             gap = next(
                 g for g in load_gap_ledger(state_root, "root-1")
                 if g.gap_id == "unit-tv::missing_subtitle::zh"
             )
+            self.assertEqual(gap.status, "closed")
+            self.assertIn(
+                "/library/番剧/Fate Zero/S01E01.zh-CN-bilingual-ja.srt",
+                alist.files,
+            )
+            self.assertFalse(any(
+                path.endswith((".ja.srt", ".en.srt", ".ko.srt"))
+                for path in alist.files
+            ))
+
+    def test_subtitle_uncertain_provider_response_is_not_resubmitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            save_work_unit_records(state_root, "root-1", [
+                _work_unit(
+                    "root-1", "unit-tv", media_type="tv", tmdb_id=35507,
+                    title="Fate/Zero",
+                ),
+            ])
+            save_gap_ledger(state_root, "root-1", [
+                Gap(
+                    gap_id="unit-tv::missing_subtitle::zh",
+                    root_task_id="root-1",
+                    work_unit_id="unit-tv",
+                    kind="missing_subtitle",
+                    media_type="tv",
+                    tmdb_id=35507,
+                    season=None,
+                    episodes=(),
+                    subtitle_path="/library/番剧/Fate Zero/S01E01.mkv",
+                    subtitle_language="zh",
+                    status="open",
+                ),
+            ])
+            calls: list[object] = []
+
+            class UncertainMaterializer:
+                def acquire_subtitles(self, *args, **kwargs):
+                    del args, kwargs
+                    calls.append("acquire")
+                    raise _InfraError("staging response lost")
+
+            runner = self._runner(state_root)
+            first = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: UncertainMaterializer(),
+            )
+            second = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: UncertainMaterializer(),
+            )
+            self.assertEqual(calls, ["acquire"])
+            self.assertEqual(first["subtitle_waiting"], "waiting_reconcile")
+            self.assertEqual(second["subtitle_waiting"], "waiting_reconcile")
+            gap = load_gap_ledger(state_root, "root-1")[0]
             self.assertEqual(gap.status, "open")
-            self.assertEqual(gap.attempts, ())
+            self.assertIn("in_doubt", [attempt.status for attempt in gap.attempts])
+
+    def test_subtitle_empty_delivery_after_staging_is_not_resubmitted(self) -> None:
+        """A lost/partial response cannot erase evidence of staged bytes."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_subtitle_gap(state_root)
+            calls: list[str] = []
+
+            class PartialDeliveryMaterializer:
+                def acquire_subtitles(
+                    self, _request, _gaps, *, staging_root, alist, **_kwargs,
+                ):
+                    calls.append("acquire")
+                    alist.files[f"{staging_root}/orphan.srt"] = b"not reported"
+                    return {"delivery_kind": "subtitle_delivery", "files": []}
+
+            runner = self._runner(state_root)
+            first = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: PartialDeliveryMaterializer(),
+            )
+            second = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: PartialDeliveryMaterializer(),
+            )
+
+            self.assertEqual(calls, ["acquire"])
+            self.assertEqual(first["subtitle_waiting"], "waiting_reconcile")
+            self.assertEqual(second["subtitle_waiting"], "waiting_reconcile")
+            intent = load_root_replenishment_state(state_root, "root-1")[
+                "subtitle_intents"
+            ]["unit-tv::missing_subtitle::zh"]
+            self.assertEqual(intent["phase"], "waiting_reconcile")
+            self.assertEqual(load_gap_ledger(state_root, "root-1")[0].status, "open")
+
+    def test_subtitle_invalid_staged_content_is_not_resubmitted(self) -> None:
+        """Content-proof failure after staging remains an in-doubt barrier."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_subtitle_gap(state_root)
+            events: list[dict[str, Any]] = []
+            runner = self._runner(state_root)
+            invalid_srt = (
+                "1\n00:00:00,000 --> 00:00:02,000\n"
+                "This is only an English subtitle line.\n"
+            ).encode("utf-8")
+
+            first = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: _FakeSubtitleMaterializer(
+                    payload=invalid_srt, events=events,
+                ),
+            )
+            second = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: _FakeSubtitleMaterializer(
+                    payload=invalid_srt, events=events,
+                ),
+            )
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(first["subtitle_waiting"], "waiting_reconcile")
+            self.assertEqual(second["subtitle_waiting"], "waiting_reconcile")
+            state = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(
+                state["subtitle_intents"]["unit-tv::missing_subtitle::zh"]["phase"],
+                "waiting_reconcile",
+            )
+            gap = load_gap_ledger(state_root, "root-1")[0]
+            self.assertEqual(gap.status, "open")
+            self.assertIn("in_doubt", [attempt.status for attempt in gap.attempts])
+
+    def test_subtitle_pause_before_provider_call_rearms_without_stuck_intent(self) -> None:
+        """A pause during local preparation must not fabricate submission."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_subtitle_gap(state_root)
+            paused = [False]
+            calls: list[str] = []
+
+            class ProbeMaterializer:
+                def acquire_subtitles(self, *_args, **_kwargs):
+                    calls.append("acquire")
+                    return {"delivery_kind": "subtitle_delivery", "files": []}
+
+            def pause_during_preparation():
+                paused[0] = True
+                return ProbeMaterializer()
+
+            runner = self._runner(state_root)
+            first = run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=pause_during_preparation,
+                pause_requested=lambda: paused[0],
+            )
+            self.assertTrue(first["paused"])
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                load_root_replenishment_state(state_root, "root-1")["subtitle_intents"],
+                {},
+            )
+
+            paused[0] = False
+            run_root_replenishment(
+                runner, state_root, "root-1",
+                subtitle_materializer_factory=lambda: ProbeMaterializer(),
+                pause_requested=lambda: paused[0],
+            )
+            self.assertEqual(calls, ["acquire"])
 
 
     # --- pre-upgrade AList state refusal -----------------------------------

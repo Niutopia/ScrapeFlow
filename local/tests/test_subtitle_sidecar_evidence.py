@@ -14,9 +14,13 @@ from local.scrapeflow_api.simple_library_audit import (
 )
 
 
-def _report(sidecar: bytes) -> tuple[dict[str, object], object]:
+def _report(
+    sidecar: bytes,
+    *,
+    subtitle_name: str = "Show.S01E01.zh.srt",
+) -> tuple[dict[str, object], object]:
     video = "/library/Show/Show.S01E01.mkv"
-    subtitle = "/library/Show/Show.S01E01.zh.srt"
+    subtitle = f"/library/Show/{subtitle_name}"
 
     class Client:
         def read_file_prefix(self, path: str, *, max_bytes: int) -> bytes:
@@ -24,6 +28,11 @@ def _report(sidecar: bytes) -> tuple[dict[str, object], object]:
             if path == subtitle:
                 return sidecar
             raise AssertionError(path)
+
+        def exact_file_info(self, path: str) -> dict[str, object] | None:
+            if path == subtitle:
+                return {"size": len(sidecar), "is_dir": False}
+            return None
 
     report: dict[str, object] = {
         "status": "completed",
@@ -73,6 +82,71 @@ class SubtitleSidecarEvidenceTests(unittest.TestCase):
         )
         self.assertFalse(any(row.get("kind") == "missing_subtitle" for row in result["gaps"]))
         self.assertFalse(any(row.get("kind") == "unknown_subtitle_evidence" for row in result["unknowns"]))
+
+    def test_one_marked_bilingual_sidecar_satisfies_simplified_chinese(self) -> None:
+        payload = (
+            "1\n00:00:01,000 --> 00:00:02,000\n"
+            "这是一个简体中文测试。\nこれはテストです。\n\n"
+            "2\n00:00:03,000 --> 00:00:04,000\n"
+            "我们现在开始。\nいま始めます。\n"
+        ).encode("utf-8")
+        report, client = _report(
+            payload,
+            subtitle_name="Show.S01E01.zh-CN-bilingual-ja.srt",
+        )
+        checker = make_alist_subtitle_checker(client, "zh")
+        with patch(
+            "local.scrapeflow_api.simple_library_audit.probe_remote_subtitle_streams",
+            return_value={"status": "unknown", "reason": "ffprobe_timeout"},
+        ):
+            result = build_automatic_library_gaps(
+                report,
+                [{
+                    "tmdb_id": 7,
+                    "title": "Show",
+                    "media_type": "tv",
+                    "target_root": "/library/Show",
+                    "season": 1,
+                    "expected_episodes": {1: [1]},
+                }],
+                required_subtitle_language="zh",
+                subtitle_checker=checker,
+            )
+        self.assertFalse(any(row.get("kind") == "missing_subtitle" for row in result["gaps"]))
+        self.assertFalse(any(row.get("kind") == "unknown_subtitle_evidence" for row in result["unknowns"]))
+
+    def test_marked_bilingual_sidecar_requires_a_complete_fresh_read(self) -> None:
+        subtitle = "/library/Show/Show.S01E01.zh-CN-bilingual-ja.srt"
+        valid_prefix = (
+            "1\n00:00:01,000 --> 00:00:02,000\n"
+            "这是一个简体中文测试。\nこれはテストです。\n"
+        ).encode("utf-8")
+
+        class TruncatedClient:
+            def exact_file_info(self, path: str) -> dict[str, object] | None:
+                if path != subtitle:
+                    raise AssertionError(path)
+                return {"size": len(valid_prefix) + 32, "is_dir": False}
+
+            def read_file_prefix(self, path: str, *, max_bytes: int) -> bytes:
+                if path != subtitle or max_bytes != len(valid_prefix) + 32:
+                    raise AssertionError((path, max_bytes))
+                return valid_prefix
+
+        verdict = probe_remote_subtitle_content(TruncatedClient(), subtitle, "zh")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertEqual(verdict["reason"], "bilingual_content_read_incomplete")
+
+    def test_unmarked_mixed_sidecar_stays_unknown(self) -> None:
+        result = self._run(
+            (
+                "1\n00:00:01,000 --> 00:00:02,000\n"
+                "这是一个简体中文测试。\nこれはテストです。\n"
+            ).encode("utf-8")
+        )
+        self.assertFalse(any(row.get("kind") == "missing_subtitle" for row in result["gaps"]))
+        self.assertTrue(any(row.get("kind") == "unknown_subtitle_evidence" for row in result["unknowns"]))
 
     def test_unreadable_sidecar_stays_unknown_not_missing(self) -> None:
         result = self._run(b"not a subtitle")

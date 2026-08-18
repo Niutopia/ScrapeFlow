@@ -7,10 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from engine.scrapeflow.subtitle_content import DEFAULT_MAX_PREFIX_BYTES
-from local.scrapeflow_api.automatic_replenishment import (
-    AutomaticReplenishmentError,
-    AutomaticReplenishmentRuntime,
-)
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     SimplePlanExecutor,
@@ -96,27 +92,23 @@ class SubtitleWriterValidationTests(unittest.TestCase):
                 self.assertIn(SOURCE, alist.files)
                 self.assertNotIn(TARGET, alist.files)
 
-    def test_runtime_preprobe_rejects_unknown_before_current_writer(self) -> None:
-        """A modern custom writer cannot bypass the coordinator's gate."""
-        alist = ContentAList(_srt("這是一個測試字幕"))
-        calls: list[tuple[object, ...]] = []
+    def test_formal_writer_custom_validator_rejects_before_move(self) -> None:
+        """The RootJob-owned validator can stop a formal sidecar write early."""
+        alist = ContentAList(_srt("这是一个测试字幕"))
+        validations: list[tuple[str, str]] = []
 
-        class ModernRunner:
-            def install_subtitle_sidecar(self, *args, **kwargs):
-                calls.append((args, kwargs))
-                return {"status": "moved", "size": len(alist.files[SOURCE])}
+        def reject(source_path: str, language: str) -> dict[str, str]:
+            validations.append((source_path, language))
+            return {"status": "unknown", "reason": "rootjob_validation_required"}
 
-        runtime = AutomaticReplenishmentRuntime.__new__(
-            AutomaticReplenishmentRuntime
-        )
-        runtime.engine_runner = ModernRunner()
-        runtime.alist = alist
-        with self.assertRaises(AutomaticReplenishmentError):
-            runtime._validate_subtitle_source_content(
-                SOURCE, "zh",
-                installer=runtime.engine_runner.install_subtitle_sidecar,
+        with self.assertRaisesRegex(EngineExecutionError, "rootjob_validation_required"):
+            SimplePlanExecutor(alist).install_subtitle_sidecar(
+                SOURCE, TARGET, expected_size=len(alist.files[SOURCE]),
+                video_path=VIDEO, subtitle_language="zh", subtitle_validator=reject,
             )
-        self.assertEqual(calls, [])
+        self.assertEqual(validations, [(SOURCE, "zh")])
+        self.assertIn(SOURCE, alist.files)
+        self.assertNotIn(TARGET, alist.files)
 
 
 if __name__ == "__main__":  # pragma: no cover

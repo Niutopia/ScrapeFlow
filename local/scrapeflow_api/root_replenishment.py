@@ -18,10 +18,12 @@ writes forbidden ``EngineJob.summary.replenishment`` projections).  Instead it
 reuses the thin, injectable per-tier *materializers* and the bridge/search
 boundaries directly, and drives its own durable tier state.
 
-``missing_subtitle`` gaps are deliberately left open by this module: contract
-rule 4 routes subtitles through the independent subtitle channel (subtitle
-sites, subtitle-only members, no full-video downloads), so the two video
-tiers here never try to acquire them.
+``missing_subtitle`` gaps run through a small, independent subtitle channel
+before the two video tiers.  It only retrieves direct, exact sidecars and
+installs **one** formal subtitle file per gap: a verified Simplified-Chinese
+track, optionally merged with the TMDB-proven original language into that same
+file.  It never creates a second original-language sidecar and never falls
+back to a video, season pack, or archive download.
 
 Tier progression (contract rule 4) is delegated to the pure
 ``replenishment_tiers.apply_tier_outcome`` policy:
@@ -72,8 +74,15 @@ from engine.scrapeflow.gap_ledger import (
 )
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.subtitle_content import (
+    MAX_MERGED_SUBTITLE_BYTES,
+    classify_bilingual_subtitle_content,
+    classify_subtitle_content,
+    normalize_subtitle_language,
+)
 from engine.scrapeflow.target_shelf import target_root_for_shelf
 from engine.scrapeflow.work_units import load_work_unit_records
+from engine.tools.replenishment_adapter import SubtitleMaterializer
 
 from .replenishment_bridge import (
     _nonempty_strings,
@@ -96,8 +105,18 @@ from .simple_engine_runner import EngineRequest
 _STATE_FILE_PREFIX = "replenishment_"
 _STATE_SUFFIX = ".json"
 _IN_FLIGHT_KEY = "in_flight_gap_ids"
+_SUBTITLE_INTENTS_KEY = "subtitle_intents"
 _MAX_ATTEMPT_LOG = 200
 _STAGING_NAMESPACE = "/ScrapeFlow/补源"
+_SUBTITLE_TIER = "subtitle"
+_SUBTITLE_PROVIDER = "subtitle"
+_SUBTITLE_SUPPORTED_ORIGINAL_LANGUAGES = frozenset({
+    "japanese", "english", "korean",
+})
+_SUBTITLE_TEXT_EXTENSIONS = frozenset({".ass", ".ssa", ".srt", ".vtt"})
+_SUBTITLE_INTENT_PHASES = frozenset({
+    "prepared", "submitting", "staged", "installing", "waiting_reconcile",
+})
 
 _KNOWN_FAILURE_SCOPES = frozenset({
     FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE, FAILURE_IN_DOUBT,
@@ -136,8 +155,76 @@ def _fresh_state() -> dict[str, Any]:
         "waiting": None,
         "attempt_log": [],
         _IN_FLIGHT_KEY: {},
+        # One entry exists only while a subtitle acquisition/write requires
+        # recovery.  It is intentionally separate from the video-tier
+        # in-flight map: subtitle providers have no video-tier reconcile API,
+        # so an uncertain subtitle must be held rather than resubmitted.
+        _SUBTITLE_INTENTS_KEY: {},
     })
     return state
+
+
+def _bounded_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if not path or len(path) > 2048 or "\x00" in path:
+        return None
+    return path
+
+
+def _normalize_subtitle_intents(value: object) -> dict[str, dict[str, Any]]:
+    """Retain only minimal, non-secret recovery evidence for subtitle work.
+
+    Durable intent is written before the provider is called.  A malformed
+    state must therefore become a conservative recovery barrier rather than a
+    license to call a provider again with an unknown prior attempt.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_gap_id, raw in value.items():
+        if (
+            not isinstance(raw_gap_id, str)
+            or not raw_gap_id
+            or len(raw_gap_id) > 512
+        ):
+            continue
+        if not isinstance(raw, Mapping):
+            normalized[raw_gap_id] = {"phase": "waiting_reconcile"}
+            continue
+        phase = str(raw.get("phase") or "").strip().casefold()
+        # An unrecognised persisted attempt may be a partially-written record
+        # from an older process.  Keep it as a barrier; silently dropping it
+        # would permit a duplicate subtitle provider submission.
+        if phase not in _SUBTITLE_INTENT_PHASES:
+            normalized[raw_gap_id] = {"phase": "waiting_reconcile"}
+            continue
+        entry: dict[str, Any] = {"phase": phase}
+        for key in ("attempt_id", "staging_root", "source", "target", "video_path"):
+            parsed = _bounded_path(raw.get(key))
+            if parsed is not None:
+                entry[key] = parsed
+        size = raw.get("size")
+        if (
+            isinstance(size, int)
+            and not isinstance(size, bool)
+            and 0 < size <= MAX_MERGED_SUBTITLE_BYTES
+        ):
+            entry["size"] = size
+        language = normalize_subtitle_language(raw.get("subtitle_language"))
+        if language == "simplified_chinese":
+            entry["subtitle_language"] = language
+        original_language = normalize_subtitle_language(raw.get("original_language"))
+        if original_language in _SUBTITLE_SUPPORTED_ORIGINAL_LANGUAGES:
+            entry["original_language"] = original_language
+        if raw.get("bilingual") is True:
+            entry["bilingual"] = True
+        updated_at = raw.get("updated_at")
+        if isinstance(updated_at, str) and len(updated_at) <= 64:
+            entry["updated_at"] = updated_at
+        normalized[raw_gap_id] = entry
+    return normalized
 
 
 def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -153,6 +240,7 @@ def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
     state.setdefault("waiting", None)
     state.setdefault("attempt_log", [])
     state.setdefault(_IN_FLIGHT_KEY, {})
+    state.setdefault(_SUBTITLE_INTENTS_KEY, {})
     in_flight = state.get(_IN_FLIGHT_KEY)
     if not isinstance(in_flight, Mapping):
         state[_IN_FLIGHT_KEY] = {}
@@ -169,6 +257,9 @@ def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
         state["attempt_log"] = [
             dict(item) for item in log if isinstance(item, Mapping)
         ][- _MAX_ATTEMPT_LOG:]
+    state[_SUBTITLE_INTENTS_KEY] = _normalize_subtitle_intents(
+        state.get(_SUBTITLE_INTENTS_KEY),
+    )
     return state
 
 
@@ -547,6 +638,29 @@ def _child_request(
     return EngineRequest.from_mapping(payload)
 
 
+def _strip_video_companion_subtitle_members(
+    selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a video-only RootJob selection without mutating durable evidence.
+
+    Older Torrent candidate builders could attach a subtitle index as a
+    ``companion_subtitle_index_by_media_gap`` entry.  The local adapter turns
+    that map directly into aria2 ``--select-file`` arguments.  RootJob owns
+    the only automatic subtitle transaction now (including the strict merged
+    bilingual proof), so a video materializer must never receive that map.
+    Keep the original selection immutable for search/audit evidence and copy
+    just the two shallow layers that carry it.
+    """
+    output = dict(selection)
+    acquisition = selection.get("acquisition")
+    if not isinstance(acquisition, Mapping):
+        return output
+    cleaned = dict(acquisition)
+    cleaned.pop("companion_subtitle_index_by_media_gap", None)
+    output["acquisition"] = cleaned
+    return output
+
+
 def _append_attempt_log(
     state: dict[str, Any],
     entry: Mapping[str, Any],
@@ -636,20 +750,21 @@ def _noop_result(state: dict[str, Any], tier: str) -> dict[str, Any]:
 
 
 def _enrich_media_titles(runner: Any, request: dict[str, Any]) -> None:
-    """Fill an empty bridged media title/aliases from TMDB.
+    """Enrich bridge aliases and a trustworthy original language from TMDB.
 
     An operator-confirmed unit identity may carry only ``media_type +
     tmdb_id`` (no title), which would leave the bridge with empty aliases and
     the selector would reject every candidate.  The TMDB client is the
-    canonical title source; enrichment is best-effort and never overrides a
-    non-empty alias list.
+    canonical title source.  The subtitle path also consumes
+    ``original_language`` but only when this exact read-only TMDB detail
+    response proves it; request/identity/provider values are deliberately
+    discarded first so stale metadata cannot manufacture a bilingual track.
     """
     media = request.get("media")
     if not isinstance(media, dict):
         return
-    aliases = media.get("aliases")
-    if isinstance(aliases, list) and aliases:
-        return
+    media.pop("original_language", None)
+    media.pop("original_language_verified_by_tmdb", None)
     media_type = str(media.get("media_type") or "").strip().casefold()
     tmdb_id = media.get("tmdb_id")
     if (
@@ -677,16 +792,1168 @@ def _enrich_media_titles(runner: Any, request: dict[str, Any]) -> None:
     original_title = str(
         details.get("original_name") or details.get("original_title") or ""
     ).strip()
-    if not title:
-        return
-    media["title"] = title
-    if original_title:
-        media["original_title"] = original_title
-    media["aliases"] = _nonempty_strings([
-        title,
-        original_title,
-        *(media.get("aliases") if isinstance(media.get("aliases"), list) else []),
-    ])
+    if title:
+        media["title"] = title
+        if original_title:
+            media["original_title"] = original_title
+        media["aliases"] = _nonempty_strings([
+            title,
+            original_title,
+            *(media.get("aliases") if isinstance(media.get("aliases"), list) else []),
+        ])
+
+    # A Chinese-original title cannot form the requested 简中 + 原语 pair;
+    # unknown / unsupported values are not preserved as a weak hint.  The
+    # boolean remains bound to this request's concrete TMDB id and is checked
+    # again immediately before any merged file can be installed.
+    original_language = normalize_subtitle_language(
+        details.get("original_language"),
+    )
+    if original_language in _SUBTITLE_SUPPORTED_ORIGINAL_LANGUAGES:
+        media["original_language"] = original_language
+        media["original_language_verified_by_tmdb"] = True
+
+
+def _subtitle_target_marker(
+    language: object,
+    *,
+    bilingual: bool,
+    original_language: object = None,
+) -> str | None:
+    """Build the one formal marker for a Simplified-Chinese subtitle gap.
+
+    The bilingual marker is deliberately part of the *same filename*.  It is
+    durable evidence for later audit/restart code that this one Chinese-named
+    sidecar was merged against a particular TMDB-proven original language; it
+    never denotes another file to write.
+    """
+    if normalize_subtitle_language(language) != "simplified_chinese":
+        return None
+    marker = "zh-CN"
+    if not bilingual:
+        return marker
+    codes = {"japanese": "ja", "english": "en", "korean": "ko"}
+    code = codes.get(normalize_subtitle_language(original_language))
+    if code is None:
+        return None
+    return f"{marker}-bilingual-{code}"
+
+
+def _subtitle_target_path(
+    gap: Mapping[str, Any],
+    source_path: str,
+    *,
+    bilingual: bool,
+    original_language: object = None,
+) -> str | None:
+    """Derive a single non-overlapping formal target for one subtitle gap."""
+    video_path = gap.get("path")
+    if not isinstance(video_path, str) or not video_path.startswith("/"):
+        return None
+    suffix = posixpath.splitext(source_path)[1].casefold()
+    if suffix not in _SUBTITLE_TEXT_EXTENSIONS:
+        return None
+    marker = _subtitle_target_marker(
+        gap.get("subtitle_language"),
+        bilingual=bilingual,
+        original_language=original_language,
+    )
+    if marker is None:
+        return None
+    return f"{posixpath.splitext(video_path)[0]}.{marker}{suffix}"
+
+
+def _verified_original_language(request: Mapping[str, Any]) -> str | None:
+    """Return only a value tied to a fresh TMDB detail response."""
+    media = request.get("media")
+    if not isinstance(media, Mapping):
+        return None
+    tmdb_id = media.get("tmdb_id")
+    if (
+        media.get("original_language_verified_by_tmdb") is not True
+        or isinstance(tmdb_id, bool)
+        or not isinstance(tmdb_id, int)
+        or tmdb_id <= 0
+    ):
+        return None
+    language = normalize_subtitle_language(media.get("original_language"))
+    return language if language in _SUBTITLE_SUPPORTED_ORIGINAL_LANGUAGES else None
+
+
+def _task_subtitle_staging_root(
+    runner: Any, root_task_id: str, attempt_id: str,
+) -> str:
+    return (
+        f"{str(runner.library_root).rstrip('/')}"
+        f"{_STAGING_NAMESPACE}/{root_task_id}/{attempt_id}"
+    )
+
+
+def _is_task_subtitle_staging_path(
+    value: object,
+    staging_root: str,
+) -> bool:
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    normalized = posixpath.normpath(value)
+    root = posixpath.normpath(staging_root)
+    return normalized.startswith(root.rstrip("/") + "/")
+
+
+def _fresh_file_info(alist: Any, path: str) -> Mapping[str, Any] | None:
+    """Read one exact remote object, with a refreshed-parent fallback."""
+    exact = getattr(alist, "exact_file_info", None)
+    if callable(exact):
+        try:
+            row = exact(path)
+        except Exception:
+            row = None
+        if isinstance(row, Mapping) and row.get("is_dir") is not True:
+            return row
+    listing = getattr(alist, "list", None)
+    if not callable(listing):
+        return None
+    parent = posixpath.dirname(path) or "/"
+    name = posixpath.basename(path)
+    try:
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            rows = listing(parent)
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    matches = [
+        row for row in rows
+        if isinstance(row, Mapping)
+        and row.get("name") == name
+        and row.get("is_dir") is not True
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _file_size(row: Mapping[str, Any] | None) -> int | None:
+    if not isinstance(row, Mapping):
+        return None
+    value = row.get("size")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _read_subtitle_bytes(alist: Any, path: str, *, max_bytes: int) -> bytes | None:
+    """Bound a content read used for pre/post writer proof."""
+    reader = getattr(alist, "read_file_prefix", None)
+    if not callable(reader):
+        reader = getattr(alist, "read_file_bytes", None)
+    if not callable(reader):
+        return None
+    try:
+        try:
+            raw = reader(path, max_bytes=max_bytes)
+        except TypeError:
+            raw = reader(path, max_bytes)
+    except Exception:
+        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    return bytes(raw)
+
+
+def _validate_root_subtitle_content(
+    runner: Any,
+    source_path: str,
+    *,
+    expected_size: int,
+    bilingual: bool,
+    original_language: str | None,
+) -> dict[str, Any]:
+    """Validate the full, freshly observed object that will be written.
+
+    A prefix alone is not acceptance evidence: a provider could append another
+    track or payload after the parsed bytes.  The exact remote size must equal
+    the persisted delivery size and the bounded read must contain all of it.
+    """
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or not (0 < expected_size <= MAX_MERGED_SUBTITLE_BYTES)
+        or _file_size(_fresh_file_info(runner.alist, source_path)) != expected_size
+    ):
+        return {"status": "unknown", "reason": "subtitle_size_unproven"}
+    raw = _read_subtitle_bytes(
+        runner.alist, source_path, max_bytes=expected_size,
+    )
+    if raw is None or len(raw) != expected_size:
+        return {"status": "unknown", "reason": "subtitle_full_read_unproven"}
+    if bilingual:
+        if original_language not in _SUBTITLE_SUPPORTED_ORIGINAL_LANGUAGES:
+            return {"status": "unknown", "reason": "unsupported_original_language"}
+        return dict(classify_bilingual_subtitle_content(
+            raw, original_language, max_bytes=expected_size,
+        ))
+    # ``raw`` above is a complete, exact-size read.  Preserve that proof in
+    # the classifier instead of silently falling back to its ordinary bounded
+    # audit prefix (which could otherwise accept a valid beginning followed by
+    # unrelated bytes).
+    return dict(classify_subtitle_content(
+        raw, "zh", max_bytes=expected_size, require_each_cue=True,
+    ))
+
+
+def _subtitle_content_is_satisfied(result: Mapping[str, Any] | object) -> bool:
+    return (
+        isinstance(result, Mapping)
+        and str(result.get("status") or "").strip().casefold() == "satisfied"
+    )
+
+
+def _call_subtitle_installer(
+    installer: Callable[..., object],
+    source_path: str,
+    target_path: str,
+    *,
+    expected_size: int,
+    video_path: str,
+    validator: Callable[..., object],
+    pause_requested: Callable[[], bool] | None,
+) -> object:
+    """Invoke the only writer without silently dropping its pause fence."""
+    try:
+        parameters = inspect.signature(installer).parameters.values()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("字幕 writer 无法证明支持受控调用") from exc
+    names = {parameter.name for parameter in parameters}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    if pause_requested is not None and not (accepts_kwargs or "pause_requested" in names):
+        raise RuntimeError("字幕 writer 不支持 pause_requested，已安全停止")
+    # The direct pre/post validation below is necessary but is not a reason to
+    # bypass the writer's own validator for a merged file.
+    if not (accepts_kwargs or "subtitle_validator" in names):
+        raise RuntimeError("字幕 writer 不支持内容验证回调，拒绝写入")
+    kwargs: dict[str, object] = {
+        "expected_size": expected_size,
+        "video_path": video_path,
+        "subtitle_language": "zh",
+        "subtitle_validator": validator,
+    }
+    if pause_requested is not None:
+        kwargs["pause_requested"] = pause_requested
+    return installer(source_path, target_path, **kwargs)
+
+
+def _empty_subtitle_result() -> dict[str, Any]:
+    return {
+        "subtitle_requests_built": 0,
+        "subtitle_attempts": [],
+        "subtitle_gaps_closed": [],
+        "subtitle_waiting": None,
+        "paused": False,
+    }
+
+
+def _subtitle_request_rows(request: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return only formal Simplified-Chinese subtitle gaps for one request."""
+    rows: dict[str, dict[str, Any]] = {}
+    for raw in request.get("gaps") or []:
+        if not isinstance(raw, Mapping) or raw.get("kind") != "missing_subtitle":
+            continue
+        gap_id = raw.get("id")
+        if (
+            not isinstance(gap_id, str)
+            or not gap_id
+            or normalize_subtitle_language(raw.get("subtitle_language"))
+            != "simplified_chinese"
+            or not isinstance(raw.get("path"), str)
+            or not str(raw.get("path")).startswith("/")
+        ):
+            continue
+        rows[gap_id] = dict(raw)
+    return rows
+
+
+def _extract_subtitle_delivery(
+    delivery: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    staging_root: str,
+) -> dict[str, dict[str, Any]]:
+    """Validate provider delivery metadata without trusting a second track.
+
+    The provider must emit one row bound to one subtitle gap.  A merged row
+    carries an explicit ``bilingual`` flag and the exact TMDB-verified original
+    language; Chinese-only is the safe fallback.  ``original_optional`` or a
+    second row for the same gap is rejected rather than quietly becoming a
+    second formal sidecar.
+    """
+    rows = delivery.get("files")
+    if not isinstance(rows, list):
+        raise ValueError("字幕 provider delivery 缺少 files 列表")
+    gaps = _subtitle_request_rows(request)
+    output: dict[str, dict[str, Any]] = {}
+    global_bilingual = delivery.get("bilingual") is True
+    global_original = normalize_subtitle_language(delivery.get("original_language"))
+    verified_original = _verified_original_language(request)
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            raise ValueError("字幕 provider files 项无效")
+        if raw.get("kind") not in {None, "subtitle"}:
+            raise ValueError("字幕 provider 返回了非字幕成员")
+        role = str(raw.get("subtitle_role") or "").strip().casefold()
+        if role in {"original", "original_optional", "secondary"}:
+            raise ValueError("字幕 provider 试图交付独立原语轨")
+        gap_ids = raw.get("gap_ids")
+        if not isinstance(gap_ids, list) or len(gap_ids) != 1:
+            raise ValueError("字幕 provider 未将文件精确绑定唯一 gap")
+        gap_id = gap_ids[0]
+        if not isinstance(gap_id, str) or gap_id not in gaps or gap_id in output:
+            raise ValueError("字幕 provider 交付了未知或重复 gap")
+        source = raw.get("path")
+        size = raw.get("size")
+        if (
+            not _is_task_subtitle_staging_path(source, staging_root)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or size > MAX_MERGED_SUBTITLE_BYTES
+        ):
+            raise ValueError("字幕 provider 交付未绑定有效任务 staging 文件")
+        suffix = posixpath.splitext(str(source))[1].casefold()
+        if suffix not in _SUBTITLE_TEXT_EXTENSIONS:
+            raise ValueError("双语字幕仅接受可解析文本格式")
+        bilingual = raw.get("bilingual") is True or (
+            "bilingual" not in raw and global_bilingual
+        )
+        original_language = normalize_subtitle_language(
+            raw.get("original_language")
+            if raw.get("original_language") is not None
+            else global_original,
+        )
+        if bilingual:
+            if (
+                verified_original is None
+                or original_language != verified_original
+            ):
+                raise ValueError("双语字幕未绑定 TMDB 已验证原语")
+            expected_marker = _subtitle_target_marker(
+                gaps[gap_id].get("subtitle_language"),
+                bilingual=True,
+                original_language=original_language,
+            )
+            marker = raw.get("subtitle_marker")
+            if marker is None:
+                marker = delivery.get("subtitle_marker")
+            if not isinstance(marker, str) or marker != expected_marker:
+                raise ValueError("双语字幕缺少可信持久化语言标识")
+        else:
+            original_language = None
+        target = _subtitle_target_path(
+            gaps[gap_id], str(source), bilingual=bilingual,
+            original_language=original_language,
+        )
+        if target is None:
+            raise ValueError("字幕正式目标无法证明为简中单文件")
+        output[gap_id] = {
+            "source": str(source),
+            "size": size,
+            "target": target,
+            "video_path": str(gaps[gap_id]["path"]),
+            "subtitle_language": "simplified_chinese",
+            "bilingual": bilingual,
+            **({"original_language": original_language} if original_language else {}),
+        }
+    return output
+
+
+def _subtitle_intents(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    intents = state.get(_SUBTITLE_INTENTS_KEY)
+    if not isinstance(intents, dict):
+        intents = {}
+        state[_SUBTITLE_INTENTS_KEY] = intents
+    return intents
+
+
+def _write_subtitle_intent(
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    gap_id: str,
+    value: Mapping[str, Any],
+) -> None:
+    intents = _subtitle_intents(state)
+    intents[gap_id] = dict(value)
+    state["updated_at"] = _now()
+    save_root_replenishment_state(state_root, root_task_id, state)
+
+
+def _drop_subtitle_intent(
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    gap_id: str,
+) -> None:
+    _subtitle_intents(state).pop(gap_id, None)
+    state["updated_at"] = _now()
+    save_root_replenishment_state(state_root, root_task_id, state)
+
+
+def _record_subtitle_attempt(
+    state_root: Path,
+    root_task_id: str,
+    gap: Gap,
+    *,
+    attempt_id: str,
+    status: str,
+    staged_paths: list[str] | None = None,
+    error: str | None = None,
+) -> None:
+    record_attempt(
+        state_root,
+        root_task_id,
+        gap.gap_id,
+        attempt_id=attempt_id,
+        provider=_SUBTITLE_PROVIDER,
+        tier=_SUBTITLE_TIER,
+        locator=None,
+        status=status,
+        staged_paths=staged_paths or [],
+        error=(str(error)[:200] if error else None),
+    )
+
+
+def _cleanup_empty_subtitle_staging(
+    runner: Any,
+    staging_root: str,
+    *,
+    pause_requested: Callable[[], bool] | None,
+) -> bool:
+    """Remove at most one freshly-proven-empty task attempt directory."""
+    if pause_requested is not None and pause_requested():
+        return False
+    listing = getattr(runner.alist, "list", None)
+    remove_empty = getattr(runner.alist, "remove_empty_dir", None)
+    if not callable(listing) or not callable(remove_empty):
+        return False
+    try:
+        try:
+            rows = listing(staging_root, refresh=True)
+        except TypeError:
+            rows = listing(staging_root)
+    except Exception:
+        return False
+    if not isinstance(rows, list) or rows:
+        return False
+    if pause_requested is not None and pause_requested():
+        return False
+    try:
+        remove_empty(staging_root)
+    except Exception:
+        return False
+    parent = posixpath.dirname(staging_root) or "/"
+    name = posixpath.basename(staging_root)
+    try:
+        try:
+            parent_rows = listing(parent, refresh=True)
+        except TypeError:
+            parent_rows = listing(parent)
+    except Exception:
+        return False
+    return not any(
+        isinstance(row, Mapping)
+        and row.get("name") == name
+        and row.get("is_dir") is True
+        for row in (parent_rows if isinstance(parent_rows, list) else [])
+    )
+
+
+def _subtitle_staging_is_fresh_empty(runner: Any, staging_root: str) -> bool:
+    """Prove a task attempt has no staged side effect before re-arming it.
+
+    An empty/invalid provider response is not a no-op proof.  We clear an
+    intent only after a fresh listing of its exact task root (or its parent
+    when the root no longer exists) shows that no object or directory remains.
+    Any read error stays fail-closed.
+    """
+    listing = getattr(runner.alist, "list", None)
+    if not callable(listing):
+        return False
+    try:
+        try:
+            rows = listing(staging_root, refresh=True)
+        except TypeError:
+            rows = listing(staging_root)
+    except Exception:
+        parent = posixpath.dirname(staging_root) or "/"
+        name = posixpath.basename(staging_root)
+        try:
+            try:
+                parent_rows = listing(parent, refresh=True)
+            except TypeError:
+                parent_rows = listing(parent)
+        except Exception:
+            return False
+        return (
+            isinstance(parent_rows, list)
+            and not any(
+                isinstance(row, Mapping) and row.get("name") == name
+                for row in parent_rows
+            )
+        )
+    return isinstance(rows, list) and not rows
+
+
+def _finish_subtitle_intent(
+    runner: Any,
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    *,
+    gap: Gap,
+    gap_row: Mapping[str, Any],
+    request: Mapping[str, Any],
+    pause_requested: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    """Install/recover one persisted subtitle delivery without re-submitting it.
+
+    A ``submitting`` intent with no immutable staged-file evidence is never
+    replayed: its provider response may have been lost.  Once a source/target
+    pair has been persisted, recovery uses fresh exact observations to either
+    prove the formal target and close the gap, or safely continue that one
+    writer operation.  Any ambiguous state remains ``waiting_reconcile``.
+    """
+    intent = _subtitle_intents(state).get(gap.gap_id)
+    if not isinstance(intent, Mapping):
+        return {"outcome": "none"}
+    attempt_id = str(intent.get("attempt_id") or uuid.uuid4().hex)
+    source = _bounded_path(intent.get("source"))
+    target = _bounded_path(intent.get("target"))
+    video_path = _bounded_path(intent.get("video_path"))
+    staging_root = _bounded_path(intent.get("staging_root"))
+    size = intent.get("size")
+    bilingual = intent.get("bilingual") is True
+    original_language = normalize_subtitle_language(intent.get("original_language"))
+    phase = str(intent.get("phase") or "").casefold()
+    expected_staging_root = (
+        _task_subtitle_staging_root(runner, root_task_id, attempt_id)
+        if _safe_task_id(attempt_id) is not None
+        else None
+    )
+    if (
+        phase in {"submitting", "waiting_reconcile"}
+        and (not source or not target or not video_path or not staging_root or not size)
+    ):
+        return {"outcome": "waiting_reconcile"}
+    if (
+        not source
+        or not target
+        or not video_path
+        or not staging_root
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or size > MAX_MERGED_SUBTITLE_BYTES
+        or expected_staging_root is None
+        or posixpath.normpath(staging_root) != posixpath.normpath(expected_staging_root)
+        or not _is_task_subtitle_staging_path(source, staging_root)
+        or _subtitle_target_path(
+            gap_row, source, bilingual=bilingual,
+            original_language=original_language,
+        ) != target
+        or (bilingual and original_language != _verified_original_language(request))
+    ):
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id,
+            {"phase": "waiting_reconcile", "attempt_id": attempt_id},
+        )
+        return {"outcome": "waiting_reconcile"}
+
+    def prove_target() -> bool:
+        info = _fresh_file_info(runner.alist, target)
+        if _file_size(info) != size:
+            return False
+        verdict = _validate_root_subtitle_content(
+            runner,
+            target,
+            expected_size=size,
+            bilingual=bilingual,
+            original_language=original_language if bilingual else None,
+        )
+        return _subtitle_content_is_satisfied(verdict)
+
+    # This first branch handles a lost writer response and makes restart
+    # idempotent without ever creating a second sidecar.
+    if prove_target():
+        try:
+            close_gap(state_root, root_task_id, gap.gap_id)
+        except KeyError:
+            return {"outcome": "none"}
+        _drop_subtitle_intent(state_root, root_task_id, state, gap.gap_id)
+        return {
+            "outcome": "closed",
+            "gap_id": gap.gap_id,
+            "attempt_id": attempt_id,
+            "target": target,
+            "bilingual": bilingual,
+        }
+
+    if pause_requested is not None and pause_requested():
+        return {"outcome": "paused"}
+
+    source_info = _fresh_file_info(runner.alist, source)
+    if _file_size(source_info) != size:
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id,
+            {"phase": "waiting_reconcile", "attempt_id": attempt_id},
+        )
+        return {"outcome": "waiting_reconcile"}
+
+    verdict = _validate_root_subtitle_content(
+        runner,
+        source,
+        expected_size=size,
+        bilingual=bilingual,
+        original_language=original_language if bilingual else None,
+    )
+    if not _subtitle_content_is_satisfied(verdict):
+        # The provider has already staged a real remote object.  Even when
+        # its bytes fail our strict content proof, treating that as a simple
+        # candidate miss would drop the durable intent and permit a second
+        # submission beside unexamined task-owned bytes.  Hold the attempt
+        # for reconciliation instead; only a separately proven cleanup may
+        # make this coordinate retryable.
+        pending = dict(intent)
+        pending["phase"] = "waiting_reconcile"
+        pending["updated_at"] = _now()
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id, pending,
+        )
+        _record_subtitle_attempt(
+            state_root, root_task_id, gap,
+            attempt_id=attempt_id,
+            status="in_doubt",
+            staged_paths=[source],
+            error=str(verdict.get("reason") or "subtitle_content_unproven"),
+        )
+        return {"outcome": "waiting_reconcile", "gap_id": gap.gap_id}
+
+    installer = getattr(runner, "install_subtitle_sidecar", None)
+    if not callable(installer):
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id,
+            {"phase": "waiting_reconcile", "attempt_id": attempt_id},
+        )
+        return {"outcome": "waiting_reconcile"}
+
+    def validator(candidate_path: str, _required_language: str = "zh") -> Mapping[str, Any]:
+        return _validate_root_subtitle_content(
+            runner,
+            candidate_path,
+            expected_size=size,
+            bilingual=bilingual,
+            original_language=original_language if bilingual else None,
+        )
+
+    persisted = dict(intent)
+    persisted["phase"] = "installing"
+    persisted["updated_at"] = _now()
+    _write_subtitle_intent(
+        state_root, root_task_id, state, gap.gap_id, persisted,
+    )
+    try:
+        result = _call_subtitle_installer(
+            installer,
+            source,
+            target,
+            expected_size=size,
+            video_path=video_path,
+            validator=validator,
+            pause_requested=pause_requested,
+        )
+    except Exception as exc:
+        if _is_pause_error(exc):
+            return {"outcome": "paused"}
+        # A lost move response is distinguishable only by fresh target/source
+        # observations, never by replaying the provider.  Keep the delivery
+        # intent intact so the next round can make that proof.
+        if prove_target():
+            try:
+                close_gap(state_root, root_task_id, gap.gap_id)
+            except KeyError:
+                return {"outcome": "none"}
+            _drop_subtitle_intent(state_root, root_task_id, state, gap.gap_id)
+            return {
+                "outcome": "closed", "gap_id": gap.gap_id,
+                "attempt_id": attempt_id, "target": target,
+                "bilingual": bilingual,
+            }
+        pending = dict(persisted)
+        pending["phase"] = "waiting_reconcile"
+        pending["updated_at"] = _now()
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id, pending,
+        )
+        return {
+            "outcome": "waiting_reconcile", "gap_id": gap.gap_id,
+            "error": str(exc)[:200],
+        }
+
+    if (
+        not isinstance(result, Mapping)
+        or _file_size(result) not in {None, size}
+        or not prove_target()
+    ):
+        pending = dict(persisted)
+        pending["phase"] = "waiting_reconcile"
+        pending["updated_at"] = _now()
+        _write_subtitle_intent(
+            state_root, root_task_id, state, gap.gap_id, pending,
+        )
+        return {"outcome": "waiting_reconcile", "gap_id": gap.gap_id}
+    try:
+        close_gap(state_root, root_task_id, gap.gap_id)
+    except KeyError:
+        return {"outcome": "none"}
+    _drop_subtitle_intent(state_root, root_task_id, state, gap.gap_id)
+    return {
+        "outcome": "closed", "gap_id": gap.gap_id,
+        "attempt_id": attempt_id, "target": target,
+        "bilingual": bilingual,
+    }
+
+
+def _recover_root_subtitle_intents(
+    runner: Any,
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    subtitle_requests: list[dict[str, Any]],
+    *,
+    pause_requested: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    """Reconcile persisted subtitle writes without calling a provider again."""
+    result = _empty_subtitle_result()
+    by_gap: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for request in subtitle_requests:
+        for gap_id, row in _subtitle_request_rows(request).items():
+            by_gap[gap_id] = (request, row)
+    gap_records = {
+        gap.gap_id: gap
+        for gap in load_gap_ledger(state_root, root_task_id)
+        if gap.status == "open" and gap.kind == "missing_subtitle"
+    }
+    for gap_id in list(_subtitle_intents(state)):
+        if pause_requested is not None and pause_requested():
+            result["paused"] = True
+            break
+        pair = by_gap.get(gap_id)
+        gap = gap_records.get(gap_id)
+        if gap is None:
+            # A fresh re-audit may already have proven this target.  The gap is
+            # no longer open, so retaining a recovery token would only block
+            # unrelated subtitle work; do not delete any remote staging tree.
+            _drop_subtitle_intent(state_root, root_task_id, state, gap_id)
+            continue
+        if pair is None:
+            # Missing bridge/title evidence does not prove the old provider
+            # call never happened.  Keep the barrier rather than discarding it
+            # and allowing a future bridge rebuild to submit again.
+            result["subtitle_waiting"] = "waiting_reconcile"
+            continue
+        request, gap_row = pair
+        intent = _subtitle_intents(state).get(gap_id)
+        if (
+            isinstance(intent, Mapping)
+            and str(intent.get("phase") or "").casefold() == "prepared"
+        ):
+            # ``prepared`` is persisted before local workspace setup only.
+            # The provider submission state is written later, immediately
+            # before its call, so this state cannot denote a remote effect and
+            # can safely be re-armed after a restart or a pre-call pause.
+            _drop_subtitle_intent(state_root, root_task_id, state, gap_id)
+            continue
+        completed = _finish_subtitle_intent(
+            runner, state_root, root_task_id, state,
+            gap=gap, gap_row=gap_row, request=request,
+            pause_requested=pause_requested,
+        )
+        outcome = completed.get("outcome")
+        if outcome == "closed":
+            result["subtitle_gaps_closed"].append(gap_id)
+            result["subtitle_attempts"].append({
+                "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                "outcome": "closed", "recovered": True,
+            })
+        elif outcome == "paused":
+            result["paused"] = True
+            break
+        elif outcome == FAILURE_CANDIDATE:
+            result["subtitle_attempts"].append({
+                "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                "outcome": FAILURE_CANDIDATE, "recovered": True,
+            })
+        elif outcome == "waiting_reconcile":
+            result["subtitle_waiting"] = "waiting_reconcile"
+    if _subtitle_intents(state):
+        result["subtitle_waiting"] = "waiting_reconcile"
+    return result
+
+
+def _run_root_subtitle_channel(
+    runner: Any,
+    state_root: Path,
+    root_task_id: str,
+    state: dict[str, Any],
+    requests: list[dict[str, Any]],
+    *,
+    subtitle_materializer_factory: Callable[[], Any] | Any | None,
+    pause_requested: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    """Drive independent subtitle acquisition before any video-tier effect.
+
+    The provider is called at most once per new root request in a round.  A
+    durable ``prepared`` intent covers local setup; it becomes ``submitting``
+    immediately before the provider call.  If that call loses its response,
+    later invocations only inspect the task-owned staging/target state; they
+    never call the provider again for that gap.
+    """
+    result = _empty_subtitle_result()
+    subtitle_requests: list[dict[str, Any]] = []
+    for raw_request in requests:
+        rows = _subtitle_request_rows(raw_request)
+        if not rows:
+            continue
+        request = dict(raw_request)
+        media = raw_request.get("media")
+        request["media"] = dict(media) if isinstance(media, Mapping) else {}
+        request["gaps"] = list(rows.values())
+        subtitle_requests.append(request)
+    result["subtitle_requests_built"] = len(subtitle_requests)
+    if not subtitle_requests and not _subtitle_intents(state):
+        return result
+
+    recovery = _recover_root_subtitle_intents(
+        runner, state_root, root_task_id, state, subtitle_requests,
+        pause_requested=pause_requested,
+    )
+    result["subtitle_attempts"].extend(recovery["subtitle_attempts"])
+    result["subtitle_gaps_closed"].extend(recovery["subtitle_gaps_closed"])
+    result["subtitle_waiting"] = recovery["subtitle_waiting"]
+    if recovery["paused"]:
+        result["paused"] = True
+        return result
+
+    gap_records = {
+        gap.gap_id: gap
+        for gap in load_gap_ledger(state_root, root_task_id)
+        if gap.status == "open" and gap.kind == "missing_subtitle"
+    }
+    candidate_failed = False
+    active_staging_roots: set[str] = set()
+
+    for request in subtitle_requests:
+        if pause_requested is not None and pause_requested():
+            result["paused"] = True
+            break
+        rows = _subtitle_request_rows(request)
+        pending = {
+            gap_id: row for gap_id, row in rows.items()
+            if gap_id in gap_records and gap_id not in _subtitle_intents(state)
+        }
+        if not pending:
+            continue
+
+        attempt_id = f"subtitle-{uuid.uuid4().hex}"
+        staging_root = _task_subtitle_staging_root(
+            runner, root_task_id, attempt_id,
+        )
+        workspace = state_root / "subtitle_replenishment_workspace" / root_task_id / attempt_id
+        if pause_requested is not None and pause_requested():
+            result["paused"] = True
+            break
+
+        # Persist every gap in this provider call before allocating its local
+        # workspace or invoking any discovery/download/upload boundary.
+        intents = _subtitle_intents(state)
+        for gap_id in pending:
+            intents[gap_id] = {
+                # This reserves the local preparation work only.  It must not
+                # be mistaken for a provider submission after a pause or
+                # crash before the final pre-call fence.
+                "phase": "prepared",
+                "attempt_id": attempt_id,
+                "staging_root": staging_root,
+                "subtitle_language": "simplified_chinese",
+                "updated_at": _now(),
+            }
+        state["last_attempt_at"] = _now()
+        state["updated_at"] = _now()
+        save_root_replenishment_state(state_root, root_task_id, state)
+
+        if pause_requested is not None and pause_requested():
+            # No external provider boundary has been crossed.  Do not leave a
+            # misleading in-flight token solely because the pause landed
+            # between local intent persistence and workspace preparation.
+            for gap_id in pending:
+                intents.pop(gap_id, None)
+            state["updated_at"] = _now()
+            save_root_replenishment_state(state_root, root_task_id, state)
+            result["paused"] = True
+            break
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # The adapter uses the workspace only for bounded temporary bytes;
+            # a local failure before the provider call has no remote state and
+            # can be classified safely as infrastructure, not in-doubt.
+            for gap_id in pending:
+                intents.pop(gap_id, None)
+                _record_subtitle_attempt(
+                    state_root, root_task_id, gap_records[gap_id],
+                    attempt_id=attempt_id, status="infrastructure",
+                    error="字幕本地 workspace 无法创建",
+                )
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_INFRASTRUCTURE,
+                })
+            state["updated_at"] = _now()
+            save_root_replenishment_state(state_root, root_task_id, state)
+            result["subtitle_waiting"] = "retry_wait"
+            continue
+
+        if subtitle_materializer_factory is None:
+            materializer = SubtitleMaterializer()
+        elif callable(subtitle_materializer_factory):
+            materializer = subtitle_materializer_factory()
+        else:
+            materializer = subtitle_materializer_factory
+        acquire = getattr(materializer, "acquire_subtitles", None)
+        if not callable(acquire):
+            # No call occurred; the safe recovery intent may be cleared and
+            # the visible failure remains a retryable infrastructure defect.
+            for gap_id in pending:
+                intents.pop(gap_id, None)
+                _record_subtitle_attempt(
+                    state_root, root_task_id, gap_records[gap_id],
+                    attempt_id=attempt_id, status="infrastructure",
+                    error="字幕 materializer 不支持 acquire_subtitles",
+                )
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_INFRASTRUCTURE,
+                })
+            state["updated_at"] = _now()
+            save_root_replenishment_state(state_root, root_task_id, state)
+            result["subtitle_waiting"] = "retry_wait"
+            continue
+
+        if pause_requested is not None and pause_requested():
+            # ``acquire_subtitles`` is the first provider effect.  Clearing a
+            # prepared intent here is safe and makes a user pause resumable
+            # without requiring a remote reconciliation round.
+            for gap_id in pending:
+                intents.pop(gap_id, None)
+            state["updated_at"] = _now()
+            save_root_replenishment_state(state_root, root_task_id, state)
+            result["paused"] = True
+            break
+
+        # From this exact point onward a crash can race the provider call, so
+        # make the durable token conservative before emitting the attempt.
+        for gap_id in pending:
+            intents[gap_id]["phase"] = "submitting"
+            intents[gap_id]["updated_at"] = _now()
+        state["updated_at"] = _now()
+        save_root_replenishment_state(state_root, root_task_id, state)
+        for gap_id in pending:
+            _record_subtitle_attempt(
+                state_root, root_task_id, gap_records[gap_id],
+                attempt_id=attempt_id, status="submitted",
+            )
+
+        try:
+            delivery = _call_materializer_with_pause(
+                acquire,
+                request,
+                list(pending.values()),
+                staging_root=staging_root,
+                workspace=workspace,
+                alist=runner.alist,
+                pause_requested=pause_requested,
+            )
+        except Exception as exc:
+            if _is_pause_error(exc):
+                # The adapter might have stopped just before or just after an
+                # upload.  Do not clear/replay the persisted intent.
+                for gap_id in pending:
+                    intents[gap_id]["phase"] = "waiting_reconcile"
+                    intents[gap_id]["updated_at"] = _now()
+                state["updated_at"] = _now()
+                save_root_replenishment_state(state_root, root_task_id, state)
+                result["paused"] = True
+                result["subtitle_waiting"] = "waiting_reconcile"
+                break
+            scope, _task_id = _classify_error(exc)
+            if (
+                scope == FAILURE_CANDIDATE
+                and _subtitle_staging_is_fresh_empty(runner, staging_root)
+            ):
+                # A candidate-labelled exception becomes retryable only after
+                # the exact task root freshly proves it contains no staged
+                # object.  The exception class alone cannot prove an upload
+                # response was not lost.
+                for gap_id in pending:
+                    intents.pop(gap_id, None)
+                    _record_subtitle_attempt(
+                        state_root, root_task_id, gap_records[gap_id],
+                        attempt_id=attempt_id, status="candidate_failed",
+                        error=str(exc),
+                    )
+                    result["subtitle_attempts"].append({
+                        "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                        "outcome": FAILURE_CANDIDATE,
+                    })
+                candidate_failed = True
+                state["updated_at"] = _now()
+                save_root_replenishment_state(state_root, root_task_id, state)
+                continue
+            # A transport/upload *or candidate-labelled* exception can arrive
+            # after the remote staging write committed. Preserve the intent as
+            # in-doubt; no second provider call for these gap ids is allowed.
+            for gap_id in pending:
+                intents[gap_id]["phase"] = "waiting_reconcile"
+                intents[gap_id]["updated_at"] = _now()
+                _record_subtitle_attempt(
+                    state_root, root_task_id, gap_records[gap_id],
+                    attempt_id=attempt_id, status="in_doubt", error=str(exc),
+                )
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_IN_DOUBT,
+                })
+            state["updated_at"] = _now()
+            save_root_replenishment_state(state_root, root_task_id, state)
+            result["subtitle_waiting"] = "waiting_reconcile"
+            continue
+
+        if not isinstance(delivery, Mapping):
+            delivered: dict[str, dict[str, Any]] = {}
+            delivery_error = "字幕 provider 返回无效 delivery"
+        else:
+            try:
+                delivered = _extract_subtitle_delivery(
+                    delivery, request, staging_root=staging_root,
+                )
+                delivery_error = None
+            except ValueError as exc:
+                delivered = {}
+                delivery_error = str(exc)
+
+        valid: dict[str, dict[str, Any]] = {}
+        for gap_id, entry in delivered.items():
+            info = _fresh_file_info(runner.alist, entry["source"])
+            if _file_size(info) == entry["size"]:
+                valid[gap_id] = entry
+            else:
+                delivery_error = "字幕 provider staging 回读不可证明"
+        staging_proven_empty = _subtitle_staging_is_fresh_empty(
+            runner, staging_root,
+        )
+        for gap_id in pending:
+            if gap_id in valid:
+                entry = valid[gap_id]
+                intents[gap_id] = {
+                    "phase": "staged",
+                    "attempt_id": attempt_id,
+                    "staging_root": staging_root,
+                    **entry,
+                    "updated_at": _now(),
+                }
+                active_staging_roots.add(staging_root)
+                continue
+            if staging_proven_empty:
+                intents.pop(gap_id, None)
+                _record_subtitle_attempt(
+                    state_root, root_task_id, gap_records[gap_id],
+                    attempt_id=attempt_id, status="candidate_failed",
+                    error=delivery_error or "字幕 provider 未交付精确单集文件",
+                )
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_CANDIDATE,
+                })
+                candidate_failed = True
+            else:
+                # A malformed/partial response can still have staged bytes
+                # that are absent from its file list.  Keep its original
+                # durable intent and make the ambiguity explicit; a future
+                # round is not permitted to submit this gap again.
+                intents[gap_id]["phase"] = "waiting_reconcile"
+                intents[gap_id]["updated_at"] = _now()
+                _record_subtitle_attempt(
+                    state_root, root_task_id, gap_records[gap_id],
+                    attempt_id=attempt_id, status="in_doubt",
+                    error=delivery_error or "字幕 provider 交付不完整",
+                )
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_IN_DOUBT,
+                })
+                result["subtitle_waiting"] = "waiting_reconcile"
+        state["updated_at"] = _now()
+        save_root_replenishment_state(state_root, root_task_id, state)
+
+        for gap_id, entry in valid.items():
+            if pause_requested is not None and pause_requested():
+                result["paused"] = True
+                break
+            completed = _finish_subtitle_intent(
+                runner, state_root, root_task_id, state,
+                gap=gap_records[gap_id], gap_row=pending[gap_id],
+                request=request, pause_requested=pause_requested,
+            )
+            outcome = completed.get("outcome")
+            if outcome == "closed":
+                result["subtitle_gaps_closed"].append(gap_id)
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": "closed", "bilingual": bool(entry.get("bilingual")),
+                })
+            elif outcome == "paused":
+                result["paused"] = True
+                break
+            elif outcome == FAILURE_CANDIDATE:
+                result["subtitle_attempts"].append({
+                    "gap_id": gap_id, "tier": _SUBTITLE_TIER,
+                    "outcome": FAILURE_CANDIDATE,
+                })
+                candidate_failed = True
+            elif outcome == "waiting_reconcile":
+                result["subtitle_waiting"] = "waiting_reconcile"
+        if result["paused"]:
+            break
+
+    # Cleanup never walks a non-empty tree and is skipped while any intent
+    # still references that attempt.  This leaves uncertain staging untouched
+    # for an operator/recovery read rather than deleting evidence.
+    still_active = {
+        str(entry.get("staging_root"))
+        for entry in _subtitle_intents(state).values()
+        if isinstance(entry, Mapping) and entry.get("staging_root")
+    }
+    for staging_root in sorted(active_staging_roots - still_active):
+        _cleanup_empty_subtitle_staging(
+            runner, staging_root, pause_requested=pause_requested,
+        )
+
+    if _subtitle_intents(state):
+        result["subtitle_waiting"] = "waiting_reconcile"
+    elif result["subtitle_waiting"] is None and candidate_failed:
+        result["subtitle_waiting"] = "retry_wait"
+    return result
 
 
 def _exclude_locator(state: dict[str, Any], tier: str, locator: str) -> None:
@@ -712,6 +1979,7 @@ def run_root_replenishment(
     *,
     search_runner=None,
     materializer_factory=None,
+    subtitle_materializer_factory: Callable[[], Any] | Any | None = None,
     pause_requested=None,
 ) -> dict[str, Any]:
     """Run one replenishment round for the root task's open gaps.
@@ -768,18 +2036,70 @@ def run_root_replenishment(
 
     requests = gap_ledger_requests(state_root, root_task_id)
     _trace(f"start root={root_task_id} tier={tier} requests={len(requests)}")
-    if not requests:
-        return _noop_result(state, tier)
 
     # Operator-confirmed identities may carry no title; fill it from TMDB so
-    # the selection boundary has real alias evidence.
+    # the selection boundary has real alias evidence.  The same read-only
+    # detail response is the only source trusted for an optional bilingual
+    # original language.
     for request in requests:
         _enrich_media_titles(runner, request)
 
+    # Subtitle-only delivery is intentionally completed before any video tier
+    # can reach a search/materializer/write boundary.  A pause requested here
+    # therefore cannot be followed by an unrelated video acquisition.
+    subtitle_result = _run_root_subtitle_channel(
+        runner,
+        state_root,
+        root_task_id,
+        state,
+        requests,
+        subtitle_materializer_factory=subtitle_materializer_factory,
+        pause_requested=materializer_pause,
+    )
+
+    def attach_subtitle_result(result: dict[str, Any]) -> dict[str, Any]:
+        result.update({
+            "subtitle_requests_built": subtitle_result["subtitle_requests_built"],
+            "subtitle_attempts": subtitle_result["subtitle_attempts"],
+            "subtitle_gaps_closed": subtitle_result["subtitle_gaps_closed"],
+            "subtitle_waiting": subtitle_result["subtitle_waiting"],
+            "paused": subtitle_result["paused"],
+        })
+        return result
+
+    def merged_waiting(video_waiting: str | None) -> str | None:
+        subtitle_waiting = subtitle_result.get("subtitle_waiting")
+        if "waiting_reconcile" in {video_waiting, subtitle_waiting}:
+            return "waiting_reconcile"
+        if "retry_wait" in {video_waiting, subtitle_waiting}:
+            return "retry_wait"
+        return video_waiting
+
+    if subtitle_result["paused"]:
+        state["updated_at"] = _now()
+        state["waiting"] = merged_waiting(None)
+        save_root_replenishment_state(state_root, root_task_id, state)
+        return attach_subtitle_result({
+            "tier": tier,
+            "tier_before": tier,
+            "requests_built": 0,
+            "attempts": [],
+            "gaps_closed": [],
+            "state": state,
+            "waiting": state["waiting"],
+        })
+
+    if not requests:
+        state["updated_at"] = _now()
+        state["waiting"] = merged_waiting(None)
+        save_root_replenishment_state(state_root, root_task_id, state)
+        noop = _noop_result(state, tier)
+        noop["waiting"] = state["waiting"]
+        return attach_subtitle_result(noop)
+
     # Drop in-flight (in_doubt) gaps so the same coordinate is never re-submitted.
-    # missing_subtitle gaps are NOT served by the two video tiers: contract
-    # rule 4 routes them through the independent subtitle channel, so they stay
-    # open in the ledger for that channel instead of downloading whole videos.
+    # Subtitle rows have already had their independent direct-sidecar pass;
+    # they never enter the two video tiers or their full-media search.
     filtered: list[dict[str, Any]] = []
     for request in requests:
         rows = [
@@ -821,9 +2141,10 @@ def run_root_replenishment(
                 "recorded_at": _now(),
             })
         state["updated_at"] = _now()
+        waiting = merged_waiting(waiting)
         state["waiting"] = waiting
         save_root_replenishment_state(state_root, root_task_id, state)
-        return {
+        return attach_subtitle_result({
             "tier": tier,
             "tier_before": tier,
             "requests_built": 0,
@@ -831,7 +2152,7 @@ def run_root_replenishment(
             "gaps_closed": reconcile_closed,
             "state": state,
             "waiting": waiting,
-        }
+        })
 
     requests_built = len(requests)
     attempts: list[dict[str, Any]] = list(reconcile_attempts)
@@ -967,6 +2288,10 @@ def run_root_replenishment(
         for selection in selections:
             if not isinstance(selection, Mapping):
                 continue
+            # Video tiers may not piggy-back an old torrent companion
+            # subtitle.  RootJob's independent subtitle channel is the only
+            # route allowed to stage and formally install the merged file.
+            selection = _strip_video_companion_subtitle_members(selection)
             if pause():
                 paused_during_round = True
                 break
@@ -1252,6 +2577,7 @@ def run_root_replenishment(
                 **({"shelf": shelf} if shelf is not None else {}),
             })
 
+    waiting = merged_waiting(waiting)
     state["updated_at"] = _now()
     state["waiting"] = waiting
     _trace(f"end root={root_task_id} tier={state.get('tier')} waiting={waiting} closed={len(gaps_closed)}")
@@ -1265,7 +2591,7 @@ def run_root_replenishment(
         })
     save_root_replenishment_state(state_root, root_task_id, state)
 
-    return {
+    return attach_subtitle_result({
         "tier": str(state.get("tier") or tier),
         "tier_before": tier,
         "requests_built": requests_built,
@@ -1273,7 +2599,7 @@ def run_root_replenishment(
         "gaps_closed": gaps_closed,
         "state": state,
         "waiting": waiting,
-    }
+    })
 
 
 __all__ = [

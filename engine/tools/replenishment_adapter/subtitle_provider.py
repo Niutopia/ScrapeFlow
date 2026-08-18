@@ -25,6 +25,7 @@ import urllib.request
 
 from engine.scrapeflow.subtitle_content import (
     classify_subtitle_content,
+    merge_bilingual_subtitle,
     normalize_subtitle_language,
 )
 
@@ -275,7 +276,14 @@ def _subtitle_url_exactly_matches_gap(
         return False
     season, episode = _gap_episode_coordinate(gap)
     if episode is None:
-        return True
+        # A movie gap has no episode coordinate to match.  It must therefore
+        # reject—not merely fail to compare—any URL-visible TV coordinate;
+        # otherwise a same-title ``Movie.S01E01.srt`` can be accepted as a
+        # generic movie sidecar after the title-overlap check.
+        return (
+            not _candidate_episode_numbers(filename)
+            and _SEASON_REGEX.search(filename) is None
+        )
     advertised_episodes = _candidate_episode_numbers(filename)
     if advertised_episodes:
         if advertised_episodes != {episode}:
@@ -332,9 +340,14 @@ def subtitle_candidate_exactly_matches_gap(
         return False
     season, episode = _gap_episode_coordinate(gap)
     if episode is None:
-        # A movie sidecar has no episode coordinate, but it still needs the
-        # title proof above and must not advertise a multi-episode package.
-        return True
+        # A movie sidecar has no episode coordinate, but must independently
+        # prove it is not a TV episode/season member in either its title or
+        # URL.  Generic movie filenames remain allowed; only an explicit TV
+        # marker is disqualifying.
+        return (
+            not _candidate_episode_numbers(title)
+            and _SEASON_REGEX.search(title) is None
+        )
     advertised_episodes = _candidate_episode_numbers(title)
     if advertised_episodes:
         if advertised_episodes != {episode}:
@@ -892,6 +905,220 @@ class SubtitleMaterializer:
         return raw
 
     @staticmethod
+    def _candidate_format(candidate: Mapping[str, Any]) -> str:
+        """Return the direct sidecar format declared by one candidate.
+
+        The discovery gate already rejects a URL/extension mismatch.  Keeping
+        this check here too makes the byte-validation path self-contained:
+        a caller that injects a discovery double cannot turn an opaque or
+        unsupported payload into a staged sidecar.
+        """
+        fmt = str(candidate.get("format") or "").casefold().lstrip(".")
+        if f".{fmt}" not in SUPPORTED_SUBTITLE_EXTENSIONS:
+            raise SubtitleProviderError("字幕候选声明了不支持的格式")
+        return fmt
+
+    def _fetch_exact_candidate(
+        self,
+        candidate: Mapping[str, Any],
+        gap: Mapping[str, Any],
+        request: Mapping[str, Any],
+        *,
+        required_language: object,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> tuple[bytes, str]:
+        """Fetch exactly one direct sidecar and independently prove its text.
+
+        This is deliberately shared by the Chinese and original-language
+        paths.  The optional original track is not allowed to bypass the
+        episode, pack/archive, size, encoding, or language gates merely
+        because it will later be embedded in a Chinese sidecar.
+        """
+        download_url = candidate.get("url")
+        if (
+            not isinstance(download_url, str)
+            or not subtitle_candidate_exactly_matches_gap(candidate, gap, request)
+        ):
+            raise SubtitleProviderError("字幕候选未通过精确单集校验")
+        _pause_checkpoint(pause_requested)
+        raw_bytes = self._fetch_bytes(download_url)
+        if len(raw_bytes) < MIN_SUBTITLE_BYTES:
+            raise SubtitleProviderError(
+                f"下载的字幕文件过小 ({len(raw_bytes)} bytes)"
+            )
+        if len(raw_bytes) > MAX_SUBTITLE_BYTES:
+            raise SubtitleProviderError(
+                f"下载的字幕文件过大 ({len(raw_bytes)} bytes)"
+            )
+        if _subtitle_payload_is_archive(raw_bytes):
+            raise SubtitleProviderError("字幕候选是网页或压缩包，拒绝整包下载")
+
+        fmt = self._candidate_format(candidate)
+        target = normalize_subtitle_language(required_language)
+        if target is None:
+            raise SubtitleProviderError("字幕候选缺少可验证语言")
+        verdict = classify_subtitle_content(raw_bytes, target)
+        if str(verdict.get("status") or "").casefold() != "satisfied":
+            raise SubtitleProviderError(
+                f"字幕内容未能证明目标语言 ({target})"
+            )
+        detected_format = str(verdict.get("format") or "").casefold()
+        if detected_format != fmt:
+            raise SubtitleProviderError("字幕内容格式与候选声明不一致")
+        return raw_bytes, fmt
+
+    @staticmethod
+    def _direct_url_identity(value: object) -> str | None:
+        """Return the stable identity of a direct member URL.
+
+        A bilingual attempt must use two separately fetched resources.  URL
+        fragments never affect an HTTP fetch, so they are ignored; scheme and
+        host case are normalized to avoid treating the same source as two
+        different tracks.
+        """
+        if not isinstance(value, str):
+            return None
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        return urllib.parse.urlunsplit((
+            parsed.scheme.casefold(),
+            parsed.netloc.casefold(),
+            parsed.path,
+            parsed.query,
+            "",
+        ))
+
+    @staticmethod
+    def _tmdb_verified_original_language(request: Mapping[str, Any]) -> str | None:
+        """Read a TMDB-proven original language, never a provider assertion.
+
+        The root pipeline is responsible for obtaining this field from the
+        authoritative TMDB item before calling the subtitle provider.  A
+        plain ``original_language`` value is intentionally insufficient: it
+        could have come from a release title or stale local metadata.
+        """
+        request_media = request.get("media")
+        if not isinstance(request_media, Mapping):
+            return None
+        if request_media.get("original_language_verified_by_tmdb") is not True:
+            return None
+        tmdb_id = request_media.get("tmdb_id")
+        if tmdb_id in {None, ""}:
+            # The proof marker is meaningful only when it remains bound to a
+            # concrete TMDB identity.  Do not consult gap/request top-level
+            # fields: provider input may carry mutable per-gap annotations.
+            return None
+        language = normalize_subtitle_language(request_media.get("original_language"))
+        if language not in {"japanese", "english", "korean"}:
+            # A Chinese original does not yield a useful bilingual
+            # Chinese/original pair, and unknown languages cannot be
+            # classified conservatively by this local classifier.
+            return None
+        return language
+
+    def _try_bilingual_merge(
+        self,
+        *,
+        chinese_candidate: Mapping[str, Any],
+        chinese_bytes: bytes,
+        chinese_format: str,
+        gap: Mapping[str, Any],
+        request: Mapping[str, Any],
+        pause_requested: Callable[[], bool] | None,
+    ) -> tuple[bytes, str, dict[str, object]]:
+        """Return one strictly merged file, or the safe Chinese-only fallback.
+
+        The original language is optional from the user's point of view.  A
+        missing, transiently unreachable, different-format, or differently
+        timed original candidate must not make a verified Chinese subtitle
+        disappear.  It also must never create a second sidecar.
+        """
+        original_language = self._tmdb_verified_original_language(request)
+        fallback: dict[str, object] = {"bilingual": False}
+        if original_language is None:
+            return chinese_bytes, chinese_format, fallback
+
+        original_gap = dict(gap)
+        original_gap["subtitle_language"] = original_language
+        chinese_url = self._direct_url_identity(chinese_candidate.get("url"))
+        try:
+            _pause_checkpoint(pause_requested)
+            candidates = self.discovery.search_gap(original_gap, request)
+        except SubtitlePauseRequested:
+            raise
+        except Exception:
+            # The required Chinese track is already proven.  Original-track
+            # search is optional, so an outage is a safe fallback rather than
+            # a reason to relabel or discard the Chinese sidecar.
+            return chinese_bytes, chinese_format, fallback
+        if not isinstance(candidates, list):
+            return chinese_bytes, chinese_format, fallback
+
+        for candidate in candidates:
+            _pause_checkpoint(pause_requested)
+            if not isinstance(candidate, Mapping):
+                continue
+            original_url = self._direct_url_identity(candidate.get("url"))
+            if original_url is None or original_url == chinese_url:
+                # Never fetch the Chinese URL again and pretend its payload
+                # is an original-language track.
+                continue
+            try:
+                if self._candidate_format(candidate) != chinese_format:
+                    # The merger deliberately does not transcode or align
+                    # different container formats.
+                    continue
+                original_bytes, original_format = self._fetch_exact_candidate(
+                    candidate,
+                    original_gap,
+                    request,
+                    required_language=original_language,
+                    pause_requested=pause_requested,
+                )
+                if original_format != chinese_format:
+                    continue
+                merged = merge_bilingual_subtitle(
+                    chinese_bytes,
+                    original_bytes,
+                    original_language,
+                )
+                content = merged.get("content") if isinstance(merged, Mapping) else None
+                if (
+                    str(merged.get("status") or "").casefold() != "satisfied"
+                    or not isinstance(content, bytes)
+                ):
+                    continue
+                return content, chinese_format, {
+                    "bilingual": True,
+                    "original_language": original_language,
+                    "original_provider": candidate.get("provider"),
+                    "bilingual_cue_count": merged.get("cue_count"),
+                    # This is one file's language marker, not a request to
+                    # create an original-language sidecar.  It lets durable
+                    # post-write audit distinguish a strictly proven merged
+                    # cue body from a Chinese-only .zh-CN file after restart.
+                    "subtitle_marker": (
+                        "zh-CN-bilingual-"
+                        + {"japanese": "ja", "english": "en", "korean": "ko"}[original_language]
+                    ),
+                }
+            except SubtitlePauseRequested:
+                raise
+            except SubtitleInfrastructureError:
+                # Optional original-track transport is not allowed to block a
+                # fully validated Chinese subtitle.  The caller still gets
+                # the same one-file delivery, never a partial second track.
+                return chinese_bytes, chinese_format, fallback
+            except (urllib.error.URLError, TimeoutError, OSError):
+                return chinese_bytes, chinese_format, fallback
+            except Exception:
+                # Candidate, language, or timing proof failure: try another
+                # exact original candidate, then retain Chinese-only.
+                continue
+        return chinese_bytes, chinese_format, fallback
+
+    @staticmethod
     def _content_type(fmt: str) -> str:
         return _SUBTITLE_CONTENT_TYPES.get(fmt.casefold().lstrip("."), "text/plain")
 
@@ -1004,52 +1231,53 @@ class SubtitleMaterializer:
                 continue
 
             acquired_file: dict[str, Any] | None = None
-            last_err: Exception | None = None
+            target_lang = normalize_subtitle_language(
+                gap.get("subtitle_language") or "zh"
+            ) or "simplified_chinese"
 
             for candidate in candidates:
                 _pause_checkpoint(pause_requested)
-                download_url = candidate.get("url")
-                if (
-                    not download_url
-                    or not subtitle_candidate_exactly_matches_gap(
-                        candidate, gap, request,
-                    )
-                ):
+                if not isinstance(candidate, Mapping):
                     continue
-
                 try:
-                    _pause_checkpoint(pause_requested)
-                    raw_bytes = self._fetch_bytes(download_url)
-                    if len(raw_bytes) < MIN_SUBTITLE_BYTES:
-                        raise SubtitleProviderError(f"下载的字幕文件过小 ({len(raw_bytes)} bytes)")
-                    if len(raw_bytes) > MAX_SUBTITLE_BYTES:
-                        raise SubtitleProviderError(f"下载的字幕文件过大 ({len(raw_bytes)} bytes)")
-                    if _subtitle_payload_is_archive(raw_bytes):
-                        raise SubtitleProviderError(
-                            "字幕候选是网页或压缩包，拒绝整包下载"
-                        )
+                    raw_bytes, fmt = self._fetch_exact_candidate(
+                        candidate,
+                        gap,
+                        request,
+                        required_language=target_lang,
+                        pause_requested=pause_requested,
+                    )
+                    # The original track is an optional enhancement.  It is
+                    # merged in memory only after both independently fetched
+                    # sidecars pass every exactness/language check.  This
+                    # returns the original Chinese bytes unchanged when no
+                    # TMDB-proven, cue-aligned original exists.
+                    raw_bytes, fmt, bilingual = self._try_bilingual_merge(
+                        chinese_candidate=candidate,
+                        chinese_bytes=raw_bytes,
+                        chinese_format=fmt,
+                        gap=gap,
+                        request=request,
+                        pause_requested=pause_requested,
+                    )
 
-                    fmt = str(candidate.get("format") or "srt").lower().lstrip(".")
-                    if f".{fmt}" not in SUPPORTED_SUBTITLE_EXTENSIONS:
-                        fmt = "srt"
-
-                    target_lang = normalize_subtitle_language(gap.get("subtitle_language") or "zh") or "simplified_chinese"
-                    verdict = classify_subtitle_content(raw_bytes, target_lang)
-                    if str(verdict.get("status") or "").casefold() != "satisfied":
-                        raise SubtitleProviderError(
-                            f"字幕内容未能证明目标语言 ({target_lang})"
-                        )
-                    detected_format = str(verdict.get("format") or "").casefold()
-                    if detected_format != fmt:
-                        raise SubtitleProviderError(
-                            "字幕内容格式与候选声明不一致"
-                        )
-
-                    # Name staging file to match video stem
+                    # Name the only staged/final candidate as the requested
+                    # Chinese lane even when its cue body also carries the
+                    # original language.  There is intentionally no .ja/.en/
+                    # .ko companion output.
                     video_path = str(gap.get("path") or "")
                     video_name = posixpath.basename(video_path) if video_path else "subtitle"
                     video_stem = posixpath.splitext(video_name)[0]
-                    lang_tag = "zh-CN" if target_lang == "simplified_chinese" else ("zh-TW" if target_lang == "traditional_chinese" else "zh")
+                    lang_tag = (
+                        "zh-CN" if target_lang == "simplified_chinese"
+                        else "zh-TW" if target_lang == "traditional_chinese"
+                        else "zh"
+                    )
+                    if bilingual.get("bilingual") is True:
+                        marker = bilingual.get("subtitle_marker")
+                        if not isinstance(marker, str) or not marker:
+                            raise SubtitleProviderError("双语字幕缺少持久化语言标识")
+                        lang_tag = marker
                     sub_filename = f"{video_stem}.{lang_tag}.{fmt}"
                     # Two audited rows can point at files with the same
                     # basename (for example duplicate season roots).  Keep
@@ -1060,7 +1288,9 @@ class SubtitleMaterializer:
                         safe_gap = re.sub(
                             r"[^a-zA-Z0-9._-]+", "-", gap_id,
                         ).strip(".-")[:48] or "gap"
-                        sub_filename = f"{video_stem}.{safe_gap}.{lang_tag}.{fmt}"
+                        sub_filename = (
+                            f"{video_stem}.{safe_gap}.{lang_tag}.{fmt}"
+                        )
                     used_staging_names.add(sub_filename)
 
                     local_sub_path = workspace / sub_filename
@@ -1103,6 +1333,7 @@ class SubtitleMaterializer:
                         "gap_ids": [gap_id],
                         "kind": "subtitle",
                         "provider": candidate.get("provider"),
+                        **bilingual,
                     }
                     break
                 except SubtitlePauseRequested:
@@ -1110,14 +1341,16 @@ class SubtitleMaterializer:
                 except SubtitleInfrastructureError:
                     raise
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                    # A candidate download failure is an infrastructure
-                    # outage, not proof that the subtitle candidate is bad or
-                    # that this lane is exhausted.
+                    # A required Chinese candidate download failure is an
+                    # infrastructure outage, not proof that this lane is
+                    # exhausted.  Optional original-track failures are
+                    # already converted to the Chinese-only fallback above.
                     raise SubtitleInfrastructureError(
                         f"字幕下载接口不可用: {exc}"
                     ) from exc
-                except Exception as exc:
-                    last_err = exc
+                except Exception:
+                    # Candidate content/format/episode proof failure.  Try
+                    # the next independently exact Chinese sidecar.
                     continue
 
             if acquired_file is not None:

@@ -35,6 +35,7 @@ from engine.scrapeflow.media_policy import (
 )
 from engine.scrapeflow.subtitle_content import (
     DEFAULT_MAX_PREFIX_BYTES,
+    classify_bilingual_subtitle_content,
     classify_subtitle_content,
     normalize_subtitle_language,
 )
@@ -263,6 +264,50 @@ _SUBTITLE_COMPANION_SUFFIX_RE = re.compile(
     r"))+$",
     re.IGNORECASE,
 )
+
+# A merged subtitle remains exactly one Chinese sidecar.  The original-language
+# token is deliberately part of that *same* filename so a later bounded audit
+# has enough evidence to validate the mixed cue body rather than trusting a
+# generic ``.zh`` suffix.  Do not infer this from arbitrary mixed text: only a
+# writer-produced, explicit marker is eligible for the bilingual validator.
+_BILINGUAL_SIDECAR_MARKER_RE = re.compile(
+    r"(?:^|[._-])zh(?:[-_](?:cn|hans))?"
+    r"[._-]+bilingual[._-]+(?P<original>ja|en|ko)(?:$|[._-])",
+    re.IGNORECASE,
+)
+
+
+def _bilingual_sidecar_original_language(path: object) -> str | None:
+    if not isinstance(path, str):
+        return None
+    stem = PurePosixPath(path).stem
+    match = _BILINGUAL_SIDECAR_MARKER_RE.search(stem)
+    if match is None:
+        return None
+    return normalize_subtitle_language(match.group("original"))
+
+
+def _is_simplified_chinese_requirement(
+    required_language: str | Sequence[str],
+) -> bool:
+    """Return true only for the one Chinese lane a merged sidecar satisfies.
+
+    A bilingual ``zh + original`` file proves the configured Simplified
+    Chinese requirement.  It must not silently satisfy an unrelated
+    multi-language policy, because that would make a single mixed file look
+    like separate independently verified tracks.
+    """
+    if isinstance(required_language, str):
+        values: Sequence[object] = (required_language,)
+    elif isinstance(required_language, (list, tuple, set, frozenset)):
+        values = tuple(required_language)
+    else:
+        return False
+    normalized = {
+        value for item in values
+        if (value := normalize_subtitle_language(item)) is not None
+    }
+    return normalized == {"simplified_chinese"}
 
 
 def _subtitle_companion_key(path: str) -> tuple[str, str]:
@@ -3199,6 +3244,43 @@ def probe_remote_subtitle_content(
         else DEFAULT_MAX_PREFIX_BYTES
     )
     limit = max(1024, min(DEFAULT_MAX_PREFIX_BYTES * 16, limit))
+    original_language = _bilingual_sidecar_original_language(subtitle_path)
+    require_complete_bilingual_proof = bool(
+        original_language is not None
+        and _is_simplified_chinese_requirement(required_language)
+    )
+    read_limit = limit
+    expected_size: int | None = None
+    if require_complete_bilingual_proof:
+        # A marked merged subtitle promises that *every* cue is exactly
+        # Chinese-first/original-second.  A prefix cannot prove that a later
+        # cue is still aligned, so read the entire bounded sidecar or leave
+        # it unknown.  Never promote an unverified suffix into a closed gap.
+        info_reader = getattr(client, "exact_file_info", None)
+        if not callable(info_reader):
+            return {
+                "status": "unknown",
+                "source": "external_subtitle_content",
+                "reason": "bilingual_exact_size_unavailable",
+            }
+        try:
+            info = info_reader(subtitle_path)
+        except Exception:
+            info = None
+        size = info.get("size") if isinstance(info, Mapping) else None
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or size > limit
+        ):
+            return {
+                "status": "unknown",
+                "source": "external_subtitle_content",
+                "reason": "bilingual_exact_size_unavailable",
+            }
+        expected_size = size
+        read_limit = size
     reader = getattr(client, "read_file_prefix", None)
     if not callable(reader):
         reader = getattr(client, "read_file_bytes", None)
@@ -3210,18 +3292,44 @@ def probe_remote_subtitle_content(
         }
     try:
         try:
-            prefix = reader(subtitle_path, max_bytes=limit)
+            prefix = reader(subtitle_path, max_bytes=read_limit)
         except TypeError:
-            prefix = reader(subtitle_path, limit)
+            prefix = reader(subtitle_path, read_limit)
     except Exception:
         return {
             "status": "unknown",
             "source": "external_subtitle_content",
             "reason": "subtitle_content_read_error",
         }
-    result = classify_subtitle_content(
-        prefix, required_language, max_bytes=limit,
-    )
+    if (
+        expected_size is not None
+        and (
+            not isinstance(prefix, (bytes, bytearray, memoryview))
+            or len(prefix) != expected_size
+        )
+    ):
+        return {
+            "status": "unknown",
+            "source": "external_subtitle_content",
+            "reason": "bilingual_content_read_incomplete",
+        }
+    if (
+        original_language is not None
+        and _is_simplified_chinese_requirement(required_language)
+    ):
+        # A mixed cue body is never accepted by the ordinary single-language
+        # classifier.  The explicit one-file marker selects the stricter
+        # validator, which proves every cue contains a Simplified-Chinese
+        # line plus the named original language in Chinese-first order.
+        result = classify_bilingual_subtitle_content(
+            prefix,
+            original_language,
+            max_bytes=limit,
+        )
+    else:
+        result = classify_subtitle_content(
+            prefix, required_language, max_bytes=limit,
+        )
     if not isinstance(result, Mapping):
         return {
             "status": "unknown",

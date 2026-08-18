@@ -17,28 +17,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from engine.scrapeflow.serialization import atomic_write_json
-from engine.scrapeflow.replenishment_matching import (
-    expanded_episode_ids as _expanded_episode_ids,
-    normalized_text as _normalized_text,
-    season_markers as _season_markers,
-)
 from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
-)
-from engine.scrapeflow.subtitle_content import (
-    DEFAULT_MAX_PREFIX_BYTES,
-    classify_subtitle_content,
 )
 from engine.scrapeflow.target_shelf import target_shelf_for_shelf_segment
 from engine.scrapeflow.video_admission import (
     VideoAdmissionError,
     probe_remote_video_stream,
 )
-from engine.tools.replenishment_adapter import (
-    SubtitleMaterializer,
-)
-
 from .replenishment import (
     build_replenishment_requests,
     enrich_replenishment_plan_aliases,
@@ -98,6 +85,15 @@ _CANDIDATE_MEMORY_MAX_GAPS_PER_ENTRY = 64
 _FAILURE_DELIVERY = "delivery"
 _FAILURE_CANCELLED = "cancelled"
 _POST_ACQUISITION_REAUDIT_KEY = "post_acquisition_reaudit"
+_LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY = "legacy_companion_subtitle_migration"
+_LEGACY_COMPANION_SUBTITLE_MIGRATION_MESSAGE = (
+    "旧媒体补源携带的字幕成员已停用；系统没有把它作为字幕通道交付或写入正式库，"
+    "请通过 RootJob 字幕通道重新审计"
+)
+_LEGACY_SUBTITLE_MIGRATION_MESSAGE = (
+    "旧字幕自动通道已停用；请通过 RootJob 字幕通道重新触发，"
+    "系统没有提交、下载、暂存或写入任何字幕"
+)
 _POST_ACQUISITION_REAUDIT_PENDING_STATUSES = frozenset({
     "pending",
     "audit_uncertain",
@@ -118,15 +114,6 @@ _DURABLE_GAP_STATE_DEFAULTS: dict[str, object] = {
     "next_retry_at": None,
     "tier_status": None,
 }
-
-_COMPANION_LANGUAGE_MARKER_RE = re.compile(
-    r"(?i)(?<![a-z0-9])(?:zh|zho|chi|chs|cht|中文|简中|簡中|简体|繁体|繁體|"
-    r"chinese)(?![a-z0-9])"
-)
-_COMPANION_LANGUAGE_VALUE_RE = re.compile(
-    r"(?i)^(?:zh|zho|chi|chs|cht|中文|简中|簡中|简体|繁体|繁體|chinese)$"
-)
-
 
 class AutomaticReplenishmentError(RuntimeError):
     """An automatic replenishment attempt could not be completed."""
@@ -1257,7 +1244,7 @@ class AutomaticReplenishmentRuntime:
         alist: object,
         search: AutomaticProviderSearch,
         materializer: AutomaticMaterializer,
-        subtitle_materializer: SubtitleMaterializer | None = None,
+        subtitle_materializer: object | None = None,
         staging_root: str = CANONICAL_REPLENISHMENT_STAGING_ROOT,
         max_candidate_rounds: int = 3,
         progress: Callable[[EngineJob, str, Mapping[str, object]], None] | None = None,
@@ -1270,7 +1257,10 @@ class AutomaticReplenishmentRuntime:
         self.alist = alist
         self.search = search
         self.materializer = materializer
-        self.subtitle_materializer = subtitle_materializer or SubtitleMaterializer()
+        # Kept only as a constructor compatibility slot for callers that still
+        # inject the retired EngineJob subtitle provider.  This runtime never
+        # invokes it: RootJob owns the sole automatic subtitle transaction.
+        self.subtitle_materializer = subtitle_materializer
         try:
             self.staging_root = validate_provider_staging_root(staging_root)
         except ProviderStagingPathError as exc:
@@ -2476,6 +2466,26 @@ class AutomaticReplenishmentRuntime:
             fields[_POST_ACQUISITION_REAUDIT_KEY] = (
                 dict(raw_reaudit) if isinstance(raw_reaudit, Mapping) else raw_reaudit
             )
+        # This is a RootJob migration notice, not a provider-tier state and
+        # not an EngineJob summary mirror.  Preserve only its fixed,
+        # operator-facing shape when the next audit re-projects the media gap;
+        # arbitrary historic JSON must not become provider input.
+        raw_companion_migration = prior_state.get(
+            _LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY,
+        )
+        if (
+            isinstance(raw_companion_migration, Mapping)
+            and raw_companion_migration.get("status") == "required"
+        ):
+            migration: dict[str, object] = {
+                "status": "required",
+                "manual_action": "migrate_rootjob_subtitle",
+                "message": _LEGACY_COMPANION_SUBTITLE_MIGRATION_MESSAGE,
+            }
+            observed_at = raw_companion_migration.get("observed_at")
+            if isinstance(observed_at, str) and 0 < len(observed_at) <= 64:
+                migration["observed_at"] = observed_at
+            fields[_LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY] = migration
         return fields
 
     @staticmethod
@@ -2505,39 +2515,114 @@ class AutomaticReplenishmentRuntime:
             raise AutomaticReplenishmentError("补源请求 lane 与 gap 类型不一致")
         return lane
 
-    @classmethod
-    def _delivered_subtitle_gap_ids(
-        cls,
-        acquisition: Mapping[str, object],
-        request: Mapping[str, object],
-    ) -> set[str]:
-        """Return only subtitle gaps with one explicitly delivered member.
+    @staticmethod
+    def _strip_legacy_companion_subtitle_members(
+        selections: Sequence[Mapping[str, object]],
+    ) -> tuple[list[dict[str, object]], set[str]]:
+        """Drop legacy companion members before a media materializer sees them.
 
-        This is intentionally derived from the materializer's durable
-        ``files`` map rather than from a provider candidate.  A manifest can
-        claim a subtitle while delivery can still omit it.
+        A previous EngineJob compatibility path allowed one ``.chs`` member in
+        a media torrent to cross into staging and then wrote it beside the
+        child video.  That is incompatible with the RootJob-owned, verified
+        merged-bilingual subtitle transaction.  Strip the selection map before
+        the downloader's ``--select-file`` list is derived, while keeping the
+        selected video members untouched.
+        """
+        sanitized: list[dict[str, object]] = []
+        affected_gap_ids: set[str] = set()
+        for raw_selection in selections:
+            selection = dict(raw_selection)
+            acquisition = selection.get("acquisition")
+            if not isinstance(acquisition, Mapping):
+                sanitized.append(selection)
+                continue
+            cleaned_acquisition = dict(acquisition)
+            raw_companions = cleaned_acquisition.pop(
+                "companion_subtitle_index_by_media_gap", None,
+            )
+            if raw_companions is not None:
+                selected_gap_ids = {
+                    gap_id
+                    for gap_id in selection.get("selected_gap_ids", [])
+                    if isinstance(gap_id, str) and gap_id
+                } if isinstance(selection.get("selected_gap_ids"), list) else set()
+                selected_companion_gap_ids: set[str] = set()
+                if isinstance(raw_companions, Mapping):
+                    selected_companion_gap_ids.update(
+                        str(gap_id)
+                        for gap_id in raw_companions
+                        if isinstance(gap_id, str)
+                        and gap_id
+                        and gap_id in selected_gap_ids
+                    )
+                # A malformed map cannot authorize a subtitle either.  Keep
+                # the notice scoped to the already selected media coordinates.
+                if not selected_companion_gap_ids:
+                    selected_companion_gap_ids.update(selected_gap_ids)
+                affected_gap_ids.update(selected_companion_gap_ids)
+            selection["acquisition"] = cleaned_acquisition
+            sanitized.append(selection)
+        return sanitized, affected_gap_ids
+
+    @staticmethod
+    def _delivered_legacy_companion_subtitle_gap_ids(
+        acquisition: Mapping[str, object],
+        *,
+        known_gap_ids: set[str],
+    ) -> tuple[set[str], int]:
+        """Return media gaps with an already-delivered subtitle member.
+
+        A third-party or old materializer can ignore the sanitized selection.
+        The normalized delivery record is the only evidence used for the
+        resulting manual-migration marker; the member is never installed.
         """
         rows = acquisition.get("files")
         if not isinstance(rows, list):
-            raise AutomaticReplenishmentError("字幕获取结果缺少 files 映射")
-        kinds = {
-            str(row.get("id")): str(row.get("kind") or "")
-            for row in cls._request_gaps(request)
-            if isinstance(row.get("id"), str) and row.get("id")
-        }
+            raise AutomaticReplenishmentError("媒体获取结果缺少 files 映射")
         delivered: set[str] = set()
+        count = 0
         for raw in rows:
-            if not isinstance(raw, Mapping):
-                raise AutomaticReplenishmentError("字幕获取 files 项无效")
-            gap_ids = raw.get("gap_ids")
-            if not isinstance(gap_ids, list) or len(gap_ids) != 1:
-                raise AutomaticReplenishmentError("字幕获取结果未绑定唯一 gap")
-            gap_id = gap_ids[0]
-            if not isinstance(gap_id, str) or not gap_id or gap_id not in kinds:
-                raise AutomaticReplenishmentError("字幕获取结果绑定了未知 gap")
-            if kinds[gap_id] == "missing_subtitle":
-                delivered.add(gap_id)
-        return delivered
+            if not isinstance(raw, Mapping) or raw.get("kind") != "subtitle":
+                continue
+            count += 1
+            raw_gap_ids = raw.get("gap_ids")
+            if not isinstance(raw_gap_ids, list):
+                continue
+            delivered.update(
+                gap_id
+                for gap_id in raw_gap_ids
+                if isinstance(gap_id, str) and gap_id in known_gap_ids
+            )
+        return delivered, count
+
+    def _mark_legacy_companion_subtitle_migration(
+        self,
+        gap_state_paths: Mapping[str, Path],
+        *,
+        gap_ids: set[str],
+        delivered_member_count: int = 0,
+    ) -> list[str]:
+        """Persist a manual RootJob notice without blocking media delivery."""
+        affected = sorted(set(gap_state_paths) & set(gap_ids))
+        if not affected:
+            return []
+        marker: dict[str, object] = {
+            "status": "required",
+            "manual_action": "migrate_rootjob_subtitle",
+            "message": _LEGACY_COMPANION_SUBTITLE_MIGRATION_MESSAGE,
+            "observed_at": _now(),
+        }
+        if delivered_member_count > 0:
+            marker["delivered_member_count"] = min(delivered_member_count, 256)
+        self._update_gap_states(
+            gap_state_paths,
+            gap_ids=set(affected),
+            updates={
+                _LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY: marker,
+                "updated_at": _now(),
+            },
+        )
+        return affected
 
     @staticmethod
     def _media_child_staging_root(
@@ -2565,491 +2650,6 @@ class AutomaticReplenishmentRuntime:
         if any(path.startswith(prefix) for path in subtitles):
             raise AutomaticReplenishmentError("字幕不得进入媒体 child staging 根")
         return media_root
-
-    @staticmethod
-    def _subtitle_staging_root(
-        staging_root: str,
-        staging_files: Sequence[StagingFile],
-    ) -> str | None:
-        """Derive a subtitle-only root, or decline the best-effort sidecar."""
-        root = _safe_path(staging_root, label="staging path")
-        subtitles = [item.path for item in staging_files if item.kind == "subtitle"]
-        videos = [item.path for item in staging_files if item.kind == "video"]
-        if not subtitles:
-            raise AutomaticReplenishmentError("字幕 staging 没有字幕文件")
-        if not videos:
-            return root
-        relative = [path[len(root) + 1:] for path in subtitles]
-        first_parts = {
-            value.split("/", 1)[0]
-            for value in relative if "/" in value
-        }
-        if len(first_parts) != 1 or any("/" not in value for value in relative):
-            return None
-        subtitle_root = f"{root}/{next(iter(first_parts))}"
-        prefix = subtitle_root + "/"
-        if any(path.startswith(prefix) for path in videos):
-            return None
-        return subtitle_root
-
-    @staticmethod
-    def _companion_core(path: str) -> str:
-        """Normalize a provider stem after removing only a language suffix."""
-        stem = Path(path).stem
-        # Keep this suffix list intentionally finite.  Removing arbitrary
-        # release/quality tokens would make a cross-work or cross-edition
-        # subtitle look like an exact companion.
-        stem = re.sub(
-            r"(?i)(?:[ ._\-\[\]()]+(?:zh|zho|chi|chs|cht|中文|简中|簡中|"
-            r"简体|繁体|繁體|chinese))+$",
-            "",
-            stem,
-        )
-        return _normalized_text(stem)
-
-    @staticmethod
-    def _companion_required_language(value: object) -> bool:
-        text = str(value or "").strip().casefold()
-        return any(
-            token in text
-            for token in ("zh", "中文", "简", "繁", "chinese", "chs", "cht")
-        )
-
-    @classmethod
-    def _companion_path_has_language(
-        cls, path: str, requested: object, declared: object = None,
-    ) -> bool:
-        """Require an explicit CHS/Chinese marker in the provider member."""
-        if not cls._companion_required_language(requested):
-            # The companion lane is deliberately only a Chinese lane.  Other
-            # languages remain eligible for the ordinary subtitle audit path.
-            return False
-        if declared is not None and not cls._companion_required_language(declared):
-            return False
-        return _COMPANION_LANGUAGE_MARKER_RE.search(path) is not None
-
-    @staticmethod
-    def _companion_gap_episode_ids(gap: Mapping[str, object]) -> set[str]:
-        values: set[str] = set()
-        for key in ("label", "title", "id"):
-            value = gap.get(key)
-            if isinstance(value, str):
-                values.update(_expanded_episode_ids(value))
-        season = gap.get("season")
-        episodes = gap.get("episodes")
-        if type(season) is int and isinstance(episodes, list):
-            values.update(
-                f"S{season:02d}E{episode:02d}"
-                for episode in episodes
-                if type(episode) is int and episode > 0
-            )
-        return values
-
-    @classmethod
-    def _companion_pair_is_exact(
-        cls,
-        *,
-        request: Mapping[str, object],
-        gap: Mapping[str, object],
-        video_path: str,
-        subtitle_path: str,
-        subtitle_language: object,
-        declared_language: object = None,
-    ) -> bool:
-        """Prove one manifest subtitle belongs to one selected new video.
-
-        This gate intentionally does not use the broader subtitle selector's
-        bare-ordinal fallback.  A companion has to carry the same single
-        episode coordinate as the selected video, the same season evidence,
-        an explicit Chinese marker, and a work identity (or an exactly equal
-        stem after the language suffix is removed).
-        """
-        if not cls._companion_path_has_language(
-            subtitle_path, subtitle_language, declared_language,
-        ):
-            return False
-        video_ids = _expanded_episode_ids(video_path)
-        subtitle_ids = _expanded_episode_ids(subtitle_path)
-        if video_ids or subtitle_ids:
-            # Ranges/packs and bare ordinal sidecars are never companions.
-            if len(video_ids) != 1 or subtitle_ids != video_ids:
-                return False
-            expected_ids = cls._companion_gap_episode_ids(gap)
-            if expected_ids and video_ids != expected_ids:
-                return False
-        else:
-            # Movie/opaque media still require an exact same-stem pairing.  A
-            # language-only ``E05.chs.ass`` cannot be laundered as a movie
-            # companion.
-            video_core = cls._companion_core(video_path)
-            subtitle_core = cls._companion_core(subtitle_path)
-            if not video_core or video_core != subtitle_core:
-                return False
-
-        video_seasons = _season_markers(video_path)
-        subtitle_seasons = _season_markers(subtitle_path)
-        if video_seasons and subtitle_seasons and video_seasons != subtitle_seasons:
-            return False
-        expected_season = gap.get("season")
-        if type(expected_season) is int and expected_season > 0:
-            if any(season != expected_season for season in video_seasons | subtitle_seasons):
-                return False
-
-        video_core = cls._companion_core(video_path)
-        subtitle_core = cls._companion_core(subtitle_path)
-        if video_core == subtitle_core:
-            return True
-
-        # Different release tags are acceptable only when the same explicit
-        # work alias appears in both manifest members.  This keeps a subtitle
-        # from another franchise (even with the same SxxEyy) out of the lane.
-        media = request.get("media")
-        if not isinstance(media, Mapping):
-            return False
-        raw_aliases = media.get("aliases")
-        aliases = raw_aliases if isinstance(raw_aliases, list) else [media.get("title")]
-        video_key = _normalized_text(video_path)
-        subtitle_key = _normalized_text(subtitle_path)
-        for alias in aliases:
-            alias_key = _normalized_text(alias)
-            han_count = sum("\u3400" <= char <= "\u9fff" for char in alias_key)
-            if (
-                alias_key and (len(alias_key) >= 4 or han_count >= 2)
-                and alias_key in video_key and alias_key in subtitle_key
-            ):
-                return True
-        return False
-
-    @classmethod
-    def _validated_companion_subtitles(
-        cls,
-        *,
-        request: Mapping[str, object],
-        acquisition: Mapping[str, object],
-        staging_files: Sequence[StagingFile],
-        selected_gap_ids: set[str],
-    ) -> list[dict[str, object]]:
-        """Derive exact companions solely from normalized Delivery rows.
-
-        One video and one subtitle must each bind only the same selected media
-        gap, and their actual staged names must pass the strict work/episode/
-        language matcher.  Any ambiguity drops only the optional subtitle;
-        the video remains eligible for the child transaction.
-        """
-        media_gaps = {
-            str(gap.get("id")): dict(gap)
-            for gap in cls._request_gaps(request)
-            if str(gap.get("kind") or "") != "missing_subtitle"
-            and isinstance(gap.get("id"), str) and gap.get("id")
-            and str(gap.get("id")) in selected_gap_ids
-        }
-        if not media_gaps:
-            return []
-        rows = acquisition.get("files")
-        if not isinstance(rows, list):
-            return []
-        staging_by_path = {item.path: item for item in staging_files}
-        output: list[dict[str, object]] = []
-        used_subtitles: set[str] = set()
-        for gap_id, gap in media_gaps.items():
-            bound = [
-                row for row in rows
-                if isinstance(row, Mapping) and row.get("gap_ids") == [gap_id]
-            ]
-            video_rows = [row for row in bound if row.get("kind") == "video"]
-            subtitle_rows = [row for row in bound if row.get("kind") == "subtitle"]
-            if len(subtitle_rows) != 1 or len(video_rows) != 1:
-                continue
-            subtitle_row = subtitle_rows[0]
-            video_row = video_rows[0]
-            subtitle_source = subtitle_row.get("path")
-            video_source = video_row.get("path")
-            subtitle_size = subtitle_row.get("size")
-            video_size = video_row.get("size")
-            if (
-                not isinstance(subtitle_source, str)
-                or not isinstance(video_source, str)
-                or subtitle_source in used_subtitles
-                or type(subtitle_size) is not int
-                or type(video_size) is not int
-                or subtitle_source not in staging_by_path
-                or video_source not in staging_by_path
-                or staging_by_path[subtitle_source].kind != "subtitle"
-                or staging_by_path[video_source].kind != "video"
-            ):
-                continue
-            if not cls._companion_pair_is_exact(
-                request=request,
-                gap=gap,
-                video_path=posixpath.basename(video_source),
-                subtitle_path=posixpath.basename(subtitle_source),
-                subtitle_language=gap.get("subtitle_language") or "zh",
-            ):
-                continue
-            output.append({
-                "gap_id": gap_id,
-                "video_source": video_source,
-                "subtitle_source": subtitle_source,
-                "video_size": video_size,
-                "subtitle_size": subtitle_size,
-                "video_manifest_path": posixpath.basename(video_source),
-                "subtitle_manifest_path": posixpath.basename(subtitle_source),
-                "subtitle_language": gap.get("subtitle_language") or "zh",
-            })
-            used_subtitles.add(subtitle_source)
-        return output
-
-    @staticmethod
-    def _new_child_video_targets(
-        child: EngineJob,
-    ) -> list[dict[str, object]]:
-        """Return only video targets that this child actually moved now."""
-        execution = child.execution if isinstance(child.execution, Mapping) else {}
-        rows = execution.get("files")
-        if not isinstance(rows, list):
-            return []
-        output: list[dict[str, object]] = []
-        for row in rows:
-            if not isinstance(row, Mapping) or str(row.get("status") or "").casefold() != "moved":
-                continue
-            target = row.get("target") or row.get("path")
-            source = row.get("source")
-            if (
-                not isinstance(target, str) or not target.startswith("/")
-                or Path(target).suffix.casefold() not in _VIDEO_EXTENSIONS
-            ):
-                continue
-            output.append({
-                "target": target,
-                **({"source": source} if isinstance(source, str) else {}),
-                "size": row.get("size"),
-            })
-        return output
-
-    @classmethod
-    def _companion_target_for_child(
-        cls,
-        child: EngineJob,
-        spec: Mapping[str, object],
-    ) -> str | None:
-        """Bind one companion to a newly moved child target, never a stale one."""
-        moved = cls._new_child_video_targets(child)
-        if not moved:
-            return None
-        video_source = spec.get("video_source")
-        video_ids = _expanded_episode_ids(str(spec.get("video_manifest_path") or ""))
-        candidates: list[str] = []
-        plan = child.plan if isinstance(child.plan, Mapping) else {}
-        plan_files = plan.get("files") if isinstance(plan.get("files"), list) else []
-        for row in moved:
-            target = row.get("target")
-            source = row.get("source")
-            if not isinstance(target, str):
-                continue
-            if isinstance(video_source, str) and isinstance(source, str) and source == video_source:
-                candidates.append(target)
-                continue
-            for planned in plan_files:
-                if not isinstance(planned, Mapping):
-                    continue
-                if str(planned.get("media_kind") or "") != "video":
-                    continue
-                planned_source = planned.get("source_path")
-                planned_target = posixpath.join(
-                    str(planned.get("target_dir") or ""),
-                    str(planned.get("final_name") or ""),
-                )
-                if (
-                    isinstance(video_source, str)
-                    and planned_source == video_source
-                    and planned_target == target
-                ):
-                    candidates.append(target)
-                    break
-            if target not in candidates and video_ids:
-                target_ids = _expanded_episode_ids(target)
-                if target_ids == video_ids:
-                    candidates.append(target)
-        unique = sorted(set(candidates))
-        return unique[0] if len(unique) == 1 else None
-
-    @staticmethod
-    def _installer_accepts_subtitle_language(installer: object) -> bool:
-        """Return whether a writer exposes the current language contract.
-
-        A few pre-convergence test/extension doubles still implement the old
-        ``install_subtitle_sidecar(source, target, expected_size, video_path)``
-        shape.  They cannot receive the validation contract and are retained
-        only as a compatibility lane when no bounded AList reader is present.
-        A writer that accepts the new keyword (or arbitrary keywords) is
-        treated as a current writer and must not bypass content validation.
-        """
-        try:
-            parameters = inspect.signature(installer).parameters
-        except (TypeError, ValueError):
-            # An opaque callable is not safe to classify as a legacy double.
-            return True
-        if "subtitle_language" in parameters:
-            return True
-        return any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-
-    def _validate_subtitle_source_content(
-        self,
-        source: str,
-        required_language: object,
-        *,
-        installer: object,
-    ) -> Mapping[str, object] | None:
-        """Require bounded, positive subtitle content before a formal move.
-
-        The production ``SimplePlanExecutor`` exposes the same validator and
-        reads through its AList client.  We prefer that shared validator when
-        available; otherwise this coordinator uses the AList bounded-prefix
-        port directly.  A missing reader is fail-closed for current writers,
-        while an old writer double (which cannot accept ``subtitle_language``)
-        remains callable in focused legacy tests only.
-        """
-        language = str(required_language or "zh")
-        validator = getattr(self.engine_runner, "validate_subtitle_source_content", None)
-        reader = getattr(self.alist, "read_file_prefix", None)
-        if not callable(reader):
-            reader = getattr(self.alist, "read_file_bytes", None)
-
-        verdict: Mapping[str, object] | None = None
-        if callable(reader):
-            try:
-                try:
-                    prefix = reader(source, max_bytes=DEFAULT_MAX_PREFIX_BYTES)
-                except TypeError:
-                    prefix = reader(source, DEFAULT_MAX_PREFIX_BYTES)
-            except Exception as exc:
-                raise AutomaticReplenishmentError(
-                    "字幕内容读取失败，已拒绝正式写入"
-                ) from exc
-            result = classify_subtitle_content(
-                prefix, language, max_bytes=DEFAULT_MAX_PREFIX_BYTES,
-            )
-            if isinstance(result, Mapping):
-                verdict = result
-        elif callable(validator) and self._installer_accepts_subtitle_language(installer):
-            # A custom runner may own a different bounded reader (for example
-            # a local staging port), so use its shared validator when the
-            # coordinator's AList object has no read method.
-            try:
-                try:
-                    result = validator(source, language)
-                except TypeError:
-                    result = validator(
-                        source_path=source, required_language=language,
-                    )
-            except Exception as exc:
-                raise AutomaticReplenishmentError(
-                    "字幕内容校验失败，已拒绝正式写入"
-                ) from exc
-            if isinstance(result, Mapping):
-                verdict = result
-        elif not self._installer_accepts_subtitle_language(installer):
-            # Legacy doubles are intentionally kept out of production: they
-            # lack the language keyword and are used only where no reader is
-            # available.  The default writer below still enforces validation.
-            return None
-
-        if verdict is None:
-            verdict = {
-                "status": "unknown",
-                "reason": "subtitle_content_reader_unavailable",
-            }
-        if str(verdict.get("status") or "").casefold() != "satisfied":
-            reason = str(verdict.get("reason") or "subtitle_content_unknown")
-            raise AutomaticReplenishmentError(
-                f"字幕内容未通过语言校验: {reason}"
-            )
-        return dict(verdict)
-
-    def _install_companion_subtitles(
-        self,
-        *,
-        job: EngineJob,
-        request: Mapping[str, object],
-        specs: Sequence[Mapping[str, object]],
-        subtitle_root: str,
-        round_number: int,
-        child: EngineJob,
-    ) -> list[dict[str, object]]:
-        """Install only companions whose media child reports a fresh move."""
-        installer = getattr(self.engine_runner, "install_subtitle_sidecar", None)
-        if not callable(installer):
-            return []
-        installed: list[dict[str, object]] = []
-        for spec in specs:
-            source = spec.get("subtitle_source")
-            size = spec.get("subtitle_size")
-            if (
-                not isinstance(source, str)
-                or not source.startswith(subtitle_root.rstrip("/") + "/")
-                or type(size) is not int or size <= 0
-            ):
-                continue
-            video_target = self._companion_target_for_child(child, spec)
-            if video_target is None:
-                # The child may have been idempotently recovered or may have
-                # written a different episode.  Do not attach a subtitle in
-                # either case; the next audit will use the safe sidecar lane.
-                continue
-            suffix = Path(source).suffix.casefold()
-            if suffix not in _SUBTITLE_EXTENSIONS:
-                continue
-            language = spec.get("subtitle_language") or "zh"
-            target = (
-                f"{posixpath.splitext(video_target)[0]}."
-                f"{self._subtitle_marker(language)}{suffix}"
-            )
-            self._raise_if_cancelled(
-                job, round_number=round_number, boundary="subtitle_write",
-            )
-            self._validate_subtitle_source_content(
-                source, language, installer=installer,
-            )
-            self._progress(
-                job, "subtitle_installing", gap_id=str(spec.get("gap_id") or ""),
-                target=target, companion=True,
-            )
-            writer_pause = self._provider_pause_callback(
-                job,
-                round_number=round_number,
-                boundary="companion_subtitle_write",
-            )
-            try:
-                result = _call_with_pause(
-                    installer,
-                    source, target, expected_size=size, video_path=video_target,
-                    subtitle_language=str(language),
-                    pause_requested=writer_pause,
-                )
-            except TypeError as exc:
-                # Focused legacy test executors may not expose the optional
-                # language keyword.  Production runner/executor does; only
-                # retry when the signature, rather than the write itself,
-                # rejected that keyword.
-                if writer_pause is not None or "subtitle_language" not in str(exc):
-                    raise
-                result = installer(
-                    source, target, expected_size=size, video_path=video_target,
-                )
-            if not isinstance(result, Mapping) or int(result.get("size") or 0) != size:
-                raise AutomaticReplenishmentError("伴随字幕正式库回读大小不匹配")
-            installed.append({
-                "gap_id": str(spec.get("gap_id") or ""),
-                "source": source,
-                "target": target,
-                "size": size,
-                "companion": True,
-                "video_target": video_target,
-            })
-        return installed
 
     def _gap_state(
         self,
@@ -3172,6 +2772,43 @@ class AutomaticReplenishmentRuntime:
             state[_POST_ACQUISITION_REAUDIT_KEY] = marker
         else:
             state.pop(_POST_ACQUISITION_REAUDIT_KEY, None)
+
+    def _mark_legacy_subtitle_migration(
+        self,
+        *,
+        gap: Mapping[str, object],
+        job_id: str,
+        state_path: Path,
+        prior_state: Mapping[str, object],
+    ) -> None:
+        """Durably retire one legacy subtitle row before any provider boundary.
+
+        Some pre-retirement deployments persisted only
+        ``phase=completed_with_gaps``.  That is historical exhaustion evidence,
+        not proof that the RootJob subtitle transaction ran, so normalize the
+        row into the explicit manual migration state rather than skipping it.
+        """
+        gap_id = gap.get("id")
+        if not isinstance(gap_id, str) or not gap_id:
+            raise AutomaticReplenishmentError("旧字幕迁移缺少 gap id")
+        state = dict(prior_state)
+        state.setdefault("id", gap_id)
+        state.setdefault("job_id", job_id)
+        state.setdefault("gap", dict(gap))
+        state.setdefault("created_at", _now())
+        self._project_subtitle_lane_state(
+            state,
+            phase="needs_attention",
+            error=_LEGACY_SUBTITLE_MIGRATION_MESSAGE,
+            failure_scope=None,
+            # A pre-retirement attempt may own task-scoped staging.  Preserve
+            # its audit evidence for a human; the retired lane never resumes
+            # or cleans it automatically.
+            preserve_reaudit=True,
+        )
+        state["subtitle_migration_required"] = True
+        state["subtitle_migration_message"] = _LEGACY_SUBTITLE_MIGRATION_MESSAGE
+        self._write_gap(state, state_path)
 
     def _fresh_list(
         self,
@@ -3348,30 +2985,6 @@ class AutomaticReplenishmentRuntime:
                     candidate=candidate,
                 )
 
-    @staticmethod
-    def _subtitle_marker(value: object) -> str:
-        text = str(value or "zh").casefold()
-        # Keep regional Chinese lanes distinct in the final sidecar name.
-        # Generic ``zh`` retains the existing compact suffix; an explicit
-        # Traditional/Hant request must never be rewritten as a Simplified
-        # ``.zh`` file that a later audit could mistake for the target lane.
-        if any(token in text for token in (
-            "hant", "zh-tw", "zh_tw", "zhtw", "cht", "繁中", "繁體", "繁体",
-        )):
-            return "zh-tw"
-        if any(token in text for token in (
-            "hans", "zh-cn", "zh_cn", "zhcn", "chs", "简中", "简體", "简体",
-        )):
-            return "zh-cn"
-        if text.strip() in {"zh", "zho", "chi", "cmn", "中文", "chinese"}:
-            return "zh"
-        if any(token in text for token in ("en", "英文", "英语", "english")):
-            return "en"
-        if any(token in text for token in ("ja", "日文", "日语", "japanese")):
-            return "ja"
-        marker = re.sub(r"[^a-z0-9-]+", "-", text).strip("-")
-        return marker[:16] or "sub"
-
     def _install_subtitle_members(
         self,
         *,
@@ -3382,101 +2995,17 @@ class AutomaticReplenishmentRuntime:
         round_number: int,
         required_gap_ids: set[str] | None = None,
     ) -> list[dict[str, object]]:
-        """Pair explicitly delivered subtitle members with audited videos.
+        """Fail closed for callers retained from the retired EngineJob lane.
 
-        The caller passes the subset actually present in
-        ``acquisition.files``; no candidate metadata alone can mark a
-        subtitle gap resolved. Explicit ``missing_subtitle`` rows reach this
-        writer only through the dedicated subtitle request lane.
+        Automatic subtitle acquisition, staging, recovery and the single
+        merged-sidecar write are now RootJob responsibilities.  This guard is
+        intentionally kept only to make a stale direct call fail before it can
+        inspect a provider payload or invoke the formal writer.
         """
-        rows = acquisition.get("files")
-        if not isinstance(rows, list):
-            raise AutomaticReplenishmentError("字幕获取结果缺少 files 映射")
-        gaps = {
-            str(row.get("id")): dict(row)
-            for row in self._request_gaps(request)
-            if row.get("kind") == "missing_subtitle"
-            and isinstance(row.get("id"), str) and row.get("id")
-        }
-        requested_ids = {
-            str(row.get("id"))
-            for row in self._request_gaps(request)
-            if isinstance(row.get("id"), str) and row.get("id")
-        }
-        delivered_ids: set[str] = set()
-        for raw in rows:
-            if not isinstance(raw, Mapping):
-                raise AutomaticReplenishmentError("字幕获取 files 项无效")
-            gap_ids = raw.get("gap_ids")
-            if not isinstance(gap_ids, list) or len(gap_ids) != 1:
-                raise AutomaticReplenishmentError("字幕获取结果未绑定唯一 gap")
-            gap_id = gap_ids[0]
-            if not isinstance(gap_id, str) or not gap_id or gap_id not in requested_ids:
-                raise AutomaticReplenishmentError("字幕获取结果绑定了未知 gap")
-            if gap_id in gaps:
-                delivered_ids.add(gap_id)
-        required = set(gaps) if required_gap_ids is None else set(required_gap_ids)
-        if not required <= delivered_ids or not required <= set(gaps):
-            raise AutomaticReplenishmentError("字幕获取结果未覆盖所需 gap")
-        installer = getattr(self.engine_runner, "install_subtitle_sidecar", None)
-        if not callable(installer):
-            raise AutomaticReplenishmentError("Engine runner 不支持字幕侧挂写入")
-        installed: list[dict[str, object]] = []
-        installed_ids: set[str] = set()
-        for raw in rows:
-            source, size, gap_ids = raw.get("path"), raw.get("size"), raw.get("gap_ids")
-            gap_id = str(gap_ids[0])
-            if gap_id not in required:
-                # Video members (and subtitle members selected for another
-                # pending gap) stay in the media/staging transaction.
-                continue
-            if gap_id in installed_ids:
-                raise AutomaticReplenishmentError("同一字幕 gap 被重复安装")
-            if (
-                not isinstance(source, str)
-                or not source.startswith(staging_root.rstrip("/") + "/")
-                or isinstance(size, bool) or not isinstance(size, int) or size <= 0
-            ):
-                raise AutomaticReplenishmentError("字幕获取结果未绑定有效 staging 文件")
-            gap = gaps.get(gap_id)
-            video_path = gap.get("path") if isinstance(gap, Mapping) else None
-            if not isinstance(video_path, str) or not video_path.startswith("/"):
-                raise AutomaticReplenishmentError("字幕 gap 缺少正式视频路径")
-            suffix = Path(source).suffix.casefold()
-            if suffix not in _SUBTITLE_EXTENSIONS:
-                raise AutomaticReplenishmentError("字幕获取结果包含不支持的文件格式")
-            self._raise_if_cancelled(
-                job, round_number=round_number, boundary="subtitle_write",
-            )
-            target = f"{posixpath.splitext(video_path)[0]}.{self._subtitle_marker(gap.get('subtitle_language'))}{suffix}"
-            self._progress(job, "subtitle_installing", gap_id=str(gap_id), target=target)
-            language = gap.get("subtitle_language") or "zh"
-            self._validate_subtitle_source_content(
-                source, language, installer=installer,
-            )
-            writer_pause = self._provider_pause_callback(
-                job,
-                round_number=round_number,
-                boundary="subtitle_write",
-            )
-            try:
-                result = _call_with_pause(
-                    installer,
-                    source, target, expected_size=size, video_path=video_path,
-                    subtitle_language=str(language),
-                    pause_requested=writer_pause,
-                )
-            except TypeError as exc:
-                if writer_pause is not None or "subtitle_language" not in str(exc):
-                    raise
-                result = installer(source, target, expected_size=size, video_path=video_path)
-            if not isinstance(result, Mapping) or int(result.get("size") or 0) != size:
-                raise AutomaticReplenishmentError("字幕正式库回读大小不匹配")
-            installed_ids.add(gap_id)
-            installed.append({"gap_id": str(gap_id), "source": source, "target": target, "size": size})
-        if installed_ids != required:
-            raise AutomaticReplenishmentError("字幕补源未覆盖所有 gap")
-        return installed
+        del job, request, acquisition, staging_root, round_number, required_gap_ids
+        raise AutomaticReplenishmentError(
+            "旧字幕正式写入器已移除；请通过 RootJob 字幕通道重新触发"
+        )
 
     def _remove_staging(
         self,
@@ -4643,6 +4172,16 @@ class AutomaticReplenishmentRuntime:
                     "tier_status": tier_status,
                     "error": message,
                 }
+            # ``_run_request`` is the legacy media lane.  It is intentionally
+            # never allowed to ask a materializer for an optional sidecar:
+            # RootJob owns the only automatic subtitle acquisition/write path.
+            selections, selected_companion_gap_ids = (
+                self._strip_legacy_companion_subtitle_members(
+                    [row for row in selections if isinstance(row, Mapping)],
+                )
+            )
+            if not selections:
+                raise AutomaticReplenishmentError("补源选择缺少有效候选")
             # Selection/search is read-only. Do not turn it into a staging
             # write once a live control change has stopped this root.
             self._raise_if_cancelled(
@@ -4699,22 +4238,13 @@ class AutomaticReplenishmentRuntime:
                 if isinstance(active_attempt.get("external_task_id"), str):
                     state["external_task_id"] = active_attempt["external_task_id"]
                 self._write_gap(state, state_path)
+            companion_migration_gap_ids = self._mark_legacy_companion_subtitle_migration(
+                gap_state_paths,
+                gap_ids=selected_companion_gap_ids,
+            )
             staging_files: list[StagingFile] = []
             child: EngineJob | None = None
             completed_child: EngineJob | None = None
-            installed_subtitles: list[dict[str, object]] = []
-            installed_companions: list[dict[str, object]] = []
-            companion_specs: list[dict[str, object]] = []
-            subtitle_lane = bool(request_gaps) and all(
-                str(gap.get("kind") or "") == "missing_subtitle"
-                for gap in request_gaps
-            )
-            subtitle_gap_ids = {
-                str(gap.get("id"))
-                for gap in request_gaps
-                if str(gap.get("kind") or "") == "missing_subtitle"
-                and isinstance(gap.get("id"), str) and gap.get("id")
-            }
             attempt_error: Exception | None = None
             candidate_exclusions: list[dict[str, object]] = []
             try:
@@ -4798,169 +4328,94 @@ class AutomaticReplenishmentRuntime:
                     staging_files,
                     [row for row in selections if isinstance(row, Mapping)],
                 )
-                # Derive both lane roots from normalized files.  A subtitle
-                # without a provable isolated root remains best-effort and is
-                # ignored; it never blocks an already isolated video.
-                subtitle_root: str | None = None
-                if any(item.kind == "subtitle" for item in staging_files):
-                    subtitle_root = self._subtitle_staging_root(
-                        staging, staging_files,
+                # A media delivery may still contain a sidecar if an old or
+                # third-party materializer ignored the stripped select-file
+                # map.  Keep it outside the child source tree and record only
+                # a durable RootJob migration notice; this compatibility lane
+                # must never validate, stage-as-subtitle, or write that file.
+                delivered_companion_gap_ids, delivered_companion_count = (
+                    self._delivered_legacy_companion_subtitle_gap_ids(
+                        acquisition,
+                        known_gap_ids=set(gap_state_paths),
                     )
-                if not subtitle_lane and subtitle_root is not None:
-                    selected_media_gap_ids = {
-                        str(gap_id)
-                        for selection in selections
-                        if isinstance(selection, Mapping)
-                        for gap_id in (
-                            selection.get("selected_gap_ids")
-                            if isinstance(selection.get("selected_gap_ids"), list)
-                            else []
-                        )
-                        if isinstance(gap_id, str) and gap_id
-                    }
-                    companion_specs = self._validated_companion_subtitles(
-                        request=request_body,
-                        acquisition=acquisition,
-                        staging_files=staging_files,
-                        selected_gap_ids=selected_media_gap_ids,
+                )
+                companion_migration_gap_ids = sorted(set(
+                    companion_migration_gap_ids
+                ) | set(self._mark_legacy_companion_subtitle_migration(
+                    gap_state_paths,
+                    gap_ids=delivered_companion_gap_ids,
+                    delivered_member_count=delivered_companion_count,
+                )))
+                has_video = any(item.kind == "video" for item in staging_files)
+                if not has_video:
+                    raise AutomaticReplenishmentError("视频补源 staging 没有可回投的视频")
+                # Planning is durable local state; check before creating it as
+                # well as immediately before the formal child write.
+                self._raise_if_cancelled(
+                    job, round_number=round_number, boundary="child_plan",
+                )
+                child_request = dict(job.request)
+                child_request["source_path"] = self._media_child_staging_root(
+                    staging, staging_files,
+                )
+                if not self._request_inherits_target_shelf(job, child_request):
+                    raise AutomaticReplenishmentError(
+                        "补源 child 请求未继承根任务的目标货架，拒绝规划"
                     )
-                if subtitle_lane:
-                    if any(item.kind != "subtitle" for item in staging_files):
-                        raise AutomaticReplenishmentError("字幕补源 staging 不得混入视频文件")
-                    if subtitle_root is None:
-                        raise AutomaticReplenishmentError("字幕补源 staging 缺少字幕根")
-                    self._raise_if_cancelled(
-                        job, round_number=round_number, boundary="subtitle_write",
-                    )
-                    installed_subtitles = self._install_subtitle_members(
-                        job=job,
-                        request=request_body,
-                        acquisition=acquisition,
-                        staging_root=subtitle_root,
+                child = self._plan_internal_child(
+                    child_request,
+                    root_job_id=job.id,
+                    pause_requested=self._provider_pause_callback(
+                        job,
                         round_number=round_number,
-                        required_gap_ids=subtitle_gap_ids,
+                        boundary="child_plan",
+                    ),
+                )
+                if not self._child_inherits_target_shelf(job, child):
+                    raise AutomaticReplenishmentError(
+                        "补源 child 未继承根任务的目标货架，拒绝写入"
                     )
-                    self._progress(
-                        job, "final_verifying", round=round_number,
-                        subtitle_sidecars=len(installed_subtitles),
+                if not self._audit_child_target_matches(job, child):
+                    raise AutomaticReplenishmentError(
+                        "审计补源 child 目标与已审计正式目录不一致，拒绝写入"
                     )
-                else:
-                    has_video = any(item.kind == "video" for item in staging_files)
-                    if has_video:
-                        # Planning is durable local state; check before creating
-                        # it as well as immediately before the formal child write.
-                        self._raise_if_cancelled(
-                            job, round_number=round_number, boundary="child_plan",
-                        )
-                        child_request = dict(job.request)
-                        child_request["source_path"] = self._media_child_staging_root(
-                            staging, staging_files,
-                        )
-                        if not self._request_inherits_target_shelf(job, child_request):
-                            raise AutomaticReplenishmentError(
-                                "补源 child 请求未继承根任务的目标货架，拒绝规划"
-                            )
-                        child = self._plan_internal_child(
-                            child_request,
-                            root_job_id=job.id,
-                            pause_requested=self._provider_pause_callback(
-                                job,
-                                round_number=round_number,
-                                boundary="child_plan",
-                            ),
-                        )
-                        if not self._child_inherits_target_shelf(job, child):
-                            raise AutomaticReplenishmentError(
-                                "补源 child 未继承根任务的目标货架，拒绝写入"
-                            )
-                        if not self._audit_child_target_matches(job, child):
-                            raise AutomaticReplenishmentError(
-                                "审计补源 child 目标与已审计正式目录不一致，拒绝写入"
-                            )
-                        self._progress(
-                            job, "child_planning", round=round_number,
-                            staging_root=staging, child_job_id=child.id,
-                            child_phase=child.phase,
-                        )
-                        self._progress(
-                            job, "child_executing", round=round_number,
-                            child_job_id=child.id, child_phase="executing",
-                        )
-                        self._raise_if_cancelled(
-                            job, round_number=round_number, boundary="child_write",
-                        )
-                        # The shared adapter combines global pause and the
-                        # root/pilot cancellation fence.  It is ``None`` only
-                        # for unscoped library/test callers; a scoped runtime
-                        # must prove that the child writer accepts it.
-                        child_pause = self._provider_pause_callback(
-                            job,
-                            round_number=round_number,
-                            boundary="child_write",
-                        )
-                        completed_child = _call_with_pause(
-                            self.engine_runner.execute_automatic,
-                            child.id,
-                            pause_requested=child_pause,
-                        )
-                        if completed_child.phase != "executed":
-                            self._raise_if_paused(
-                                job, round_number=round_number,
-                                boundary="child_resume",
-                            )
-                            raise AutomaticReplenishmentError("补源 child 未完成")
-
-                    # This lane is distinct from an audited missing_subtitle
-                    # repair: it has no pre-existing formal video.  A
-                    # companion becomes eligible only after the internal child
-                    # reports that it *moved* its corresponding new video.
-                    # Invalid/missing companion evidence is intentionally not
-                    # an error for the media acquisition; audit will discover
-                    # the missing sidecar later.
-                    if companion_specs and completed_child is not None:
-                        if subtitle_root is None:
-                            raise AutomaticReplenishmentError("伴随字幕 staging 缺少字幕根")
-                        installed_companions = self._install_companion_subtitles(
-                            job=job,
-                            request=request_body,
-                            specs=companion_specs,
-                            subtitle_root=subtitle_root,
-                            round_number=round_number,
-                            child=completed_child,
-                        )
-
-                    # A media candidate may carry a subtitle member for an
-                    # already-audited video.  Only an explicit subtitle gap
-                    # can claim that member, and the child video (if any) is
-                    # committed first so the sidecar writer can verify its
-                    # exact formal target.
-                    if subtitle_gap_ids:
-                        delivered_subtitle_ids = self._delivered_subtitle_gap_ids(
-                            acquisition, request_body,
-                        )
-                        if delivered_subtitle_ids and subtitle_root is not None:
-                            self._raise_if_cancelled(
-                                job, round_number=round_number, boundary="subtitle_write",
-                            )
-                            installed_subtitles = self._install_subtitle_members(
-                                job=job,
-                                request=request_body,
-                                acquisition=acquisition,
-                                staging_root=subtitle_root,
-                                round_number=round_number,
-                                required_gap_ids=delivered_subtitle_ids,
-                            )
-                    if not has_video and not installed_subtitles:
-                        raise AutomaticReplenishmentError(
-                            "视频补源 staging 没有可回投的视频或已配对字幕"
-                        )
-                    self._progress(
-                        job, "final_verifying", round=round_number,
-                        **({"child_job_id": completed_child.id, "child_phase": completed_child.phase}
-                           if completed_child is not None else {}),
-                        **({"subtitle_sidecars": len(installed_subtitles) + len(installed_companions)}
-                           if installed_subtitles or installed_companions else {}),
+                self._progress(
+                    job, "child_planning", round=round_number,
+                    staging_root=staging, child_job_id=child.id,
+                    child_phase=child.phase,
+                )
+                self._progress(
+                    job, "child_executing", round=round_number,
+                    child_job_id=child.id, child_phase="executing",
+                )
+                self._raise_if_cancelled(
+                    job, round_number=round_number, boundary="child_write",
+                )
+                # The shared adapter combines global pause and the root/pilot
+                # cancellation fence. It is ``None`` only for unscoped
+                # library/test callers; a scoped runtime must prove that the
+                # child writer accepts it.
+                child_pause = self._provider_pause_callback(
+                    job,
+                    round_number=round_number,
+                    boundary="child_write",
+                )
+                completed_child = _call_with_pause(
+                    self.engine_runner.execute_automatic,
+                    child.id,
+                    pause_requested=child_pause,
+                )
+                if completed_child.phase != "executed":
+                    self._raise_if_paused(
+                        job, round_number=round_number,
+                        boundary="child_resume",
                     )
+                    raise AutomaticReplenishmentError("补源 child 未完成")
+                self._progress(
+                    job, "final_verifying", round=round_number,
+                    child_job_id=completed_child.id,
+                    child_phase=completed_child.phase,
+                )
             except Exception as exc:
                 attempt_error = exc
                 # Capture the materializer's explicit candidate attribution
@@ -5197,22 +4652,10 @@ class AutomaticReplenishmentRuntime:
                         f"补源已尝试 {round_number} 轮仍失败: {attempt_error}"
                     ) from attempt_error
                 continue
-            if subtitle_lane:
-                resolved_now = {
-                    str(row.get("gap_id"))
-                    for row in installed_subtitles
-                    if isinstance(row, Mapping) and isinstance(row.get("gap_id"), str)
-                }
-            else:
-                resolved_now = set()
-                if completed_child is not None:
-                    resolved_now.update(
-                        self._child_resolved_gap_ids(completed_child, request_gaps)
-                    )
+            resolved_now = set()
+            if completed_child is not None:
                 resolved_now.update(
-                    str(row.get("gap_id"))
-                    for row in installed_subtitles
-                    if isinstance(row, Mapping) and isinstance(row.get("gap_id"), str)
+                    self._child_resolved_gap_ids(completed_child, request_gaps)
                 )
             resolved_now &= {
                 str(gap.get("id")) for gap in request_gaps
@@ -5300,10 +4743,82 @@ class AutomaticReplenishmentRuntime:
                 "staging_files": [item.as_dict() for item in staging_files],
                 "post_acquisition_reaudit": post_acquisition_reaudit,
                 **({"child_job_id": completed_child.id} if completed_child is not None else {}),
-                **({"companion_subtitles": installed_companions}
-                   if installed_companions else {}),
+                **({
+                    "legacy_companion_subtitle_migration": {
+                        "status": "required",
+                        "manual_action": "migrate_rootjob_subtitle",
+                        "gap_ids": companion_migration_gap_ids,
+                    },
+                } if companion_migration_gap_ids else {}),
             }
         raise AutomaticReplenishmentError("补源没有可执行候选")
+
+    def _retire_legacy_subtitle_request(
+        self,
+        *,
+        job: EngineJob,
+        request: Mapping[str, object],
+        gap_state_paths: Mapping[str, Path],
+    ) -> dict[str, object]:
+        """Fail closed instead of using the retired legacy subtitle writer.
+
+        New RootJob work owns the only automatic subtitle transaction: it
+        persists a submit intent, reconciles task-scoped staging, and performs
+        the one merged bilingual-sidecar write.  The legacy EngineJob lane
+        cannot provide those same restart guarantees, so it must never search,
+        download, stage, or write a subtitle merely because an old record is
+        still scheduled.  Keep an explicit durable operator-visible marker
+        rather than converting it into a retry or a misleading completion.
+        """
+        request_body = dict(request)
+        request_gaps = self._request_gaps(request_body)
+        if self._validated_request_lane(request_body) != "subtitle":
+            raise AutomaticReplenishmentError(
+                "视频缺口不得进入已停用的字幕自动通道"
+            )
+        message = _LEGACY_SUBTITLE_MIGRATION_MESSAGE
+        affected_ids: list[str] = []
+        for gap in request_gaps:
+            gap_id = gap.get("id")
+            if not isinstance(gap_id, str) or not gap_id:
+                continue
+            state_path = gap_state_paths.get(gap_id)
+            if state_path is None:
+                continue
+            try:
+                raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AutomaticReplenishmentError(
+                    "旧字幕任务状态不可读取，拒绝自动重试"
+                ) from exc
+            if not isinstance(raw_state, Mapping):
+                raise AutomaticReplenishmentError(
+                    "旧字幕任务状态无效，拒绝自动重试"
+                )
+            self._mark_legacy_subtitle_migration(
+                gap=gap,
+                job_id=job.id,
+                state_path=state_path,
+                prior_state=raw_state,
+            )
+            affected_ids.append(gap_id)
+        self._progress(
+            job,
+            "needs_attention",
+            lane="subtitle",
+            message=message,
+            migration_required=True,
+        )
+        return {
+            "request": request_body,
+            "resolved_gap_ids": [],
+            "unresolved_gap_ids": affected_ids,
+            "terminal": True,
+            "status": "needs_attention",
+            "manual_action": "migrate_rootjob_subtitle",
+            "migration_required": True,
+            "error": message,
+        }
 
     def _run_subtitle_request(
         self,
@@ -5312,249 +4827,12 @@ class AutomaticReplenishmentRuntime:
         request: Mapping[str, object],
         gap_state_paths: Mapping[str, Path],
     ) -> dict[str, object]:
-        """Acquire standalone subtitles via the dedicated Subtitle Provider."""
-        request_body = dict(request)
-        request_gaps = self._request_gaps(request_body)
-        if self._validated_request_lane(request_body) != "subtitle":
-            raise AutomaticReplenishmentError(
-                "视频缺口不得进入字幕补全通道"
-            )
-
-        attempt_id = f"attempt-{uuid.uuid4().hex}"
-        staging = f"{self.staging_root}/{job.id}/{attempt_id}"
-        workspace = self.workspace_root / job.id / attempt_id
-
-        # The dedicated provider performs its own search, download and staging
-        # writes in one bounded call.  Check the shared pause/admission
-        # boundary before that call; a subtitle request never falls back to a
-        # video search or materializer.
-        self._raise_if_cancelled(job, round_number=1, boundary="candidate_round")
-        self._progress(job, "provider_searching", round=1, provider="subtitle")
-        for gap in request_gaps:
-            gap_id = str(gap.get("id") or "")
-            state_path = gap_state_paths.get(gap_id)
-            if state_path:
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                self._project_subtitle_lane_state(
-                    state,
-                    phase="provider_searching",
-                    error=None,
-                    failure_scope=None,
-                )
-                state["attempts"] = 1
-                self._write_gap(state, state_path)
-        self._progress(
-            job, "acquiring", round=1, staging_root=staging,
-            provider="subtitle",
+        """Compatibility stop for code that still references the retired lane."""
+        return self._retire_legacy_subtitle_request(
+            job=job,
+            request=request,
+            gap_state_paths=gap_state_paths,
         )
-        self._raise_if_cancelled(job, round_number=1, boundary="materialization")
-
-        attempt_error: Exception | None = None
-        acquisition: Mapping[str, object] | None = None
-        try:
-            provider_pause = self._provider_pause_callback(
-                job,
-                round_number=1,
-                boundary="subtitle_materializer",
-            )
-            acquisition = _call_with_pause(
-                self.subtitle_materializer.acquire_subtitles,
-                request_body,
-                request_gaps,
-                staging_root=staging,
-                workspace=workspace,
-                alist=_PauseCheckedProviderPort(self.alist, provider_pause),
-                pause_requested=provider_pause,
-            )
-        except AutomaticReplenishmentCancelled:
-            raise
-        except Exception as exc:
-            if getattr(exc, "pause_requested", False) is True:
-                raise AutomaticReplenishmentPaused(
-                    "字幕补源在暂停边界安全停止",
-                ) from exc
-            attempt_error = exc
-
-        delivered_files = (
-            acquisition.get("files")
-            if isinstance(acquisition, Mapping) and isinstance(acquisition.get("files"), list)
-            else []
-        )
-
-        try:
-            if attempt_error is not None:
-                scope = self._failure_scope(attempt_error, [])
-                for gap in request_gaps:
-                    gap_id = str(gap.get("id") or "")
-                    state_path = gap_state_paths.get(gap_id)
-                    if state_path:
-                        try:
-                            state = json.loads(state_path.read_text(encoding="utf-8"))
-                            self._project_subtitle_lane_state(
-                                state,
-                                phase="retry_wait",
-                                error=redact_error(attempt_error),
-                                failure_scope=scope,
-                            )
-                            self._write_gap(state, state_path)
-                        except Exception:
-                            pass
-                self._progress(job, "retry_wait", round=1, error=redact_error(attempt_error))
-                return {
-                    "request": request_body,
-                    "resolved_gap_ids": [],
-                    "unresolved_gap_ids": [
-                        str(g.get("id") or "") for g in request_gaps
-                        if isinstance(g.get("id"), str) and g.get("id")
-                    ],
-                    "failure_scope": scope,
-                    "error": redact_error(attempt_error),
-                    "terminal": False,
-                    "status": "retry_wait",
-                }
-
-            if delivered_files:
-                self._progress(
-                    job, "staging_verifying", round=1,
-                    staging_root=staging, provider="subtitle",
-                )
-                delivered_gap_ids: set[str] = set()
-                for file_entry in delivered_files:
-                    if isinstance(file_entry, Mapping) and isinstance(file_entry.get("gap_ids"), list):
-                        for g_id in file_entry["gap_ids"]:
-                            delivered_gap_ids.add(str(g_id))
-                self._raise_if_cancelled(job, round_number=1, boundary="subtitle_write")
-                installed = self._install_subtitle_members(
-                    job=job,
-                    request=request_body,
-                    acquisition=acquisition if isinstance(acquisition, Mapping) else {},
-                    staging_root=staging,
-                    round_number=1,
-                    required_gap_ids=delivered_gap_ids,
-                )
-                installed_gap_ids = {
-                    str(row.get("gap_id"))
-                    for row in installed
-                    if isinstance(row, Mapping)
-                    and isinstance(row.get("gap_id"), str)
-                    and row.get("gap_id")
-                }
-                post_acquisition_reaudit = self._mark_post_acquisition_reaudit(
-                    gap_state_paths,
-                    job_id=job.id,
-                    attempt_id=attempt_id,
-                    staging_root=staging,
-                    selected_gap_ids=installed_gap_ids,
-                )
-                self._progress(
-                    job,
-                    "final_verifying",
-                    round=1,
-                    subtitle_sidecars=len(installed),
-                )
-                unresolved = [
-                    str(g.get("id") or "") for g in request_gaps
-                    if str(g.get("id") or "") not in installed_gap_ids
-                ]
-                if unresolved:
-                    partial_error = "字幕获取仅覆盖部分缺口，未覆盖项等待独立重试"
-                    unresolved_set = set(unresolved)
-                    for gap_id, state_path in gap_state_paths.items():
-                        if gap_id not in unresolved_set:
-                            continue
-                        try:
-                            state = json.loads(state_path.read_text(encoding="utf-8"))
-                            self._project_subtitle_lane_state(
-                                state,
-                                phase="retry_wait",
-                                error=partial_error,
-                                failure_scope=FAILURE_CANDIDATE,
-                            )
-                            self._write_gap(state, state_path)
-                        except Exception:
-                            pass
-                    return {
-                        "request": request_body,
-                        "resolved_gap_ids": sorted(installed_gap_ids),
-                        "unresolved_gap_ids": unresolved,
-                        "post_acquisition_reaudit": post_acquisition_reaudit,
-                        "failure_scope": FAILURE_CANDIDATE,
-                        "error": partial_error,
-                        "terminal": False,
-                        "status": "retry_wait",
-                    }
-                return {
-                    "request": request_body,
-                    "resolved_gap_ids": sorted(installed_gap_ids),
-                    "unresolved_gap_ids": unresolved,
-                    "post_acquisition_reaudit": post_acquisition_reaudit,
-                    "terminal": len(unresolved) == 0,
-                    "status": "completed" if len(unresolved) == 0 else "completed_with_gaps",
-                }
-            else:
-                for gap in request_gaps:
-                    gap_id = str(gap.get("id") or "")
-                    state_path = gap_state_paths.get(gap_id)
-                    if state_path:
-                        try:
-                            state = json.loads(state_path.read_text(encoding="utf-8"))
-                            self._project_subtitle_lane_state(
-                                state,
-                                phase="completed_with_gaps",
-                                error="字幕接口未检索到可用字幕",
-                                failure_scope=FAILURE_CANDIDATE,
-                                preserve_reaudit=False,
-                            )
-                            self._write_gap(state, state_path)
-                        except Exception:
-                            pass
-
-
-                self._progress(
-                    job,
-                    "completed_with_gaps",
-                    round=1,
-                    message="未检索到匹配字幕，安全停止",
-                )
-                return {
-                    "request": request_body,
-                    "resolved_gap_ids": [],
-                    "unresolved_gap_ids": [
-                        str(g.get("id") or "") for g in request_gaps
-                        if isinstance(g.get("id"), str) and g.get("id")
-                    ],
-                    "terminal": True,
-                    "status": "completed_with_gaps",
-                    "failure_scope": FAILURE_CANDIDATE,
-                    "error": "未检索到匹配字幕",
-                }
-        finally:
-            # A successfully installed sidecar remains task-owned staging
-            # until a later scoped audit proves its exact gap disappeared.
-            # Only a clean zero-candidate attempt is eligible for immediate
-            # bounded cleanup; failures retain evidence for safe recovery.
-            if not delivered_files and attempt_error is None:
-                try:
-                    self._raise_if_cancelled(
-                        job, round_number=1, boundary="subtitle_cleanup",
-                    )
-                    cleanup_pause = self._provider_pause_callback(
-                        job,
-                        round_number=1,
-                        boundary="subtitle_cleanup",
-                    )
-                    self._remove_staging(
-                        staging,
-                        pause_requested=cleanup_pause,
-                    )
-                    self._remove_local_attempt_workspace(
-                        job_id=job.id, attempt_id=attempt_id,
-                        pause_requested=cleanup_pause,
-                    )
-                except AutomaticReplenishmentCancelled:
-                    raise
-                except Exception:
-                    pass
 
     def run_for_job(self, job: EngineJob) -> dict[str, object]:
         """Automatically resolve all engine-discovered, provider-compatible gaps."""
@@ -5593,6 +4871,8 @@ class AutomaticReplenishmentRuntime:
         outcomes: list[dict[str, object]] = []
         already_resolved: list[str] = []
         already_exhausted: list[str] = []
+        legacy_subtitle_migration: list[str] = []
+        legacy_companion_subtitle_migration: list[str] = []
         pending_reaudit: list[str] = []
         for request in requests:
             if not isinstance(request, Mapping):
@@ -5623,6 +4903,38 @@ class AutomaticReplenishmentRuntime:
                         state = None
                     if (
                         isinstance(state, Mapping)
+                        and str(gap.get("kind") or "") != "missing_subtitle"
+                        and isinstance(
+                            state.get(_LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY),
+                            Mapping,
+                        )
+                        and state[_LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY].get(
+                            "status"
+                        ) == "required"
+                    ):
+                        legacy_companion_subtitle_migration.append(gap_id)
+                    if (
+                        str(gap.get("kind") or "") == "missing_subtitle"
+                        and isinstance(state, Mapping)
+                        and (
+                            state.get("subtitle_migration_required") is True
+                            or state.get("phase") == "completed_with_gaps"
+                        )
+                    ):
+                        # Markerless ``completed_with_gaps`` is the durable
+                        # shape written by the pre-retirement subtitle lane.
+                        # Normalize it before any re-audit/provider branch so
+                        # a historic row can never be mistaken for success.
+                        self._mark_legacy_subtitle_migration(
+                            gap=gap,
+                            job_id=job.id,
+                            state_path=path,
+                            prior_state=state,
+                        )
+                        legacy_subtitle_migration.append(gap_id)
+                        continue
+                    if (
+                        isinstance(state, Mapping)
                         and self._post_acquisition_reaudit_blocks_provider(state)
                     ):
                         # A completed child must not become a fresh provider
@@ -5636,9 +4948,10 @@ class AutomaticReplenishmentRuntime:
                         isinstance(state, Mapping)
                         and state.get("phase") == "completed_with_gaps"
                     ):
-                        # Exhaustion is lane-local durable evidence.  A retry
+                        # Exhaustion is lane-local durable evidence. A retry
                         # for a sibling media gap must not restart subtitle
-                        # discovery (and vice versa).
+                        # discovery (and vice versa). Retired subtitle rows
+                        # are handled above so they never look complete.
                         already_exhausted.append(gap_id)
                         continue
                     if (
@@ -5674,22 +4987,54 @@ class AutomaticReplenishmentRuntime:
                         "字幕专属任务包含视频缺口，拒绝执行"
                     )
                 if lane == "subtitle":
-                    outcomes.append(self._run_subtitle_request(
+                    retired = self._retire_legacy_subtitle_request(
                         job=job,
                         request=active_request,
                         gap_state_paths=states,
-                    ))
+                    )
+                    outcomes.append(retired)
+                    if retired.get("migration_required") is True:
+                        legacy_subtitle_migration.extend(
+                            gap_id
+                            for gap_id in retired.get("unresolved_gap_ids", [])
+                            if isinstance(gap_id, str) and gap_id
+                        )
                 elif lane == "media":
-                    outcomes.append(self._run_request(
+                    media_outcome = self._run_request(
                         job=job,
                         request=active_request,
                         gap_state_paths=states,
-                    ))
+                    )
+                    outcomes.append(media_outcome)
+                    raw_companion_migration = media_outcome.get(
+                        "legacy_companion_subtitle_migration"
+                    )
+                    if (
+                        isinstance(raw_companion_migration, Mapping)
+                        and raw_companion_migration.get("status") == "required"
+                        and isinstance(raw_companion_migration.get("gap_ids"), list)
+                    ):
+                        legacy_companion_subtitle_migration.extend(
+                            gap_id
+                            for gap_id in raw_companion_migration["gap_ids"]
+                            if isinstance(gap_id, str)
+                            and gap_id
+                            and gap_id in states
+                        )
             except AutomaticReplenishmentCancelled as exc:
                 scope = self._failure_scope(exc, [])
                 subtitle_lane = request.get("lane") == "subtitle"
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
+                    raw_companion_migration = state.get(
+                        _LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY
+                    )
+                    if (
+                        not subtitle_lane
+                        and isinstance(raw_companion_migration, Mapping)
+                        and raw_companion_migration.get("status") == "required"
+                    ):
+                        legacy_companion_subtitle_migration.append(gap_id)
                     if (
                         state.get("phase") != "resolved"
                         and not self._post_acquisition_reaudit_blocks_provider(state)
@@ -5724,6 +5069,13 @@ class AutomaticReplenishmentRuntime:
                     "outcomes": outcomes,
                     "already_resolved_gap_ids": sorted(set(already_resolved)),
                     "already_exhausted_gap_ids": sorted(set(already_exhausted)),
+                    "legacy_subtitle_migration_gap_ids": sorted(
+                        set(legacy_subtitle_migration)
+                        | set(legacy_companion_subtitle_migration)
+                    ),
+                    "legacy_companion_subtitle_migration_gap_ids": sorted(
+                        set(legacy_companion_subtitle_migration)
+                    ),
                     "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
                     "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
                     "cancelled": True,
@@ -5745,6 +5097,15 @@ class AutomaticReplenishmentRuntime:
                 subtitle_lane = request.get("lane") == "subtitle"
                 for gap_id, path in states.items():
                     state = json.loads(path.read_text(encoding="utf-8"))
+                    raw_companion_migration = state.get(
+                        _LEGACY_COMPANION_SUBTITLE_MIGRATION_KEY
+                    )
+                    if (
+                        not subtitle_lane
+                        and isinstance(raw_companion_migration, Mapping)
+                        and raw_companion_migration.get("status") == "required"
+                    ):
+                        legacy_companion_subtitle_migration.append(gap_id)
                     if (
                         state.get("phase") != "resolved"
                         and not self._post_acquisition_reaudit_blocks_provider(state)
@@ -5785,6 +5146,13 @@ class AutomaticReplenishmentRuntime:
             "outcomes": outcomes,
             "already_resolved_gap_ids": sorted(set(already_resolved)),
             "already_exhausted_gap_ids": sorted(set(already_exhausted)),
+            "legacy_subtitle_migration_gap_ids": sorted(
+                set(legacy_subtitle_migration)
+                | set(legacy_companion_subtitle_migration)
+            ),
+            "legacy_companion_subtitle_migration_gap_ids": sorted(
+                set(legacy_companion_subtitle_migration)
+            ),
             "pending_reaudit_gap_ids": sorted(set(pending_reaudit)),
             "unresolved_gaps": list(request_bundle.get("unresolved_gaps") or []),
         }

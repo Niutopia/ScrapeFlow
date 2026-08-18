@@ -27,7 +27,11 @@ from engine.tools.replenishment_adapter import (
 from engine.tools.replenishment_adapter.subtitle_provider import (
     score_subtitle_candidate,
 )
+from engine.scrapeflow.subtitle_content import (
+    classify_bilingual_subtitle_content,
+)
 from local.scrapeflow_api.automatic_replenishment import (
+    AutomaticReplenishmentError,
     AutomaticReplenishmentRuntime,
 )
 from local.scrapeflow_api.simple_engine_runner import EngineJob
@@ -294,6 +298,277 @@ class SubtitleProviderTests(unittest.TestCase):
             )],
         )
 
+    def test_materializer_merges_tmdb_verified_original_into_one_sidecar(self) -> None:
+        """A verified pair produces one Chinese-named bilingual file only."""
+        chinese_url = "https://example.test/Show.S01E01.zh.srt"
+        japanese_url = "https://example.test/Show.S01E01.ja.srt"
+        chinese = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是简体中文字幕测试内容，确保语言可验证。\n"
+        ).encode("utf-8")
+        japanese = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "これはにほんごのてすとです。\n"
+        ).encode("utf-8")
+        chinese_candidate = {
+            "provider": "assrt", "url": chinese_url, "direct_file": True,
+            "format": "srt", "title": "Show S01E01 中文字幕",
+        }
+        japanese_candidate = {
+            "provider": "assrt", "url": japanese_url, "direct_file": True,
+            "format": "srt", "title": "Show S01E01 日本語字幕",
+        }
+        discovery = MagicMock()
+        discovery.search_gap.side_effect = [[chinese_candidate], [japanese_candidate]]
+        downloads: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            downloads.append(url)
+            return {chinese_url: chinese, japanese_url: japanese}[url]
+
+        materializer = SubtitleMaterializer(discovery=discovery, downloader=fetch)
+        gap = {
+            "id": "missing_subtitle:bilingual", "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv", "season": 1,
+            "episode": 1, "subtitle_language": "zh",
+            # This injected per-gap flag must not be relied on; the request
+            # below carries the actual TMDB provenance.
+            "media": {"title": "Show", "original_language": "en"},
+        }
+        request = {"media": {
+            "title": "Show", "tmdb_id": 123,
+            "original_language": "ja",
+            "original_language_verified_by_tmdb": True,
+        }}
+        alist = MockAList()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                request, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/bilingual/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(len(result["files"]), 1)
+        row = result["files"][0]
+        self.assertTrue(row["bilingual"])
+        self.assertEqual(row["original_language"], "japanese")
+        self.assertEqual(downloads, [chinese_url, japanese_url])
+        self.assertEqual(len(alist.files), 1)
+        staged_path, staged = next(iter(alist.files.items()))
+        self.assertTrue(
+            staged_path.endswith("Show.S01E01.zh-CN-bilingual-ja.srt")
+        )
+        self.assertNotIn(".ja.", staged_path)
+        self.assertEqual(
+            classify_bilingual_subtitle_content(staged, "ja")["status"],
+            "satisfied",
+        )
+
+    def test_materializer_keeps_chinese_only_when_original_timing_differs(self) -> None:
+        """No fuzzy alignment or second output when cue timing is not exact."""
+        chinese_url = "https://example.test/Show.S01E01.zh.srt"
+        japanese_url = "https://example.test/Show.S01E01.ja.srt"
+        chinese = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是简体中文字幕测试内容，确保语言可验证。\n"
+        ).encode("utf-8")
+        shifted_japanese = (
+            "1\n00:00:01,100 --> 00:00:04,100\n"
+            "これはにほんごのてすとです。\n"
+        ).encode("utf-8")
+        discovery = MagicMock()
+        discovery.search_gap.side_effect = [[
+            {"provider": "assrt", "url": chinese_url, "direct_file": True,
+             "format": "srt", "title": "Show S01E01 中文字幕"},
+        ], [
+            {"provider": "assrt", "url": japanese_url, "direct_file": True,
+             "format": "srt", "title": "Show S01E01 日本語字幕"},
+        ]]
+        materializer = SubtitleMaterializer(
+            discovery=discovery,
+            downloader=lambda url: {
+                chinese_url: chinese, japanese_url: shifted_japanese,
+            }[url],
+        )
+        gap = {
+            "id": "missing_subtitle:timing", "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv", "season": 1,
+            "episode": 1, "subtitle_language": "zh",
+            "media": {"title": "Show"},
+        }
+        request = {"media": {
+            "title": "Show", "tmdb_id": 123,
+            "original_language": "ja",
+            "original_language_verified_by_tmdb": True,
+        }}
+        alist = MockAList()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                request, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/timing/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(len(result["files"]), 1)
+        self.assertFalse(result["files"][0]["bilingual"])
+        self.assertEqual(len(alist.files), 1)
+        staged = next(iter(alist.files.values()))
+        self.assertEqual(staged, chinese)
+        self.assertNotIn("これは", staged.decode("utf-8"))
+
+    def test_materializer_does_not_trust_gap_original_language(self) -> None:
+        """Only request-media TMDB proof can enable a second fetch."""
+        chinese_url = "https://example.test/Show.S01E01.zh.srt"
+        chinese = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是简体中文字幕测试内容，确保语言可验证。\n"
+        ).encode("utf-8")
+        candidate = {
+            "provider": "assrt", "url": chinese_url, "direct_file": True,
+            "format": "srt", "title": "Show S01E01 中文字幕",
+        }
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [candidate]
+        downloads: list[str] = []
+        materializer = SubtitleMaterializer(
+            discovery=discovery,
+            downloader=lambda url: downloads.append(url) or chinese,
+        )
+        gap = {
+            "id": "missing_subtitle:provenance", "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv", "season": 1,
+            "episode": 1, "subtitle_language": "zh",
+            "media": {
+                "title": "Show", "tmdb_id": 999,
+                "original_language": "ja",
+                "original_language_verified_by_tmdb": True,
+            },
+        }
+        # A gap can be externally derived/mutated.  It may not grant the
+        # provider authority to look for a second subtitle source.
+        request = {"media": {"title": "Show", "tmdb_id": 123}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                request, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/provenance/attempt",
+                workspace=Path(tmpdir), alist=MockAList(),
+            )
+
+        self.assertFalse(result["files"][0]["bilingual"])
+        self.assertEqual(downloads, [chinese_url])
+        self.assertEqual(discovery.search_gap.call_count, 1)
+
+    def test_materializer_never_refetches_chinese_url_as_original_track(self) -> None:
+        """A different language label cannot make one URL serve both tracks."""
+        url = "https://example.test/Show.S01E01.zh.srt"
+        chinese = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是简体中文字幕测试内容，确保语言可验证。\n"
+        ).encode("utf-8")
+        chinese_candidate = {
+            "provider": "assrt", "url": url, "direct_file": True,
+            "format": "srt", "title": "Show S01E01 中文字幕",
+        }
+        mislabeled_same_url = {
+            "provider": "assrt", "url": url + "#ignored-fragment",
+            "direct_file": True, "format": "srt",
+            "title": "Show S01E01 日本語字幕",
+        }
+        discovery = MagicMock()
+        discovery.search_gap.side_effect = [
+            [chinese_candidate], [mislabeled_same_url],
+        ]
+        downloads: list[str] = []
+        materializer = SubtitleMaterializer(
+            discovery=discovery,
+            downloader=lambda candidate_url: downloads.append(candidate_url) or chinese,
+        )
+        gap = {
+            "id": "missing_subtitle:no-url-reuse", "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv", "season": 1,
+            "episode": 1, "subtitle_language": "zh",
+            "media": {"title": "Show"},
+        }
+        request = {"media": {
+            "title": "Show", "tmdb_id": 123, "original_language": "ja",
+            "original_language_verified_by_tmdb": True,
+        }}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = materializer.acquire_subtitles(
+                request, [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/no-url-reuse/attempt",
+                workspace=Path(tmpdir), alist=MockAList(),
+            )
+
+        self.assertFalse(result["files"][0]["bilingual"])
+        self.assertEqual(downloads, [url])
+        self.assertEqual(discovery.search_gap.call_count, 2)
+
+    def test_legacy_runtime_refuses_direct_subtitle_writer(self) -> None:
+        """A stale EngineJob caller cannot bypass RootJob subtitle recovery."""
+        class Writer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def install_subtitle_sidecar(
+                self,
+                source_path: str,
+                target_path: str,
+                *,
+                expected_size: int,
+                video_path: str,
+                subtitle_language: str | None = None,
+                subtitle_validator=None,
+            ) -> dict[str, object]:
+                self.calls.append({
+                    "source": source_path, "target": target_path,
+                    "video": video_path, "size": expected_size,
+                })
+                return {"size": expected_size, "status": "moved"}
+
+        alist = MockAList()
+        staging_root = "/quark/影视/ScrapeFlow/补源/bilingual-write/attempt"
+        source = f"{staging_root}/Show.S01E01.zh-CN-bilingual-ja.srt"
+        content = b"legacy subtitle bytes must not be inspected or moved"
+        alist.files[source] = content
+        writer = Writer()
+        gap_id = "missing_subtitle:writer-bilingual"
+        request = {"gaps": [{
+            "id": gap_id, "kind": "missing_subtitle",
+            "path": "/library/Show/Show.S01E01.mkv",
+            "subtitle_language": "zh",
+        }]}
+        job = EngineJob.from_dict({
+            "id": "writer-bilingual", "phase": "executed",
+            "created_at": "2026-08-18T00:00:00Z",
+            "updated_at": "2026-08-18T00:00:00Z",
+            "request": {}, "plan": {}, "summary": {},
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AutomaticReplenishmentRuntime(
+                state_root=Path(tmpdir), engine_runner=writer, alist=alist,
+                search=MagicMock(), materializer=MagicMock(),
+            )
+            with self.assertRaisesRegex(
+                AutomaticReplenishmentError,
+                "旧字幕正式写入器已移除",
+            ):
+                runtime._install_subtitle_members(  # noqa: SLF001
+                    job=job,
+                    request=request,
+                    acquisition={"files": [{
+                        "path": source, "size": len(content), "kind": "subtitle",
+                        "gap_ids": [gap_id], "bilingual": True,
+                        "original_language": "japanese",
+                        "subtitle_marker": "zh-CN-bilingual-ja",
+                    }]},
+                    staging_root=staging_root,
+                    round_number=1,
+                )
+
+        self.assertEqual(writer.calls, [])
+        self.assertEqual(alist.files[source], content)
+
     def test_materializer_refuses_season_pack_before_subtitle_download(self) -> None:
         """A missing sidecar must never fetch an ambiguous season package."""
         downloads: list[str] = []
@@ -391,6 +666,73 @@ class SubtitleProviderTests(unittest.TestCase):
         self.assertEqual(downloads, [])
         self.assertEqual(alist.files, {})
 
+    def test_materializer_rejects_tv_marked_sidecar_for_movie_before_download(self) -> None:
+        """A same-title TV episode can never satisfy a coordinate-free movie gap."""
+        downloads: list[str] = []
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/Example.Movie.S01E01.zh.srt",
+            "direct_file": True,
+            "format": "srt",
+            "title": "Example Movie Season 01 Episode 01 中文字幕",
+        }]
+        alist = MockAList()
+        gap = {
+            "id": "missing_subtitle:movie-wrong-episode",
+            "kind": "missing_subtitle",
+            "path": "/library/电影/Example Movie/Example.Movie.2024.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = SubtitleMaterializer(
+                discovery=discovery,
+                downloader=lambda url: downloads.append(url) or b"not reached",
+            ).acquire_subtitles(
+                {"media": {"title": "Example Movie", "media_type": "movie"}},
+                [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/movie-wrong-episode/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(downloads, [])
+        self.assertEqual(alist.files, {})
+
+    def test_materializer_allows_generic_direct_sidecar_for_movie(self) -> None:
+        """The movie guard rejects TV markers, not all coordinate-free files."""
+        content = (
+            "1\n00:00:01,000 --> 00:00:04,000\n"
+            "这是电影的简体中文字幕内容。\n"
+        ).encode("utf-8")
+        discovery = MagicMock()
+        discovery.search_gap.return_value = [{
+            "provider": "assrt",
+            "url": "https://example.test/Example.Movie.2024.zh.srt",
+            "direct_file": True,
+            "format": "srt",
+            "title": "Example Movie 2024 中文字幕",
+        }]
+        alist = MockAList()
+        gap = {
+            "id": "missing_subtitle:movie-generic",
+            "kind": "missing_subtitle",
+            "path": "/library/电影/Example Movie/Example.Movie.2024.mkv",
+            "subtitle_language": "zh",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = SubtitleMaterializer(
+                discovery=discovery, downloader=lambda _url: content,
+            ).acquire_subtitles(
+                {"media": {"title": "Example Movie", "media_type": "movie"}},
+                [gap],
+                staging_root="/quark/影视/ScrapeFlow/补源/movie-generic/attempt",
+                workspace=Path(tmpdir), alist=alist,
+            )
+
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(len(alist.files), 1)
+
     def test_materializer_rejects_declared_format_mismatch_without_staging(self) -> None:
         """The bytes must corroborate the candidate's exact sidecar extension."""
         content = (
@@ -479,7 +821,7 @@ class SubtitleProviderTests(unittest.TestCase):
         self.assertEqual(alist.upload_calls, [])
         self.assertEqual(list(Path(tmpdir).glob("*.srt")), [])
 
-    def test_runtime_handles_no_subtitles_found_as_completed_with_gaps(self) -> None:
+    def test_legacy_runtime_retires_subtitle_request_before_discovery(self) -> None:
         discovery = SubtitleDiscoveryService(
             enabled=True,
             fetcher=lambda url, headers: json.dumps({"data": {"subs": []}}).encode("utf-8"),
@@ -531,12 +873,16 @@ class SubtitleProviderTests(unittest.TestCase):
             outcome = runtime.run_for_job(job)
             self.assertEqual(len(outcome["outcomes"]), 1)
             first = outcome["outcomes"][0]
-            self.assertEqual(first["status"], "completed_with_gaps")
+            self.assertEqual(first["status"], "needs_attention")
             self.assertTrue(first["terminal"])
+            self.assertTrue(first["migration_required"])
+            self.assertEqual(
+                first["manual_action"], "migrate_rootjob_subtitle",
+            )
             mock_search.search.assert_not_called()
             mock_mat.acquire.assert_not_called()
 
-    def test_runtime_acquires_and_installs_subtitles_successfully(self) -> None:
+    def test_legacy_runtime_does_not_install_subtitles_even_when_a_candidate_exists(self) -> None:
         srt_content = (
             "1\n"
             "00:00:01,000 --> 00:00:04,000\n"
@@ -608,12 +954,13 @@ class SubtitleProviderTests(unittest.TestCase):
             outcome = runtime.run_for_job(job)
             self.assertEqual(len(outcome["outcomes"]), 1)
             first = outcome["outcomes"][0]
-            self.assertEqual(first["status"], "completed")
+            self.assertEqual(first["status"], "needs_attention")
             self.assertTrue(first["terminal"])
-            self.assertEqual(first["resolved_gap_ids"], ["missing_subtitle:123:Show.S01E01.mkv"])
-            mock_runner.install_subtitle_sidecar.assert_called_once()
+            self.assertEqual(first["resolved_gap_ids"], [])
+            self.assertTrue(first["migration_required"])
+            mock_runner.install_subtitle_sidecar.assert_not_called()
 
-    def test_runtime_handles_infrastructure_error_as_retry_wait(self) -> None:
+    def test_legacy_runtime_does_not_turn_subtitle_infrastructure_into_retry(self) -> None:
         def failing_fetcher(url: str, headers: dict | None) -> bytes:
             raise SubtitleInfrastructureError("连接超时")
 
@@ -667,9 +1014,10 @@ class SubtitleProviderTests(unittest.TestCase):
             outcome = runtime.run_for_job(job)
             self.assertEqual(len(outcome["outcomes"]), 1)
             first = outcome["outcomes"][0]
-            self.assertEqual(first["status"], "retry_wait")
-            self.assertFalse(first["terminal"])
-            self.assertEqual(first["failure_scope"], "infrastructure")
+            self.assertEqual(first["status"], "needs_attention")
+            self.assertTrue(first["terminal"])
+            self.assertTrue(first["migration_required"])
+            self.assertNotIn("failure_scope", first)
 
     def test_opensubtitles_without_api_key_is_explicitly_unavailable(self) -> None:
         from engine.tools.replenishment_adapter.subtitle_provider import (

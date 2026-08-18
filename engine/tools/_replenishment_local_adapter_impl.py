@@ -3476,6 +3476,14 @@ def _selected_indices(selection: Mapping[str, Any]) -> tuple[set[int], dict[int,
     gap_map = acquisition.get("file_index_by_gap")
     if not isinstance(gap_map, Mapping):
         raise ValueError("选中候选缺少集号到 torrent 文件索引映射")
+    # Companion sidecars belonged to the retired legacy media flow.  The
+    # current RootJob subtitle channel obtains and proves one merged bilingual
+    # file independently, so a direct Torrent invocation must fail closed if
+    # a serialized old companion map slips past its caller.  Current callers
+    # strip it before reaching this lower boundary; rejecting here protects
+    # manual/recovery callers too, before aria2 sees an extra index.
+    if acquisition.get("companion_subtitle_index_by_media_gap") is not None:
+        raise ValueError("媒体磁力补源不接受伴随字幕成员")
     by_index: dict[int, list[str]] = {}
     for gap_id in selection.get("selected_gap_ids") or []:
         values = gap_map.get(gap_id)
@@ -3487,6 +3495,47 @@ def _selected_indices(selection: Mapping[str, Any]) -> tuple[set[int], dict[int,
             by_index.setdefault(value, []).append(str(gap_id))
     if not by_index:
         raise ValueError("选中候选没有需要获取的文件")
+    path_map = acquisition.get("file_path_by_index")
+    if not isinstance(path_map, Mapping):
+        raise ValueError("选中候选缺少 torrent 文件路径映射")
+
+    def is_subtitle_gap_id(gap_id: str) -> bool:
+        """Recognize the durable subtitle coordinates accepted by this adapter.
+
+        The compact selector keeps only ids at this boundary.  Do not infer a
+        media kind from an extension after aria2 has already started: a
+        non-subtitle coordinate must prove an ordinary video member *before*
+        it is serialized into ``--select-file``.  Both legacy and RootJob
+        ledger ids are accepted for the standalone subtitle lane.
+        """
+        return (
+            gap_id.startswith("missing_subtitle:")
+            or "::missing_subtitle::" in gap_id
+        )
+
+    # Every selected primary member is checked here, before preflight or
+    # aria2.  The prior episode-only guard left movie/season/manual rows able
+    # to map a subtitle (or another non-media member) as a primary payload.
+    # A mixed media/subtitle binding is equally unsafe: it would let a video
+    # delivery masquerade as a sidecar or vice versa.
+    for index, gap_ids in by_index.items():
+        path = path_map.get(str(index), path_map.get(index))
+        if not isinstance(path, str):
+            raise ValueError(f"torrent 文件缺少路径映射: {index}")
+        subtitle_gaps = [gap_id for gap_id in gap_ids if is_subtitle_gap_id(gap_id)]
+        media_gaps = [gap_id for gap_id in gap_ids if not is_subtitle_gap_id(gap_id)]
+        if subtitle_gaps and media_gaps:
+            raise ValueError("torrent 文件不能同时绑定媒体与字幕缺口")
+        if media_gaps:
+            if (
+                not _is_ordinary_primary_video_path(path)
+                or len(media_gaps) != 1
+            ):
+                raise ValueError(
+                    f"媒体缺口的 torrent 文件不唯一或非正片: {media_gaps[0]}"
+                )
+        elif Path(path).suffix.casefold() not in SUBTITLE_EXTENSIONS:
+            raise ValueError(f"字幕缺口的 torrent 文件不是字幕: {subtitle_gaps[0]}")
     # Exact episode gaps are never batch members.  A selected candidate must
     # serialize one ordinary video for each one, and no video may be replayed
     # against several gaps after a restart/manual edit.
@@ -3494,25 +3543,19 @@ def _selected_indices(selection: Mapping[str, Any]) -> tuple[set[int], dict[int,
         gap_id for gap_id in (str(value) for value in selection.get("selected_gap_ids") or [])
         if re.fullmatch(r"S\d{2,3}E\d{2,4}", gap_id)
     }
-    path_map = acquisition.get("file_path_by_index")
-    if episode_gap_ids and not isinstance(path_map, Mapping):
-        raise ValueError("选中候选缺少 episode 文件路径映射")
     for gap_id in episode_gap_ids:
         values = gap_map.get(gap_id)
         if not isinstance(values, list) or len(values) != 1 or type(values[0]) is not int:
             raise ValueError(f"episode gap 没有唯一 torrent 视频: {gap_id}")
         index = values[0]
-        path = path_map.get(str(index), path_map.get(index)) if isinstance(path_map, Mapping) else None
+        path = path_map.get(str(index), path_map.get(index))
         if (
             not isinstance(path, str)
             or not _is_ordinary_primary_video_path(path)
             or len(by_index.get(index, [])) != 1
         ):
             raise ValueError(f"episode gap 的 torrent 视频不唯一或非正片: {gap_id}")
-    companion_by_index = _selected_companion_indices(
-        selection, selected_gap_ids={str(value) for value in selection.get("selected_gap_ids") or []},
-    )
-    return set(by_index) | set(companion_by_index), by_index
+    return set(by_index), by_index
 
 
 def _verify_manifest(selection: Mapping[str, Any], manifest: Mapping[str, Any]) -> tuple[set[int], dict[int, list[str]]]:

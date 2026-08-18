@@ -146,7 +146,19 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
             # Keep the compact original header; readiness is enforced by the
             # control endpoint rather than expanded into a dashboard wall.
             self.assertIn('id="serviceStatus"', body)
-            self.assertIn("服务正常", body)
+            self.assertIn("正在读取状态", body)
+            self.assertIn("API 可达", body)
+            self.assertIn("系统已暂停", body)
+            self.assertIn("暂停等待", body)
+            # A RootJob's durable replenishment state is read separately from
+            # its immutable Engine projection, so a safe retry/reconcile wait
+            # cannot be painted as a completed task or generic pause wait.
+            self.assertIn("function rootReplenishmentWait(job)", body)
+            self.assertIn("loadReplenishmentViews(state.jobs)", body)
+            self.assertIn("等待安全对账", body)
+            self.assertIn("恢复后继续等待重试", body)
+            self.assertIn("旧字幕任务需迁移到 RootJob", body)
+            self.assertNotIn("正在连接", body)
             self.assertNotIn('id="dependencyStatus"', body)
             self.assertNotIn('id="runtimeRows"', body)
             self.assertEqual(body.count('id="createButton"'), 1)
@@ -215,6 +227,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         self.assertEqual(health["liveness"]["scope"], "api_process")
         self.assertEqual(health["mode"], "automatic")
         self.assertEqual(health["ok_scope"], "runtime_configuration")
+        self.assertTrue(health["control"]["paused"])
         self.assertTrue(health["connected"])
         self.assertTrue(health["engine_configured"])
         self.assertEqual(health["build_version"], "p15-test")
@@ -620,6 +633,75 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         status, payload = self.request("GET", "/api/readiness/alist-offline")
         self.assertEqual(status, 404)
         self.assertEqual(payload["error"], "not found")
+
+    def test_legacy_companion_migration_projects_manual_attention(self) -> None:
+        """A media child with a retired sidecar cannot be painted completed."""
+        job = EngineJob(
+            id="legacy-companion-projection",
+            phase="executed",
+            created_at="2026-08-18T00:00:00Z",
+            updated_at="2026-08-18T00:00:00Z",
+            request={},
+            plan={},
+            summary={},
+        )
+
+        class Runner:
+            def get_job(self, job_id: str) -> EngineJob:
+                if job_id != job.id:
+                    raise AssertionError(f"unexpected job: {job_id}")
+                return job
+
+        class Runtime:
+            def run_for_job(self, received: EngineJob) -> dict[str, object]:
+                if received.id != job.id:
+                    raise AssertionError("wrong provider job")
+                return {
+                    "outcomes": [],
+                    "unresolved_gaps": [],
+                    "legacy_companion_subtitle_migration_gap_ids": ["S01E01"],
+                }
+
+        recorded: list[dict[str, object]] = []
+        with patch.object(
+            self.application, "control", return_value={"paused": False},
+        ), patch.object(
+            self.application, "_automatic_root_allowed", return_value=True,
+        ), patch.object(
+            self.application, "_provider_auto_repair_enabled", return_value=True,
+        ), patch.object(
+            self.application, "_provider_worker_configuration", return_value={"valid": True},
+        ), patch.object(
+            self.application, "_provider_submission_admitted", return_value=True,
+        ), patch.object(
+            self.application, "_provider_pilot_tmdb", return_value=None,
+        ), patch.object(
+            self.application, "_provider_job_allowed", return_value=True,
+        ), patch.object(
+            self.application, "_provider_pilot_job", return_value=job,
+        ), patch.object(
+            self.application, "_get_engine_runner", return_value=Runner(),
+        ), patch.object(
+            self.application, "_get_automatic_replenishment", return_value=Runtime(),
+        ), patch.object(
+            self.application, "_record_replenishment_progress",
+        ), patch.object(
+            self.application, "_record_replenishment_summary",
+            side_effect=lambda _job, outcome: recorded.append(dict(outcome)),
+        ), patch.object(self.application, "_cancel_job_timers") as cancel_timers:
+            self.application._run_automatic_replenishment(job.id)  # noqa: SLF001
+
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["status"], "needs_attention")
+        self.assertTrue(recorded[0]["terminal"])
+        self.assertEqual(
+            recorded[0]["legacy_subtitle_migration_gap_ids"], ["S01E01"],
+        )
+        self.assertEqual(
+            recorded[0]["legacy_companion_subtitle_migration_gap_ids"], ["S01E01"],
+        )
+        self.assertIn("历史媒体补源携带的字幕成员", recorded[0]["error"])
+        cancel_timers.assert_called_once_with(job.id)
 
     def test_root_job_creation_rejects_bad_shelf_and_bad_path(self) -> None:
         self.remote.entries["/library/待刮削"] = [{"name": "Example", "is_dir": True}]
@@ -1664,6 +1746,7 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         for status, terminal, expected in (
             ("provider_searching", False, "provider_searching"),
             ("failed", True, "failed_provider"),
+            ("needs_attention", True, "needs_attention"),
         ):
             with self.subTest(status=status):
                 job = replace(

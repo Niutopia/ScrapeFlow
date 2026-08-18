@@ -1514,14 +1514,14 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(acquisition["file_path_by_index"]["2"], "Example.Show.S01E01.1080p.chs.ass")
         self.assertEqual(acquisition["file_size_by_index"]["2"], 45)
 
-    def test_actual_torrent_companion_bridges_selection_delivery_and_fresh_child_move(self) -> None:
-        """Exercise the real adapter contract through the runtime sidecar write.
+    def test_actual_torrent_companion_is_removed_before_legacy_media_delivery(self) -> None:
+        """A legacy media run selects only video and leaves subtitles to RootJob.
 
         Network/torrent/AList transport is mocked, but the test uses the
         actual candidate mapper, selector, materializer implementation and
-        returned acquisition provenance.  It protects the otherwise easy to
-        miss hand-off where a valid manifest companion reached staging but was
-        absent from the runtime result.
+        returned acquisition provenance.  It protects the hand-off where a
+        valid old companion could otherwise be selected, staged and written by
+        the legacy runtime.
         """
         request = {
             "media": {
@@ -1568,11 +1568,13 @@ class AutomaticReplenishmentTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.result: dict[str, object] | None = None
+                self.received_selections: list[dict[str, object]] = []
 
             def acquire(self, run_request, selections, *, staging_root, workspace, alist):
+                self.received_selections = [dict(row) for row in selections]
                 wrapper = {
                     "request": dict(run_request),
-                    "selection": {"selections": [dict(row) for row in selections]},
+                    "selection": {"selections": self.received_selections},
                     "automatic_staging_root": staging_root,
                     "automatic_staging_parent": posixpath.dirname(posixpath.dirname(staging_root)),
                 }
@@ -1654,6 +1656,9 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                     tier=TIER_LOCAL_MAGNET,
                 )
                 outcome = runtime.run_for_job(root_job)
+                gap_state = json.loads(runtime._gap_path(  # noqa: SLF001 - durable assertion
+                    job_id=root_job.id, gap_id="S01E01",
+                ).read_text(encoding="utf-8"))
 
         result = materializer.result
         self.assertIsNotNone(result)
@@ -1664,16 +1669,22 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             set(result), {"lane", "attempt_id", "staging_root", "files"},
         )
         self.assertEqual(
-            [row["kind"] for row in result["files"]], ["video", "subtitle"],
+            [row["kind"] for row in result["files"]], ["video"],
         )
-        self.assertTrue(engine.planned[0]["source_path"].endswith("/media"))
+        self.assertNotIn(
+            "companion_subtitle_index_by_media_gap",
+            materializer.received_selections[0]["acquisition"],
+        )
+        self.assertNotIn("/subtitles", str(engine.planned[0]["source_path"]))
         self.assertEqual(outcome["unresolved_gaps"], [])
-        self.assertEqual(len(engine.installed_subtitles), 1)
-        installed = engine.installed_subtitles[0]
-        self.assertIn("/subtitles/", str(installed["source_path"]))
+        self.assertEqual(engine.installed_subtitles, [])
+        self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
+        self.assertNotIn("subtitle_sidecars", outcome["outcomes"][0])
+        migration = outcome["outcomes"][0]["legacy_companion_subtitle_migration"]
+        self.assertEqual(migration["manual_action"], "migrate_rootjob_subtitle")
+        self.assertEqual(migration["gap_ids"], ["S01E01"])
         self.assertEqual(
-            installed["target_path"],
-            "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E01.zh.ass",
+            gap_state["legacy_companion_subtitle_migration"]["status"], "required",
         )
 
     def test_serialized_episode_selection_cannot_reintroduce_multiple_videos(self) -> None:
@@ -1700,6 +1711,27 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "唯一 torrent 视频"):
+            _verify_manifest(selection, manifest)
+
+    def test_serialized_movie_selection_cannot_map_a_subtitle_as_media(self) -> None:
+        """All non-subtitle gap kinds are gated before aria2, not just episodes."""
+        gap_id = "unit-movie::missing_media::main"
+        selection = {
+            "infohash": "5" * 40,
+            "selected_gap_ids": [gap_id],
+            "acquisition": {
+                "kind": "torrent",
+                "file_index_by_gap": {gap_id: [1]},
+                "file_size_by_index": {"1": 321},
+                "file_path_by_index": {"1": "Example.Movie.2024.zh-CN.srt"},
+            },
+        }
+        manifest = {
+            "infohash": "5" * 40,
+            "files": {1: {"path": "Example.Movie.2024.zh-CN.srt", "size": 321}},
+        }
+
+        with self.assertRaisesRegex(ValueError, "媒体缺口.*非正片"):
             _verify_manifest(selection, manifest)
 
     def test_optional_release_level_s00_does_not_promote_plain_member_numbers(self) -> None:
@@ -2388,15 +2420,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(uploads, [])
         self.assertEqual(verified, [])
 
-    def test_companion_delivery_returns_exact_manifest_provenance(self) -> None:
-        """Runtime gets the one selected companion's map and delivered row."""
-        request = {
-            "media": {"tmdb_id": 7, "title": "Example Show"},
-            "gaps": [{
-                "id": "S01E01", "kind": "missing_episode", "season": 1,
-                "episodes": [1], "label": "Example Show S01E01",
-            }],
-        }
+    def test_companion_torrent_member_is_rejected_before_download(self) -> None:
+        """A retired media companion cannot re-enter aria2 through a raw row."""
         manifest = {
             "infohash": "c" * 40,
             "files": {
@@ -2418,63 +2443,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 },
             },
         }
-
-        class Client:
-            def mkdir(self, _path: str) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as temporary:
-            temporary_root = Path(temporary)
-            workspace = temporary_root / "workspace"
-            workspace.mkdir()
-            video = temporary_root / "Example.Show.S01E01.mkv"
-            subtitle = temporary_root / "Example.Show.S01E01.CHS.ass"
-            video.write_bytes(b"v" * 123)
-            subtitle.write_bytes(b"s" * 321)
-            staging = "/quark/影视/ScrapeFlow/补源/engine-test/attempt-companion"
-
-            with patch(
-                "engine.tools._replenishment_local_adapter_impl._preflight",
-                return_value={"candidates": [{
-                    "manifest": manifest,
-                    "torrent_path": str(temporary_root / "candidate.torrent"),
-                }]},
-            ), patch(
-                "engine.tools._replenishment_local_adapter_impl._payload_is_complete",
-                return_value=True,
-            ), patch(
-                "engine.tools._replenishment_local_adapter_impl._find_download",
-                side_effect=lambda _payload, path, _size: video if path.endswith(".mkv") else subtitle,
-            ), patch(
-                "engine.tools._replenishment_local_adapter_impl._verify_video_payload",
-            ), patch(
-                "engine.tools._replenishment_local_adapter_impl._automatic_upload",
-            ), patch(
-                "engine.tools._replenishment_local_adapter_impl._verify_remote_uploads",
-            ):
-                result = _acquire(
-                    {
-                        "request": request,
-                        "selection": {"selections": [selection]},
-                        "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
-                        "automatic_staging_root": staging,
-                    },
-                    workspace,
-                    client=Client(),
-                )
-
-        self.assertEqual(
-            set(result), {"lane", "attempt_id", "staging_root", "files"},
-        )
-        rows = result["files"]
-        self.assertEqual(rows[0]["kind"], "video")
-        self.assertEqual(rows[0]["gap_ids"], ["S01E01"])
-        self.assertEqual(rows[1]["kind"], "subtitle")
-        self.assertEqual(rows[1]["gap_ids"], ["S01E01"])
-        self.assertTrue(all(
-            set(row) == {"path", "size", "kind", "gap_ids"}
-            for row in rows
-        ))
+        with self.assertRaisesRegex(ValueError, "不接受伴随字幕"):
+            _verify_manifest(selection, manifest)
 
     def test_task_staging_parent_is_created_before_attempt(self) -> None:
         class FakeClient:
@@ -3963,8 +3933,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(engine.planned[0]["media_type"], "movie")
         self.assertEqual(engine.executed, ["engine-child-1"])
 
-    def test_subtitle_gap_uses_sidecar_lane_without_video_child(self) -> None:
-        """A missing subtitle must not download or re-organize the video again."""
+    def test_legacy_subtitle_lane_requires_rootjob_migration_without_effects(self) -> None:
+        """Legacy subtitle rows must never retry through an unsafe writer."""
         video_path = "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E01.mkv"
         subtitle_gap_id = "missing_subtitle:7:S01E01:zh"
         plan = {
@@ -3993,53 +3963,24 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             }, plan=plan, summary={"mode": "tv"},
         )
 
-        class SubtitleSearch:
-            def run(self, _request):
-                return {"candidates": [{
-                    "provider": "magnet",
-                    "locator": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
-                    "release_name": "Example Show S01E01 中文字幕",
-                    "title": "Example Show",
-                    "year": "2020",
-                    "files": ["Example.Show.S01E01.zh.srt"],
-                    "file_coverage": [subtitle_gap_id],
-                    "acquisition": {
-                        "kind": "torrent",
-                        "file_index_by_gap": {subtitle_gap_id: [1]},
-                    },
-                }]}
+        class RejectingSubtitleMaterializer:
+            def __init__(self) -> None:
+                self.calls = 0
 
-        class SubtitleMaterializer(FakeMaterializer):
-            def acquire_subtitles(
-                self, request, gaps, *, staging_root, workspace, alist,
-            ):
-                del request, gaps, workspace, alist
-                self.calls.append(staging_root)
-                parent = posixpath.dirname(staging_root)
-                self.alist.mkdir(parent)
-                self.alist.mkdir(staging_root)
-                source = f"{staging_root}/{subtitle_gap_id} - Example.Show.S01E01.zh.srt"
-                self.alist.tree[staging_root] = [{
-                    "name": posixpath.basename(source), "is_dir": False, "size": 321,
-                }]
-                return _ready_delivery(
-                    staging_root,
-                    [{
-                        "path": source,
-                        "size": 321,
-                        "kind": "subtitle",
-                        "gap_ids": [subtitle_gap_id],
-                    }],
-                )
+            def acquire_subtitles(self, *args, **kwargs):
+                del args, kwargs
+                self.calls += 1
+                raise AssertionError("retired legacy subtitle lane was called")
 
         with tempfile.TemporaryDirectory() as temporary:
             alist = MemoryAList()
             engine = FakeSubtitleEngine()
             progress: list[str] = []
+            subtitle_materializer = RejectingSubtitleMaterializer()
             runtime = AutomaticReplenishmentRuntime(
                 Path(temporary), engine_runner=engine, alist=alist,
-                search=SubtitleSearch(), materializer=SubtitleMaterializer(alist),
-                subtitle_materializer=SubtitleMaterializer(alist),
+                search=FakeSearch(), materializer=FakeMaterializer(alist),
+                subtitle_materializer=subtitle_materializer,
                 staging_root="/quark/影视/ScrapeFlow/补源", max_candidate_rounds=1,
                 progress=lambda _job, phase, _details: progress.append(phase),
             )
@@ -4053,30 +3994,53 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             outcome = runtime.run_for_job(root_job)
 
             self.assertEqual(outcome["unresolved_gaps"], [])
-            self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], [subtitle_gap_id])
-            self.assertIn("post_acquisition_reaudit", outcome["outcomes"][0])
-            self.assertNotIn("child_job_id", outcome["outcomes"][0])
+            self.assertEqual(len(outcome["outcomes"]), 1)
+            self.assertEqual(outcome["outcomes"][0]["status"], "needs_attention")
+            self.assertTrue(outcome["outcomes"][0]["terminal"])
+            self.assertTrue(outcome["outcomes"][0]["migration_required"])
+            self.assertEqual(
+                outcome["outcomes"][0]["manual_action"],
+                "migrate_rootjob_subtitle",
+            )
+            self.assertIn("旧字幕自动通道已停用", outcome["outcomes"][0]["error"])
+            self.assertEqual(subtitle_materializer.calls, 0)
             self.assertEqual(engine.planned, [])
             self.assertEqual(engine.executed, [])
-            self.assertEqual(len(engine.installed_subtitles), 1)
-            installed = engine.installed_subtitles[0]
-            self.assertTrue(str(installed["source_path"]).endswith(
-                f"/{subtitle_gap_id} - Example.Show.S01E01.zh.srt",
-            ))
-            self.assertEqual(
-                installed["target_path"],
-                "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E01.zh.srt",
+            self.assertEqual(engine.installed_subtitles, [])
+            self.assertEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            self.assertEqual(progress, ["gap_discovering", "needs_attention"])
+
+            state_path = runtime._gap_path(  # noqa: SLF001 - durable assertion
+                job_id=root_job.id, gap_id=subtitle_gap_id,
             )
-            self.assertEqual(installed["expected_size"], 321)
-            self.assertEqual(installed["video_path"], video_path)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "needs_attention")
+            self.assertTrue(state["subtitle_migration_required"])
+            self.assertIsNone(state["next_retry_at"])
+
+            # Older deployments wrote only an exhausted phase, without the
+            # new migration marker.  This is the literal persisted shape that
+            # must be repaired before any legacy provider/timer branch.
+            historic = {
+                "id": subtitle_gap_id,
+                "job_id": root_job.id,
+                "phase": "completed_with_gaps",
+            }
+            self.assertNotIn("subtitle_migration_required", historic)
+            runtime._write_gap(historic, state_path)  # noqa: SLF001
+            repeated = runtime.run_for_job(root_job)
+            self.assertEqual(repeated["outcomes"], [])
             self.assertEqual(
-                progress,
-                [
-                    "gap_discovering", "provider_searching", "acquiring",
-                    "staging_verifying", "subtitle_installing", "final_verifying",
-                ],
+                repeated["legacy_subtitle_migration_gap_ids"], [subtitle_gap_id],
             )
-            self.assertNotEqual(alist.tree["/quark/影视/ScrapeFlow/补源"], [])
+            self.assertNotIn(
+                subtitle_gap_id, repeated["already_exhausted_gap_ids"],
+            )
+            self.assertEqual(subtitle_materializer.calls, 0)
+            repaired = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["phase"], "needs_attention")
+            self.assertTrue(repaired["subtitle_migration_required"])
+            self.assertIsNone(repaired["next_retry_at"])
 
     def test_subtitle_gap_state_does_not_inherit_video_tier_evidence(self) -> None:
         gap = {
@@ -4194,8 +4158,8 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             ],
         )
 
-    def test_mixed_gaps_use_independent_media_and_subtitle_requests(self) -> None:
-        """One work with two gap types must invoke two isolated providers."""
+    def test_mixed_gaps_keep_media_running_and_retire_legacy_subtitle_lane(self) -> None:
+        """A legacy subtitle row cannot restart while its media sibling runs."""
         root_job = _example_root_job("engine-mixed-subtitle-root")
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         subtitle_video = (
@@ -4264,31 +4228,19 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             for row in outcome["outcomes"]
         }
         self.assertEqual(by_lane["media"]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(by_lane["subtitle"]["resolved_gap_ids"], [subtitle_id])
+        self.assertEqual(by_lane["subtitle"]["status"], "needs_attention")
+        self.assertTrue(by_lane["subtitle"]["migration_required"])
         self.assertEqual(
             [gap["kind"] for gap in media_search.requests[0]["gaps"]],
             ["missing_episode"],
         )
-        self.assertEqual(
-            [gap["kind"] for gap in subtitle_materializer.gap_batches[0]],
-            ["missing_subtitle"],
-        )
-        self.assertNotEqual(
-            media_materializer.calls[0],
-            subtitle_materializer.staging_roots[0],
-        )
+        self.assertEqual(subtitle_materializer.requests, [])
+        self.assertEqual(subtitle_materializer.gap_batches, [])
+        self.assertEqual(subtitle_materializer.staging_roots, [])
         self.assertEqual(engine.executed, ["engine-child-1"])
-        self.assertEqual(len(engine.installed_subtitles), 1)
-        installed = engine.installed_subtitles[0]
-        self.assertIn("/subtitles/", str(installed["source_path"]))
-        self.assertEqual(installed["video_path"], subtitle_video)
-        self.assertEqual(
-            installed["target_path"],
-            "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E02.zh.srt",
-        )
-        self.assertEqual(installed["expected_size"], 321)
+        self.assertEqual(engine.installed_subtitles, [])
 
-    def test_retrying_media_does_not_restart_exhausted_subtitle_lane(self) -> None:
+    def test_retrying_media_migrates_markerless_exhausted_subtitle_lane(self) -> None:
         root_job = _example_root_job("engine-split-lane-retry")
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         plan = dict(root_job.plan)
@@ -4341,10 +4293,18 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             )
 
             outcome = runtime.run_for_job(root_job)
+            subtitle_state = json.loads(runtime._gap_path(  # noqa: SLF001
+                job_id=root_job.id, gap_id=subtitle_id,
+            ).read_text(encoding="utf-8"))
 
         self.assertEqual(len(outcome["outcomes"]), 1)
         self.assertEqual(outcome["outcomes"][0]["request"]["lane"], "media")
-        self.assertEqual(outcome["already_exhausted_gap_ids"], [subtitle_id])
+        self.assertEqual(outcome["already_exhausted_gap_ids"], [])
+        self.assertEqual(
+            outcome["legacy_subtitle_migration_gap_ids"], [subtitle_id],
+        )
+        self.assertEqual(subtitle_state["phase"], "needs_attention")
+        self.assertTrue(subtitle_state["subtitle_migration_required"])
         self.assertEqual(subtitle_materializer.requests, [])
         self.assertEqual(engine.executed, ["engine-child-1"])
 
@@ -4487,33 +4447,34 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             outcome = runtime.run_for_job(root_job)
         return outcome, engine
 
-    def test_new_media_exact_chs_companion_is_installed_after_fresh_child_move(self) -> None:
-        """A missing episode can carry its exact CHS sidecar after its move."""
+    def test_legacy_media_delivery_never_installs_an_exact_companion(self) -> None:
+        """A rogue materializer sidecar is isolated and marked for RootJob."""
         outcome, engine = self._run_new_media_companion(
             "Example.Show.S01E01.CHS.ass",
         )
 
-        # There was no missing_subtitle request gap, so the video is the only
-        # resolved work coordinate while its newly created formal target gets
-        # the companion sidecar with the same basename.
         self.assertEqual(outcome["unresolved_gaps"], [])
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(len(engine.installed_subtitles), 1)
-        installed = engine.installed_subtitles[0]
         self.assertEqual(
-            installed["target_path"],
-            "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E01.zh.ass",
+            outcome["legacy_companion_subtitle_migration_gap_ids"], ["S01E01"],
         )
         self.assertEqual(
-            installed["video_path"],
-            "/quark/影视/番剧/Example Show/Season 01/Example.Show.S01E01.mkv",
+            outcome["legacy_subtitle_migration_gap_ids"], ["S01E01"],
         )
-        companions = outcome["outcomes"][0]["companion_subtitles"]
-        self.assertEqual(len(companions), 1)
-        self.assertTrue(companions[0]["companion"])
+        self.assertEqual(engine.installed_subtitles, [])
+        self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
+        self.assertNotIn("subtitle_sidecars", outcome["outcomes"][0])
+        self.assertEqual(
+            outcome["outcomes"][0]["legacy_companion_subtitle_migration"],
+            {
+                "status": "required",
+                "manual_action": "migrate_rootjob_subtitle",
+                "gap_ids": ["S01E01"],
+            },
+        )
 
-    def test_new_media_companion_rejects_wrong_episode_and_wrong_season(self) -> None:
-        """A candidate's video still completes; mismatched sidecars never write."""
+    def test_legacy_media_ignores_wrong_episode_and_wrong_season_sidecars(self) -> None:
+        """The old lane does not need a pairing heuristic to avoid a write."""
         for member in (
             "Example.Show.S01E02.CHS.ass",
             "Example.Show.S02E01.CHS.ass",
@@ -4524,9 +4485,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
                 self.assertEqual(engine.installed_subtitles, [])
                 self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
+                self.assertIn(
+                    "legacy_companion_subtitle_migration", outcome["outcomes"][0],
+                )
 
-    def test_new_media_companion_rejects_bare_and_cross_work_members(self) -> None:
-        """A coordinate/language tag alone cannot launder another work's sidecar."""
+    def test_legacy_media_ignores_bare_and_cross_work_sidecars(self) -> None:
+        """No member name can make the old media lane a subtitle writer."""
         for member in (
             "S01E01.CHS.ass",
             "Other.Show.S01E01.CHS.ass",
@@ -4536,9 +4500,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
                 self.assertEqual(outcome["unresolved_gaps"], [])
                 self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
                 self.assertEqual(engine.installed_subtitles, [])
+                self.assertIn(
+                    "legacy_companion_subtitle_migration", outcome["outcomes"][0],
+                )
 
-    def test_new_media_companion_requires_a_fresh_child_video_move(self) -> None:
-        """An idempotent/already-present child target must not receive a sidecar."""
+    def test_legacy_media_never_installs_sidecar_after_idempotent_child(self) -> None:
+        """A completed-looking child cannot revive the retired sidecar path."""
         outcome, engine = self._run_new_media_companion(
             "Example.Show.S01E01.CHS.ass", child_status="already_present",
         )
@@ -4547,18 +4514,22 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
         self.assertEqual(engine.installed_subtitles, [])
         self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
+        self.assertIn("legacy_companion_subtitle_migration", outcome["outcomes"][0])
 
-    def test_new_media_without_legal_companion_still_writes_media_only(self) -> None:
-        """No candidate sidecar must not block the media child or synthesize one."""
+    def test_legacy_media_without_companion_still_writes_media_only(self) -> None:
+        """No subtitle candidate must not block the video child or synthesize one."""
         outcome, engine = self._run_new_media_companion(None)
 
         self.assertEqual(outcome["unresolved_gaps"], [])
         self.assertEqual(outcome["outcomes"][0]["resolved_gap_ids"], ["S01E01"])
         self.assertEqual(engine.installed_subtitles, [])
         self.assertNotIn("companion_subtitles", outcome["outcomes"][0])
+        self.assertNotIn(
+            "legacy_companion_subtitle_migration", outcome["outcomes"][0],
+        )
 
-    def test_separate_lanes_keep_subtitle_out_of_real_engine_planner(self) -> None:
-        """The media child planner must never receive the subtitle request."""
+    def test_legacy_subtitle_lane_stays_out_of_real_engine_planner(self) -> None:
+        """A media child remains isolated while legacy subtitles stop safely."""
         root_job = _example_root_job("engine-isolated-planner-root")
         subtitle_id = "missing_subtitle:7:S01E02:zh"
         subtitle_video = (
@@ -4701,15 +4672,12 @@ class AutomaticReplenishmentTests(unittest.TestCase):
             for row in outcome["outcomes"]
         }
         self.assertEqual(by_lane["media"]["resolved_gap_ids"], ["S01E01"])
-        self.assertEqual(by_lane["subtitle"]["resolved_gap_ids"], [subtitle_id])
+        self.assertEqual(by_lane["subtitle"]["status"], "needs_attention")
+        self.assertTrue(by_lane["subtitle"]["migration_required"])
         self.assertEqual(len(engine.planner_sources), 1)
         self.assertTrue(engine.planner_sources[0].endswith("/media"))
-        self.assertEqual(len(engine.installed_subtitles), 1)
-        self.assertTrue(
-            str(engine.installed_subtitles[0]["source_path"]).endswith(
-                "/subtitles/" + subtitle_id + " - Example.Show.S01E02.zh.srt"
-            )
-        )
+        self.assertEqual(subtitle_materializer.requests, [])
+        self.assertEqual(engine.installed_subtitles, [])
 
     def test_pause_after_failed_attempt_stops_before_next_candidate_round(self) -> None:
         """A killed downloader must not immediately start another round."""

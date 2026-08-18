@@ -78,6 +78,9 @@ button:focus-visible,[role="button"]:focus-visible{
 .forge-status.is-bad::before{
   background:var(--forge-danger);box-shadow:0 0 0 4px rgba(219,128,100,.1);
 }
+.forge-status.is-paused::before{
+  background:var(--forge-alert);box-shadow:0 0 0 4px rgba(213,169,75,.1);
+}
 .forge-button{
   min-height:36px;padding:0 14px;border:1px solid var(--forge-line);border-radius:var(--forge-radius);
   background:#2a2b28;color:var(--forge-text);font-size:13px;font-weight:600;cursor:pointer;
@@ -309,7 +312,7 @@ button:focus-visible,[role="button"]:focus-visible{
   </div>
   <div class="forge-commands">
     <div class="forge-status-cluster">
-      <span class="forge-status" id="serviceStatus">正在连接</span>
+      <span class="forge-status" id="serviceStatus">正在读取状态</span>
     </div>
     <div class="forge-command-actions">
       <button type="button" class="forge-button forge-button--quiet" id="refreshButton">刷新</button>
@@ -328,7 +331,7 @@ button:focus-visible,[role="button"]:focus-visible{
   <div id="tasksView" hidden>
   <section class="forge-summary" id="taskSummary" aria-label="任务状态" hidden>
     <article class="forge-summary-card forge-summary-card--run">
-      <span>处理中</span><strong id="activeCount">0</strong>
+      <span id="activeSummaryLabel">处理中</span><strong id="activeCount">0</strong>
     </article>
     <article class="forge-summary-card forge-summary-card--alert">
       <span>需要处理</span><strong id="attentionCount">0</strong>
@@ -447,7 +450,7 @@ button:focus-visible,[role="button"]:focus-visible{
   }
   var state = {
     jobs:[], sources:[], units:{}, replenishment:{}, health:null, intakeRefreshedAt:null,
-    view:savedView(), filter:"all", busy:false, loading:false, drawerJobId:null, selectedSource:null,
+    view:savedView(), filter:"all", busy:false, loading:false, healthError:false, drawerJobId:null, selectedSource:null,
     selectedShelf:"anime", pendingAction:null
   };
   var terminal = new Set(["completed","completed_with_gaps","executed","cancelled"]);
@@ -469,7 +472,8 @@ button:focus-visible,[role="button"]:focus-visible{
     provider_searching:"搜索补源",acquiring:"获取文件",staging_verifying:"核对暂存",
     subtitle_installing:"处理字幕",child_planning:"规划补源",child_executing:"整理补源",
     final_verifying:"最终核对",uncertain:"需要确认",confirmed:"已确认",complete:"已完成",
-    pending:"等待处理",running:"处理中"
+    pending:"等待处理",running:"处理中",waiting_reconcile:"等待安全对账",
+    paused_waiting:"暂停等待"
   };
   var shelfLabels = {movie:"电影",anime:"番剧",us_tv:"美剧"};
   var tierLabels = {quark_share:"夸克分享",magnet:"本地磁力"};
@@ -488,8 +492,28 @@ button:focus-visible,[role="button"]:focus-visible{
     return "run";
   }
   function isWaiting(job){ return !!(job && Array.isArray(job.allowed_target_shelves) && job.allowed_target_shelves.length); }
+  function rootTierState(job){
+    var view = job && state.replenishment[job.id];
+    return view && view.tier_state && typeof view.tier_state === "object" ? view.tier_state : {};
+  }
+  function rootReplenishmentWait(job){
+    var waiting = rootTierState(job).waiting;
+    return waiting === "waiting_reconcile" || waiting === "retry_wait" ? waiting : "";
+  }
   function isAttentionJob(job){ return !!(job && attention.has(job.phase)); }
-  function isTerminalJob(job){ return !!(job && terminal.has(job.phase)); }
+  function isTerminalJob(job){ return !!(job && terminal.has(job.phase) && !rootReplenishmentWait(job)); }
+  function systemPaused(){
+    return !!(state.health && state.health.control && state.health.control.paused === true);
+  }
+  function isRecoveryWait(job){
+    return !!(job && (rootReplenishmentWait(job) || job.phase === "waiting_reconcile" || job.phase === "retry_wait"));
+  }
+  function isPausedWaiting(job){
+    return systemPaused() && !isTerminalJob(job) && !isAttentionJob(job) && !isWaiting(job) && !isRecoveryWait(job);
+  }
+  function displayPhase(job){
+    return rootReplenishmentWait(job) || (isPausedWaiting(job) ? "paused_waiting" : job.phase);
+  }
   function unitData(jobId){ return state.units[jobId] || null; }
   function stats(job){
     var aggregate = unitData(job.id) && unitData(job.id).aggregate || {};
@@ -512,8 +536,18 @@ button:focus-visible,[role="button"]:focus-visible{
     return date.toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit",hour12:false});
   }
   function tierFor(job){
+    var rootView = job && state.replenishment[job.id];
+    var rootTier = rootTierState(job).tier;
+    if(rootTier && rootView && rootView.aggregate && number(rootView.aggregate.open_gaps) > 0){ return rootTier; }
     var replenishment = job && job.summary && job.summary.replenishment;
     return replenishment && replenishment.tier || "";
+  }
+  function replenishmentFor(job){
+    return job && ((job.plan && job.plan.replenishment) || (job.summary && job.summary.replenishment)) || {};
+  }
+  function requiresRootJobSubtitleMigration(job){
+    var replenishment = replenishmentFor(job);
+    return !!(replenishment && replenishment.migration_required === true);
   }
   function api(path,options){
     options = options || {};
@@ -554,18 +588,36 @@ button:focus-visible,[role="button"]:focus-visible{
   }
   function updateHeader(){
     var service = $("#serviceStatus");
-    var healthy = !!(state.health && state.health.ok);
-    service.textContent = healthy ? "服务正常" : (state.health ? "服务异常" : "正在连接");
-    service.className = "forge-status " + (healthy ? "is-ready" : (state.health ? "is-bad" : ""));
+    if(!state.health){
+      service.textContent = state.healthError ? "API 无响应" : "正在读取状态";
+      service.className = "forge-status" + (state.healthError ? " is-bad" : "");
+      return;
+    }
+    var alive = !!(state.health.liveness && state.health.liveness.alive === true);
+    if(!alive){
+      service.textContent = "API 无响应";
+      service.className = "forge-status is-bad";
+    } else if(systemPaused()){
+      service.textContent = "系统已暂停";
+      service.className = "forge-status is-paused";
+    } else {
+      service.textContent = "API 可达";
+      service.className = "forge-status is-ready";
+    }
   }
   function renderCore(){
     var waiting = state.jobs.filter(isWaiting).length;
-    var active = state.jobs.filter(function(job){ return !isTerminalJob(job) && !isAttentionJob(job) && !isWaiting(job); }).length;
+    var paused = systemPaused() ? state.jobs.filter(isPausedWaiting).length : 0;
+    var recovering = state.jobs.filter(isRecoveryWait).length;
+    var active = state.jobs.filter(function(job){
+      return !isTerminalJob(job) && !isAttentionJob(job) && !isWaiting(job) && !isPausedWaiting(job);
+    }).length;
     var issues = attentionItems().length + waiting;
     var completed = state.jobs.filter(isTerminalJob).length;
     var total = state.jobs.length;
     $("#taskSummary").hidden = total === 0;
-    $("#activeCount").textContent = active;
+    $("#activeSummaryLabel").textContent = recovering ? "安全对账 / 重试" : (paused ? "暂停等待" : "处理中");
+    $("#activeCount").textContent = paused || active;
     $("#attentionCount").textContent = issues;
     $("#completedCount").textContent = completed;
     $("#sourceRefreshStamp").textContent = state.intakeRefreshedAt
@@ -606,6 +658,8 @@ button:focus-visible,[role="button"]:focus-visible{
     var detail = stats(job);
     var progress = percent(detail.completed,detail.total);
     var waiting = isWaiting(job);
+    var paused = isPausedWaiting(job);
+    var shownPhase = displayPhase(job);
     var tier = tierFor(job);
     var action = '<button type="button" class="forge-button forge-button--small forge-button--quiet" data-action="open" data-job="' + esc(job.id) + '">查看详情</button>';
     if(waiting){
@@ -614,7 +668,7 @@ button:focus-visible,[role="button"]:focus-visible{
           esc(job.id) + '" data-shelf="' + esc(shelf) + '">' + esc(shelfLabels[shelf] || shelf) + "</button>";
       }).join("");
     }
-    if(detail.gaps > 0 && !waiting){
+    if(detail.gaps > 0 && !waiting && !requiresRootJobSubtitleMigration(job)){
       action += '<button type="button" class="forge-button forge-button--small forge-button--danger" data-action="replenish" data-job="' +
         esc(job.id) + '">手动补源</button>';
     }
@@ -624,13 +678,22 @@ button:focus-visible,[role="button"]:focus-visible{
     }
     var progressClass = progress === 100 ? " is-complete" : "";
     var secondary = detail.total ? (detail.completed + " / " + detail.total + " 个作品") : (waiting ? "等待选择货架" : "等待单元数据");
+    if(requiresRootJobSubtitleMigration(job)){
+      secondary = "旧字幕任务需迁移到 RootJob，不能在此手动补源";
+    } else if(paused){
+      secondary = "系统已暂停，等待恢复运行";
+    } else if(systemPaused() && shownPhase === "waiting_reconcile"){
+      secondary = "系统已暂停；保留任务，恢复后安全对账";
+    } else if(systemPaused() && shownPhase === "retry_wait"){
+      secondary = "系统已暂停；恢复后继续等待重试";
+    }
     if(tier){ secondary += " · " + (tierLabels[tier] || tier); }
     return '<article class="forge-job-row" data-open-job="' + esc(job.id) + '">' +
       '<div class="forge-job-index">' + String(index + 1).padStart(2,"0") + "</div>" +
       '<div class="forge-job-main"><strong title="' + esc(jobSource(job)) + '">' + esc(jobTitle(job)) +
       '</strong><small title="' + esc(jobSource(job)) + '">' + esc(jobSource(job)) + "</small>" +
       '<div class="forge-progress"><i class="' + progressClass + '" style="width:' + progress + '%"></i></div></div>' +
-      '<div class="forge-job-stage">' + chip(job.phase) + '<small>' + esc(secondary) + "</small></div>" +
+      '<div class="forge-job-stage">' + chip(shownPhase) + '<small>' + esc(secondary) + "</small></div>" +
       '<div class="forge-job-metrics">' + (detail.total ? ("完成 " + detail.completed + " / " + detail.total) : "尚未生成单元") +
       "<br>" + (detail.gaps ? (detail.gaps + " 个开放缺口") : "无开放缺口") +
       (detail.attention ? "<br>" + detail.attention + " 个待确认" : "") + "</div>" +
@@ -685,6 +748,28 @@ button:focus-visible,[role="button"]:focus-visible{
     renderView();
     if(state.drawerJobId){ renderDrawer(); }
   }
+  function loadReplenishmentView(jobId){
+    return api("/api/jobs/" + encodeURIComponent(jobId) + "/replenishment").then(function(view){
+      state.replenishment[jobId] = view;
+      return view;
+    }).catch(function(){
+      // A legacy job has no RootJob ledger.  This is a read-only adornment,
+      // so an unavailable view must never make the ordinary task list look
+      // failed or block its refresh.
+      state.replenishment[jobId] = null;
+      return null;
+    });
+  }
+  function loadReplenishmentViews(jobs){
+    var liveIds = {};
+    (jobs || []).forEach(function(job){ liveIds[job.id] = true; });
+    Object.keys(state.replenishment).forEach(function(jobId){
+      if(!liveIds[jobId]){ delete state.replenishment[jobId]; }
+    });
+    return Promise.all((jobs || []).map(function(job){
+      return loadReplenishmentView(job.id);
+    }));
+  }
   function load(options){
     options = options || {};
     if(state.loading){ return Promise.resolve(false); }
@@ -694,6 +779,7 @@ button:focus-visible,[role="button"]:focus-visible{
       : api("/api/intake");
     return Promise.all([api("/api/health"),api("/api/jobs"),intakeRequest]).then(function(result){
       state.health = result[0];
+      state.healthError = false;
       var intake = state.health && state.health.intake || {};
       state.intakeRefreshedAt = (options.refreshIntake && result[2].refreshed_at)
         || intake.last_scan_at || state.intakeRefreshedAt;
@@ -711,11 +797,12 @@ button:focus-visible,[role="button"]:focus-visible{
         return api("/api/jobs/" + encodeURIComponent(job.id) + "/work-units").then(function(view){
           state.units[job.id] = view;
         }).catch(function(){ state.units[job.id] = null; });
-      }));
+      })).then(function(){ return loadReplenishmentViews(state.jobs); });
     }).then(function(){
       renderAll();
       return true;
     }).catch(function(error){
+      if(!state.health){ state.healthError = true; }
       updateHeader();
       toast((options.refreshIntake ? "AList 刷新失败：" : "") + error.message,true);
       renderAll();
@@ -750,7 +837,7 @@ button:focus-visible,[role="button"]:focus-visible{
   function loadDrawerData(jobId){
     var requests = [
       api("/api/jobs/" + encodeURIComponent(jobId) + "/work-units").then(function(view){ state.units[jobId] = view; }),
-      api("/api/jobs/" + encodeURIComponent(jobId) + "/replenishment").then(function(view){ state.replenishment[jobId] = view; }).catch(function(){ state.replenishment[jobId] = null; })
+      loadReplenishmentView(jobId)
     ];
     return Promise.all(requests).then(function(){ renderDrawer(); }).catch(function(error){
       $("#drawerBody").innerHTML = '<div class="forge-empty">' + esc(error.message) + "</div>";
@@ -788,8 +875,10 @@ button:focus-visible,[role="button"]:focus-visible{
     $("#drawerTitle").textContent = jobTitle(job);
     $("#drawerSource").textContent = jobSource(job);
     var actions = "";
-    if(detail.gaps > 0 && !isWaiting(job)){
+    if(detail.gaps > 0 && !isWaiting(job) && !requiresRootJobSubtitleMigration(job)){
       actions += '<button type="button" class="forge-button forge-button--danger" data-action="replenish" data-job="' + esc(job.id) + '">补源（' + detail.gaps + ' 个缺口）</button>';
+    } else if(requiresRootJobSubtitleMigration(job)){
+      actions += '<p class="forge-label">旧字幕任务需迁移到 RootJob；此处不会重新下载或写入。</p>';
     }
     if(isTerminalJob(job)){
       actions += '<button type="button" class="forge-button forge-button--quiet" data-action="cleanup" data-job="' + esc(job.id) + '">清理任务记录</button>';
@@ -800,7 +889,7 @@ button:focus-visible,[role="button"]:focus-visible{
     var gapText = detail.gaps ? (detail.gaps + " 个开放缺口") : "没有开放缺口";
     var detailBar =
       '<div class="forge-detail-bar" aria-label="任务概况">' +
-      '<div class="forge-detail-item"><span>状态</span>' + chip(job.phase) + "</div>" +
+      '<div class="forge-detail-item"><span>状态</span>' + chip(displayPhase(job)) + "</div>" +
       '<div class="forge-detail-item"><span>作品单元</span><strong>' + esc(unitText) + "</strong></div>" +
       '<div class="forge-detail-item forge-detail-item--gaps"><span>缺口</span><strong>' + esc(gapText) + "</strong></div>" +
       (tier ? '<div class="forge-detail-item"><span>当前补源方式</span><strong>' + esc(tierLabels[tier] || tier) + "</strong></div>" : "") +
