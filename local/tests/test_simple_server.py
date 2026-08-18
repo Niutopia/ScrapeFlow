@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -16,6 +17,7 @@ from unittest.mock import patch
 
 from engine.scrapeflow.serialization import atomic_write_json
 from local.simple_server import ApplicationError, SimpleApplication, make_server
+from local.scrapeflow_api.quark_helper_readiness import QuarkHelperReadinessCache
 from local.scrapeflow_api.root_job_pilot import single_root_scope, unrestricted_scope
 from local.scrapeflow_api.simple_engine_runner import (
     EngineJob,
@@ -274,6 +276,77 @@ class SimpleServerAutomaticApiTests(unittest.TestCase):
         status, detail = self.request("GET", f"/api/jobs/{job_id}")
         self.assertEqual(status, 200)
         self.assertEqual(detail["job"]["id"], job_id)
+
+    def test_health_uses_cached_helper_projection_and_acceptance_probe_is_explicit(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def factory(_url: str, _token: str, _timeout: float):
+            nonlocal calls
+            calls += 1
+
+            class Client:
+                def health(self):
+                    started.set()
+                    if not release.wait(2):
+                        raise AssertionError("test probe was not released")
+                    return {
+                        "status": "ready",
+                        "authenticated": True,
+                        "actions": ["health", "share-save"],
+                    }
+
+            return Client()
+
+        self.application._quark_helper_readiness = QuarkHelperReadinessCache(  # noqa: SLF001 - public endpoint integration
+            client_factory=factory,
+            probe_timeout=5,
+        )
+        with patch.dict(os.environ, {
+            "SCRAPEFLOW_QUARK_HELPER_URL": "http://127.0.0.1:18765",
+            "SCRAPEFLOW_QUARK_HELPER_TOKEN": "abcdefghijklmnopqrstuvwxyz012345",
+        }, clear=False):
+            before = time.monotonic()
+            status, health = self.request("GET", "/api/health")
+            elapsed = time.monotonic() - before
+            self.assertEqual(status, 200)
+            helper = health["helper_readiness"]["quark"]
+            self.assertLess(elapsed, 0.3)
+            self.assertEqual(helper["status"], "not_verified")
+            self.assertFalse(helper["verified"])
+            self.assertIsNone(helper["reachable"])
+            self.assertTrue(started.wait(1))
+            self.assertEqual(calls, 1)
+
+            # This endpoint is intentionally the only blocking/read-only
+            # Helper proof used by an isolated acceptance check.  It joins
+            # the already-running probe rather than starting another one.
+            result: dict[str, object] = {}
+
+            def explicit_probe() -> None:
+                probe_status, probe_payload = self.request(
+                    "GET", "/api/dependencies/quark-helper/readiness",
+                )
+                result["status"] = probe_status
+                result["payload"] = probe_payload
+
+            probe_thread = threading.Thread(target=explicit_probe)
+            probe_thread.start()
+            time.sleep(0.02)
+            self.assertEqual(calls, 1)
+            release.set()
+            probe_thread.join(2)
+            status = result["status"]
+            payload = result["payload"]
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        helper = payload["quark"]
+        self.assertEqual(calls, 1)
+        self.assertEqual(helper["status"], "ready")
+        self.assertTrue(helper["verified"])
+        self.assertTrue(helper["fresh"])
+        self.assertEqual(helper["probe_mode"], "explicit")
 
     def test_provider_worker_configuration_is_strictly_single_worker(self) -> None:
         for value in ("2", "0", "not-a-number"):

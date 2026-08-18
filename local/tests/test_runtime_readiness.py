@@ -75,6 +75,24 @@ def fake_fetcher(
             return 200, health_payload
         if url.endswith("/api/control"):
             return 200, control_payload
+        if url.endswith("/api/dependencies/quark-helper/readiness"):
+            helpers = health_payload.get("helper_readiness")
+            helper = (
+                helpers.get("quark")
+                if isinstance(helpers, dict) else None
+            )
+            if not isinstance(helper, dict):
+                return 200, {}
+            return 200, {
+                "quark": {
+                    **helper,
+                    "fresh": True,
+                    "verified": helper.get("status") == "ready"
+                    and helper.get("reachable") is True
+                    and helper.get("authenticated") is True,
+                    "probe_mode": "explicit",
+                },
+            }
         return 404, {}
 
     return fetch
@@ -90,6 +108,25 @@ class RuntimeReadinessTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "通过")
         self.assertEqual(report["issues"], [])
+
+    def test_explicit_helper_probe_gets_a_bounded_deep_probe_timeout(self) -> None:
+        timeouts: dict[str, float] = {}
+        delegate = fake_fetcher()
+
+        def fetch(url: str, timeout: float) -> tuple[int, object]:
+            timeouts[url.rsplit("/", 1)[-1]] = timeout
+            return delegate(url, timeout)
+
+        report = runtime_readiness_report(
+            api_url="http://127.0.0.1:8765",
+            expected_commit="abc1234",
+            timeout=5.0,
+            fetch_json=fetch,
+        )
+
+        self.assertEqual(report["status"], "通过")
+        self.assertEqual(timeouts["health"], 5.0)
+        self.assertGreaterEqual(timeouts["readiness"], 23.0)
 
     def test_non_loopback_api_url_fails_without_fetching(self) -> None:
         calls: list[str] = []

@@ -3788,6 +3788,73 @@ class AutomaticReplenishmentTests(unittest.TestCase):
         direct_transport.assert_not_called()
         self.assertEqual(delivery["external_task_id"], "share-task-1")
 
+    def test_quark_share_reauthenticates_before_every_share_save(self) -> None:
+        """A dashboard readiness cache must never authorize a mutation.
+
+        The materializer performs its own fresh Helper health call immediately
+        before each typed share-save.  If the second live authentication is
+        no longer valid, the second mutation is refused even though a prior
+        operation in this process was authenticated.
+        """
+        selection = {
+            "provider": "quark_share",
+            "locator": "quark_share:fixture-share",
+            "selected_gap_ids": ["S01E01"],
+            "acquisition": {
+                "kind": "quark_fast_save",
+                "share_id": "fixture-share",
+                "file_id_by_gap": {"S01E01": ["share-fid"]},
+                "file_path_by_id": {"share-fid": "Example.Show.S01E01.mkv"},
+                "file_size_by_id": {"share-fid": 123},
+            },
+        }
+
+        class FreshAuthHelper:
+            def __init__(self, alist: MemoryAList) -> None:
+                self.alist = alist
+                self.health_calls = 0
+                self.share_save_calls = 0
+
+            def health(self):
+                self.health_calls += 1
+                return {
+                    "status": "ready",
+                    "authenticated": self.health_calls == 1,
+                    "actions": ["health", "share-save"],
+                }
+
+            def share_save(self, plan):
+                self.share_save_calls += 1
+                destination = str(plan["destination"])
+                self.alist.tree[destination] = [{
+                    "name": "Example.Show.S01E01.mkv",
+                    "is_dir": False,
+                    "size": 123,
+                }]
+                return {"status": "finished", "task_id": "share-task-1"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alist = MemoryAList()
+            helper = FreshAuthHelper(alist)
+            materializer = QuarkFastSaveAutomaticMaterializer(helper=helper)
+            with patch("local.scrapeflow_api.automatic_replenishment.time.sleep"):
+                materializer.acquire(
+                    {}, [selection],
+                    staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-one",
+                    workspace=Path(temporary) / "one",
+                    alist=alist,
+                )
+                with self.assertRaisesRegex(Exception, "未认证"):
+                    materializer.acquire(
+                        {}, [selection],
+                        staging_root="/quark/影视/ScrapeFlow/补源/root/attempt-two",
+                        workspace=Path(temporary) / "two",
+                        alist=alist,
+                    )
+
+        self.assertEqual(helper.health_calls, 2)
+        self.assertEqual(helper.share_save_calls, 1)
+
     def test_partial_child_output_does_not_resolve_unwritten_episode(self) -> None:
         plan = {
             "mode": "tv",

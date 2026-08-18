@@ -175,7 +175,7 @@ python3 scripts/scrapeflow_quark_lifecycle.py --force-restart
 - 内嵌字幕探针按次审计使用有界单调时间预算（默认 120 秒、最多 4 个并发）；预算内未完成的证据标记为 `unknown_subtitle_evidence`，不会误判为缺字幕。相同的字幕未知不会每 30 秒重复全库扫描，而是在新媒体提交或手动审计时再次核对。可用 `SCRAPEFLOW_SUBTITLE_PROBE_BUDGET_SECONDS`、`SCRAPEFLOW_SUBTITLE_PROBE_WORKERS` 和 `SCRAPEFLOW_SUBTITLE_PROBE_MAX_FILES` 调整。
 - AList 不参与补源下载、提交、预检或任务恢复；它仅承担媒体库与夸克存储访问。本地 Magnet 的范围由已证明的一对一缺口成员映射和 staging 回读共同约束。
 - 新对象短暂不可见时，只对相关读取执行有界重试。
-- 任务重启时会先根据 AList 当前状态重新核对，再继续或进入可重试的失败状态。
+- 任务重启时只根据 RootJob 持久化的 attempt 与任务专属 staging 回读恢复；任何无法证明的外部边界保持 `waiting_reconcile`，绝不重新提交。AList 离线任务不再参与恢复。
 - 正式媒体库、AList 数据库和其他任务不属于当前任务的清理范围。
 - 停服后的本机状态备份和隔离恢复演练见
   [离线备份与恢复演练](docs/scrapeflow-offline-backup.md)；正式媒体库恢复点必须由存储侧单独准备。

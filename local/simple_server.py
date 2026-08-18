@@ -62,7 +62,7 @@ from local.scrapeflow_api.automatic_replenishment import (
 )
 from local.scrapeflow_api.control_state import PersistentControlState
 from local.scrapeflow_api.quark_helper_readiness import (
-    quark_helper_readiness_from_env,
+    QuarkHelperReadinessCache,
 )
 from local.scrapeflow_api.provider_staging import (
     ProviderStagingPathError,
@@ -219,6 +219,7 @@ class SimpleApplication:
         engine_runner: SimpleEngineRunner | None = None,
         enforce_engine_roots: bool | None = None,
         archive_preprocessor: object | None = None,
+        quark_helper_readiness: QuarkHelperReadinessCache | None = None,
     ) -> None:
         self.state_root = Path(state_root or os.getenv("SCRAPEFLOW_STATE_DIR", "/data")).resolve()
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -244,6 +245,13 @@ class SimpleApplication:
             ),
         )
         self._engine_runner_lock = threading.Lock()
+        # API liveness is intentionally decoupled from the expensive, live
+        # Quark renderer authentication check.  The cache returns an honest
+        # not-verified/stale row immediately and owns a single background
+        # probe; isolated acceptance uses ``deep_quark_helper_readiness``.
+        self._quark_helper_readiness = (
+            quark_helper_readiness or QuarkHelperReadinessCache()
+        )
         self._automatic_replenishment: AutomaticReplenishmentRuntime | None = None
         self._automatic_replenishment_lock = threading.Lock()
         self._control_path = self.state_root / "global-control.json"
@@ -705,12 +713,8 @@ class SimpleApplication:
         pilot_scope = self._pilot_scope_view()
         alist_configured = self.remote_configured
         tmdb_configured = bool(os.getenv("TMDB_API_KEY", "").strip())
-        helper_readiness = quark_helper_readiness_from_env()
-        helper_verified = (
-            helper_readiness.get("status") == "ready"
-            and helper_readiness.get("reachable") is True
-            and helper_readiness.get("authenticated") is True
-        )
+        helper_readiness = self._quark_helper_readiness.snapshot()
+        helper_verified = helper_readiness.get("verified") is True
         dependencies = {
             # A constructed client is only configuration evidence.  /health
             # deliberately never turns this into an AList network operation.
@@ -721,8 +725,10 @@ class SimpleApplication:
                 "read_only": True,
                 "reason": "API liveness 不执行 AList 远端探测",
             },
-            # This keeps the existing authenticated, read-only Helper probe
-            # separate from both API liveness and static lane declarations.
+            # A regular health read uses only the freshness-aware cached
+            # proof.  The explicit acceptance endpoint below requests a new
+            # authenticated check; neither path can make API liveness green
+            # merely because the static Quark lane exists.
             "quark": {
                 **helper_readiness,
                 "verified": helper_verified,
@@ -786,6 +792,15 @@ class SimpleApplication:
             "operations": operations,
             "message": "API 可响应；AList、Quark Helper 与 TMDB 状态见 dependencies。",
         }
+
+    def deep_quark_helper_readiness(self) -> dict[str, object]:
+        """Perform the explicit, read-only Helper proof for acceptance.
+
+        This endpoint must never be used to gate ordinary dashboard polling.
+        It joins the cache's existing probe if one is in flight and therefore
+        cannot multiply CDP authentications under concurrent callers.
+        """
+        return self._quark_helper_readiness.probe_now()
 
     def _operations_summary(self) -> dict[str, object]:
         """Small read-only counters for the Web operations home page."""
@@ -7023,6 +7038,13 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send_html(200, dashboard_html())
             elif path == "/api/health":
                 self._send(200, self.application.health())
+            elif path == "/api/dependencies/quark-helper/readiness":
+                # This is the explicit, authenticated, read-only acceptance
+                # probe.  It is intentionally separate from ordinary health
+                # polling, which returns only the cache projection.
+                self._send(200, {
+                    "quark": self.application.deep_quark_helper_readiness(),
+                })
             elif path == "/api/control":
                 self._send(200, self.application.control())
             elif path == "/api/jobs":

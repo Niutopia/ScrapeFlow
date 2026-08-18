@@ -15,6 +15,10 @@ from engine.scrapeflow.provider_capabilities import (
     QUARK_HELPER_NAME,
     QUARK_HELPER_REQUIRED_ACTIONS,
 )
+from local.scrapeflow_api.quark_helper_readiness import (
+    DEFAULT_HELPER_HEALTH_TIMEOUT_SECONDS,
+    DEFAULT_HELPER_HEALTH_WAIT_SLACK_SECONDS,
+)
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -125,8 +129,8 @@ def _is_utc_build_time(value: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
 
 
-def _check_quark_helper_readiness(
-    health: Mapping[str, object],
+def _check_quark_helper_record(
+    helper: Mapping[str, object],
     issues: list[str],
 ) -> None:
     """Require a live, authenticated helper proof rather than lane metadata.
@@ -136,14 +140,6 @@ def _check_quark_helper_readiness(
     must never be interpreted as evidence that the host-side Quark Helper is
     available for a real pilot.
     """
-    helpers = health.get("helper_readiness")
-    if not isinstance(helpers, Mapping):
-        issues.append("health.helper_readiness must be an object")
-        return
-    helper = helpers.get(QUARK_HELPER_NAME)
-    if not isinstance(helper, Mapping):
-        issues.append("health.helper_readiness.quark must be an object")
-        return
     for key in ("configured", "reachable", "authenticated"):
         if helper.get(key) is not True:
             issues.append(f"helper quark.{key} must be true")
@@ -175,6 +171,21 @@ def _check_quark_helper_readiness(
         # This is intentionally redundant with the fixed-contract checks: it
         # leaves a clear diagnostic if a future schema relaxes one side.
         issues.append("helper quark.required_actions must equal actions")
+
+
+def _check_quark_helper_readiness(
+    health: Mapping[str, object],
+    issues: list[str],
+) -> None:
+    helpers = health.get("helper_readiness")
+    if not isinstance(helpers, Mapping):
+        issues.append("health.helper_readiness must be an object")
+        return
+    helper = helpers.get(QUARK_HELPER_NAME)
+    if not isinstance(helper, Mapping):
+        issues.append("health.helper_readiness.quark must be an object")
+        return
+    _check_quark_helper_record(helper, issues)
 
 
 def _check_health(
@@ -283,6 +294,18 @@ def runtime_readiness_evidence_issues(report: Mapping[str, object]) -> list[str]
             issues.append("health.build_commit does not match expected commit")
         if not _is_utc_build_time(health.get("build_time")):
             issues.append("health.build_time must be a recorded ISO-8601 UTC timestamp")
+        helpers = health.get("helper_readiness")
+        helper = helpers.get(QUARK_HELPER_NAME) if isinstance(helpers, Mapping) else None
+        if not isinstance(helper, Mapping):
+            issues.append("health.helper_readiness.quark must be an explicit readiness object")
+        else:
+            if helper.get("probe_mode") != "explicit":
+                issues.append("helper quark.probe_mode must be explicit")
+            if helper.get("fresh") is not True:
+                issues.append("helper quark.fresh must be true")
+            if helper.get("verified") is not True:
+                issues.append("helper quark.verified must be true")
+            _check_quark_helper_record(helper, issues)
     return issues
 
 
@@ -294,7 +317,7 @@ def runtime_readiness_report(
     allow_existing_jobs: bool = False,
     fetch_json: FetchJson = _fetch_json,
 ) -> dict[str, Any]:
-    """Fetch health/control and return a read-only startup report."""
+    """Fetch health/control plus an explicit Helper proof for acceptance."""
     issues: list[str] = []
     expected = expected_commit.strip() if isinstance(expected_commit, str) else ""
     if _parse_build_id(expected) is None:
@@ -307,16 +330,36 @@ def runtime_readiness_report(
             "issues": ["api_url must be an HTTP(S) loopback URL"],
             "health": None,
             "control": None,
+            "quark_helper_readiness": None,
         }
 
     endpoints = {
         "health": _endpoint(api_url, "/api/health"),
         "control": _endpoint(api_url, "/api/control"),
+        # Ordinary health intentionally uses a non-blocking cached Helper
+        # projection.  Acceptance needs a fresh read-only authentication
+        # proof, so it requests the dedicated endpoint exactly once.
+        "quark_helper_readiness": _endpoint(
+            api_url, "/api/dependencies/quark-helper/readiness",
+        ),
     }
     payloads: dict[str, object] = {}
     for name, url in endpoints.items():
         try:
-            status, payload = fetch_json(url, timeout)
+            # The explicit endpoint can wait for one bounded deep Helper
+            # authentication probe (20s by default).  The generic CLI's 5s
+            # liveness timeout must not race that intentional acceptance
+            # action and turn a slow renderer into a transport failure.
+            request_timeout = (
+                max(
+                    timeout,
+                    DEFAULT_HELPER_HEALTH_TIMEOUT_SECONDS
+                    + DEFAULT_HELPER_HEALTH_WAIT_SLACK_SECONDS
+                    + 2.0,
+                )
+                if name == "quark_helper_readiness" else timeout
+            )
+            status, payload = fetch_json(url, request_timeout)
         except RuntimeReadinessError as exc:
             issues.append(f"{name} fetch failed: {exc}")
             continue
@@ -329,6 +372,41 @@ def runtime_readiness_report(
         payloads[name] = dict(payload)
 
     health = payloads.get("health")
+    helper_probe = payloads.get("quark_helper_readiness")
+    if isinstance(health, Mapping) and isinstance(helper_probe, Mapping):
+        # The ordinary endpoint must still expose a Helper projection for the
+        # console.  It may be not_verified/stale by design, so do not demand
+        # a green result here; require only that the explicit proof is not
+        # masking a missing public dependency record.
+        cached_helpers = health.get("helper_readiness")
+        if not isinstance(cached_helpers, Mapping):
+            issues.append("health.helper_readiness must be an object")
+        elif not isinstance(cached_helpers.get(QUARK_HELPER_NAME), Mapping):
+            issues.append("health.helper_readiness.quark must be an object")
+        helper = helper_probe.get(QUARK_HELPER_NAME)
+        if not isinstance(helper, Mapping):
+            issues.append("quark_helper_readiness.quark must be an object")
+        else:
+            if helper.get("probe_mode") != "explicit":
+                issues.append("quark helper readiness must be an explicit probe")
+            if helper.get("fresh") is not True:
+                issues.append("quark helper readiness must be fresh")
+            if helper.get("verified") is not True:
+                issues.append("quark helper readiness must be verified")
+            _check_quark_helper_record(helper, issues)
+            # Persist the acceptance proof under the conventional health
+            # shape so downstream evidence consumers do not treat a static
+            # lane declaration or an expired dashboard cache as proof.
+            helpers = health.get("helper_readiness")
+            copied_helpers = dict(helpers) if isinstance(helpers, Mapping) else {}
+            copied_helpers[QUARK_HELPER_NAME] = dict(helper)
+            health = {**health, "helper_readiness": copied_helpers}
+    elif isinstance(health, Mapping):
+        # Missing helper proof is a hard acceptance failure.  Continue with
+        # ordinary health validation to report all independently actionable
+        # issues in one invocation.
+        issues.append("quark_helper_readiness response must be a JSON object")
+
     if isinstance(health, Mapping):
         _check_health(
             health,
@@ -347,6 +425,7 @@ def runtime_readiness_report(
         "issues": issues,
         "health": health,
         "control": control,
+        "quark_helper_readiness": helper_probe,
     }
 
 

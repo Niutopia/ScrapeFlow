@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import local.scrapeflow_api.root_replenishment as root_replenishment
+
 from engine.scrapeflow.gap_ledger import (
     Gap,
     load_gap_ledger,
@@ -826,7 +828,7 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(result["tier_before"], "quark_share")
             self.assertEqual(result["tier"], "magnet")
 
-    def test_infrastructure_keeps_tier_and_waits_retry(self) -> None:
+    def test_provider_infrastructure_after_submit_waits_reconcile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             self._seed_tv_gap(state_root)
@@ -842,10 +844,13 @@ class RootReplenishmentTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(result["tier"], "magnet")
-            self.assertEqual(result["waiting"], "retry_wait")
+            # The exception occurred after the durable pre-submit boundary;
+            # it might hide an accepted aria2/provider task, so it must not
+            # become a retryable new download.
+            self.assertEqual(result["waiting"], "waiting_reconcile")
             self.assertEqual(result["gaps_closed"], [])
             self.assertEqual(
-                result["attempts"][0]["outcome"], "infrastructure",
+                result["attempts"][0]["outcome"], "in_doubt",
             )
 
     def test_in_doubt_keeps_tier_and_never_resubmits(self) -> None:
@@ -878,6 +883,246 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(second["requests_built"], 0)
             self.assertEqual(len(events), 1)
             self.assertEqual(second["waiting"], "waiting_reconcile")
+
+    def test_crash_after_video_pre_submit_never_reacquires_on_reload(self) -> None:
+        """A torn process after the final pre-call write is recovery-only."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            calls: list[str] = []
+
+            class CrashAfterProviderBoundary:
+                def acquire(self, *_args, **_kwargs):
+                    calls.append("acquire")
+                    raise SystemExit("fixture process died during acquire")
+
+            with self.assertRaisesRegex(SystemExit, "process died"):
+                run_root_replenishment(
+                    runner,
+                    state_root,
+                    "root-1",
+                    search_runner=_magnet_search("S01E02"),
+                    materializer_factory=lambda _tier: CrashAfterProviderBoundary(),
+                )
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            intent = next(iter(persisted["video_intents"].values()))
+            self.assertEqual(intent["phase"], "submitting")
+
+            search_calls: list[str] = []
+            reloaded = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=lambda _request: search_calls.append("search") or {},
+                materializer_factory=lambda _tier: _FakeMaterializer(
+                    events=[],
+                ),
+            )
+
+            self.assertEqual(calls, ["acquire"])
+            self.assertEqual(search_calls, [])
+            self.assertEqual(reloaded["waiting"], "waiting_reconcile")
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(
+                next(iter(persisted["video_intents"].values()))["phase"],
+                "waiting_reconcile",
+            )
+
+    def test_crash_after_video_success_before_receipt_persist_never_reacquires(self) -> None:
+        """A lost successful delivery receipt must not create a second task."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            acquire_calls: list[str] = []
+
+            class SuccessfulDelivery:
+                def acquire(self, _request, _selections, *, staging_root, **_kwargs):
+                    acquire_calls.append("acquire")
+                    return {
+                        "lane": "magnet",
+                        "attempt_id": staging_root.rsplit("/", 1)[-1],
+                        "staging_root": staging_root,
+                        "files": [],
+                        "external_task_id": "torrent-task-1",
+                    }
+
+            original_write = root_replenishment._write_video_intent
+
+            def crash_before_staged_receipt(*args, **kwargs):
+                value = args[-1]
+                if isinstance(value, dict) and value.get("phase") == "staged":
+                    raise SystemExit("fixture crash before staged receipt")
+                return original_write(*args, **kwargs)
+
+            with patch.object(
+                root_replenishment,
+                "_write_video_intent",
+                side_effect=crash_before_staged_receipt,
+            ), self.assertRaisesRegex(SystemExit, "before staged receipt"):
+                run_root_replenishment(
+                    runner,
+                    state_root,
+                    "root-1",
+                    search_runner=_magnet_search("S01E02"),
+                    materializer_factory=lambda _tier: SuccessfulDelivery(),
+                )
+            self.assertEqual(acquire_calls, ["acquire"])
+
+            second = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("reload must not re-search a torn attempt"),
+                ),
+                materializer_factory=lambda _tier: _FakeMaterializer(),
+            )
+            self.assertEqual(acquire_calls, ["acquire"])
+            self.assertEqual(second["waiting"], "waiting_reconcile")
+
+    def test_child_failure_recovers_same_video_attempt_without_new_acquire(self) -> None:
+        """A failed child may be resumed, but its provider is never replayed."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            events: list[dict[str, Any]] = []
+            original_plan = runner.plan_job
+
+            def fail_child_plan(*_args, **_kwargs):
+                raise RuntimeError("fixture child planner failed")
+
+            runner.plan_job = fail_child_plan  # type: ignore[method-assign]
+            first = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda _tier: _FakeMaterializer(events=events),
+            )
+            self.assertEqual(first["waiting"], "waiting_reconcile")
+            self.assertEqual(len(events), 1)
+            self.assertTrue(load_root_replenishment_state(
+                state_root, "root-1",
+            )["video_intents"])
+
+            runner.plan_job = original_plan  # type: ignore[method-assign]
+            second = run_root_replenishment(
+                runner,
+                state_root,
+                "root-1",
+                search_runner=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("recovery must not search or submit again"),
+                ),
+                materializer_factory=lambda _tier: _FakeMaterializer(events=events),
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(second["gaps_closed"], [
+                "unit-tv::missing_episode::S01E02",
+            ])
+
+    def test_credentialed_quark_attempt_is_redacted_and_never_replayed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            runner = self._runner(
+                state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
+            )
+            events: list[dict[str, Any]] = []
+            reconcile_events: list[dict[str, Any]] = []
+
+            def protected_search(request):
+                result = _quark_share_search("S01E02")(request)
+                candidate = result["candidates"][0]
+                candidate["locator"] = "quark_share:fixture?token=secret-token"
+                candidate["acquisition"]["passcode"] = "vault-passcode"
+                return result
+
+            first = run_root_replenishment(
+                runner, state_root, "root-1", search_runner=protected_search,
+                materializer_factory=lambda _tier: _FakeMaterializer(
+                    events=events, error=_InDoubtError("quark-task-1"),
+                ),
+            )
+            self.assertEqual(first["waiting"], "waiting_reconcile")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["selections"][0]["acquisition"]["passcode"], "vault-passcode")
+            persisted = load_root_replenishment_state(state_root, "root-1")
+            self.assertFalse(next(iter(persisted["video_intents"].values()))["recovery_safe"])
+            disk = "\n".join(path.read_text(encoding="utf-8") for path in state_root.rglob("*.json"))
+            self.assertNotIn("vault-passcode", disk)
+            self.assertNotIn("secret-token", disk)
+
+            second = run_root_replenishment(
+                runner, state_root, "root-1",
+                search_runner=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("credentialed attempt must not be re-searched"),
+                ),
+                materializer_factory=lambda _tier: _FakeMaterializer(
+                    events=events, reconcile_events=reconcile_events,
+                ),
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(reconcile_events, [])
+            self.assertEqual(second["waiting"], "waiting_reconcile")
+
+    def test_corrupt_or_legacy_video_inflight_state_never_starts_fresh_acquire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            path = state_root / "replenishment_root-1.json"
+            path.write_text("{not json", encoding="utf-8")
+            calls: list[str] = []
+
+            blocked = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=lambda _request: calls.append("search") or {},
+                materializer_factory=lambda _tier: calls.append("acquire"),
+            )
+            self.assertEqual(blocked["waiting"], "waiting_reconcile")
+            self.assertEqual(calls, [])
+
+            state = {
+                "tier": "magnet",
+                "candidate_failures_by_provider": {},
+                "exhaustion_proof_by_provider": {},
+                "last_error_scope": None,
+                "in_flight_gap_ids": {"S01E02": "old-task"},
+            }
+            path.write_text(json.dumps(state), encoding="utf-8")
+            calls.clear()
+            blocked_legacy = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=lambda _request: calls.append("search") or {},
+                materializer_factory=lambda _tier: calls.append("acquire"),
+            )
+            self.assertEqual(blocked_legacy["waiting"], "waiting_reconcile")
+            self.assertEqual(calls, [])
+
+            state["video_intents"] = {"bad": {"phase": "submitting"}}
+            state["in_flight_gap_ids"] = {}
+            path.write_text(json.dumps(state), encoding="utf-8")
+            blocked_invalid = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=lambda _request: calls.append("search") or {},
+            )
+            self.assertEqual(blocked_invalid["waiting"], "waiting_reconcile")
+            self.assertEqual(calls, [])
 
     # --- attempt ordering / coverage proof / pause --------------------------
 
@@ -946,6 +1191,27 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             acquisition = events[0]["selections"][0]["acquisition"]
             self.assertNotIn("companion_subtitle_index_by_media_gap", acquisition)
+
+    def test_video_delivery_rejects_companion_subtitle_member(self) -> None:
+        """A provider response cannot bypass the RootJob subtitle channel."""
+        intent = {
+            "tier": "magnet",
+            "attempt_id": "attempt-1",
+            "staging_root": "/library/ScrapeFlow/补源/root-1/attempt-1",
+            "selected_gap_ids": ["S01E02"],
+        }
+        delivery = {
+            "lane": "magnet",
+            "attempt_id": "attempt-1",
+            "staging_root": intent["staging_root"],
+            "files": [{
+                "path": f"{intent['staging_root']}/Episode.S01E02.zh.srt",
+                "size": 123,
+                "kind": "subtitle",
+                "gap_ids": ["S01E02"],
+            }],
+        }
+        self.assertIsNone(root_replenishment._video_delivery(delivery, intent))
 
     def test_close_gap_only_after_coverage_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -60,7 +60,9 @@ scopes.
 from __future__ import annotations
 
 import inspect
+import json
 import posixpath
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,6 +107,7 @@ from .simple_engine_runner import EngineRequest
 _STATE_FILE_PREFIX = "replenishment_"
 _STATE_SUFFIX = ".json"
 _IN_FLIGHT_KEY = "in_flight_gap_ids"
+_VIDEO_INTENTS_KEY = "video_intents"
 _SUBTITLE_INTENTS_KEY = "subtitle_intents"
 _MAX_ATTEMPT_LOG = 200
 _STAGING_NAMESPACE = "/ScrapeFlow/补源"
@@ -117,6 +120,23 @@ _SUBTITLE_TEXT_EXTENSIONS = frozenset({".ass", ".ssa", ".srt", ".vtt"})
 _SUBTITLE_INTENT_PHASES = frozenset({
     "prepared", "submitting", "staged", "installing", "waiting_reconcile",
 })
+_VIDEO_INTENT_PHASES = frozenset({
+    "prepared", "submitting", "staged", "installing", "waiting_reconcile",
+})
+# ``load_root_replenishment_state`` intentionally keeps this marker in memory
+# only.  Persisting over an unreadable state file would destroy the only
+# forensic evidence of an external provider attempt.  A caller seeing the
+# marker must not search, submit, download, or write until an operator has
+# reconciled the file.
+_STATE_RECOVERY_BLOCKED_KEY = "_recovery_blocked"
+_STATE_RECOVERY_REASON_KEY = "_recovery_reason"
+_VIDEO_SECRET_KEY_PARTS = frozenset({
+    "password", "passcode", "token", "cookie", "authorization", "secret", "pwd",
+})
+_LOCATOR_SECRET_QUERY = re.compile(
+    r"([?&][^=&?#]*(?:password|passcode|token|cookie|authorization|secret|pwd)[^=&?#]*=)[^&#]*",
+    re.IGNORECASE,
+)
 
 _KNOWN_FAILURE_SCOPES = frozenset({
     FAILURE_CANDIDATE, FAILURE_INFRASTRUCTURE, FAILURE_IN_DOUBT,
@@ -155,6 +175,10 @@ def _fresh_state() -> dict[str, Any]:
         "waiting": None,
         "attempt_log": [],
         _IN_FLIGHT_KEY: {},
+        # One immutable row per video provider attempt.  Unlike the former
+        # token->task-id projection, this contains enough request/selection
+        # evidence to resume the same staged child without another acquire.
+        _VIDEO_INTENTS_KEY: {},
         # One entry exists only while a subtitle acquisition/write requires
         # recovery.  It is intentionally separate from the video-tier
         # in-flight map: subtitle providers have no video-tier reconcile API,
@@ -171,6 +195,127 @@ def _bounded_path(value: object) -> str | None:
     if not path or len(path) > 2048 or "\x00" in path:
         return None
     return path
+
+
+def _redact_sensitive_text(value: str) -> tuple[str, bool]:
+    redacted = _LOCATOR_SECRET_QUERY.sub(r"\1<redacted>", value)
+    return redacted, redacted == value and "<redacted>" not in value
+
+
+def _durable_locator(value: object) -> tuple[str | None, bool]:
+    locator = _bounded_path(value)
+    return (None, False) if locator is None else _redact_sensitive_text(locator)
+
+
+def _durable_mapping(value: object) -> tuple[dict[str, Any] | None, bool]:
+    """Copy JSON evidence, redacting credentials and marking it unrecoverable."""
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        copied = json.loads(encoded)
+    except (TypeError, ValueError):
+        return None, False
+    if not isinstance(copied, dict) or len(encoded.encode("utf-8")) > 262_144:
+        return None, False
+    recovery_safe = True
+
+    def redact(row: object) -> object:
+        nonlocal recovery_safe
+        if isinstance(row, dict):
+            output = {}
+            for key, item in row.items():
+                normalized = "".join(char for char in key.casefold() if char.isalnum())
+                if any(part in normalized for part in _VIDEO_SECRET_KEY_PARTS):
+                    recovery_safe = False
+                    continue
+                output[key] = redact(item)
+            return output
+        if isinstance(row, list):
+            return [redact(item) for item in row]
+        if isinstance(row, str):
+            text, safe = _redact_sensitive_text(row)
+            recovery_safe &= safe
+            return text
+        return row
+
+    return redact(copied), recovery_safe
+
+
+def _normalize_video_intents(value: object) -> dict[str, dict[str, Any]] | None:
+    """Return canonical recovery rows, or ``None`` for an unsafe state."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or len(value) > 32:
+        return None
+    intents: dict[str, dict[str, Any]] = {}
+    for key, raw in value.items():
+        attempt_id = _safe_task_id(key)
+        if attempt_id is None or not isinstance(raw, Mapping):
+            return None
+        tier = str(raw.get("tier") or "").strip().casefold()
+        provider = str(raw.get("provider") or "").strip().casefold()
+        selected = raw.get("selected_gap_ids")
+        ledger_ids = raw.get("ledger_gap_ids")
+        request, request_safe = _durable_mapping(raw.get("request"))
+        selection, selection_safe = _durable_mapping(raw.get("selection"))
+        locator, locator_safe = _durable_locator(raw.get("locator"))
+        valid_ids = lambda rows: (
+            isinstance(rows, list) and bool(rows)
+            and all(isinstance(item, str) and item and len(item) <= 512 for item in rows)
+            and len(rows) == len(set(rows))
+        )
+        if (
+            raw.get("attempt_id") != attempt_id
+            or str(raw.get("phase") or "").casefold() not in _VIDEO_INTENT_PHASES
+            or tier not in STRICT_TIER_ORDER
+            or provider != _TIER_PROVIDER.get(tier)
+            or locator is None
+            or _bounded_path(raw.get("staging_root")) is None
+            or _bounded_path(raw.get("workspace")) is None
+            or _safe_task_id(raw.get("child_job_id")) is None
+            or not valid_ids(selected) or not valid_ids(ledger_ids)
+            or request is None or selection is None
+            or selection.get("provider") != provider
+            or _durable_locator(selection.get("locator"))[0] != locator
+            or selection.get("selected_gap_ids") != selected
+            or not isinstance(raw.get("recovery_safe"), bool)
+        ):
+            return None
+        entry = {
+            "phase": str(raw["phase"]).casefold(), "attempt_id": attempt_id,
+            "tier": tier, "provider": provider, "locator": locator,
+            "selected_gap_ids": list(selected), "ledger_gap_ids": list(ledger_ids),
+            "staging_root": _bounded_path(raw["staging_root"]),
+            "workspace": _bounded_path(raw["workspace"]),
+            "child_job_id": _safe_task_id(raw["child_job_id"]),
+            "request": request, "selection": selection,
+            "recovery_safe": bool(
+                raw["recovery_safe"] and request_safe and selection_safe and locator_safe
+            ),
+        }
+        task_id = raw.get("external_task_id")
+        if task_id is not None:
+            task_id = _safe_task_id(task_id)
+            if task_id is None:
+                return None
+            entry["external_task_id"] = task_id
+        delivery = raw.get("delivery")
+        if delivery is not None:
+            delivery, _ = _durable_mapping(delivery)
+            if delivery is None:
+                return None
+            entry["delivery"] = delivery
+        intents[attempt_id] = entry
+    return intents
+
+
+def _state_recovery_blocked(reason: str) -> dict[str, Any]:
+    state = _fresh_state()
+    state.update({
+        _STATE_RECOVERY_BLOCKED_KEY: True,
+        _STATE_RECOVERY_REASON_KEY: reason[:200],
+        "waiting": "waiting_reconcile",
+    })
+    return state
 
 
 def _normalize_subtitle_intents(value: object) -> dict[str, dict[str, Any]]:
@@ -231,7 +376,9 @@ def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
     state = dict(raw)
     tier = state.get("tier")
     if tier not in STRICT_TIER_ORDER:
-        return _fresh_state()
+        # An existing but malformed state is not equivalent to an absent
+        # state.  It might have been torn down just after a provider submit.
+        return _state_recovery_blocked("补源状态 tier 无效或缺失")
     state.setdefault("candidate_failures_by_provider", {})
     state.setdefault("exhaustion_proof_by_provider", {})
     state.setdefault("last_error_scope", None)
@@ -239,17 +386,48 @@ def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
     state.setdefault("last_attempt_at", None)
     state.setdefault("waiting", None)
     state.setdefault("attempt_log", [])
-    state.setdefault(_IN_FLIGHT_KEY, {})
     state.setdefault(_SUBTITLE_INTENTS_KEY, {})
-    in_flight = state.get(_IN_FLIGHT_KEY)
-    if not isinstance(in_flight, Mapping):
-        state[_IN_FLIGHT_KEY] = {}
-    else:
-        state[_IN_FLIGHT_KEY] = {
-            str(key): (str(value) if value else None)
-            for key, value in in_flight.items()
-            if isinstance(key, str) and key
-        }
+    legacy_in_flight = state.get(_IN_FLIGHT_KEY, {})
+    if not isinstance(legacy_in_flight, Mapping):
+        return _state_recovery_blocked("视频 in_flight 状态结构无效")
+    normalized_legacy_in_flight: dict[str, str | None] = {}
+    for key, value in legacy_in_flight.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or len(key) > 512
+            or (
+                value is not None
+                and value != ""
+                and _safe_task_id(value) is None
+            )
+        ):
+            return _state_recovery_blocked("视频 in_flight 状态字段无效")
+        normalized_legacy_in_flight[key] = (
+            _safe_task_id(value) if value else None
+        )
+    video_intents = _normalize_video_intents(state.get(_VIDEO_INTENTS_KEY))
+    if video_intents is None:
+        return _state_recovery_blocked("视频补源 attempt 状态无效")
+    expected_in_flight = {
+        token: _safe_task_id(intent.get("external_task_id"))
+        for intent in video_intents.values()
+        for token in intent.get("selected_gap_ids") or []
+        if isinstance(token, str) and token
+    }
+    # The former projection alone has no request/selection/staging evidence.
+    # Treat any such historical in-flight token as ambiguous instead of
+    # letting the new code start a fresh provider attempt around it.
+    if (
+        not video_intents
+        and normalized_legacy_in_flight
+    ) or any(
+        token not in expected_in_flight
+        for token in normalized_legacy_in_flight
+    ):
+        return _state_recovery_blocked("存在无完整 attempt 证据的视频 in_flight 记录")
+    state[_VIDEO_INTENTS_KEY] = video_intents
+    state[_IN_FLIGHT_KEY] = expected_in_flight
     log = state.get("attempt_log")
     if not isinstance(log, list):
         state["attempt_log"] = []
@@ -268,21 +446,21 @@ def load_root_replenishment_state(
 ) -> dict[str, Any]:
     """Load the durable tier/orchestration state for one root task.
 
-    A missing or unreadable file yields a fresh ``quark_share`` state; a file
-    with an invalid tier is treated the same (fail-closed, never trust a
-    malformed persisted tier).
+    Only a *missing* file yields a fresh ``quark_share`` state.  An unreadable
+    or malformed existing file is a recovery barrier: it may have been torn
+    down during a provider submission, so treating it as a new task would
+    authorize a duplicate download/share-save.
     """
     state_root = Path(state_root)
     path = _state_path(state_root, root_task_id)
     if not path.exists():
         return _fresh_state()
     try:
-        import json
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
-        return _fresh_state()
+        return _state_recovery_blocked("补源状态文件不可读")
     if not isinstance(raw, Mapping):
-        return _fresh_state()
+        return _state_recovery_blocked("补源状态文件不是对象")
     raw_tier = str(raw.get("tier") or "").strip().casefold()
     if raw_tier in {"alist_offline", "legacy_alist_offline_blocked"}:
         raise PreUpgradeAListStateError(
@@ -1972,6 +2150,248 @@ def _exclude_locator(state: dict[str, Any], tier: str, locator: str) -> None:
         rows.append(locator)
 
 
+def _video_paths(runner: Any, state_root: Path, root_task_id: str, attempt_id: str) -> tuple[str, Path, str]:
+    staging = f"{str(runner.library_root).rstrip('/')}{_STAGING_NAMESPACE}/{root_task_id}/{attempt_id}"
+    workspace = Path(state_root) / "replenishment_workspace" / root_task_id / attempt_id
+    return staging, workspace, f"replenishment-{attempt_id}"
+
+
+def _video_intents(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    intents = state.get(_VIDEO_INTENTS_KEY)
+    if not isinstance(intents, dict):
+        intents = {}
+        state[_VIDEO_INTENTS_KEY] = intents
+    return intents
+
+
+def _sync_video_in_flight(state: dict[str, Any]) -> None:
+    state[_IN_FLIGHT_KEY] = {
+        token: _safe_task_id(intent.get("external_task_id"))
+        for intent in _video_intents(state).values()
+        if isinstance(intent, Mapping)
+        for token in intent.get("selected_gap_ids", [])
+        if isinstance(token, str) and token
+    }
+
+
+def _write_video_intent(state_root: Path, root_task_id: str, state: dict[str, Any], attempt_id: str, value: Mapping[str, Any]) -> None:
+    _video_intents(state)[attempt_id] = dict(value)
+    _sync_video_in_flight(state)
+    state["updated_at"] = _now()
+    save_root_replenishment_state(state_root, root_task_id, state)
+
+
+def _drop_video_intent(state_root: Path, root_task_id: str, state: dict[str, Any], attempt_id: str) -> None:
+    _video_intents(state).pop(attempt_id, None)
+    _sync_video_in_flight(state)
+    state["updated_at"] = _now()
+    save_root_replenishment_state(state_root, root_task_id, state)
+
+
+def _new_video_intent(runner: Any, state_root: Path, root_task_id: str, *, attempt_id: str, tier: str, request: Mapping[str, Any], selection: Mapping[str, Any], covered_gaps: list[Gap]) -> dict[str, Any]:
+    request_copy, request_safe = _durable_mapping(request)
+    selection_copy, selection_safe = _durable_mapping(selection)
+    provider = str(selection.get("provider") or "").strip().casefold()
+    locator, locator_safe = _durable_locator(selection.get("locator"))
+    selected = selection.get("selected_gap_ids")
+    if (
+        request_copy is None or selection_copy is None or _safe_task_id(attempt_id) is None
+        or tier not in STRICT_TIER_ORDER or provider != _TIER_PROVIDER.get(tier)
+        or locator is None or not isinstance(selected, list) or not selected
+        or any(not isinstance(item, str) or not item for item in selected)
+        or len(selected) != len(set(selected))
+        or not covered_gaps
+    ):
+        raise ValueError("补源 selection 无法形成完整可恢复 attempt")
+    selection_copy.update({"provider": provider, "locator": locator, "selected_gap_ids": list(selected)})
+    staging_root, workspace, child_job_id = _video_paths(runner, state_root, root_task_id, attempt_id)
+    return {
+        "phase": "prepared", "attempt_id": attempt_id, "tier": tier,
+        "provider": provider, "locator": locator, "selected_gap_ids": list(selected),
+        "ledger_gap_ids": [gap.gap_id for gap in covered_gaps],
+        "staging_root": staging_root, "workspace": str(workspace),
+        "child_job_id": child_job_id, "request": request_copy, "selection": selection_copy,
+        "recovery_safe": request_safe and selection_safe and locator_safe,
+    }
+
+
+def _valid_video_intent(runner: Any, state_root: Path, root_task_id: str, value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    attempt_id = _safe_task_id(value.get("attempt_id"))
+    parsed = _normalize_video_intents({attempt_id: value}) if attempt_id else None
+    if not parsed:
+        return None
+    intent = parsed[attempt_id]
+    staging_root, workspace, child_job_id = _video_paths(runner, state_root, root_task_id, attempt_id)
+    if (intent["staging_root"], intent["workspace"], intent["child_job_id"]) != (staging_root, str(workspace), child_job_id):
+        return None
+    return intent
+
+
+def _video_delivery(value: object, intent: Mapping[str, Any]) -> dict[str, Any] | None:
+    delivery, _ = _durable_mapping(value)
+    if delivery is None or (
+        delivery.get("lane", intent["tier"]) != intent["tier"]
+        or delivery.get("attempt_id", intent["attempt_id"]) != intent["attempt_id"]
+        or delivery.get("staging_root") != intent["staging_root"]
+    ):
+        return None
+    files = delivery.get("files", [])
+    selected = set(intent["selected_gap_ids"])
+    if not isinstance(files, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for row in files:
+        if not isinstance(row, Mapping):
+            return None
+        path, size, kind, gap_ids = _bounded_path(row.get("path")), row.get("size"), row.get("kind"), row.get("gap_ids")
+        if (
+            path is None or not _path_under(path, str(intent["staging_root"]))
+            or isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            # The video tiers are not permitted to smuggle a companion
+            # sidecar through the staging root.  RootJob's independent
+            # subtitle transaction is the sole automatic subtitle writer,
+            # including its exact bilingual validation.
+            or kind != "video" or not isinstance(gap_ids, list)
+            or not gap_ids or any(not isinstance(item, str) or item not in selected for item in gap_ids)
+        ):
+            return None
+        normalized.append({"path": path, "size": size, "kind": kind, "gap_ids": list(gap_ids)})
+    output = {"lane": intent["tier"], "attempt_id": intent["attempt_id"], "staging_root": intent["staging_root"], "files": normalized}
+    task_id = delivery.get("external_task_id")
+    if task_id is not None:
+        task_id = _safe_task_id(task_id)
+        if task_id is None:
+            return None
+        output["external_task_id"] = task_id
+    return output
+
+
+def _video_gaps(state_root: Path, root_task_id: str, intent: Mapping[str, Any]) -> list[Gap]:
+    open_gaps = {gap.gap_id: gap for gap in load_gap_ledger(state_root, root_task_id) if gap.status == "open" and gap.kind != "missing_subtitle"}
+    return [open_gaps[gap_id] for gap_id in intent["ledger_gap_ids"] if gap_id in open_gaps]
+
+
+def _wait_video_intent(state_root: Path, root_task_id: str, state: dict[str, Any], intent: Mapping[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
+    pending = dict(intent)
+    pending["phase"] = "waiting_reconcile"
+    if task_id is not None:
+        pending["external_task_id"] = task_id
+    _write_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]), pending)
+    return pending
+
+
+def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state: dict[str, Any], intent: Mapping[str, Any], *, pause_requested: Callable[[], bool] | None) -> dict[str, Any]:
+    intent = _valid_video_intent(runner, state_root, root_task_id, intent)
+    delivery = _video_delivery(intent.get("delivery"), intent) if intent else None
+    if intent is None or delivery is None:
+        if intent is not None:
+            _wait_video_intent(state_root, root_task_id, state, intent)
+        return {"outcome": "waiting_reconcile", "attempts": [], "gaps_closed": []}
+    gaps = _video_gaps(state_root, root_task_id, intent)
+    if not gaps:
+        _drop_video_intent(state_root, root_task_id, state, str(intent["attempt_id"]))
+        return {"outcome": "closed", "attempts": [], "gaps_closed": []}
+    if pause_requested is not None and pause_requested():
+        return {"outcome": "paused", "attempts": [], "gaps_closed": []}
+    pending = dict(intent)
+    pending.update({"phase": "installing", "delivery": delivery})
+    _write_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]), pending)
+    try:
+        try:
+            child = runner.get_job(str(pending["child_job_id"]))
+        except Exception:
+            child = None
+        if child is None:
+            child = runner.plan_job(_child_request(runner, state_root, root_task_id, pending["request"], delivery), job_id=pending["child_job_id"], internal_child_of=root_task_id, pause_requested=pause_requested)
+        if getattr(child, "phase", None) == "executed":
+            executed = child
+        elif getattr(child, "phase", None) in {"planned", "retry_wait"}:
+            executed = runner.execute_job(str(pending["child_job_id"]), pause_requested=pause_requested)
+        else:
+            return {"outcome": "waiting_reconcile", "attempts": [], "gaps_closed": []}
+    except Exception as exc:
+        if _is_pause_error(exc):
+            return {"outcome": "paused", "attempts": [], "gaps_closed": []}
+        _wait_video_intent(state_root, root_task_id, state, pending)
+        return {"outcome": "waiting_reconcile", "attempts": [], "gaps_closed": []}
+    if getattr(executed, "phase", None) != "executed":
+        _wait_video_intent(state_root, root_task_id, state, pending)
+        return {"outcome": "waiting_reconcile", "attempts": [], "gaps_closed": []}
+    media = pending["request"].get("media") or {}
+    _, by_unit = _open_gaps_by_token(state_root, root_task_id, str(media.get("media_type") or ""), media.get("tmdb_id"))
+    plan = executed.plan if isinstance(getattr(executed, "plan", None), Mapping) else {}
+    attempts, closed, uncovered = [], [], []
+    for gap in gaps:
+        if _prove_gap_coverage(gap, by_unit, plan):
+            try:
+                close_gap(state_root, root_task_id, gap.gap_id)
+            except KeyError:
+                continue
+            closed.append(gap.gap_id)
+            attempts.append({"gap_id": gap.gap_id, "tier": pending["tier"], "outcome": "closed", "candidate_key": pending["locator"]})
+        else:
+            uncovered.append(gap)
+            record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=pending["attempt_id"], provider=pending["provider"], tier=pending["tier"], locator=pending["locator"], status="candidate_failed", error="补源执行后未证明缺口被覆盖")
+            attempts.append({"gap_id": gap.gap_id, "tier": pending["tier"], "outcome": FAILURE_CANDIDATE, "candidate_key": pending["locator"]})
+    if uncovered:
+        _wait_video_intent(state_root, root_task_id, state, pending)
+        return {"outcome": "waiting_reconcile", "attempts": attempts, "gaps_closed": closed}
+    _drop_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]))
+    return {"outcome": "closed", "attempts": attempts, "gaps_closed": closed}
+
+
+def _recover_video_intents(runner: Any, state_root: Path, root_task_id: str, state: dict[str, Any], *, materializer_factory: Callable[[str], Any], pause_requested: Callable[[], bool] | None) -> dict[str, Any]:
+    result = {"attempts": [], "gaps_closed": [], "waiting": None, "paused": False}
+    for attempt_id in list(_video_intents(state)):
+        if pause_requested is not None and pause_requested():
+            result["paused"] = True
+            return result
+        intent = _valid_video_intent(runner, state_root, root_task_id, _video_intents(state).get(attempt_id))
+        if intent is None:
+            result["waiting"] = "waiting_reconcile"
+            return result
+        if not isinstance(intent.get("delivery"), Mapping):
+            task_id = _safe_task_id(intent.get("external_task_id"))
+            if (
+                task_id is None
+                or intent["recovery_safe"] is not True
+                or intent["phase"] not in {"submitting", "waiting_reconcile"}
+            ):
+                _wait_video_intent(state_root, root_task_id, state, intent)
+                result["waiting"] = "waiting_reconcile"
+                return result
+            try:
+                reconcile = getattr(materializer_factory(intent["tier"]), "reconcile_existing_task")
+                delivery = _call_materializer_with_pause(reconcile, intent["request"], [intent["selection"]], staging_root=intent["staging_root"], workspace=Path(intent["workspace"]), alist=runner.alist, external_task_id=task_id, pause_requested=pause_requested)
+            except Exception as exc:
+                if _is_pause_error(exc):
+                    result["paused"] = True
+                    return result
+                _wait_video_intent(state_root, root_task_id, state, intent, task_id=task_id)
+                result["waiting"] = "waiting_reconcile"
+                return result
+            delivery = _video_delivery(delivery, intent)
+            if delivery is None or (delivery.get("external_task_id") not in {None, task_id}):
+                _wait_video_intent(state_root, root_task_id, state, intent, task_id=task_id)
+                result["waiting"] = "waiting_reconcile"
+                return result
+            intent = dict(intent)
+            intent.update({"phase": "staged", "delivery": delivery, "external_task_id": task_id})
+            _write_video_intent(state_root, root_task_id, state, attempt_id, intent)
+        continued = _resume_video_intent(runner, state_root, root_task_id, state, intent, pause_requested=pause_requested)
+        result["attempts"].extend(continued["attempts"])
+        result["gaps_closed"].extend(continued["gaps_closed"])
+        if continued["outcome"] == "paused":
+            result["paused"] = True
+            return result
+        if continued["outcome"] == "waiting_reconcile":
+            result["waiting"] = "waiting_reconcile"
+            return result
+    return result
+
+
 def run_root_replenishment(
     runner,
     state_root: Path,
@@ -2013,34 +2433,54 @@ def run_root_replenishment(
         factory = materializer_factory
 
     state = load_root_replenishment_state(state_root, root_task_id)
+    if state.get(_STATE_RECOVERY_BLOCKED_KEY) is True:
+        # Do not overwrite the malformed file with a fresh-looking state.
+        # Its unreadable bytes may be the only evidence of a provider submit.
+        tier = str(state.get("tier") or TIER_QUARK_SHARE)
+        return {
+            "tier": tier,
+            "tier_before": tier,
+            "requests_built": 0,
+            "attempts": [],
+            "gaps_closed": [],
+            "state": state,
+            "waiting": "waiting_reconcile",
+            "subtitle_requests_built": 0,
+            "subtitle_attempts": [],
+            "subtitle_gaps_closed": [],
+            "subtitle_waiting": "waiting_reconcile",
+            "paused": False,
+        }
     tier = str(state.get("tier") or TIER_QUARK_SHARE)
-    in_flight = {
-        str(key)
-        for key in (state.get(_IN_FLIGHT_KEY) or {})
-        if isinstance(key, str) and key
-    }
 
-    # J/N discipline: close gaps the library already proves present before
-    # anything reaches the acquisition lane.  Phantom ledger rows (historical
-    # registration bugs) must never be searched, submitted or downloaded.
+    # A durable provider boundary is resolved before any new read, search,
+    # subtitle lane, or materializer can run.  Recovery never calls acquire.
+    video_recovery = _recover_video_intents(runner, state_root, root_task_id, state, materializer_factory=factory, pause_requested=materializer_pause)
+    recovered_attempts = list(video_recovery["attempts"])
+    recovered_gaps_closed = list(video_recovery["gaps_closed"])
+    if video_recovery["paused"] or video_recovery["waiting"]:
+        state.update({"updated_at": _now(), "waiting": "waiting_reconcile"})
+        _sync_video_in_flight(state)
+        save_root_replenishment_state(state_root, root_task_id, state)
+        return {
+            "tier": tier, "tier_before": tier, "requests_built": 0,
+            "attempts": recovered_attempts, "gaps_closed": recovered_gaps_closed,
+            "state": state, "waiting": "waiting_reconcile",
+            "subtitle_requests_built": 0, "subtitle_attempts": [],
+            "subtitle_gaps_closed": [], "subtitle_waiting": None,
+            "paused": bool(video_recovery["paused"]),
+        }
+
+    # Reaudit phantom gaps before building a fresh candidate request.
     try:
         from .gap_reaudit import reaudit_open_gaps
         reaudit = reaudit_open_gaps(runner, state_root, root_task_id)
         if reaudit.get("closed"):
-            _trace(
-                f"reaudit root={root_task_id} closed={len(reaudit['closed'])} "
-                f"kept={len(reaudit.get('kept_open') or [])}",
-            )
+            _trace(f"reaudit root={root_task_id} closed={len(reaudit['closed'])} kept={len(reaudit.get('kept_open') or [])}")
     except Exception:
-        reaudit = {}
-
+        pass
     requests = gap_ledger_requests(state_root, root_task_id)
     _trace(f"start root={root_task_id} tier={tier} requests={len(requests)}")
-
-    # Operator-confirmed identities may carry no title; fill it from TMDB so
-    # the selection boundary has real alias evidence.  The same read-only
-    # detail response is the only source trusted for an optional bilingual
-    # original language.
     for request in requests:
         _enrich_media_titles(runner, request)
 
@@ -2092,67 +2532,34 @@ def run_root_replenishment(
     if not requests:
         state["updated_at"] = _now()
         state["waiting"] = merged_waiting(None)
+        _sync_video_in_flight(state)
         save_root_replenishment_state(state_root, root_task_id, state)
         noop = _noop_result(state, tier)
+        noop["attempts"] = recovered_attempts
+        noop["gaps_closed"] = recovered_gaps_closed
         noop["waiting"] = state["waiting"]
         return attach_subtitle_result(noop)
 
-    # Drop in-flight (in_doubt) gaps so the same coordinate is never re-submitted.
-    # Subtitle rows have already had their independent direct-sidecar pass;
-    # they never enter the two video tiers or their full-media search.
+    # Any durable video intent returned above after reconciliation; only
+    # subtitle rows remain to be removed from this video-only loop.
     filtered: list[dict[str, Any]] = []
     for request in requests:
-        rows = [
-            row for row in (request.get("gaps") or [])
-            if isinstance(row, Mapping)
-            and str(row.get("id") or "") not in in_flight
-            and row.get("kind") != "missing_subtitle"
-        ]
+        rows = [row for row in request.get("gaps", []) if isinstance(row, Mapping) and row.get("kind") != "missing_subtitle"]
         if rows:
-            copied = dict(request)
-            copied["gaps"] = rows
-            filtered.append(copied)
+            filtered.append({**request, "gaps": rows})
     requests = filtered
-
-    # Current materializers do not have a poll-only reconciliation hook.  A
-    # durable in-doubt token therefore remains an explicit barrier rather
-    # than being re-submitted or converted into another provider's attempt.
-    reconcile_attempts: list[dict[str, Any]] = []
-    reconcile_closed: list[str] = []
-    reconcile_waiting: str | None = (
-        "waiting_reconcile" if in_flight else None
-    )
+    reconcile_attempts: list[dict[str, Any]] = list(recovered_attempts)
+    reconcile_closed: list[str] = list(recovered_gaps_closed)
+    reconcile_waiting: str | None = None
 
     if not requests:
-        # Subtitle-only leftovers are the subtitle channel's job and must not
-        # loop the video tiers; parked tokens remain a durable barrier.
-        still_parked = bool(state.get(_IN_FLIGHT_KEY))
-        waiting = (
-            reconcile_waiting
-            if reconcile_waiting is not None
-            else ("waiting_reconcile" if still_parked else None)
-        )
+        waiting = merged_waiting(None)
         for entry in reconcile_attempts:
-            _append_attempt_log(state, {
-                "gap_id": entry["gap_id"],
-                "tier": entry["tier"],
-                "outcome": entry["outcome"],
-                "candidate_key": entry.get("candidate_key"),
-                "recorded_at": _now(),
-            })
-        state["updated_at"] = _now()
-        waiting = merged_waiting(waiting)
-        state["waiting"] = waiting
+            _append_attempt_log(state, {"gap_id": entry["gap_id"], "tier": entry["tier"], "outcome": entry["outcome"], "candidate_key": entry.get("candidate_key"), "recorded_at": _now()})
+        state.update({"updated_at": _now(), "waiting": waiting})
+        _sync_video_in_flight(state)
         save_root_replenishment_state(state_root, root_task_id, state)
-        return attach_subtitle_result({
-            "tier": tier,
-            "tier_before": tier,
-            "requests_built": 0,
-            "attempts": reconcile_attempts,
-            "gaps_closed": reconcile_closed,
-            "state": state,
-            "waiting": waiting,
-        })
+        return attach_subtitle_result({"tier": tier, "tier_before": tier, "requests_built": 0, "attempts": reconcile_attempts, "gaps_closed": reconcile_closed, "state": state, "waiting": waiting})
 
     requests_built = len(requests)
     attempts: list[dict[str, Any]] = list(reconcile_attempts)
@@ -2161,9 +2568,7 @@ def run_root_replenishment(
 
     hit_in_doubt = False
     hit_infrastructure = False
-    in_doubt_task_ids: dict[str, str | None] = {}
     failed_locators: set[str] = set()
-    newly_in_flight: dict[str, str | None] = {}
     no_candidate_proofs: list[Mapping[str, Any]] = []
     searched_requests = 0
     paused_during_round = False
@@ -2204,8 +2609,9 @@ def run_root_replenishment(
             # locator.  Even if a lower adapter labels it ``candidate``, it
             # cannot establish no-candidate exhaustion, so retry this same
             # tier instead of leaving an unprovable silent stop.
-            if scope == FAILURE_CANDIDATE:
+            if scope != FAILURE_INFRASTRUCTURE:
                 scope = FAILURE_INFRASTRUCTURE
+                task_id = None
             for row in request.get("gaps") or []:
                 token = str(row.get("id") or "")
                 for gap in by_token.get(token, ()):
@@ -2224,18 +2630,7 @@ def run_root_replenishment(
                         "tier": tier,
                         "outcome": scope,
                     })
-            if scope == FAILURE_IN_DOUBT:
-                hit_in_doubt = True
-                in_doubt_task_ids.update({
-                    str(row.get("id") or ""): task_id
-                    for row in request.get("gaps") or []
-                })
-                for row in request.get("gaps") or []:
-                    token = str(row.get("id") or "")
-                    if token:
-                        newly_in_flight[token] = task_id
-            elif scope == FAILURE_INFRASTRUCTURE:
-                hit_infrastructure = True
+            hit_infrastructure = True
             continue
 
         if not isinstance(bundle, Mapping):
@@ -2308,201 +2703,84 @@ def run_root_replenishment(
             if not covered_gaps:
                 continue
 
-            locator = str(selection.get("locator") or "")
-            provider = str(selection.get("provider") or _TIER_PROVIDER.get(tier, tier))
-            _trace(f"materialize root={root_task_id} tier={tier} locator={locator[:60]!r}")
             attempt_id = uuid.uuid4().hex
-            staging_root = (
-                f"{str(runner.library_root).rstrip('/')}"
-                f"{_STAGING_NAMESPACE}/{root_task_id}/{attempt_id}"
-            )
-            workspace = (
-                state_root / "replenishment_workspace"
-                / root_task_id / attempt_id
-            )
-            # Creating an attempt workspace is also a provider-owned local
-            # mutation.  Do not allocate a new staging directory once the
-            # root/pilot fence was withdrawn between selection and submit.
+            try:
+                intent = _new_video_intent(runner, state_root, root_task_id, attempt_id=attempt_id, tier=tier, request=request, selection=selection, covered_gaps=covered_gaps)
+            except ValueError:
+                hit_infrastructure = True
+                attempts.extend({"gap_id": gap.gap_id, "tier": tier, "outcome": FAILURE_INFRASTRUCTURE} for gap in covered_gaps)
+                continue
+            locator, staging_root = str(intent["locator"]), str(intent["staging_root"])
+            workspace = Path(str(intent["workspace"]))
+            _write_video_intent(state_root, root_task_id, state, attempt_id, intent)
             if pause():
+                _drop_video_intent(state_root, root_task_id, state, attempt_id)
                 paused_during_round = True
                 break
             try:
                 workspace.mkdir(parents=True, exist_ok=True)
             except OSError:
-                workspace = state_root
+                _drop_video_intent(state_root, root_task_id, state, attempt_id)
+                for gap in covered_gaps:
+                    record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=attempt_id, provider=intent["provider"], tier=tier, locator=locator, status="infrastructure", error="补源本地 workspace 无法创建")
+                    attempts.append({"gap_id": gap.gap_id, "tier": tier, "outcome": FAILURE_INFRASTRUCTURE})
+                hit_infrastructure = True
+                continue
 
-            # record_attempt BEFORE the external submit (contract).
-            for gap in covered_gaps:
-                record_attempt(
-                    state_root, root_task_id, gap.gap_id,
-                    attempt_id=attempt_id,
-                    provider=provider,
-                    tier=tier,
-                    locator=locator or None,
-                    status="submitted",
-                )
+            submitting = dict(intent)
+            submitting["phase"] = "submitting"
+            _write_video_intent(state_root, root_task_id, state, attempt_id, submitting)
             state["last_attempt_at"] = _now()
-
-            try:
-                delivery = _call_materializer_with_pause(
-                    materializer.acquire,
-                    request,
-                    [selection],
-                    staging_root=staging_root,
-                    workspace=workspace,
-                    alist=runner.alist,
-                    pause_requested=materializer_pause,
-                )
-            except Exception as exc:
-                if _is_pause_error(exc):
-                    paused_during_round = True
-                    break
-                scope, task_id = _classify_error(exc)
-                for gap in covered_gaps:
-                    record_attempt(
-                        state_root, root_task_id, gap.gap_id,
-                        attempt_id=attempt_id,
-                        provider=provider,
-                        tier=tier,
-                        locator=locator or None,
-                        status=_attempt_status(scope),
-                        external_task_id=task_id,
-                        error=str(exc)[:200] or None,
-                    )
-                    attempts.append({
-                        "gap_id": gap.gap_id,
-                        "tier": tier,
-                        "outcome": scope,
-                        **({"candidate_key": locator} if locator else {}),
-                    })
-                if scope == FAILURE_IN_DOUBT:
-                    hit_in_doubt = True
-                    for gap in covered_gaps:
-                        token = _bridge_token(gap) or gap.gap_id
-                        newly_in_flight[token] = task_id
-                elif scope == FAILURE_INFRASTRUCTURE:
-                    hit_infrastructure = True
-                else:
-                    if locator:
-                        failed_locators.add(locator)
-                continue
-
-            if not isinstance(delivery, Mapping):
-                for gap in covered_gaps:
-                    record_attempt(
-                        state_root, root_task_id, gap.gap_id,
-                        attempt_id=attempt_id,
-                        provider=provider,
-                        tier=tier,
-                        locator=locator or None,
-                        status="candidate_failed",
-                        error="补源 materializer 返回无效 delivery",
-                    )
-                    attempts.append({
-                        "gap_id": gap.gap_id,
-                        "tier": tier,
-                        "outcome": FAILURE_CANDIDATE,
-                        **({"candidate_key": locator} if locator else {}),
-                    })
-                if locator:
-                    failed_locators.add(locator)
-                continue
-
-            # Writer closed loop: plan + execute an internal child, then prove
-            # coverage from the executed plan's files before closing any gap.
-            try:
-                if pause():
-                    break
-                child_request = _child_request(
-                    runner, state_root, root_task_id, request, delivery,
-                )
-                child = runner.plan_job(
-                    child_request,
-                    internal_child_of=root_task_id,
-                    pause_requested=pause,
-                )
-                if pause():
-                    break
-                executed = runner.execute_job(child.id, pause_requested=pause)
-                if executed.phase != "executed":
-                    # See the reconciliation path above: an active paused
-                    # child has no proof of delivered coverage yet.
-                    if pause():
-                        break
-                    raise RuntimeError("补源 internal child 未完成")
-                executed_plan = (
-                    executed.plan if isinstance(executed.plan, Mapping) else {}
-                )
-            except Exception as exc:
-                if _is_pause_error(exc):
-                    # A child plan/write pause has no acceptance evidence and
-                    # no failed candidate/infrastructure evidence. Stop this
-                    # round without writing a retry attempt or trying another
-                    # provider selection.
-                    paused_during_round = True
-                    break
-                scope, task_id = _classify_error(exc)
-                for gap in covered_gaps:
-                    record_attempt(
-                        state_root, root_task_id, gap.gap_id,
-                        attempt_id=attempt_id,
-                        provider=provider,
-                        tier=tier,
-                        locator=locator or None,
-                        status=_attempt_status(scope),
-                        external_task_id=task_id,
-                        error=str(exc)[:200] or None,
-                    )
-                    attempts.append({
-                        "gap_id": gap.gap_id,
-                        "tier": tier,
-                        "outcome": scope,
-                        **({"candidate_key": locator} if locator else {}),
-                    })
-                if scope == FAILURE_IN_DOUBT:
-                    hit_in_doubt = True
-                    for gap in covered_gaps:
-                        token = _bridge_token(gap) or gap.gap_id
-                        newly_in_flight[token] = task_id
-                elif scope == FAILURE_INFRASTRUCTURE:
-                    hit_infrastructure = True
-                else:
-                    if locator:
-                        failed_locators.add(locator)
-                continue
-
             for gap in covered_gaps:
-                if _prove_gap_coverage(gap, by_unit, executed_plan):
-                    try:
-                        close_gap(state_root, root_task_id, gap.gap_id)
-                    except KeyError:
-                        continue
-                    gaps_closed.append(gap.gap_id)
-                    attempts.append({
-                        "gap_id": gap.gap_id,
-                        "tier": tier,
-                        "outcome": "closed",
-                        **({"candidate_key": locator} if locator else {}),
-                    })
-                else:
-                    record_attempt(
-                        state_root, root_task_id, gap.gap_id,
-                        attempt_id=attempt_id,
-                        provider=provider,
-                        tier=tier,
-                        locator=locator or None,
-                        status="candidate_failed",
-                        error="补源执行后未证明缺口被覆盖",
-                    )
-                    attempts.append({
-                        "gap_id": gap.gap_id,
-                        "tier": tier,
-                        "outcome": FAILURE_CANDIDATE,
-                        **({"candidate_key": locator} if locator else {}),
-                    })
-                    if locator:
-                        failed_locators.add(locator)
+                record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=attempt_id, provider=intent["provider"], tier=tier, locator=locator, status="submitted")
+            try:
+                delivery = _call_materializer_with_pause(materializer.acquire, request, [selection], staging_root=staging_root, workspace=workspace, alist=runner.alist, pause_requested=materializer_pause)
+            except Exception as exc:
+                if _is_pause_error(exc):
+                    _wait_video_intent(state_root, root_task_id, state, submitting)
+                    paused_during_round = True
+                    break
+                scope, task_id = _classify_error(exc)
+                if scope == FAILURE_CANDIDATE:
+                    _drop_video_intent(state_root, root_task_id, state, attempt_id)
+                    for gap in covered_gaps:
+                        record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=attempt_id, provider=intent["provider"], tier=tier, locator=locator, status="candidate_failed", error="补源候选被 provider 明确拒绝")
+                        attempts.append({"gap_id": gap.gap_id, "tier": tier, "outcome": FAILURE_CANDIDATE, "candidate_key": locator})
+                    failed_locators.add(locator)
+                    continue
+                _wait_video_intent(state_root, root_task_id, state, submitting, task_id=task_id)
+                for gap in covered_gaps:
+                    record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=attempt_id, provider=intent["provider"], tier=tier, locator=locator, status="in_doubt", external_task_id=task_id, error="补源 provider 响应未证明；等待对账")
+                    attempts.append({"gap_id": gap.gap_id, "tier": tier, "outcome": FAILURE_IN_DOUBT, "candidate_key": locator})
+                hit_in_doubt = True
+                break
 
+            delivery = _video_delivery(delivery, submitting)
+            if delivery is None:
+                _wait_video_intent(state_root, root_task_id, state, submitting)
+                for gap in covered_gaps:
+                    record_attempt(state_root, root_task_id, gap.gap_id, attempt_id=attempt_id, provider=intent["provider"], tier=tier, locator=locator, status="in_doubt", error="补源 delivery 无法证明属于当前 attempt")
+                    attempts.append({"gap_id": gap.gap_id, "tier": tier, "outcome": FAILURE_IN_DOUBT, "candidate_key": locator})
+                hit_in_doubt = True
+                break
+            staged = dict(submitting)
+            staged.update({"phase": "staged", "delivery": delivery})
+            task_id = _safe_task_id(delivery.get("external_task_id"))
+            if task_id is not None:
+                staged["external_task_id"] = task_id
+            _write_video_intent(state_root, root_task_id, state, attempt_id, staged)
+            continued = _resume_video_intent(runner, state_root, root_task_id, state, staged, pause_requested=materializer_pause)
+            attempts.extend(continued["attempts"])
+            gaps_closed.extend(continued["gaps_closed"])
+            if continued["outcome"] == "paused":
+                paused_during_round = True
+                break
+            if continued["outcome"] == "waiting_reconcile":
+                hit_in_doubt = True
+                break
+
+        if hit_in_doubt:
+            break
         if pause():
             paused_during_round = True
             break
@@ -2531,17 +2809,16 @@ def run_root_replenishment(
                 "scope": FAILURE_CANDIDATE,
                 "locator": locator,
             })
-    if hit_in_doubt or reconcile_waiting == "waiting_reconcile":
+    if (
+        hit_in_doubt
+        or _video_intents(state)
+        or reconcile_waiting == "waiting_reconcile"
+    ):
         waiting = "waiting_reconcile"
-        if hit_in_doubt:
+        if hit_in_doubt or _video_intents(state):
             state = apply_tier_outcome(state, {
                 "scope": FAILURE_IN_DOUBT,
-                "external_task_id": next(iter(in_doubt_task_ids.values()), None),
             })
-        state[_IN_FLIGHT_KEY] = {
-            **state.get(_IN_FLIGHT_KEY, {}),
-            **newly_in_flight,
-        }
     elif hit_infrastructure or reconcile_waiting == "retry_wait":
         waiting = "retry_wait"
         state = apply_tier_outcome(state, {"scope": FAILURE_INFRASTRUCTURE})
@@ -2580,6 +2857,7 @@ def run_root_replenishment(
     waiting = merged_waiting(waiting)
     state["updated_at"] = _now()
     state["waiting"] = waiting
+    _sync_video_in_flight(state)
     _trace(f"end root={root_task_id} tier={state.get('tier')} waiting={waiting} closed={len(gaps_closed)}")
     for entry in attempts:
         _append_attempt_log(state, {
