@@ -488,6 +488,31 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(persisted.reconciliation_evidence, record.reconciliation_evidence)
             self.assertNotEqual(persisted.identity.get("source"), "derived_bare_episode")
 
+    def test_partial_season_prefix_source_gets_a_revalidatable_proof(self) -> None:
+        """A contiguous ``1..N`` run shorter than the sole positive season is a
+        partial-season prefix (the still-airing tail stays a J gap), not an
+        uncertain run."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99006, {1: 8})
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                [f"One.Season.Show.E{episode:02d}.mkv" for episode in range(1, 7)],
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bare-partial",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_bare_episodes",
+                    "tmdb_id": 99006,
+                    "season": 1,
+                    "episode_count": 6,
+                    "episode_tokens": [f"S01E{episode:02d}" for episode in range(1, 7)],
+                },
+            )
+
     def test_complete_naked_numeric_source_gets_a_revalidatable_single_season_proof(self) -> None:
         """A clean ``01.mp4`` … ``N.mp4`` run is proven only by D/TMDB.
 

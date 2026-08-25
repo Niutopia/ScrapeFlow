@@ -1456,6 +1456,58 @@ def _merged_multi_season_evidence(
     return _TmdbMergedSeasonEvidence(tuple(positives))
 
 
+def _partial_season_prefix_evidence(
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    episode_count: int,
+) -> tuple[int, int] | None:
+    """Prove a contiguous ``1..N`` run is the prefix of the sole positive
+    season when ``N < season episode_count``.
+
+    A not-yet-finished release legitimately has fewer source episodes than the
+    published season total.  The proof only accepts the unique positive season
+    (a multi-season show stays ambiguous) and returns ``(season, total)``; the
+    uncovered tail ``E(N+1)..E(total)`` is left for the ordinary J gap
+    discovery against the TMDB episode catalog, never treated as complete.
+    """
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+    except Exception:
+        return None
+    if not isinstance(show, Mapping):
+        return None
+    raw_seasons = show.get("seasons")
+    if not isinstance(raw_seasons, list) or not raw_seasons:
+        return None
+    positives: list[tuple[int, int]] = []
+    for row in raw_seasons:
+        if not isinstance(row, Mapping):
+            return None
+        raw_season = row.get("season_number")
+        raw_count = row.get("episode_count")
+        if (
+            isinstance(raw_season, bool)
+            or not isinstance(raw_season, int)
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_season < 0
+            or raw_count < 0
+        ):
+            return None
+        if raw_season > 0 and raw_count > 0:
+            positives.append((raw_season, raw_count))
+    if len(positives) != 1:
+        return None
+    season, total = positives[0]
+    if total <= episode_count:
+        return None
+    return (season, total)
+
+
 def prove_single_season_episode_evidence(
     alist: object,
     state_root: Any,
@@ -1520,7 +1572,39 @@ def prove_single_season_episode_evidence(
             tmdb_id=tmdb_id,
             episode_count=len(episode_numbers),
         )
-        if merged is None or not callable(episode_catalog):
+        if merged is None:
+            # A partial-season prefix is only sound for a pure regular run.
+            # Any fractional or physical-special (SP/OAD/OVA) video mixed in
+            # means the source carries ambiguous coordinates, so fail closed
+            # instead of reading it as a short regular season.
+            if any(
+                _is_fractional_episode_video(file)
+                or _is_unnumbered_special_video(file)
+                or is_physical_special_video_file(file)
+                for file in collect_all_files(scoped)
+                if file.object_type == "video"
+            ):
+                return None
+            prefix = _partial_season_prefix_evidence(
+                tmdb_client,
+                tmdb_id=tmdb_id,
+                episode_count=len(episode_numbers),
+            )
+            if prefix is None or not callable(episode_catalog):
+                return None
+            season, _total = prefix
+            count = len(episode_numbers)
+            return SingleSeasonEpisodeProof(
+                tmdb_id=tmdb_id,
+                season=season,
+                episode_count=count,
+                episode_tokens=tuple(
+                    f"S{season:02d}E{episode:02d}"
+                    for episode in range(1, count + 1)
+                ),
+                evidence_kind=evidence_kind,
+            )
+        if not callable(episode_catalog):
             return None
         boundaries = merged.boundaries
         merged_tokens = tuple(
