@@ -1113,11 +1113,18 @@ class AListClient:
             url_validator=self._validate_download_url,
         )
 
-    def read_file_bytes(self, path: str, *, max_bytes: int) -> bytes:
-        """Download one bounded remote file without relying on its MIME type."""
+    def read_file_bytes(self, path: str, *, max_bytes: int, refresh: bool = False) -> bytes:
+        """Download one bounded remote file without relying on its MIME type.
+
+        ``refresh=False`` uses the provider's cached read link (the AList
+        proxy) instead of forcing a fresh Quark download grant.  NFO/metadata
+        reads are static and must not pay the Quark download-latency per file;
+        a whole-library NFO sweep otherwise takes minutes and can trip the
+        provider's per-request timeout.
+        """
         if max_bytes <= 0:
             raise ValueError("max_bytes 必须大于 0")
-        raw_url, headers = self.file_link(path, refresh=True)
+        raw_url, headers = self.file_link(path, refresh=refresh)
         return self.http.request_bytes(
             raw_url,
             headers=headers,
