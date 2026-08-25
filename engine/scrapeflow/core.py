@@ -1103,8 +1103,15 @@ class AListClient:
             raise ApiError("AList 外部文件下载地址使用了不允许的端口")
 
     def read_file_prefix(self, path: str, *, max_bytes: int = 1024 * 1024) -> bytes:
-        """Read only the beginning of a remote file; used for signature checks."""
-        raw_url, headers = self.file_link(path, refresh=True)
+        """Read only the beginning of a remote file; used for signature checks.
+
+        ``refresh=False`` keeps the provider's cached read link (the AList
+        proxy) instead of forcing a fresh Quark download grant per file.  The
+        archive pre-scan reads a prefix of every member of a source tree, so a
+        per-file ``refresh=True`` (Quark download grant) turns a 30-file
+        directory into dozens of slow, timeout-prone download grants.
+        """
+        raw_url, headers = self.file_link(path, refresh=False)
         headers["Range"] = f"bytes=0-{max_bytes - 1}"
         return self.http.request_bytes(
             raw_url,
