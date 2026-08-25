@@ -772,8 +772,8 @@ def _container_layout_targets(
     or tied relation is marked ``uncertain`` so callers can stop that unit
     without putting it under an arbitrary sibling.
 
-    The returned mapping is intentionally stable and side-effect free; it is
-    also used by accepted-layout repair to compare actual carrier roots.
+    The returned mapping is intentionally stable and side-effect free; the
+    main layout planning path uses it to place units under their family parent.
     """
     ordered, container_parent, main_tmdb = _container_plan(runner, root_job, list(records))
     shelf_root = target_root_for_shelf(
