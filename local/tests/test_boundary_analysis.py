@@ -65,6 +65,20 @@ class TestClassifyObjectType(unittest.TestCase):
     def test_other(self) -> None:
         self.assertEqual(classify_object_type("readme.txt"), "other")
 
+    def test_font_pack_exe_is_not_executable(self) -> None:
+        """A ``[Fonts].exe`` installer is a residual resource, not a disguised
+        media container: boundary analysis must not park the whole source."""
+        for name in (
+            "[Sakurato] Oshi no Ko [Fonts].exe",
+            "冰菓 [Fonts].exe",
+            "字体包.exe",
+            "font_installer.exe",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(classify_object_type(name), "font")
+        # A non-font executable is still flagged for expansion.
+        self.assertEqual(classify_object_type("wrapper.exe"), "executable")
+
 
 class TestBuildFromFixture(unittest.TestCase):
     def test_ordinary_movie_structure(self) -> None:
@@ -595,6 +609,23 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertTrue(candidate.requires_content_expansion)
         self.assertEqual(candidate.source_paths, (node.path,))
         self.assertIn("光盘镜像", candidate.boundary_evidence.reasons[0])
+
+    def test_font_pack_exe_does_not_park_source(self) -> None:
+        """A ``[Fonts].exe`` installer must not block a normal video source."""
+        fixture = {
+            "root": "/quark/影视/待刮削/W 4k 我推的孩子",
+            "children": [
+                {"name": "[Sakurato] Oshi no Ko [Fonts].exe", "is_dir": False, "size": 54615467},
+                {"name": "[Ygm] Oshi no Ko [01][Ma10p_2160p].mkv", "is_dir": False, "size": 7 * 1024**3},
+                {"name": "[Ygm] Oshi no Ko [02][Ma10p_2160p].mkv", "is_dir": False, "size": 2 * 1024**3},
+            ],
+        }
+        node = self._node(fixture)
+        candidates = analyze_boundaries(node, root_task_id="font-root")
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertNotEqual(candidate.boundary_evidence.role, DirectoryRole.UNCERTAIN)
+        self.assertFalse(candidate.requires_content_expansion)
 
     def test_chinese_season_dir_is_season(self) -> None:
         """'第1季' and similar Chinese patterns must match the season rule."""

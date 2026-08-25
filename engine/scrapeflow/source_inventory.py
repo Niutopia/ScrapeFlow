@@ -25,6 +25,7 @@ from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     TEMPORARY_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    classify_filename,
 )
 
 
@@ -48,6 +49,12 @@ def classify_object_type(name: str) -> str:
     if suffix in _DISC_IMAGE_EXTS:
         return "disc_image"
     if suffix in _EXECUTABLE_EXTS:
+        # A font-pack self-extractor (``[Fonts].exe``) is a residual resource,
+        # not a disguised-media container.  Boundary analysis must not park the
+        # whole source over it; the shared media-policy classifier already has
+        # this distinction.
+        if classify_filename(name) == "font":
+            return "font"
         return "executable"
     if suffix in _VIDEO_EXTS:
         return "video"
