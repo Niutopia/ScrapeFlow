@@ -1024,11 +1024,10 @@ class SimplePlanExecutor:
 
         ``list(path)`` cannot distinguish a missing path from an empty
         directory, so use the parent/name row just like the runner's
-        read-only probe.  This helper lives on the executor because layout
-        relocation is executed under the writer and must not reach into the
-        runner's private methods.
+        read-only probe.  This helper lives on the executor so writer-side
+        checks do not reach into the runner's private methods.
         """
-        normalized = _safe_remote_path(path, field="布局修复远端路径", allow_root=False)
+        normalized = _safe_remote_path(path, field="远端探测路径", allow_root=False)
         parent, name = posixpath.split(normalized)
         listing = getattr(self.alist, "list", None)
         if not parent or not name or not callable(listing):
@@ -1058,12 +1057,13 @@ class SimplePlanExecutor:
     def _fresh_tree_files(self, root: str) -> list[dict[str, object]]:
         """Return a bounded, exact recursive file inventory for one directory.
 
-        This is intentionally separate from ``AListClient.walk``: a layout
-        repair must include metadata and artwork as well as media, while the
-        ordinary planner deliberately filters release extras.  The inventory
-        is read-only and rejects malformed names, links and unknown sizes.
+        This is intentionally separate from ``AListClient.walk``: an archive
+        transaction must account for metadata and artwork as well as media,
+        while the ordinary planner deliberately filters release extras.  The
+        inventory is read-only and rejects malformed names, links and unknown
+        sizes.
         """
-        normalized = _safe_remote_path(root, field="布局修复来源根", allow_root=False)
+        normalized = _safe_remote_path(root, field="递归清单根", allow_root=False)
         listing = getattr(self.alist, "list", None)
         if not callable(listing):
             raise EngineExecutionError("AList 客户端缺少 list 接口，无法核对布局来源")
@@ -1076,16 +1076,16 @@ class SimplePlanExecutor:
                 continue
             visited.add(current)
             if len(visited) > 10_000:
-                raise EngineExecutionError("布局修复来源目录过多，已停止")
+                raise EngineExecutionError("递归清单目录过多，已停止")
             try:
                 rows = listing(current, refresh=True)
             except TypeError:
                 rows = listing(current)
             if not isinstance(rows, list):
-                raise EngineExecutionError(f"布局修复来源目录清单无效: {current}")
+                raise EngineExecutionError(f"递归清单目录响应无效: {current}")
             for raw in rows:
                 if not isinstance(raw, Mapping):
-                    raise EngineExecutionError(f"布局修复来源包含无效条目: {current}")
+                    raise EngineExecutionError(f"递归清单包含无效条目: {current}")
                 name = raw.get("name")
                 if (
                     not isinstance(name, str)
@@ -1095,20 +1095,20 @@ class SimplePlanExecutor:
                     or "\\" in name
                     or "\x00" in name
                 ):
-                    raise EngineExecutionError(f"布局修复来源包含不安全名称: {current}")
+                    raise EngineExecutionError(f"递归清单包含不安全名称: {current}")
                 if (
                     raw.get("is_link") is True
                     or raw.get("is_symlink") is True
                     or raw.get("symlink") is True
                 ):
-                    raise EngineExecutionError(f"布局修复拒绝链接条目: {current}/{name}")
+                    raise EngineExecutionError(f"递归清单拒绝链接条目: {current}/{name}")
                 full_path = posixpath.join(current, name)
                 if raw.get("is_dir") is True:
                     stack.append(full_path)
                     continue
                 size = self._entry_size(raw)
                 if size is None:
-                    raise EngineExecutionError(f"布局修复来源文件缺少有效大小: {full_path}")
+                    raise EngineExecutionError(f"递归清单文件缺少有效大小: {full_path}")
                 files.append({
                     "full_path": full_path,
                     "name": name,
@@ -1116,7 +1116,7 @@ class SimplePlanExecutor:
                     "modified": raw.get("modified") or raw.get("updated_at"),
                 })
                 if len(files) > 200_000:
-                    raise EngineExecutionError("布局修复来源文件过多，已停止")
+                    raise EngineExecutionError("递归清单文件过多，已停止")
         files.sort(key=lambda row: str(row["full_path"]).casefold())
         return files
 

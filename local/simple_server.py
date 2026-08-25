@@ -216,6 +216,29 @@ class SimpleApplication:
         from local.scrapeflow_api.root_pipeline import is_intake_bound_root
         if not is_intake_bound_root(self.state_root, root_job_id):
             raise EngineRequestError("只能选择 IntakeSource 绑定的 RootJob")
+        # Ownership isolation (AGENTS.md §3): a catalog row that merely names
+        # this id is not proof of ownership.  ``select`` is the only
+        # authorization entry, so it must also prove the row describes the very
+        # intake child this root will read.  Without the agreement check a
+        # drifted or forged binding could point a selectable root at a formal
+        # shelf, and B/W would then split the live library as if it were a
+        # source.  Same rule the boundary rebuild already enforces.
+        from engine.scrapeflow.intake_source import load_intake_catalog
+        try:
+            ingress = runner._job_ingress_source(job)  # noqa: SLF001 - exact ingress
+            ingress = self._validate_automatic_source(ingress)
+            owners = [
+                item
+                for item in load_intake_catalog(self.state_root)
+                if item.root_task_id == root_job_id
+                and item.canonical_path == ingress
+            ]
+        except EngineRequestError:
+            raise
+        except Exception as exc:
+            raise EngineRequestError("RootJob 的来源归属无法验证") from exc
+        if len(owners) != 1:
+            raise EngineRequestError("RootJob 与待刮削来源绑定不一致，不能选择")
         return root_job_id
 
     def select_root_job(self, root_job_id: object) -> dict[str, object]:

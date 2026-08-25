@@ -26,6 +26,7 @@ from engine.scrapeflow.work_units import (
 from local.simple_server import ApplicationError, SimpleApplication, make_server
 from local.scrapeflow_api.simple_engine_runner import (
     EngineJobConflictError,
+    EngineRequestError,
     SimpleEngineRunner,
 )
 from local.scrapeflow_api.batch_manifest import (
@@ -862,3 +863,118 @@ class SimpleServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertIn("本机", payload["error"])
+
+class SelectOwnershipIsolationTests(SimpleServerTests):
+    """AGENTS.md §3: select is the only authorization entry, so it must prove
+    the intake row it relies on describes the very source this root will read.
+
+    ``is_intake_bound_root`` only answers "some catalog row names this id".
+    A row whose ``canonical_path`` no longer agrees with the root's own ingress
+    is a forged or drifted binding: accepting it would let B/W treat a formal
+    shelf as a source tree.  These are the counter-examples, not the happy path.
+    """
+
+    def _repoint_root_source(self, root_id: str, source_path: str) -> None:
+        """Rewrite only the root's own recorded ingress (no catalog change)."""
+        runner = self.application._get_engine_runner()
+        payload = runner.get_job(root_id).as_dict()
+        payload["request"]["source_path"] = source_path
+        payload["summary"]["ingress_source_path"] = source_path
+        payload["summary"]["source_root"] = source_path
+        atomic_write_json(runner._job_path(root_id), payload, allow_nan=False)
+
+    def test_select_accepts_a_root_whose_binding_still_agrees(self) -> None:
+        root_id = self.create_root()
+        self.assertEqual(
+            self.application.select_root_job(root_id),
+            {"paused": True, "root_job_id": root_id},
+        )
+
+    def test_forged_binding_cannot_point_select_at_a_formal_shelf(self) -> None:
+        root_id = self.create_root()
+        before = self.application.control()
+        self._repoint_root_source(root_id, "/library/番剧")
+
+        with self.assertRaises(EngineRequestError):
+            self.application.select_root_job(root_id)
+        # A refused authorization changes nothing: no new selection, still paused.
+        self.assertEqual(self.application.control(), before)
+        self.assertIs(self.application.control()["paused"], True)
+
+    def test_forged_binding_cannot_point_select_outside_intake(self) -> None:
+        root_id = self.create_root()
+        before = self.application.control()
+        for foreign in (
+            "/library/欧美剧/行尸走肉",
+            "/library/待刮削",
+            "/library/待刮削/Example/Season 01",
+            "/library/ScrapeFlow/补源/engine-x/1",
+        ):
+            with self.subTest(source=foreign):
+                self._repoint_root_source(root_id, foreign)
+                with self.assertRaises(EngineRequestError):
+                    self.application.select_root_job(root_id)
+                self.assertEqual(self.application.control(), before)
+
+    def test_stale_catalog_row_for_a_deleted_source_cannot_be_selected(self) -> None:
+        """A source that vanished keeps its row, but must not stay selectable.
+
+        This is the "旧权游/旧无耻之徒/旧 Rick" shape: the intake directory is
+        gone and the row survives only as history.  The row still names the id,
+        so ``is_intake_bound_root`` alone would still say yes.
+        """
+        from engine.scrapeflow.intake_source import (
+            load_intake_catalog,
+            save_intake_catalog,
+        )
+
+        root_id = self.create_root()
+        before = self.application.control()
+        catalog = load_intake_catalog(self.state_root)
+        save_intake_catalog(
+            self.state_root,
+            [
+                replace(row, canonical_path="/library/待刮削/Deleted", present=False)
+                if row.root_task_id == root_id else row
+                for row in catalog
+            ],
+        )
+
+        with self.assertRaises(EngineRequestError):
+            self.application.select_root_job(root_id)
+        self.assertEqual(self.application.control(), before)
+
+    def test_two_rows_claiming_one_root_is_refused(self) -> None:
+        """Overlapping ownership claims are refused instead of picking one."""
+        from engine.scrapeflow.intake_source import (
+            IntakeSource,
+            intake_source_id,
+            load_intake_catalog,
+            save_intake_catalog,
+        )
+
+        root_id = self.create_root()
+        before = self.application.control()
+        catalog = list(load_intake_catalog(self.state_root))
+        owner = next(row for row in catalog if row.root_task_id == root_id)
+        duplicate = IntakeSource(
+            source_id=intake_source_id("/library/待刮削/Example"),
+            canonical_path=owner.canonical_path,
+            display_name="Example",
+            first_seen_at=owner.first_seen_at,
+            last_seen_at=owner.last_seen_at,
+            present=True,
+            snapshot_revision=owner.snapshot_revision,
+            child_count=owner.child_count,
+            file_count=owner.file_count,
+            root_task_id=root_id,
+        )
+        save_intake_catalog(self.state_root, [*catalog, duplicate])
+
+        with self.assertRaises(EngineRequestError):
+            self.application.select_root_job(root_id)
+        self.assertEqual(self.application.control(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()
