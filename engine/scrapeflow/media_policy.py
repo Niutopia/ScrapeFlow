@@ -18,15 +18,17 @@ import re
 from typing import Any
 
 
-# Container/stream names accepted as video payloads.  ``.strm`` is a text
-# pointer understood by the target media library, while ISO and transport
-# stream suffixes are intentionally retained for archive/provider parity.
+# Container/stream names accepted as directly plannable video payloads.
+# ``.strm`` is a text pointer understood by the target media library and the
+# transport-stream suffixes name actual media streams.  Optical-disc images
+# are deliberately *not* in this set: their internal title/season/file
+# boundaries are opaque until a dedicated read-only inspection has produced
+# an exact inventory.
 VIDEO_EXTENSIONS = frozenset({
     ".3gp",
     ".asf",
     ".avi",
     ".flv",
-    ".iso",
     ".m2ts",
     ".m4v",
     ".mkv",
@@ -42,6 +44,44 @@ VIDEO_EXTENSIONS = frozenset({
     ".webm",
     ".wmv",
 })
+
+
+# Optical-disc images and their common descriptor/raw-payload companions.
+# They are containers, not directly consumable media.  In particular, a
+# filename such as ``Season 01.iso`` is insufficient evidence of whether the
+# image contains a feature, multiple episodes, extras, or unrelated files.
+# Keep this deliberately separate from ``ARCHIVE_EXTENSIONS``: ordinary
+# archive extraction must never mount or directly consume a disc image.  The
+# bounded archive-inspection lane may still recognize its on-disk filesystem
+# magic and use 7-Zip to list/selectively extract members into task staging.
+DISC_IMAGE_EXTENSIONS = frozenset({
+    ".b5t",
+    ".b6t",
+    ".bin",
+    ".ccd",
+    ".cdi",
+    ".cue",
+    ".dmg",
+    ".img",
+    ".iso",
+    ".isz",
+    ".mdf",
+    ".mds",
+    ".nrg",
+    ".pdi",
+    ".udf",
+})
+
+
+# This is a policy fact, rather than a title-specific exception.  The current
+# intake flow has no privileged "trust this ISO" escape hatch: a later
+# read-only expander/confirmation surface must supply concrete content
+# evidence and then rebuild B/W before the ordinary identity/planning flow
+# can resume.
+DISC_IMAGE_INSPECTION_REQUIRED = (
+    "发现光盘镜像容器；必须先完成只读安全内容展开并重建来源快照，"
+    "才能确认作品边界、季集与可消费媒体。禁止将镜像直接规划、移动或归档"
+)
 
 
 # Sidecar and subtitle-container suffixes.  IDX/SUB are a paired subtitle
@@ -203,8 +243,39 @@ def extension(value: Any) -> str:
     return PurePosixPath(value.replace("\\", "/")).suffix.casefold()
 
 
+_FONT_LABEL_RE = re.compile(
+    r"(?:font|fonts|字体|フォント)", re.IGNORECASE,
+)
+
+
 def is_video_filename(value: Any) -> bool:
     return extension(value) in VIDEO_EXTENSIONS
+
+
+def is_disc_image_filename(value: Any) -> bool:
+    """Return whether a name denotes an opaque optical-disc image container."""
+    return extension(value) in DISC_IMAGE_EXTENSIONS
+
+
+def is_executable_filename(value: Any) -> bool:
+    """Return whether a name must never be executed at an intake boundary."""
+
+    return extension(value) in EXECUTABLE_EXTENSIONS
+
+
+def is_container_candidate_filename(value: Any) -> bool:
+    """Return whether a filename needs byte-level container proof.
+
+    This deliberately includes executable-looking names.  A genuine binary is
+    rejected without execution; a self-extracting or renamed archive is only
+    admitted after the archive detector finds a real supported signature.
+    """
+
+    return (
+        is_archive_filename(value)
+        or is_disc_image_filename(value)
+        or is_executable_filename(value)
+    )
 
 
 def is_subtitle_filename(value: Any) -> bool:
@@ -243,6 +314,8 @@ def is_temporary_filename(value: Any) -> bool:
 
 def classify_filename(value: Any) -> str:
     """Return one stable coarse category for residual/provider consumers."""
+    if is_disc_image_filename(value):
+        return "disc_image"
     if is_video_filename(value):
         return "video"
     if is_subtitle_filename(value):
@@ -260,6 +333,13 @@ def classify_filename(value: Any) -> str:
         return "font"
     if suffix in MANIFEST_EXTENSIONS:
         return "manifest"
+    # An executable whose basename advertises a font package (e.g. ``[Fonts].exe``,
+    # a self-extracting subtitle font installer) is a resource residual, not a
+    # disguised media container and not a runnable media binary.
+    if suffix in EXECUTABLE_EXTENSIONS and _FONT_LABEL_RE.search(
+        PurePosixPath(value.replace("\\", "/")).name
+    ):
+        return "font"
     if suffix in EXECUTABLE_EXTENSIONS:
         return "executable"
     if is_temporary_filename(value):
@@ -271,6 +351,8 @@ __all__ = [
     "ARCHIVE_EXTENSIONS",
     "ARCHIVE_PART_EXTENSIONS",
     "AUDIO_EXTENSIONS",
+    "DISC_IMAGE_EXTENSIONS",
+    "DISC_IMAGE_INSPECTION_REQUIRED",
     "DOCUMENT_EXTENSIONS",
     "EXECUTABLE_EXTENSIONS",
     "FONT_EXTENSIONS",
@@ -285,6 +367,9 @@ __all__ = [
     "extension",
     "is_archive_filename",
     "is_audio_filename",
+    "is_container_candidate_filename",
+    "is_disc_image_filename",
+    "is_executable_filename",
     "is_subtitle_filename",
     "is_temporary_filename",
     "is_video_filename",

@@ -1,27 +1,12 @@
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
-ARG SCRAPEFLOW_BUILD_VERSION=p15
-ARG SCRAPEFLOW_BUILD_COMMIT=unrecorded
-ARG SCRAPEFLOW_BUILD_TIME=unrecorded
-LABEL org.opencontainers.image.title="ScrapeFlow" \
-      org.opencontainers.image.version="${SCRAPEFLOW_BUILD_VERSION}" \
-      org.opencontainers.image.revision="${SCRAPEFLOW_BUILD_COMMIT}" \
-      org.opencontainers.image.created="${SCRAPEFLOW_BUILD_TIME}"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    SCRAPEFLOW_BUILD_VERSION=${SCRAPEFLOW_BUILD_VERSION} \
-    SCRAPEFLOW_BUILD_COMMIT=${SCRAPEFLOW_BUILD_COMMIT} \
-    SCRAPEFLOW_BUILD_TIME=${SCRAPEFLOW_BUILD_TIME}
+    PIP_NO_CACHE_DIR=1
 
-# Build identity is baked into both OCI labels and the process environment.
-# Compose deliberately does not override these variables at container start:
-# a missing host variable must not erase the identity of an already-built
-# image.  ``unrecorded`` is an explicit non-proof, never a release identity.
-
-# The API process owns intake, planning, library writes, audit and acquisition.
+# The API process owns intake, planning, library writes and acquisition.
 # The same image also runs the narrow Quark Helper as a Compose sidecar; aiohttp
 # supplies its maintained HTTP/WebSocket runtime.  aria2c downloads selected
 # torrents; ffprobe checks downloaded media streams; 7z performs bounded local

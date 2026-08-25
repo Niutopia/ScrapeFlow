@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
-from engine.tools.replenishment_adapter.pansou import PanSouDiscovery
+from engine.tools.replenishment_adapter.pansou import (
+    PanSouDiscovery,
+    quark_share_inspector,
+)
 from engine.tools.replenishment_adapter.search import ReplenishmentSearchService
-from local.simple_server import SimpleApplication
-from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
 from local.scrapeflow_api.replenishment import select_replenishment_candidates
 
 
@@ -113,6 +112,47 @@ class PanSouDiscoveryTests(unittest.TestCase):
         )
         return discovery, calls
 
+    def test_share_inspector_lazily_authenticates_uninitialised_alist_client(self) -> None:
+        class FakeAList:
+            token = None
+
+            def __init__(self) -> None:
+                self.login_calls = 0
+
+            def login(self) -> str:
+                self.login_calls += 1
+                self.token = "fixture-token"
+                return self.token
+
+        class FakeBridge:
+            def __init__(self) -> None:
+                self.sessions: list[object] = []
+
+            def inspect_share(self, session, *, pwd_id, passcode):  # noqa: ANN001
+                self.sessions.append(session)
+                self.pwd_id = pwd_id
+                self.passcode = passcode
+                return []
+
+        client = FakeAList()
+        bridge = FakeBridge()
+        session = object()
+        with patch(
+            "engine.tools.replenishment_adapter.pansou.delegated_quark_session",
+            return_value=session,
+        ) as delegated:
+            inspector = quark_share_inspector(
+                client,
+                "/quark/影视",
+                bridge=bridge,
+            )
+            self.assertEqual(inspector("fixtureShare01", ""), [])
+
+        self.assertEqual(client.login_calls, 1)
+        delegated.assert_called_once_with(client, "/quark/影视")
+        self.assertEqual(bridge.sessions, [session])
+        self.assertEqual(bridge.pwd_id, "fixtureShare01")
+
     def test_official_response_becomes_exact_runnable_quark_share(self) -> None:
         discovery, calls = self._discovery(
             _response("https://pan.quark.cn/s/fixtureShare01"),
@@ -155,6 +195,29 @@ class PanSouDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["completed_sources"], ["pansou"])
         self.assertTrue(result["search_complete_no_candidates"])
         self.assertEqual(result["unchecked_secondary_candidates"], 0)
+
+    def test_query_cursor_resumes_after_bounded_window(self) -> None:
+        discovery, calls = self._discovery(_response(), max_queries=2)
+        request = _request()
+        with patch(
+            "engine.tools.replenishment_adapter.pansou._impl._compact_dynamic_search_terms",
+            return_value=["Example Show S01E01", "Example Show season", "Example Show"],
+        ):
+            first = discovery.run(request)
+            self.assertFalse(first["search_complete_no_candidates"])
+            self.assertEqual(
+                first["source_telemetry"]["PanSou"]["query_cursor"]["offset"],
+                2,
+            )
+            request["pansou_query_cursor"] = first["source_telemetry"]["PanSou"]["query_cursor"]
+            second = discovery.run(request)
+
+        self.assertTrue(second["search_complete_no_candidates"])
+        self.assertEqual(second["unchecked_secondary_candidates"], 0)
+        self.assertEqual(
+            [call["payload"]["kw"] for call in calls],
+            ["Example Show S01E01", "Example Show season", "Example Show"],
+        )
 
     def test_documented_direct_search_response_is_accepted(self) -> None:
         documented_direct_response = _response(
@@ -273,6 +336,42 @@ class PanSouDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["completed_sources"], [])
         self.assertEqual(result["unchecked_secondary_candidates"], 1)
 
+    def test_scoped_reviewed_miss_is_skipped_before_link_cap(self) -> None:
+        inspected: list[str] = []
+
+        def inspector(pwd_id, _passcode):
+            inspected.append(pwd_id)
+            return [{
+                "file_id": f"fid-{pwd_id}",
+                "path": "Example.Show.S01E01.1080p.mkv",
+                "size": 2_000_000,
+            }]
+
+        discovery, _calls = self._discovery(
+            _response(
+                "https://pan.quark.cn/s/fixtureShare01",
+                "https://pan.quark.cn/s/fixtureShare02",
+            ),
+            inspector=inspector,
+            max_links=1,
+        )
+        request = _request()
+        request["reviewed_resource_miss_locators"] = [
+            "quark_share:fixtureShare01",
+        ]
+
+        result = discovery.run(request)
+
+        self.assertEqual(inspected, ["fixtureShare02"])
+        self.assertEqual(
+            result["candidates"][0]["locator"],
+            "quark_share:fixtureShare02",
+        )
+        telemetry = result["source_telemetry"]["PanSou"]
+        self.assertEqual(telemetry["previously_reviewed_miss_count"], 1)
+        self.assertTrue(result["search_complete"])
+        self.assertEqual(result["unchecked_secondary_candidates"], 0)
+
     def test_query_cap_cannot_become_a_complete_zero_candidate_proof(self) -> None:
         discovery, calls = self._discovery(
             _response(),
@@ -352,70 +451,43 @@ class PanSouDiscoveryTests(unittest.TestCase):
             result["source_telemetry"]["PanSou"]["resource_failed_locators"],
             ["quark_share:fixtureShare01"],
         )
+        self.assertEqual(
+            result["source_telemetry"]["PanSou"]["reviewed_resource_miss_locators"],
+            ["quark_share:fixtureShare01"],
+        )
 
-    def test_application_wires_the_real_pansou_search_service(self) -> None:
-        class MinimalAList:
-            def list(self, _path, refresh=False):
-                del refresh
-                return []
+    def test_zero_total_without_result_arrays_is_a_complete_empty_result(self) -> None:
+        # The live PanSou API omits both ``results`` and ``merged_by_type``
+        # when total=0.  This is a valid zero-hit response, not an outage.
+        discovery, _calls = self._discovery({
+            "code": 0,
+            "message": "success",
+            "data": {"total": 0},
+        })
 
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            alist = MinimalAList()
-            runner = SimpleEngineRunner(
-                state_root,
-                alist=alist,
-                tmdb=object(),
-                validate=False,
-                library_root="/library",
-            )
-            with patch.object(SimpleApplication, "_start_startup_thread"):
-                application = SimpleApplication(
-                    state_root=state_root,
-                    remote_root="/quark/影视",
-                    remote=alist,
-                    engine_runner=runner,
-                )
-            self.addCleanup(application.close)
+        result = discovery.run(_request())
 
-            runtime = application._get_automatic_replenishment()  # noqa: SLF001
+        self.assertTrue(result["search_complete"])
+        self.assertTrue(result["search_complete_no_candidates"])
+        self.assertEqual(result["completed_sources"], ["pansou"])
 
-            self.assertIsInstance(runtime.search, ReplenishmentSearchService)
-            self.assertIsInstance(runtime.search._pansou, PanSouDiscovery)  # noqa: SLF001
-            self.assertIsNotNone(runtime.search._pansou.inspector)  # noqa: SLF001
+    def test_coverage_miss_becomes_a_scoped_reviewed_miss(self) -> None:
+        discovery, _calls = self._discovery(
+            _response("https://pan.quark.cn/s/fixtureShare01"),
+            inspector=lambda _pwd_id, _passcode: [{
+                "file_id": "fixture-fid",
+                "path": "Other.Show.S02E02.1080p.mkv",
+                "size": 2_000_000,
+            }],
+        )
 
-    def test_application_derives_provider_staging_from_one_acceptance_root(self) -> None:
-        class MinimalAList:
-            def list(self, _path, refresh=False):
-                del refresh
-                return []
+        result = discovery.run(_request())
 
-        media_root = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8"
-        with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            alist = MinimalAList()
-            runner = SimpleEngineRunner(
-                state_root,
-                alist=alist,
-                tmdb=object(),
-                validate=False,
-                library_root=media_root,
-            )
-            with patch.object(SimpleApplication, "_start_startup_thread"):
-                application = SimpleApplication(
-                    state_root=state_root,
-                    remote_root=media_root,
-                    remote=alist,
-                    engine_runner=runner,
-                )
-            self.addCleanup(application.close)
-
-            runtime = application._get_automatic_replenishment()  # noqa: SLF001
-
-            self.assertEqual(
-                runtime.staging_root,
-                f"{media_root}/ScrapeFlow/补源",
-            )
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(
+            result["source_telemetry"]["PanSou"]["reviewed_resource_miss_locators"],
+            ["quark_share:fixtureShare01"],
+        )
 
     def test_infrastructure_failure_during_manifest_inspection_is_not_a_miss(self) -> None:
         def unavailable(_pwd_id, _passcode):

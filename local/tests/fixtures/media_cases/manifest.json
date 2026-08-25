@@ -25,5 +25,12 @@
     "description": "字幕组目录：只含字幕文件，无视频",
     "expected_role": "subtitle_group",
     "expected_work_count": 1
+  },
+  {
+    "id": "seraph_of_end_cjk_seasons",
+    "description": "真实语料：标题父容器下的第一季/第二季，文件名携带英文明细标题",
+    "expected_role": "series_container",
+    "expected_work_count": 2,
+    "expected_media_context": "tv"
   }
 ]

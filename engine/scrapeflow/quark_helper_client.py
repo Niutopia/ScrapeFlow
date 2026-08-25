@@ -6,7 +6,7 @@ reviewed, task-scoped manifest over loopback; it never drives a GUI or
 forwards an AList cookie.  The sidecar resolves that short-lived Cookie
 internally and uses the desktop renderer only for passive WSG transforms.
 
-The fixed action contract is ``health`` + ``share-save`` (2026-08-17): the
+The fixed action contract is a lightweight ``health`` + ``share-save`` (2026-08-17): the
 magnet submit/status impersonation path was removed with the ``quark_magnet``
 tier, which Quark account-level rate-limiting made unusable in production.
 Video fallback now uses the local Torrent lane with exact selected members.
@@ -22,9 +22,6 @@ from typing import Any, Protocol
 import urllib.error
 import urllib.parse
 import urllib.request
-
-from .provider_capabilities import QUARK_HELPER_REQUIRED_ACTIONS
-
 
 DEFAULT_QUARK_HELPER_URL = "http://127.0.0.1:18765"
 
@@ -67,28 +64,6 @@ def _approved_helper_host(value: str) -> bool:
         return ipaddress.ip_address(value).is_loopback
     except ValueError:
         return value.casefold() in {"localhost", "host.docker.internal"}
-
-
-def _require_helper_health(value: object) -> Mapping[str, Any]:
-    """Validate the complete fixed Helper contract before any mutation."""
-    if not isinstance(value, Mapping):
-        raise QuarkHelperClientError("Quark helper health returned an invalid object")
-    status = str(value.get("status") or "").strip().casefold()
-    if status not in {"ok", "ready"}:
-        raise QuarkHelperClientError("Quark helper is not ready")
-    if value.get("authenticated") is not True:
-        raise QuarkHelperClientError("Quark helper is not authenticated")
-    actions = value.get("actions")
-    if (
-        not isinstance(actions, list)
-        or any(not isinstance(action, str) for action in actions)
-        or len(actions) != len(set(actions))
-        or set(actions) != set(QUARK_HELPER_REQUIRED_ACTIONS)
-    ):
-        raise QuarkHelperClientError(
-            "Quark helper actions do not match the fixed contract"
-        )
-    return value
 
 
 class QuarkHelper(Protocol):
@@ -254,5 +229,4 @@ __all__ = [
     "HttpQuarkHelperClient",
     "QuarkHelper",
     "QuarkHelperClientError",
-    "_require_helper_health",
 ]

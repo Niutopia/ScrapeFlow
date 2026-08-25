@@ -78,6 +78,7 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
                 "scope": FAILURE_CANDIDATE,
                 "search_complete_no_candidates": True,
                 "completed_sources": sorted(MAGNET_REQUIRED_SOURCES),
+                "configured_sources": sorted(MAGNET_REQUIRED_SOURCES),
                 "unchecked_secondary_candidates": 1,
             },
         )
@@ -87,6 +88,7 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
                 "scope": FAILURE_CANDIDATE,
                 "search_complete_no_candidates": True,
                 "completed_sources": sorted(MAGNET_REQUIRED_SOURCES),
+                "configured_sources": sorted(MAGNET_REQUIRED_SOURCES),
                 "unchecked_secondary_candidates": 0,
             },
         )
@@ -110,20 +112,43 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
             MAGNET_REQUIRED_SOURCES,
         )
 
-    def test_movie_proof_does_not_need_anime_only_sources(self) -> None:
+    def test_configured_subset_is_valid_against_the_canonical_source_set(self) -> None:
         state = {**initial_tier_state(), "tier": TIER_LOCAL_MAGNET}
         outcome = {
             "scope": FAILURE_CANDIDATE,
             "search_complete_no_candidates": True,
             "completed_sources": sorted(MAGNET_REQUIRED_SOURCES_BY_SHELF["movie"]),
+            "configured_sources": sorted(MAGNET_REQUIRED_SOURCES_BY_SHELF["movie"]),
             "unchecked_secondary_candidates": 0,
         }
 
         conservative = apply_tier_outcome(state, dict(outcome))
         movie = apply_tier_outcome(state, {**outcome, "shelf": "movie"})
 
-        self.assertEqual(conservative["status"], "candidate_failed")
+        self.assertEqual(conservative["status"], "exhausted")
         self.assertEqual(movie["status"], "exhausted")
+
+    def test_magnet_dynamic_proof_requires_a_nonempty_canonical_configured_set(self) -> None:
+        state = {**initial_tier_state(), "tier": TIER_LOCAL_MAGNET}
+        base = {
+            "scope": FAILURE_CANDIDATE,
+            "search_complete_no_candidates": True,
+            "completed_sources": ["acg"],
+            "unchecked_secondary_candidates": 0,
+            "shelf": "anime",
+        }
+
+        disabled = apply_tier_outcome(state, dict(base))
+        unknown = apply_tier_outcome(
+            state, {**base, "configured_sources": ["untrusted-index"]},
+        )
+        one_enabled = apply_tier_outcome(
+            state, {**base, "configured_sources": ["acg"]},
+        )
+
+        self.assertEqual(disabled["status"], "candidate_failed")
+        self.assertEqual(unknown["status"], "candidate_failed")
+        self.assertEqual(one_enabled["status"], "exhausted")
 
     def test_in_doubt_keeps_current_exact_lane(self) -> None:
         result = apply_tier_outcome(

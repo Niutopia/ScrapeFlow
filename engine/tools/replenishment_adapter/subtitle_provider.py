@@ -27,6 +27,7 @@ from engine.scrapeflow.subtitle_content import (
     classify_subtitle_content,
     merge_bilingual_subtitle,
     normalize_subtitle_language,
+    validate_managed_subtitle_content,
 )
 
 PROVIDER_SUBTITLE_ASSRT = "assrt"
@@ -959,13 +960,69 @@ class SubtitleMaterializer:
             raise SubtitleProviderError("字幕候选缺少可验证语言")
         verdict = classify_subtitle_content(raw_bytes, target)
         if str(verdict.get("status") or "").casefold() != "satisfied":
-            raise SubtitleProviderError(
-                f"字幕内容未能证明目标语言 ({target})"
-            )
+            # A direct provider member may already be the stronger one-file
+            # Chinese+original track.  Validate it against the TMDB-bound
+            # original language before allowing it through the ordinary
+            # Chinese fetch lane; otherwise mixed cues correctly fail the
+            # pure-language classifier below.
+            direct_bilingual = self._direct_bilingual_proof(raw_bytes, fmt, request)
+            if not (
+                direct_bilingual.get("bilingual") is True
+                and direct_bilingual.get("subtitle_language") == target
+            ):
+                raise SubtitleProviderError(
+                    f"字幕内容未能证明目标语言 ({target})"
+                )
         detected_format = str(verdict.get("format") or "").casefold()
-        if detected_format != fmt:
+        if detected_format and detected_format != fmt:
             raise SubtitleProviderError("字幕内容格式与候选声明不一致")
         return raw_bytes, fmt
+
+    def _direct_bilingual_proof(
+        self,
+        raw_bytes: bytes,
+        fmt: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Recognize a provider-returned, already merged SRT sidecar.
+
+        Most providers expose separate Chinese/original members and are
+        handled by :meth:`_try_bilingual_merge`.  A few expose one SRT whose
+        cues already contain both lines.  Treat it as the stronger preference
+        only when the exact bytes pass the same TMDB-bound validator used by
+        ordinary planning; a filename claim or a provider language field is
+        never enough.
+        """
+        original_language = self._tmdb_verified_original_language(request)
+        if original_language is None or fmt.casefold() != "srt":
+            return {"bilingual": False}
+        verdict = validate_managed_subtitle_content(
+            raw_bytes,
+            original_language,
+            declared_size=len(raw_bytes),
+        )
+        if (
+            str(verdict.get("status") or "").casefold() != "satisfied"
+            or verdict.get("preference") != 0
+        ):
+            return {"bilingual": False}
+        code = {"japanese": "ja", "english": "en", "korean": "ko"}.get(
+            original_language,
+        )
+        chinese_language = verdict.get("chinese_language")
+        lane_marker = {
+            "simplified_chinese": "zh-CN",
+            "traditional_chinese": "zh-TW",
+        }.get(str(chinese_language))
+        if code is None or lane_marker is None:
+            return {"bilingual": False}
+        return {
+            "bilingual": True,
+            "original_language": original_language,
+            "subtitle_language": chinese_language,
+            "bilingual_cue_count": verdict.get("cue_count"),
+            "subtitle_marker": f"{lane_marker}-bilingual-{code}",
+        }
 
     @staticmethod
     def _direct_url_identity(value: object) -> str | None:
@@ -1089,8 +1146,19 @@ class SubtitleMaterializer:
                     or not isinstance(content, bytes)
                 ):
                     continue
+                chinese_language = merged.get("chinese_language")
+                chinese_marker = {
+                    "simplified_chinese": "zh-CN",
+                    "traditional_chinese": "zh-TW",
+                }.get(str(chinese_language))
+                original_marker = {"japanese": "ja", "english": "en", "korean": "ko"}.get(
+                    original_language,
+                )
+                if chinese_marker is None or original_marker is None:
+                    continue
                 return content, chinese_format, {
                     "bilingual": True,
+                    "subtitle_language": chinese_language,
                     "original_language": original_language,
                     "original_provider": candidate.get("provider"),
                     "bilingual_cue_count": merged.get("cue_count"),
@@ -1098,10 +1166,7 @@ class SubtitleMaterializer:
                     # create an original-language sidecar.  It lets durable
                     # post-write audit distinguish a strictly proven merged
                     # cue body from a Chinese-only .zh-CN file after restart.
-                    "subtitle_marker": (
-                        "zh-CN-bilingual-"
-                        + {"japanese": "ja", "english": "en", "korean": "ko"}[original_language]
-                    ),
+                    "subtitle_marker": f"{chinese_marker}-bilingual-{original_marker}",
                 }
             except SubtitlePauseRequested:
                 raise
@@ -1121,6 +1186,113 @@ class SubtitleMaterializer:
     @staticmethod
     def _content_type(fmt: str) -> str:
         return _SUBTITLE_CONTENT_TYPES.get(fmt.casefold().lstrip("."), "text/plain")
+
+    @staticmethod
+    def _candidate_chinese_lane(candidate: Mapping[str, Any]) -> str | None:
+        """Read a conservative SC/TC claim from one search result.
+
+        Discovery adapters stamp their *requested* language onto every row;
+        it is not an assertion about a particular downloaded member.  Only an
+        explicit release-title marker can narrow the lane before bytes are
+        read.  Returning ``None`` lets the bounded acquire loop try an
+        otherwise unlabelled candidate as SC and, only when needed, TC.
+        """
+        title = str(candidate.get("title") or "").casefold()
+        traditional_markers = (
+            "cht", "big5", "zh-tw", "zh_tw", "zh-hant", "zhhant",
+            "繁体", "繁體", "繁中", "繁日", "繁英", "繁",
+        )
+        simplified_markers = (
+            "chs", "gb", "zh-cn", "zh_cn", "zh-hans", "zhhans",
+            "简体", "簡體", "简中", "簡中", "简日", "简英", "简",
+        )
+        has_traditional = any(marker in title for marker in traditional_markers)
+        has_simplified = any(marker in title for marker in simplified_markers)
+        if has_traditional and not has_simplified:
+            return "traditional_chinese"
+        if has_simplified and not has_traditional:
+            return "simplified_chinese"
+        return None
+
+    @classmethod
+    def _stage_subtitle_candidate(
+        cls,
+        *,
+        candidate: Mapping[str, Any],
+        raw_bytes: bytes,
+        fmt: str,
+        bilingual: Mapping[str, object],
+        selected_language: str,
+        gap: Mapping[str, Any],
+        gap_id: str,
+        staging_root: str,
+        workspace: Path,
+        alist: Any,
+        used_staging_names: set[str],
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Stage exactly one already-proven subtitle candidate."""
+        video_path = str(gap.get("path") or "")
+        video_name = posixpath.basename(video_path) if video_path else "subtitle"
+        video_stem = posixpath.splitext(video_name)[0]
+        lang_tag = (
+            "zh-CN" if selected_language == "simplified_chinese"
+            else "zh-TW" if selected_language == "traditional_chinese"
+            else "zh"
+        )
+        if bilingual.get("bilingual") is True:
+            marker = bilingual.get("subtitle_marker")
+            if not isinstance(marker, str) or not marker:
+                raise SubtitleProviderError("双语字幕缺少持久化语言标识")
+            lang_tag = marker
+        sub_filename = f"{video_stem}.{lang_tag}.{fmt}"
+        # Two audited rows can point at files with the same basename (for
+        # example duplicate season roots). Keep the familiar name for the
+        # first row, but isolate later rows so a create-only AList PUT cannot
+        # collide or make one row appear to resolve another.
+        if sub_filename in used_staging_names:
+            safe_gap = re.sub(r"[^a-zA-Z0-9._-]+", "-", gap_id).strip(".-")[:48] or "gap"
+            sub_filename = f"{video_stem}.{safe_gap}.{lang_tag}.{fmt}"
+        used_staging_names.add(sub_filename)
+
+        local_sub_path = workspace / sub_filename
+        _pause_checkpoint(pause_requested)
+        local_sub_path.write_bytes(raw_bytes)
+
+        staging_sub_path = f"{staging_root.rstrip('/')}/{sub_filename}"
+        try:
+            mkdir = getattr(alist, "mkdir", None)
+            if callable(mkdir):
+                _pause_checkpoint(pause_requested)
+                mkdir(posixpath.dirname(staging_root))
+                _pause_checkpoint(pause_requested)
+                mkdir(staging_root)
+            cls._upload_staged_file(
+                alist,
+                staging_root=staging_root,
+                staging_sub_path=staging_sub_path,
+                local_sub_path=local_sub_path,
+                sub_filename=sub_filename,
+                raw_bytes=raw_bytes,
+                content_type=cls._content_type(fmt),
+                pause_requested=pause_requested,
+            )
+        except SubtitlePauseRequested:
+            raise
+        except SubtitleInfrastructureError:
+            raise
+        except Exception as exc:
+            raise SubtitleInfrastructureError("字幕 staging 上传失败") from exc
+
+        return {
+            "path": staging_sub_path,
+            "size": len(raw_bytes),
+            "gap_ids": [gap_id],
+            "kind": "subtitle",
+            "provider": candidate.get("provider"),
+            "subtitle_language": selected_language,
+            **dict(bilingual),
+        }
 
     @staticmethod
     def _parameter_names(callable_obj: object) -> list[str]:
@@ -1230,131 +1402,109 @@ class SubtitleMaterializer:
             if not candidates:
                 continue
 
-            acquired_file: dict[str, Any] | None = None
-            target_lang = normalize_subtitle_language(
-                gap.get("subtitle_language") or "zh"
-            ) or "simplified_chinese"
+            # Search results are usually weighted by provider/language, so a
+            # valid SC candidate can appear before a lower-ranked candidate
+            # that can be paired with a TMDB-proven original track.  Keep the
+            # first validated Chinese fallback in memory, but inspect every
+            # candidate in the preferred lane before staging it.  Only then
+            # try the opposite Chinese lane (SC -> TC by default).
+            # The managed-track contract has one global ranking even when a
+            # legacy gap happens to name a different Chinese alias: seek a
+            # proven bilingual file first, then SC, then TC.
+            preferred_lane = "simplified_chinese"
+            lane_order = ["simplified_chinese", "traditional_chinese"]
+            fallback: tuple[Mapping[str, Any], bytes, str, dict[str, object], str] | None = None
+            staged = False
 
-            for candidate in candidates:
-                _pause_checkpoint(pause_requested)
-                if not isinstance(candidate, Mapping):
-                    continue
-                try:
-                    raw_bytes, fmt = self._fetch_exact_candidate(
-                        candidate,
-                        gap,
-                        request,
-                        required_language=target_lang,
-                        pause_requested=pause_requested,
-                    )
-                    # The original track is an optional enhancement.  It is
-                    # merged in memory only after both independently fetched
-                    # sidecars pass every exactness/language check.  This
-                    # returns the original Chinese bytes unchanged when no
-                    # TMDB-proven, cue-aligned original exists.
-                    raw_bytes, fmt, bilingual = self._try_bilingual_merge(
-                        chinese_candidate=candidate,
-                        chinese_bytes=raw_bytes,
-                        chinese_format=fmt,
-                        gap=gap,
-                        request=request,
-                        pause_requested=pause_requested,
-                    )
-
-                    # Name the only staged/final candidate as the requested
-                    # Chinese lane even when its cue body also carries the
-                    # original language.  There is intentionally no .ja/.en/
-                    # .ko companion output.
-                    video_path = str(gap.get("path") or "")
-                    video_name = posixpath.basename(video_path) if video_path else "subtitle"
-                    video_stem = posixpath.splitext(video_name)[0]
-                    lang_tag = (
-                        "zh-CN" if target_lang == "simplified_chinese"
-                        else "zh-TW" if target_lang == "traditional_chinese"
-                        else "zh"
-                    )
-                    if bilingual.get("bilingual") is True:
-                        marker = bilingual.get("subtitle_marker")
-                        if not isinstance(marker, str) or not marker:
-                            raise SubtitleProviderError("双语字幕缺少持久化语言标识")
-                        lang_tag = marker
-                    sub_filename = f"{video_stem}.{lang_tag}.{fmt}"
-                    # Two audited rows can point at files with the same
-                    # basename (for example duplicate season roots).  Keep
-                    # the familiar name for the first row, but isolate later
-                    # rows so a create-only AList PUT cannot collide or make
-                    # one row appear to resolve another.
-                    if sub_filename in used_staging_names:
-                        safe_gap = re.sub(
-                            r"[^a-zA-Z0-9._-]+", "-", gap_id,
-                        ).strip(".-")[:48] or "gap"
-                        sub_filename = (
-                            f"{video_stem}.{safe_gap}.{lang_tag}.{fmt}"
-                        )
-                    used_staging_names.add(sub_filename)
-
-                    local_sub_path = workspace / sub_filename
+            for lane in lane_order:
+                for candidate in candidates:
                     _pause_checkpoint(pause_requested)
-                    local_sub_path.write_bytes(raw_bytes)
-
-                    staging_sub_path = f"{staging_root.rstrip('/')}/{sub_filename}"
+                    if not isinstance(candidate, Mapping):
+                        continue
+                    declared_lane = self._candidate_chinese_lane(candidate)
+                    # Explicitly labelled candidates belong to one lane only;
+                    # an unlabelled result may still prove either lane from
+                    # its bytes, which is why it is considered in both phases.
+                    if declared_lane is not None and declared_lane != lane:
+                        continue
                     try:
-                        mkdir = getattr(alist, "mkdir", None)
-                        if callable(mkdir):
-                            # Match the existing media materializers: create
-                            # the parent and attempt directory before the
-                            # first PUT.
-                            _pause_checkpoint(pause_requested)
-                            mkdir(posixpath.dirname(staging_root))
-                            _pause_checkpoint(pause_requested)
-                            mkdir(staging_root)
-                        self._upload_staged_file(
-                            alist,
-                            staging_root=staging_root,
-                            staging_sub_path=staging_sub_path,
-                            local_sub_path=local_sub_path,
-                            sub_filename=sub_filename,
-                            raw_bytes=raw_bytes,
-                            content_type=self._content_type(fmt),
+                        raw_bytes, fmt = self._fetch_exact_candidate(
+                            candidate,
+                            gap,
+                            request,
+                            required_language=lane,
                             pause_requested=pause_requested,
                         )
+                        bilingual: dict[str, object] = self._direct_bilingual_proof(
+                            raw_bytes, fmt, request,
+                        )
+                        # Both Chinese lanes can be paired with an independently
+                        # proven TMDB-original member.  A same-file bilingual
+                        # result wins over an earlier SC fallback; two separate
+                        # SC/TC files never become a synthetic bilingual track.
+                        if bilingual.get("bilingual") is not True:
+                            raw_bytes, fmt, bilingual = self._try_bilingual_merge(
+                                chinese_candidate=candidate,
+                                chinese_bytes=raw_bytes,
+                                chinese_format=fmt,
+                                gap=gap,
+                                request=request,
+                                pause_requested=pause_requested,
+                            )
+                        if bilingual.get("bilingual") is True:
+                            files_out.append(self._stage_subtitle_candidate(
+                                candidate=candidate,
+                                raw_bytes=raw_bytes,
+                                fmt=fmt,
+                                bilingual=bilingual,
+                                selected_language=lane,
+                                gap=gap,
+                                gap_id=gap_id,
+                                staging_root=staging_root,
+                                workspace=workspace,
+                                alist=alist,
+                                used_staging_names=used_staging_names,
+                                pause_requested=pause_requested,
+                            ))
+                            staged = True
+                            break
+                        if fallback is None:
+                            fallback = (candidate, raw_bytes, fmt, bilingual, lane)
                     except SubtitlePauseRequested:
                         raise
                     except SubtitleInfrastructureError:
                         raise
-                    except Exception as exc:
+                    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                        # A required Chinese candidate download failure is an
+                        # infrastructure outage, not proof that this lane is
+                        # exhausted.  Optional original-track failures are
+                        # already converted to the Chinese-only fallback.
                         raise SubtitleInfrastructureError(
-                            "字幕 staging 上传失败"
+                            f"字幕下载接口不可用: {exc}"
                         ) from exc
-
-                    acquired_file = {
-                        "path": staging_sub_path,
-                        "size": len(raw_bytes),
-                        "gap_ids": [gap_id],
-                        "kind": "subtitle",
-                        "provider": candidate.get("provider"),
-                        **bilingual,
-                    }
+                    except Exception:
+                        # Candidate content/format/episode proof failure. Try
+                        # the next independently exact sidecar.
+                        continue
+                if staged:
                     break
-                except SubtitlePauseRequested:
-                    raise
-                except SubtitleInfrastructureError:
-                    raise
-                except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                    # A required Chinese candidate download failure is an
-                    # infrastructure outage, not proof that this lane is
-                    # exhausted.  Optional original-track failures are
-                    # already converted to the Chinese-only fallback above.
-                    raise SubtitleInfrastructureError(
-                        f"字幕下载接口不可用: {exc}"
-                    ) from exc
-                except Exception:
-                    # Candidate content/format/episode proof failure.  Try
-                    # the next independently exact Chinese sidecar.
-                    continue
 
-            if acquired_file is not None:
-                files_out.append(acquired_file)
+            if not staged and fallback is not None:
+                candidate, raw_bytes, fmt, bilingual, selected_lane = fallback
+                files_out.append(self._stage_subtitle_candidate(
+                    candidate=candidate,
+                    raw_bytes=raw_bytes,
+                    fmt=fmt,
+                    bilingual=bilingual,
+                    selected_language=selected_lane,
+                    gap=gap,
+                    gap_id=gap_id,
+                    staging_root=staging_root,
+                    workspace=workspace,
+                    alist=alist,
+                    used_staging_names=used_staging_names,
+                    pause_requested=pause_requested,
+                ))
 
         return {
             "delivery_kind": "subtitle_delivery",

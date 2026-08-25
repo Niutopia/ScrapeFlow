@@ -15,6 +15,8 @@ from dataclasses import dataclass
 import re
 from typing import Mapping
 
+from pathlib import PurePosixPath
+
 
 DEFAULT_MAX_PREFIX_BYTES = 512 * 1024
 MAX_PREFIX_BYTES = 8 * 1024 * 1024
@@ -60,6 +62,28 @@ _ENGLISH_SIGNAL_WORDS = frozenset({
 # second cap prevents an accidental direct caller from making a large output
 # object in memory.
 MAX_MERGED_SUBTITLE_BYTES = MAX_PREFIX_BYTES
+
+# DBD-Raws and a few other providers export UTF-8 SRT sidecars through a text
+# endpoint, appending a language marker and a second ``.txt`` suffix (for
+# example ``Show.S02E13.sc.srt.txt``).  These are not generic text files: they
+# may enter the normal subtitle planner only after the complete, bounded SRT
+# document has been validated.  Keep the cap independent from the larger
+# archive/download limits so a malformed text object cannot become an
+# unbounded planner read.
+EXPORTED_SRT_MAX_BYTES = MAX_MERGED_SUBTITLE_BYTES
+EXPORTED_SRT_SUFFIX_RE = re.compile(r"\.(?P<marker>sc|tc)\.srt\.txt$", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class ExportedSrtNormalization:
+    """Content proof and canonical virtual name for an exported SRT sidecar."""
+
+    source_name: str
+    normalized_name: str
+    language: str
+    marker: str
+    size: int
+    format: str = "srt"
 
 _TIMING_LINE_RE = re.compile(
     r"^\s*(?P<start>(?:(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{3}|"
@@ -524,6 +548,84 @@ def parse_subtitle_document(
     return None
 
 
+def validate_exported_srt_sidecar(
+    name: object,
+    value: object,
+    *,
+    declared_size: int | None = None,
+    max_bytes: int = EXPORTED_SRT_MAX_BYTES,
+) -> ExportedSrtNormalization | None:
+    """Validate and canonically name a ``.sc/.tc.srt.txt`` sidecar.
+
+    The suffix is only a language *claim*.  A caller must provide the bounded
+    bytes read from the exact source object; a missing payload, a non-UTF-8
+    stream, a malformed SRT, or a size mismatch fails closed.  The returned
+    name is a planner-only virtual basename.  The caller must retain the
+    original ``full_path`` so the normal writer moves the exact source object
+    and never creates a second provider-specific copy.
+
+    ``sc`` maps to the project's canonical ``zh-CN`` lane and ``tc`` maps to
+    ``zh-TW``.  Only a final, case-insensitive ``.srt.txt`` suffix is accepted;
+    an arbitrary ``.txt`` file or an embedded marker is never promoted.
+    """
+    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+        return None
+    match = EXPORTED_SRT_SUFFIX_RE.search(name)
+    if match is None:
+        return None
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        max_bytes = EXPORTED_SRT_MAX_BYTES
+    max_bytes = max(1024, min(EXPORTED_SRT_MAX_BYTES, max_bytes))
+    if isinstance(declared_size, bool):
+        return None
+    if declared_size is not None:
+        if not isinstance(declared_size, int) or declared_size <= 0 or declared_size > max_bytes:
+            return None
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+    else:
+        return None
+    if not raw or len(raw) > max_bytes:
+        return None
+    # A remote range read must not silently validate a truncated document.
+    # When the provider supplied a size, require an exact bounded read.  The
+    # no-size case is still bounded by ``max_bytes`` and is useful for local
+    # staging adapters whose listings do not expose byte counts.
+    if declared_size is not None and len(raw) != declared_size:
+        return None
+    try:
+        raw.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    document = parse_subtitle_document(raw, max_bytes=max_bytes)
+    if document is None or document.format != "srt":
+        return None
+    marker = match.group("marker").casefold()
+    language = "zh-CN" if marker == "sc" else "zh-TW"
+    # Remove exactly the provider export suffix, preserving the release stem
+    # (including its episode token) and avoiding ``Path.stem``'s lossy handling
+    # of a double extension.
+    stem = name[: match.start()]
+    if not stem or stem in {".", ".."}:
+        return None
+    normalized_name = f"{stem}.{language}.srt"
+    # Ensure the resulting basename remains a single safe path component.  A
+    # Unicode control or separator in the source name must be rejected by the
+    # normal source validator before this helper is called; this check keeps
+    # the standalone helper fail-closed as well.
+    if PurePosixPath(normalized_name).name != normalized_name or "\x00" in normalized_name:
+        return None
+    return ExportedSrtNormalization(
+        source_name=name,
+        normalized_name=normalized_name,
+        language=language,
+        marker=marker,
+        size=len(raw),
+    )
+
+
 def _format_srt_timestamp(milliseconds: int) -> str:
     hours, remainder = divmod(milliseconds, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
@@ -658,7 +760,7 @@ def classify_bilingual_subtitle_content(
     *,
     max_bytes: int = DEFAULT_MAX_PREFIX_BYTES,
 ) -> dict[str, object]:
-    """Validate one merged subtitle as ``简中\n原文`` for every cue.
+    """Validate one merged subtitle as ``中文\n原文`` for every cue.
 
     Every cue has exactly two nonempty rendered lines: Chinese first and the
     TMDB-confirmed original second.  Requiring exactly two lines is stricter
@@ -686,29 +788,171 @@ def classify_bilingual_subtitle_content(
     # Aggregate script counts are not enough: one valid Chinese/Japanese cue
     # followed by an English/English cue would otherwise look like a valid
     # bilingual file.  The user-visible contract is per cue, so every left
-    # half must independently prove simplified Chinese and every right half
-    # must independently prove the named original language.  Short or
-    # ambiguous lines deliberately fail closed instead of being inferred from
-    # neighbouring cues.
-    if any(
-        _classify_script(parts[0]) != "simplified_chinese"
-        or _classify_script(parts[1]) != target
-        for parts in split_cues
+    # half must independently prove one *consistent* Chinese lane and every
+    # right half must independently prove the TMDB-confirmed original
+    # language.  Simplified and traditional Chinese are both Chinese here;
+    # mixing them per cue is deliberately not guessed into a single track.
+    chinese_lanes = [_classify_script(parts[0]) for parts in split_cues]
+    if (
+        not chinese_lanes
+        or any(lane not in {"simplified_chinese", "traditional_chinese"}
+               for lane in chinese_lanes)
+        or len(set(chinese_lanes)) != 1
+        or any(_classify_script(parts[1]) != target for parts in split_cues)
     ):
         return _bilingual_failure(
             "bilingual_cue_language_order_not_proven",
             format_name=document.format,
         )
-    classification = f"bilingual_simplified_chinese_{target}"
+    chinese_lane = chinese_lanes[0]
+    classification = f"bilingual_{chinese_lane}_{target}"
     return {
         "status": "satisfied",
         "classification": classification,
-        "language_lane": "zh-Hans+bilingual",
+        "language_lane": (
+            "zh-Hans+bilingual"
+            if chinese_lane == "simplified_chinese"
+            else "zh-Hant+bilingual"
+        ),
+        "chinese_language": chinese_lane,
         "original_language": target,
         "format": document.format,
         "cue_count": len(document.cues),
         "reason": "bilingual_language_match",
     }
+
+
+def _managed_subtitle_failure(
+    reason: str,
+    *,
+    format_name: str | None = None,
+) -> dict[str, object]:
+    """Return a uniform fail-closed verdict for one managed sidecar.
+
+    This is intentionally separate from :func:`classify_subtitle_content`.
+    A managed external subtitle is a writer input, not merely audit evidence:
+    it must be one complete UTF-8 SRT object with an exact size before it is
+    eligible for the global one-track selector.
+    """
+    result: dict[str, object] = {
+        "status": "unknown",
+        "classification": "unknown",
+        "selection": "unverified",
+        "preference": 99,
+        "reason": reason,
+    }
+    if format_name is not None:
+        result["format"] = format_name
+    return result
+
+
+def validate_managed_subtitle_content(
+    value: object,
+    original_language: object = None,
+    *,
+    declared_size: int | None = None,
+    max_bytes: int = EXPORTED_SRT_MAX_BYTES,
+) -> dict[str, object]:
+    """Prove one candidate for the managed external-subtitle slot.
+
+    The selector is deliberately content-first.  It never treats a filename
+    marker such as ``.sc``/``.tc`` as language evidence, and it never joins
+    two independent Chinese tracks into a fictional bilingual track.  A
+    satisfied result has exactly one of these stable preferences:
+
+    ``0`` same-file Chinese + TMDB-confirmed original-language bilingual;
+    ``1`` Simplified Chinese; ``2`` Traditional Chinese.
+
+    Only complete, exact-size UTF-8 SRT documents are eligible.  The strict
+    all-cue language check means a valid Chinese prefix followed by unrelated
+    content cannot pass a persisted-plan revalidation.
+    """
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        max_bytes = EXPORTED_SRT_MAX_BYTES
+    max_bytes = max(1024, min(EXPORTED_SRT_MAX_BYTES, max_bytes))
+    if isinstance(declared_size, bool):
+        return _managed_subtitle_failure("subtitle_size_unproven")
+    if declared_size is not None and (
+        not isinstance(declared_size, int)
+        or declared_size <= 0
+        or declared_size > max_bytes
+    ):
+        return _managed_subtitle_failure("subtitle_size_unproven")
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+    else:
+        return _managed_subtitle_failure("subtitle_content_unavailable")
+    if not raw or len(raw) > max_bytes:
+        return _managed_subtitle_failure("subtitle_size_unproven")
+    if declared_size is not None and len(raw) != declared_size:
+        return _managed_subtitle_failure("subtitle_full_read_unproven")
+    try:
+        raw.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        return _managed_subtitle_failure("subtitle_utf8_required")
+    document = parse_subtitle_document(raw, max_bytes=max_bytes)
+    if document is None or document.format != "srt":
+        return _managed_subtitle_failure("subtitle_complete_srt_required")
+
+    normalized_original = normalize_subtitle_language(original_language)
+    if normalized_original in {"japanese", "english", "korean"}:
+        bilingual = classify_bilingual_subtitle_content(
+            raw,
+            normalized_original,
+            max_bytes=max_bytes,
+        )
+        if str(bilingual.get("status") or "").casefold() == "satisfied":
+            return {
+                "status": "satisfied",
+                "classification": str(bilingual["classification"]),
+                "selection": "bilingual",
+                "preference": 0,
+                "chinese_language": bilingual.get("chinese_language"),
+                "original_language": normalized_original,
+                "format": "srt",
+                "cue_count": len(document.cues),
+                "size": len(raw),
+                "reason": "same_file_bilingual_verified",
+            }
+
+    simplified = classify_subtitle_content(
+        raw,
+        "zh",
+        max_bytes=max_bytes,
+        require_each_cue=True,
+    )
+    if str(simplified.get("status") or "").casefold() == "satisfied":
+        return {
+            "status": "satisfied",
+            "classification": "simplified_chinese",
+            "selection": "simplified_chinese",
+            "preference": 1,
+            "format": "srt",
+            "cue_count": len(document.cues),
+            "size": len(raw),
+            "reason": "simplified_chinese_verified",
+        }
+
+    traditional = classify_subtitle_content(
+        raw,
+        "zh-Hant",
+        max_bytes=max_bytes,
+        require_each_cue=True,
+    )
+    if str(traditional.get("status") or "").casefold() == "satisfied":
+        return {
+            "status": "satisfied",
+            "classification": "traditional_chinese",
+            "selection": "traditional_chinese",
+            "preference": 2,
+            "format": "srt",
+            "cue_count": len(document.cues),
+            "size": len(raw),
+            "reason": "traditional_chinese_verified",
+        }
+    return _managed_subtitle_failure("subtitle_chinese_language_not_proven", format_name="srt")
 
 
 def merge_bilingual_subtitle(
@@ -750,8 +994,12 @@ def merge_bilingual_subtitle(
         )
     chinese_verdict = classify_subtitle_content(chinese_raw, "zh", max_bytes=max_bytes)
     if str(chinese_verdict.get("status") or "").casefold() != "satisfied":
+        chinese_verdict = classify_subtitle_content(
+            chinese_raw, "zh-Hant", max_bytes=max_bytes,
+        )
+    if str(chinese_verdict.get("status") or "").casefold() != "satisfied":
         return _bilingual_failure(
-            "simplified_chinese_not_proven", format_name=primary.format,
+            "chinese_language_not_proven", format_name=primary.format,
         )
     original_verdict = classify_subtitle_content(
         original_raw, target, max_bytes=max_bytes,
@@ -774,6 +1022,7 @@ def merge_bilingual_subtitle(
         "status": "satisfied",
         "classification": proof["classification"],
         "language_lane": proof["language_lane"],
+        "chinese_language": proof.get("chinese_language"),
         "original_language": target,
         "format": primary.format,
         "cue_count": len(primary.cues),
@@ -952,8 +1201,11 @@ def classify_subtitle_content(
 
 __all__ = [
     "DEFAULT_MAX_PREFIX_BYTES",
+    "EXPORTED_SRT_MAX_BYTES",
+    "EXPORTED_SRT_SUFFIX_RE",
     "MAX_PREFIX_BYTES",
     "MAX_MERGED_SUBTITLE_BYTES",
+    "ExportedSrtNormalization",
     "SubtitleCue",
     "SubtitleDocument",
     "classify_subtitle_content",
@@ -962,4 +1214,6 @@ __all__ = [
     "merge_bilingual_subtitle",
     "normalize_subtitle_language",
     "parse_subtitle_document",
+    "validate_exported_srt_sidecar",
+    "validate_managed_subtitle_content",
 ]

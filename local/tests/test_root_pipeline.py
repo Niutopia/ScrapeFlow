@@ -4,25 +4,43 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from engine.scrapeflow.intake_source import intake_source_id
+from engine.scrapeflow.gap_ledger import Gap, load_gap_ledger, save_gap_ledger
+from engine.scrapeflow.intake_source import (
+    bind_root_task,
+    intake_source_id,
+    load_intake_catalog,
+    save_intake_catalog,
+    upsert_intake_source,
+)
 from engine.scrapeflow.models import Plan, PlannedFile
+from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.unit_identity import apply_work_unit_override
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_units import (
+    WorkUnitRecord,
+    load_work_unit_records,
+    save_work_unit_records,
+)
 
 from local.scrapeflow_api.root_pipeline import (
+    _coalesce_confirmed_tv_season_records,
+    finalize_root_gap_closure,
     is_intake_bound_root,
     run_root_pipeline,
 )
+from local.scrapeflow_api.root_aggregation import aggregate_root_job
 from local.scrapeflow_api.simple_engine_runner import (
+    EngineJobConflictError,
     EnginePauseRequested,
     SimpleEngineRunner,
 )
 from local.scrapeflow_api.unit_execution import load_work_acceptance
 
-from local.tests.test_library_index import IndexAList, _sample_library
+from local.tests.test_library_index import IndexAList, _nfo_movie, _sample_library
 from local.tests.test_simple_engine_runner import FAKE_VIDEO_BYTES, FAKE_VIDEO_SIZE
 from local.tests.test_work_unit_identity import FakeTMDBClient
 
@@ -92,6 +110,14 @@ def _merge_planner(events: list[dict[str, Any]]):
 
 
 def _confirming_tmdb() -> FakeTMDBClient:
+    season_101 = [
+        {"episode_number": number, "air_date": "2020-01-01"}
+        for number in range(1, 2)
+    ]
+    season_35507 = [
+        {"episode_number": number, "air_date": "2011-01-01"}
+        for number in range(1, 12)
+    ]
     return FakeTMDBClient(
         search_results={
             "My Show": [
@@ -103,8 +129,37 @@ def _confirming_tmdb() -> FakeTMDBClient:
                 },
             ],
         },
-        details={"/tv/101": {"number_of_episodes": 2}},
+        details={
+            "/tv/101": {
+                "number_of_episodes": 1,
+                "seasons": [{"season_number": 1, "name": "Season 1"}],
+            },
+            "/tv/101/season/1": {"episodes": season_101},
+            "/tv/35507": {
+                "seasons": [{"season_number": 1, "name": "Season 1"}],
+            },
+            "/tv/35507/season/1": {"episodes": season_35507},
+        },
     )
+
+
+class LoginRequiredIndexAList(IndexAList):
+    """A persisted-root double that rejects B/W before login."""
+
+    def __init__(self, files: dict[str, bytes]) -> None:
+        super().__init__(files)
+        self.token: str | None = None
+        self.login_calls = 0
+
+    def login(self) -> str:
+        self.login_calls += 1
+        self.token = "test-token"
+        return self.token
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        if not self.token:
+            raise RuntimeError("尚未登录 AList")
+        return super().list(path, refresh=refresh)
 
 
 class RootPipelineTests(unittest.TestCase):
@@ -116,6 +171,7 @@ class RootPipelineTests(unittest.TestCase):
         tmdb: object | None = None,
         shelf: str = "anime",
         planner=None,
+        archive_preprocessor: object | None = None,
     ):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -133,6 +189,7 @@ class RootPipelineTests(unittest.TestCase):
             executor=lambda plan: (
                 executor_events.append(str(plan.target_root)) or {"ok": True}
             ),
+            archive_preprocessor=archive_preprocessor,
         )
         return state_root, alist, runner, planner_events, executor_events
 
@@ -148,6 +205,28 @@ class RootPipelineTests(unittest.TestCase):
             target_shelf=shelf,
         )
         return runner.start_automatic_job(job.id, target_shelf=shelf)
+
+    def test_stale_intake_binding_fails_closed_without_creating_replacement(self) -> None:
+        """A deleted RootJob must be reconciled, never silently recreated."""
+        state_root, _alist, runner, _planner_events, _executor_events = self._setup(
+            {"/incoming/Orphaned/S01E01.mkv": FAKE_VIDEO_BYTES},
+        )
+        source = "/incoming/Orphaned"
+        catalog, _ = upsert_intake_source([], source, present=True)
+        catalog, _ = bind_root_task(catalog, intake_source_id(source), "deleted-root")
+        save_intake_catalog(state_root, catalog)
+
+        with self.assertRaises(EngineJobConflictError):
+            runner.create_root_job(
+                intake_source_id(source),
+                source_path=source,
+                target_shelf="anime",
+            )
+        self.assertEqual(runner.list_jobs(), [])
+        self.assertEqual(
+            load_intake_catalog(state_root)[0].root_task_id,
+            "deleted-root",
+        )
 
     def test_pipeline_completes_new_work_root_end_to_end(self) -> None:
         files = {
@@ -173,6 +252,81 @@ class RootPipelineTests(unittest.TestCase):
         # The pipeline adds no new EngineJob.summary business fields.
         self.assertLessEqual(set(final.summary), summary_keys_before)
 
+    def test_open_j_gap_parks_root_until_replenishment_closes_it(self) -> None:
+        """A successful H receipt cannot skip the J/N closure boundary."""
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/S01E02.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, _alist, runner, _planner_events, _executor_events = self._setup(files)
+        job = self._new_path_root(runner, "/incoming/My Show", "anime")
+        root_task_id = job.id
+
+        # Seed the ordinary B/W/C/D/F/H records through the real pipeline,
+        # but arrange a precise J gap after H so the R node sees the same
+        # durable state that a partial catalog reconciliation would produce.
+        from local.scrapeflow_api import root_pipeline
+        original_execute = root_pipeline.execute_new_work_units
+
+        def execute_then_register(*args, **kwargs):
+            result = original_execute(*args, **kwargs)
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            identity = record.identity or {}
+            save_gap_ledger(state_root, root_task_id, [Gap(
+                gap_id=f"{record.work_unit_id}::missing_episode::S01E03",
+                root_task_id=root_task_id,
+                work_unit_id=record.work_unit_id,
+                kind="missing_episode",
+                media_type="tv",
+                tmdb_id=int(identity["tmdb_id"]),
+                season=1,
+                episodes=(3,),
+                subtitle_path=None,
+                subtitle_language=None,
+                status="open",
+            )])
+            return result
+
+        with patch(
+            "local.scrapeflow_api.root_pipeline.execute_new_work_units",
+            side_effect=execute_then_register,
+        ):
+            final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "gaps_pending")
+        self.assertEqual(aggregate_root_job(state_root, root_task_id).status, "gaps_pending")
+        gap = load_gap_ledger(state_root, root_task_id)[0]
+        save_gap_ledger(state_root, root_task_id, [replace(gap, status="closed")])
+        closed = finalize_root_gap_closure(runner, state_root, root_task_id)
+        self.assertEqual(closed.phase, "completed")
+
+    def test_pipeline_authenticates_a_resumed_root_before_boundary_read(self) -> None:
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/S01E02.mkv": FAKE_VIDEO_BYTES,
+        }
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = LoginRequiredIndexAList(files)
+        planner_events: list[dict[str, Any]] = []
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner(planner_events),
+            validate=False,
+            library_root="/library",
+            executor=lambda _plan: {"ok": True},
+        )
+        job = self._new_path_root(runner, "/incoming/My Show", "anime")
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertEqual(alist.login_calls, 1)
+        self.assertEqual(len(planner_events), 1)
+
     def test_pipeline_parks_uncertain_identity_without_writing(self) -> None:
         files = {
             "/incoming/Mystery Show/S01E01.mkv": FAKE_VIDEO_BYTES,
@@ -190,6 +344,565 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(planner_events, [])
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].identity_status, "uncertain")
+
+    def test_pipeline_parks_disc_image_without_planning_moving_or_archiving(self) -> None:
+        source = "/incoming/Disc source"
+        image_path = f"{source}/Season 01.iso"
+        state_root, alist, runner, planner_events, executor_events = self._setup({
+            image_path: b"i" * (1024 * 1024),
+        }, tmdb=FakeTMDBClient())
+        job = self._new_path_root(runner, source, "anime")
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(planner_events, [])
+        self.assertEqual(executor_events, [])
+        self.assertEqual(alist.move_calls, [])
+        self.assertIn(image_path, alist.files)
+        record = load_work_unit_records(state_root, job.id)[0]
+        self.assertTrue(record.requires_content_expansion)
+        self.assertEqual(record.identity_status, "uncertain")
+        self.assertIsNone(record.identity)
+        self.assertIsNone(record.reconciliation_outcome)
+        self.assertIn("只读安全内容展开", record.attention or "")
+
+    def test_pipeline_does_not_stage_opaque_container_before_snapshot_bridge(self) -> None:
+        """A configured archive adapter cannot replace RootJob ingress pre-B/W.
+
+        The adapter itself is safe, but its task-owned staging root is not an
+        IntakeSource.  Calling it from the RootJob pipeline before there is a
+        durable expanded-source ownership bridge would make the B snapshot and
+        later F scope checks disagree.  The container must stay visible as
+        explicit attention instead.
+        """
+        class WouldStageArchive:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def prepare_ordinary_request(self, request, **_kwargs):
+                self.calls += 1
+                return {
+                    **request,
+                    "source_path": "/library/ScrapeFlow/归档/forbidden-staging",
+                    "archive_preprocessed": {"changed": True},
+                }
+
+        source = "/incoming/No pre-BW stage"
+        image_path = f"{source}/Disc.iso"
+        preprocessor = WouldStageArchive()
+        state_root, _alist, runner, planner_events, executor_events = self._setup(
+            {image_path: b"i" * (1024 * 1024)},
+            tmdb=FakeTMDBClient(),
+            archive_preprocessor=preprocessor,
+        )
+        job = self._new_path_root(runner, source, "anime")
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(preprocessor.calls, 0)
+        self.assertEqual(planner_events, [])
+        self.assertEqual(executor_events, [])
+        record = load_work_unit_records(state_root, job.id)[0]
+        self.assertTrue(record.requires_content_expansion)
+        self.assertTrue(record.source_paths[0].startswith(source))
+
+    def test_pipeline_coalesces_confirmed_same_tv_season_siblings_before_d(self) -> None:
+        """C-confirmed sibling season scopes become one D input, pre-write only."""
+        source = "/incoming/Explicit Seasons"
+        season_one = f"{source}/Release S01"
+        season_two = f"{source}/Release S02"
+        files = {
+            f"{season_one}/My.Show.S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{season_two}/My.Show.S02E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, _alist, runner, _planner_events, _executor_events = self._setup(files)
+        job = self._new_path_root(runner, source, "anime")
+        records = [
+            WorkUnitRecord(
+                work_unit_id="unit-season-one",
+                root_task_id=job.id,
+                boundary_key=season_one,
+                source_paths=(season_one,),
+                source_revision=1,
+                role="season",
+                display_label="Release S01",
+                claimed_seasons=(1,),
+                media_context="tv",
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 101,
+                    "season": 1,
+                    "source": "operator_override",
+                },
+            ),
+            WorkUnitRecord(
+                work_unit_id="unit-season-two",
+                root_task_id=job.id,
+                boundary_key=season_two,
+                source_paths=(season_two,),
+                source_revision=1,
+                role="season",
+                display_label="Release S02",
+                claimed_seasons=(2,),
+                media_context="tv",
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 101,
+                    "season": 2,
+                    "source": "operator_override",
+                },
+            ),
+        ]
+        save_work_unit_records(state_root, job.id, records)
+        atomic_write_json(
+            state_root / f"work_snapshot_{job.id}.json",
+            {
+                "root": source,
+                "rows": [
+                    {"name": "Release S01", "is_dir": True, "full_path": season_one},
+                    {
+                        "name": "My.Show.S01E01.mkv",
+                        "is_dir": False,
+                        "size": FAKE_VIDEO_SIZE,
+                        "full_path": f"{season_one}/My.Show.S01E01.mkv",
+                    },
+                    {"name": "Release S02", "is_dir": True, "full_path": season_two},
+                    {
+                        "name": "My.Show.S02E01.mkv",
+                        "is_dir": False,
+                        "size": FAKE_VIDEO_SIZE,
+                        "full_path": f"{season_two}/My.Show.S02E01.mkv",
+                    },
+                ],
+            },
+            allow_nan=False,
+        )
+        observed_d_inputs: list[list[WorkUnitRecord]] = []
+
+        def observe_d(*_args, **_kwargs):
+            observed_d_inputs.append(load_work_unit_records(state_root, job.id))
+            return observed_d_inputs[-1]
+
+        with patch(
+            "local.scrapeflow_api.root_pipeline.reconcile_root_work_units",
+            side_effect=observe_d,
+        ), patch(
+            "local.scrapeflow_api.root_pipeline.execute_unit_e_lanes",
+            return_value=[],
+        ):
+            final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(len(observed_d_inputs), 1)
+        self.assertEqual(len(observed_d_inputs[0]), 1)
+        merged = observed_d_inputs[0][0]
+        self.assertEqual(merged.work_unit_id, "unit-season-one")
+        self.assertEqual(merged.source_paths, (season_one, season_two))
+        self.assertEqual(merged.claimed_seasons, (1, 2))
+        self.assertNotIn("season", merged.identity or {})
+
+    def test_retry_coalescing_preserves_partially_accepted_same_tv_sibling(self) -> None:
+        """An H receipt blocks C-stage re-keying during a later retry."""
+        source = "/incoming/Partial Seasons"
+        season_one = f"{source}/Release S01"
+        season_two = f"{source}/Release S02"
+        state_root, _alist, runner, _planner_events, _executor_events = self._setup({
+            f"{season_one}/My.Show.S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{season_two}/My.Show.S02E01.mkv": FAKE_VIDEO_BYTES,
+        })
+        job = self._new_path_root(runner, source, "anime")
+        records = [
+            WorkUnitRecord(
+                work_unit_id="unit-accepted-s01",
+                root_task_id=job.id,
+                boundary_key=season_one,
+                source_paths=(season_one,),
+                source_revision=1,
+                role="season",
+                display_label="Release S01",
+                claimed_seasons=(1,),
+                media_context="tv",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 101},
+                reconciliation_outcome="new_work",
+                writer_job_id="unit-accepted-s01",
+                gap_status="registered",
+            ),
+            WorkUnitRecord(
+                work_unit_id="unit-pending-s02",
+                root_task_id=job.id,
+                boundary_key=season_two,
+                source_paths=(season_two,),
+                source_revision=1,
+                role="season",
+                display_label="Release S02",
+                claimed_seasons=(2,),
+                media_context="tv",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 101},
+            ),
+        ]
+        save_work_unit_records(state_root, job.id, records)
+        atomic_write_json(
+            state_root / f"work_snapshot_{job.id}.json",
+            {
+                "root": source,
+                "rows": [
+                    {"name": "Release S01", "is_dir": True, "full_path": season_one},
+                    {
+                        "name": "My.Show.S01E01.mkv", "is_dir": False,
+                        "size": FAKE_VIDEO_SIZE,
+                        "full_path": f"{season_one}/My.Show.S01E01.mkv",
+                    },
+                    {"name": "Release S02", "is_dir": True, "full_path": season_two},
+                    {
+                        "name": "My.Show.S02E01.mkv", "is_dir": False,
+                        "size": FAKE_VIDEO_SIZE,
+                        "full_path": f"{season_two}/My.Show.S02E01.mkv",
+                    },
+                ],
+            },
+            allow_nan=False,
+        )
+        atomic_write_json(
+            state_root / f"work_acceptance_{job.id}.json",
+            [
+                {
+                    "work_unit_id": "unit-accepted-s01",
+                    "outcome": "accepted",
+                    "writer_job_id": "unit-accepted-s01",
+                    "phase": "executed",
+                    "target_root": "/library/番剧/My Show",
+                    "planned_files": 1,
+                    "error": None,
+                    "recorded_at": "2026-08-19T00:00:00Z",
+                },
+            ],
+            allow_nan=False,
+        )
+
+        unchanged = _coalesce_confirmed_tv_season_records(
+            state_root, job.id, load_work_unit_records(state_root, job.id),
+        )
+
+        self.assertEqual(unchanged, records)
+        self.assertEqual(
+            load_work_unit_records(state_root, job.id), records,
+        )
+
+    def test_uncertain_sibling_does_not_block_confirmed_new_work_unit(self) -> None:
+        files = {
+            "/incoming/Container/Confirmed/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Container/Mystery/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            files, tmdb=_confirming_tmdb(),
+        )
+        job = self._new_path_root(runner, "/incoming/Container", "anime")
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        analyze_root_boundaries(
+            alist,
+            "/incoming/Container",
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, job.id)
+        confirmed = next(record for record in records if record.display_label == "Confirmed")
+        apply_work_unit_override(
+            state_root,
+            job.id,
+            confirmed.work_unit_id,
+            media_type="tv",
+            tmdb_id=101,
+        )
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(len(planner_events), 1)
+        self.assertEqual(len(executor_events), 1)
+        updated = {record.display_label: record for record in load_work_unit_records(state_root, job.id)}
+        self.assertEqual(updated["Confirmed"].reconciliation_outcome, "new_work")
+        self.assertIsNotNone(updated["Confirmed"].writer_job_id)
+        self.assertEqual(updated["Mystery"].identity_status, "uncertain")
+
+    def test_d_uncertain_sibling_does_not_block_confirmed_new_work_unit(self) -> None:
+        """A cross-shelf D conflict parks only its own WorkUnit.
+
+        The unrelated confirmed movie still follows F/G/H, while R keeps the
+        root in attention for the conflict rather than silently skipping it.
+        """
+        files = {
+            "/incoming/Container/Conflicted/Feature.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Container/Fresh/Feature.mkv": FAKE_VIDEO_BYTES,
+        }
+        library_files = _sample_library()
+        library_files[
+            "/library/番剧/Inception copy/movie.nfo"
+        ] = _nfo_movie(27205, "Inception", "2010")
+        library_files[
+            "/library/番剧/Inception copy/Inception.2010.2160p.mkv"
+        ] = b"v"
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            files,
+            library_files=library_files,
+        )
+        job = self._new_path_root(runner, "/incoming/Container", "anime")
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        analyze_root_boundaries(
+            alist,
+            "/incoming/Container",
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        for record in load_work_unit_records(state_root, job.id):
+            if record.display_label == "Conflicted":
+                apply_work_unit_override(
+                    state_root,
+                    job.id,
+                    record.work_unit_id,
+                    media_type="movie",
+                    tmdb_id=27205,
+                )
+            elif record.display_label == "Fresh":
+                apply_work_unit_override(
+                    state_root,
+                    job.id,
+                    record.work_unit_id,
+                    media_type="movie",
+                    tmdb_id=99092,
+                )
+            else:  # pragma: no cover - fixture boundary assertion
+                self.fail(f"unexpected WorkUnit: {record.display_label}")
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(len(planner_events), 1)
+        self.assertEqual(len(executor_events), 1)
+        updated = {
+            record.display_label: record
+            for record in load_work_unit_records(state_root, job.id)
+        }
+        self.assertEqual(updated["Conflicted"].reconciliation_outcome, "uncertain")
+        self.assertIsNone(updated["Conflicted"].writer_job_id)
+        self.assertEqual(updated["Fresh"].reconciliation_outcome, "new_work")
+        self.assertIsNotNone(updated["Fresh"].writer_job_id)
+        aggregate = aggregate_root_job(state_root, job.id)
+        self.assertEqual((aggregate.completed, aggregate.attention, aggregate.failed), (1, 1, 0))
+
+    def test_decorated_multi_season_cohort_writes_only_its_scoped_manifest(self) -> None:
+        """A confirmed cohort must not widen into an ambiguous aftershow.
+
+        This is intentionally a generic fixture: two decorated, corroborated
+        season folders plus an adjacent empty declared season form one TV
+        WorkUnit, while a separately named aftershow remains a distinct C/U
+        unit.  The injected writer is only an observation seam; normal
+        runner scope validation still runs before it is called.
+        """
+        root = "/incoming/Northwind Bundle"
+        season_one = f"{root}/Northwind.Series.S01.Blu-ray"
+        season_two = f"{root}/Northwind.Series.S02.WEB-DL"
+        season_three = f"{root}/Northwind.Series.S03.WEB-DL"
+        aftershow = f"{root}/Aftershow"
+        expected_scopes = (season_one, season_two, season_three)
+        expected_manifest = {
+            f"{season_one}/Northwind.Series.S01E01.mkv",
+            f"{season_one}/Northwind.Series.S01E02.mkv",
+            f"{season_two}/Northwind.Series.S02E01.mkv",
+            f"{season_two}/Northwind.Series.S02E02.mkv",
+        }
+        aftershow_video = f"{aftershow}/Aftershow.E01.mkv"
+        files = {
+            path: FAKE_VIDEO_BYTES
+            for path in expected_manifest | {aftershow_video}
+        }
+        catalog_id = 99091
+        season_rows = {
+            season: [
+                {
+                    "season_number": season,
+                    "episode_number": episode,
+                    "air_date": "2020-01-01",
+                }
+                for episode in (1, 2)
+            ]
+            for season in (1, 2, 3)
+        }
+        tmdb = FakeTMDBClient(details={
+            f"/tv/{catalog_id}": {
+                "seasons": [
+                    {"season_number": season, "name": f"Season {season}"}
+                    for season in (1, 2, 3)
+                ],
+            },
+            **{
+                f"/tv/{catalog_id}/season/{season}": {"episodes": rows}
+                for season, rows in season_rows.items()
+            },
+        })
+        planner_observations: list[dict[str, object]] = []
+        writer_sources: list[tuple[str, ...]] = []
+
+        def scoped_planner(request, _alist, _tmdb) -> Plan:
+            manifest = tuple(request.source_files or ())
+            planner_observations.append({
+                "source_path": request.source_path,
+                "scope_paths": tuple(request.source_scope_paths),
+                "manifest_paths": tuple(sorted(
+                    str(row.get("full_path") or "") for row in manifest
+                )),
+            })
+            target = f"{request.parent_path.rstrip('/')}/Scoped Work ({request.tmdb_id})"
+            planned = [
+                PlannedFile(
+                    source_path=str(row["full_path"]),
+                    source_dir=str(row["full_path"]).rsplit("/", 1)[0],
+                    original_name=str(row["name"]),
+                    final_name=str(row["name"]),
+                    target_dir=target,
+                    media_kind="video",
+                    source_size=int(row["size"]),
+                )
+                for row in manifest
+                if str(row.get("name") or "").endswith(".mkv")
+            ]
+            return Plan(
+                mode="tv",
+                source_root=request.source_path,
+                target_root=target,
+                files=planned,
+                warnings=[],
+                metadata={"tmdb_id": request.tmdb_id, "title": "Scoped Work"},
+            )
+
+        def observing_writer(plan: Plan) -> dict[str, object]:
+            writer_sources.append(tuple(sorted(item.source_path for item in plan.files)))
+            return {"ok": True}
+
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=tmdb,
+            planner=scoped_planner,
+        )
+        # A real empty provider directory is required for B/W to prove the
+        # adjacent S03 boundary; it intentionally has no manifest file rows.
+        alist.dirs.add(season_three)
+        runner.executor = observing_writer
+        job = self._new_path_root(runner, root, "anime")
+
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+        analyze_root_boundaries(
+            alist,
+            root,
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        discovered = load_work_unit_records(state_root, job.id)
+        self.assertEqual(len(discovered), 2)
+        cohort = next(record for record in discovered if record.claimed_seasons)
+        sibling = next(record for record in discovered if not record.claimed_seasons)
+        self.assertEqual(cohort.source_paths, expected_scopes)
+        self.assertEqual(cohort.claimed_seasons, (1, 2, 3))
+        self.assertEqual(cohort.role, "single_work")
+        self.assertEqual(sibling.source_paths, (aftershow,))
+
+        # This is the only manual C/U input.  The aftershow deliberately has
+        # no identity evidence and must stay isolated as operator attention.
+        apply_work_unit_override(
+            state_root,
+            job.id,
+            cohort.work_unit_id,
+            media_type="tv",
+            tmdb_id=catalog_id,
+        )
+
+        final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "reconciliation_uncertain")
+        self.assertEqual(len(planner_observations), 1)
+        self.assertEqual(planner_observations[0]["source_path"], root)
+        self.assertEqual(planner_observations[0]["scope_paths"], expected_scopes)
+        self.assertEqual(
+            set(planner_observations[0]["manifest_paths"]), expected_manifest,
+        )
+        self.assertEqual(writer_sources, [tuple(sorted(expected_manifest))])
+        self.assertNotIn(aftershow_video, writer_sources[0])
+        # The ambiguous sibling was neither consumed nor widened into F/G.
+        self.assertEqual(alist.files[aftershow_video], FAKE_VIDEO_BYTES)
+        self.assertEqual(alist.move_calls, [])
+
+        updated = {record.work_unit_id: record for record in load_work_unit_records(state_root, job.id)}
+        self.assertEqual(updated[cohort.work_unit_id].reconciliation_outcome, "new_work")
+        self.assertEqual(updated[cohort.work_unit_id].gap_status, "registered")
+        self.assertEqual(updated[sibling.work_unit_id].identity_status, "uncertain")
+        self.assertIsNone(updated[sibling.work_unit_id].writer_job_id)
+        carrier = runner.get_job(updated[cohort.work_unit_id].writer_job_id)
+        self.assertEqual(carrier.phase, "executed")
+        self.assertEqual(tuple(carrier.request["source_scope_paths"]), expected_scopes)
+        self.assertEqual(
+            {
+                str(row.get("full_path") or "")
+                for row in carrier.request["source_files"]
+            },
+            expected_manifest,
+        )
+        gaps = load_gap_ledger(state_root, job.id)
+        self.assertEqual(
+            {(gap.work_unit_id, gap.season, gap.episodes, gap.status) for gap in gaps},
+            {
+                (cohort.work_unit_id, 3, (1,), "open"),
+                (cohort.work_unit_id, 3, (2,), "open"),
+            },
+        )
+
+    def test_j_persistence_failure_wins_over_separate_attention(self) -> None:
+        files = {
+            "/incoming/Container/Confirmed/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Container/Mystery/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files, tmdb=_confirming_tmdb(),
+        )
+        job = self._new_path_root(runner, "/incoming/Container", "anime")
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+
+        analyze_root_boundaries(
+            alist,
+            "/incoming/Container",
+            root_task_id=job.id,
+            state_root=state_root,
+        )
+        confirmed = next(
+            record for record in load_work_unit_records(state_root, job.id)
+            if record.display_label == "Confirmed"
+        )
+        apply_work_unit_override(
+            state_root,
+            job.id,
+            confirmed.work_unit_id,
+            media_type="tv",
+            tmdb_id=101,
+        )
+
+        with patch(
+            "local.scrapeflow_api.unit_execution.discover_episode_gaps",
+            side_effect=OSError("injected J ledger failure"),
+        ):
+            final = run_root_pipeline(runner, state_root, job.id)
+
+        # A real J persistence/readback fault must not be obscured by the
+        # sibling's normal identity uncertainty.
+        self.assertEqual(final.phase, "failed")
+        updated = {record.display_label: record for record in load_work_unit_records(state_root, job.id)}
+        self.assertEqual(updated["Confirmed"].gap_status, "failed")
+        self.assertEqual(updated["Mystery"].identity_status, "uncertain")
 
     def test_pipeline_consumes_duplicate_units_into_archive(self) -> None:
         files = {
@@ -290,7 +1003,7 @@ class RootPipelineTests(unittest.TestCase):
 
         final = run_root_pipeline(runner, state_root, root_task_id)
 
-        self.assertEqual(final.phase, "completed")
+        self.assertEqual(final.phase, "gaps_pending")
         self.assertEqual(executor_events, [])
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].reconciliation_outcome, "existing_gap")
@@ -337,6 +1050,11 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(records[0].lane_status, "merge_done")
         self.assertEqual(records[0].matched_work_root, "/library/番剧/Fate Zero")
         self.assertIsNotNone(records[0].writer_job_id)
+        # J reuses the locked post-write work root: the incoming E11 must not
+        # make already-present E01–E10 appear as fabricated missing gaps.
+        self.assertEqual(records[0].gap_status, "registered")
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+        self.assertEqual(load_gap_ledger(state_root, root_task_id), [])
         # The carrier is an internal child, never a second public task.
         carrier = runner.get_job(records[0].writer_job_id)
         self.assertIs(carrier.summary.get("internal_child"), True)
@@ -359,6 +1077,28 @@ class RootPipelineTests(unittest.TestCase):
         records = load_work_unit_records(state_root, root_task_id)
         self.assertEqual(records[0].reconciliation_outcome, "new_work")
         self.assertIsNone(records[0].writer_job_id)
+
+    def test_cancel_after_read_only_boundary_wins_over_stale_root_transition(self) -> None:
+        """A cancel must not be overwritten by the pipeline's old root copy."""
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, _alist, runner, _planner, executor_events = self._setup(files)
+        job = self._new_path_root(runner, "/incoming/My Show", "anime")
+
+        from local.scrapeflow_api import root_pipeline
+
+        original = root_pipeline.analyze_root_boundaries
+
+        def analyze_then_cancel(*args, **kwargs):
+            result = original(*args, **kwargs)
+            runner.cancel_job(job.id, reason="stop after analysis")
+            return result
+
+        with patch.object(root_pipeline, "analyze_root_boundaries", side_effect=analyze_then_cancel):
+            final = run_root_pipeline(runner, state_root, job.id)
+
+        self.assertEqual(final.phase, "cancelled")
+        self.assertEqual(runner.get_job(job.id).phase, "cancelled")
+        self.assertEqual(executor_events, [])
 
     def test_merge_lane_pause_after_plan_keeps_formal_writer_idle(self) -> None:
         """E3 passes the root callback through planning and execution."""

@@ -75,9 +75,80 @@ EPISODE_ONLY_RE = re.compile(
     + _INTEGER_EPISODE_END + r")?",
     re.I,
 )
+# A packed name such as ``E01E02`` contains two episode markers but the
+# ordinary matcher above deliberately cannot start a second match immediately
+# after the final digit of the first one.  Bare-E evidence must never reduce a
+# multi-episode pack to its first member, so detect this adjacent form before
+# accepting one otherwise-valid ordinal.
+_ADJACENT_BARE_EPISODE_MARKERS_RE = re.compile(
+    r"(?<![A-Z0-9])E(?:P)?0*\d{1,4}(?:E(?:P)?0*\d{1,4})+",
+    re.I,
+)
 CHINESE_EPISODE_ONLY_RE = re.compile(
     r"第\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话]"
     r"(?:\s*[-~–—至到]\s*第?\s*([\d一二三四五六七八九十百零〇两]{1,5})\s*[集话])?",
+)
+# A bare ``E01`` is useful evidence only when it is the entire episode
+# coordinate, not a fragment of an explicit SxxEyy label or a special-release
+# marker.  D/F use this narrow primitive when a one-season TMDB catalog is the
+# *only* possible season proof.  Keeping it here means source reconciliation
+# and later writer validation share the same episode grammar.
+_BARE_REGULAR_EPISODE_SPECIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sp(?:ecial)?|ova|oav|oad|extra(?:s)?|bonus|"
+    r"特别篇|特辑|花絮|映像特典"
+    r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# A bracketed ordinal is only useful as a single-season fallback when the
+# bracket itself contains digits and nothing else.  This intentionally does
+# not accept ``[01v2]``, ``[01-02]`` or ``[1080p]`` as an episode coordinate.
+# The caller additionally requires exactly one such bracket per primary video
+# and a complete TMDB-backed run before it can invent a season.
+_PURE_BRACKETED_NUMERIC_RE = re.compile(r"\[\s*(\d{1,6})\s*\]")
+# A release-style member often carries no ``E``/season marker at all:
+# ``[Group] Title - 01 [WebRip].mkv``.  It is not an ordinary coverage
+# coordinate because the leading title can itself contain numbers or dashes.
+# D/F may use it only as one member of a complete, catalog-backed run, so the
+# primitive below deliberately requires one terminal `` - N`` ordinal and
+# preserves the normalized title prefix for an exact sibling comparison.
+_RELEASE_DASH_EPISODE_RE = re.compile(
+    r"^(?P<prefix>.+?)\s[-–—]\s*0*(?P<episode>[1-9]\d{0,2})"
+    r"(?P<tail>(?:\s*(?:\[[^\[\]]+\]|\([^()]+\)))*?)\s*$",
+    re.IGNORECASE,
+)
+_RELEASE_DASH_ORDINAL_RE = re.compile(
+    r"\s[-–—]\s*0*(?P<episode>[1-9]\d{0,2})(?!\d)",
+)
+_RELEASE_DASH_COMPACT_SPECIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sp(?:ecial)?|ova|oav|oad|extra(?:s)?|bonus|"
+    r"ncop|nced|mv|pv|trailer|teaser|promo"
+    r")\s*0*\d{0,3}(?![A-Za-z0-9])"
+    r"|(?:特别篇|特辑|花絮|映像特典)",
+    re.IGNORECASE,
+)
+_RELEASE_DASH_TAIL_ORDINAL_RE = re.compile(
+    r"(?:\[|\()\s*0*[1-9]\d{0,2}\s*(?:\]|\))",
+)
+_RELEASE_DASH_TAIL_RANGE_RE = re.compile(
+    r"(?:\[|\()\s*0*\d{1,3}\s*[-~–—]\s*0*\d{1,3}\s*(?:\]|\))",
+)
+# These labels are release-side presentation material, not an episode of the
+# story.  Keep this tail-only so an ordinary title containing (say) ``ED`` is
+# not globally reclassified; ``[ED]``, ``[OP2]`` and ``(MENU)`` after the dash
+# ordinal are nevertheless incompatible with the narrow D/F proof.
+_RELEASE_DASH_TAIL_NON_STORY_TAG_RE = re.compile(
+    r"(?:\[|\()\s*(?:cm|op(?:ed)?|ed|menu)"
+    r"(?=\s|[0-9._-]|\]|\))",
+    re.IGNORECASE,
+)
+# A terminal ``E01``/``EP01`` is competing explicit coordinate evidence.  It
+# must not be silently ignored merely because the earlier release-style dash
+# ordinal happens to have the same number.
+_RELEASE_DASH_TAIL_EXPLICIT_EPISODE_RE = re.compile(
+    r"(?:\[|\()[^\]\)]*?(?<![A-Za-z0-9])E(?:P)?\s*0*[1-9]\d{0,3}",
+    re.IGNORECASE,
 )
 ANIME_EPISODE_RANGE_RE = re.compile(
     r"(?<!\d)\(\s*0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})\s*\)(?!\d)",
@@ -317,6 +388,149 @@ def fractional_episode_tokens(
     return output
 
 
+def bare_regular_episode_number(value: Any) -> int | None:
+    """Return one unqualified regular ``E##`` ordinal, or ``None``.
+
+    This is deliberately much narrower than :func:`coverage_tokens`: it
+    rejects a season marker anywhere in the source path, ranges, fractional
+    labels, special/OVA markers, and multiple episode markers.  It therefore
+    cannot itself invent a season; callers must pair it with independent
+    evidence such as an operator-selected season or a fully verified TMDB
+    single-season catalog.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return None
+    if _ADJACENT_BARE_EPISODE_MARKERS_RE.search(text):
+        return None
+    # Explicit SxxEyy / x-style / Chinese-season coordinates and even a bare
+    # season marker are stronger, different evidence.  Do not reinterpret
+    # their trailing E number as an unqualified ordinal.
+    if episode_ranges(text) or season_markers(text):
+        return None
+    matches = list(EPISODE_ONLY_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    if match.group(2) is not None:
+        return None
+    number = int(match.group(1))
+    return number if number > 0 else None
+
+
+def bracketed_regular_episode_number(value: Any) -> int | None:
+    """Return one unqualified pure-bracket ordinal, or ``None``.
+
+    ``[01]`` is widespread in anime releases but is much weaker than an
+    explicit ``SxxEyy`` coordinate.  It is admitted only as one member of a
+    separately proved, complete single-season sequence.  The primitive itself
+    rejects special labels, explicit season/episode forms, ranges and every
+    basename with zero or multiple pure numeric brackets.  Four-digit values
+    such as ``[1080]`` are deliberately not possible episode ordinals here;
+    treating a resolution-only bracket as an episode would be unsafe.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return None
+    if episode_ranges(text) or season_markers(text):
+        return None
+    # A filename carrying a bare ``E01`` as well as ``[01]`` has competing
+    # grammars.  The D/F proof must not choose one by accident simply because
+    # the numeric values happen to agree.
+    if bare_regular_episode_number(text) is not None:
+        return None
+    matches = list(_PURE_BRACKETED_NUMERIC_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    number = int(matches[0].group(1))
+    # A regular TV episode is bounded to the same three-digit range used by
+    # the shared anime parser.  This makes a bare ``[1080]`` fail closed even
+    # when it is the only numeric bracket in the name.
+    return number if 0 < number <= 999 else None
+
+
+def release_dash_regular_episode(value: Any) -> tuple[str, int] | None:
+    """Return ``(title_prefix, ordinal)`` for one strict ``Title - 01`` file.
+
+    The dash ordinal is intentionally not emitted as normal coverage: absent
+    an explicit season, it cannot safely identify a TV coordinate by itself.
+    The D/F single-season proof uses this narrow primitive only after it has
+    shown that *every* video shares one title prefix and forms a complete
+    contiguous run against the selected TV's sole positive TMDB season.
+
+    The filename must have one (and only one) dash ordinal, a non-empty
+    alphabetic title prefix, and only bracketed/parenthesized release tags
+    after the ordinal.  Explicit season/episode forms, fractional values and
+    special-release labels stay outside this grammar.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return None
+    if _RELEASE_DASH_COMPACT_SPECIAL_RE.search(text):
+        return None
+    if episode_ranges(text) or season_markers(text):
+        return None
+    name = re.split(r"[/\\]", text.rstrip("/"))[-1]
+    stem, dot, _suffix = name.rpartition(".")
+    if not dot:
+        stem = name
+    stem = stem.strip()
+    if not stem:
+        return None
+    # A title may contain ordinary punctuation, but a second `` - N`` is a
+    # competing ordinal (or a packed release) and must not be guessed.
+    if len(_RELEASE_DASH_ORDINAL_RE.findall(stem)) != 1:
+        return None
+    match = _RELEASE_DASH_EPISODE_RE.fullmatch(stem)
+    if match is None:
+        return None
+    tail = match.group("tail") or ""
+    # Do not silently choose the dash number when the tail has another pure
+    # ordinal such as ``Title - 01 [02]`` or ``(02)``.  Nor may a release
+    # presentation tag (CM/OP/ED/MENU) or an explicit trailing E/EP coordinate
+    # be smuggled through as harmless metadata.
+    if (
+        _RELEASE_DASH_TAIL_ORDINAL_RE.search(tail)
+        or _RELEASE_DASH_TAIL_RANGE_RE.search(tail)
+        or _RELEASE_DASH_TAIL_NON_STORY_TAG_RE.search(tail)
+        or _RELEASE_DASH_TAIL_EXPLICIT_EPISODE_RE.search(tail)
+    ):
+        return None
+    prefix = re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKC", match.group("prefix")).casefold(),
+    ).strip()
+    if not prefix or not any(character.isalpha() for character in prefix):
+        return None
+    number = int(match.group("episode"))
+    return (prefix, number) if 0 < number <= 999 else None
+
+
+def bare_regular_episode_context_is_safe(value: Any) -> bool:
+    """Return whether path context can safely accompany a bare ``E##``.
+
+    The naked-E coordinate itself must be parsed from the media basename: a
+    release-container directory such as ``E01-E06`` describes the collection,
+    not each member.  Path context is still meaningful negative evidence,
+    though.  A parent season/qualified coordinate or special/OVA marker means
+    the file belongs to a stronger hierarchy and must not enter the strict
+    single-season naked-E proof.
+
+    Bare ranges and adjacent bare markers are intentionally *not* inspected
+    here.  Those are basename-only coordinate checks in
+    :func:`bare_regular_episode_number`.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return False
+    # ``episode_ranges`` covers explicit SxxEyy/x-style/Chinese coordinates
+    # in a parent directory, while ``season_markers`` also catches a plain
+    # ``Season 01`` hierarchy.  Neither parser treats a bare ``E01-E06``
+    # collection directory as a qualified coordinate.
+    return not episode_ranges(text) and not season_markers(text)
+
+
 def coverage_tokens(
     value: Any, *, default_seasons: set[int] | None = None,
     maximum_span: int = 5000,
@@ -460,7 +674,9 @@ def audit_episode_tokens(
 
 
 __all__ = [
-    "audit_episode_tokens", "coverage_tokens", "episode_ranges",
+    "audit_episode_tokens", "bare_regular_episode_context_is_safe",
+    "bare_regular_episode_number", "bracketed_regular_episode_number",
+    "coverage_tokens", "episode_ranges",
     "expanded_episode_ids", "fractional_episode_tokens", "normalized_text",
-    "parse_chinese_number", "season_markers",
+    "parse_chinese_number", "release_dash_regular_episode", "season_markers",
 ]

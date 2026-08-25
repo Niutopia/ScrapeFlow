@@ -25,7 +25,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 import sys
-from typing import Any, Collection, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import identity_matching as _identity_matching
 from . import media_naming as _media_naming
@@ -52,8 +52,17 @@ from .clients.http import (
     redact_sensitive_text as _redact_sensitive_text,
     redact_url as _redact_url,
 )
-from .current_plan import load_json_text as _load_json_text
+from .current_plan import (
+    _retain_one_subtitle_track_per_exact_video,
+    load_json_text as _load_json_text,
+)
 from .errors import ApiError, FormalTargetConflictError, PlanError, ScraperError
+from .subtitle_content import (
+    EXPORTED_SRT_MAX_BYTES,
+    EXPORTED_SRT_SUFFIX_RE,
+    validate_managed_subtitle_content,
+    validate_exported_srt_sidecar,
+)
 from .identity_matching import (
     AUTO_MATCH_MIN_MARGIN,
     _alternative_tmdb_titles,
@@ -108,11 +117,13 @@ from .remote_paths import (
     _has_unsafe_unicode,
     _terminal_text,
     _truncate_utf8,
+    validate_provider_safe_basename,
     join_remote,
     normalize_remote_path,
     safe_name,
     split_remote,
 )
+from .replenishment_matching import release_dash_regular_episode
 from .residual_policy import (
     classify_residual,
     cleanup_allowlist_reason,
@@ -242,6 +253,19 @@ EPISODE_NOISE_RE = re.compile(
 )
 DATE_NOISE_RE = re.compile(r"\b(?:19|20)\d{2}[-._]\d{1,2}[-._]\d{1,2}\b")
 
+# A bare four-digit year (``2021``) is release metadata, never an episode
+# number.  ``S01.2021`` therefore reads as ``Season 1, year 2021``, not
+# ``Season 1, episode 2021``.
+BARE_YEAR_NOISE_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+
+# A release-group banner advertising a download site (``www.<domain>``) is an
+# advertisement, not playable media.  It stays at source and never becomes a
+# plan problem file.
+ADVERTISEMENT_NAME_RE = re.compile(
+    r"www\.[A-Za-z0-9.-]+\.(?:com|net|org|cn|tv|xyz|info|me)",
+    re.IGNORECASE,
+)
+
 SIMPLIFIED_MARKERS = _media_naming.SIMPLIFIED_MARKERS
 TRADITIONAL_MARKERS = _media_naming.TRADITIONAL_MARKERS
 ENGLISH_MARKERS = _media_naming.ENGLISH_MARKERS
@@ -321,16 +345,28 @@ def _planned_file_from_entry(
 ) -> "PlannedFile":
     source_path = normalize_remote_path(str(item["full_path"]))
     source_dir, original_name = split_remote(source_path)
+    source_media_kind = (
+        "subtitle"
+        if isinstance(item.get("_subtitle_normalization"), Mapping)
+        else None
+    )
+    subtitle_validation = item.get("_managed_subtitle_validation")
+    if not isinstance(subtitle_validation, Mapping):
+        subtitle_validation = None
     return PlannedFile(
         source_path=source_path,
         source_dir=source_dir,
         original_name=original_name,
         final_name=final_name,
         target_dir=target_dir,
-        media_kind=media_kind(original_name),
+        media_kind=source_media_kind or media_kind(original_name),
         episode_key=episode_key,
         source_size=_entry_size_value(item),
         source_modified=_entry_modified_value(item),
+        source_media_kind=source_media_kind,
+        subtitle_validation=(
+            dict(subtitle_validation) if subtitle_validation is not None else None
+        ),
     )
 
 
@@ -339,6 +375,34 @@ def _validate_remote_basename(name: str) -> str:
         raise ValueError(f"无效远端文件名: {name!r}")
     if "/" in name or "\\" in name or _has_unsafe_unicode(name):
         raise ValueError(f"远端文件名包含非法或不可见控制字符: {name!r}")
+    return validate_provider_safe_basename(name)
+
+
+def _validate_remote_source_basename(name: str) -> str:
+    """Validate an existing provider name without applying rename policy.
+
+    Source releases commonly contain punctuation such as ``x264....mp4``.
+    That is not a path traversal segment: the name is never sent as a target
+    rename.  Keep the strict provider-safe validator for destinations, moves,
+    and deletes, but let a read-only source listing retain ordinary internal
+    dot runs while still rejecting separators, controls, compatibility
+    separators, and the exact ``.``/``..`` path components.
+    """
+    if not isinstance(name, str) or not name or name in {".", ".."}:
+        raise ValueError(f"无效远端源文件名: {name!r}")
+    if "/" in name or "\\" in name or _has_unsafe_unicode(name):
+        raise ValueError(f"远端源文件名包含非法或不可见字符: {name!r}")
+    # Only compatibility forms that alter path segmentation remain unsafe.
+    # A provider may already expose a real source object whose literal name
+    # contains other compatibility punctuation (for example ``：``).  That
+    # source spelling must be retained for reads and source-side moves; the
+    # later rename into the formal library still uses the strict target-name
+    # policy.
+    compatible = unicodedata.normalize("NFKC", name)
+    if "/" in compatible or "\\" in compatible:
+        raise ValueError(f"远端源文件名包含兼容形式路径分隔符: {name!r}")
+    if compatible in {".", ".."}:
+        raise ValueError(f"远端源文件名不能是路径段: {name!r}")
     return name
 
 
@@ -678,7 +742,7 @@ class AListClient:
                 if not isinstance(name, str) or not name:
                     continue
                 try:
-                    _validate_remote_basename(name)
+                    _validate_remote_source_basename(name)
                 except ValueError as exc:
                     raise PlanError(
                         f"AList 返回了无法安全表示的条目名称: {current}/{name!r}"
@@ -708,6 +772,10 @@ class AListClient:
                         continue
                     stack.append(full_path)
                 else:
+                    if ADVERTISEMENT_NAME_RE.search(name):
+                        # A download-site banner is not playable media and
+                        # must never become a plan problem file.
+                        continue
                     if should_ignore_extra(name) and cleanup_reason(name) is None and not (
                         include_bonus and bonus_type(name) is not None
                     ) and not (
@@ -730,7 +798,12 @@ class AListClient:
     def move(self, src_dir: str, dst_dir: str, names: Sequence[str]) -> None:
         if not names:
             return
-        clean_names = [_validate_remote_basename(name) for name in names]
+        # ``names`` selects members that already exist in ``src_dir``; it is
+        # not a destination rename.  Use the source-member policy so a
+        # provider-listed name such as one containing full-width punctuation
+        # can be moved unchanged.  The subsequent destination rename remains
+        # guarded by ``_validate_remote_basename``.
+        clean_names = [_validate_remote_source_basename(name) for name in names]
         self.call(
             "move",
             {
@@ -1811,6 +1884,7 @@ ROMAN_MAP = {
 def extract_episode_key(text: str) -> EpisodeKey | None:
     clean = DATE_NOISE_RE.sub(" ", text)
     clean = EPISODE_NOISE_RE.sub(" ", clean)
+    clean = BARE_YEAR_NOISE_RE.sub(" ", clean)
     for roman, arabic in ROMAN_MAP.items():
         clean = clean.replace(roman, f" {arabic} ")
 
@@ -1856,7 +1930,6 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
         r"(?:^|[\s._\-\[\]()])(?:OVA|OAV|OAD)[\s._-]*(?:SERIES|系列)[\s._-]*\[?\s*0*(\d{1,3})\s*\]?(?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])(?:SP|SPECIAL|OVA|OAV|OAD)[\s._-]*[\[(]\s*0*(\d{1,3})\s*[\])](?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])(?:SP|SPECIAL|OVA|OAV|OAD)[\s._-]*0*(\d{1,3})(?:$|[\s._\-\[\]()])",
-        r"(?:^|[\s._\-\[\]()])0*(\d{1,3})[\s._-]*(?:OVA|OAV|OAD)(?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])TOKUTEN[ ._-]*ANIME[ ._-]*0*(\d{1,3})(?:$|[\s._\-\[\]()])",
         r"第\s*0*(\d{1,3})\s*(?:话|集)?\s*(?:特别篇|特典)",
     ]
@@ -1864,6 +1937,16 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
         match = re.search(pattern, clean, re.IGNORECASE)
         if match:
             return EpisodeKey("special", int(match.group(1)))
+
+    # ``13 OAV``/``12(OVA)`` is episode N's OAV edition, not special ordinal N.
+    # The ordinal is absent, so return an unnumbered special (0) rather than a
+    # fake special number that would collide with the regular episode.
+    if re.search(
+        r"(?:^|[\s._\-\[\]()])0*\d{1,3}[\s._-]*(?:OVA|OAV|OAD)(?:$|[\s._\-\[\]()])",
+        clean,
+        re.IGNORECASE,
+    ):
+        return EpisodeKey("special", 0)
 
     if re.search(
         r"(?:^|[\s._\-\[\]()])(?:SP|SPECIAL|OVA|OAV|OAD)(?:$|[\s._\-\[\]()])",
@@ -1937,6 +2020,7 @@ def parse_ep_files(
     *,
     prefer_simplified: bool = False,
     defer_unnumbered_specials: bool = False,
+    allow_release_dash_ordinal: bool = False,
 ) -> dict[EpisodeKey, list[dict[str, Any]]]:
     groups: dict[EpisodeKey, list[dict[str, Any]]] = defaultdict(list)
     for raw_item in files:
@@ -1952,6 +2036,16 @@ def parse_ep_files(
         ext = Path(name).suffix.lower()
         if ext not in MEDIA_EXTS:
             continue
+        # ``Title - 01`` is deliberately *not* a global episode grammar: a
+        # title can contain its own numbers (``The 100 - 01``) and ordinary
+        # planning must not reinterpret them.  F enables this narrow branch
+        # only after D has freshly proved one homogeneous, catalog-complete
+        # release-dash run and supplied its explicit source-key map.
+        release_dash = (
+            release_dash_regular_episode(name)
+            if allow_release_dash_ordinal
+            else None
+        )
         multi_text = DATE_NOISE_RE.sub(" ", name)
         multi_clean = EPISODE_NOISE_RE.sub(" ", multi_text)
         # Release groups also write a single episode as ``S4 - 01``.  The
@@ -2008,6 +2102,8 @@ def parse_ep_files(
         )
         if key is None and titled_season_dash_episode is not None:
             key = EpisodeKey("regular", int(titled_season_dash_episode.group(1)))
+        if key is None and release_dash is not None:
+            key = EpisodeKey("regular", release_dash[1])
         if key is None and dual_number_episode is not None:
             key = EpisodeKey("regular", int(dual_number_episode.group(1)))
         if key is None and multi_match and multi_match.group(1) != multi_match.group(2):
@@ -2034,6 +2130,8 @@ def parse_ep_files(
                 and not re.fullmatch(
                     r"(?:season|s)\s*0*\d{1,3}", parent_name, re.IGNORECASE
                 )
+                and not re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", parent_name)
+                and not re.search(r"www\.[A-Za-z0-9.-]+\.(?:com|net|org|cn|tv)", parent_name, re.IGNORECASE)
             ):
                 key = extract_episode_key(parent_name)
         if key is not None:
@@ -2051,7 +2149,16 @@ def parse_ep_files(
                 Path(item["name"]).suffix.lower() in SUBTITLE_EXTS and is_simplified_sub(item["name"])
                 for item in items
             )
-            if explicit_simplified:
+            # A strict SRT proof is content evidence, whereas the historical
+            # SC/TC preference below is only a filename heuristic.  Preserve
+            # every proved/unproved SRT candidate for the global selector so
+            # an invalid ``.zh-CN`` cannot discard a valid ``.zh-TW`` fallback
+            # before it has a chance to rank bilingual > SC > TC.
+            has_managed_subtitle_candidate = any(
+                isinstance(item.get("_managed_subtitle_validation"), Mapping)
+                for item in items
+            )
+            if explicit_simplified and not has_managed_subtitle_candidate:
                 groups[key] = [
                     item
                     for item in items
@@ -2660,6 +2767,8 @@ def _filter_media(files: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
             continue
         if cleanup_reason(name) is not None or _contextual_cleanup_reason(item) is not None:
             continue
+        if ADVERTISEMENT_NAME_RE.search(name):
+            continue
         full_path = str(item.get("full_path") or "")
         if full_path and _collision_key(normalize_remote_path(full_path)) in contextual_cleanup:
             continue
@@ -2668,6 +2777,148 @@ def _filter_media(files: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if Path(name).suffix.lower() in MEDIA_EXTS:
             result.append(dict(item))
     return result
+
+
+def normalize_exported_srt_entries(
+    alist: Any,
+    files: Iterable[Mapping[str, Any]],
+    *,
+    original_language: object = None,
+    max_bytes: int = EXPORTED_SRT_MAX_BYTES,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Promote only content-proven ``.sc/.tc.srt.txt`` entries to SRT.
+
+    AList listings are immutable discovery evidence, so this helper creates
+    shallow entry copies and keeps ``full_path``/``size`` untouched.  The
+    canonical ``name`` is a planner-only projection; the executor therefore
+    still moves the exact provider basename from ``full_path``.  Every SRT
+    candidate is additionally given a bounded full-content proof used by the
+    global one-track selector.  Invalid or unreadable candidates remain in
+    the returned inventory with a structured marker and are never promoted
+    into a formal write.
+    """
+    normalized: list[dict[str, Any]] = []
+    issues: list[dict[str, str]] = []
+    reader = getattr(alist, "read_file_bytes", None)
+    if not callable(reader):
+        reader = getattr(alist, "read_file_prefix", None)
+    for raw in files:
+        item = dict(raw)
+        name = item.get("name")
+        full_path = item.get("full_path")
+        persisted_issue = item.get("_exported_srt_invalid")
+        if isinstance(persisted_issue, str) and persisted_issue:
+            if full_path and item.get("_exported_srt_issue_reported") is not True:
+                issues.append({
+                    "source_path": normalize_remote_path(str(full_path)),
+                    "reason": persisted_issue,
+                })
+                item["_exported_srt_issue_reported"] = True
+            normalized.append(item)
+            continue
+        if item.get("is_dir") or not isinstance(name, str):
+            normalized.append(item)
+            continue
+        path = str(full_path or "")
+        declared_size = _entry_size_value(item)
+        payload: bytes | None = None
+
+        # First project the provider's ``.sc/.tc.srt.txt`` spelling to a
+        # parser-facing SRT basename.  The physical source path is untouched.
+        if EXPORTED_SRT_SUFFIX_RE.search(name) is not None:
+            reason = "导出字幕不是可验证的 UTF-8 SRT"
+            if declared_size is not None and declared_size > max_bytes:
+                reason = f"导出字幕超过 {max_bytes} 字节内容校验上限"
+            elif not path or not callable(reader):
+                reason = "无法从来源读取导出字幕的完整内容"
+            else:
+                read_limit = declared_size or max_bytes
+                try:
+                    payload = reader(path, max_bytes=read_limit)
+                except (ApiError, OSError, ValueError, TypeError):
+                    payload = None
+                    reason = "读取导出字幕失败"
+            proof = (
+                validate_exported_srt_sidecar(
+                    name,
+                    payload,
+                    declared_size=declared_size,
+                    max_bytes=max_bytes,
+                )
+                if payload is not None
+                else None
+            )
+            if proof is None:
+                item["_exported_srt_invalid"] = reason
+                if path:
+                    issues.append({"source_path": normalize_remote_path(path), "reason": reason})
+                normalized.append(item)
+                continue
+            # Keep the exact source object and its declared snapshot metadata;
+            # only the parser-facing name is canonicalized.  This marker is
+            # later persisted in source-scope rows for replay auditing.
+            item["name"] = proof.normalized_name
+            item["_subtitle_source_name"] = proof.source_name
+            item["_subtitle_normalization"] = {
+                "format": proof.format,
+                "marker": proof.marker,
+                "language": proof.language,
+                "source_name": proof.source_name,
+                "normalized_name": proof.normalized_name,
+                "size": proof.size,
+                "source_path": normalize_remote_path(path),
+            }
+
+        # Content proof is intentionally limited to SRT.  Other subtitle
+        # containers remain on the historical deterministic selector lane;
+        # they are never allowed to outrank a proven SRT candidate.
+        if Path(str(item.get("name") or "")).suffix.lower() == ".srt":
+            if payload is None and path and callable(reader):
+                read_limit = declared_size or max_bytes
+                try:
+                    payload = reader(path, max_bytes=read_limit)
+                except (ApiError, OSError, ValueError, TypeError):
+                    payload = None
+            verdict = validate_managed_subtitle_content(
+                payload,
+                original_language,
+                declared_size=declared_size,
+                max_bytes=max_bytes,
+            )
+            verdict = dict(verdict)
+            verdict.update({
+                "source_path": normalize_remote_path(path) if path else "",
+                "source_name": (
+                    split_remote(normalize_remote_path(path))[1]
+                    if path else str(item.get("name") or "")
+                ),
+            })
+            item["_managed_subtitle_validation"] = verdict
+            if str(verdict.get("status") or "").casefold() == "satisfied":
+                chinese_language = verdict.get("chinese_language")
+                canonical_language = (
+                    "zh-TW"
+                    if chinese_language == "traditional_chinese"
+                    or verdict.get("selection") == "traditional_chinese"
+                    else "zh-CN"
+                )
+                current_name = str(item.get("name") or "")
+                stem = current_name[:-4] if current_name.casefold().endswith(".srt") else current_name
+                stem = re.sub(
+                    r"\.(?:sc|tc|zh-CN|zh-TW|zh-Hans|zh-Hant)$",
+                    "",
+                    stem,
+                    flags=re.IGNORECASE,
+                )
+                item["name"] = f"{stem}.{canonical_language}.srt"
+                normalization = item.get("_subtitle_normalization")
+                if isinstance(normalization, Mapping):
+                    normalization = dict(normalization)
+                    normalization["normalized_name"] = item["name"]
+                    normalization["language"] = canonical_language
+                    item["_subtitle_normalization"] = normalization
+        normalized.append(item)
+    return normalized, issues
 
 
 def cleanup_reason(name: str) -> str | None:
@@ -2693,7 +2944,8 @@ def _contextual_cleanup_reason(item: Mapping[str, Any]) -> str | None:
             re.I,
         )
         and re.search(
-            r"(?:^|[\s._\-\[\]()])(?:NC)?(?:OP|ED)(?:\d+(?:v\d+)?)?"
+            r"(?:^|[\s._\-\[\]()])(?:(?:NC)?(?:OP|ED)|MV|PV|MENU)"
+            r"(?:\d+(?:v\d+)?)?"
             r"(?:$|[\s._\-\[\]()])",
             name,
             re.I,
@@ -6437,6 +6689,7 @@ def build_tv_plan(
     episode_group_id: str | None = None,
     auto_special_title_match: bool = False,
     auto_align_subtitles: bool = False,
+    allow_release_dash_ordinal: bool = False,
     source_files: Sequence[Mapping[str, Any]] | None = None,
     media_root: str | None = None,
 ) -> Plan:
@@ -6525,6 +6778,15 @@ def build_tv_plan(
                 ignore_orphan_temp=ignore_orphan_temp,
                 include_bonus=True,
             )
+    # Provider text exports such as ``.sc.srt.txt`` are admitted to the
+    # ordinary parser only after a bounded, content-validated normalization.
+    # Keep the source object's real ``full_path`` untouched so the normal
+    # writer moves it without a provider-only side channel.
+    files, exported_srt_issues = normalize_exported_srt_entries(
+        alist,
+        files,
+        original_language=show.get("original_language"),
+    )
     cleanup_files = _planned_cleanup_files(files)
     # Keep destructive cleanup candidates out of every downstream episode
     # parser.  Computing ``cleanup_files`` alone is not sufficient: parsing
@@ -6575,6 +6837,7 @@ def build_tv_plan(
         media_files,
         prefer_simplified=False,
         defer_unnumbered_specials=auto_special_title_match,
+        allow_release_dash_ordinal=allow_release_dash_ordinal,
     )
     subtitle_alignment_applied = bool(
         auto_align_subtitles and _align_subtitles_to_video_sequence(all_groups)
@@ -6648,14 +6911,12 @@ def build_tv_plan(
             )
             for path in unparsed_videos
         ),
-        *(
-            PlannedProblem(
-                source_path=path,
-                reason="无对应视频或无法唯一编号的字幕；保留原位并标记规划未闭合",
-            )
-            for path in retained_subtitles
-        ),
     ]
+    if exported_srt_issues:
+        warnings.append(
+            f"{len(exported_srt_issues)} 个导出 .sc/.tc.srt.txt 字幕未通过"
+            " UTF-8/SRT 内容校验，已保留原位"
+        )
 
     def record_problem(source_path: str, reason: str, target_path: str | None = None) -> None:
         existing = next(
@@ -6679,6 +6940,7 @@ def build_tv_plan(
             media_files,
             prefer_simplified=True,
             defer_unnumbered_specials=auto_special_title_match,
+            allow_release_dash_ordinal=allow_release_dash_ordinal,
         )
         if prefer_simplified
         else all_groups
@@ -6899,13 +7161,6 @@ def build_tv_plan(
                     reason="无法唯一识别的附加视频；保留原位并标记规划未闭合",
                 )
                 for path in unparsed_videos
-            ),
-            *(
-                PlannedProblem(
-                    source_path=path,
-                    reason="无对应视频或无法唯一编号的字幕；保留原位并标记规划未闭合",
-                )
-                for path in retained_subtitles
             ),
         ]
         if unparsed_videos:
@@ -7271,6 +7526,11 @@ def build_tv_plan(
                 target_dir=season_dir,
                 episode_key=key.display,
             )
+            if isinstance(planned_item.subtitle_validation, Mapping):
+                proof = dict(planned_item.subtitle_validation)
+                proof["source_coordinate"] = key.display
+                proof["target_coordinate"] = episode_token
+                planned_item.subtitle_validation = proof
             planned.append(planned_item)
             planned_group.append(planned_item)
             if diagnostic_reason:
@@ -7378,6 +7638,11 @@ def build_tv_plan(
             "season": season,
             "absolute": absolute,
             "episode_group": episode_group_id,
+            "exported_srt_normalizations": [
+                dict(item["_subtitle_normalization"])
+                for item in files
+                if isinstance(item.get("_subtitle_normalization"), Mapping)
+            ],
         },
         cleanup_files=cleanup_files,
         problem_files=problem_files,
@@ -7388,14 +7653,25 @@ def build_tv_plan(
         # into a problem-file gate that would stop the verified media plan.
         scan_report={
             "deferred_subtitles": [
-                {
-                    "source_path": path,
-                    "action": "preserve_at_source",
-                    "reason": "preferred_simplified_subtitle",
-                }
-                for path in preferred_excluded_subtitle_paths
+                *(
+                    {
+                        "source_path": path,
+                        "action": "preserve_at_source",
+                        "reason": "preferred_simplified_subtitle",
+                    }
+                    for path in preferred_excluded_subtitle_paths
+                ),
+                *(
+                    {
+                        "source_path": issue["source_path"],
+                        "action": "preserve_at_source",
+                        "reason": "invalid_exported_srt",
+                        "detail": issue["reason"],
+                    }
+                    for issue in exported_srt_issues
+                ),
             ],
-        } if preferred_excluded_subtitle_paths else {},
+        } if preferred_excluded_subtitle_paths or exported_srt_issues else {},
     )
     if not absolute and season > 0:
         try:
@@ -7417,7 +7693,11 @@ def build_tv_plan(
             if episode_gaps:
                 plan.scan_report["resource_gaps"] = episode_gaps
     _add_snapshot_warnings(plan)
-    validate_plan(alist, plan, media_root=media_root)
+    validate_plan(
+        alist,
+        plan,
+        media_root=media_root,
+    )
     return plan
 
 
@@ -9789,14 +10069,8 @@ def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
     if not unpaired:
         return
 
-    known_problems = {_collision_key(item.source_path) for item in plan.problem_files}
-    for item in unpaired:
-        if _collision_key(item.source_path) not in known_problems:
-            plan.problem_files.append(PlannedProblem(
-                source_path=item.source_path,
-                target_path=join_remote(item.target_dir, item.final_name),
-                reason="没有对应视频，自动规划未闭合；字幕保留在来源目录",
-            ))
+    # An orphan subtitle has no video to ingest: it stays at source and is
+    # recorded as a resource gap below, not as a blocking plan problem.
     gaps = plan.scan_report.setdefault("resource_gaps", [])
     if not isinstance(gaps, list):
         raise PlanError("scan_report.resource_gaps 必须是数组")
@@ -9908,12 +10182,100 @@ def _same_concrete_movie_release(
     )
 
 
+def _revalidate_managed_subtitle(
+    alist: Any,
+    item: PlannedFile,
+) -> None:
+    """Fresh-read a selected managed subtitle before formal validation.
+
+    The proof is intentionally attached to the selected ``PlannedFile``
+    rather than trusted from a plan-level summary.  A restart may observe a
+    same-size replacement at the source path; recomputing the content verdict
+    catches that drift before the writer can move it.
+    """
+    proof = item.subtitle_validation
+    if not isinstance(proof, Mapping):
+        return
+    if item.media_kind != "subtitle":
+        raise PlanError("字幕内容证明绑定到了非字幕文件")
+    source_path = normalize_remote_path(item.source_path)
+    proof_path = normalize_remote_path(str(proof.get("source_path") or ""))
+    if proof_path != source_path:
+        raise PlanError(f"字幕内容证明来源不匹配: {source_path}")
+    declared_size = item.source_size
+    if (
+        isinstance(declared_size, bool)
+        or not isinstance(declared_size, int)
+        or declared_size <= 0
+        or declared_size > EXPORTED_SRT_MAX_BYTES
+    ):
+        raise PlanError(f"字幕内容证明缺少有效来源大小: {source_path}")
+    proof_size = proof.get("size")
+    if proof_size != declared_size:
+        raise PlanError(f"字幕内容证明大小不匹配: {source_path}")
+    proof_name = str(proof.get("source_name") or "")
+    if proof_name and proof_name != item.original_name:
+        raise PlanError(f"字幕内容证明文件名不匹配: {source_path}")
+
+    exact_info = getattr(alist, "exact_file_info", None)
+    if callable(exact_info):
+        try:
+            observed = exact_info(source_path)
+        except Exception as exc:  # pragma: no cover - transport-specific
+            raise PlanError(f"无法 fresh 核验字幕来源: {source_path}") from exc
+        if isinstance(observed, Mapping):
+            observed_size = observed.get("size")
+            if observed_size != declared_size:
+                raise PlanError(f"字幕来源大小已漂移: {source_path}")
+
+    reader = getattr(alist, "read_file_bytes", None)
+    if not callable(reader):
+        reader = getattr(alist, "read_file_prefix", None)
+    if not callable(reader):
+        raise PlanError(f"无法读取已选字幕来源进行内容复核: {source_path}")
+    try:
+        try:
+            payload = reader(source_path, max_bytes=declared_size)
+        except TypeError:
+            payload = reader(source_path, declared_size)
+    except Exception as exc:  # pragma: no cover - transport-specific
+        raise PlanError(f"读取已选字幕来源失败: {source_path}") from exc
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise PlanError(f"已选字幕来源读取结果无效: {source_path}")
+    verdict = validate_managed_subtitle_content(
+        bytes(payload),
+        proof.get("original_language"),
+        declared_size=declared_size,
+        max_bytes=EXPORTED_SRT_MAX_BYTES,
+    )
+    if str(verdict.get("status") or "").casefold() != "satisfied":
+        raise PlanError(
+            f"已选字幕内容证明失效: {source_path} ({verdict.get('reason')})"
+        )
+    if verdict.get("preference") != proof.get("preference"):
+        raise PlanError(f"已选字幕优先级证明已变化: {source_path}")
+    if verdict.get("selection") != proof.get("selection"):
+        raise PlanError(f"已选字幕语言证明已变化: {source_path}")
+    target_coordinate = proof.get("target_coordinate")
+    if (
+        isinstance(target_coordinate, str)
+        and target_coordinate
+        and target_coordinate != "movie"
+        and target_coordinate not in Path(item.final_name).stem
+    ):
+        raise PlanError(f"已选字幕目标集坐标不匹配: {source_path}")
+
+
 def validate_plan(
     alist: AListClient,
     plan: Plan,
     *,
     media_root: str | None = None,
 ) -> None:
+    # Apply the same one-track selector used by persisted-plan finalization
+    # before any destination collision checks.  This keeps direct planner
+    # callers and restart/recovery validation on the exact writer input.
+    _retain_one_subtitle_track_per_exact_video(plan)
     _demote_unpaired_subtitles(alist, plan)
     _restrict_cleanup_to_allowlist(plan)
     if not plan.files:
@@ -9928,6 +10290,23 @@ def validate_plan(
 
     source_root = normalize_remote_path(plan.source_root).rstrip("/") or "/"
     target_root = normalize_remote_path(plan.target_root).rstrip("/") or "/"
+    exported_srt_proofs: dict[str, Mapping[str, Any]] = {}
+    raw_exported_proofs = (
+        plan.metadata.get("exported_srt_normalizations", [])
+        if isinstance(plan.metadata, Mapping)
+        else []
+    )
+    if raw_exported_proofs is None:
+        raw_exported_proofs = []
+    if not isinstance(raw_exported_proofs, list):
+        raise PlanError("exported_srt_normalizations 必须是数组")
+    for proof in raw_exported_proofs:
+        if not isinstance(proof, Mapping):
+            raise PlanError("exported_srt_normalizations 包含无效行")
+        proof_path = normalize_remote_path(str(proof.get("source_path", "")))
+        if proof_path in exported_srt_proofs:
+            raise PlanError(f"导出字幕证明重复: {proof_path}")
+        exported_srt_proofs[proof_path] = proof
     try:
         placement_for(source_root, target_root, media_root=media_root)
     except ValueError as exc:
@@ -9989,19 +10368,40 @@ def validate_plan(
 
     for item in plan.files:
         source_path = normalize_remote_path(item.source_path)
-        if _media_quality.is_production_test_media_path(source_path):
-            raise PlanError(
-                "保留的生产 E2E 测试来源路径不得进入正式媒体计划: "
-                f"{source_path}"
-            )
         source_dir = normalize_remote_path(item.source_dir)
         target_dir = normalize_remote_path(item.target_dir)
         expected_dir, expected_name = split_remote(source_path)
         register_path_spelling(source_dir, "源目录")
         register_path_spelling(target_dir, "目标目录")
-        original_name = _validate_remote_basename(item.original_name)
+        original_name = _validate_remote_source_basename(item.original_name)
         final_name = _validate_remote_basename(item.final_name)
-        expected_media_kind = media_kind(original_name)
+        declared_source_kind = item.source_media_kind
+        if declared_source_kind is not None and declared_source_kind not in {"video", "subtitle"}:
+            raise PlanError(
+                "计划包含不受支持的 source_media_kind: "
+                f"{item.source_path}"
+            )
+        _revalidate_managed_subtitle(alist, item)
+        if declared_source_kind == "subtitle" and Path(original_name).suffix.lower() == ".txt":
+            proof = exported_srt_proofs.get(source_path)
+            if (
+                proof is None
+                or proof.get("format") != "srt"
+                or proof.get("size") != item.source_size
+                or proof.get("source_name") != original_name
+                or proof.get("language") not in {"zh-CN", "zh-TW"}
+                or subtitle_language(item.final_name) != proof.get("language")
+            ):
+                raise PlanError(
+                    "导出字幕缺少与来源/目标绑定的内容证明: "
+                    f"{item.source_path}"
+                )
+        expected_media_kind = declared_source_kind or media_kind(original_name)
+        if expected_media_kind == "disc_image":
+            raise PlanError(
+                "光盘镜像容器必须先完成只读安全内容展开；"
+                f"禁止直接进入正式媒体计划: {item.source_path}"
+            )
         if item.media_kind != expected_media_kind:
             raise PlanError(
                 "计划媒体类型与源文件扩展名不一致，拒绝绕过正式媒体准入: "
@@ -10080,7 +10480,7 @@ def validate_plan(
         source_dir = normalize_remote_path(item.source_dir)
         expected_dir, expected_name = split_remote(source_path)
         register_path_spelling(source_dir, "清理目录")
-        original_name = _validate_remote_basename(item.original_name)
+        original_name = _validate_remote_source_basename(item.original_name)
         if source_dir != expected_dir or original_name != expected_name:
             raise PlanError(f"计划清理项的路径、目录或文件名不一致: {item.source_path}")
         source_prefix = source_root_folded.rstrip("/") + "/"
@@ -10341,6 +10741,7 @@ def validate_plan(
     # 已有前者的媒体库。在没有完成跨库 ffprobe/字幕/画质比较前，
     # 安全行为是拒绝执行，而不是制造双版本。
     target_dirs = sorted({normalize_remote_path(item.target_dir) for item in plan.files})
+
     for target_dir in target_dirs:
         content = alist.try_list(target_dir, refresh=True)
         if content is None:
@@ -10385,13 +10786,18 @@ def validate_plan(
                 _planned_companion_key(target_dir, item.final_name), []
             ):
                 name = str(entry["name"])
-                if _collision_key(name) == _collision_key(item.final_name):
-                    continue
                 current_path = join_remote(target_dir, name)
                 if _collision_key(current_path) == _collision_key(
                     normalize_remote_path(item.source_path)
                 ):
                     continue
+                if _collision_key(name) == _collision_key(item.final_name):
+                    # The same-name case was already checked above; retaining
+                    # this branch prevents an unusual extension from bypassing
+                    # the exact-name conflict check.
+                    raise FormalTargetConflictError(
+                        f"目标目录已存在同名视频: {current_path}"
+                    )
                 occupying_item = source_items.get(_collision_key(current_path))
                 if occupying_item is not None and occupying_item.requires_rename:
                     continue
@@ -10455,6 +10861,7 @@ __all__ = [
     "build_movie_plan",
     "build_tv_plan_smart",
     "join_remote",
+    "normalize_exported_srt_entries",
     "planned_artwork",
     "planned_nfos",
     "split_remote",

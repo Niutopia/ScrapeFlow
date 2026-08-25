@@ -9,6 +9,8 @@ from pathlib import Path
 
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
+    build_root_boundary_analysis,
+    load_source_manifest,
     walk_source_rows,
 )
 from engine.scrapeflow.work_units import load_work_unit_records
@@ -108,6 +110,188 @@ class RootBoundaryCompositionTests(unittest.TestCase):
         records, _loaded, _alist = self._analyze("subtitle_only")
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].role, "subtitle_group")
+
+    def test_disc_image_source_persists_visible_content_expansion_attention(self) -> None:
+        root = "/incoming/Disc source"
+        alist = DictAList({
+            root: [
+                {"name": "Season 01", "is_dir": True},
+                {"name": "Season 02", "is_dir": True},
+            ],
+            f"{root}/Season 01": [
+                {"name": "Disc 1.iso", "is_dir": False, "size": 45 * 1024**3},
+            ],
+            f"{root}/Season 02": [
+                {"name": "Disc 2.iso", "is_dir": False, "size": 45 * 1024**3},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-disc", state_root=state_root,
+            )
+            loaded = load_work_unit_records(state_root, "root-disc")
+
+        self.assertEqual(records, loaded)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertTrue(record.requires_content_expansion)
+        self.assertEqual(record.identity_status, "uncertain")
+        self.assertEqual(record.media_context, "unknown")
+        self.assertIsNone(record.identity)
+        self.assertIn("只读安全内容展开", record.attention or "")
+
+    def test_executable_masquerade_source_requires_expansion_not_silent_skip(self) -> None:
+        root = "/incoming/Masquerade"
+        alist = DictAList({
+            root: [
+                {"name": "Show S1", "is_dir": True},
+            ],
+            f"{root}/Show S1": [
+                {"name": "[FSH] Show - 01 [BD].exe", "is_dir": False, "size": 400 * 1024**3},
+                {"name": "[FSH] Show - 02 [BD].exe", "is_dir": False, "size": 400 * 1024**3},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-exe", state_root=state_root,
+            )
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertTrue(record.requires_content_expansion)
+        self.assertEqual(record.identity_status, "uncertain")
+        self.assertIn("伪装视频 .exe", record.attention or "")
+
+    def test_boundary_snapshot_persists_exact_source_object_manifest(self) -> None:
+        root = "/incoming/Exact"
+        alist = DictAList({
+            root: [
+                {"name": "Season 01", "is_dir": True, "size": 0},
+                {"name": "poster.jpg", "is_dir": False, "size": 7, "version": "v1"},
+            ],
+            f"{root}/Season 01": [
+                {"name": "E01.mkv", "is_dir": False, "size": 1024, "mtime": "m1"},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-exact", state_root=state_root,
+            )
+            manifest = load_source_manifest(state_root, "root-exact")
+
+        self.assertTrue(records)
+        self.assertIsNotNone(manifest)
+        assert manifest is not None
+        self.assertEqual(manifest.root_path, root)
+        self.assertEqual(
+            manifest.object_paths,
+            (f"{root}/Season 01", f"{root}/Season 01/E01.mkv", f"{root}/poster.jpg"),
+        )
+        self.assertEqual(manifest.object_at(f"{root}/Season 01/E01.mkv").size, 1024)  # type: ignore[union-attr]
+
+    def test_boundary_snapshot_records_missing_exact_object_metadata_without_faking_it(self) -> None:
+        root = "/incoming/No-size"
+        alist = DictAList({
+            root: [{"name": "E01.mkv", "is_dir": False}],
+        })
+        snapshot, _records = build_root_boundary_analysis(
+            alist, root, root_task_id="root-no-size",
+        )
+
+        self.assertNotIn("source_manifest", snapshot)
+        self.assertIn("source_manifest_error", snapshot)
+
+    def test_decorated_sibling_seasons_persist_one_exact_multi_source_unit(self) -> None:
+        root = "/incoming/Northwind Bundle"
+        entries: dict[str, list[dict[str, object]]] = {
+            root: [
+                *[
+                    {"name": f"Northwind.Show.S{season:02d}.1080p", "is_dir": True}
+                    for season in (1, 2, 3, 4)
+                ],
+                {"name": "Northwind.Aftershow", "is_dir": True},
+            ],
+            f"{root}/Northwind.Show.S04.1080p": [],
+            f"{root}/Northwind.Aftershow": [
+                {"name": "Northwind.Aftershow.E01.mkv", "is_dir": False, "size": 10},
+            ],
+        }
+        for season in (1, 2, 3):
+            entries[f"{root}/Northwind.Show.S{season:02d}.1080p"] = [
+                {
+                    "name": f"Northwind.Show.S{season:02d}E01.mkv",
+                    "is_dir": False,
+                    "size": 10,
+                },
+            ]
+        alist = DictAList(entries)
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-northwind", state_root=state_root,
+            )
+            loaded = load_work_unit_records(state_root, "root-northwind")
+
+        self.assertEqual(records, loaded)
+        self.assertEqual(len(records), 2)
+        cohort = next(record for record in records if len(record.source_paths) == 4)
+        self.assertEqual(cohort.claimed_seasons, (1, 2, 3, 4))
+        self.assertEqual(cohort.source_revision, 1)
+        self.assertTrue(all(record.identity_status == "pending" for record in records))
+
+    def test_mixed_season_and_generic_film_group_persist_disjoint_units(self) -> None:
+        """B/W must persist a TV scope separate from nested film title scopes."""
+        root = "/incoming/Example Show"
+        alist = DictAList({
+            root: [
+                {"name": "S01", "is_dir": True},
+                {"name": "S02", "is_dir": True},
+                {"name": "SP", "is_dir": True},
+                {"name": "剧场版", "is_dir": True},
+            ],
+            f"{root}/S01": [
+                {"name": "Example.Show.S01E01.mkv", "is_dir": False, "size": 1_073_741_824},
+            ],
+            f"{root}/S02": [
+                {"name": "Example.Show.S02E01.mkv", "is_dir": False, "size": 1_073_741_824},
+            ],
+            f"{root}/SP": [
+                {"name": "Example.Show.S00E01.mkv", "is_dir": False, "size": 536_870_912},
+            ],
+            f"{root}/剧场版": [
+                {"name": "Example Feature (2019)", "is_dir": True},
+                {"name": "Example Reminiscence (2021)", "is_dir": True},
+            ],
+            f"{root}/剧场版/Example Feature (2019)": [
+                {"name": "Example.Feature.2019.mkv", "is_dir": False, "size": 2_147_483_648},
+            ],
+            f"{root}/剧场版/Example Reminiscence (2021)": [
+                {"name": "Example.Reminiscence.2021.mkv", "is_dir": False, "size": 2_147_483_648},
+                {"name": "Example.Reminiscence.Promo.mkv", "is_dir": False, "size": 67_108_864},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-mixed", state_root=state_root,
+            )
+            loaded = load_work_unit_records(state_root, "root-mixed")
+
+        self.assertEqual(records, loaded)
+        self.assertEqual(len(records), 3)
+        tv = next(record for record in records if record.display_label == "Example Show")
+        self.assertEqual(tv.role, "single_work")
+        self.assertEqual(tv.source_paths, (f"{root}/S01", f"{root}/S02", f"{root}/SP"))
+        self.assertEqual(tv.claimed_seasons, (1, 2))
+        self.assertEqual(
+            {record.source_paths for record in records if record is not tv},
+            {
+                (f"{root}/剧场版/Example Feature (2019)",),
+                (f"{root}/剧场版/Example Reminiscence (2021)",),
+            },
+        )
 
 
 class WalkSourceRowsTests(unittest.TestCase):

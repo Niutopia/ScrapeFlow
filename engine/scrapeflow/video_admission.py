@@ -76,7 +76,12 @@ def _run_video_probe(
 
     command = [
         _ffprobe_binary(ffprobe_path),
-        "-nostdin",
+        # ffprobe does not expose ffmpeg's ``-nostdin`` option on the
+        # Debian/Bookworm build used by the API image (it interprets the next
+        # flag as the option value and exits non-zero).  We only ever pass a
+        # concrete local path or a validated HTTP URL, so ffprobe has no
+        # interactive stdin to consume; omitting the unsupported flag keeps
+        # the bounded probe portable across supported ffprobe builds.
         "-v", "error",
         "-rw_timeout", str(FFPROBE_RW_TIMEOUT_US),
         "-probesize", str(FFPROBE_PROBE_BYTES),

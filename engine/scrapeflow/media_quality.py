@@ -15,7 +15,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Collection, Mapping
 
-from .media_policy import VIDEO_EXTENSIONS
+from .media_policy import DISC_IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 
 
 # A regular feature-length film or episode is many orders of magnitude larger
@@ -62,42 +62,17 @@ def is_video_filename(value: object) -> bool:
     )
 
 
-def is_production_test_media_path(value: object) -> bool:
-    """Recognize legacy E2E-only AList source trees, case-insensitively.
-
-    Historical smoke harnesses used the production AList and created source
-    trees below these prefixes.  They must never be interpreted as user media
-    by a normal plan or by restart recovery.  Match complete path components
-    so ordinary task-owned ``audit-<job>/attempt-<id>`` staging continues to
-    work unchanged.
-    """
-    if not isinstance(value, str):
-        return False
-    parts = [
-        unicodedata.normalize("NFKC", part).casefold()
-        for part in value.replace("\\", "/").split("/")
-        if part not in {"", "."}
-    ]
-    for index, part in enumerate(parts):
-        if (
-            part == "待刮削"
-            and index + 1 < len(parts)
-            and parts[index + 1].startswith("scrapeflow-e2e-")
-        ):
-            return True
-        if (
-            part == "scrapeflow"
-            and index + 2 < len(parts)
-            and parts[index + 1] == "补源"
-            and parts[index + 2].startswith("e2e-")
-        ):
-            return True
-    return False
-
-
 def media_kind(name: str, *, video_exts: Collection[str]) -> str:
-    """Classify a filename using the Engine-owned video extension set."""
+    """Classify a planned filename using the Engine-owned media policy.
+
+    ``disc_image`` is intentionally a third value: formal plan validation
+    rejects it before a plan can be persisted or executed.  Returning it here
+    rather than silently treating it as a subtitle makes forged/legacy plan
+    rows fail for the real reason.
+    """
     ext = Path(name).suffix.lower()
+    if ext in DISC_IMAGE_EXTENSIONS:
+        return "disc_image"
     return "video" if ext in video_exts else "subtitle"
 
 
@@ -166,7 +141,6 @@ __all__ = [
     "ABSOLUTE_MINIMUM_VIDEO_BYTES",
     "DEFAULT_MINIMUM_VIDEO_BYTES",
     "VIDEO_FILE_EXTENSIONS",
-    "is_production_test_media_path",
     "is_video_filename",
     "media_kind",
     "minimum_video_bytes",

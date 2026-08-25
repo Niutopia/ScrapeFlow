@@ -29,6 +29,27 @@ class RootJobAggregate:
     open_gaps: int
     closed_gaps: int
 
+    @property
+    def status(self) -> str:
+        """Return the root-level completion state represented by this ledger.
+
+        An accepted H/readback result does not close a J Gap.  Keep that
+        distinction explicit in the aggregate so callers cannot infer
+        ``completed`` merely from every media unit having an acceptance row.
+        The precedence mirrors the R node: technical failure and evidence
+        attention win first, then unfinished units, then open replenishment
+        gaps, and only finally the completed state.
+        """
+        if self.failed:
+            return "failed"
+        if self.attention:
+            return "needs_attention"
+        if self.in_progress:
+            return "in_progress"
+        if self.open_gaps:
+            return "gaps_pending"
+        return "completed"
+
     def as_dict(self) -> dict[str, object]:
         return {
             "root_task_id": self.root_task_id,
@@ -39,6 +60,7 @@ class RootJobAggregate:
             "failed": self.failed,
             "open_gaps": self.open_gaps,
             "closed_gaps": self.closed_gaps,
+            "status": self.status,
         }
 
 
@@ -55,6 +77,16 @@ def aggregate_root_job(state_root: Path, root_task_id: str) -> RootJobAggregate:
     failed = 0
     for record in records:
         result = acceptance.get(record.work_unit_id)
+        # J has its own post-write durable state.  A writer may already have
+        # passed exact formal-library readback while catalog evidence is still
+        # insufficient, or while the local gap ledger could not be persisted.
+        # Do not let the accepted G/H carrier hide either condition.
+        if record.gap_status == "failed":
+            failed += 1
+            continue
+        if record.gap_status == "attention":
+            attention += 1
+            continue
         if record.identity_status in {"uncertain", "failed"}:
             attention += 1
             continue
@@ -116,7 +148,8 @@ def public_work_unit_row(
         "work_unit_id": record.work_unit_id,
         "boundary_key": record.boundary_key,
         "display_label": (
-            str(record.boundary_key).rstrip("/").rsplit("/", 1)[-1]
+            str(record.display_label or "").strip()
+            or str(record.boundary_key).rstrip("/").rsplit("/", 1)[-1]
             or record.boundary_key
         ),
         "role": record.role,
@@ -137,6 +170,8 @@ def public_work_unit_row(
         "reconciliation_outcome": record.reconciliation_outcome,
         "matched_work_root": record.matched_work_root,
         "lane_status": record.lane_status,
+        "gap_status": record.gap_status,
+        "gap_detail": record.gap_detail,
         "acceptance": (
             {
                 "outcome": result.outcome,

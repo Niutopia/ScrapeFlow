@@ -3,31 +3,44 @@ and typed acceptance."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from engine.scrapeflow.errors import PlanError
+from engine.scrapeflow.current_plan import plan_to_dict
 from engine.scrapeflow.models import Plan, PlannedFile
+from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.unit_identity import apply_work_unit_override
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_units import load_work_unit_records, save_work_unit_records
 
 from local.scrapeflow_api.library_index import reconcile_root_work_units
+from local.scrapeflow_api.tmdb_episode_catalog import TmdbEpisodeCatalog
 from local.scrapeflow_api.simple_engine_runner import (
     EnginePauseRequested,
+    SimplePlanExecutor,
     SimpleEngineRunner,
+    recover_persisted_engine_jobs,
 )
 from local.scrapeflow_api.unit_execution import (
+    GapDiscoveryAttention,
     _register_unit_episode_gaps,
     _request_for_unit,
     execute_new_work_units,
     load_work_acceptance,
 )
 
-from local.tests.test_library_index import IndexAList
-from local.tests.test_simple_engine_runner import FAKE_VIDEO_BYTES, FAKE_VIDEO_SIZE
+from local.tests.test_library_index import IndexAList, _nfo_tv
+from local.tests.test_simple_engine_runner import (
+    FAKE_VIDEO_BYTES,
+    FAKE_VIDEO_SIZE,
+    FakeAList,
+)
 
 
 def _recording_planner(events: list[dict], *, fail_for: str | None = None):
@@ -113,6 +126,86 @@ class MultiSeasonTMDB:
                     ],
                 }
         return {}
+
+
+class BareEpisodePlanningTMDB:
+    """One complete published regular season used to prove the D→F→J bridge."""
+
+    def __init__(
+        self,
+        tmdb_id: int,
+        episode_count: int,
+        *,
+        specials: int = 0,
+    ) -> None:
+        self.tmdb_id = tmdb_id
+        self.episode_count = episode_count
+        self.specials = specials
+
+    def get(self, path: str, **_params: object) -> dict[str, object]:
+        if path == f"/tv/{self.tmdb_id}":
+            return {
+                "name": "One Season Show",
+                "original_name": "One Season Show",
+                "first_air_date": "2020-01-01",
+                "number_of_seasons": 1,
+                "number_of_episodes": self.episode_count,
+                "seasons": (
+                    ([{
+                        "season_number": 0,
+                        "episode_count": self.specials,
+                        "name": "Specials",
+                    }] if self.specials else [])
+                    + [{
+                        "season_number": 1,
+                        "episode_count": self.episode_count,
+                        "name": "Season 1",
+                    }]
+                ),
+            }
+        if path == f"/tv/{self.tmdb_id}/season/1":
+            return {
+                "episodes": [
+                    {
+                        "episode_number": episode,
+                        "air_date": "2020-01-01",
+                        "name": f"Episode {episode}",
+                    }
+                    for episode in range(1, self.episode_count + 1)
+                ],
+            }
+        if path == f"/tv/{self.tmdb_id}/season/0":
+            return {
+                "episodes": [
+                    {
+                        "episode_number": episode,
+                        "air_date": "2020-01-01",
+                        "name": f"Special {episode}",
+                    }
+                    for episode in range(1, self.specials + 1)
+                ],
+            }
+        return {}
+
+
+class BareEpisodePlanningAList(IndexAList):
+    """Index double with the read-only walk surface used by the real planner."""
+
+    def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        return self.list(path, refresh=refresh)
+
+    def walk(self, path: str, **_kwargs: object) -> list[dict[str, object]]:
+        prefix = path.rstrip("/") + "/"
+        return [
+            {
+                "name": full_path.rsplit("/", 1)[-1],
+                "full_path": full_path,
+                "size": len(payload),
+                "is_dir": False,
+            }
+            for full_path, payload in sorted(self.files.items())
+            if full_path.startswith(prefix)
+        ]
 
 
 class UnitExecutionTests(unittest.TestCase):
@@ -258,6 +351,142 @@ class UnitExecutionTests(unittest.TestCase):
         self.assertEqual(len(planner_events), 1)
         self.assertEqual(len(executor_events), 1)
 
+    def test_disc_image_stale_new_work_record_cannot_reach_planner_or_writer(self) -> None:
+        """F repeats the B/C barrier even if persisted state was stale/forged."""
+        source = "/incoming/disc"
+        state_root, alist, runner, planner_events, executor_events = self._setup({
+            f"{source}/Season 01.iso": b"i" * (1024 * 1024),
+        })
+        root_task_id = "root-disc-f"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        self.assertTrue(record.requires_content_expansion)
+        # Simulate a legacy state written before the B/C ISO gate existed.
+        stale = replace(
+            record,
+            requires_content_expansion=False,
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 101},
+            reconciliation_outcome="new_work",
+            attention=None,
+        )
+        save_work_unit_records(state_root, root_task_id, [stale])
+
+        results = execute_new_work_units(runner, state_root, root_task_id)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].outcome, "skipped")
+        self.assertIn("光盘镜像", results[0].error or "")
+        self.assertEqual(planner_events, [])
+        self.assertEqual(executor_events, [])
+        parked = load_work_unit_records(state_root, root_task_id)[0]
+        self.assertTrue(parked.requires_content_expansion)
+        self.assertEqual(parked.identity_status, "uncertain")
+        self.assertIsNone(parked.reconciliation_outcome)
+
+    def test_explicit_chinese_scope_season_reaches_planner_request(self) -> None:
+        """A season-directory source keeps its B/W season when F builds a request.
+
+        The smart planner receives paths relative to ``source_path``.  When
+        that path is itself ``第二季``, the parent marker is no longer present
+        in the relative filename, so F must carry the independently proved
+        scope season instead of falling back to EngineRequest's Season 01
+        default.
+        """
+        source = "/incoming/某剧第二季"
+        files = {
+            f"{source}/[{episode:02d}].mkv": FAKE_VIDEO_BYTES
+            for episode in range(1, 3)
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiSeasonTMDB(91001, {1: 2, 2: 2}),
+        )
+        root_task_id = "root-explicit-cjk-season"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root,
+            root_task_id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=91001,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+
+        request = _request_for_unit(runner, record, root_task_id, state_root)
+
+        self.assertEqual(request.season, 2)
+        self.assertEqual(request.source_path, source)
+
+    def test_explicit_scope_season_rejects_conflicting_file_marker(self) -> None:
+        """A contradictory SxxExx marker cannot silently choose a season."""
+        source = "/incoming/某剧第二季"
+        files = {f"{source}/某剧.S03E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiSeasonTMDB(91002, {1: 1, 2: 1}),
+        )
+        root_task_id = "root-conflicting-scope-season"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root,
+            root_task_id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=91002,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+
+        with self.assertRaisesRegex(ValueError, "来源文件显式季号与目录季号冲突"):
+            _request_for_unit(runner, record, root_task_id, state_root)
+
+        self.assertEqual(alist.move_calls, [])
+
+    def test_explicit_scope_season_ignores_s00_specials_bucket(self) -> None:
+        """S00 specials beside S01 are one season, not a boundary conflict."""
+        source = "/incoming/某剧第一季"
+        files = {
+            f"{source}/某剧.S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/某剧.S00E02.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiSeasonTMDB(91003, {1: 1}),
+        )
+        root_task_id = "root-s00-specials-not-conflict"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root,
+            root_task_id,
+            record.work_unit_id,
+            media_type="tv",
+            tmdb_id=91003,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+
+        request = _request_for_unit(runner, record, root_task_id, state_root)
+
+        self.assertEqual(request.season, 1)
+
     def test_root_scope_pause_after_plan_blocks_unit_formal_writer(self) -> None:
         """F/G/H must pass the root predicate into the child executor."""
         files = {"/incoming/one/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
@@ -347,6 +576,706 @@ class UnitExecutionTests(unittest.TestCase):
             {f"S01E{episode:02d}" for episode in range(2, 11)},
         )
 
+    def test_complete_bare_e_proof_is_revalidated_for_f_and_read_by_j(self) -> None:
+        """D's automatic season proof is not an EngineRequest default.
+
+        The real TV planner receives an explicit, freshly revalidated S01;
+        its final names then give J exact S01E01..E06 coordinates with no
+        fabricated gaps.  This is read/plan-only: no writer is invoked.
+        """
+        tmdb_id = 99101
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 6)
+        source = "/quark/影视/待刮削/One Season Show"
+        files = {
+            f"{source}/One.Season.Show.E{episode:02d}.mkv": FAKE_VIDEO_BYTES
+            for episode in range(1, 7)
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bare-f-j"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="us_tv")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root,
+                root_task_id,
+                record.work_unit_id,
+                media_type="tv",
+                tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist,
+                "/quark/影视",
+                state_root,
+                root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb),
+                tmdb_client=tmdb,
+            )
+            record = reconciled[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertIsNotNone(record.reconciliation_evidence)
+
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(request.season, 1)
+            plan = runner._build_plan(request)  # noqa: SLF001 - F planner seam
+            primary_tokens = {
+                f"S{season:02d}E{episode:02d}"
+                for item in plan.files
+                if item.media_kind == "video"
+                for season, episode in audit_episode_tokens(item.final_name)
+            }
+            self.assertEqual(
+                primary_tokens,
+                {f"S01E{episode:02d}" for episode in range(1, 7)},
+            )
+            self.assertEqual(
+                _register_unit_episode_gaps(
+                    runner,
+                    state_root,
+                    root_task_id,
+                    record,
+                    plan_to_dict(plan),
+                ),
+                [],
+            )
+
+            # Changing a source object after D invalidates the persisted
+            # receipt; F stops before it could plan or write anything.
+            del alist.files[f"{source}/One.Season.Show.E06.mkv"]
+            alist.files[f"{source}/One.Season.Show.E07.mkv"] = FAKE_VIDEO_BYTES
+            with self.assertRaisesRegex(ValueError, "D 裸 E 季集证据"):
+                _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(alist.move_calls, [])
+
+    def test_release_dash_proof_is_revalidated_for_f(self) -> None:
+        """F repeats the exact D release-dash proof before planning.
+
+        A dash ordinal alone is not a planner default.  Only the persisted
+        D receipt from the shared proof turns this source into explicit S01;
+        source drift then stops F before it can build or write a plan.
+        """
+        prefixes = (
+            "[LoliHouse] Akuyaku Reijou Level 99",
+            "[Group] The 100",
+            "[Group] Show 2",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            for index, prefix in enumerate(prefixes):
+                with self.subTest(prefix=prefix):
+                    tmdb_id = 99103 + index
+                    tmdb = BareEpisodePlanningTMDB(tmdb_id, 3)
+                    source = f"/quark/影视/待刮削/Release Dash {index}"
+                    names = [
+                        (
+                            f"{prefix} - {episode:02d} "
+                            "[WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
+                        )
+                        for episode in range(1, 4)
+                    ]
+                    files = {
+                        f"{source}/{name}": FAKE_VIDEO_BYTES for name in names
+                    }
+                    alist = BareEpisodePlanningAList(files)
+                    runner = SimpleEngineRunner(
+                        state_root,
+                        alist=alist,
+                        tmdb=tmdb,
+                        validate=False,
+                        library_root="/quark/影视",
+                    )
+                    root_task_id = f"root-release-dash-f-{index}"
+                    pending = runner.create_pending_job(source, job_id=root_task_id)
+                    runner.start_automatic_job(pending.id, target_shelf="anime")
+                    analyze_root_boundaries(
+                        alist,
+                        source,
+                        root_task_id=root_task_id,
+                        state_root=state_root,
+                    )
+                    record = load_work_unit_records(state_root, root_task_id)[0]
+                    apply_work_unit_override(
+                        state_root,
+                        root_task_id,
+                        record.work_unit_id,
+                        media_type="tv",
+                        tmdb_id=tmdb_id,
+                    )
+                    record = reconcile_root_work_units(
+                        alist,
+                        "/quark/影视",
+                        state_root,
+                        root_task_id,
+                        episode_catalog=TmdbEpisodeCatalog(tmdb),
+                        tmdb_client=tmdb,
+                    )[0]
+                    self.assertEqual(record.reconciliation_outcome, "new_work")
+                    self.assertEqual(
+                        (record.reconciliation_evidence or {}).get("kind"),
+                        "tmdb_single_positive_season_release_dash_episodes",
+                    )
+
+                    request = _request_for_unit(
+                        runner, record, root_task_id, state_root,
+                    )
+                    self.assertEqual(request.season, 1)
+                    self.assertTrue(request.allow_release_dash_ordinal)
+                    self.assertEqual(request.source_scope_paths, (source,))
+                    self.assertEqual(
+                        {
+                            str(item.get("full_path") or "")
+                            for item in request.source_files or ()
+                        },
+                        {f"{source}/{name}" for name in names},
+                    )
+                    self.assertIsNotNone(request.episode_map_path)
+                    mapping = json.loads(
+                        Path(str(request.episode_map_path)).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        mapping,
+                        {str(episode): f"S01E{episode:02d}" for episode in range(1, 4)},
+                    )
+                    plan = runner._build_plan(request)  # noqa: SLF001 - F planner seam
+                    self.assertEqual(
+                        [item.episode_key for item in plan.files if item.media_kind == "video"],
+                        ["E01", "E02", "E03"],
+                    )
+                    self.assertEqual(
+                        {
+                            token
+                            for item in plan.files
+                            if item.media_kind == "video"
+                            for season, episode in audit_episode_tokens(item.final_name)
+                            for token in (f"S{season:02d}E{episode:02d}",)
+                        },
+                        {f"S01E{episode:02d}" for episode in range(1, 4)},
+                    )
+
+                    old_path = f"{source}/{names[-1]}"
+                    new_path = (
+                        f"{source}/[LoliHouse] Other Show - 03 "
+                        "[WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
+                    )
+                    alist.files[new_path] = alist.files.pop(old_path)
+                    with self.assertRaisesRegex(
+                        ValueError, "D 发行组短横线集号 季集证据",
+                    ):
+                        _request_for_unit(runner, record, root_task_id, state_root)
+                    self.assertEqual(alist.move_calls, [])
+
+    def test_release_dash_manifest_rejects_file_added_between_proof_and_planner(self) -> None:
+        """The F handoff may not widen after its fresh D proof.
+
+        The injected fourth file appears after the release-dash proof and the
+        exact fresh scope fingerprint, but while the planner-shaped manifest
+        is being assembled.  It must stop before an EngineRequest can carry
+        that new object into the narrowly enabled parser.
+        """
+        class InjectingManifestAList(BareEpisodePlanningAList):
+            def __init__(self, files: dict[str, bytes], injected_path: str) -> None:
+                super().__init__(files)
+                self.injected_path = injected_path
+                self.inject_on_next_walk = False
+
+            def walk(self, path: str, **kwargs: object) -> list[dict[str, object]]:
+                if self.inject_on_next_walk:
+                    self.inject_on_next_walk = False
+                    self.files[self.injected_path] = FAKE_VIDEO_BYTES
+                return super().walk(path, **kwargs)
+
+        tmdb_id = 99120
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 3)
+        source = "/quark/影视/待刮削/Release Dash Manifest Race"
+        names = [
+            f"[Group] The 100 - {episode:02d} [WebRip].mkv"
+            for episode in range(1, 4)
+        ]
+        injected_path = f"{source}/[Group] The 100 - 04 [WebRip].mkv"
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = InjectingManifestAList(
+                {f"{source}/{name}": FAKE_VIDEO_BYTES for name in names},
+                injected_path,
+            )
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-release-dash-manifest-race"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist,
+                source,
+                root_task_id=root_task_id,
+                state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root,
+                root_task_id,
+                record.work_unit_id,
+                media_type="tv",
+                tmdb_id=tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist,
+                "/quark/影视",
+                state_root,
+                root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb),
+                tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+
+            alist.inject_on_next_walk = True
+            with self.assertRaisesRegex(
+                ValueError, "fresh 来源清单在快照核验后变化",
+            ):
+                _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertIn(injected_path, alist.files)
+            self.assertEqual(alist.move_calls, [])
+
+    def test_complete_bracketed_proof_is_revalidated_for_f_and_read_by_j(self) -> None:
+        """The strict ``[01]..[12]`` D proof is fresh again at F.
+
+        This mirrors the real one-season release shape: primary bracketed
+        ordinals plus NCOP/NCED and a shorter published TMDB Season 00.
+        F must pass the proved regular season explicitly to the existing
+        planner; a changed source snapshot must stop planning before a writer
+        could be reached.
+        """
+        tmdb_id = 99102
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=2)
+        source = "/quark/影视/待刮削/Bracketed One Season Show"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files.update({
+            f"{source}/[Ygm] Example Show [NCOP][Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+            f"{source}/[Ygm] Example Show [NCED][Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-f-j"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root,
+                root_task_id,
+                record.work_unit_id,
+                media_type="tv",
+                tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist,
+                "/quark/影视",
+                state_root,
+                root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb),
+                tmdb_client=tmdb,
+            )
+            record = reconciled[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_bracketed_episodes",
+            )
+
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(request.season, 1)
+            plan = runner._build_plan(request)  # noqa: SLF001 - F planner seam
+            primary_tokens = {
+                f"S{season:02d}E{episode:02d}"
+                for item in plan.files
+                if item.media_kind == "video"
+                for season, episode in audit_episode_tokens(item.final_name)
+            }
+            self.assertEqual(
+                primary_tokens,
+                {f"S01E{episode:02d}" for episode in range(1, 13)},
+            )
+            self.assertEqual(
+                _register_unit_episode_gaps(
+                    runner,
+                    state_root,
+                    root_task_id,
+                    record,
+                    plan_to_dict(plan),
+                ),
+                [],
+            )
+
+            old_name = (
+                f"{source}/[Ygm] Example Show [12]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            )
+            new_name = (
+                f"{source}/[Ygm] Example Show [13]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            )
+            del alist.files[old_name]
+            alist.files[new_name] = FAKE_VIDEO_BYTES
+            with self.assertRaisesRegex(ValueError, "D 纯方括号集号 季集证据"):
+                _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(alist.move_calls, [])
+
+    def test_bracketed_proof_excludes_complete_physical_special_run(self) -> None:
+        """A complete OAD family beside ``[01]..[N]`` no longer fails the proof.
+
+        The regular bracketed run still proves the single positive season; a
+        separately complete OAD/OVA/OAV family is excluded instead of
+        invalidating the whole proof.
+        """
+        tmdb_id = 99122
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 24, specials=3)
+        source = "/quark/影视/待刮削/Bracketed Show With OADs"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 25)
+        }
+        files.update({
+            f"{source}/[Ygm] Example Show [OAD{number:02d}][Ma10p_1440p].mkv": FAKE_VIDEO_BYTES
+            for number in range(1, 4)
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-oad"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (reconciled.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_bracketed_episodes",
+            )
+
+    def test_bracketed_proof_fails_closed_on_incomplete_physical_special(self) -> None:
+        """A gapped OAD family keeps the bracketed proof fail-closed."""
+        tmdb_id = 99123
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 24, specials=3)
+        source = "/quark/影视/待刮削/Bracketed Show With Partial OADs"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 25)
+        }
+        files.update({
+            f"{source}/[Ygm] Example Show [OAD01][Ma10p_1440p].mkv": FAKE_VIDEO_BYTES,
+            f"{source}/[Ygm] Example Show [OAD03][Ma10p_1440p].mkv": FAKE_VIDEO_BYTES,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-oad-partial"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "uncertain")
+
+    def test_bracketed_proof_excludes_bonus_directory_video(self) -> None:
+        """An ``[MV]`` inside ``NCOP&ED`` no longer fails the bracketed proof.
+
+        The OP/ED bonus-directory context is enough to omit a non-NCOP/NCED
+        video (``[MV]``) from the integer regular run.
+        """
+        tmdb_id = 99124
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=0)
+        source = "/quark/影视/待刮削/Bracketed Show 99124"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files.update({
+            f"{source}/NCOP&ED/[Ygm] Example Show [MV][Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+            f"{source}/NCOP&ED/[Ygm] Example Show [NCOP][Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-bonus-dir"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (reconciled.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_bracketed_episodes",
+            )
+
+    def test_theme_directory_classifies_mv_as_cleanup_only_inside_ncop_ed(self) -> None:
+        """An ``[MV]`` is theme only inside a recognized OP/ED directory.
+
+        This is the F-step complement of the D-step bonus-directory proof: a
+        music video beside ``NCOP&ED`` must not leak into the smart planner's
+        movie detection (which would otherwise mint an empty related-movie
+        child).  The same basename outside an OP/ED directory stays media.
+        """
+        from engine.scrapeflow.core import _contextual_cleanup_reason
+
+        def item(name: str, path: str) -> dict[str, object]:
+            return {"name": name, "full_path": path}
+
+        self.assertEqual(
+            _contextual_cleanup_reason(item(
+                "[Ygm] Show [MV][Ma10p_2160p].mkv",
+                "/x/Show/NCOP&ED/[Ygm] Show [MV][Ma10p_2160p].mkv",
+            )),
+            "无字幕片头/片尾/光盘菜单视频",
+        )
+        self.assertIsNone(_contextual_cleanup_reason(item(
+            "[Ygm] Show [MV][Ma10p_2160p].mkv",
+            "/x/Show/[Ygm] Show [MV][Ma10p_2160p].mkv",
+        )))
+        self.assertIsNone(_contextual_cleanup_reason(item(
+            "[Ygm] Show [01][Ma10p_2160p].mkv",
+            "/x/Show/[Ygm] Show [01][Ma10p_2160p].mkv",
+        )))
+
+    def test_bracketed_proof_excludes_movie_shaped_sibling_subdir(self) -> None:
+        """A titled sibling with exactly one large video is an independent film.
+
+        The rooted TV ``[01]..[12]`` run must still prove the season; the
+        movie-shaped sibling subtree is omitted instead of invalidating it.
+        """
+        tmdb_id = 99126
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=0)
+        source = "/quark/影视/待刮削/Bracketed Show 99126"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files[f"{source}/电影/[Ygm] Example Show Movie [Ma10p_2160p].mkv"] = (
+            b"m" * (200 * 1024 * 1024 + 1)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-movie-sibling"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (reconciled.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_bracketed_episodes",
+            )
+
+    def test_bracketed_proof_excludes_unnumbered_special_marker(self) -> None:
+        """A bare ``[OAD]`` (no ordinal) is a named special, not an episode."""
+        tmdb_id = 99127
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=0)
+        source = "/quark/影视/待刮削/Bracketed Show 99127"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files[f"{source}/[Ygm] Example Show [OAD][Ma10p_2160p].mkv"] = FAKE_VIDEO_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-unnumbered-oad"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+
+    def test_bracketed_proof_excludes_disc_menu_video(self) -> None:
+        """A ``[Menu01]`` disc menu is bonus content, not an episode."""
+        tmdb_id = 99128
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=0)
+        source = "/quark/影视/待刮削/Bracketed Show 99128"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files[f"{source}/Menu/[Ygm] Example Show [Menu01][Ma10p_2160p].mkv"] = FAKE_VIDEO_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-menu"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+
+    def test_bracketed_proof_excludes_numbered_op_ed_theme(self) -> None:
+        """A numbered ``[OPn]``/``[EDn]`` theme is non-story, not an episode."""
+        tmdb_id = 99129
+        tmdb = BareEpisodePlanningTMDB(tmdb_id, 12, specials=0)
+        source = "/quark/影视/待刮削/Bracketed Show 99129"
+        files = {
+            (
+                f"{source}/[Ygm] Example Show [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+            ): FAKE_VIDEO_BYTES
+            for episode in range(1, 13)
+        }
+        files[f"{source}/[Ygm] Example Show [OP1][Ma10p_2160p].mkv"] = FAKE_VIDEO_BYTES
+        files[f"{source}/[Ygm] Example Show [ED1][Ma10p_2160p].mkv"] = FAKE_VIDEO_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = BareEpisodePlanningAList(files)
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=tmdb, validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-op-ed"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            reconciled = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(reconciled.reconciliation_outcome, "new_work")
+
     def _record_for(self, state_root: Path, root_task_id: str, tmdb_id: int):
         pending = self._record_runner.create_pending_job(
             "/incoming/one", job_id=root_task_id,
@@ -389,6 +1318,56 @@ class UnitExecutionTests(unittest.TestCase):
         # Only the unit's own season (S2) is registered; the sibling S1
         # catalog rows must never become phantom gaps.
         self.assertEqual(tokens, {f"S02E{e:02d}" for e in range(2, 25)})
+
+    def test_declared_empty_season_registers_only_its_precise_gap(self) -> None:
+        """A cohort's declared empty middle season remains visible to J.
+
+        The executed plan proves S01E01 and S03E01.  B/W additionally
+        declared S02 as part of the same exact source cohort, so J must use
+        the official catalog to register only S02E01—not invent gaps for the
+        two written seasons or silently erase the empty declared season.
+        """
+        files = {
+            "/incoming/one/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/one/Fate Zero/S03E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _p, _e = self._setup(
+            files, tmdb=MultiSeasonTMDB(101, {1: 1, 2: 1, 3: 1}),
+        )
+        self._record_runner = runner
+        self._record_alist = alist
+        record = replace(
+            self._record_for(state_root, "root-declared-empty", 101),
+            claimed_seasons=(1, 2, 3),
+        )
+        executed_plan = {
+            "files": [
+                {
+                    "final_name": "S01E01.mkv",
+                    "media_kind": "video",
+                    "target_dir": "/library/番剧/Work (101)",
+                },
+                {
+                    "final_name": "S03E01.mkv",
+                    "media_kind": "video",
+                    "target_dir": "/library/番剧/Work (101)",
+                },
+            ],
+            "target_root": "/library/番剧/Work (101)",
+        }
+
+        _register_unit_episode_gaps(
+            runner, state_root, "root-declared-empty", record, executed_plan,
+        )
+
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+
+        gaps = load_gap_ledger(state_root, "root-declared-empty")
+        self.assertEqual(
+            {gap.gap_id.rsplit("::", 1)[1] for gap in gaps},
+            {"S02E01"},
+        )
+        self.assertTrue(all(gap.work_unit_id == record.work_unit_id for gap in gaps))
 
     def test_gap_registration_dedupes_across_units_of_one_series(self) -> None:
         files = {"/incoming/one/Fate Zero/S02E01.mkv": FAKE_VIDEO_BYTES}
@@ -470,14 +1449,203 @@ class UnitExecutionTests(unittest.TestCase):
             ],
             "target_root": "/library/番剧/Work (101)",
         }
-        _register_unit_episode_gaps(
-            runner, state_root, "root-absolute", record, executed_plan,
-        )
+        with self.assertRaises(GapDiscoveryAttention):
+            _register_unit_episode_gaps(
+                runner, state_root, "root-absolute", record, executed_plan,
+            )
         from engine.scrapeflow.gap_ledger import load_gap_ledger
 
         # Absolute-number names cannot be verified against season coordinates:
-        # the J step must fail closed and register nothing.
+        # the J step fails closed as explicit operator attention rather than
+        # silently accepting a zero-gap result.
         self.assertEqual(load_gap_ledger(state_root, "root-absolute"), [])
+
+    def test_catalog_unavailable_becomes_durable_attention_without_rewriting(self) -> None:
+        files = {"/incoming/one/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _p, executor_events = self._setup(files)
+        root_task_id = "root-gap-attention"
+        pending = runner.create_pending_job("/incoming/one", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+
+        first = execute_new_work_units(runner, state_root, root_task_id)
+
+        self.assertEqual(first[0].outcome, "accepted")
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        self.assertEqual(record.gap_status, "attention")
+        self.assertIn("缺口", record.attention or "")
+        from local.scrapeflow_api.root_aggregation import aggregate_root_job
+
+        self.assertEqual(aggregate_root_job(state_root, root_task_id).attention, 1)
+        # A later pass revisits J only; it must never schedule a second G/H
+        # writer for the already accepted carrier.
+        execute_new_work_units(runner, state_root, root_task_id)
+        self.assertEqual(len(executor_events), 1)
+
+    def test_gap_ledger_persistence_failure_is_durable_failed_state(self) -> None:
+        files = {"/incoming/one/Fate Zero/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _p, executor_events = self._setup(
+            files, tmdb=CatalogTMDB(101, 1),
+        )
+        root_task_id = "root-gap-ledger-failure"
+        pending = runner.create_pending_job("/incoming/one", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+
+        with patch(
+            "local.scrapeflow_api.unit_execution.discover_episode_gaps",
+            side_effect=OSError("injected ledger fsync failure"),
+        ):
+            results = execute_new_work_units(runner, state_root, root_task_id)
+
+        self.assertEqual(results[0].outcome, "accepted")
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        self.assertEqual(record.gap_status, "failed")
+        self.assertIn("缺口账本", record.gap_detail or "")
+        from local.scrapeflow_api.root_aggregation import aggregate_root_job
+
+        self.assertEqual(aggregate_root_job(state_root, root_task_id).failed, 1)
+        self.assertEqual(len(executor_events), 1)
+
+    def test_deleted_declared_empty_scope_cannot_pass_fresh_boundary_proof(self) -> None:
+        root = "/incoming/Northwind"
+        files = {
+            f"{root}/Northwind.Show.S01.1080p/Northwind.Show.S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{root}/Northwind.Show.S02.1080p/Northwind.Show.S02E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = IndexAList(files)
+            # B/W sees this adjacent declared empty season.  It disappears
+            # before F, which must not look equivalent to an empty listing.
+            empty_scope = f"{root}/Northwind.Show.S03.1080p"
+            alist.dirs.add(empty_scope)
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=object(),
+                planner=_recording_planner([]),
+                validate=False,
+                library_root="/library",
+                executor=lambda _plan: {"ok": True},
+            )
+            pending = runner.create_pending_job(root, job_id="root-fresh-scope")
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, root, root_task_id=pending.id, state_root=state_root,
+            )
+            cohort = next(
+                record for record in load_work_unit_records(state_root, pending.id)
+                if len(record.source_paths) > 1
+            )
+            self.assertEqual(cohort.claimed_seasons, (1, 2, 3))
+            apply_work_unit_override(
+                state_root, pending.id, cohort.work_unit_id,
+                media_type="tv", tmdb_id=101,
+            )
+            cohort = next(
+                record for record in load_work_unit_records(state_root, pending.id)
+                if record.work_unit_id == cohort.work_unit_id
+            )
+            alist.dirs.discard(empty_scope)
+
+            with self.assertRaisesRegex(ValueError, "可证明目录"):
+                _request_for_unit(runner, cohort, pending.id, state_root)
+
+    def test_new_sibling_nests_under_duplicate_main_work_root(self) -> None:
+        """A D-locked main TV root remains the parent for a new sibling.
+
+        This is intentionally a mixed-shelf case: the root was authorised as
+        anime, while the pre-existing main work is in 欧美剧.  The new movie
+        must inherit that real existing root instead of being planned at the
+        newly selected anime shelf.
+        """
+        files = {
+            "/incoming/container/Main Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/container/Side Film/Feature.mkv": FAKE_VIDEO_BYTES,
+            "/library/欧美剧/Main Show/tvshow.nfo": _nfo_tv(101, "Main Show", "2020"),
+            "/library/欧美剧/Main Show/Season 01/S01E01.mkv": b"v",
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(files)
+        root_task_id = "root-existing-main"
+        pending = runner.create_pending_job("/incoming/container", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/container", root_task_id=root_task_id,
+            state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 2)
+        for record in records:
+            tmdb_id = 101 if record.source_paths == ("/incoming/container/Main Show",) else 202
+            media_type = "tv" if tmdb_id == 101 else "movie"
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type=media_type, tmdb_id=tmdb_id,
+            )
+
+        reconciled = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+        )
+        main = next(record for record in reconciled if record.identity["tmdb_id"] == 101)
+        side = next(record for record in reconciled if record.identity["tmdb_id"] == 202)
+        self.assertEqual(main.reconciliation_outcome, "duplicate_complete")
+        self.assertEqual(main.matched_work_root, "/library/欧美剧/Main Show")
+        self.assertEqual(side.reconciliation_outcome, "new_work")
+
+        results = execute_new_work_units(runner, state_root, root_task_id)
+
+        self.assertEqual({result.outcome for result in results}, {"accepted", "skipped"})
+        self.assertEqual(len(executor_events), 1)
+        side_event = next(event for event in planner_events if event["tmdb_id"] == 202)
+        self.assertEqual(side_event["parent_path"], "/library/欧美剧/Main Show")
+
+    def test_failed_new_main_does_not_write_a_sibling_below_unaccepted_root(self) -> None:
+        files = {
+            "/incoming/container/Main Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/container/Side Film/Feature.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(files)
+        root_task_id = "root-main-failure"
+        pending = runner.create_pending_job("/incoming/container", job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/container", root_task_id=root_task_id,
+            state_root=state_root,
+        )
+        for record in load_work_unit_records(state_root, root_task_id):
+            tmdb_id = 101 if record.source_paths == ("/incoming/container/Main Show",) else 202
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv" if tmdb_id == 101 else "movie",
+                tmdb_id=tmdb_id,
+            )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        runner.planner = _recording_planner(
+            planner_events, fail_for="/incoming/container/Main Show",
+        )
+
+        results = execute_new_work_units(runner, state_root, root_task_id)
+
+        self.assertEqual([result.outcome for result in results], ["failed"])
+        self.assertEqual([event["tmdb_id"] for event in planner_events], [101])
+        self.assertEqual(executor_events, [])
 
 
 def replace_work_unit_record(record):
@@ -542,6 +1710,66 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
         self.assertEqual(mapping["25"], "S04E01")
         self.assertEqual(mapping["47"], "S04E23")
 
+    def test_physical_oad_proof_carries_only_sp_to_regular_episode_map(self) -> None:
+        """F may map OAD source keys only from the exact persisted D proof."""
+        class OadTMDB(BareEpisodePlanningTMDB):
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "Example OAD",
+                        "original_name": "Example OAD",
+                        "first_air_date": "2020-01-01",
+                        "number_of_seasons": 1,
+                        "number_of_episodes": 5,
+                        "seasons": [{
+                            "season_number": 1,
+                            "episode_count": 5,
+                            "name": "OAD",
+                        }],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {"episodes": [{
+                        "episode_number": number,
+                        "air_date": "2020-01-01",
+                        "name": f"OAD #{number}",
+                    } for number in range(1, 6)]}
+                return {}
+
+        source = "/incoming/Example OAD"
+        files = {
+            f"{source}/Example [OAD{number:02d}].mkv": FAKE_VIDEO_BYTES
+            for number in range(1, 6)
+        }
+        tmdb = OadTMDB(99100, 5)
+        state_root, alist, runner = self._setup(files, tmdb)
+        root_task_id = "root-oad-map"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=99100,
+        )
+        record = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )[0]
+        self.assertEqual(
+            record.reconciliation_evidence and record.reconciliation_evidence["kind"],
+            "tmdb_single_positive_season_physical_special",
+        )
+        request = _request_for_unit(runner, record, root_task_id, state_root)
+        self.assertEqual(request.season, 1)
+        self.assertIsNotNone(request.episode_map_path)
+        mapping = json.loads(Path(request.episode_map_path).read_text(encoding="utf-8"))
+        self.assertEqual(
+            mapping,
+            {f"SP{number:02d}": f"S01E{number:02d}" for number in range(1, 6)},
+        )
+
     def test_single_season_block_keeps_the_ordinary_path(self) -> None:
         files = {
             f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES
@@ -589,6 +1817,276 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
         request = _request_for_unit(runner, record, "root-se", state_root)
 
         self.assertIsNone(request.episode_map_path)
+
+class InterruptedUnitCarrierRecoveryTests(unittest.TestCase):
+    def test_restart_retry_wait_recovers_owned_partial_carrier_without_replay(self) -> None:
+        """An interrupted internal carrier resumes from its durable plan.
+
+        The first media file has already reached the formal target when the
+        process restarts.  Startup converts ``executing`` to ``retry_wait``;
+        the next root pass must exact-read that carrier, preserve the first
+        target, and move only the still-present second source.
+        """
+        root_task_id = "root-partial-recovery"
+        source_root = "/incoming/recovery"
+        target_root = "/library/番剧/Restart Work"
+        first_source = f"{source_root}/Restart.Work.S01E01.mkv"
+        second_source = f"{source_root}/Restart.Work.S01E02.mkv"
+        first_target = f"{target_root}/Season 01/Restart Work - S01E01.mkv"
+        second_target = f"{target_root}/Season 01/Restart Work - S01E02.mkv"
+        planner_calls: list[object] = []
+
+        def planner(request, _alist, _tmdb) -> Plan:
+            planner_calls.append(request)
+            return Plan(
+                mode="tv",
+                source_root=request.source_path,
+                target_root=target_root,
+                files=[
+                    PlannedFile(
+                        source_path=first_source,
+                        source_dir=source_root,
+                        original_name="Restart.Work.S01E01.mkv",
+                        final_name="Restart Work - S01E01.mkv",
+                        target_dir=f"{target_root}/Season 01",
+                        media_kind="video",
+                        episode_key="E01",
+                        source_size=FAKE_VIDEO_SIZE,
+                    ),
+                    PlannedFile(
+                        source_path=second_source,
+                        source_dir=source_root,
+                        original_name="Restart.Work.S01E02.mkv",
+                        final_name="Restart Work - S01E02.mkv",
+                        target_dir=f"{target_root}/Season 01",
+                        media_kind="video",
+                        episode_key="E02",
+                        source_size=FAKE_VIDEO_SIZE,
+                    ),
+                ],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 101,
+                    "title": "Restart Work",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        class PauseAfterFirstMove(SimplePlanExecutor):
+            def execute(self, plan):  # type: ignore[no-untyped-def]
+                item = plan.files[0]
+                self._move_file(
+                    item.source_dir,
+                    item.target_dir,
+                    item.original_name,
+                    item.final_name,
+                )
+                self._check_size(
+                    f"{item.target_dir}/{item.final_name}", item.source_size,
+                )
+                self._verify_source_absent(item.source_path)
+                raise EnginePauseRequested("injected interrupted formal write")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = FakeAList()
+            alist.files = {
+                first_source: FAKE_VIDEO_BYTES,
+                second_source: FAKE_VIDEO_BYTES,
+            }
+            tmdb = CatalogTMDB(101, 2)
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                planner=planner,
+                executor=PauseAfterFirstMove(alist, tmdb),
+                validate=False,
+                library_root="/library",
+            )
+            pending = runner.create_pending_job(source_root, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist,
+                source_root,
+                root_task_id=root_task_id,
+                state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root,
+                root_task_id,
+                record.work_unit_id,
+                media_type="tv",
+                tmdb_id=101,
+            )
+            reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+
+            with self.assertRaises(EnginePauseRequested):
+                execute_new_work_units(runner, state_root, root_task_id)
+
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            self.assertIsNotNone(record.writer_job_id)
+            carrier_id = str(record.writer_job_id)
+            self.assertEqual(runner.get_job(carrier_id).phase, "executing")
+            self.assertEqual(alist.files[first_target], FAKE_VIDEO_BYTES)
+            self.assertNotIn(first_source, alist.files)
+            self.assertEqual(alist.files[second_source], FAKE_VIDEO_BYTES)
+
+            # This is the process-start transition which used to strand the
+            # unit in retry_wait and then fail before it could read back the
+            # partially moved first episode.
+            recover_persisted_engine_jobs(state_root)
+            self.assertEqual(runner.get_job(carrier_id).phase, "retry_wait")
+
+            runner.executor = SimplePlanExecutor(alist, tmdb)
+            # The missing second target follows the visibility retry schedule;
+            # collapse sleeps in this focused state-machine regression.
+            with patch("local.scrapeflow_api.simple_engine_runner.time.sleep"):
+                results = execute_new_work_units(runner, state_root, root_task_id)
+
+            self.assertEqual([result.outcome for result in results], ["accepted"])
+            self.assertEqual(len(planner_calls), 1)
+            self.assertEqual(runner.get_job(carrier_id).phase, "executed")
+            self.assertEqual(alist.files[first_target], FAKE_VIDEO_BYTES)
+            self.assertEqual(alist.files[second_target], FAKE_VIDEO_BYTES)
+            self.assertNotIn(first_source, alist.files)
+            self.assertNotIn(second_source, alist.files)
+            # First move occurred before the simulated restart; continuation
+            # moved only E02, proving the existing E01 target was not replayed.
+            self.assertEqual(len(alist.moves), 2)
+            self.assertEqual(alist.moves[0][2], ["Restart.Work.S01E01.mkv"])
+            self.assertEqual(alist.moves[1][2], ["Restart.Work.S01E02.mkv"])
+            execution = runner.get_job(carrier_id).execution or {}
+            self.assertEqual(
+                [row["status"] for row in execution.get("files", [])],
+                ["already_present", "moved"],
+            )
+
+    def test_failed_owned_legacy_name_carrier_keeps_plan_and_resumes_rename(self) -> None:
+        """A failed pre-policy carrier must not be retired against a mutated source."""
+        root_task_id = "root-legacy-name-recovery"
+        source_root = "/incoming/legacy-name"
+        target_root = "/library/番剧/Legacy Name Work"
+        first_source = f"{source_root}/Legacy.Name.S01E01.mkv"
+        second_source = f"{source_root}/Legacy.Name.S01E02.mkv"
+        first_intermediate = f"{target_root}/Season 01/Legacy.Name.S01E01.mkv"
+        first_final = f"{target_root}/Season 01/Legacy Name Work - S01E01 - First-Title.mkv"
+        second_final = f"{target_root}/Season 01/Legacy Name Work - S01E02 - Second.mkv"
+        planner_calls: list[object] = []
+
+        def planner(request, _alist, _tmdb) -> Plan:
+            planner_calls.append(request)
+            return Plan(
+                mode="tv",
+                source_root=request.source_path,
+                target_root=target_root,
+                files=[
+                    PlannedFile(
+                        source_path=first_source,
+                        source_dir=source_root,
+                        original_name="Legacy.Name.S01E01.mkv",
+                        final_name="Legacy Name Work - S01E01 - First...Title.mkv",
+                        target_dir=f"{target_root}/Season 01",
+                        media_kind="video",
+                        episode_key="E01",
+                        source_size=FAKE_VIDEO_SIZE,
+                    ),
+                    PlannedFile(
+                        source_path=second_source,
+                        source_dir=source_root,
+                        original_name="Legacy.Name.S01E02.mkv",
+                        final_name="Legacy Name Work - S01E02 - Second.mkv",
+                        target_dir=f"{target_root}/Season 01",
+                        media_kind="video",
+                        episode_key="E02",
+                        source_size=FAKE_VIDEO_SIZE,
+                    ),
+                ],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 101,
+                    "title": "Legacy Name Work",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = FakeAList()
+            alist.files = {
+                first_source: FAKE_VIDEO_BYTES,
+                second_source: FAKE_VIDEO_BYTES,
+            }
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=CatalogTMDB(101, 2),
+                planner=planner,
+                validate=False,
+                library_root="/library",
+            )
+            pending = runner.create_pending_job(source_root, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist,
+                source_root,
+                root_task_id=root_task_id,
+                state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root,
+                root_task_id,
+                record.work_unit_id,
+                media_type="tv",
+                tmdb_id=101,
+            )
+            reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            carrier = runner.plan_job(
+                request,
+                job_id=f"unit-{record.work_unit_id}",
+                internal_child_of=root_task_id,
+            )
+            # Model the exact prior provider effect: the cross-directory move
+            # reached formal storage, but the old `...` final rename failed.
+            alist.files[first_intermediate] = alist.files.pop(first_source)
+            failed = replace(carrier, phase="failed", error="legacy rename rejected")
+            atomic_write_json(
+                runner._job_path(carrier.id),  # noqa: SLF001 - durable carrier fixture
+                failed.as_dict(),
+                allow_nan=False,
+            )
+            save_work_unit_records(
+                state_root,
+                root_task_id,
+                [replace(record, writer_job_id=carrier.id)],
+            )
+
+            results = execute_new_work_units(runner, state_root, root_task_id)
+
+            self.assertEqual([result.outcome for result in results], ["accepted"])
+            self.assertEqual(len(planner_calls), 1)
+            recovered = runner.get_job(carrier.id)
+            self.assertEqual(recovered.phase, "executed")
+            self.assertEqual(recovered.plan["files"][0]["final_name"], first_final.rsplit("/", 1)[1])
+            self.assertIn(first_final, alist.files)
+            self.assertIn(second_final, alist.files)
+            self.assertNotIn(first_intermediate, alist.files)
+            self.assertNotIn(first_source, alist.files)
+            self.assertNotIn(second_source, alist.files)
+            self.assertEqual(len(alist.moves), 1)
+            self.assertEqual(alist.moves[0][2], ["Legacy.Name.S01E02.mkv"])
+            self.assertEqual(
+                [row["status"] for row in (recovered.execution or {})["files"]],
+                ["renamed_after_interrupted_move", "moved"],
+            )
 
 
 class FailedUnitRetryTests(unittest.TestCase):

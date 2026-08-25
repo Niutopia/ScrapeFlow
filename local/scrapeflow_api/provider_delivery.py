@@ -92,7 +92,7 @@ def validate_provider_delivery(
     This is the shared boundary for both acquisition lanes.  A delivery
     may describe only task-owned staging bytes; it must not carry any formal
     library destination, because Engine remains the sole naming/planning
-    authority after admission.
+    authority when staging is later written into the formal library.
     """
     if not isinstance(delivery, Mapping):
         raise ProviderDeliveryError("delivery 必须是对象")

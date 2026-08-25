@@ -130,12 +130,38 @@ def required_sources_for_tier(tier: str, shelf: str | None = None) -> frozenset[
     return frozenset()
 
 
+def _proof_sources_for_outcome(
+    tier: str,
+    outcome: Mapping[str, object],
+) -> frozenset[str]:
+    """Return the source set an outcome is allowed to prove exhausted.
+
+    Quark share keeps its single fixed source.  The local magnet lane is
+    different: installations may explicitly enable a smaller set of the
+    canonical, shelf-appropriate indexes.  A proof is valid only when that
+    configured set is explicit, non-empty, and wholly contained in the
+    canonical set for the shelf.  Missing/empty configuration therefore stays
+    fail-closed rather than treating a disabled deployment as "searched".
+    """
+    tier = _tier(tier)
+    shelf = _outcome_shelf(outcome)
+    canonical = required_sources_for_tier(tier, shelf)
+    if tier != TIER_LOCAL_MAGNET:
+        return canonical
+    configured = _strings(outcome.get("configured_sources"))
+    if not configured or not configured.issubset(canonical):
+        return frozenset()
+    return frozenset(configured)
+
+
 def _has_complete_no_candidate_proof(tier: str, outcome: Mapping[str, object]) -> bool:
     if outcome.get("search_complete_no_candidates") is not True:
         return False
     completed = _strings(outcome.get("completed_sources"))
-    required = required_sources_for_tier(tier, _outcome_shelf(outcome))
+    required = _proof_sources_for_outcome(tier, outcome)
     if required and not required.issubset(completed):
+        return False
+    if not required:
         return False
     unchecked = outcome.get("unchecked_secondary_candidates")
     if unchecked is not None and unchecked != 0:
@@ -154,7 +180,9 @@ def _tier_exhausted(state: Mapping[str, object], tier: str, outcome: Mapping[str
             if tier != TIER_LOCAL_MAGNET:
                 return True
             completed = _strings(outcome.get("completed_sources"))
-            required = required_sources_for_tier(tier, _outcome_shelf(outcome))
+            required = _proof_sources_for_outcome(tier, outcome)
+            if not required:
+                return False
             if required.issubset(completed) and outcome.get("unchecked_secondary_candidates", 0) == 0:
                 return True
     proofs = state.get("exhaustion_proof_by_provider")

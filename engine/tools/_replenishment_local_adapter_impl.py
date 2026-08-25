@@ -10,11 +10,7 @@ is retained until the coordinator proves formal-library convergence.
 
 from __future__ import annotations
 
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 from html.parser import HTMLParser
 import json
@@ -29,14 +25,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
-import zlib
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -55,6 +50,9 @@ from engine.scrapeflow.video_admission import (
     VideoAdmissionError,
     probe_local_video_stream,
 )
+
+
+_TASK_STAGING_PARENT = "/quark/影视/ScrapeFlow/补源"
 
 
 class ReplenishmentDeliveryError(RuntimeError):
@@ -121,115 +119,8 @@ def _pause_checkpoint(pause_requested: Callable[[], bool] | None) -> None:
         ) from exc
     if paused:
         raise ReplenishmentPauseRequested(
-            "补源已暂停或不在当前 RootJob 试运行范围",
+            "补源已暂停或不属于当前 RootJob",
         )
-
-
-@contextmanager
-def _workspace_lease(root: Path, workspace_key: str):
-    """Prevent two retries from mutating one deterministic workspace at once."""
-    lock_dir = root / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{workspace_key}.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ReplenishmentInfrastructureError(
-                "相同补源工作区已有获取进程在运行",
-                stage="orchestration_concurrency",
-            ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
-def _search_capacity_lease(root: Path):
-    """Bound API-heavy search subprocesses across restored scheduler threads."""
-    try:
-        slots = int(os.getenv("SCRAPEFLOW_REPLENISHMENT_SEARCH_WORKERS", "2"))
-    except ValueError:
-        slots = 2
-    slots = max(1, min(8, slots))
-    state_root = os.getenv("SCRAPEFLOW_STATE_DIR", "").strip()
-    lock_dir = (
-        Path(state_root) / ".replenishment-search-locks"
-        if state_root and Path(state_root).is_absolute()
-        else root / ".search-locks"
-    )
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    acquired = None
-    try:
-        while acquired is None:
-            for index in range(slots):
-                handle = (lock_dir / f"slot-{index}.lock").open("a+", encoding="utf-8")
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    handle.close()
-                    continue
-                acquired = handle
-                break
-            if acquired is None:
-                time.sleep(0.25)
-        yield
-    finally:
-        if acquired is not None:
-            fcntl.flock(acquired.fileno(), fcntl.LOCK_UN)
-            acquired.close()
-
-
-def _selection_workspace_key(selection_wrapper: Mapping[str, Any]) -> str:
-    selection = selection_wrapper.get("selection")
-    rows = selection.get("selections") if isinstance(selection, Mapping) else []
-    identities = []
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, Mapping):
-            continue
-        acquisition = row.get("acquisition")
-        gap_map = acquisition.get("file_index_by_gap") if isinstance(acquisition, Mapping) else {}
-        companion_map = (
-            acquisition.get("companion_subtitle_index_by_media_gap")
-            if isinstance(acquisition, Mapping) else {}
-        )
-        file_id_map = acquisition.get("file_id_by_gap") if isinstance(acquisition, Mapping) else {}
-        indices = sorted({
-            int(value) for values in (gap_map.values() if isinstance(gap_map, Mapping) else [])
-            if isinstance(values, list) for value in values if type(value) is int
-        })
-        indices = sorted(set(indices) | {
-            int(value)
-            for values in (companion_map.values() if isinstance(companion_map, Mapping) else [])
-            if isinstance(values, list) for value in values if type(value) is int
-        })
-        file_ids = sorted({
-            str(value) for values in (
-                file_id_map.values() if isinstance(file_id_map, Mapping) else []
-            )
-            for value in (
-                [values] if isinstance(values, str)
-                else values if isinstance(values, list) else []
-            )
-            if isinstance(value, str) and value
-        })
-        identity = {
-            "infohash": str(row.get("infohash") or "").casefold(),
-            "locator": (
-                "" if row.get("infohash") else str(row.get("locator") or "")
-            ),
-            "indices": indices,
-        }
-        # Include file IDs when a selection provides them so retries reuse the
-        # same workspace for the same payload members.
-        if file_ids:
-            identity["file_ids"] = file_ids
-        identities.append(identity)
-    encoded = json.dumps(identities, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    # This key is only a short, stable directory name for retry reuse; it is
-    # not used to validate payload content.
-    return f"{zlib.crc32(encoded.encode('utf-8')):08x}"
 
 
 from engine.scrapeflow.replenishment_matching import (
@@ -239,7 +130,6 @@ from engine.scrapeflow.replenishment_matching import (
     season_markers as _season_markers,
 )
 from engine.scrapeflow.media_quality import (
-    is_production_test_media_path,
     minimum_video_bytes,
     video_size_is_admissible,
 )
@@ -271,6 +161,76 @@ OPTIONAL_RETROSPECTIVE_COLLECTION_RE = re.compile(
     re.I,
 )
 OPTIONAL_EXPLICIT_S00_RE = re.compile(r"(?i)(?<![A-Z0-9])S00[ ._-]*E0*\d{1,4}\b")
+
+# DMHY's RSS endpoint rejects long ``keyword`` values (the response is an
+# HTTP error rather than an empty result).  Keep this bound local to the
+# provider adapter: it is a safety/liveness limit for a read-only query, not
+# a user-facing search policy or a title-specific exception.
+_DMHY_MAX_QUERY_TERMS = 4
+_DMHY_MAX_QUERY_TERM_LENGTH = 64
+
+# Nyaa's RSS endpoint currently returns a fixed broad window (75 rows in the
+# live service) and does not honor the usual ``page``/``offset`` parameters.
+# Collect enough rows to rank that whole window, then inspect only a bounded
+# top window of Torrent metainfo.  A saturated response or an uninspected
+# manifest window is deliberately *not* source exhaustion: there is no safe
+# pagination receipt with which to prove the rest absent.  Search terms are
+# intentionally separate from DMHY's shorter RSS keyword limit.
+_NYAA_MAX_QUERY_TERMS = 4
+# A cursor advances this deterministic logical set four queries at a time.
+# This is intentionally finite: it prevents a malformed Gap ledger from
+# creating unbounded discovery work while ensuring later coordinates are not
+# silently omitted from no-resource evidence.
+_NYAA_MAX_LOGICAL_QUERY_TERMS = 64
+_NYAA_MAX_QUERY_TERM_LENGTH = 96
+_NYAA_MAX_RSS_ROWS_PER_QUERY = 75
+# Keep a modest multiple of the normal RSS window while retaining the
+# highest-ranked rows as later terms arrive.  The tighter metainfo cap below
+# is enforced only after this relevance sort.
+_NYAA_MAX_FEED_ROWS = 256
+_NYAA_MAX_MANIFEST_INSPECTIONS = 32
+
+_SAFE_INFRA_FAILURE_CODES = frozenset({
+    "connection_refused",
+    "connection_reset",
+    "dns_failure",
+    "network_error",
+    "os_error",
+    "runtime_error",
+    "source_error",
+    "timeout",
+    "tls_failure",
+    "unknown_error",
+    "value_error",
+    "xml_parse_error",
+})
+_HTTP_FAILURE_CODE_RE = re.compile(r"\Ahttp_(?:1\d\d|2\d\d|3\d\d|4\d\d|5\d\d)\Z")
+
+
+def _safe_infrastructure_failure_types(
+    values: Mapping[object, object] | None,
+) -> dict[str, int]:
+    """Keep only bounded, provider-neutral source-health failure codes.
+
+    Search adapters may inspect arbitrary upstream exceptions.  Only the
+    closed codes below cross the adapter boundary; exception messages, URLs,
+    credentials, and class names supplied by an untrusted implementation do
+    not become durable telemetry.
+    """
+    output: dict[str, int] = {}
+    if not isinstance(values, Mapping):
+        return output
+    for raw_code, raw_count in values.items():
+        if not isinstance(raw_code, str) or type(raw_count) is not int:
+            continue
+        count = max(0, min(raw_count, 100_000))
+        if count <= 0:
+            continue
+        code = raw_code.strip().casefold()
+        if code not in _SAFE_INFRA_FAILURE_CODES and not _HTTP_FAILURE_CODE_RE.fullmatch(code):
+            code = "source_error"
+        output[code] = min(100_000, output.get(code, 0) + count)
+    return dict(sorted(output.items()))
 
 # A provider manifest is untrusted evidence.  These members can carry an
 # episode-looking token while being an opening/ending, preview, sample,
@@ -747,7 +707,6 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
     }
     warnings: list[str] = []
     output: list[dict[str, Any]] = []
-    catalog_ready = False
     try:
         catalog_path = _catalog_path()
         if catalog_path is not None:
@@ -756,7 +715,6 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
             project = projects.get(str(tmdb_id))
             raw = project.get("candidates") if isinstance(project, Mapping) else []
             if isinstance(raw, list):
-                catalog_ready = True
                 for row in raw:
                     if not isinstance(row, Mapping):
                         continue
@@ -777,25 +735,45 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
          "SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH", "0"),
         ("DMHY", _search_dmhy, False,
          "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH", "0"),
-        # Nyaa remains an optional provider in normal deployments, but the
-        # explicit switch lets isolated checks disable every network source.
+        # Nyaa remains optional so local tests and installations without that
+        # source can keep the search set explicit.
         ("Nyaa", _search_nyaa, False,
          "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH", "1"),
         ("ACG", _search_acg, True,
          "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH", "1"),
     ]
-    deadline = time.monotonic() + _dynamic_search_timeout_seconds(request)
+    # Sources are queried serially but receive equal, bounded read-only
+    # windows.  Sharing one deadline here meant an early source could consume
+    # the whole budget and leave later enabled indexes with zero attempts;
+    # that is not evidence that those sources were searched.
+    source_timeout_seconds = _dynamic_search_timeout_seconds(request)
     telemetry: dict[str, Any] = {}
     for label, searcher, required, env_name, default_enabled in source_specs:
-        if os.getenv(env_name, default_enabled).strip().casefold() in {
+        enabled = os.getenv(env_name, default_enabled).strip().casefold() not in {
             "0", "false", "no", "off", "",
-        }:
+        }
+        if not enabled:
+            # Keep disabled sources visible to the evidence boundary.  A
+            # dynamic proof must distinguish an actually searched source set
+            # from a deployment where every index was disabled.
+            telemetry[label] = {
+                "configured": False,
+                "status": "incomplete",
+                "query_attempts": 0,
+                "query_responses": 0,
+                "source_exhausted": False,
+                "resource_failed_locators": [],
+                "infrastructure_failures": 0,
+                "infrastructure_failure_types": {},
+                "required": required,
+            }
             continue
         try:
+            source_deadline = time.monotonic() + source_timeout_seconds
             result = searcher(
                 request,
                 existing_locators,
-                deadline=deadline,
+                deadline=source_deadline,
             )
             rows = [dict(row) for row in result if isinstance(row, Mapping)]
             rows = [
@@ -804,21 +782,58 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
                 and candidate_capability_error(row) is None
             ]
             output.extend(row for row in rows if str(row.get("locator") or "") not in existing_locators)
+            query_attempts = int(getattr(result, "query_attempts", 0))
+            query_responses = int(getattr(result, "query_responses", 0))
+            source_exhausted = bool(getattr(result, "source_exhausted", False))
+            infrastructure_failure_types = _safe_infrastructure_failure_types(
+                getattr(result, "infrastructure_failure_types", None),
+            )
+            infrastructure_failures = int(
+                getattr(result, "infrastructure_failures", 0),
+            )
+            infrastructure_failures = max(
+                0,
+                infrastructure_failures,
+                sum(infrastructure_failure_types.values()),
+            )
             telemetry[label] = {
-                "query_attempts": int(getattr(result, "query_attempts", 0)),
-                "query_responses": int(getattr(result, "query_responses", 0)),
-                "source_exhausted": bool(getattr(result, "source_exhausted", False)),
+                "configured": True,
+                "status": (
+                    "complete"
+                    if source_exhausted
+                    and infrastructure_failures == 0
+                    and query_attempts > 0
+                    and query_responses > 0
+                    else "incomplete"
+                ),
+                "query_attempts": query_attempts,
+                "query_responses": query_responses,
+                "source_exhausted": source_exhausted,
                 "resource_failed_locators": [
                     str(value) for value in getattr(result, "resource_failed_locators", [])
                     if str(value).startswith("torrent:")
                 ],
-                "infrastructure_failures": int(getattr(result, "infrastructure_failures", 0)),
+                "reviewed_torrent_miss_locators": [
+                    str(value)
+                    for value in getattr(result, "reviewed_torrent_miss_locators", [])
+                    if str(value).startswith("torrent:")
+                ],
+                "infrastructure_failures": infrastructure_failures,
+                "infrastructure_failure_types": infrastructure_failure_types,
                 "required": required,
             }
+            cursor = getattr(result, "query_cursor", None)
+            if isinstance(cursor, Mapping):
+                telemetry[label]["query_cursor"] = dict(cursor)
         except Exception as exc:
             telemetry[label] = {
+                "configured": True,
+                "status": "incomplete",
+                "query_attempts": 0,
+                "query_responses": 0,
                 "source_exhausted": False, "required": required,
                 "infrastructure_failures": 1,
+                "infrastructure_failure_types": {"source_error": 1},
                 "error_type": type(exc).__name__,
             }
             warnings.append(f"{label} 搜索不可用: {type(exc).__name__}")
@@ -832,15 +847,22 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
         if candidate_capability_error(row) is not None:
             continue
         deduplicated.setdefault((provider, locator), row)
-    required_rows = [
+    configured_rows = [
         value for value in telemetry.values()
-        if isinstance(value, Mapping) and value.get("required") is True
+        if isinstance(value, Mapping) and value.get("configured") is True
     ]
+    # A negative result is complete only when at least one source was enabled
+    # and every enabled source finished cleanly.  This follows the actual
+    # runtime configuration rather than a static required-source list, while
+    # retaining fail-closed behavior for an all-disabled or non-responsive
+    # deployment.
     search_complete = bool(
-        (catalog_ready or output)
-        and all(row.get("source_exhausted") is True for row in required_rows)
-        and all(int(row.get("infrastructure_failures") or 0) == 0 for row in required_rows)
-    ) if required_rows else catalog_ready
+        configured_rows
+        and all(row.get("source_exhausted") is True for row in configured_rows)
+        and all(int(row.get("infrastructure_failures") or 0) == 0 for row in configured_rows)
+        and all(int(row.get("query_attempts") or 0) > 0 for row in configured_rows)
+        and all(int(row.get("query_responses") or 0) > 0 for row in configured_rows)
+    )
     return {
         "version": 1,
         "catalog_verified_at": None,
@@ -891,19 +913,34 @@ class _DynamicSearchResult(list[dict[str, Any]]):
         infrastructure_failures: int = 0,
         infrastructure_failure_types: Mapping[str, int] | None = None,
         preexcluded_count: int = 0,
+        query_cursor: Mapping[str, Any] | None = None,
+        reviewed_torrent_miss_locators: Iterable[str] | None = None,
     ) -> None:
         super().__init__(values)
         self.query_attempts = query_attempts
         self.query_responses = query_responses
         self.source_exhausted = bool(source_exhausted)
         self.resource_failed_locators = list(resource_failed_locators or [])
-        self.infrastructure_failures = max(0, int(infrastructure_failures))
-        self.infrastructure_failure_types = {
-            str(key): max(0, int(value))
-            for key, value in (infrastructure_failure_types or {}).items()
-            if value
-        }
+        self.infrastructure_failure_types = _safe_infrastructure_failure_types(
+            infrastructure_failure_types,
+        )
+        # Keep the scalar counter and its breakdown consistent even when a
+        # provider forgot to increment the scalar for one failure branch.
+        self.infrastructure_failures = max(
+            0,
+            int(infrastructure_failures),
+            sum(self.infrastructure_failure_types.values()),
+        )
         self.preexcluded_count = max(0, int(preexcluded_count))
+        # A cursor is a read-only continuation receipt.  Provider adapters
+        # decide its shape; the bridge/root boundary validates and bounds it
+        # before durable persistence.  Keep a shallow copy so a caller cannot
+        # mutate the result after it has been emitted as telemetry.
+        self.query_cursor = dict(query_cursor) if isinstance(query_cursor, Mapping) else None
+        self.reviewed_torrent_miss_locators = [
+            str(value) for value in (reviewed_torrent_miss_locators or [])
+            if isinstance(value, str) and value
+        ]
 
 
 def _network_failure_code(exc: BaseException) -> str:
@@ -918,7 +955,12 @@ def _network_failure_code(exc: BaseException) -> str:
         )
     for error in chain:
         if isinstance(error, urllib.error.HTTPError):
-            return f"http_{error.code}"
+            code = error.code
+            if type(code) is int and 100 <= code <= 599:
+                return f"http_{code}"
+            return "network_error"
+        if isinstance(error, ET.ParseError):
+            return "xml_parse_error"
         if isinstance(error, ConnectionRefusedError):
             return "connection_refused"
         if isinstance(error, ConnectionResetError):
@@ -929,7 +971,15 @@ def _network_failure_code(exc: BaseException) -> str:
             return "timeout"
         if isinstance(error, ssl.SSLError):
             return "tls_failure"
-    return type(chain[-1] if chain else exc).__name__
+        if isinstance(error, urllib.error.URLError):
+            return "network_error"
+        if isinstance(error, ValueError):
+            return "value_error"
+        if isinstance(error, RuntimeError):
+            return "runtime_error"
+        if isinstance(error, OSError):
+            return "os_error"
+    return "source_error"
 
 def _fetch_bytes(
     url: str, *, max_bytes: int, timeout: int = 60, attempts: int = 4,
@@ -1599,8 +1649,160 @@ def _dynamic_search_terms(request: Mapping[str, Any]) -> list[str]:
     return terms
 
 
+def _identity_query_bases(
+    request: Mapping[str, Any], *, prefer_latin_aliases: bool = False,
+) -> list[str]:
+    """Return bounded identity evidence only, in a provider-friendly order.
+
+    The replenishment bridge projects ``media.aliases`` exclusively from the
+    confirmed C/TMDB identity.  Discovery may rank those aliases differently
+    for an index, but it must never manufacture a transliteration from a
+    source path or a web result.  In particular, a short pure-Latin official
+    alias is usually the release spelling on anime indexes, while a translated
+    local display title is not.
+    """
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    title = str(media.get("title") or "").strip()
+    raw_aliases = media.get("aliases")
+    aliases = raw_aliases if isinstance(raw_aliases, (list, tuple)) else []
+    if not prefer_latin_aliases:
+        # Preserve the established default term order for generic callers.
+        output: list[str] = []
+        seen_exact: set[str] = set()
+        for value in [title, *aliases[:40]]:
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text or text in seen_exact:
+                continue
+            seen_exact.add(text)
+            output.append(text)
+        return output
+
+    # The bridge itself caps aliases, but preserve a local hard limit for a
+    # malformed direct adapter request too.
+    values = [*aliases, title]
+    output: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values[:40]):
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        key = _normalized_text(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        output.append((index, text))
+    def rank(row: tuple[int, str]) -> tuple[int, int, int]:
+        index, value = row
+        normalized = unicodedata.normalize("NFKC", value)
+        has_latin = bool(re.search(r"[A-Za-z]", normalized))
+        # Keep a pure Latin/romanized alias ahead of a mixed-script alias
+        # such as a Japanese title containing an English franchise marker.
+        # Both remain confirmed TMDB evidence; this is only a search order.
+        non_latin = re.sub(
+            r"[A-Za-z0-9\s._,:;!?'\"()\[\]{}&+\-/]", "", normalized,
+        )
+        latin_rank = 0 if has_latin and not non_latin else 1 if has_latin else 2
+        return (latin_rank, len(_normalized_text(value)), index)
+
+    return [value for _index, value in sorted(output, key=rank)]
+
+
+def _requested_episode_targets(
+    request: Mapping[str, Any], *, maximum: int | None = None,
+) -> list[tuple[int, int]]:
+    """Read bounded exact episode coordinates from groups or ledger gaps.
+
+    Populated ``query_groups`` remain authoritative; they are used by callers
+    that intentionally narrow discovery.  The live Gap ledger bridge
+    deliberately does not emit that optional legacy shape, so its durable
+    ``gaps[].episodes`` rows provide the safe fallback.  A malformed or empty
+    legacy group remains compatible with the historical fallback behavior.
+    """
+    targets: list[tuple[int, int]] = []
+    target_limit = maximum if type(maximum) is int and maximum > 0 else None
+    seen_targets: set[tuple[int, int]] = set()
+
+    def add_target(season: object, episode: object) -> None:
+        if type(season) is not int or season < 0:
+            return
+        if type(episode) is not int or not 1 <= episode <= 9999:
+            return
+        coordinate = (season, episode)
+        if coordinate in seen_targets:
+            return
+        seen_targets.add(coordinate)
+        targets.append(coordinate)
+
+    for group in request.get("query_groups") or []:
+        if not isinstance(group, Mapping) or type(group.get("season")) is not int:
+            continue
+        season = int(group["season"])
+        episodes = group.get("episodes")
+        if isinstance(episodes, (list, tuple)):
+            for episode in episodes:
+                add_target(season, episode)
+                if target_limit is not None and len(targets) >= target_limit:
+                    return targets
+    if targets:
+        return targets
+
+    for gap in request.get("gaps") or []:
+        if not isinstance(gap, Mapping):
+            continue
+        season = gap.get("season")
+        episodes = gap.get("episodes")
+        if isinstance(episodes, (list, tuple)):
+            for episode in episodes:
+                add_target(season, episode)
+                if target_limit is not None and len(targets) >= target_limit:
+                    return targets
+        add_target(season, gap.get("episode"))
+        if target_limit is not None and len(targets) >= target_limit:
+            return targets
+    return targets
+
+
+def _positive_requested_seasons(
+    request: Mapping[str, Any], *, maximum: int = 8,
+) -> list[int]:
+    """Return positive seasons from explicit groups or, for bridge rows, gaps."""
+    if maximum < 1:
+        return []
+    output: list[int] = []
+    seen: set[int] = set()
+
+    def add(season: object) -> None:
+        if type(season) is not int or season <= 0 or season in seen:
+            return
+        seen.add(season)
+        output.append(season)
+
+    declared_group = False
+    for group in request.get("query_groups") or []:
+        if not isinstance(group, Mapping) or type(group.get("season")) is not int:
+            continue
+        declared_group = True
+        add(group["season"])
+        if len(output) >= maximum:
+            return output
+    if declared_group:
+        return output
+
+    for gap in request.get("gaps") or []:
+        if not isinstance(gap, Mapping):
+            continue
+        add(gap.get("season"))
+        if len(output) >= maximum:
+            break
+    return output
+
+
 def _explicit_episode_search_terms(
     request: Mapping[str, Any], *, maximum: int = 8,
+    prefer_latin_aliases: bool = False,
+    interleave_aliases: bool = False,
 ) -> list[str]:
     """Build a small, identity-scoped query set for exact requested episodes.
 
@@ -1612,49 +1814,44 @@ def _explicit_episode_search_terms(
     """
     if maximum < 1:
         return []
-    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
-    title = str(media.get("title") or "").strip()
-    aliases = [
-        str(value).strip() for value in media.get("aliases") or []
-        if isinstance(value, str) and value.strip()
-    ]
-    # Keep the local/library title and TMDB's declared alias order.  The
-    # generic bare-alias helper ranks long English descriptions first, which
-    # is sensible for broad discovery but can bury the short canonical alias
-    # that a Torrent index actually uses (for example ``Kaichou wa
-    # Maid-sama!``).
-    bases = list(dict.fromkeys([title, *aliases]))
-    targets: list[tuple[int, int]] = []
-    for group in request.get("query_groups") or []:
-        if not isinstance(group, Mapping) or not isinstance(group.get("season"), int):
-            continue
-        season = int(group["season"])
-        episodes = group.get("episodes")
-        if not isinstance(episodes, list):
-            continue
-        for episode in episodes:
-            if type(episode) is int and 1 <= episode <= 9999:
-                targets.append((season, episode))
-    if not targets:
-        for gap in request.get("gaps") or []:
-            if not isinstance(gap, Mapping) or not isinstance(gap.get("season"), int):
-                continue
-            season = int(gap["season"])
-            episode = gap.get("episode")
-            if type(episode) is int and 1 <= episode <= 9999:
-                targets.append((season, episode))
+    bases = _identity_query_bases(
+        request, prefer_latin_aliases=prefer_latin_aliases,
+    )
+    # Do not materialize a term cross-product from an arbitrarily large Gap
+    # ledger.  A later retry receives the same durable coordinates again, so
+    # this only bounds one read-only provider window.
+    targets = _requested_episode_targets(
+        request, maximum=max(1, min(32, maximum * 4)),
+    )
+    bases = bases[:max(2, min(8, maximum * 2))]
     output: list[str] = []
     seen: set[str] = set()
-    for base in bases:
-        for season, episode in targets:
-            value = f"{base} S{season:02d}E{episode:02d}"
-            key = re.sub(r"\W+", "", value).casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            output.append(value)
-            if len(output) >= maximum:
-                return output
+
+    # Provider discovery has a small query ceiling.  When asked, alternate
+    # the two strongest authoritative aliases for the first gap coordinates
+    # so one translated local title cannot consume the whole window.
+    paired: Iterable[tuple[str, tuple[int, int]]]
+    if interleave_aliases:
+        paired = (
+            (base, target)
+            for target in targets
+            for base in bases[:2]
+        )
+    else:
+        paired = (
+            (base, target)
+            for base in bases
+            for target in targets
+        )
+    for base, (season, episode) in paired:
+        value = f"{base} S{season:02d}E{episode:02d}"
+        key = re.sub(r"\W+", "", value).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+        if len(output) >= maximum:
+            return output
     return output
 
 
@@ -1844,6 +2041,245 @@ def _catalog_torrent_candidate_variants(
     return []
 
 
+def _nyaa_safe_query_term(value: object) -> str | None:
+    """Normalize one TMDB-derived Nyaa keyword and reject unsafe length."""
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or len(normalized) > _NYAA_MAX_QUERY_TERM_LENGTH:
+        return None
+    if any(
+        ord(character) < 0x20 or ord(character) == 0x7F
+        for character in normalized
+    ):
+        return None
+    return normalized
+
+
+def _nyaa_logical_search_terms(
+    request: Mapping[str, Any], *, maximum: int = _NYAA_MAX_LOGICAL_QUERY_TERMS,
+) -> list[str]:
+    """Build a bounded logical Nyaa term set from identity and coordinates.
+
+    Nyaa release labels often use a naked episode ordinal (``Title - 13``)
+    even when the same provider returns nothing for ``Title S01E13``.  Query
+    one or more exact coordinates first, then use the same confirmed identity
+    title plus each requested ordinal as a provider-specific fallback.  Bare
+    identity/season queries are last-resort discovery only.  Source paths,
+    web results, and provider release titles never enter this list; the
+    manifest-to-gap check remains the candidate authorization boundary.
+    """
+    if maximum < 1:
+        return []
+    bases: list[str] = []
+    seen_bases: set[str] = set()
+    for raw in _identity_query_bases(request, prefer_latin_aliases=True):
+        value = _nyaa_safe_query_term(raw)
+        if value is None:
+            continue
+        key = _normalized_text(value)
+        if not key or key in seen_bases:
+            continue
+        seen_bases.add(key)
+        bases.append(value)
+    if not bases:
+        return []
+
+    # Bound the intermediate cross-product as well as the final query list.
+    # The durable gap ledger is retried in later windows, so this cannot
+    # authorize or silently discard a coordinate; it only limits one
+    # provider request's read-only work.
+    targets = _requested_episode_targets(
+        request, maximum=max(1, min(32, maximum * 4)),
+    )
+    bases = bases[:max(2, min(8, maximum * 2))]
+    exact: list[str] = []
+    release_style: list[str] = []
+    # Use two independent confirmed aliases for exact grammar, but prefer one
+    # concise release spelling across several open coordinates below.  That
+    # lets a bounded pass find multiple ordinary ``Title - N`` releases
+    # without importing a directory label or an external search result.
+    for season, episode in targets:
+        for base in bases[:2]:
+            value = _nyaa_safe_query_term(
+                f"{base} S{season:02d}E{episode:02d}"
+            )
+            if value is not None:
+                exact.append(value)
+    for base in bases:
+        for _season, episode in targets:
+            value = _nyaa_safe_query_term(f"{base} {episode}")
+            if value is not None:
+                release_style.append(value)
+
+    seasons = _positive_requested_seasons(request, maximum=8)
+    season_terms: list[str] = []
+    for season in seasons:
+        for base in bases:
+            value = _nyaa_safe_query_term(f"{base} S{season:02d}")
+            if value is not None:
+                season_terms.append(value)
+    # Season 00 releases are commonly bare ``Specials``/``OVA`` rows; a bare
+    # confirmed alias is safe for discovery, while the manifest still proves
+    # the exact optional coordinate.
+    if any(season == 0 for season, _episode in targets):
+        season_terms.extend(bases[:2])
+
+    # Preserve two formal token queries as the first lane.  The subsequent
+    # release-style coordinates are intentionally contiguous: the cursor can
+    # advance through all durable Gap coordinates four at a time rather than
+    # repeatedly searching only the first two episodes.
+    if exact:
+        exact_budget = min(len(exact), 2)
+        ordered = [
+            *exact[:exact_budget], *release_style,
+            *exact[exact_budget:], *bases, *season_terms,
+        ]
+    else:
+        ordered = [*release_style, *bases, *season_terms]
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in ordered:
+        key = re.sub(r"\W+", "", value).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+        if len(output) >= maximum:
+            break
+    return output
+
+
+def _nyaa_search_terms(
+    request: Mapping[str, Any], *, maximum: int = _NYAA_MAX_QUERY_TERMS,
+) -> list[str]:
+    """Return the first bounded Nyaa provider window for direct callers.
+
+    The live searcher uses ``_nyaa_logical_search_terms`` plus a durable term
+    cursor.  Keeping this small wrapper preserves the provider helper's
+    historical bounded API for tests and isolated callers.
+    """
+    if maximum < 1:
+        return []
+    return _nyaa_logical_search_terms(
+        request, maximum=_NYAA_MAX_LOGICAL_QUERY_TERMS,
+    )[:maximum]
+
+
+def _nyaa_request_fingerprint(
+    request: Mapping[str, Any], terms: Sequence[str],
+) -> str:
+    """Bind a Nyaa term cursor to C/TMDB identity and exact gap evidence."""
+    media = request.get("media")
+    media = media if isinstance(media, Mapping) else {}
+    gap_payload: list[dict[str, Any]] = []
+    for raw in request.get("gaps") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        gap_payload.append({
+            "id": raw.get("id"),
+            "kind": raw.get("kind"),
+            "season": raw.get("season"),
+            "episodes": sorted({
+                int(value) for value in (raw.get("episodes") or [])
+                if type(value) is int and value > 0
+            }),
+        })
+    payload = {
+        "provider": "nyaa",
+        "media": {
+            "media_type": media.get("media_type"),
+            "tmdb_id": media.get("tmdb_id"),
+            "title": media.get("title"),
+            "original_title": media.get("original_title"),
+            "aliases": [
+                value for value in (media.get("aliases") or [])
+                if isinstance(value, str)
+            ][:40],
+        },
+        "gaps": sorted(gap_payload, key=lambda row: (
+            str(row.get("id") or ""), str(row.get("kind") or ""),
+            int(row.get("season")) if type(row.get("season")) is int else -1,
+            row.get("episodes") or [],
+        )),
+        "terms": list(terms),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _nyaa_request_cursor(
+    request: Mapping[str, Any], fingerprint: str, term_count: int,
+) -> dict[str, Any]:
+    """Read a bounded continuation receipt or restart safely at term zero."""
+    raw: object = None
+    cursors = request.get("search_cursors")
+    if isinstance(cursors, Mapping):
+        for key, value in cursors.items():
+            normalized = re.sub(r"[^a-z0-9]+", "", str(key).casefold())
+            if normalized == "nyaa":
+                raw = value
+                break
+    if not isinstance(raw, Mapping):
+        return {"fingerprint": fingerprint, "term_index": 0, "page": 1, "exhausted": False}
+    term_index = raw.get("term_index")
+    page = raw.get("page")
+    exhausted = raw.get("exhausted")
+    if (
+        raw.get("fingerprint") != fingerprint
+        or type(term_index) is not int
+        or not 0 <= term_index <= term_count
+        or type(page) is not int
+        or page != 1
+        or type(exhausted) is not bool
+    ):
+        return {"fingerprint": fingerprint, "term_index": 0, "page": 1, "exhausted": False}
+    return {
+        "fingerprint": fingerprint,
+        "term_index": term_index,
+        "page": 1,
+        "exhausted": exhausted,
+    }
+
+
+def _nyaa_release_priority(
+    request: Mapping[str, Any], release_name: str,
+) -> tuple[int, int, int, int, int]:
+    """Order broad RSS rows by audited identity/episode relevance.
+
+    The score only changes which untrusted metainfo is inspected first.  It
+    never admits a candidate: `_torrent_candidate_variants` must still prove
+    exact season/episode coverage and all media safety constraints.
+    """
+    base = _animetosho_release_priority(request, release_name)
+    normalized = _normalized_text(release_name)
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    aliases = [
+        value for value in [
+            media.get("title"), media.get("original_title"),
+            *(media.get("aliases") if isinstance(media.get("aliases"), (list, tuple)) else []),
+        ]
+        if isinstance(value, str) and len(_normalized_text(value)) >= 3
+    ]
+    alias_strength = max(
+        (len(_normalized_text(value)) for value in aliases
+         if _normalized_text(value) in normalized),
+        default=0,
+    )
+    # Lower tuple values are inspected first.  Keep exact/alias hits ahead of
+    # unrelated rows even when the provider's broad 75-row window is full.
+    return (
+        0 if alias_strength else 1,
+        base[0],
+        base[1],
+        base[2],
+        -alias_strength,
+    )
+
+
 def _search_nyaa(
     request: Mapping[str, Any], existing_locators: set[str], *, deadline: float,
 ) -> list[dict[str, Any]]:
@@ -1854,10 +2290,41 @@ def _search_nyaa(
     results: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     query_attempts = 0
     query_responses = 0
-    terms = _compact_dynamic_search_terms(request, maximum=3)
-    hit_cap = False
+    logical_terms = _nyaa_search_terms(
+        request, maximum=_NYAA_MAX_LOGICAL_QUERY_TERMS,
+    )
+    # A full logical-term buffer may be a prefix of a larger malformed or
+    # unusually wide identity/gap set.  It is still safe to rotate through
+    # that finite buffer, but never sufficient to certify a no-resource
+    # result for coordinates that did not fit.
+    logical_schedule_truncated = (
+        len(logical_terms) >= _NYAA_MAX_LOGICAL_QUERY_TERMS
+    )
+    fingerprint = _nyaa_request_fingerprint(request, logical_terms)
+    cursor = _nyaa_request_cursor(request, fingerprint, len(logical_terms))
+    revalidate_exhausted = cursor["exhausted"] is True and bool(logical_terms)
+    term_start = (
+        max(len(logical_terms) - 1, 0)
+        if revalidate_exhausted else int(cursor["term_index"])
+    )
+    terms = logical_terms[term_start:term_start + _NYAA_MAX_QUERY_TERMS]
+    response_window_incomplete = False
+    feed_window_incomplete = False
+    manifest_window_incomplete = False
     excluded_hashes = _locator_infohash_aliases(existing_locators)
+    # Only a successfully parsed, non-covering manifest becomes a durable
+    # negative receipt.  Download failures and RSS/metainfo mismatches stay
+    # uncached and therefore retryable.
+    reviewed_hashes = _locator_infohash_aliases(
+        request.get("reviewed_torrent_miss_locators") or [],
+    )
     preexcluded_hashes: set[str] = set()
+    reviewed_miss_locators: set[str] = set()
+    infrastructure_failure_types: dict[str, int] = {}
+    infrastructure_failures = 0
+    requested_gap_tokens = _animetosho_requested_gap_tokens(request)
+    candidate_coverage: set[str] = set()
+    partial_candidate_seen = False
 
     def rss_infohash(item: ET.Element) -> str:
         for child in item:
@@ -1887,10 +2354,37 @@ def _search_nyaa(
                 timeout=request_timeout(), attempts=1,
             )
             root = ET.fromstring(page)
-        except (OSError, RuntimeError, ValueError, ET.ParseError):
+            if root.tag.rsplit("}", 1)[-1].casefold() != "rss":
+                raise ValueError("Nyaa RSS 根节点无效")
+            channel = next(
+                (
+                    child for child in root
+                    if child.tag.rsplit("}", 1)[-1].casefold() == "channel"
+                ),
+                None,
+            )
+            if channel is None:
+                raise ValueError("Nyaa RSS 缺少 channel")
+        except (OSError, RuntimeError, ValueError, ET.ParseError) as exc:
+            infrastructure_failures += 1
+            code = _network_failure_code(exc)
+            infrastructure_failure_types[code] = (
+                infrastructure_failure_types.get(code, 0) + 1
+            )
             continue
         query_responses += 1
-        for item in root.findall("./channel/item"):
+        items = [
+            child for child in channel
+            if child.tag.rsplit("}", 1)[-1].casefold() == "item"
+        ]
+        # Nyaa currently returns at most 75 entries and exposes no reliable
+        # page/offset receipt.  A full response can therefore be a truncated
+        # provider window; inspect it for candidates, but never use it as a
+        # no-resource proof.  A provider regression beyond that bound is
+        # likewise read only within the finite window below.
+        if len(items) >= _NYAA_MAX_RSS_ROWS_PER_QUERY:
+            response_window_incomplete = True
+        for item in items[:_NYAA_MAX_RSS_ROWS_PER_QUERY]:
             release_name = str(item.findtext("title") or "").strip()
             torrent_url = str(item.findtext("link") or "").strip()
             feed_infohash = rss_infohash(item)
@@ -1901,7 +2395,7 @@ def _search_nyaa(
             )
             locator = f"torrent:{torrent_url}"
             aliases = _infohash_aliases(feed_infohash)
-            if aliases and aliases & excluded_hashes:
+            if aliases and aliases & (excluded_hashes | reviewed_hashes):
                 preexcluded_hashes.add(feed_infohash)
                 continue
             if (
@@ -1910,24 +2404,35 @@ def _search_nyaa(
                 and locator not in existing_locators
             ):
                 results.setdefault(torrent_url, (release_name, feed_infohash, swarm))
-            if len(results) >= 32:
-                hit_cap = True
-                break
-        if len(results) >= 32:
-            break
+        if len(results) > _NYAA_MAX_FEED_ROWS:
+            # Keep the globally best bounded window, rather than the first
+            # rows received.  This is only an inspection optimization; the
+            # dropped rows keep the source explicitly incomplete.
+            feed_window_incomplete = True
+            retained = sorted(
+                results.items(),
+                key=lambda row: _nyaa_release_priority(request, row[1][0]),
+            )[:_NYAA_MAX_FEED_ROWS]
+            results.clear()
+            results.update(retained)
 
     candidates: list[dict[str, Any]] = []
     resource_failed_locators: list[str] = []
-    infrastructure_failures = 0
     processed = 0
     ranked_results = sorted(
         results.items(),
-        key=lambda item: _source_episode_release_priority(
+        key=lambda item: _nyaa_release_priority(
             request, item[1][0],
         ),
     )
-    for torrent_url, (release_name, feed_infohash, swarm) in ranked_results:
+    manifest_results = ranked_results[:_NYAA_MAX_MANIFEST_INSPECTIONS]
+    if len(manifest_results) < len(ranked_results):
+        manifest_window_incomplete = True
+    for position, (torrent_url, (release_name, feed_infohash, swarm)) in enumerate(
+        manifest_results,
+    ):
         if time.monotonic() >= deadline:
+            manifest_window_incomplete = True
             break
         with tempfile.TemporaryDirectory(prefix="scrapeflow-nyaa-") as directory:
             try:
@@ -1935,15 +2440,29 @@ def _search_nyaa(
                     torrent_url, Path(directory) / "candidate.torrent",
                     timeout=request_timeout(), attempts=1,
                 )
-            except Exception:
+            except Exception as exc:
                 infrastructure_failures += 1
+                code = _network_failure_code(exc)
+                infrastructure_failure_types[code] = (
+                    infrastructure_failure_types.get(code, 0) + 1
+                )
                 continue
         processed += 1
         manifest_aliases = _infohash_aliases(manifest["infohash"])
+        feed_aliases = _infohash_aliases(feed_infohash)
         if (
-            manifest_aliases & excluded_hashes
-            or _infohash_aliases(feed_infohash) & excluded_hashes
+            manifest_aliases & (excluded_hashes | reviewed_hashes)
+            or feed_aliases & (excluded_hashes | reviewed_hashes)
         ):
+            continue
+        if feed_aliases and not manifest_aliases & feed_aliases:
+            # The RSS receipt and downloaded metainfo disagree.  It is not a
+            # verified non-covering release, so keep the source fail-closed
+            # rather than caching a negative resource result.
+            infrastructure_failures += 1
+            infrastructure_failure_types["source_error"] = (
+                infrastructure_failure_types.get("source_error", 0) + 1
+            )
             continue
         variants = _torrent_candidate_variants(
             request, release_name, torrent_url, manifest,
@@ -1952,19 +2471,80 @@ def _search_nyaa(
         )
         if variants:
             candidates.extend(variants)
+            for variant in variants:
+                if not isinstance(variant, Mapping):
+                    continue
+                coverage = variant.get("file_coverage")
+                if isinstance(coverage, (list, tuple, set)):
+                    candidate_coverage.update(
+                        str(value) for value in coverage
+                        if isinstance(value, str)
+                    )
+            if requested_gap_tokens and requested_gap_tokens <= candidate_coverage:
+                # Candidate coverage makes further metainfo reads unnecessary
+                # for this pass, but it does not prove the provider window
+                # exhausted.  Leave source health explicitly incomplete.
+                if position + 1 < len(ranked_results):
+                    manifest_window_incomplete = True
+                break
+            # A partial candidate is useful to the selector, but retaining
+            # this term window is necessary if its later acquisition fails:
+            # unselected siblings from the same RSS evidence remain possible.
+            partial_candidate_seen = True
         else:
-            resource_failed_locators.append(f"torrent:{manifest['infohash']}")
+            miss_locator = f"torrent:{manifest['infohash']}"
+            resource_failed_locators.append(miss_locator)
+            if manifest_aliases:
+                reviewed_miss_locators.add(miss_locator)
+                reviewed_hashes.update(manifest_aliases)
+    if partial_candidate_seen:
+        manifest_window_incomplete = True
+    window_fully_reviewed = bool(
+        terms
+        and query_attempts == len(terms)
+        and query_responses == query_attempts
+        and not response_window_incomplete
+        and not feed_window_incomplete
+        and not manifest_window_incomplete
+        and processed == len(ranked_results)
+        and infrastructure_failures == 0
+    )
+    next_term_index = (
+        min(len(logical_terms), term_start + len(terms))
+        if window_fully_reviewed else term_start
+    )
+    logical_schedule_complete = bool(
+        window_fully_reviewed and next_term_index >= len(logical_terms)
+    )
+    # A capped logical schedule can be retried, but cannot ever claim that
+    # omitted terms were searched.  Restart its bounded cycle rather than
+    # persisting a misleading ``exhausted`` receipt.
+    if logical_schedule_complete and logical_schedule_truncated:
+        next_term_index = 0
+    cursor_exhausted = bool(
+        logical_schedule_complete and not logical_schedule_truncated
+    )
+    query_cursor = {
+        "fingerprint": fingerprint,
+        "term_index": next_term_index,
+        "page": 1,
+        "exhausted": cursor_exhausted,
+    }
     return _DynamicSearchResult(
         candidates,
         query_attempts=query_attempts,
         query_responses=query_responses,
         source_exhausted=bool(
-            terms and query_attempts == len(terms) and query_responses == query_attempts
-            and not hit_cap and processed == len(results) and infrastructure_failures == 0
+            cursor_exhausted
+            and window_fully_reviewed
+            and not logical_schedule_truncated
         ),
         resource_failed_locators=resource_failed_locators,
+        reviewed_torrent_miss_locators=sorted(reviewed_miss_locators),
         infrastructure_failures=infrastructure_failures,
+        infrastructure_failure_types=infrastructure_failure_types,
         preexcluded_count=len(preexcluded_hashes),
+        query_cursor=query_cursor,
     )
 
 
@@ -2092,6 +2672,32 @@ def _specific_s00_title_terms(
     return list(dict.fromkeys([*latin, *non_latin]))[:maximum]
 
 
+def _broad_identity_alias_terms(
+    request: Mapping[str, Any], *, maximum: int = 1,
+) -> list[str]:
+    """Return a tiny broad fallback made only from confirmed identity names.
+
+    Some indexes (notably AnimeTosho) ignore an ``S01E13`` query even when a
+    bare series query returns the corresponding release.  Keep one short
+    Latin/romanized TMDB alias available for that case.  The fallback is only
+    discovery input: the manifest-to-gap identity and exact episode checks
+    still gate every candidate, so a broad result cannot authorize a write.
+    """
+    if maximum < 1:
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in _identity_query_bases(request, prefer_latin_aliases=True):
+        key = _normalized_text(value)
+        if len(key) < 4 or key.isdecimal() or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+        if len(output) >= maximum:
+            break
+    return output
+
+
 def _animetosho_search_terms(
     request: Mapping[str, Any], *, maximum: int = 4,
 ) -> list[str]:
@@ -2099,7 +2705,24 @@ def _animetosho_search_terms(
     if maximum < 1:
         return []
     source_episode = _source_episode_search_terms(request, maximum=1)
-    exact_episode = _explicit_episode_search_terms(request, maximum=2)
+    # The live Gap-ledger bridge carries only C/TMDB aliases and exact gap
+    # coordinates, not legacy ``query_groups``.  Reserve one slot for a broad
+    # authoritative alias: AnimeTosho can return a release for ``Mashle`` but
+    # return nothing for an otherwise precise ``Mashle S01E13`` query.
+    broad_alias = _broad_identity_alias_terms(request, maximum=1)
+    # A one-slot caller still receives an exact query.  Reserve a broad slot
+    # only when the bounded provider window has room for both lanes.
+    exact_window = (
+        maximum - len(broad_alias)
+        if broad_alias and maximum > 1
+        else maximum
+    )
+    exact_episode = _explicit_episode_search_terms(
+        request,
+        maximum=exact_window,
+        prefer_latin_aliases=True,
+        interleave_aliases=True,
+    )
     media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
     local_title = str(media.get("title") or "").strip()
     local_bare = [local_title] if local_title else []
@@ -2110,54 +2733,95 @@ def _animetosho_search_terms(
         if any(gap.get("season") == 0 for gap in gaps)
         else []
     )
-    return list(dict.fromkeys([
-        *focused, *source_episode, *exact_episode, *local_bare,
-        *optional_bare, *_compact_dynamic_search_terms(request, maximum=maximum),
-    ]))[:maximum]
+    priority = list(dict.fromkeys([
+        *focused, *source_episode, *exact_episode,
+    ]))
+    # Keep exact/specific terms first, then force the bounded broad fallback
+    # into this same request window even when focused metadata is present.
+    terms = priority[:exact_window]
+    if len(terms) < maximum:
+        terms.extend(value for value in broad_alias if value not in terms)
+    terms.extend(value for value in [
+        *local_bare, *optional_bare,
+        *_compact_dynamic_search_terms(request, maximum=maximum),
+    ] if value not in terms)
+    return terms[:maximum]
 
 
 def _dmhy_search_terms(request: Mapping[str, Any]) -> list[str]:
-    """Prefer Season 00 sub-series names that DMHY release titles retain."""
-    focused = _specific_s00_title_terms(request, maximum=4)
-    # Some active Chinese indexes encode a regular-season episode as a pair
-    # such as ``[S4][17_89]`` rather than ``S04E17``.  A bounded season query
-    # lets the index return that release; the manifest parser still requires
-    # the explicit dual-number evidence before any candidate can be selected.
-    season_terms: list[str] = []
-    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
-    raw_bases = [
-        str(value).strip()
-        for value in [media.get("title"), *(media.get("aliases") or [])]
-        if isinstance(value, str) and value.strip()
+    """Build a bounded DMHY query set from confirmed identity evidence.
+
+    DMHY returns an HTTP error for overlong RSS keywords.  A rejected long
+    alias must not consume one of the four query slots: filter each generated
+    term first, then continue with shorter aliases and exact Gap coordinates.
+    The request's ``media.title``/``media.aliases`` are the only title inputs;
+    source paths, web-search labels, and legacy generated query strings are
+    deliberately excluded from this provider's search lane.
+    """
+    maximum = _DMHY_MAX_QUERY_TERMS
+    bases = _identity_query_bases(request, prefer_latin_aliases=True)
+    seasons = _positive_requested_seasons(request, maximum=8)
+    targets = _requested_episode_targets(request)
+
+    # Keep at least one season query whenever a positive season is known, and
+    # reserve the remainder for exact gap coordinates.  With two missing
+    # episodes this yields two season terms followed by the first two exact
+    # terms, while a whole-season gap still receives the full season window.
+    exact_reserve = min(
+        max(0, maximum - 1),
+        len(targets),
+    ) if seasons else maximum
+    season_window = max(0, maximum - exact_reserve)
+    season_terms = [
+        f"{base} S{season}"
+        for base in bases
+        for season in seasons
     ]
-    # Query English/romanized aliases before the local display title: DMHY
-    # release names normally retain those spellings.  This changes discovery
-    # only; the title identity check still uses every authoritative alias.
-    bases = [
-        value for _index, value in sorted(
-            enumerate(dict.fromkeys(raw_bases)),
-            key=lambda item: (
-                0 if re.search(r"[A-Za-z]", item[1]) else 1,
-                item[0],
-            ),
-        )
-    ]
-    seasons: list[int] = []
-    for group in request.get("query_groups") or []:
-        if not isinstance(group, Mapping) or type(group.get("season")) is not int:
-            continue
-        season = int(group["season"])
-        if season > 0 and season not in seasons:
-            seasons.append(season)
-    for base in bases:
-        for season in seasons:
-            season_terms.append(f"{base} S{season}")
-            if len(season_terms) >= 4:
-                break
-        if len(season_terms) >= 4:
-            break
-    fallback = _mikan_search_terms(request)
-    return list(dict.fromkeys([*focused, *season_terms, *fallback]))[:4]
+    exact_terms = _explicit_episode_search_terms(
+        request,
+        maximum=max(maximum * 4, maximum),
+        prefer_latin_aliases=True,
+        # Base-major order fills adjacent requested episodes with the
+        # shortest confirmed alias before trying a translated/long alias.
+        interleave_aliases=False,
+    )
+
+    output: list[str] = []
+    seen: set[str] = set()
+
+    def add(values: Iterable[str]) -> None:
+        for value in values:
+            normalized = _dmhy_safe_query_term(value)
+            if normalized is None:
+                continue
+            key = _normalized_text(normalized)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            output.append(normalized)
+            if len(output) >= maximum:
+                return
+
+    add(season_terms[:season_window])
+    add(exact_terms)
+    add(season_terms[season_window:])
+    # A bare confirmed alias is a final read-only fallback for a request that
+    # has no episode coordinates (or whose exact terms were all too long).
+    add(bases)
+    return output[:maximum]
+
+
+def _dmhy_safe_query_term(value: object) -> str | None:
+    """Normalize one identity-derived DMHY keyword and reject unsafe length."""
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or len(normalized) > _DMHY_MAX_QUERY_TERM_LENGTH:
+        return None
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in normalized):
+        return None
+    return normalized
 
 
 def _source_episode_search_terms(
@@ -2229,6 +2893,91 @@ def _source_episode_release_priority(
                 ):
                     return 0
     return 1
+
+
+def _animetosho_requested_gap_tokens(request: Mapping[str, Any]) -> set[str]:
+    """Return exact episode coordinates that a feed row may advertise.
+
+    This helper is used only to order untrusted feed rows.  It does not
+    authorize a candidate: ``_gap_file_map`` and the manifest safety checks
+    remain the sole source of coverage evidence.  Keeping the requested set
+    derived from the durable gap coordinates also means a broad release title
+    cannot introduce a new season or episode through this optimization.
+    """
+    tokens: set[str] = set()
+    for raw_gap in request.get("gaps") or []:
+        if not isinstance(raw_gap, Mapping):
+            continue
+        kind = str(raw_gap.get("kind") or "")
+        gap_id = str(raw_gap.get("id") or "")
+        if kind == "missing_episode" and re.fullmatch(
+            r"S\d{2,3}E\d{2,4}", gap_id,
+        ):
+            tokens.add(gap_id)
+            continue
+        if kind != "missing_season":
+            continue
+        season = raw_gap.get("season")
+        expected = raw_gap.get("expected_episode_count")
+        if type(season) is not int or season < 0:
+            continue
+        if type(expected) is not int or expected < 1 or expected > 9999:
+            continue
+        tokens.update(
+            f"S{season:02d}E{episode:02d}"
+            for episode in range(1, expected + 1)
+        )
+    if tokens:
+        return tokens
+    # A few legacy test/integration callers provide only query groups.  They
+    # are still confirmed coordinates, but never source-directory evidence.
+    return {
+        f"S{season:02d}E{episode:02d}"
+        for season, episode in _requested_episode_targets(request)
+    }
+
+
+def _animetosho_release_priority(
+    request: Mapping[str, Any], release_name: str,
+) -> tuple[int, int, int, int]:
+    """Order feed rows likely to satisfy an already-audited gap first.
+
+    AnimeTosho's broad alias feed can contain hundreds of rows, while reading
+    each ``.torrent`` manifest is comparatively expensive.  Naked episode
+    titles (``Show - 24``) therefore need to precede unrelated specials and
+    other seasons.  The score is an ordering hint only; all rows still pass
+    the exact manifest-to-gap checks before becoming candidates.
+    """
+    requested = _animetosho_requested_gap_tokens(request)
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    requested_seasons = {
+        int(token[1:token.index("E")])
+        for token in requested
+        if re.fullmatch(r"S\d{2,3}E\d{2,4}", token)
+    }
+    # A naked trailing number is meaningful for a single requested season;
+    # with multiple seasons, refusing the fallback is safer than promoting a
+    # cross-season pack merely because its title ends in the right number.
+    default_seasons = requested_seasons if len(requested_seasons) == 1 else set()
+    release_tokens = _expanded_episode_ids(release_name) | _coverage_tokens(
+        [release_name], default_seasons=default_seasons,
+    )
+    exact = requested & release_tokens
+    source_priority = _source_episode_release_priority(request, release_name)
+    aliases = [
+        value for value in (media.get("aliases") or [])
+        if isinstance(value, str) and len(_normalized_text(value)) >= 4
+    ]
+    normalized_release = _normalized_text(release_name)
+    alias_hit = any(
+        _normalized_text(value) in normalized_release for value in aliases
+    )
+    return (
+        0 if exact else 1,
+        -len(exact),
+        source_priority,
+        0 if alias_hit else 1,
+    )
 
 
 _S00_TITLE_PREFLIGHT_LIMIT = 4
@@ -2567,6 +3316,7 @@ def _search_dmhy(
     hit_cap = False
     preexcluded_hashes: set[str] = set()
     infrastructure_failure_types: dict[str, int] = {}
+    infrastructure_failures = 0
 
     for term in terms:
         if time.monotonic() >= deadline:
@@ -2582,6 +3332,7 @@ def _search_dmhy(
             )
             root = ET.fromstring(page)
         except (OSError, RuntimeError, ValueError, ET.ParseError) as exc:
+            infrastructure_failures += 1
             code = _network_failure_code(exc)
             infrastructure_failure_types[code] = (
                 infrastructure_failure_types.get(code, 0) + 1
@@ -2616,7 +3367,6 @@ def _search_dmhy(
 
     candidates: list[dict[str, Any]] = []
     resource_failed_locators: list[str] = []
-    infrastructure_failures = 0
     processed = 0
     ranked_results = _prioritize_verified_s00_title_rows(
         request, results.items(),
@@ -2868,40 +3618,199 @@ def _search_tokyotosho(
     )
 
 
+_ANIMETOSHO_MAX_PAGES_PER_RUN = 4
+_ANIMETOSHO_MAX_PAGE = 256
+_ANIMETOSHO_MAX_ROWS_PER_PAGE = 512
+
+
+def _animetosho_request_fingerprint(
+    request: Mapping[str, Any], terms: Sequence[str],
+) -> str:
+    """Fingerprint only the confirmed identity and exact open-gap query.
+
+    The feed cursor is deliberately tied to the request that produced it.
+    Directory names, provider URLs and web-search titles never enter this
+    payload.  If TMDB identity, aliases, coordinates, or the deterministic
+    term list changes, a stale page cursor is ignored and discovery restarts
+    from page one.
+    """
+    media = request.get("media")
+    media = media if isinstance(media, Mapping) else {}
+    media_payload = {
+        "media_type": media.get("media_type"),
+        "tmdb_id": media.get("tmdb_id"),
+        "title": media.get("title"),
+        "original_title": media.get("original_title"),
+        "aliases": [
+            value for value in (media.get("aliases") or [])
+            if isinstance(value, str)
+        ][:40],
+    }
+    gap_payload: list[dict[str, Any]] = []
+    for raw in request.get("gaps") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        episodes = sorted({
+            int(value) for value in (raw.get("episodes") or [])
+            if type(value) is int and value > 0
+        })
+        gap_payload.append({
+            "id": raw.get("id"),
+            "kind": raw.get("kind"),
+            "season": raw.get("season"),
+            "episodes": episodes,
+        })
+    payload = {
+        "provider": "animetosho",
+        "media": media_payload,
+        "gaps": sorted(gap_payload, key=lambda row: (
+            str(row.get("id") or ""), str(row.get("kind") or ""),
+            int(row.get("season")) if type(row.get("season")) is int else -1,
+            row.get("episodes") or [],
+        )),
+        "terms": list(terms),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _animetosho_request_cursor(
+    request: Mapping[str, Any], fingerprint: str, term_count: int,
+) -> dict[str, Any]:
+    """Read a bounded source cursor; malformed/mismatched state restarts."""
+    raw: object = None
+    cursors = request.get("search_cursors")
+    if isinstance(cursors, Mapping):
+        for key, value in cursors.items():
+            normalized = re.sub(r"[^a-z0-9]+", "", str(key).casefold())
+            if normalized == "animetosho":
+                raw = value
+                break
+    if raw is None:
+        raw = request.get("animetosho_query_cursor")
+    if not isinstance(raw, Mapping):
+        return {"fingerprint": fingerprint, "term_index": 0, "page": 1, "exhausted": False}
+    raw_fingerprint = raw.get("fingerprint")
+    term_index = raw.get("term_index")
+    page = raw.get("page")
+    exhausted = raw.get("exhausted")
+    if (
+        raw_fingerprint != fingerprint
+        or not isinstance(raw_fingerprint, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint)
+        or type(term_index) is not int
+        or term_index < 0
+        or term_index > max(term_count, 0)
+        or type(page) is not int
+        or page < 1
+        or page > _ANIMETOSHO_MAX_PAGE
+        or type(exhausted) is not bool
+    ):
+        return {"fingerprint": fingerprint, "term_index": 0, "page": 1, "exhausted": False}
+    return {
+        "fingerprint": fingerprint,
+        "term_index": term_index,
+        "page": page,
+        "exhausted": exhausted,
+    }
+
+
 def _search_animetosho(
     request: Mapping[str, Any], existing_locators: set[str], *, deadline: float,
 ) -> list[dict[str, Any]]:
-    """Search AnimeTosho's official JSON feed for old anime torrents."""
+    """Search AnimeTosho's JSON feed with a bounded page continuation.
+
+    AnimeTosho returns up to 75 rows for each ``page``.  The old adapter
+    stopped after the first 32 unique rows, which made broad aliases (for
+    example ``Mashle``) permanently miss later pages.  We inspect a bounded
+    number of complete pages per run and persist the next exact page cursor;
+    a page is advanced only after every manifest on it was either safely
+    excluded or validated as non-covering.  HTTP/JSON/metainfo failures keep
+    the cursor on that page and mark the source infrastructure-incomplete.
+    """
     def request_timeout() -> int:
         remaining = int(deadline - time.monotonic())
         return max(1, min(12, remaining))
 
-    terms = _animetosho_search_terms(request, maximum=4)
+    # Keep the existing exact-first terms, then append confirmed bare aliases
+    # so a broad release spelling is reached by later cursor windows without
+    # using a directory name or a web-search result.
+    terms = list(_animetosho_search_terms(request, maximum=4))
+    for value in _identity_query_bases(request, prefer_latin_aliases=True):
+        if value and value not in terms:
+            terms.append(value)
+        if len(terms) >= 8:
+            break
+    fingerprint = _animetosho_request_fingerprint(request, terms)
+    cursor = _animetosho_request_cursor(request, fingerprint, len(terms))
+    revalidate_exhausted = cursor.get("exhausted") is True and bool(terms)
+    # A completed receipt is revalidated with the final term's last empty
+    # page instead of fabricating query counters.  If the provider gained a
+    # new row since the previous pass, discovery resumes from that page; if
+    # it remains empty, the new run has truthful query/response evidence.
+    term_index = (
+        max(len(terms) - 1, 0) if revalidate_exhausted
+        else int(cursor["term_index"])
+    )
+    page = int(cursor["page"])
+
+    existing_hashes = _locator_infohash_aliases(existing_locators)
+    reviewed_hashes = _locator_infohash_aliases(
+        request.get("reviewed_torrent_miss_locators") or [],
+    )
     results: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
+    candidates: list[dict[str, Any]] = []
+    requested_gap_tokens = _animetosho_requested_gap_tokens(request)
+    candidate_coverage: set[str] = set()
+    partial_candidate_seen = False
+    resource_failed_locators: list[str] = []
+    reviewed_miss_locators: set[str] = set()
     query_attempts = 0
     query_responses = 0
-    hit_cap = False
-    for term in terms:
-        if time.monotonic() >= deadline:
-            break
-        url = "https://feed.animetosho.org/json?q=" + urllib.parse.quote(term)
+    infrastructure_failures = 0
+    pages_completed = 0
+    cursor_blocked = False
+    last_empty_page: int | None = None
+
+    while (
+        term_index < len(terms)
+        and pages_completed < _ANIMETOSHO_MAX_PAGES_PER_RUN
+        and time.monotonic() < deadline
+    ):
+        term = terms[term_index]
+        url = "https://feed.animetosho.org/json?" + urllib.parse.urlencode({
+            "q": term,
+            "page": page,
+        })
         query_attempts += 1
         try:
-            payload = json.loads(_fetch_bytes(
+            raw_payload = _fetch_bytes(
                 url, max_bytes=8 * 1024 * 1024,
                 timeout=request_timeout(), attempts=2,
-            ))
+            )
+            payload = json.loads(raw_payload)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, list):
-            continue
+            # A page that cannot be fetched or parsed is not an empty page.
+            # Leave the exact cursor in place and force a same-tier retry.
+            infrastructure_failures += 1
+            cursor_blocked = True
+            break
+        if not isinstance(payload, list) or len(payload) > _ANIMETOSHO_MAX_ROWS_PER_PAGE:
+            infrastructure_failures += 1
+            cursor_blocked = True
+            break
         query_responses += 1
+
+        page_results: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
         for row in payload:
             if not isinstance(row, Mapping):
                 continue
             release_name = str(row.get("title") or "").strip()
             torrent_url = str(row.get("torrent_url") or "").strip()
             infohash = str(row.get("info_hash") or "").strip().casefold()
+            feed_hashes = _infohash_aliases(infohash)
             swarm = _swarm_payload(
                 row.get("seeders"),
                 row.get("leechers"),
@@ -2914,71 +3823,133 @@ def _search_animetosho(
                 release_name
                 and torrent_url.startswith("https://storage.animetosho.org/torrent/")
                 and locator not in existing_locators
-                and (
-                    not re.fullmatch(r"[0-9a-f]{40}", infohash)
-                    or f"torrent:{infohash}" not in existing_locators
-                )
+                and not (feed_hashes & (existing_hashes | reviewed_hashes))
             ):
-                results.setdefault(torrent_url, (release_name, infohash, swarm))
-            if len(results) >= 32:
-                hit_cap = True
+                page_results.setdefault(torrent_url, (release_name, infohash, swarm))
+
+        ranked_results = sorted(
+            page_results.items(),
+            key=lambda item: _animetosho_release_priority(
+                request, item[1][0],
+            ),
+        )
+        ranked_results = _prioritize_verified_s00_title_rows(
+            request, ranked_results,
+            release_name=lambda item: item[1][0],
+        )
+        page_failed = False
+        for torrent_url, (release_name, feed_infohash, swarm) in ranked_results:
+            if time.monotonic() >= deadline:
+                # The page was only partially reviewed.  Do not advance it;
+                # successful misses collected above remain safe to persist.
+                page_failed = True
                 break
-        if hit_cap:
+            feed_hashes = _infohash_aliases(feed_infohash)
+            if feed_hashes & (existing_hashes | reviewed_hashes):
+                continue
+            with tempfile.TemporaryDirectory(prefix="scrapeflow-animetosho-") as directory:
+                try:
+                    manifest = _download_torrent(
+                        torrent_url, Path(directory) / "candidate.torrent",
+                        timeout=request_timeout(), attempts=2,
+                    )
+                except Exception:
+                    infrastructure_failures += 1
+                    page_failed = True
+                    continue
+            manifest_hashes = _infohash_aliases(manifest.get("infohash"))
+            # If the feed advertises a hash, the fetched metainfo must agree.
+            # A mismatch is not a proven non-covering candidate and therefore
+            # must remain an infrastructure failure rather than being cached.
+            if feed_hashes and not (feed_hashes & manifest_hashes):
+                infrastructure_failures += 1
+                page_failed = True
+                continue
+            if manifest_hashes & (existing_hashes | reviewed_hashes):
+                continue
+            variants = _torrent_candidate_variants(
+                request, release_name, torrent_url, manifest,
+                include_local=_local_torrent_available(request),
+                swarm=swarm,
+            )
+            if variants:
+                candidates.extend(variants)
+                for variant in variants:
+                    if not isinstance(variant, Mapping):
+                        continue
+                    coverage = variant.get("file_coverage")
+                    if isinstance(coverage, (list, tuple, set)):
+                        candidate_coverage.update(
+                            str(value) for value in coverage if isinstance(value, str)
+                        )
+                if requested_gap_tokens and requested_gap_tokens <= candidate_coverage:
+                    # Stop only once the validated candidate union covers all
+                    # current coordinates.  The page is intentionally left
+                    # blocked: it was not fully reviewed, so its cursor must
+                    # not advance or be marked exhausted.
+                    page_failed = True
+                    break
+                # A partial candidate is useful to the selector even when it
+                # cannot close every gap.  Keep the page cursor blocked so a
+                # later request (after reconciliation or candidate rejection)
+                # can revisit the remaining rows without a false miss cache.
+                partial_candidate_seen = True
+            else:
+                # This is the only negative fact safe to carry across runs:
+                # the complete torrent metainfo was fetched and validated,
+                # then proved not to cover the current exact gaps.
+                manifest_infohash = str(manifest.get("infohash") or "").casefold()
+                if _infohash_aliases(manifest_infohash):
+                    miss_locator = f"torrent:{manifest_infohash}"
+                    reviewed_miss_locators.add(miss_locator)
+                    reviewed_hashes.update(_infohash_aliases(manifest_infohash))
+                    resource_failed_locators.append(miss_locator)
+        if page_failed:
+            cursor_blocked = True
             break
 
-    candidates: list[dict[str, Any]] = []
-    resource_failed_locators: list[str] = []
-    infrastructure_failures = 0
-    processed = 0
-    ranked_results = sorted(
-        results.items(),
-        key=lambda item: _source_episode_release_priority(
-            request, item[1][0],
-        ),
-    )
-    ranked_results = _prioritize_verified_s00_title_rows(
-        request, ranked_results,
-        release_name=lambda item: item[1][0],
-    )
-    for torrent_url, (release_name, feed_infohash, swarm) in ranked_results:
-        if time.monotonic() >= deadline:
+        if partial_candidate_seen:
+            # Every row happened to finish before the deadline, but this page
+            # still yielded only partial coverage.  Retain its cursor rather
+            # than pretending the remaining coordinates were searched by a
+            # candidate that cannot satisfy them.
+            cursor_blocked = True
             break
-        with tempfile.TemporaryDirectory(prefix="scrapeflow-animetosho-") as directory:
-            try:
-                manifest = _download_torrent(
-                    torrent_url, Path(directory) / "candidate.torrent",
-                    timeout=request_timeout(), attempts=2,
-                )
-            except Exception:
-                infrastructure_failures += 1
-                continue
-        processed += 1
-        if (
-            f"torrent:{manifest['infohash']}" in existing_locators
-            or (
-                feed_infohash
-                and f"torrent:{feed_infohash}" in existing_locators
-            )
-        ):
-            continue
-        variants = _torrent_candidate_variants(
-            request, release_name, torrent_url, manifest,
-            include_local=_local_torrent_available(request),
-            swarm=swarm,
-        )
-        if variants:
-            candidates.extend(variants)
+
+        # A valid empty page closes the current term; non-empty pages advance
+        # by one.  No 32-row cap remains: the page itself is the bounded unit.
+        if payload:
+            page += 1
+            if page > _ANIMETOSHO_MAX_PAGE:
+                cursor_blocked = True
+                break
         else:
-            resource_failed_locators.append(f"torrent:{manifest['infohash']}")
-    source_exhausted = bool(
-        terms and query_attempts == len(terms) and query_responses == query_attempts
-        and not hit_cap and processed == len(results) and infrastructure_failures == 0
+            last_empty_page = page
+            term_index += 1
+            page = 1
+        pages_completed += 1
+
+    exhausted = bool(
+        terms and term_index >= len(terms) and not cursor_blocked
     )
+    cursor_page = (
+        last_empty_page if exhausted and last_empty_page is not None else page
+    )
+    query_cursor = {
+        "fingerprint": fingerprint,
+        "term_index": min(max(term_index, 0), len(terms)),
+        "page": min(max(cursor_page, 1), _ANIMETOSHO_MAX_PAGE),
+        "exhausted": exhausted,
+    }
     return _DynamicSearchResult(
-        candidates, query_attempts=query_attempts,
-        query_responses=query_responses, source_exhausted=source_exhausted,
+        candidates,
+        query_attempts=query_attempts,
+        query_responses=query_responses,
+        source_exhausted=exhausted and infrastructure_failures == 0,
         resource_failed_locators=resource_failed_locators,
+        reviewed_torrent_miss_locators=sorted(reviewed_miss_locators),
         infrastructure_failures=infrastructure_failures,
+        query_cursor=query_cursor,
     )
 
 
@@ -3973,6 +4944,30 @@ def _find_download(payload: Path, relative_path: str, size: int) -> Path:
     return candidates[0]
 
 
+def _require_task_staging_root(remote_parent: object, remote_root: object) -> tuple[str, str]:
+    """Accept only the single RootJob/attempt staging layout."""
+    if remote_parent != _TASK_STAGING_PARENT or not isinstance(remote_root, str):
+        raise ReplenishmentInfrastructureError(
+            "补源只能使用 /quark/影视/ScrapeFlow/补源/<root>/<attempt>",
+            stage="staging_root",
+        )
+    prefix = _TASK_STAGING_PARENT + "/"
+    if not remote_root.startswith(prefix) or posixpath.normpath(remote_root) != remote_root:
+        raise ReplenishmentInfrastructureError(
+            "自动补源 staging_root 无效", stage="staging_root",
+        )
+    segments = remote_root[len(prefix):].split("/")
+    if len(segments) != 2 or any(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part) is None
+        for part in segments
+    ):
+        raise ReplenishmentInfrastructureError(
+            "自动补源 staging_root 必须是一个 RootJob 和一个 attempt",
+            stage="staging_root",
+        )
+    return segments[0], segments[1]
+
+
 def _ensure_automatic_staging_root(
     client: AListClient,
     remote_parent: str,
@@ -3981,14 +4976,11 @@ def _ensure_automatic_staging_root(
     pause_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Create the known task-owned staging path one level at a time."""
-    parent = remote_parent.rstrip("/")
-    root = remote_root.rstrip("/")
-    if not parent or not root.startswith(parent + "/"):
-        raise ReplenishmentInfrastructureError(
-            "自动补源 staging 路径超出受管父目录", stage="staging_root",
-        )
+    root_job_id, _attempt_id = _require_task_staging_root(remote_parent, remote_root)
+    parent = _TASK_STAGING_PARENT
+    root = str(remote_root)
     job_root = posixpath.dirname(root)
-    if job_root != parent and not job_root.startswith(parent + "/"):
+    if job_root != f"{parent}/{root_job_id}":
         raise ReplenishmentInfrastructureError(
             "自动补源任务 staging 父目录无效", stage="staging_root",
         )
@@ -4007,50 +4999,15 @@ def _acquire(
     pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     request = selection_wrapper.get("request") if isinstance(selection_wrapper.get("request"), Mapping) else {}
-    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
-    tmdb_id = media.get("tmdb_id")
-    title = _safe_name(str(media.get("title") or f"TMDB-{tmdb_id}"), limit=60)
-    remote_parent = os.getenv(
-        "SCRAPEFLOW_REPLENISHMENT_UNSCRAPED_ROOT",
-        "/quark/影视/ScrapeFlow/补源",
-    ).rstrip("/")
+    remote_parent = _TASK_STAGING_PARENT
     automatic_parent = selection_wrapper.get("automatic_staging_parent")
-    if automatic_parent is not None:
-        if (
-            not isinstance(automatic_parent, str)
-            or not automatic_parent.startswith("/")
-            or posixpath.normpath(automatic_parent) != automatic_parent
-            or posixpath.basename(automatic_parent) != "补源"
-        ):
-            raise ReplenishmentInfrastructureError(
-                "自动补源 staging 父目录无效", stage="staging_root",
-            )
-        remote_parent = automatic_parent
-    workspace_key = _selection_workspace_key(selection_wrapper)
-    remote_name = _safe_name(f"ScrapeFlow补源-{tmdb_id}-{title}-{workspace_key}")
     automatic_staging = selection_wrapper.get("automatic_staging_root")
-    if automatic_staging is not None and (not isinstance(automatic_staging, str) or not automatic_staging):
+    if automatic_parent != remote_parent or not isinstance(automatic_staging, str):
         raise ReplenishmentInfrastructureError(
-            "自动补源缺少受管 staging_root", stage="staging_root",
+            "自动补源缺少固定任务 staging_root", stage="staging_root",
         )
-    remote_root = str(
-        automatic_staging
-        or join_remote(remote_parent, remote_name)
-    )
-    expected_prefix = remote_parent.rstrip("/") + "/"
-    if (
-        not remote_root.startswith(expected_prefix)
-        or posixpath.normpath(remote_root) != remote_root
-        or remote_root == remote_parent.rstrip("/")
-    ):
-        raise ReplenishmentInfrastructureError(
-            "自动补源 staging_root 超出受管根", stage="staging_root",
-        )
-    if is_production_test_media_path(remote_root):
-        raise ReplenishmentInfrastructureError(
-            "保留的生产 E2E 测试 staging 路径不可用于补源",
-            stage="staging_root",
-        )
+    remote_root = automatic_staging
+    _require_task_staging_root(remote_parent, remote_root)
     uploaded: list[dict[str, Any]] = []
     raw_request_rows = request.get("gaps")
     if not isinstance(raw_request_rows, list) or any(
@@ -4389,81 +5346,3 @@ def _bounded_seconds(name: str, default: int, minimum: int, maximum: int) -> int
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} 需要在 {minimum}–{maximum} 秒之间")
     return value
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="ScrapeFlow 本地补源适配器")
-    subparsers = parser.add_subparsers(dest="action", required=True)
-    search = subparsers.add_parser("search")
-    search.add_argument("--request", type=Path, required=True)
-    search.add_argument("--output", type=Path, required=True)
-    preflight = subparsers.add_parser("preflight")
-    preflight.add_argument("--selection", type=Path, required=True)
-    preflight.add_argument("--output", type=Path, required=True)
-    acquire = subparsers.add_parser("acquire")
-    acquire.add_argument("--selection", type=Path, required=True)
-    acquire.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args(argv)
-
-    if args.action == "search":
-        request = _load(args.request)
-        root = Path(os.getenv(
-            "SCRAPEFLOW_REPLENISHMENT_DOWNLOAD_DIR",
-            "/var/tmp/scrapeflow/replenishment",
-        ))
-        with _search_capacity_lease(root):
-            result = _search(request)
-    else:
-        wrapper = _load(args.selection)
-        root = Path(os.getenv("SCRAPEFLOW_REPLENISHMENT_DOWNLOAD_DIR", "/var/tmp/scrapeflow/replenishment"))
-        workspace = (
-            root / f"preflight-{uuid.uuid4().hex}"
-            if args.action == "preflight"
-            else root / f"acquire-{_selection_workspace_key(wrapper)}"
-        )
-        try:
-            if args.action == "preflight":
-                result = _preflight_dispatch(wrapper, workspace)
-            else:
-                with _workspace_lease(root, _selection_workspace_key(wrapper)):
-                    result = _acquire_dispatch(wrapper, workspace, automatic=True)
-        except Exception as exc:
-            if args.action == "acquire":
-                _atomic_json(args.output, {
-                    "status": "failed",
-                    "failure": {
-                        "scope": str(getattr(exc, "failure_scope", "infrastructure")),
-                        "stage": str(getattr(exc, "failure_stage", "unclassified")),
-                        "reusable_candidate": bool(
-                            getattr(exc, "reusable_candidate", False)
-                        ),
-                        "exclude_candidate": bool(
-                            getattr(exc, "exclude_candidate", False)
-                        ),
-                        "candidate": dict(getattr(exc, "candidate", {}) or {}),
-                        "workspace": str(workspace),
-                        "retained_workspace": workspace.exists(),
-                        "workspace_key": _selection_workspace_key(wrapper),
-                        "message": str(exc),
-                    },
-                })
-            raise
-    _atomic_json(args.output, result)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except ReplenishmentDeliveryError as exc:
-        print("[replenishment] failure_scope=delivery reusable_candidate=true exclude_candidate=false", flush=True)
-        print(f"补源适配器失败: {exc}", flush=True)
-        raise SystemExit(1)
-    except ReplenishmentCandidateError as exc:
-        print("[replenishment] failure_scope=candidate reusable_candidate=false exclude_candidate=true", flush=True)
-        print(f"补源适配器失败: {exc}", flush=True)
-        raise SystemExit(1)
-    except (OSError, ValueError, RuntimeError, ApiError, json.JSONDecodeError) as exc:
-        print("[replenishment] failure_scope=infrastructure reusable_candidate=false exclude_candidate=false", flush=True)
-        print(f"补源适配器失败: {exc}", flush=True)
-        raise SystemExit(1)

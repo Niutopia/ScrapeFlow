@@ -16,6 +16,7 @@ import posixpath
 import re
 import shutil
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -25,15 +26,25 @@ from typing import Any, Callable, Iterator, Mapping, Protocol
 from engine.scrapeflow.archive import ArchivePasswordError
 from engine.scrapeflow.archive_preprocessing import ArchivePauseRequested
 from engine.scrapeflow.errors import FormalTargetConflictError
+from engine.scrapeflow.gap_ledger import load_gap_ledger
 from engine.scrapeflow.media_quality import (
-    is_production_test_media_path,
     is_video_filename,
     minimum_video_bytes,
     video_size_is_admissible,
 )
+from engine.scrapeflow.media_policy import is_subtitle_filename
+from engine.scrapeflow.replacement import (
+    ReplacementManifest,
+    ReplacementValidationError,
+    archive_path_for,
+)
 from engine.scrapeflow.residual_policy import (
     cleanup_allowlist_reason,
     is_task_owned_staging_root,
+)
+from engine.scrapeflow.remote_paths import (
+    is_provider_safe_basename,
+    provider_safe_basename,
 )
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.subtitle_content import (
@@ -88,9 +99,9 @@ class EngineRecoveryMatrixError(EngineExecutionError):
 
     Recovery deliberately distinguishes a provider visibility/transport error
     (which may be retried) from facts that cannot be repaired by replaying the
-    same plan.  The latter are persisted as a terminal verification failure so
-    a scheduler cannot keep submitting an operation that might overwrite a
-    different object or silently recreate a lost source.
+    same plan. The latter are persisted as a terminal verification failure so
+    a later retry cannot submit an operation that might overwrite a different
+    object or silently recreate a lost source.
     """
 
     def __init__(
@@ -133,7 +144,7 @@ class EngineJobNotFoundError(SimpleEngineError):
 
 
 class EngineWorkerBusyError(SimpleEngineError):
-    """Another process is currently executing or reconciling an Engine job."""
+    """The one local formal writer is currently busy."""
 
 
 def _require_admissible_video_size(
@@ -162,14 +173,6 @@ def _require_admissible_video_size(
         )
 
 
-def _require_non_test_media_path(path: str, *, stage: str) -> None:
-    """Keep legacy production E2E source trees outside the formal writer."""
-    if is_production_test_media_path(path):
-        raise EngineExecutionError(
-            f"{stage}拒绝保留的生产 E2E 测试来源路径: {path}"
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class AutomaticIdentity:
     """Machine-selected identity used by an automatic job."""
@@ -186,9 +189,8 @@ class AutomaticIdentity:
     trace: Mapping[str, object]
     target_shelf: str | None = None
     # ``target_root`` historically means the concrete planned work directory
-    # in identity/audit consumers.  Keep the selected first-level shelf under
-    # an unambiguous name so it can never widen a scoped audit to a whole
-    # library category.
+    # in legacy identity callers.  Keep the selected first-level shelf under
+    # an unambiguous name so a plan can never widen from its chosen category.
     target_shelf_root: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -208,19 +210,10 @@ class AutomaticIdentity:
 
 _JOB_ID_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _MEDIA_TYPES = frozenset({"auto", "movie", "tv", "collection"})
-_AUDIT_ROOT_GAP_KINDS = frozenset({
-    "missing_media", "missing_episode", "missing_season",
-})
-# A subtitle-only audit root is a local provider parent for an already
-# visible, identity-verified video.  It must never be accepted by the media
-# child planner as an episode/movie acquisition request.
-_AUDIT_SUBTITLE_GAP_KINDS = frozenset({"missing_subtitle"})
-
-# Automatic roots keep their ingress/archive cleanup evidence until the
-# audit/provider lifecycle has reached a durable terminal decision.  A
-# ContextVar carries that one-shot execution policy through injected executor
-# wrappers without changing the public Plan model or forcing every test/
-# provider executor to accept a new keyword argument.
+# A legacy direct automatic job may defer its own source cleanup until its
+# formal write returns.  The current RootJob pipeline uses its task-scoped
+# cleanup path instead.  Keep this narrow compatibility flag out of the
+# public Plan protocol.
 _DEFER_TASK_CLEANUP: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "scrapeflow_defer_task_cleanup", default=False,
 )
@@ -233,6 +226,114 @@ _CANCEL_REQUEST_CHECK: contextvars.ContextVar[Callable[[], bool] | None] = (
 _PAUSE_REQUEST_CHECK: contextvars.ContextVar[Callable[[], bool] | None] = (
     contextvars.ContextVar("scrapeflow_pause_request_check", default=None)
 )
+
+# A replenishment child is still an ordinary Engine plan: its media, NFO and
+# artwork must use the same plan projection and writer as every other work.
+# Keep this small validation separate from artifact selection.  It proves that
+# a TV child handed over by the provider contains exactly one ordinary video
+# for every explicit SxxEyy coordinate and cannot smuggle an NCOP/bonus/PV
+# file into the formal library merely by being marked internal.
+_INTERNAL_CHILD_EPISODE_TOKEN_RE = re.compile(
+    r"(?i)(?<![a-z0-9])s0*(\d{1,3})[ ._-]*e(?:p)?0*(\d{1,4})(?!\d)"
+)
+_INTERNAL_CHILD_SUPPLEMENTAL_MEMBER_RE = re.compile(
+    r"(?i)(?:^|[/\\\s._\-\[\](){}])"
+    r"(?:bonus(?:es)?|extra(?:s)?|sample(?:s)?|scan(?:s)?|"
+    r"menu|preview(?:s)?|trailer(?:s)?|teaser(?:s)?|featurette(?:s)?|"
+    r"behind[ ._\-]*the[ ._\-]*scenes|"
+    r"ncop|nced|pv|cm|creditless|op|ed)"
+    r"(?=$|[/\\\s._\-\[\](){}])"
+)
+
+
+def _internal_child_episode_coordinates(value: object) -> set[str]:
+    """Return explicit SxxEyy coordinates carried by one child filename."""
+    return {
+        f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}"
+        for match in _INTERNAL_CHILD_EPISODE_TOKEN_RE.finditer(str(value or ""))
+        if 0 <= int(match.group(1)) <= 999 and 0 < int(match.group(2)) <= 9999
+    }
+
+
+def _internal_child_member_is_supplemental(*values: object) -> bool:
+    return any(
+        _INTERNAL_CHILD_SUPPLEMENTAL_MEMBER_RE.search(str(value or ""))
+        for value in values
+    )
+
+
+def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
+    """Return durable-plan violations for one internal replenishment TV child.
+
+    This is an ownership/recovery guard, not a second provider planning path.
+    It only applies to TV plans; container-artifact and layout carriers use
+    their own modes and therefore retain their normal writer semantics.
+    """
+    mode = str(getattr(plan, "mode", "") or "").casefold()
+    metadata = getattr(plan, "metadata", None)
+    media_type = (
+        str(metadata.get("media_type") or metadata.get("type") or "").casefold()
+        if isinstance(metadata, Mapping) else ""
+    )
+    if mode != "tv" and media_type != "tv":
+        return []
+    files = [
+        item for item in list(getattr(plan, "files", ()) or ())
+        if getattr(item, "media_kind", None) == "video"
+    ]
+    if not files:
+        return ["内部 TV child 没有视频"]
+    owners: dict[str, list[str]] = {}
+    errors: list[str] = []
+    for item in files:
+        source_path = str(getattr(item, "source_path", "") or "")
+        original_name = str(getattr(item, "original_name", "") or "")
+        final_name = str(getattr(item, "final_name", "") or "")
+        label = original_name or source_path or final_name or "<unknown>"
+        if not all(
+            is_video_filename(value)
+            for value in (source_path, original_name, final_name)
+        ):
+            errors.append(f"内部 TV child 包含非视频主文件: {label}")
+            continue
+        if _internal_child_member_is_supplemental(
+            source_path, original_name, final_name,
+        ):
+            errors.append(f"内部 TV child 包含附加内容: {label}")
+            continue
+        source_ids = _internal_child_episode_coordinates(Path(source_path).name)
+        original_ids = _internal_child_episode_coordinates(original_name)
+        final_ids = _internal_child_episode_coordinates(final_name)
+        # The canonical final name is the authoritative coordinate.  A
+        # bracketed/bare source (``[01]``) carries no SxxEyy token, so its
+        # source/original sets are empty and must not invalidate the single
+        # final coordinate the normal planner already derived from the
+        # single-season proof.  When the source does carry an explicit
+        # token, it still has to agree with the final coordinate.
+        if len(final_ids) != 1:
+            errors.append(f"内部 TV child 缺少一致的唯一 episode 映射: {label}")
+            continue
+        if source_ids and source_ids != final_ids:
+            errors.append(f"内部 TV child 来源集号与最终集号不一致: {label}")
+            continue
+        if original_ids and original_ids != final_ids:
+            errors.append(f"内部 TV child 原文件名集号与最终集号不一致: {label}")
+            continue
+        episode_id = next(iter(final_ids))
+        owners.setdefault(episode_id, []).append(label)
+    for episode_id, labels in owners.items():
+        if len(labels) > 1:
+            errors.append(
+                f"内部 TV child 将多个视频映射到 {episode_id}: "
+                + ", ".join(labels[:3])
+            )
+    return errors
+
+
+def _require_internal_child_tv_primary_videos(plan: object, *, stage: str) -> None:
+    errors = _internal_child_tv_primary_video_errors(plan)
+    if errors:
+        raise ValueError(f"{stage}拒绝不唯一/非正片内部 TV child: {errors[0]}")
 
 
 def _cancellation_checkpoint() -> None:
@@ -305,15 +406,14 @@ _ENGINE_PHASES = frozenset({
     "reconciling", "reconciled", "reconciliation_uncertain",
     "awaiting_target_shelf", "queued", "analyzing", "archive_preprocessing", "identity_matching",
     "target_policy_conflict", "planning", "planned",
-    "executing", "verifying", "cleaning", "executed", "completed",
+    "executing", "verifying", "cleaning", "executed", "gaps_pending", "completed",
     "retry_wait", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider",
     "failed_write", "failed_verification", "failed_cleanup", "cancelled",
 })
 
 # A cleanup request is intentionally narrower than a general state migration.
-# ``executed`` is the durable Engine write fact, while the application may keep
-# a provider/audit projection beside it; ``cleanup_terminal_job`` checks both
-# before removing any task-owned local state.
+# ``executed`` is the durable Engine write fact; cleanup only removes local
+# state after the root and its own children are terminal.
 _CLEANUP_TERMINAL_PHASES = frozenset({
     "executed", "completed", "failed", "failed_archive", "failed_identity", "failed_planning", "failed_provider",
     "failed_write", "failed_verification", "failed_cleanup", "cancelled",
@@ -323,139 +423,6 @@ _CLEANUP_ACTIVE_PROVIDER_STATUSES = frozenset({
     "subtitle_installing", "child_planning", "child_executing", "final_verifying",
     "cleaning", "child_failed", "retry_wait",
 })
-_CLEANUP_RETRYABLE_AUDIT_STATUSES = frozenset({
-    "pending", "repairing", "retry_wait", "unknown", "blocked", "failed",
-    "failed_provider",
-})
-# A duplicate-complete intake has no formal Engine write and therefore has
-# its own, deliberately small source-consumption gate.  Keep this list local
-# to the runner rather than importing the Provider runtime (which imports the
-# runner in a few deployment compositions).
-_DUPLICATE_TERMINAL_PROVIDER_STATUSES = frozenset({
-    "completed", "resolved", "ready", "skipped", "deferred", "no_gap", "terminal",
-})
-_DUPLICATE_ACTIVE_PROVIDER_STATUSES = frozenset({
-    "gap_discovering", "provider_searching", "acquiring", "staging_verifying",
-    "subtitle_installing", "child_planning", "child_executing", "final_verifying",
-    "cleaning", "child_failed", "retry_wait", "waiting_reconcile", "in_doubt",
-    "pending", "repairing",
-})
-_DUPLICATE_IN_DOUBT_SCOPES = frozenset({"in_doubt", "failure_in_doubt"})
-# Provider attempt staging is held in one gap JSON marker after a successful
-# child until a later scoped audit proves the selected gap disappeared.  Keep
-# this literal local to the runner to avoid importing the provider runtime
-# (which intentionally imports this module) and creating a circular cleanup
-# dependency.
-_POST_ACQUISITION_REAUDIT_KEY = "post_acquisition_reaudit"
-
-# Provider replenishment children are deliberately narrower than ordinary
-# Engine roots: they only carry the missing media member into the formal
-# library.  Their existing NFO/artwork belongs to the already-audited work
-# root and must never be generated or replaced as a side effect of a child
-# retry.  Keep this as a plan-metadata marker so the persisted child retains
-# the same execution/recovery semantics after a process restart.
-_PROVIDER_MEDIA_ONLY_METADATA_KEY = "provider_media_only"
-_PROVIDER_EPISODE_TOKEN_RE = re.compile(
-    r"(?i)(?<![a-z0-9])s0*(\d{1,3})[ ._-]*e(?:p)?0*(\d{1,4})(?!\d)"
-)
-_PROVIDER_SUPPLEMENTAL_MEMBER_RE = re.compile(
-    r"(?i)(?:^|[/\\\s._\-\[\](){}])"
-    r"(?:bonus(?:es)?|extra(?:s)?|sample(?:s)?|scan(?:s)?|"
-    r"menu|preview(?:s)?|trailer(?:s)?|teaser(?:s)?|featurette(?:s)?|"
-    r"behind[ ._\-]*the[ ._\-]*scenes|"
-    r"ncop|nced|pv|cm|creditless|op|ed)"
-    r"(?=$|[/\\\s._\-\[\](){}])"
-)
-
-
-def _provider_episode_coordinates(value: object) -> set[str]:
-    """Return explicit SxxEyy coordinates carried by one child filename."""
-    return {
-        f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}"
-        for match in _PROVIDER_EPISODE_TOKEN_RE.finditer(str(value or ""))
-        if 0 <= int(match.group(1)) <= 999 and 0 < int(match.group(2)) <= 9999
-    }
-
-
-def _provider_member_is_supplemental(*values: object) -> bool:
-    return any(_PROVIDER_SUPPLEMENTAL_MEMBER_RE.search(str(value or "")) for value in values)
-
-
-def _provider_tv_child_primary_video_errors(plan: object) -> list[str]:
-    """Return serialization-stable violations for a provider TV child.
-
-    Adapter validation proves why a manifest member maps to a gap.  Once that
-    choice has been serialized into an Engine child, this runner still has to
-    prove the durable plan contains one ordinary video for one episode and no
-    duplicate coordinate.  The check deliberately reads source/original and
-    final names, so changing one JSON field cannot relabel a bonus or route a
-    source episode into another target episode.
-    """
-    mode = str(getattr(plan, "mode", "") or "").casefold()
-    metadata = getattr(plan, "metadata", None)
-    media_type = (
-        str(metadata.get("media_type") or metadata.get("type") or "").casefold()
-        if isinstance(metadata, Mapping) else ""
-    )
-    if mode != "tv" and media_type != "tv":
-        return []
-    files = [
-        item for item in list(getattr(plan, "files", ()) or ())
-        if getattr(item, "media_kind", None) == "video"
-    ]
-    if not files:
-        return ["provider TV child 没有视频"]
-    owners: dict[str, list[str]] = {}
-    errors: list[str] = []
-    for item in files:
-        source_path = str(getattr(item, "source_path", "") or "")
-        original_name = str(getattr(item, "original_name", "") or "")
-        final_name = str(getattr(item, "final_name", "") or "")
-        label = original_name or source_path or final_name or "<unknown>"
-        if not all(is_video_filename(value) for value in (source_path, original_name, final_name)):
-            errors.append(f"provider TV child 包含非视频主文件: {label}")
-            continue
-        if _provider_member_is_supplemental(source_path, original_name, final_name):
-            errors.append(f"provider TV child 包含附加内容: {label}")
-            continue
-        source_ids = _provider_episode_coordinates(Path(source_path).name)
-        original_ids = _provider_episode_coordinates(original_name)
-        final_ids = _provider_episode_coordinates(final_name)
-        if (
-            len(source_ids) != 1
-            or original_ids != source_ids
-            or final_ids != source_ids
-        ):
-            errors.append(f"provider TV child 缺少一致的唯一 episode 映射: {label}")
-            continue
-        episode_id = next(iter(source_ids))
-        owners.setdefault(episode_id, []).append(label)
-    for episode_id, labels in owners.items():
-        if len(labels) > 1:
-            errors.append(
-                f"provider TV child 将多个视频映射到 {episode_id}: "
-                + ", ".join(labels[:3])
-            )
-    return errors
-
-
-def _require_provider_tv_child_primary_videos(
-    plan: object, *, stage: str,
-) -> None:
-    errors = _provider_tv_child_primary_video_errors(plan)
-    if errors:
-        raise ValueError(f"{stage}拒绝不唯一/非正片 provider TV child: {errors[0]}")
-
-
-def _is_provider_media_only_plan(plan: object) -> bool:
-    """Return whether a persisted plan is an internal provider media child."""
-    metadata = getattr(plan, "metadata", None)
-    return (
-        isinstance(metadata, Mapping)
-        and metadata.get(_PROVIDER_MEDIA_ONLY_METADATA_KEY) is True
-    )
-
-
 def _require_problem_free_plan(plan: object, *, stage: str) -> None:
     """Refuse every formal-write path while a plan still has open problems.
 
@@ -526,18 +493,6 @@ def _require_cleanup_allowlist(plan: object, *, stage: str) -> None:
             raise EngineExecutionError(
                 f"{stage}拒绝非白名单或非任务自有清理项: {source_path}"
             )
-
-
-def _mark_provider_media_only_body(body: Mapping[str, object]) -> dict[str, object]:
-    """Copy a serialized plan and mark it as media-only for provider children."""
-    marked = dict(body)
-    metadata = body.get("metadata")
-    if not isinstance(metadata, Mapping):
-        raise SimpleEngineError("Engine child 计划缺少 metadata")
-    child_metadata = dict(metadata)
-    child_metadata[_PROVIDER_MEDIA_ONLY_METADATA_KEY] = True
-    marked["metadata"] = child_metadata
-    return marked
 
 
 @contextlib.contextmanager
@@ -622,11 +577,40 @@ class EngineRequest:
     # derive for multi-season absolute-number releases.  Deliberately NOT
     # accepted from the HTTP payload: only the internal unit pipeline sets it.
     episode_map_path: str | None = None
+    # D/F-only gate for the narrow ``Title - 01`` grammar.  It is never an
+    # external request option: F sets it only alongside a freshly revalidated
+    # release-dash proof and its explicit source-key map.
+    allow_release_dash_ordinal: bool = False
+    # The following fields are internal-only WorkUnit ownership/placement
+    # evidence.  They are persisted with the internal carrier so
+    # execute/recovery can re-check the same boundary, but no HTTP request may
+    # provide them.
+    source_files: tuple[Mapping[str, object], ...] | None = None
+    source_scope_paths: tuple[str, ...] = ()
+    # Positive seasons B/W proved inside a single owned work root.  This is
+    # not a TMDB or operator override: F uses it only to retain a subtitle-only
+    # declared season at source while J later checks the official gap.
+    source_declared_seasons: tuple[int, ...] = ()
+    # Exact formal-library subtree a WorkUnit planner may target.  For a new
+    # work this is its selected shelf (or a container below it); for a merged
+    # work it can be the D-locked existing work root.  It is deliberately
+    # separate from ``target_shelf`` because nested work units must not pretend
+    # that their parent is a first-level shelf.
+    target_scope_root: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "EngineRequest":
         if not isinstance(payload, Mapping):
             raise EngineRequestError("Engine 计划请求必须是 JSON 对象")
+        if (
+            "source_files" in payload
+            or "source_scope_paths" in payload
+            or "source_declared_seasons" in payload
+            or "target_scope_root" in payload
+            or "allow_release_dash_ordinal" in payload
+            or "episode_map_path" in payload
+        ):
+            raise EngineRequestError("WorkUnit 内部范围仅允许由服务端流程生成")
         source = _safe_remote_path(payload.get("source_path"), field="source_path", allow_root=False)
         parent = _safe_remote_path(payload.get("parent_path", "/"), field="parent_path")
         media_type = payload.get("media_type", payload.get("type", "auto"))
@@ -689,6 +673,91 @@ class EngineRequest:
             episode_map=dict(episode_map) if isinstance(episode_map, Mapping) else None,
             episode_group_id=episode_group,
             ignore_orphan_temp=_bool_option(payload, "ignore_orphan_temp"),
+        )
+
+    @classmethod
+    def from_persisted_mapping(cls, payload: Mapping[str, object]) -> "EngineRequest":
+        """Restore a request persisted by the runner, including internal scope.
+
+        This is intentionally separate from ``from_mapping``: browser/API
+        callers never gain a way to nominate an arbitrary subset of a source,
+        while execute/recovery can still verify the exact scope originally
+        approved by B/W.
+        """
+        if not isinstance(payload, Mapping):
+            raise EngineRequestError("持久化 Engine 请求必须是对象")
+        raw = dict(payload)
+        raw_files = raw.pop("source_files", None)
+        raw_scopes = raw.pop("source_scope_paths", None)
+        raw_declared_seasons = raw.pop("source_declared_seasons", None)
+        raw_target_scope = raw.pop("target_scope_root", None)
+        raw_release_dash_ordinal = raw.pop("allow_release_dash_ordinal", False)
+        raw_episode_map_path = raw.pop("episode_map_path", None)
+        request = cls.from_mapping(raw)
+        if type(raw_release_dash_ordinal) is not bool:
+            raise EngineRequestError("持久化 release-dash 集号开关必须是布尔值")
+        episode_map_path: str | None = None
+        if raw_episode_map_path is not None:
+            if (
+                not isinstance(raw_episode_map_path, str)
+                or not raw_episode_map_path.startswith("/")
+                or "\x00" in raw_episode_map_path
+            ):
+                raise EngineRequestError("持久化 episode_map_path 必须是绝对路径")
+            episode_map_path = raw_episode_map_path
+        declared_seasons: tuple[int, ...] = ()
+        if raw_declared_seasons is not None:
+            if not isinstance(raw_declared_seasons, (list, tuple)):
+                raise EngineRequestError("持久化来源声明季度必须是整数列表")
+            normalized_declared: list[int] = []
+            for value in raw_declared_seasons:
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise EngineRequestError("持久化来源声明季度包含无效值")
+                normalized_declared.append(value)
+            if len(set(normalized_declared)) != len(normalized_declared):
+                raise EngineRequestError("持久化来源声明季度包含重复值")
+            declared_seasons = tuple(sorted(normalized_declared))
+        target_scope_root: str | None = None
+        if raw_target_scope is not None:
+            target_scope_root = _safe_remote_path(
+                raw_target_scope,
+                field="持久化 WorkUnit 目标范围",
+                allow_root=False,
+            )
+            if not (
+                target_scope_root == request.parent_path
+                or target_scope_root.startswith(request.parent_path + "/")
+            ):
+                raise EngineRequestError("持久化 WorkUnit 目标范围不属于 Planner 父目录")
+        if raw_files is None and (raw_scopes is None or raw_scopes == () or raw_scopes == []):
+            return replace(
+                request,
+                target_scope_root=target_scope_root,
+                source_declared_seasons=declared_seasons,
+                allow_release_dash_ordinal=raw_release_dash_ordinal,
+                episode_map_path=episode_map_path,
+            )
+        if not isinstance(raw_scopes, (list, tuple)):
+            raise EngineRequestError("持久化来源范围必须是路径列表")
+        if not isinstance(raw_files, (list, tuple)):
+            raise EngineRequestError("持久化来源清单必须是文件列表")
+        scopes = tuple(
+            _safe_remote_path(value, field="持久化来源范围", allow_root=False)
+            for value in raw_scopes
+        )
+        files: list[Mapping[str, object]] = []
+        for value in raw_files:
+            if not isinstance(value, Mapping):
+                raise EngineRequestError("持久化来源清单包含无效条目")
+            files.append(dict(value))
+        return replace(
+            request,
+            source_files=tuple(files),
+            source_scope_paths=scopes,
+            source_declared_seasons=declared_seasons,
+            target_scope_root=target_scope_root,
+            allow_release_dash_ordinal=raw_release_dash_ordinal,
+            episode_map_path=episode_map_path,
         )
 
 
@@ -799,8 +868,8 @@ def recover_persisted_engine_jobs(state_root: Path) -> list[EngineJob]:
     """Queue interrupted writes for automatic AList reconciliation.
 
     A process restart does not prove that a remote move failed.  Preserve the
-    plan and let the active scheduler first run exact readback, then replay
-    only the still-missing operations.  This function intentionally performs
+    plan for a later user-triggered exact readback, then replay only the
+    still-missing operations. This function intentionally performs
     no network I/O because it is also used before clients are configured.
     """
     root = Path(state_root).resolve()
@@ -842,6 +911,11 @@ def recover_persisted_engine_jobs(state_root: Path) -> list[EngineJob]:
                 and isinstance(operation_id, str)
                 and isinstance(marker, Mapping)
                 and marker.get("operation_id") == operation_id
+            ) or (
+                isinstance(marker, Mapping)
+                and marker.get("kind") == "inactive"
+                and marker.get("phase") == job.phase
+                and marker.get("updated_at") == job.updated_at
             )
             # A cancel request is allowed to arrive while restart recovery has
             # the worker lock. Before converting an interrupted execution to
@@ -900,7 +974,7 @@ def recover_persisted_engine_jobs(state_root: Path) -> list[EngineJob]:
                 updated_at=_now(),
                 summary=summary,
                 error=(
-                    "Engine 在远端结果写入前重启；已排入自动 AList 回读和重试。"
+                    "Engine 在远端结果写入前重启；等待用户恢复或重试后进行 AList 回读。"
                 ),
             )
             atomic_write_json(path, recovered_job.as_dict(), allow_nan=False)
@@ -944,6 +1018,107 @@ class SimplePlanExecutor:
         if isinstance(value, str) and value.isdigit():
             return int(value)
         return None
+
+    def _remote_entry_kind(self, path: str) -> str:
+        """Freshly classify one exact remote path for layout recovery.
+
+        ``list(path)`` cannot distinguish a missing path from an empty
+        directory, so use the parent/name row just like the runner's
+        read-only probe.  This helper lives on the executor because layout
+        relocation is executed under the writer and must not reach into the
+        runner's private methods.
+        """
+        normalized = _safe_remote_path(path, field="布局修复远端路径", allow_root=False)
+        parent, name = posixpath.split(normalized)
+        listing = getattr(self.alist, "list", None)
+        if not parent or not name or not callable(listing):
+            return "missing"
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            rows = listing(parent)
+        except Exception:
+            return "unknown"
+        if not isinstance(rows, list):
+            return "unknown"
+        matches = [
+            row for row in rows
+            if isinstance(row, Mapping) and row.get("name") == name
+        ]
+        if len(matches) != 1:
+            return "ambiguous" if matches else "missing"
+        if (
+            matches[0].get("is_link") is True
+            or matches[0].get("is_symlink") is True
+            or matches[0].get("symlink") is True
+        ):
+            return "ambiguous"
+        return "directory" if matches[0].get("is_dir") is True else "file"
+
+    def _fresh_tree_files(self, root: str) -> list[dict[str, object]]:
+        """Return a bounded, exact recursive file inventory for one directory.
+
+        This is intentionally separate from ``AListClient.walk``: a layout
+        repair must include metadata and artwork as well as media, while the
+        ordinary planner deliberately filters release extras.  The inventory
+        is read-only and rejects malformed names, links and unknown sizes.
+        """
+        normalized = _safe_remote_path(root, field="布局修复来源根", allow_root=False)
+        listing = getattr(self.alist, "list", None)
+        if not callable(listing):
+            raise EngineExecutionError("AList 客户端缺少 list 接口，无法核对布局来源")
+        stack = [normalized]
+        visited: set[str] = set()
+        files: list[dict[str, object]] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            if len(visited) > 10_000:
+                raise EngineExecutionError("布局修复来源目录过多，已停止")
+            try:
+                rows = listing(current, refresh=True)
+            except TypeError:
+                rows = listing(current)
+            if not isinstance(rows, list):
+                raise EngineExecutionError(f"布局修复来源目录清单无效: {current}")
+            for raw in rows:
+                if not isinstance(raw, Mapping):
+                    raise EngineExecutionError(f"布局修复来源包含无效条目: {current}")
+                name = raw.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name in {".", ".."}
+                    or "/" in name
+                    or "\\" in name
+                    or "\x00" in name
+                ):
+                    raise EngineExecutionError(f"布局修复来源包含不安全名称: {current}")
+                if (
+                    raw.get("is_link") is True
+                    or raw.get("is_symlink") is True
+                    or raw.get("symlink") is True
+                ):
+                    raise EngineExecutionError(f"布局修复拒绝链接条目: {current}/{name}")
+                full_path = posixpath.join(current, name)
+                if raw.get("is_dir") is True:
+                    stack.append(full_path)
+                    continue
+                size = self._entry_size(raw)
+                if size is None:
+                    raise EngineExecutionError(f"布局修复来源文件缺少有效大小: {full_path}")
+                files.append({
+                    "full_path": full_path,
+                    "name": name,
+                    "size": size,
+                    "modified": raw.get("modified") or raw.get("updated_at"),
+                })
+                if len(files) > 200_000:
+                    raise EngineExecutionError("布局修复来源文件过多，已停止")
+        files.sort(key=lambda row: str(row["full_path"]).casefold())
+        return files
 
     def _exact(self, path: str) -> Mapping[str, object] | None:
         method = getattr(self.alist, "exact_file_info", None)
@@ -1218,6 +1393,52 @@ class SimplePlanExecutor:
                 return
         raise EngineExecutionError(f"AList move 后源文件仍可见: {path}")
 
+    def _require_executable_final_basenames(
+        self,
+        files: list[object],
+    ) -> None:
+        """Fence stale provider-incompatible names before the first move.
+
+        Fresh plans are rejected by the Engine validator, but persisted plans
+        may predate a provider basename policy.  A legacy final name is
+        tolerated only when it is already the exact completed target and its
+        source is absent; this permits readback/artifact recovery without
+        renaming a previously accepted file.  Every other unsafe final name
+        is rejected before this executor issues *any* move or rename.
+        """
+        unsafe_targets: list[str] = []
+        for item in files:
+            final = str(getattr(item, "final_name", "") or "")
+            if is_provider_safe_basename(final):
+                continue
+            target_dir = str(getattr(item, "target_dir", "") or "")
+            source_path = str(getattr(item, "source_path", "") or "")
+            target_path = posixpath.join(target_dir, final)
+            target = self._exact(target_path)
+            source = self._exact(source_path)
+            expected = getattr(item, "source_size", None)
+            if target is not None and source is None:
+                observed_size = int(target["size"])
+                if (
+                    expected is not None
+                    and (
+                        isinstance(expected, bool)
+                        or not isinstance(expected, int)
+                        or observed_size != expected
+                    )
+                ):
+                    raise EngineExecutionError(
+                        "已存在的旧目标文件大小无法证明与计划一致: "
+                        f"{target_path}"
+                    )
+                continue
+            unsafe_targets.append(target_path)
+        if unsafe_targets:
+            raise EngineExecutionError(
+                "计划包含 AList 不兼容的目标文件名；已在写入前停止: "
+                f"{unsafe_targets[0]}"
+            )
+
     def install_subtitle_sidecar(
         self,
         source_path: str,
@@ -1256,7 +1477,7 @@ class SimplePlanExecutor:
             raise EngineExecutionError("字幕目标路径无效")
         if video_path is not None:
             video = _safe_remote_path(video_path, field="subtitle video")
-            # The video was just found by the fresh audit.  A pre-write
+            # The video was just found by an exact fresh listing.  A pre-write
             # existence check must stay cheap; the long visibility retry is
             # reserved for the object written by this operation.
             if self._visible_exact(video) is None:
@@ -1364,12 +1585,11 @@ class SimplePlanExecutor:
         return removed
 
     def finalize_cleanup(self, plan: object) -> Mapping[str, object]:
-        """Apply only the plan-owned residual cleanup after lifecycle gates.
+        """Apply only the plan-owned residual cleanup after plan validation.
 
         Formal media moves and artifact writes are intentionally absent from
-        this method.  It is the re-entrant final step used after a trusted
-        scoped audit and any provider decision; every row is revalidated from
-        the persisted plan before the first remote delete.
+        this method.  It is the re-entrant final step; every row is
+        revalidated from the persisted plan before the first remote delete.
         """
         _cancellation_checkpoint()
         _require_cleanup_allowlist(plan, stage="最终清理")
@@ -1404,35 +1624,17 @@ class SimplePlanExecutor:
 
     def execute(self, plan: object) -> Mapping[str, object]:
         _cancellation_checkpoint()
-        all_files = list(getattr(plan, "files", ()) or ())
-        media_only = _is_provider_media_only_plan(plan)
-        # Provider children are deliberately video-only transactions.  A
-        # torrent may carry subtitle companions, but this executor never
-        # moves them implicitly.  The coordinator may install one later only
-        # through the audited ``missing_subtitle`` sidecar lane after exact
-        # language/identity pairing.
-        files = [
-            item for item in all_files
-            if not media_only or getattr(item, "media_kind", None) == "video"
-        ]
+        files = list(getattr(plan, "files", ()) or ())
         _require_problem_free_plan(plan, stage="计划执行")
         # Validate every cleanup row before the first media move. This avoids
         # a partial formal write followed by discovery that an old plan wanted
         # to delete a user-owned attachment.
         _require_cleanup_allowlist(plan, stage="计划执行")
-        if media_only and not files:
-            raise EngineExecutionError("provider media-only child 没有可执行视频")
-        if media_only:
-            try:
-                _require_provider_tv_child_primary_videos(plan, stage="计划执行")
-            except ValueError as exc:
-                raise EngineExecutionError(str(exc)) from exc
         # Reject every known undersized video before the first move, so a
         # multi-file plan cannot partially write formal media and only then
         # discover a test fragment later in the same plan.
         for item in files:
             source_path = str(getattr(item, "source_path"))
-            _require_non_test_media_path(source_path, stage="计划执行")
             expected = getattr(item, "source_size", None)
             if expected is not None and (
                 isinstance(expected, bool)
@@ -1444,6 +1646,11 @@ class SimplePlanExecutor:
                 _require_admissible_video_size(
                     item, expected, path=source_path, stage="计划",
                 )
+        # This must precede the first move: an old persisted plan can contain
+        # a bad name late in its list, and discovering it after earlier media
+        # writes would recreate the move/rename split that recovery is trying
+        # to close.
+        self._require_executable_final_basenames(files)
         moved: list[dict[str, object]] = []
         for item in files:
             # One file is one coherent remote move/readback unit.  Never
@@ -1468,9 +1675,51 @@ class SimplePlanExecutor:
                 _require_admissible_video_size(
                     item, observed["size"], path=target_path, stage="正式库回读",
                 )
+                if source_dir != target_dir and original != final:
+                    intermediate_path = posixpath.join(target_dir, original)
+                    if self._exact(intermediate_path) is not None:
+                        raise EngineExecutionError(
+                            "目标和中间原文件同时存在，拒绝覆盖或静默清理: "
+                            f"{target_path} / {intermediate_path}"
+                        )
                 moved.append({"source": source_path, "target": target_path, "status": "already_present", **observed})
                 continue
             if source is None:
+                intermediate_path = posixpath.join(target_dir, original)
+                intermediate = (
+                    self._exact(intermediate_path)
+                    if source_dir != target_dir and original != final
+                    else None
+                )
+                if intermediate is not None:
+                    intermediate_size = int(intermediate["size"])
+                    if expected is not None and intermediate_size != expected:
+                        raise EngineExecutionError(
+                            "中间原文件大小不匹配，拒绝自动 rename: "
+                            f"{intermediate_path}"
+                        )
+                    _require_admissible_video_size(
+                        item,
+                        intermediate_size,
+                        path=intermediate_path,
+                        stage="中断 rename 回读",
+                    )
+                    self._move_file(target_dir, target_dir, original, final)
+                    observed = self._check_size(
+                        target_path,
+                        expected if expected is not None else intermediate_size,
+                    )
+                    self._verify_source_absent(intermediate_path)
+                    _require_admissible_video_size(
+                        item, observed["size"], path=target_path, stage="正式库回读",
+                    )
+                    moved.append({
+                        "source": source_path,
+                        "target": target_path,
+                        "status": "renamed_after_interrupted_move",
+                        **observed,
+                    })
+                    continue
                 raise EngineExecutionError(f"源文件不可见: {source_path}")
             source_size = int(source["size"])
             if expected is not None and source_size != expected:
@@ -1497,40 +1746,61 @@ class SimplePlanExecutor:
             self._verify_source_absent(str(item["source"]))
 
         artifacts: list[dict[str, object]] = []
-        if not media_only:
-            # NFO generation is deterministic and does not need the TMDB
-            # network.  Provider children deliberately skip this entire
-            # artifact lane: they are media-only writes, and an episode NFO
-            # (or a newly synthesized poster) would change the established
-            # library metadata convention as a side effect of replenishment.
-            planned_nfos = getattr(__import__("engine.scraper", fromlist=["planned_nfos"]), "planned_nfos", None)
-            if callable(planned_nfos):
-                for target, data in planned_nfos(plan):
-                    _cancellation_checkpoint()
-                    if not isinstance(target, str) or not isinstance(data, (bytes, bytearray)):
-                        raise EngineExecutionError("Engine 生成的 NFO 结构无效")
-                    self._ensure_dir(posixpath.dirname(target) or "/")
-                    observed = self._preserve_or_upload_bytes(
-                        target, bytes(data), "application/xml",
-                    )
-                    artifacts.append({"target": target, "kind": "nfo", **observed})
+        # Every plan, including an internally owned replenishment child,
+        # follows the normal artifact projection and the same no-overwrite
+        # writer primitive.  The child request itself is constrained to its
+        # fresh selected staging manifest; artifacts are not a parallel
+        # provider lane.
+        planned_nfos = getattr(
+            __import__("engine.scraper", fromlist=["planned_nfos"]),
+            "planned_nfos",
+            None,
+        )
+        if not callable(planned_nfos):
+            raise EngineExecutionError("Engine 缺少 NFO 目标投影")
+        nfo_rows = planned_nfos(plan)
+        for target, data in nfo_rows:
+            _cancellation_checkpoint()
+            if not isinstance(target, str) or not isinstance(data, (bytes, bytearray)):
+                raise EngineExecutionError("Engine 生成的 NFO 结构无效")
+            self._ensure_dir(posixpath.dirname(target) or "/")
+            observed = self._preserve_or_upload_bytes(
+                target, bytes(data), "application/xml",
+            )
+            artifacts.append({"target": target, "kind": "nfo", **observed})
 
-            planned_artwork = getattr(__import__("engine.scraper", fromlist=["planned_artwork"]), "planned_artwork", None)
-            downloader = getattr(self.tmdb, "download_poster", None) if self.tmdb is not None else None
-            if callable(planned_artwork):
-                for target, image_path, role in planned_artwork(plan):
-                    _cancellation_checkpoint()
-                    if not callable(downloader):
-                        raise EngineExecutionError("计划包含海报，但 TMDB 客户端没有 download_poster")
-                    _cancellation_checkpoint()
-                    data = downloader(image_path)
-                    if not isinstance(data, (bytes, bytearray)):
-                        raise EngineExecutionError(f"TMDB 海报响应无效: {image_path}")
-                    self._ensure_dir(posixpath.dirname(target) or "/")
-                    observed = self._preserve_or_upload_bytes(
-                        target, bytes(data), "image/jpeg",
-                    )
-                    artifacts.append({"target": target, "kind": role, **observed})
+        planned_artwork = getattr(
+            __import__("engine.scraper", fromlist=["planned_artwork"]),
+            "planned_artwork",
+            None,
+        )
+        downloader = getattr(self.tmdb, "download_poster", None) if self.tmdb is not None else None
+        if callable(planned_artwork):
+            for target, image_path, role in planned_artwork(plan):
+                _cancellation_checkpoint()
+                # Existing library artwork is authoritative.  In particular,
+                # an artifact-only repair must not require a live TMDB image
+                # downloader just to prove that it will preserve the file.
+                existing = self._exact(target)
+                if existing is not None:
+                    artifacts.append({
+                        "target": target,
+                        "kind": role,
+                        "size": int(existing["size"]),
+                        "status": "already_present",
+                    })
+                    continue
+                if not callable(downloader):
+                    raise EngineExecutionError("计划包含海报，但 TMDB 客户端没有 download_poster")
+                _cancellation_checkpoint()
+                data = downloader(image_path)
+                if not isinstance(data, (bytes, bytearray)):
+                    raise EngineExecutionError(f"TMDB 海报响应无效: {image_path}")
+                self._ensure_dir(posixpath.dirname(target) or "/")
+                observed = self._preserve_or_upload_bytes(
+                    target, bytes(data), "image/jpeg",
+                )
+                artifacts.append({"target": target, "kind": role, **observed})
 
         if _DEFER_TASK_CLEANUP.get():
             pending_cleanup = [
@@ -1552,7 +1822,6 @@ class SimplePlanExecutor:
             "file_count": len(moved),
             "artifacts": artifacts,
             "artifact_count": len(artifacts),
-            "media_only": media_only,
             **dict(cleanup_result),
         }
 
@@ -1718,10 +1987,10 @@ class SimpleEngineRunner:
     def _request_inactive_cancellation(self, job: EngineJob, *, reason: str) -> None:
         """Fence an idle revision before cancelling it without the global lock.
 
-        This path is used only when another job owns the global formal-write
+        This path is used only while the one local writer owns the formal-write
         lock.  No worker can concurrently begin this queued/planned revision
         without first acquiring that lock; the marker makes a just-released
-        scheduler consume cancellation before it can advance the job.
+        next worker consumes cancellation before it can advance the job.
         """
         atomic_write_json(
             self._cancel_request_path(job.id),
@@ -1770,6 +2039,30 @@ class SimpleEngineRunner:
             job,
             reason=reason if isinstance(reason, str) else "cancelled by operator",
         )
+
+    def cancellation_pending(self, job_id: str) -> bool:
+        """Whether one durable cancellation now fences this job's next effect.
+
+        This is deliberately a read-only predicate so the root worker can use
+        it as its existing pause callback while a child writer or provider
+        operation is still active.  The worker consumes the marker only after
+        it reaches that safe boundary.
+        """
+        job = self._read(job_id)
+        if job.phase == "cancelled":
+            return True
+        request = self._read_cancel_request(job.id)
+        return (
+            isinstance(request, Mapping)
+            and self._cancel_request_matches(job, request)
+        )
+
+    def consume_cancellation(self, job_id: str) -> EngineJob | None:
+        """Commit a matching cancellation after a caller reaches a boundary."""
+        job = self._read(job_id)
+        if job.phase == "cancelled":
+            return job
+        return self._consume_cancel_request(job)
 
     def _read(self, job_id: str) -> EngineJob:
         path = self._job_path(job_id)
@@ -1849,6 +2142,420 @@ class SimpleEngineRunner:
             finally:
                 _PAUSE_REQUEST_CHECK.reset(pause_token)
 
+    @staticmethod
+    def _validated_replacement_manifest(manifest: object) -> ReplacementManifest:
+        """Re-parse replacement evidence at the formal-write boundary.
+
+        The HTTP composition layer persists a server-derived manifest before
+        it asks the runner to archive anything.  The runner must nevertheless
+        treat that object as untrusted: a forged frozen dataclass must not be
+        able to turn an arbitrary formal-library path into an archive source.
+        Re-parsing the public projection also keeps this narrow primitive
+        independent from a second replacement-specific state store.
+        """
+        if not isinstance(manifest, ReplacementManifest):
+            raise EngineRequestError("replacement archiving requires a ReplacementManifest")
+        try:
+            return ReplacementManifest.from_dict(manifest.as_dict())
+        except ReplacementValidationError as exc:
+            raise EngineRequestError("replacement manifest validation failed") from exc
+
+    @staticmethod
+    def _replacement_records(
+        manifest: ReplacementManifest,
+    ) -> list[dict[str, object]]:
+        """Project exactly the old formal objects allowed to be archived.
+
+        A replacement is never allowed to archive a work directory, NFO,
+        artwork, an unselected subtitle, or a broadly matched media file.  A
+        record exists only for the old video and the one old managed subtitle
+        explicitly carried by each manifest item.
+        """
+        records: list[dict[str, object]] = []
+        path_keys: set[str] = set()
+        for item in manifest.items:
+            rows: list[tuple[str, str, int, str, int]] = [
+                (
+                    "video",
+                    item.target_path,
+                    item.target_size,
+                    item.source_path,
+                    item.source_size,
+                ),
+            ]
+            if item.subtitle_target_path is not None:
+                if item.subtitle_source_path is None:
+                    raise EngineRequestError(
+                        "replacement subtitle target has no selected source"
+                    )
+                if (
+                    isinstance(item.subtitle_target_size, bool)
+                    or not isinstance(item.subtitle_target_size, int)
+                    or item.subtitle_target_size <= 0
+                    or isinstance(item.subtitle_source_size, bool)
+                    or not isinstance(item.subtitle_source_size, int)
+                    or item.subtitle_source_size <= 0
+                ):
+                    raise EngineRequestError("replacement subtitle size is invalid")
+                rows.append((
+                    "subtitle",
+                    item.subtitle_target_path,
+                    item.subtitle_target_size,
+                    item.subtitle_source_path,
+                    item.subtitle_source_size,
+                ))
+            for kind, old_target, old_size, new_source, new_size in rows:
+                archive_path = archive_path_for(
+                    manifest,
+                    item,
+                    subtitle=kind == "subtitle",
+                )
+                for path, label in (
+                    (old_target, "old target"),
+                    (new_source, "replacement source"),
+                    (archive_path, "replacement archive"),
+                ):
+                    normalized = _safe_remote_path(
+                        path,
+                        field=label,
+                        allow_root=False,
+                    )
+                    key = unicodedata.normalize("NFC", normalized).casefold()
+                    if label != "replacement source" and key in path_keys:
+                        raise EngineRequestError(
+                            "replacement archive contains colliding old targets"
+                        )
+                    if label != "replacement source":
+                        path_keys.add(key)
+                if kind == "video":
+                    if not is_video_filename(old_target) or not is_video_filename(new_source):
+                        raise EngineRequestError("replacement video path has an invalid media type")
+                elif not (
+                    is_subtitle_filename(old_target)
+                    and is_subtitle_filename(new_source)
+                ):
+                    raise EngineRequestError("replacement subtitle path has an invalid media type")
+                records.append({
+                    "coordinate": item.target_coordinate,
+                    "kind": kind,
+                    "old_target_path": old_target,
+                    "old_target_size": old_size,
+                    "new_source_path": new_source,
+                    "new_source_size": new_size,
+                    "archive_path": archive_path,
+                })
+        if not records:
+            raise EngineRequestError("replacement manifest has no archiveable target")
+        return records
+
+    @staticmethod
+    def _replacement_regular_file_state(
+        executor: "SimplePlanExecutor",
+        path: str,
+        expected_size: int,
+        *,
+        label: str,
+    ) -> Mapping[str, object] | None:
+        """Return one fresh, exact regular-file observation or ``None``.
+
+        ``exact_file_info`` alone does not prove that a path is not a
+        directory or link on every AList backend.  Pair its byte observation
+        with the writer's fresh parent/name classification, then reject every
+        non-file state rather than allowing a broad directory move.
+        """
+        observed_kind = executor._remote_entry_kind(path)
+        if observed_kind == "missing":
+            return None
+        if observed_kind != "file":
+            raise EngineJobConflictError(
+                f"replacement {label} is not one exact regular file: {path}"
+            )
+        observed = executor._visible_exact(path)
+        if observed is None:
+            raise EngineExecutionError(
+                f"replacement {label} is not visible after a fresh listing: {path}"
+            )
+        raw_size = observed.get("size") if isinstance(observed, Mapping) else None
+        if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
+            raise EngineExecutionError(
+                f"replacement {label} has no valid byte size: {path}"
+            )
+        if raw_size != expected_size:
+            raise EngineJobConflictError(
+                "replacement exact size changed: "
+                f"{path}; expected={expected_size}; actual={raw_size}"
+            )
+        return {"size": raw_size}
+
+    @staticmethod
+    def _replacement_existing_path_kind(
+        executor: "SimplePlanExecutor",
+        path: str,
+        *,
+        label: str,
+    ) -> str:
+        """Require one residual source path to remain a safe owned object."""
+        observed_kind = executor._remote_entry_kind(path)
+        if observed_kind not in {"file", "directory"}:
+            raise EngineJobConflictError(
+                f"replacement residual {label} changed or is unsafe: {path}"
+            )
+        if observed_kind == "file" and executor._visible_exact(path) is None:
+            raise EngineExecutionError(
+                f"replacement residual {label} is not visible after a fresh listing: {path}"
+            )
+        return observed_kind
+
+    def archive_replacement_targets(
+        self,
+        manifest: ReplacementManifest,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> Mapping[str, object]:
+        """Archive only the exact old targets declared by a replacement proof.
+
+        This is intentionally not a new writer.  It takes the existing
+        process-wide formal-writer lock and delegates every move, size
+        readback and source-absence proof to ``SimplePlanExecutor``.  The
+        operation is idempotent after an interruption: for each declared
+        object the only admissible preflight states are ``old target present,
+        archive absent`` or ``old target absent, archive present``.  Every
+        other matrix is a conflict and no move is issued.
+
+        The caller remains responsible for persisting manifest lifecycle
+        transitions and for handing the selected source back through the
+        ordinary Planner/Writer.  This narrow boundary deliberately performs
+        neither a replacement plan nor a direct server-side AList write.
+        """
+        checked = self._validated_replacement_manifest(manifest)
+        if checked.state in {"writing", "completed"}:
+            raise EngineJobConflictError(
+                "replacement archive cannot run after formal replacement writing began"
+            )
+        if checked.library_root != self.library_root:
+            raise EngineJobConflictError(
+                "replacement manifest library_root differs from the configured writer root"
+            )
+        executor = self.executor
+        if not isinstance(executor, SimplePlanExecutor) or executor.alist is not self.alist:
+            raise EngineExecutionError(
+                "replacement archiving requires the configured SimplePlanExecutor writer"
+            )
+        records = self._replacement_records(checked)
+        effective_pause = (
+            pause_requested
+            if pause_requested is not None
+            else self._pause_requested
+        )
+
+        with self.worker_lock():
+            _pause_checkpoint(effective_pause)
+            self._ensure_authenticated(self.alist)
+            pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
+            try:
+                root_job = self._read(checked.root_job_id)
+                if root_job.summary.get("internal_child") is True:
+                    raise EngineJobConflictError(
+                        "replacement manifest cannot be attached to an internal child"
+                    )
+                if self._job_ingress_source(root_job) != checked.source_root:
+                    raise EngineJobConflictError(
+                        "replacement source root differs from the owning RootJob ingress"
+                    )
+                source_root_kind = executor._remote_entry_kind(checked.source_root)
+                if source_root_kind != "directory":
+                    raise EngineJobConflictError(
+                        "replacement source root is missing or not a directory"
+                    )
+                source_files = executor._fresh_tree_files(checked.source_root)
+                declared_source_paths = {
+                    str(record["new_source_path"])
+                    for record in records
+                }
+                declared_source_paths.update(checked.residual_paths)
+                unexpected_source_paths = sorted(
+                    str(row["full_path"])
+                    for row in source_files
+                    if str(row["full_path"]) not in declared_source_paths
+                )
+                if unexpected_source_paths:
+                    raise EngineJobConflictError(
+                        "replacement source listing contains an undeclared object: "
+                        f"{unexpected_source_paths[0]}"
+                    )
+                # A residual has no execution authority, but it is part of
+                # the durable source ownership snapshot.  Its disappearance
+                # is source drift, not permission to archive an old episode.
+                for residual_path in checked.residual_paths:
+                    self._replacement_existing_path_kind(
+                        executor,
+                        residual_path,
+                        label="source object",
+                    )
+                for record in records:
+                    self._replacement_regular_file_state(
+                        executor,
+                        str(record["new_source_path"]),
+                        int(record["new_source_size"]),
+                        label="new source",
+                    )
+
+                archive_root_kind = executor._remote_entry_kind(checked.archive_root)
+                if archive_root_kind not in {"missing", "directory"}:
+                    raise EngineJobConflictError(
+                        "replacement archive root is already occupied by a non-directory"
+                    )
+                expected_archive = {
+                    str(record["archive_path"]): int(record["old_target_size"])
+                    for record in records
+                }
+                if archive_root_kind == "directory":
+                    archive_files = executor._fresh_tree_files(checked.archive_root)
+                    unexpected_archive_paths = sorted(
+                        str(row["full_path"])
+                        for row in archive_files
+                        if str(row["full_path"]) not in expected_archive
+                    )
+                    if unexpected_archive_paths:
+                        raise EngineJobConflictError(
+                            "replacement archive contains an undeclared object: "
+                            f"{unexpected_archive_paths[0]}"
+                        )
+
+                pending: list[dict[str, object]] = []
+                result_rows: list[dict[str, object]] = []
+                # Preflight every item before the first write.  A pre-existing
+                # collision therefore cannot leave earlier episodes partially
+                # archived merely because it was discovered late in the run.
+                for record in records:
+                    old_target = str(record["old_target_path"])
+                    archive_path = str(record["archive_path"])
+                    expected_size = int(record["old_target_size"])
+                    old_state = self._replacement_regular_file_state(
+                        executor,
+                        old_target,
+                        expected_size,
+                        label="old target",
+                    )
+                    archive_state = self._replacement_regular_file_state(
+                        executor,
+                        archive_path,
+                        expected_size,
+                        label="archive target",
+                    )
+                    if old_state is not None and archive_state is not None:
+                        raise EngineJobConflictError(
+                            "replacement old target and archive are both present: "
+                            f"{old_target}"
+                        )
+                    if old_state is None and archive_state is None:
+                        raise EngineJobConflictError(
+                            "replacement old target disappeared before archival: "
+                            f"{old_target}"
+                        )
+                    row = {
+                        "coordinate": str(record["coordinate"]),
+                        "kind": str(record["kind"]),
+                        "old_target_path": old_target,
+                        "archive_path": archive_path,
+                        "size": expected_size,
+                    }
+                    if old_state is None:
+                        result_rows.append({**row, "status": "already_archived"})
+                    else:
+                        pending.append(record)
+                        result_rows.append({**row, "status": "moved"})
+
+                for record in pending:
+                    _pause_checkpoint(effective_pause)
+                    old_target = str(record["old_target_path"])
+                    archive_path = str(record["archive_path"])
+                    expected_size = int(record["old_target_size"])
+                    # Re-check immediately before the external move.  The
+                    # single writer lock prevents ScrapeFlow races; this also
+                    # fences manual/provider drift between the broad
+                    # all-items preflight and the individual operation.
+                    if self._replacement_regular_file_state(
+                        executor,
+                        old_target,
+                        expected_size,
+                        label="old target",
+                    ) is None:
+                        raise EngineJobConflictError(
+                            f"replacement old target disappeared before move: {old_target}"
+                        )
+                    if self._replacement_regular_file_state(
+                        executor,
+                        archive_path,
+                        expected_size,
+                        label="archive target",
+                    ) is not None:
+                        raise EngineJobConflictError(
+                            f"replacement archive target appeared before move: {archive_path}"
+                        )
+                    executor._move_file(
+                        posixpath.dirname(old_target) or "/",
+                        posixpath.dirname(archive_path) or "/",
+                        posixpath.basename(old_target),
+                        posixpath.basename(archive_path),
+                    )
+                    if executor._remote_entry_kind(archive_path) != "file":
+                        raise EngineExecutionError(
+                            f"replacement archive target is not a regular file: {archive_path}"
+                        )
+                    executor._check_size(archive_path, expected_size)
+                    executor._verify_source_absent(old_target)
+                    if executor._remote_entry_kind(old_target) != "missing":
+                        raise EngineExecutionError(
+                            f"replacement old target remains visible after archive: {old_target}"
+                        )
+
+                # The task-specific archive is allowed to contain only these
+                # exact old objects.  This final fresh recursive listing is
+                # the durable hand-off proof for the ordinary replacement
+                # Planner/Writer stage.
+                final_archive_files = executor._fresh_tree_files(checked.archive_root)
+                final_archive = {
+                    str(row["full_path"]): int(row["size"])
+                    for row in final_archive_files
+                }
+                if final_archive != expected_archive:
+                    raise EngineExecutionError(
+                        "replacement archive fresh readback does not match the manifest"
+                    )
+                for record in records:
+                    old_target = str(record["old_target_path"])
+                    archive_path = str(record["archive_path"])
+                    expected_size = int(record["old_target_size"])
+                    if self._replacement_regular_file_state(
+                        executor,
+                        old_target,
+                        expected_size,
+                        label="old target",
+                    ) is not None:
+                        raise EngineExecutionError(
+                            f"replacement old target remains visible after archive: {old_target}"
+                        )
+                    if self._replacement_regular_file_state(
+                        executor,
+                        archive_path,
+                        expected_size,
+                        label="archive target",
+                    ) is None:
+                        raise EngineExecutionError(
+                            f"replacement archive target disappeared after readback: {archive_path}"
+                        )
+                return {
+                    "status": "archived",
+                    "manifest_id": checked.manifest_id,
+                    "root_job_id": checked.root_job_id,
+                    "work_unit_id": checked.work_unit_id,
+                    "archive_root": checked.archive_root,
+                    "objects": result_rows,
+                }
+            finally:
+                _PAUSE_REQUEST_CHECK.reset(pause_token)
+
     def validate_subtitle_source_content(
         self,
         source_path: str,
@@ -1870,7 +2577,7 @@ class SimpleEngineRunner:
         than immediately after the formal move.  Keep every persisted public
         root as the source owner until an explicit terminal cleanup removes
         its record; otherwise an intake rescan could recreate a second job for
-        a source that still belongs to an audit/provider lifecycle.
+        a source that still belongs to the task lifecycle.
         """
         normalized = _safe_remote_path(source_path, field="source_path", allow_root=False)
         for job in self.list_jobs():
@@ -1900,15 +2607,6 @@ class SimpleEngineRunner:
     def _confirmed_target_selection(self, job: EngineJob) -> tuple[TargetShelf, str]:
         """Rebuild and verify a persisted ordinary-job shelf selection."""
         if job.target_shelf is None or job.target_root is None or job.selected_at is None:
-            reconciliation = job.summary.get("reconciliation")
-            if (
-                isinstance(reconciliation, Mapping)
-                and reconciliation.get("outcome") == "merge_existing"
-            ):
-                _identity, shelf, shelf_root, _work_root = self._merge_existing_context(
-                    job.summary,
-                )
-                return shelf, shelf_root
             raise EngineRequestError("自动任务尚未选择目标货架，不能启动正式处理")
         try:
             shelf = parse_target_shelf(job.target_shelf)
@@ -2003,8 +2701,6 @@ class SimpleEngineRunner:
         of nesting a second lock acquisition.
         """
         source = _safe_remote_path(source_path, field="source_path", allow_root=False)
-        if is_production_test_media_path(source):
-            raise EngineRequestError("生产 E2E 测试目录不能创建自动任务")
         # Intake polling and an explicit POST can arrive together.  Re-check
         # durable ownership under the existing process lock so neither caller
         # creates a second pending root for the same source.
@@ -2028,9 +2724,6 @@ class SimpleEngineRunner:
                 "source_root": source,
                 "ingress_source_path": source,
                 "mode": "auto",
-                "automatic_attempts": 0,
-                "automatic_terminal": False,
-                "next_retry_seconds": None,
             },
             target_shelf=None,
             target_root=None,
@@ -2098,19 +2791,46 @@ class SimpleEngineRunner:
         from engine.scrapeflow.intake_source import (
             bind_root_task,
             find_by_source_id,
+            intake_source_id,
             load_intake_catalog,
             save_intake_catalog,
             upsert_intake_source,
         )
+        # The S-step request must name the same canonical direct child that
+        # produced ``source_id``.  Accepting a mismatched pair would let a
+        # caller attach a RootJob to the wrong IntakeSource and is especially
+        # dangerous when a stale binding is present.
+        canonical_source_id = intake_source_id(source_path)
+        if source_id != canonical_source_id:
+            raise EngineJobConflictError(
+                "IntakeSource source_id 与来源路径不一致，拒绝创建根任务"
+            )
         with self.worker_lock():
             catalog = load_intake_catalog(self.state_root)
             intake = find_by_source_id(catalog, source_id)
             if intake is not None and intake.root_task_id is not None:
                 try:
                     existing_job = self._read(intake.root_task_id)
-                    return existing_job
                 except (SimpleEngineError, FileNotFoundError):
-                    pass  # Orphaned reference — create a fresh job below.
+                    # A missing job record is an orphaned lifecycle, not an
+                    # invitation to create a replacement.  Replacing it here
+                    # used to leave an unbound JSON job when bind_root_task()
+                    # rejected the old catalog association, and could also
+                    # revive deleted formal-library ownership.  Stop
+                    # fail-closed; a separate audited repair operation must
+                    # reconcile or retire the orphan before S can proceed.
+                    raise EngineJobConflictError(
+                        "IntakeSource 仍绑定已不存在的 RootJob；需先完成孤儿任务核对"
+                    )
+                # A durable binding is also an ownership claim.  Even if the
+                # caller supplied the right source_id, never return a job
+                # whose ingress path points at a different source.
+                existing_source = self._job_ingress_source(existing_job)
+                if existing_source != source_path:
+                    raise EngineJobConflictError(
+                        "IntakeSource 已绑定到不同来源路径，拒绝复用根任务"
+                    )
+                return existing_job
 
             # The worker lock is already held; create_pending_job would nest a
             # second non-reentrant flock, so use the locked helper directly.
@@ -2126,10 +2846,18 @@ class SimpleEngineRunner:
             try:
                 new_catalog, _ = bind_root_task(catalog, source_id, job.id)
                 save_intake_catalog(self.state_root, new_catalog)
-            except (ValueError, OSError):
-                # Binding failed — the job is still valid; the catalog update
-                # is best-effort and will be retried on the next scan cycle.
-                pass
+            except (ValueError, OSError) as exc:
+                # Do not leave a freshly-created unbound job behind if the
+                # durable source claim changed or could not be persisted.
+                # The lock still protects this local cleanup; no media or
+                # formal-library path is touched.
+                try:
+                    self._job_path(job.id).unlink()
+                except FileNotFoundError:
+                    pass
+                raise EngineJobConflictError(
+                    "IntakeSource 根任务绑定未能原子保存，已拒绝创建"
+                ) from exc
 
             return job
 
@@ -2153,34 +2881,8 @@ class SimpleEngineRunner:
             raise EngineRequestError(str(exc)) from exc
         with self.worker_lock():
             job = self._read(job_id)
-            if job.summary.get("internal_child") is True or job.summary.get("audit_owned") is True:
+            if job.summary.get("internal_child") is True:
                 raise EngineJobConflictError("内部任务不能通过用户目标货架启动")
-            has_reconciliation = "reconciliation" in job.summary
-            reconciliation = (
-                job.summary.get("reconciliation")
-                if isinstance(job.summary.get("reconciliation"), Mapping)
-                else {}
-            )
-            reconciliation_outcome = str(reconciliation.get("outcome") or "")
-            if job.phase == "reconciling":
-                raise EngineJobConflictError("任务已开始只读对账，不能更改目标货架")
-            if job.phase == "reconciliation_uncertain":
-                raise EngineJobConflictError("身份/正式库对账不确定，请先处理 needs_attention")
-            if job.phase == "reconciled":
-                raise EngineJobConflictError("已匹配现有作品，不需要重新选择目标货架")
-            # Every newly registered ordinary root reaches this gate before
-            # reconciliation. Legacy records that already completed the old
-            # reconciliation-first flow may still start only when that result
-            # is a validated ``new_work`` outcome.
-            if has_reconciliation and reconciliation_outcome:
-                if reconciliation_outcome != "new_work":
-                    raise EngineJobConflictError("已匹配现有作品的任务不能重新选择目标货架")
-                try:
-                    self._reconciled_identity(reconciliation.get("identity"))
-                except EngineRequestError as exc:
-                    raise EngineJobConflictError(
-                        "new_work 对账身份记录无效，请先处理 needs_attention"
-                    ) from exc
             if job.phase not in {"awaiting_target_shelf", "target_policy_conflict"}:
                 # A duplicate start is idempotent only while the selected
                 # root is still in the pre-terminal workflow.  Once the job
@@ -2220,16 +2922,16 @@ class SimpleEngineRunner:
                 "ingress_source_path": source,
                 "target_shelf": selected.value,
                 "selected_target_root": selected_root,
-                "automatic_terminal": False,
-                "next_retry_seconds": None,
             })
-            # A target-policy conflict never has a formal plan.  Drop only
-            # stale result projections; an explicit manual identity correction
-            # remains a user-requested retry input and still goes through the
-            # same compatibility matrix after the new shelf is selected.
+            # Drop stale projections from retired compatibility flows. The
+            # RootJob pipeline owns identity and D-step reconciliation in its
+            # own ledgers, never in EngineJob.summary.
             summary.pop("identity", None)
             summary.pop("resource_gaps", None)
             summary.pop("waiting_source_state", None)
+            summary.pop("reconciliation", None)
+            summary.pop("reconciliation_outcome", None)
+            summary.pop("reconciliation_identity_confirmation", None)
             selected_at = _now()
             updated = replace(
                 job,
@@ -2247,1759 +2949,6 @@ class SimpleEngineRunner:
             atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
             return updated
 
-    def mark_reconciling(self, job_id: str) -> EngineJob:
-        """Open read-only reconciliation after the user shelf is durable."""
-        with self.worker_lock():
-            job = self._read(job_id)
-            reconciliation = (
-                job.summary.get("reconciliation")
-                if isinstance(job.summary.get("reconciliation"), Mapping)
-                else {}
-            )
-            if job.phase == "reconciling":
-                return job
-            if (
-                job.phase != "queued"
-                or not job.target_shelf
-                or not job.target_root
-                or not job.selected_at
-                or reconciliation.get("outcome")
-            ):
-                raise EngineJobConflictError("任务当前不能进入只读对账")
-            summary = dict(job.summary)
-            # 存量清退：phase=reconciling 即权威状态，不再续写镜像字段。
-            summary.pop("automatic_stage", None)
-            updated = replace(job, phase="reconciling", summary=summary, updated_at=_now())
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return updated
-
-    @staticmethod
-    def _reconciliation_formal_roots(library_root: str) -> tuple[str, str, str]:
-        """Return the three closed formal shelves for a configured library root."""
-        return tuple(
-            target_root_for_shelf(library_root, shelf)
-            for shelf in (TargetShelf.MOVIE, TargetShelf.ANIME, TargetShelf.US_TV)
-        )
-
-    @staticmethod
-    def _reconciliation_identity_key(identity: AutomaticIdentity) -> tuple[int, str] | None:
-        if identity.media_type not in {"movie", "tv"} or identity.tmdb_id <= 0:
-            return None
-        return identity.tmdb_id, identity.media_type
-
-    @staticmethod
-    def _reconciliation_work_metadata(work: Mapping[str, object]) -> Mapping[str, object]:
-        metadata = work.get("metadata")
-        return metadata if isinstance(metadata, Mapping) else work
-
-    @classmethod
-    def _reconciliation_work_key(cls, work: Mapping[str, object]) -> tuple[int, str] | None:
-        metadata = cls._reconciliation_work_metadata(work)
-        raw_tmdb_id = metadata.get("tmdb_id")
-        if isinstance(raw_tmdb_id, str) and raw_tmdb_id.isdecimal():
-            raw_tmdb_id = int(raw_tmdb_id)
-        media_type = str(metadata.get("media_type") or metadata.get("type") or "").casefold()
-        if type(raw_tmdb_id) is not int or raw_tmdb_id <= 0 or media_type not in {"movie", "tv"}:
-            return None
-        return raw_tmdb_id, media_type
-
-    @classmethod
-    def _reconciliation_target_root(cls, work: Mapping[str, object]) -> str | None:
-        metadata = cls._reconciliation_work_metadata(work)
-        value = metadata.get("target_root") or metadata.get("series_root")
-        if not isinstance(value, str) or not value.startswith("/"):
-            return None
-        try:
-            return _safe_remote_path(value, field="formal target_root", allow_root=False)
-        except EngineRequestError:
-            return None
-
-    @staticmethod
-    def _reconciliation_scope_is_ambiguous(work: Mapping[str, object]) -> bool:
-        metadata = SimpleEngineRunner._reconciliation_work_metadata(work)
-        scope = metadata.get("identity_scope")
-        if not isinstance(scope, Mapping):
-            # Completed legacy job records are a weaker but still durable
-            # identity projection. They can only classify a work when no
-            # competing formal identity exists; we do not invent a scope.
-            return False
-        return str(scope.get("kind") or "").casefold().startswith("ambiguous_")
-
-    def _reconciliation_shelf_for_work(self, target_root: str) -> str | None:
-        parent = posixpath.dirname(target_root)
-        shelf = target_shelf_for_root(self.library_root, parent)
-        return shelf.value if shelf is not None else None
-
-    @staticmethod
-    def _reconciliation_public_work(work: Mapping[str, object]) -> dict[str, object]:
-        metadata = SimpleEngineRunner._reconciliation_work_metadata(work)
-        return {
-            "tmdb_id": metadata.get("tmdb_id"),
-            "title": metadata.get("title"),
-            "year": metadata.get("year"),
-            "media_type": metadata.get("media_type") or metadata.get("type"),
-            "target_root": metadata.get("target_root") or metadata.get("series_root"),
-            "identity_source": metadata.get("identity_source"),
-            "identity_scope": dict(metadata.get("identity_scope"))
-            if isinstance(metadata.get("identity_scope"), Mapping)
-            else None,
-        }
-
-    @staticmethod
-    def _reconciliation_reason(exc: Exception) -> str:
-        message = redact_error(exc).strip()
-        return message[:320] if message else type(exc).__name__
-
-    @staticmethod
-    def _reconciled_identity(value: object) -> AutomaticIdentity:
-        """Validate the compact identity persisted by read-only reconciliation."""
-        if not isinstance(value, Mapping):
-            raise EngineRequestError("new_work 对账缺少已确认身份")
-        media_type = value.get("media_type")
-        raw_tmdb_id = value.get("tmdb_id")
-        if (
-            not isinstance(media_type, str)
-            or media_type not in {"movie", "tv"}
-            or isinstance(raw_tmdb_id, bool)
-            or not isinstance(raw_tmdb_id, int)
-            or raw_tmdb_id <= 0
-        ):
-            raise EngineRequestError("new_work 对账身份记录无效")
-        title = value.get("title")
-        year = value.get("year")
-        season = value.get("season")
-        trace = value.get("trace")
-        if not isinstance(title, str) or not title.strip():
-            raise EngineRequestError("new_work 对账身份缺少标题")
-        if not isinstance(year, str) or not year.strip():
-            raise EngineRequestError("new_work 对账身份缺少年份")
-        if media_type == "tv":
-            if isinstance(season, bool) or not isinstance(season, int) or season < 0:
-                raise EngineRequestError("new_work 对账身份季号无效")
-        elif season is not None:
-            raise EngineRequestError("电影 new_work 对账身份不应包含季号")
-        if not isinstance(trace, Mapping):
-            trace = {}
-        raw_confidence = value.get("confidence", 1.0)
-        if (
-            isinstance(raw_confidence, bool)
-            or not isinstance(raw_confidence, (int, float))
-            or not 0.0 <= float(raw_confidence) <= 1.0
-        ):
-            raise EngineRequestError("new_work 对账身份置信度无效")
-        return AutomaticIdentity(
-            media_type=media_type,
-            tmdb_id=raw_tmdb_id,
-            title=title.strip(),
-            year=year.strip(),
-            # Preserve the existing Engine's bounded evidence value.  It is
-            # not re-scored here, but malformed persisted evidence must fail
-            # closed instead of silently becoming a perfect match.
-            confidence=float(raw_confidence),
-            target_parent=None,
-            season=season if media_type == "tv" else None,
-            trace=dict(trace),
-        )
-
-    def _merge_existing_context(
-        self,
-        summary: Mapping[str, object],
-    ) -> tuple[AutomaticIdentity, TargetShelf, str, str]:
-        """Validate the durable identity and destination selected by reconciliation.
-
-        ``EngineJob.target_root`` is intentionally the first-level shelf root;
-        the concrete matched work root remains in the reconciliation projection.
-        Keeping those meanings separate lets the existing planner/executor
-        retain their ordinary containment and readback gates.
-        """
-        return self._reconciled_existing_context(
-            summary,
-            expected_outcome="merge_existing",
-        )
-
-    def _reconciled_existing_context(
-        self,
-        summary: Mapping[str, object],
-        *,
-        expected_outcome: str,
-    ) -> tuple[AutomaticIdentity, TargetShelf, str, str]:
-        """Validate one matched-work reconciliation without doing remote I/O.
-
-        ``merge_existing`` and ``existing_gap`` share the same durable
-        identity/shelf/work-root proof.  Keeping this validation in one
-        helper prevents the Provider hand-off from trusting a second copy of
-        the path/identity rules.
-        """
-        reconciliation = summary.get("reconciliation")
-        if not isinstance(reconciliation, Mapping):
-            raise EngineRequestError("正式库对账记录缺失")
-        if reconciliation.get("outcome") != expected_outcome:
-            raise EngineRequestError(f"当前任务不是 {expected_outcome}")
-        identity = self._reconciled_identity(reconciliation.get("identity"))
-        matched = reconciliation.get("matched_formal_work")
-        if not isinstance(matched, Mapping):
-            raise EngineRequestError("merge_existing 缺少匹配的正式作品")
-        matched_key = self._reconciliation_work_key(matched)
-        if matched_key != self._reconciliation_identity_key(identity):
-            raise EngineRequestError("正式作品身份与对账身份不一致")
-        work_root = self._reconciliation_target_root(matched)
-        shelf_value = reconciliation.get("matched_shelf")
-        if work_root is None or not isinstance(shelf_value, str):
-            raise EngineRequestError("既有作品的货架或作品根无效")
-        try:
-            shelf = parse_target_shelf(shelf_value)
-            shelf_root = target_root_for_shelf(self.library_root, shelf)
-        except ValueError as exc:
-            raise EngineRequestError("既有作品的货架无效") from exc
-        # Reconciliation only accepts a concrete work directly below one of
-        # the three closed shelves. Re-check that invariant at the write gate.
-        if posixpath.dirname(work_root) != shelf_root:
-            raise EngineRequestError("既有作品根不在匹配一级货架下")
-        if self._reconciliation_shelf_for_work(work_root) != shelf.value:
-            raise EngineRequestError("既有作品根与货架映射不一致")
-        if self._reconciliation_scope_is_ambiguous(matched):
-            raise EngineRequestError("正式作品身份范围不明确")
-        return identity, shelf, shelf_root, work_root
-
-    def reconciled_existing_work_root(
-        self,
-        job_id: str,
-        *,
-        outcome: str = "existing_gap",
-    ) -> str:
-        """Return a validated matched work root for a post-reconciliation lane.
-
-        This is a local-state read gate for the composition root.  It does
-        not scan AList, call TMDB, or create a Provider owner; the scoped
-        audit that follows remains the existing Provider/audit composition
-        path.
-        """
-        if outcome not in {"merge_existing", "existing_gap"}:
-            raise EngineRequestError("只允许读取既有作品对账结果")
-        with self.worker_lock():
-            job = self._read(job_id)
-            if job.phase not in {"reconciled", "queued", "planned", "executing", "executed"}:
-                raise EngineJobConflictError(
-                    f"任务当前没有可用的既有作品对账结果: {job.phase}"
-                )
-            _identity, _shelf, _shelf_root, work_root = self._reconciled_existing_context(
-                job.summary,
-                expected_outcome=outcome,
-            )
-            return work_root
-
-    def _request_from_reconciled_identity(
-        self,
-        source: str,
-        *,
-        identity: AutomaticIdentity,
-        shelf: TargetShelf,
-        shelf_root: str,
-    ) -> EngineRequest:
-        """Adapt persisted reconciliation evidence to the existing planner API."""
-        return EngineRequest.from_mapping({
-            "source_path": source,
-            "parent_path": shelf_root,
-            "media_type": identity.media_type,
-            "target_shelf": shelf.value,
-            "tmdb_id": identity.tmdb_id,
-            "query": identity.title,
-            "season": identity.season if isinstance(identity.season, int) else 1,
-        })
-
-    def _require_merge_existing_plan_target(
-        self,
-        plan: object,
-        *,
-        identity: AutomaticIdentity,
-        work_root: str,
-        stage: str,
-    ) -> None:
-        """Fail closed if the existing planner proposes a second work root."""
-        planned_root = getattr(plan, "target_root", None)
-        if not isinstance(planned_root, str):
-            raise FormalTargetConflictError(
-                f"{stage}缺少既有作品目标根"
-            )
-        try:
-            planned_root = _safe_remote_path(
-                planned_root, field=f"{stage} target_root", allow_root=False,
-            )
-        except EngineRequestError as exc:
-            raise FormalTargetConflictError(f"{stage}目标根无效") from exc
-        if planned_root != work_root:
-            raise FormalTargetConflictError(
-                f"{stage}不得为既有作品创建第二个正式作品根: "
-                f"expected={work_root}; planned={planned_root}"
-            )
-        self._require_reconciled_plan_identity(
-            plan,
-            identity=identity,
-            stage=stage,
-        )
-
-    @staticmethod
-    def _require_reconciled_plan_identity(
-        plan: object,
-        *,
-        identity: AutomaticIdentity,
-        stage: str,
-    ) -> None:
-        """Keep a persisted reconciliation identity stable through recovery."""
-        metadata = getattr(plan, "metadata", {})
-        if not isinstance(metadata, Mapping):
-            raise FormalTargetConflictError(f"{stage}缺少作品身份元数据")
-        raw_tmdb_id = metadata.get("tmdb_id")
-        if isinstance(raw_tmdb_id, str) and raw_tmdb_id.isdecimal():
-            raw_tmdb_id = int(raw_tmdb_id)
-        if raw_tmdb_id != identity.tmdb_id:
-            raise FormalTargetConflictError(
-                f"{stage}计划身份与既有作品不一致"
-            )
-        mode = str(getattr(plan, "mode", "")).casefold()
-        if mode != identity.media_type:
-            raise FormalTargetConflictError(
-                f"{stage}计划媒体类型与既有作品不一致"
-            )
-
-    def _reconciliation_source_video_paths(self, source: str) -> set[str] | None:
-        """Return only real intake videos from an existing read-only walk."""
-        walker = getattr(self.alist, "walk", None)
-        if not callable(walker):
-            return None
-        try:
-            rows = walker(source, ignore_orphan_temp=True)
-        except TypeError:
-            try:
-                rows = walker(source)
-            except Exception:
-                return None
-        except Exception:
-            return None
-        if not isinstance(rows, list):
-            return None
-        paths: set[str] = set()
-        source_prefix = source.rstrip("/") + "/"
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            path = row.get("full_path") or row.get("path") or row.get("name")
-            size = row.get("size")
-            # A zero-byte listing is not usable media evidence.  Keep the
-            # broader quality/readability gate in the existing planner, but
-            # do not let an empty placeholder authorize merge_existing.
-            if not isinstance(path, str) or not path.startswith(source_prefix):
-                continue
-            try:
-                normalized = _safe_remote_path(
-                    path, field="reconciliation source media path", allow_root=False,
-                )
-            except EngineRequestError:
-                continue
-            if (
-                normalized.startswith(source_prefix)
-                and is_video_filename(normalized)
-                and video_size_is_admissible(size)
-            ):
-                paths.add(normalized)
-        return paths
-
-    def _reconciliation_source_episode_tokens(
-        self,
-        source: str,
-        *,
-        default_season: int | None,
-    ) -> set[tuple[int, int]] | None:
-        """Reuse the shared episode parser over real intake videos only."""
-        paths = self._reconciliation_source_video_paths(source)
-        if paths is None:
-            return None
-        from engine.scrapeflow.replenishment_matching import audit_episode_tokens
-
-        tokens: set[tuple[int, int]] = set()
-        for path in paths:
-            tokens.update(audit_episode_tokens(path, default_season=default_season))
-        return tokens
-
-    @staticmethod
-    def _reconciliation_formal_video_paths(
-        report: Mapping[str, object],
-        target_root: str,
-    ) -> set[str]:
-        """Return formally admissible movie videos inside one matched root.
-
-        The semantic audit projection is intentionally reused for identity and
-        gap evidence, but its inventory may still contain zero-byte or tiny
-        video entries as diagnostics.  Those entries are not sufficient proof
-        of a complete formal movie; the same admission floor used by the
-        writer must apply at this reconciliation boundary too.
-        """
-        inventory = report.get("inventory")
-        if not isinstance(inventory, list):
-            return set()
-        prefix = target_root.rstrip("/") + "/"
-        paths: set[str] = set()
-        for row in inventory:
-            if not isinstance(row, Mapping) or row.get("type") != "file":
-                continue
-            path = row.get("path") or row.get("full_path")
-            if not isinstance(path, str):
-                continue
-            try:
-                normalized = _safe_remote_path(
-                    path, field="reconciliation formal media path", allow_root=False,
-                )
-            except EngineRequestError:
-                continue
-            if (
-                (normalized == target_root or normalized.startswith(prefix))
-                and is_video_filename(normalized)
-                and video_size_is_admissible(row.get("size"))
-            ):
-                paths.add(normalized)
-        return paths
-
-    def _reconciliation_outcome(
-        self,
-        *,
-        source: str,
-        identity: AutomaticIdentity,
-        report: Mapping[str, object],
-        works: list[dict[str, object]],
-        semantic: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object] | None, str | None]:
-        """Classify one known identity without authorising any side effect."""
-        identity_key = self._reconciliation_identity_key(identity)
-        if identity_key is None:
-            return "uncertain", "Engine identity lacks a supported media type or TMDB id", None, None
-        if report.get("complete") is not True or report.get("status") != "completed":
-            return "uncertain", "正式库只读清单不完整", None, None
-        matches = [
-            work for work in works
-            if self._reconciliation_work_key(work) == identity_key
-        ]
-        if not matches:
-            # Any formal media without a projected identity makes absence
-            # inconclusive. The audit exposes these directly as unknowns;
-            # do not infer a new work merely from a missing NFO match.
-            semantic_unknowns = semantic.get("unknowns")
-            if isinstance(semantic_unknowns, list) and semantic_unknowns:
-                return "uncertain", "正式库存在未能由 NFO/完成任务确认身份的媒体", None, None
-            return "new_work", "三库中没有已确认的同一 TMDB 作品", None, None
-        unique_roots = {
-            target for work in matches
-            if (target := self._reconciliation_target_root(work)) is not None
-        }
-        if len(matches) != 1 or len(unique_roots) != 1:
-            return "uncertain", "多个正式作品身份匹配，不能安全选择工作根", None, None
-        work = matches[0]
-        target_root = next(iter(unique_roots))
-        shelf = self._reconciliation_shelf_for_work(target_root)
-        if shelf is None or self._reconciliation_scope_is_ambiguous(work):
-            return "uncertain", "正式作品身份范围或一级货架不明确", work, shelf
-        work_gaps = semantic.get("gaps") if isinstance(semantic.get("gaps"), list) else []
-        work_unknowns = semantic.get("unknowns") if isinstance(semantic.get("unknowns"), list) else []
-        matching_gaps = [
-            row for row in work_gaps
-            if isinstance(row, Mapping)
-            and isinstance(row.get("media"), Mapping)
-            and row["media"].get("tmdb_id") == identity.tmdb_id
-            and row["media"].get("target_root") == target_root
-        ]
-        matching_unknowns = [
-            row for row in work_unknowns
-            if isinstance(row, Mapping)
-            and (
-                row.get("target_root") == target_root
-                or row.get("work") == f"tmdb:{identity.tmdb_id}"
-                or (
-                    isinstance(row.get("path"), str)
-                    and (
-                        row["path"] == target_root
-                        or row["path"].startswith(target_root.rstrip("/") + "/")
-                    )
-                )
-                or any(
-                    isinstance(path, str)
-                    and (
-                        path == target_root
-                        or path.startswith(target_root.rstrip("/") + "/")
-                    )
-                    for path in (
-                        row.get("uncovered_video_paths")
-                        if isinstance(row.get("uncovered_video_paths"), list)
-                        else []
-                    )
-                )
-            )
-        ]
-        media_gap_kinds = {"missing_media", "missing_episode", "missing_season"}
-        matching_media_gaps = [
-            row for row in matching_gaps
-            if str(row.get("kind") or "") in media_gap_kinds
-        ]
-        if identity.media_type == "movie" and matching_media_gaps:
-            source_videos = self._reconciliation_source_video_paths(source)
-            if source_videos is None:
-                return "uncertain", "无法只读确认输入电影媒体", work, shelf
-            if source_videos:
-                return "merge_existing", "输入包含可补入既有正式电影的视频", work, shelf
-        if identity.media_type == "tv":
-            source_tokens = self._reconciliation_source_episode_tokens(
-                source,
-                default_season=identity.season,
-            )
-            if source_tokens is None:
-                return "uncertain", "无法只读确认输入剧集范围", work, shelf
-            inventory = report.get("inventory") if isinstance(report.get("inventory"), list) else []
-            formal_tokens: set[tuple[int, int]] = set()
-            from engine.scrapeflow.replenishment_matching import audit_episode_tokens
-
-            for row in inventory:
-                if not isinstance(row, Mapping) or row.get("type") != "file":
-                    continue
-                path = row.get("path")
-                if not isinstance(path, str):
-                    continue
-                try:
-                    normalized = _safe_remote_path(
-                        path, field="reconciliation formal episode path", allow_root=False,
-                    )
-                except EngineRequestError:
-                    continue
-                if (
-                    is_video_filename(normalized)
-                    and video_size_is_admissible(row.get("size"))
-                    and (normalized == target_root or normalized.startswith(target_root.rstrip("/") + "/"))
-                ):
-                    formal_tokens.update(
-                        audit_episode_tokens(normalized, default_season=identity.season),
-                    )
-            if not source_tokens:
-                return "uncertain", "输入剧集没有可验证的季集坐标", work, shelf
-            if source_tokens - formal_tokens:
-                return "merge_existing", "输入包含正式作品尚未覆盖的明确剧集", work, shelf
-        if matching_unknowns:
-            return "uncertain", "正式作品完整性证据不足", work, shelf
-        formal_movie_videos = (
-            self._reconciliation_formal_video_paths(report, target_root)
-            if identity.media_type == "movie"
-            else None
-        )
-        if identity.media_type == "movie" and not formal_movie_videos:
-            source_videos = self._reconciliation_source_video_paths(source)
-            if source_videos is None:
-                return "uncertain", "无法只读确认输入电影媒体", work, shelf
-            if source_videos:
-                return "merge_existing", "输入包含可补入既有正式电影的视频", work, shelf
-            return "existing_gap", "正式电影缺少可接受的视频媒体", work, shelf
-        if matching_media_gaps:
-            return "existing_gap", "已确认正式作品存在媒体缺口", work, shelf
-        return "duplicate_complete", "正式作品身份与媒体范围已充分匹配", work, shelf
-
-    @staticmethod
-    def _reconciliation_identity_candidates(
-        identity: AutomaticIdentity | None,
-        error_candidates: object,
-    ) -> list[dict[str, object]]:
-        """Project bounded, confirmable identity candidates for uncertain.
-
-        Rows come either from a safe matcher rejection (which refused to
-        choose but scored candidates) or from the resolved identity's own
-        decision trace.  Only movie/tv rows with a usable TMDB id survive,
-        because the U-node confirmation tuple accepts exactly those two
-        media types.  This list is read-only evidence; it never authorises
-        a shelf, path, link or Provider operation.
-        """
-        rows: object = error_candidates
-        if rows is None and identity is not None:
-            trace = identity.trace if isinstance(identity.trace, Mapping) else {}
-            rows = trace.get("top_candidates")
-        if not isinstance(rows, list):
-            return []
-        projected: list[dict[str, object]] = []
-        for row in rows[:5]:
-            if not isinstance(row, Mapping):
-                continue
-            tmdb_id = row.get("tmdb_id")
-            media_type = str(row.get("media_type") or "")
-            if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
-                continue
-            if media_type not in {"movie", "tv"}:
-                continue
-            confidence = row.get("confidence")
-            projected.append({
-                "media_type": media_type,
-                "tmdb_id": tmdb_id,
-                "title": str(row.get("title") or ""),
-                "year": str(row.get("year") or ""),
-                "confidence": (
-                    float(confidence)
-                    if isinstance(confidence, (int, float))
-                    and not isinstance(confidence, bool)
-                    else None
-                ),
-                "status": str(row.get("status") or ""),
-            })
-        return projected
-
-    def reconcile_automatic_job(self, job_id: str) -> EngineJob:
-        """Persist a bounded, read-only intake reconciliation result.
-
-        This method deliberately calls only existing Engine identity code and
-        the existing library audit projections. It never invokes archive
-        preprocessing, a planner, executor, Provider, cleanup, or any formal
-        writer. The sole mutation is the task's local JSON record.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            if job.phase != "reconciling":
-                return job
-            cancelled = self._consume_cancel_request(job)
-            if cancelled is not None:
-                return cancelled
-            identity: AutomaticIdentity | None = None
-            matched_work: Mapping[str, object] | None = None
-            matched_shelf: str | None = None
-            try:
-                source = self._job_ingress_source(job)
-                if not self.source_directory_exists(source):
-                    raise EngineRequestError("待刮削来源目录不存在或不可读取")
-                confirmation = job.summary.get("reconciliation_identity_confirmation")
-                if isinstance(confirmation, Mapping):
-                    # The operator confirms only the bounded identity tuple;
-                    # title/year remain Engine-derived source evidence and the
-                    # ordinary library comparison below still decides all
-                    # five outcomes.  In particular this is not a second
-                    # planner, destination, or Provider input path.
-                    original = self.resolve_automatic_identity(source)
-                    confirmed_id = confirmation.get("tmdb_id")
-                    confirmed_type = str(confirmation.get("media_type") or "").casefold()
-                    confirmed_season = confirmation.get("season")
-                    if (
-                        isinstance(confirmed_id, bool)
-                        or not isinstance(confirmed_id, int)
-                        or confirmed_id <= 0
-                        or confirmed_type not in {"movie", "tv"}
-                        or (
-                            confirmed_type == "tv"
-                            and (
-                                isinstance(confirmed_season, bool)
-                                or not isinstance(confirmed_season, int)
-                                or not 0 <= confirmed_season <= 999
-                            )
-                        )
-                        or (confirmed_type == "movie" and confirmed_season is not None)
-                    ):
-                        raise EngineRequestError("手工对账身份确认记录无效")
-                    trace = dict(original.trace)
-                    trace["reconciliation_identity_confirmation"] = {
-                        "tmdb_id": confirmed_id,
-                        "media_type": confirmed_type,
-                    }
-                    identity = replace(
-                        original,
-                        media_type=confirmed_type,
-                        tmdb_id=confirmed_id,
-                        confidence=1.0,
-                        season=confirmed_season if confirmed_type == "tv" else None,
-                        trace=trace,
-                    )
-                else:
-                    identity = self.resolve_automatic_identity(source)
-                from local.scrapeflow_api.simple_library_audit import (
-                    SimpleLibraryAuditor,
-                    TmdbEpisodeCatalog,
-                    _merge_library_and_job_works,
-                    automatic_works_from_engine_jobs,
-                    bootstrap_automatic_works_from_library,
-                    build_automatic_library_gaps,
-                )
-
-                formal_roots = self._reconciliation_formal_roots(self.library_root)
-                report = SimpleLibraryAuditor(
-                    self.alist,
-                    formal_roots=formal_roots,
-                ).scan()
-                library_works = bootstrap_automatic_works_from_library(
-                    report,
-                    self.alist,
-                    formal_roots=formal_roots,
-                )
-                job_works = automatic_works_from_engine_jobs(self.list_jobs())
-                works, _unowned = _merge_library_and_job_works(library_works, job_works)
-                # Reuse the audit's bounded, read-only published-episode
-                # evidence for TV work. A TMDB failure stays unknown and is
-                # classified fail-closed rather than treating a partial TV
-                # directory as complete.
-                catalog = TmdbEpisodeCatalog(self.tmdb)
-                try:
-                    catalog.prefetch(works)
-                except Exception:
-                    pass
-                semantic = build_automatic_library_gaps(
-                    report,
-                    works,
-                    episode_catalog=catalog,
-                )
-                outcome, reason, matched_work, matched_shelf = self._reconciliation_outcome(
-                    source=source,
-                    identity=identity,
-                    report=report,
-                    works=works,
-                    semantic=semantic,
-                )
-                if matched_shelf is not None and matched_shelf != job.target_shelf:
-                    outcome = "uncertain"
-                    reason = (
-                        f"用户选择的一级货架 {job.target_shelf} 与正式库匹配货架 "
-                        f"{matched_shelf} 冲突"
-                    )
-            except Exception as exc:
-                outcome = "uncertain"
-                reason = self._reconciliation_reason(exc)
-                # A safe matcher rejection may still carry bounded candidate
-                # evidence (title/year/TMDB id/confidence).  Keep it for the
-                # U-node so the operator confirms from system candidates
-                # instead of researching identities by hand.
-                error_candidates = getattr(exc, "candidates", None)
-            else:
-                error_candidates = None
-            summary = dict(job.summary)
-            reconciliation: dict[str, object] = {
-                "status": "completed" if outcome != "uncertain" else "needs_attention",
-                "outcome": outcome,
-                "reason": reason,
-            }
-            if identity is not None:
-                reconciliation["identity"] = identity.as_dict()
-            if outcome == "uncertain":
-                candidate_rows = self._reconciliation_identity_candidates(
-                    identity, error_candidates,
-                )
-                if candidate_rows:
-                    reconciliation["identity_candidates"] = candidate_rows
-            if matched_work is not None:
-                reconciliation["matched_formal_work"] = self._reconciliation_public_work(matched_work)
-            if matched_shelf is not None:
-                reconciliation["matched_shelf"] = matched_shelf
-            summary.update({
-                "automatic": True,
-                "reconciliation": reconciliation,
-                "reconciliation_outcome": outcome,
-                "automatic_terminal": outcome not in {"new_work", "merge_existing"},
-                "next_retry_seconds": None,
-            })
-            if isinstance(summary.get("reconciliation_identity_confirmation"), Mapping):
-                confirmation = dict(summary["reconciliation_identity_confirmation"])
-                confirmation["reconciled_at"] = _now()
-                confirmation["result"] = outcome
-                summary["reconciliation_identity_confirmation"] = confirmation
-            phase = (
-                "queued" if outcome == "new_work"
-                else "reconciliation_uncertain" if outcome == "uncertain"
-                else "reconciled"
-            )
-            updated = replace(
-                job,
-                phase=phase,
-                updated_at=_now(),
-                summary=summary,
-                error=(reason if outcome == "uncertain" else None),
-            )
-            latest = self._read(job_id)
-            cancelled = self._consume_cancel_request(latest)
-            if cancelled is not None:
-                return cancelled
-            if latest.phase != "reconciling" or latest.updated_at != job.updated_at:
-                return latest
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return self._read(job_id)
-
-    def reopen_reconciliation_uncertain(
-        self,
-        job_id: str,
-        correction: Mapping[str, object],
-    ) -> EngineJob:
-        """Accept one bounded identity confirmation and repeat only B/C.
-
-        ``uncertain`` must never be reopened into a shelf, planner, writer or
-        Provider lane.  The caller can confirm only the same compact identity
-        tuple used by the ordinary retry boundary; this method records it as
-        audit evidence and returns the root to ``reconciling``.  The next
-        invocation of :meth:`reconcile_automatic_job` performs the ordinary
-        read-only three-library comparison again.
-        """
-        if not isinstance(correction, Mapping):
-            raise EngineRequestError("对账身份确认必须是 JSON 对象")
-        forbidden = set(correction) - {"tmdb_id", "media_type", "season"}
-        if forbidden:
-            raise EngineRequestError("对账身份确认包含不支持的字段")
-        raw_id = correction.get("tmdb_id")
-        if isinstance(raw_id, str) and raw_id.isascii() and raw_id.isdecimal():
-            raw_id = int(raw_id)
-        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
-            raise EngineRequestError("对账身份确认需要正整数 tmdb_id")
-        media_type = str(correction.get("media_type") or "").strip().casefold()
-        if media_type not in {"movie", "tv"}:
-            raise EngineRequestError("对账身份确认需要 media_type=movie 或 tv")
-        raw_season = correction.get("season", 1)
-        if isinstance(raw_season, str) and raw_season.isascii() and raw_season.isdecimal():
-            raw_season = int(raw_season)
-        if isinstance(raw_season, bool) or not isinstance(raw_season, int) or not 0 <= raw_season <= 999:
-            raise EngineRequestError("对账身份确认 season 必须是 0–999 的整数")
-
-        normalized: dict[str, object] = {
-            "tmdb_id": raw_id,
-            "media_type": media_type,
-            # Keep the existing public correction shape backward compatible:
-            # movie retries historically carry the default ``season=1`` even
-            # though it is ignored.  It is discarded below and never becomes
-            # a movie identity fact.
-            "season": raw_season if media_type == "tv" else None,
-        }
-        with self.worker_lock():
-            job = self._read(job_id)
-            if job.phase != "reconciliation_uncertain":
-                raise EngineJobConflictError("只有 needs_attention 对账任务可以确认身份")
-            summary = job.summary if isinstance(job.summary, Mapping) else {}
-            reconciliation = summary.get("reconciliation")
-            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "uncertain":
-                raise EngineJobConflictError("当前任务不是不确定的只读对账结果")
-            if self._owned_children(job) or self._existing_gap_registration_blockers(job):
-                raise EngineJobConflictError("任务仍有活动 child 或 Provider 状态，不能重新对账")
-            source = self._job_ingress_source(job)
-            if not self.source_directory_exists(source):
-                raise EngineJobConflictError("待刮削来源目录不存在或不可读取")
-            cancelled = self._consume_cancel_request(job)
-            if cancelled is not None:
-                return cancelled
-            updated_summary = dict(summary)
-            updated_summary["reconciliation_identity_confirmation"] = {
-                **normalized,
-                "confirmed_at": _now(),
-            }
-            updated_summary["automatic"] = True
-            # 存量清退：phase=reconciling 即权威状态，不再续写镜像字段。
-            updated_summary.pop("automatic_stage", None)
-            updated_summary["automatic_terminal"] = False
-            updated_summary["next_retry_seconds"] = None
-            updated_summary.pop("existing_gap_registration", None)
-            updated_summary.pop("source_fate", None)
-            updated = replace(
-                job,
-                phase="reconciling",
-                request={"source_path": source},
-                plan={},
-                summary=updated_summary,
-                updated_at=_now(),
-                error=None,
-                execution=None,
-            )
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return self._read(job.id)
-
-    def prepare_reconciled_merge_job(self, job_id: str) -> EngineJob:
-        """Open a read-only ``merge_existing`` result for the existing Engine.
-
-        Reconciliation intentionally leaves the result in ``reconciled`` so
-        the HTTP composition root can expose the five-way decision before any
-        formal planning starts.  This narrow local transition is the explicit
-        hand-off for the one result that is allowed to continue automatically:
-        it records no user shelf choice, copies the already validated matched
-        work coordinates into the summary, and changes only the local job
-        phase to ``queued``.  The planner branch below consumes the persisted
-        identity and performs the ordinary Engine/write path.
-
-        ``duplicate_complete`` and ``existing_gap`` deliberately do not use
-        this method.  They require their own terminal/Provider decisions and
-        must never be silently turned into a media write.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            if job.phase == "queued":
-                reconciliation = job.summary.get("reconciliation")
-                if (
-                    isinstance(reconciliation, Mapping)
-                    and reconciliation.get("outcome") == "merge_existing"
-                ):
-                    return job
-            if job.phase != "reconciled":
-                raise EngineJobConflictError(
-                    f"任务当前不能打开 merge_existing: {job.phase}"
-                )
-            reconciliation = job.summary.get("reconciliation")
-            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "merge_existing":
-                raise EngineJobConflictError("只有 merge_existing 对账结果才能进入现有 Engine")
-            # Validate every durable coordinate at the hand-off boundary.  No
-            # network call or planner is made here.
-            _identity, shelf, shelf_root, work_root = self._merge_existing_context(
-                job.summary,
-            )
-            source = self._job_ingress_source(job)
-            summary = dict(job.summary)
-            # 存量清退：phase=queued 即权威状态，不再续写镜像字段。
-            summary.pop("automatic_stage", None)
-            summary.update({
-                "automatic": True,
-                "selected_target_root": shelf_root,
-                "target_work_path": work_root,
-                "merge_existing_ready": True,
-                "automatic_terminal": False,
-                "next_retry_seconds": None,
-            })
-            # Keep the classification and matched evidence intact.  The
-            # target shelf remains in reconciliation evidence, not in the
-            # user-selection fields used by ``new_work`` /start.
-            reconciliation_copy = dict(reconciliation)
-            reconciliation_copy.update({
-                "status": "completed",
-                "execution_ready": True,
-                "matched_shelf": shelf.value,
-                "matched_work_root": work_root,
-            })
-            summary["reconciliation"] = reconciliation_copy
-            now = _now()
-            updated = replace(
-                job,
-                phase="queued",
-                updated_at=now,
-                request={"source_path": source},
-                plan={},
-                summary=summary,
-                target_shelf=None,
-                target_root=None,
-                selected_at=None,
-                execution=None,
-                error=None,
-            )
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return updated
-
-    @staticmethod
-    def _audit_text(value: object, *, field: str, required: bool = False) -> str:
-        """Normalize bounded audit text without allowing path/control data through."""
-        if not isinstance(value, str):
-            if required:
-                raise EngineRequestError(f"审计项目缺少 {field}")
-            return ""
-        text = value.strip()
-        if required and not text:
-            raise EngineRequestError(f"审计项目缺少 {field}")
-        if "\x00" in text or len(text) > 512:
-            raise EngineRequestError(f"审计项目 {field} 无效")
-        return text
-
-    def _audit_target_root(self, value: object) -> str:
-        """Accept only a formal-library work root, never intake or staging."""
-        target = _safe_remote_path(value, field="audit target_root", allow_root=False)
-        library = self.library_root.rstrip("/") or "/"
-        if library == "/" or not target.startswith(library + "/"):
-            raise EngineRequestError("审计目标必须位于配置的正式媒体库根目录")
-        relative = target[len(library) + 1:]
-        if "/" not in relative:
-            raise EngineRequestError("审计目标必须是正式媒体库中的作品目录")
-        first = relative.split("/", 1)[0]
-        if first == "待刮削" or first.casefold() == "scrapeflow":
-            raise EngineRequestError("审计目标不得位于待刮削或 ScrapeFlow 运行时目录")
-        return target
-
-    @staticmethod
-    def _audit_positive_int(value: object, *, field: str, allow_zero: bool = False) -> int:
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise EngineRequestError(f"审计项目 {field} 必须是整数")
-        if value < 0 or (value == 0 and not allow_zero):
-            raise EngineRequestError(f"审计项目 {field} 超出范围")
-        return value
-
-    @staticmethod
-    def _audit_media_mapping(
-        raw_gap: Mapping[str, object],
-        *,
-        tmdb_id: int,
-        target_root: str,
-        media_type: str,
-        title: str,
-        original_title: str,
-        year: str,
-        media_format: str,
-    ) -> dict[str, object] | None:
-        """Project one semantic gap into the narrow provider input contract.
-
-        The audit report is untrusted observation data.  Rebuild the row from
-        scalar fields instead of copying arbitrary nested values; rows whose
-        identity disagrees with the owning project are ignored.  In
-        particular, subtitle/metadata/unknown findings never become video
-        acquisition work here.
-        """
-        kind = str(raw_gap.get("kind") or "").strip().casefold()
-        if kind not in _AUDIT_ROOT_GAP_KINDS:
-            return None
-        raw_media = raw_gap.get("media")
-        media = raw_media if isinstance(raw_media, Mapping) else raw_gap
-        raw_tmdb = media.get("tmdb_id")
-        if isinstance(raw_tmdb, str) and raw_tmdb.isdigit():
-            raw_tmdb = int(raw_tmdb)
-        if raw_tmdb != tmdb_id:
-            return None
-        raw_target = media.get("target_root")
-        if not isinstance(raw_target, str):
-            raw_target = raw_gap.get("target_root")
-        try:
-            if _safe_remote_path(raw_target, field="audit gap target_root", allow_root=False) != target_root:
-                return None
-        except EngineRequestError:
-            return None
-        expected_type = "movie" if kind == "missing_media" else "tv"
-        if media_type != expected_type:
-            return None
-        row_type = str(media.get("media_type") or media.get("type") or "").strip().casefold()
-        if row_type not in {expected_type, "mixed" if expected_type == "tv" else expected_type}:
-            return None
-
-        label = SimpleEngineRunner._audit_text(raw_gap.get("label"), field="label", required=True)
-        reason = SimpleEngineRunner._audit_text(raw_gap.get("reason"), field="reason")
-        row: dict[str, object] = {
-            "kind": kind,
-            "source": "automatic_library_audit",
-            "reason": reason,
-            "media": {
-                "tmdb_id": tmdb_id,
-                "title": title,
-                "original_title": original_title,
-                "year": year,
-                "target_root": target_root,
-                "media_type": expected_type,
-                **({"media_format": media_format} if media_format else {}),
-            },
-        }
-        # Keep a deterministic coordinate.  The provider adapter derives its
-        # own request id from the explicit season/episode fields, so an
-        # untrusted human label cannot create a path outside the gap state.
-        if kind == "missing_media":
-            row["id"] = f"missing_media:{tmdb_id}"
-            row["label"] = label
-            return row
-
-        season = raw_gap.get("season")
-        try:
-            season_number = SimpleEngineRunner._audit_positive_int(
-                season, field="season", allow_zero=True,
-            )
-        except EngineRequestError:
-            return None
-        if season_number > 999:
-            return None
-        row["season"] = season_number
-        if kind == "missing_episode":
-            try:
-                episode_number = SimpleEngineRunner._audit_positive_int(
-                    raw_gap.get("episode"), field="episode",
-                )
-            except EngineRequestError:
-                return None
-            if episode_number > 9999:
-                return None
-            row["episode"] = episode_number
-            row["id"] = f"missing_episode:{tmdb_id}:S{season_number:02d}E{episode_number:02d}"
-            row["label"] = f"{title} S{season_number:02d}E{episode_number:02d}"
-            episode_title = SimpleEngineRunner._audit_text(
-                raw_gap.get("title"), field="title",
-            )
-            if episode_title:
-                row["title"] = episode_title
-            raw_title_aliases = raw_gap.get("title_aliases")
-            if isinstance(raw_title_aliases, list):
-                title_aliases: list[str] = []
-                seen_titles = {episode_title.casefold()} if episode_title else set()
-                for raw_alias in raw_title_aliases:
-                    if not isinstance(raw_alias, str):
-                        continue
-                    alias = raw_alias.strip()
-                    if (
-                        not alias or "\x00" in alias or len(alias) > 512
-                        or alias.casefold() in seen_titles
-                    ):
-                        continue
-                    seen_titles.add(alias.casefold())
-                    title_aliases.append(alias)
-                    if len(title_aliases) >= 7:
-                        break
-                if title_aliases:
-                    row["title_aliases"] = title_aliases
-            raw_source_aliases = raw_gap.get("source_episode_aliases")
-            if isinstance(raw_source_aliases, list):
-                source_aliases: list[dict[str, object]] = []
-                for raw_alias in raw_source_aliases:
-                    if not isinstance(raw_alias, Mapping):
-                        continue
-                    source_season = raw_alias.get("season")
-                    source_episode = raw_alias.get("episode")
-                    if (
-                        isinstance(source_season, bool)
-                        or not isinstance(source_season, int)
-                        or source_season <= 0
-                        or source_season > 999
-                        or isinstance(source_episode, bool)
-                        or not isinstance(source_episode, int)
-                        or source_episode <= 0
-                        or source_episode > 9999
-                    ):
-                        continue
-                    raw_series_titles = raw_alias.get("series_titles")
-                    if not isinstance(raw_series_titles, list):
-                        continue
-                    series_titles: list[str] = []
-                    seen_series_titles: set[str] = set()
-                    for raw_series_title in raw_series_titles:
-                        if not isinstance(raw_series_title, str):
-                            continue
-                        series_title = raw_series_title.strip()
-                        if (
-                            not series_title or "\x00" in series_title
-                            or len(series_title) > 512
-                            or series_title.casefold() in seen_series_titles
-                        ):
-                            continue
-                        seen_series_titles.add(series_title.casefold())
-                        series_titles.append(series_title)
-                        if len(series_titles) >= 4:
-                            break
-                    if series_titles:
-                        source_aliases.append({
-                            "season": source_season,
-                            "episode": source_episode,
-                            "series_titles": series_titles,
-                        })
-                    if len(source_aliases) >= 8:
-                        break
-                if source_aliases:
-                    row["source_episode_aliases"] = source_aliases
-            return row
-
-        row["id"] = f"missing_season:{tmdb_id}:S{season_number:02d}"
-        row["label"] = f"{title} S{season_number:02d}"
-        expected_count = raw_gap.get("expected_episode_count")
-        if expected_count is not None:
-            try:
-                count = SimpleEngineRunner._audit_positive_int(
-                    expected_count, field="expected_episode_count",
-                )
-            except EngineRequestError:
-                return None
-            if count > 5000:
-                return None
-            row["expected_episode_count"] = count
-        season_name = SimpleEngineRunner._audit_text(raw_gap.get("season_name"), field="season_name")
-        if season_name:
-            row["season_name"] = season_name
-        return row
-
-    @staticmethod
-    def _audit_subtitle_mapping(
-        raw_gap: Mapping[str, object],
-        *,
-        tmdb_id: int,
-        target_root: str,
-        media_type: str,
-        title: str,
-        original_title: str,
-        year: str,
-        media_format: str,
-    ) -> dict[str, object] | None:
-        """Project one exact subtitle gap into the pure sidecar contract.
-
-        Subtitle-only roots are deliberately stricter than normal media
-        projects.  The row must identify one existing video below the already
-        validated work root and one non-empty language.  No season/episode
-        inference is performed here: the audited video path is the only
-        pairing coordinate consumed by the provider lane.
-        """
-        kind = str(raw_gap.get("kind") or "").strip().casefold()
-        if kind not in _AUDIT_SUBTITLE_GAP_KINDS:
-            return None
-        raw_media = raw_gap.get("media")
-        media = raw_media if isinstance(raw_media, Mapping) else raw_gap
-        raw_tmdb = media.get("tmdb_id")
-        if isinstance(raw_tmdb, str) and raw_tmdb.isdigit():
-            raw_tmdb = int(raw_tmdb)
-        if raw_tmdb != tmdb_id:
-            return None
-        raw_target = media.get("target_root")
-        if not isinstance(raw_target, str):
-            raw_target = raw_gap.get("target_root")
-        try:
-            if _safe_remote_path(raw_target, field="audit subtitle target_root", allow_root=False) != target_root:
-                return None
-        except EngineRequestError:
-            return None
-        expected_type = "tv" if media_type == "mixed" else media_type
-        if expected_type not in {"movie", "tv"}:
-            return None
-        row_type = str(media.get("media_type") or media.get("type") or "").strip().casefold()
-        if row_type not in {expected_type, "mixed" if expected_type == "tv" else expected_type}:
-            return None
-
-        label = SimpleEngineRunner._audit_text(
-            raw_gap.get("label"), field="subtitle label", required=True,
-        )
-        reason = SimpleEngineRunner._audit_text(raw_gap.get("reason"), field="reason")
-        gap_id = SimpleEngineRunner._audit_text(
-            raw_gap.get("id"), field="subtitle gap id", required=True,
-        )
-        # Gap ids become local filenames.  Reject path/control characters
-        # rather than allowing a crafted report to escape the gap directory.
-        if any(char in gap_id for char in ("/", "\\", "\x00", "\n", "\r")):
-            return None
-        raw_path = raw_gap.get("path")
-        if not isinstance(raw_path, str):
-            return None
-        try:
-            video_path = _safe_remote_path(
-                raw_path, field="audit subtitle video path", allow_root=False,
-            )
-        except EngineRequestError:
-            return None
-        if (
-            not video_path.startswith(target_root.rstrip("/") + "/")
-            or not is_video_filename(video_path)
-            or is_production_test_media_path(video_path)
-        ):
-            return None
-        raw_language = raw_gap.get("subtitle_language")
-        if not isinstance(raw_language, str):
-            return None
-        language = raw_language.strip()
-        if (
-            not language or len(language) > 64
-            or any(char in language for char in ("/", "\\", "\x00", "\n", "\r"))
-        ):
-            return None
-        return {
-            "id": gap_id,
-            "kind": "missing_subtitle",
-            "label": label,
-            "reason": reason,
-            "source": "automatic_library_audit",
-            "media": {
-                "tmdb_id": tmdb_id,
-                "title": title,
-                "original_title": original_title,
-                "year": year,
-                "target_root": target_root,
-                "media_type": expected_type,
-                **({"media_format": media_format} if media_format else {}),
-            },
-            "path": video_path,
-            "subtitle_language": language,
-        }
-
-    def _audit_project_payload(
-        self, project: Mapping[str, object],
-    ) -> tuple[str, str, int, str, dict[str, object], list[dict[str, object]]]:
-        """Validate and reduce one audit acquisition project.
-
-        Returns ``(work_key, target_root, tmdb_id, media_type, plan, gaps)``.
-        No planner/network call is made here; the resulting plan is consumed
-        only by ``AutomaticReplenishmentRuntime``.
-        """
-        if not isinstance(project, Mapping):
-            raise EngineRequestError("审计补源项目必须是对象")
-        raw_plan = project.get("plan")
-        if not isinstance(raw_plan, Mapping):
-            raise EngineRequestError("审计补源项目缺少 plan")
-        mode = str(raw_plan.get("mode") or project.get("media_type") or "").strip().casefold()
-        if mode not in {"movie", "tv"}:
-            raise EngineRequestError("审计补源项目媒体类型不受支持")
-        raw_project_id = project.get("tmdb_id")
-        raw_metadata = raw_plan.get("metadata")
-        metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
-        metadata_type = str(metadata.get("media_type") or metadata.get("type") or "").strip().casefold()
-        if metadata_type and metadata_type not in {mode, "mixed" if mode == "tv" else mode}:
-            raise EngineRequestError("审计项目 metadata 的媒体类型不一致")
-        raw_metadata_id = metadata.get("tmdb_id")
-        if raw_project_id != raw_metadata_id:
-            # Accept the common string JSON form only after an exact positive
-            # conversion; never guess an identity from a title.
-            if not (
-                isinstance(raw_project_id, str) and raw_project_id.isdigit()
-                and isinstance(raw_metadata_id, str) and raw_metadata_id.isdigit()
-                and int(raw_project_id) == int(raw_metadata_id)
-            ):
-                raise EngineRequestError("审计项目的 TMDB 身份字段不一致")
-        try:
-            tmdb_id = self._audit_positive_int(
-                int(raw_project_id) if isinstance(raw_project_id, str) else raw_project_id,
-                field="tmdb_id",
-            )
-        except (TypeError, ValueError) as exc:
-            raise EngineRequestError("审计项目 tmdb_id 必须是正整数") from exc
-        project_target = project.get("target_root")
-        plan_target = raw_plan.get("target_root")
-        if not isinstance(project_target, str) or not isinstance(plan_target, str):
-            raise EngineRequestError("审计项目缺少 target_root")
-        target_root = self._audit_target_root(project_target)
-        if self._audit_target_root(plan_target) != target_root:
-            raise EngineRequestError("审计项目的 target_root 字段不一致")
-        metadata_target = metadata.get("target_root") or metadata.get("series_root")
-        if metadata_target is not None and self._audit_target_root(metadata_target) != target_root:
-            raise EngineRequestError("审计项目 metadata 的 target_root 字段不一致")
-        title = self._audit_text(
-            metadata.get("title") or metadata.get("name") or metadata.get("original_title"),
-            field="title", required=True,
-        )
-        original_title = self._audit_text(metadata.get("original_title"), field="original_title")
-        year = self._audit_text(metadata.get("year"), field="year")
-        media_format = self._audit_text(
-            metadata.get("media_format") or metadata.get("format"),
-            field="media_format",
-        )
-        raw_gaps = (
-            raw_plan.get("scan_report", {}).get("resource_gaps")
-            if isinstance(raw_plan.get("scan_report"), Mapping) else None
-        )
-        if not isinstance(raw_gaps, list):
-            raw_gaps = project.get("gaps")
-        if not isinstance(raw_gaps, list):
-            raise EngineRequestError("审计项目缺少 resource_gaps")
-        gaps: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for raw_gap in raw_gaps:
-            if not isinstance(raw_gap, Mapping):
-                continue
-            projected = self._audit_media_mapping(
-                raw_gap,
-                tmdb_id=tmdb_id,
-                target_root=target_root,
-                media_type=mode,
-                title=title,
-                original_title=original_title,
-                year=year,
-                media_format=media_format,
-            )
-            if projected is None:
-                continue
-            identity = str(projected["id"])
-            if identity in seen:
-                continue
-            seen.add(identity)
-            gaps.append(projected)
-        if not gaps:
-            raise EngineRequestError("审计项目没有可安全补源的媒体缺口")
-        metadata_body: dict[str, object] = {
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "original_title": original_title or title,
-            "year": year,
-            "media_type": mode,
-            "target_root": target_root,
-            "series_root": target_root,
-            **({"media_format": media_format} if media_format else {}),
-        }
-        aliases = metadata.get("aliases")
-        if isinstance(aliases, list):
-            safe_aliases = [
-                value.strip() for value in aliases
-                if isinstance(value, str) and value.strip() and len(value.strip()) <= 256
-            ][:16]
-            if safe_aliases:
-                metadata_body["aliases"] = safe_aliases
-        plan = {
-            "mode": mode,
-            "target_root": target_root,
-            "metadata": metadata_body,
-            "scan_report": {"resource_gaps": gaps},
-        }
-        work_key = f"tmdb:{mode}:{tmdb_id}:{target_root}"
-        return work_key, target_root, tmdb_id, mode, plan, gaps
-
-    def _audit_subtitle_project_payload(
-        self, project: Mapping[str, object],
-    ) -> tuple[str, str, int, str, dict[str, object], list[dict[str, object]]]:
-        """Validate a project that contains *only* subtitle sidecar gaps.
-
-        This contract is intentionally separate from ``_audit_project_payload``
-        so a subtitle observation can never silently become a missing-media
-        project when a report is malformed or a caller supplies a broad
-        target.  The returned plan is consumed by the pure subtitle lane and
-        has no media child inputs.
-        """
-        if not isinstance(project, Mapping) or project.get("subtitle_only") is not True:
-            raise EngineRequestError("字幕-only 审计项目必须显式声明 subtitle_only")
-        raw_plan = project.get("plan")
-        if not isinstance(raw_plan, Mapping):
-            raise EngineRequestError("字幕-only 审计项目缺少 plan")
-        mode = str(raw_plan.get("mode") or project.get("media_type") or "").strip().casefold()
-        if mode not in {"movie", "tv"}:
-            raise EngineRequestError("字幕-only 审计项目媒体类型不受支持")
-        raw_project_id = project.get("tmdb_id")
-        metadata = raw_plan.get("metadata") if isinstance(raw_plan.get("metadata"), Mapping) else {}
-        metadata_type = str(metadata.get("media_type") or metadata.get("type") or "").strip().casefold()
-        if metadata_type and metadata_type not in {mode, "mixed" if mode == "tv" else mode}:
-            raise EngineRequestError("字幕-only 项目 metadata 的媒体类型不一致")
-        raw_metadata_id = metadata.get("tmdb_id")
-        if raw_project_id != raw_metadata_id:
-            if not (
-                isinstance(raw_project_id, str) and raw_project_id.isdigit()
-                and isinstance(raw_metadata_id, str) and raw_metadata_id.isdigit()
-                and int(raw_project_id) == int(raw_metadata_id)
-            ):
-                raise EngineRequestError("字幕-only 项目的 TMDB 身份字段不一致")
-        try:
-            tmdb_id = self._audit_positive_int(
-                int(raw_project_id) if isinstance(raw_project_id, str) else raw_project_id,
-                field="tmdb_id",
-            )
-        except (TypeError, ValueError) as exc:
-            raise EngineRequestError("字幕-only 项目 tmdb_id 必须是正整数") from exc
-        project_target = project.get("target_root")
-        plan_target = raw_plan.get("target_root")
-        if not isinstance(project_target, str) or not isinstance(plan_target, str):
-            raise EngineRequestError("字幕-only 项目缺少 target_root")
-        target_root = self._audit_target_root(project_target)
-        if self._audit_target_root(plan_target) != target_root:
-            raise EngineRequestError("字幕-only 项目的 target_root 字段不一致")
-        metadata_target = metadata.get("target_root") or metadata.get("series_root")
-        if metadata_target is not None and self._audit_target_root(metadata_target) != target_root:
-            raise EngineRequestError("字幕-only 项目 metadata 的 target_root 字段不一致")
-        title = self._audit_text(
-            metadata.get("title") or metadata.get("name") or metadata.get("original_title"),
-            field="title", required=True,
-        )
-        original_title = self._audit_text(metadata.get("original_title"), field="original_title")
-        year = self._audit_text(metadata.get("year"), field="year")
-        media_format = self._audit_text(
-            metadata.get("media_format") or metadata.get("format"),
-            field="media_format",
-        )
-        raw_gaps = (
-            raw_plan.get("scan_report", {}).get("resource_gaps")
-            if isinstance(raw_plan.get("scan_report"), Mapping) else None
-        )
-        if not isinstance(raw_gaps, list):
-            raw_gaps = project.get("gaps")
-        if not isinstance(raw_gaps, list):
-            raise EngineRequestError("字幕-only 项目缺少 resource_gaps")
-        gaps: list[dict[str, object]] = []
-        seen_ids: set[str] = set()
-        seen_coordinates: set[tuple[str, str]] = set()
-        for raw_gap in raw_gaps:
-            if not isinstance(raw_gap, Mapping):
-                continue
-            projected = self._audit_subtitle_mapping(
-                raw_gap,
-                tmdb_id=tmdb_id,
-                target_root=target_root,
-                media_type=mode,
-                title=title,
-                original_title=original_title,
-                year=year,
-                media_format=media_format,
-            )
-            if projected is None:
-                continue
-            gap_id = str(projected["id"])
-            coordinate = (str(projected["path"]), str(projected["subtitle_language"]).casefold())
-            # A duplicate id with a different exact video/language coordinate
-            # is ambiguous; fail closed rather than letting one state file
-            # claim two sidecars.
-            if gap_id in seen_ids:
-                if coordinate not in seen_coordinates:
-                    raise EngineRequestError("字幕-only 项目包含重复 gap id")
-                continue
-            if coordinate in seen_coordinates:
-                continue
-            seen_ids.add(gap_id)
-            seen_coordinates.add(coordinate)
-            gaps.append(projected)
-        if not gaps:
-            raise EngineRequestError("字幕-only 审计项目没有可安全补源的字幕缺口")
-        metadata_body: dict[str, object] = {
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "original_title": original_title or title,
-            "year": year,
-            "media_type": mode,
-            "target_root": target_root,
-            "series_root": target_root,
-            "subtitle_only": True,
-            **({"media_format": media_format} if media_format else {}),
-        }
-        aliases = metadata.get("aliases")
-        if isinstance(aliases, list):
-            safe_aliases = [
-                value.strip() for value in aliases
-                if isinstance(value, str) and value.strip() and len(value.strip()) <= 256
-            ][:16]
-            if safe_aliases:
-                metadata_body["aliases"] = safe_aliases
-        plan = {
-            "mode": mode,
-            "target_root": target_root,
-            "source_root": target_root,
-            "metadata": metadata_body,
-            "scan_report": {"resource_gaps": gaps},
-        }
-        work_key = f"tmdb:{mode}:{tmdb_id}:{target_root}:subtitle"
-        return work_key, target_root, tmdb_id, mode, plan, gaps
-
-    @staticmethod
-    def _job_work_coordinates(job: EngineJob) -> tuple[int | None, str | None, str | None]:
-        summary = job.summary if isinstance(job.summary, Mapping) else {}
-        identity = summary.get("identity") if isinstance(summary.get("identity"), Mapping) else {}
-        metadata = job.plan.get("metadata") if isinstance(job.plan.get("metadata"), Mapping) else {}
-        raw_id = identity.get("tmdb_id") or metadata.get("tmdb_id") or summary.get("tmdb_id")
-        if isinstance(raw_id, str) and raw_id.isdigit():
-            raw_id = int(raw_id)
-        tmdb_id = raw_id if type(raw_id) is int and raw_id > 0 else None
-        raw_target = (
-            identity.get("target_root") or metadata.get("series_root")
-            or metadata.get("target_root") or job.plan.get("target_root")
-            or summary.get("target_root")
-        )
-        target = raw_target if isinstance(raw_target, str) and raw_target.startswith("/") else None
-        media_type = str(identity.get("media_type") or metadata.get("media_type")
-                         or job.plan.get("mode") or summary.get("mode") or "").casefold()
-        return tmdb_id, target, media_type
-
-    def create_audit_owned_root(self, project: Mapping[str, object]) -> EngineJob:
-        """Ensure one hidden implementation root for an audited media gap.
-
-        The returned root is intentionally persisted as ``executed`` without
-        an execution record: the audit observed the existing target and no
-        formal media move occurred.  Only the provider worker may act on its
-        validated ``resource_gaps`` by creating a separate internal child.
-        Calling this method is local-state-only and never invokes AList, TMDB,
-        a planner, or an executor.
-        """
-        work_key, target_root, tmdb_id, media_type, plan, gaps = self._audit_project_payload(project)
-        parent_path = posixpath.dirname(target_root) or "/"
-        season_values = {
-            int(row["season"])
-            for row in gaps
-            if isinstance(row.get("season"), int)
-        }
-        season = next(iter(season_values)) if len(season_values) == 1 else 1
-        request = asdict(EngineRequest.from_mapping({
-            # This is an observed formal target used only as a placeholder;
-            # the provider worker replaces it with task-owned staging before
-            # any Engine child is planned.
-            "source_path": target_root,
-            "parent_path": parent_path,
-            "media_type": media_type,
-            "tmdb_id": tmdb_id,
-            "query": plan["metadata"]["title"],
-            "season": season,
-            "auto_episode_mode": True,
-            "prefer_simplified": True,
-        }))
-        now = _now()
-        identity = {
-            "media_type": media_type,
-            "tmdb_id": tmdb_id,
-            "title": plan["metadata"]["title"],
-            "year": plan["metadata"].get("year") or "",
-            "target_parent": parent_path,
-            "target_root": target_root,
-            "season": season if media_type == "tv" else None,
-            "trace": {"source": "library_audit", "work_key": work_key},
-        }
-        base_summary: dict[str, object] = {
-            "automatic": True,
-            "audit_owned": True,
-            "audit_work_key": work_key,
-            "audit_origin": "library_audit",
-            "source_root": "全库审计",
-            "target_root": target_root,
-            "mode": media_type,
-            "title": plan["metadata"]["title"],
-            "tmdb_id": tmdb_id,
-            "file_count": 0,
-            "cleanup_count": 0,
-            "problem_count": 0,
-            "warning_count": 0,
-            "identity": identity,
-            "resource_gaps": gaps,
-            "last_audit_at": now,
-            "automatic_attempts": 0,
-            "automatic_terminal": False,
-            "next_retry_seconds": None,
-        }
-        with self.worker_lock():
-            existing_audit: EngineJob | None = None
-            existing_work: EngineJob | None = None
-            for candidate in self.list_jobs():
-                if self._is_internal_job(candidate):
-                    continue
-                candidate_id, candidate_target, candidate_type = self._job_work_coordinates(candidate)
-                if candidate_id != tmdb_id or candidate_target != target_root:
-                    continue
-                if candidate_type not in {media_type, "mixed"}:
-                    continue
-                if candidate.summary.get("audit_owned") is True:
-                    existing_audit = candidate
-                    break
-                if candidate.phase in {"executed", "completed"}:
-                    existing_work = candidate
-            if existing_work is not None and existing_audit is None:
-                # A historical completed root already owns this work.  Do not
-                # manufacture a second root merely because its old plan was
-                # not present in the current process snapshot.
-                return existing_work
-            if existing_audit is not None:
-                summary = dict(existing_audit.summary)
-                summary.update(base_summary)
-                # Preserve provider attempt/child lineage while replacing the
-                # audit's fresh gap observation.
-                for key in ("replenishment", "replenishment_attempts"):
-                    if key in existing_audit.summary:
-                        summary[key] = existing_audit.summary[key]
-                updated = replace(
-                    existing_audit,
-                    phase="executed",
-                    updated_at=now,
-                    request=request,
-                    plan=plan,
-                    summary=summary,
-                    error=None,
-                )
-                if updated.as_dict() != existing_audit.as_dict():
-                    atomic_write_json(
-                        self._job_path(existing_audit.id), updated.as_dict(), allow_nan=False,
-                    )
-                return updated
-            identifier = f"audit-{uuid.uuid4().hex}"
-            job = EngineJob(
-                id=identifier,
-                phase="executed",
-                created_at=now,
-                updated_at=now,
-                request=request,
-                plan=plan,
-                summary=base_summary,
-                execution=None,
-                error=None,
-            )
-            atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
-            return job
-
-    def create_audit_owned_subtitle_root(self, project: Mapping[str, object]) -> EngineJob:
-        """Persist one local, subtitle-only audit owner.
-
-        This method never invokes the planner, Engine executor, AList, or a
-        metadata/artwork writer.  Its plan contains only exact subtitle gaps;
-        ``AutomaticReplenishmentRuntime`` therefore enters its pure sidecar
-        lane and cannot create a media child from this owner.
-        """
-        work_key, target_root, tmdb_id, media_type, plan, gaps = (
-            self._audit_subtitle_project_payload(project)
-        )
-        parent_path = posixpath.dirname(target_root) or "/"
-        season_values = {
-            int(row.get("season")) for row in gaps
-            if isinstance(row.get("season"), int) and 0 <= int(row.get("season")) <= 999
-        }
-        season = next(iter(season_values)) if len(season_values) == 1 else 1
-        request = asdict(EngineRequest.from_mapping({
-            # This is a validated formal target placeholder.  Pure subtitle
-            # acquisition never executes this request as a media plan.
-            "source_path": target_root,
-            "parent_path": parent_path,
-            "media_type": media_type,
-            "tmdb_id": tmdb_id,
-            "query": plan["metadata"]["title"],
-            "season": season,
-            "auto_episode_mode": True,
-            "prefer_simplified": True,
-        }))
-        languages = {str(row.get("subtitle_language") or "").casefold() for row in gaps}
-        now = _now()
-        identity = {
-            "media_type": media_type,
-            "tmdb_id": tmdb_id,
-            "title": plan["metadata"]["title"],
-            "year": plan["metadata"].get("year") or "",
-            "target_parent": parent_path,
-            "target_root": target_root,
-            "season": season if media_type == "tv" else None,
-            "trace": {"source": "library_audit", "work_key": work_key},
-        }
-        base_summary: dict[str, object] = {
-            "automatic": True,
-            "audit_owned": True,
-            "audit_subtitle_only": True,
-            "subtitle_only": True,
-            "audit_work_key": work_key,
-            "audit_origin": "library_audit",
-            "source_root": "全库审计",
-            "target_root": target_root,
-            "mode": media_type,
-            "title": plan["metadata"]["title"],
-            "tmdb_id": tmdb_id,
-            "file_count": 0,
-            "cleanup_count": 0,
-            "problem_count": 0,
-            "warning_count": 0,
-            "identity": identity,
-            "resource_gaps": gaps,
-            "last_audit_at": now,
-            "automatic_attempts": 0,
-            "automatic_terminal": False,
-            "next_retry_seconds": None,
-            **({"audit_subtitle_language": next(iter(languages))} if len(languages) == 1 else {}),
-        }
-        with self.worker_lock():
-            existing: EngineJob | None = None
-            for candidate in self.list_jobs():
-                if self._is_internal_job(candidate):
-                    continue
-                summary = candidate.summary if isinstance(candidate.summary, Mapping) else {}
-                if (
-                    summary.get("audit_subtitle_only") is True
-                    and summary.get("audit_work_key") == work_key
-                ):
-                    existing = candidate
-                    break
-            if existing is not None:
-                summary = dict(existing.summary)
-                summary.update(base_summary)
-                # Preserve provider attempt/child lineage while replacing the
-                # fresh audit observation.  Never resurrect a media child.
-                for key in ("replenishment", "replenishment_attempts"):
-                    if key in existing.summary:
-                        summary[key] = existing.summary[key]
-                candidate = replace(
-                    existing,
-                    phase="executed",
-                    request=request,
-                    plan=plan,
-                    summary=summary,
-                    error=None,
-                    # Keep identical scans idempotent at the durable-record
-                    # level; a changed gap set receives a fresh timestamp.
-                    updated_at=existing.updated_at,
-                )
-                if candidate.as_dict() != existing.as_dict():
-                    candidate = replace(candidate, updated_at=now)
-                    atomic_write_json(
-                        self._job_path(existing.id), candidate.as_dict(), allow_nan=False,
-                    )
-                return candidate
-            identifier = f"audit-{uuid.uuid4().hex}"
-            job = EngineJob(
-                id=identifier,
-                phase="executed",
-                created_at=now,
-                updated_at=now,
-                request=request,
-                plan=plan,
-                summary=base_summary,
-                execution=None,
-                error=None,
-            )
-            atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
-            return job
-
     @staticmethod
     def _is_internal_job(job: EngineJob) -> bool:
         return isinstance(job.summary, Mapping) and job.summary.get("internal_child") is True
@@ -4013,82 +2962,26 @@ class SimpleEngineRunner:
             and candidate.summary.get("root_job_id") == root.id
         ]
 
-    def _pending_replenishment_reaudit_states(self, job_id: str) -> list[str]:
-        """Return task-state markers that still own provider staging.
-
-        The finalizer cannot remove a provider attempt itself: it lacks the
-        selected-gap/audit evidence and must not turn into a second Provider
-        coordinator.  It can, however, refuse to consume the ordinary root's
-        source or erase local JSON while that evidence is still pending.
-        """
-        safe_id = _safe_job_id(job_id)
-        state_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", safe_id).strip(".-")[:96] or "job"
-        directory = self.state_root / "gaps" / state_id
-        if not directory.exists():
-            return []
-        if directory.is_symlink() or not directory.is_dir():
-            return ["gap-state-directory-invalid"]
-        pending: list[str] = []
-        try:
-            paths = sorted(path for path in directory.glob("*.json") if path.is_file())
-        except OSError:
-            return ["gap-state-directory-unreadable"]
-        for path in paths:
-            if path.is_symlink():
-                pending.append(path.name)
-                continue
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                # A damaged task-state record could be the only durable
-                # indication of a held staging attempt.  Failing closed is
-                # preferable to erasing it along with the root record.
-                pending.append(path.name)
-                continue
-            if not isinstance(raw, Mapping):
-                pending.append(path.name)
-                continue
-            if _POST_ACQUISITION_REAUDIT_KEY not in raw:
-                continue
-            marker = raw.get(_POST_ACQUISITION_REAUDIT_KEY)
-            if (
-                not isinstance(marker, Mapping)
-                or str(marker.get("status") or "").casefold() != "cleaned"
-            ):
-                pending.append(path.name)
-        return pending
-
-    def has_pending_replenishment_reaudit(self, job_id: str) -> bool:
-        """Publicly expose the finalizer's narrow provider-staging fence."""
-        return bool(self._pending_replenishment_reaudit_states(job_id))
-
     def _validate_cleanup_root(self, root: EngineJob) -> list[EngineJob]:
         """Return terminal children after proving the root is safe to forget."""
         if self._is_internal_job(root):
             raise EngineExecutionError("只允许清理根任务，内部 child 不能单独清理")
         if root.phase not in _CLEANUP_TERMINAL_PHASES:
             raise EngineWorkerBusyError(f"任务仍在运行，不能清理记录: {root.phase}")
+        # A historical Engine record may still say ``completed`` even though
+        # its RootJob J ledger contains open coordinates.  Never let local
+        # cleanup erase that durable replenishment evidence before N closes
+        # every Gap; public projections also expose this as gaps_pending.
+        if root.phase == "completed":
+            open_gaps = [
+                gap for gap in load_gap_ledger(self.state_root, root.id)
+                if gap.status == "open"
+            ]
+            if open_gaps:
+                raise EngineWorkerBusyError(
+                    f"根任务仍有 {len(open_gaps)} 个开放缺口，不能清理记录"
+                )
         summary = root.summary if isinstance(root.summary, Mapping) else {}
-        if summary.get("automatic") is True and root.phase in {
-            "executed", "completed", "failed_cleanup",
-        }:
-            lifecycle = summary.get("lifecycle")
-            cleanup = lifecycle.get("cleanup") if isinstance(lifecycle, Mapping) else None
-            if lifecycle is not None and (
-                not isinstance(cleanup, Mapping)
-                or cleanup.get("status") != "completed"
-            ):
-                raise EngineWorkerBusyError("任务最终 source/staging 清理尚未完成，不能删除记录")
-        if (
-            root.phase in {"failed", "failed_provider"}
-            and summary.get("automatic") is True
-            and summary.get("automatic_terminal") is not True
-        ):
-            raise EngineWorkerBusyError("任务仍会自动重试，不能清理记录")
-        if self._pending_replenishment_reaudit_states(root.id):
-            raise EngineWorkerBusyError(
-                "任务仍有待定向重审/清理的补源 staging，不能删除记录"
-            )
         replenishment = summary.get("replenishment")
         if isinstance(replenishment, Mapping):
             status = str(replenishment.get("status") or "").casefold()
@@ -4098,14 +2991,6 @@ class SimpleEngineRunner:
                 and status not in {"completed", "resolved", "ready"}
             ):
                 raise EngineWorkerBusyError("任务仍有未终结的补源工作，不能清理记录")
-        audit = summary.get("audit")
-        if isinstance(audit, Mapping):
-            audit_status = str(audit.get("status") or "").casefold()
-            if (
-                audit_status in _CLEANUP_RETRYABLE_AUDIT_STATUSES
-                and audit.get("retryable") is not False
-            ):
-                raise EngineWorkerBusyError("任务仍有可重试审计工作，不能清理记录")
         children = self._owned_children(root)
         for child in children:
             if child.phase not in _CLEANUP_TERMINAL_PHASES:
@@ -4249,26 +3134,35 @@ class SimpleEngineRunner:
         *,
         target_root: str,
         stage: str,
+        allow_target_root: bool = False,
     ) -> None:
-        """Keep every formal target inside one confirmed first-level shelf.
+        """Keep every formal target inside one approved target subtree.
 
-        The planner normally receives the selected root as its parent, but a
-        persisted plan or an injected planner is still untrusted at the
-        single-writer boundary. Validate the concrete work root and every
-        target file before the plan can be stored or replayed.
+        ``target_root`` is normally the selected first-level shelf, but the
+        same primitive also gates a nested WorkUnit or a D-locked existing
+        work root.  A persisted plan or an injected planner is still
+        untrusted at the single-writer boundary, so validate the concrete work
+        root and every target file before the plan can be stored or replayed.
         """
-        shelf_root = _safe_remote_path(
+        allowed_root = _safe_remote_path(
             target_root,
-            field=f"{stage} target_shelf_root",
+            field=f"{stage} target_scope_root",
             allow_root=False,
         )
-        prefix = shelf_root + "/"
+        prefix = allowed_root + "/"
 
-        def require_within(value: object, *, field: str) -> str:
+        def require_within(
+            value: object,
+            *,
+            field: str,
+            allow_exact_root: bool = False,
+        ) -> str:
             path = _safe_remote_path(value, field=f"{stage} {field}", allow_root=False)
+            if path == allowed_root and allow_exact_root:
+                return path
             if not path.startswith(prefix):
                 raise EngineRequestError(
-                    f"{stage}拒绝目标货架外的路径: {path}"
+                    f"{stage}拒绝目标货架外或允许目标范围外的路径: {path}"
                 )
             return path
 
@@ -4284,12 +3178,44 @@ class SimpleEngineRunner:
                 raise EngineRequestError(f"{stage} {field} 必须是安全文件名")
             return value
 
-        require_within(getattr(plan, "target_root", None), field="target_work_path")
+        require_within(
+            getattr(plan, "target_root", None),
+            field="target_work_path",
+            allow_exact_root=allow_target_root,
+        )
         metadata = getattr(plan, "metadata", None)
         if isinstance(metadata, Mapping):
             series_root = metadata.get("series_root")
             if series_root is not None:
-                require_within(series_root, field="metadata.series_root")
+                require_within(
+                    series_root,
+                    field="metadata.series_root",
+                    allow_exact_root=allow_target_root,
+                )
+            container_root = metadata.get("container_root")
+            if container_root is not None:
+                container_path = require_within(
+                    container_root,
+                    field="metadata.container_root",
+                    allow_exact_root=allow_target_root,
+                )
+                plan_root = _safe_remote_path(
+                    getattr(plan, "target_root", None),
+                    field=f"{stage} target_work_path",
+                    allow_root=False,
+                )
+                if not (
+                    container_path == plan_root
+                    or container_path.startswith(plan_root + "/")
+                ):
+                    raise EngineRequestError(
+                        f"{stage}容器元数据根目录必须属于计划目标根: {container_path}"
+                    )
+                container_title = metadata.get("container_title")
+                if not isinstance(container_title, str) or not container_title.strip():
+                    raise EngineRequestError(
+                        f"{stage}容器元数据缺少有效 container_title"
+                    )
         for index, item in enumerate(list(getattr(plan, "files", ()) or ())):
             source_path = _safe_remote_path(
                 getattr(item, "source_path", None),
@@ -4312,6 +3238,10 @@ class SimpleEngineRunner:
             target_dir = require_within(
                 getattr(item, "target_dir", None),
                 field=f"files[{index}].target_dir",
+                # A merge plan writes new season files directly into its
+                # D-locked work root.  The filenames themselves remain strict
+                # descendants and are checked below.
+                allow_exact_root=allow_target_root,
             )
             final_name = require_basename(
                 getattr(item, "final_name", None),
@@ -4353,6 +3283,79 @@ class SimpleEngineRunner:
         except Exception as exc:
             raise EngineRequestError(f"{stage}无法验证元数据/艺术图目标: {exc}") from exc
 
+    def _require_plan_work_unit_target_scope(
+        self,
+        plan: object,
+        request: EngineRequest,
+        *,
+        stage: str,
+    ) -> None:
+        """Gate a WorkUnit plan to its durable, internal target subtree.
+
+        RootJob shelf selection is an authorization for *new* work, while a
+        D result may instead lock a sibling under an existing work root on a
+        different shelf.  ``target_scope_root`` records that exact authorized
+        subtree in the internal carrier so plan, execute, and restart recovery
+        share one containment rule.
+        """
+        raw_scope = request.target_scope_root
+        if raw_scope is None:
+            return
+        scope = _safe_remote_path(
+            raw_scope,
+            field=f"{stage} WorkUnit target_scope_root",
+            allow_root=False,
+        )
+        parent = _safe_remote_path(
+            request.parent_path,
+            field=f"{stage} WorkUnit parent_path",
+            allow_root=False,
+        )
+        if not (scope == parent or scope.startswith(parent + "/")):
+            raise EngineRequestError(
+                f"{stage} WorkUnit 目标范围不属于 Planner 父目录"
+            )
+        formal_shelves = tuple(
+            target_root_for_shelf(self.library_root, shelf)
+            for shelf in ("movie", "anime", "us_tv")
+        )
+        scope_shelf = next(
+            (
+                shelf
+                for shelf in formal_shelves
+                if scope == shelf or scope.startswith(shelf + "/")
+            ),
+            None,
+        )
+        if scope_shelf is None:
+            raise EngineRequestError(
+                f"{stage} WorkUnit 目标范围不在正式库货架内"
+            )
+        self._require_plan_target_shelf_containment(
+            plan,
+            target_root=scope,
+            stage=stage,
+            # Only E3 supplies a narrower D-locked work root below both its
+            # planner parent and its formal shelf and may therefore plan *at*
+            # that root. A malformed D record must never turn a whole shelf
+            # into an exact-target allowance. A normal new WorkUnit has
+            # scope == parent (shelf/container/main root) and must still
+            # create a distinct work child. File/artifact paths remain strict
+            # descendants in both cases.
+            allow_target_root=(scope != parent and scope != scope_shelf),
+        )
+
+    def _require_persisted_plan_work_unit_target_scope(
+        self,
+        job: EngineJob,
+        plan: object,
+        *,
+        stage: str,
+    ) -> None:
+        """Reapply a persisted WorkUnit target boundary before any replay."""
+        request = EngineRequest.from_persisted_mapping(job.request)
+        self._require_plan_work_unit_target_scope(plan, request, stage=stage)
+
     def _require_persisted_target_shelf_containment(
         self,
         job: EngineJob,
@@ -4368,40 +3371,8 @@ class SimpleEngineRunner:
         complete user selection.
         """
         if job.target_shelf is None and job.target_root is None and job.selected_at is None:
-            reconciliation = job.summary.get("reconciliation")
-            if (
-                isinstance(reconciliation, Mapping)
-                and reconciliation.get("outcome") == "merge_existing"
-            ):
-                identity, _selected_shelf, expected_root, work_root = (
-                    self._merge_existing_context(job.summary)
-                )
-                self._require_plan_target_shelf_containment(
-                    plan,
-                    target_root=expected_root,
-                    stage=stage,
-                )
-                self._require_merge_existing_plan_target(
-                    plan,
-                    identity=identity,
-                    work_root=work_root,
-                    stage=stage,
-                )
-                return
-            if (
-                isinstance(reconciliation, Mapping)
-                and reconciliation.get("outcome") == "new_work"
-                and not isinstance(job.summary.get("manual_identity"), Mapping)
-            ):
-                identity = self._reconciled_identity(reconciliation.get("identity"))
-                self._require_reconciled_plan_identity(
-                    plan,
-                    identity=identity,
-                    stage=stage,
-                )
             if (
                 job.summary.get("automatic") is True
-                and job.summary.get("audit_owned") is not True
                 and job.summary.get("internal_child") is not True
             ):
                 raise EngineRequestError("自动任务尚未选择目标货架，不能进入正式处理")
@@ -4412,17 +3383,6 @@ class SimpleEngineRunner:
             target_root=expected_root,
             stage=stage,
         )
-        reconciliation = job.summary.get("reconciliation")
-        if (
-            isinstance(reconciliation, Mapping)
-            and reconciliation.get("outcome") == "new_work"
-            and not isinstance(job.summary.get("manual_identity"), Mapping)
-        ):
-            self._require_reconciled_plan_identity(
-                plan,
-                identity=self._reconciled_identity(reconciliation.get("identity")),
-                stage=stage,
-            )
 
     def _archive_task_roots(self, job_id: str) -> tuple[Path, str]:
         """Return deterministic local/remote task-owned archive roots.
@@ -4757,8 +3717,143 @@ class SimpleEngineRunner:
         })
         return request, identity
 
+    def _validated_source_scope_paths(self, request: EngineRequest) -> tuple[str, ...]:
+        """Validate the internal-only exact source ownership boundary."""
+        if not request.source_scope_paths:
+            if request.source_files is not None:
+                raise EngineRequestError("来源清单缺少对应的来源范围")
+            return ()
+        if request.source_files is None:
+            raise EngineRequestError("来源范围缺少 fresh 文件清单")
+        source_root = _safe_remote_path(
+            request.source_path, field="source_path", allow_root=False,
+        )
+        scopes: list[str] = []
+        for raw in request.source_scope_paths:
+            scope = _safe_remote_path(raw, field="source_scope_path", allow_root=False)
+            if not (scope == source_root or scope.startswith(source_root + "/")):
+                raise EngineRequestError("来源范围不属于 Engine 来源根")
+            if scope in scopes:
+                raise EngineRequestError("来源范围包含重复路径")
+            scopes.append(scope)
+        for index, left in enumerate(scopes):
+            for right in scopes[index + 1:]:
+                if left.startswith(right + "/") or right.startswith(left + "/"):
+                    raise EngineRequestError("来源范围不得互相嵌套")
+        return tuple(scopes)
+
+    @staticmethod
+    def _path_in_exactly_one_scope(path: str, scopes: tuple[str, ...]) -> bool:
+        matches = [
+            scope for scope in scopes
+            if path == scope or path.startswith(scope + "/")
+        ]
+        return len(matches) == 1
+
+    def _validated_scoped_source_files(
+        self,
+        request: EngineRequest,
+    ) -> tuple[tuple[str, ...], list[dict[str, object]]] | None:
+        """Validate the fresh manifest that a multi-path WorkUnit hands over."""
+        scopes = self._validated_source_scope_paths(request)
+        if not scopes:
+            return None
+        if request.media_type not in {"tv", "movie", "collection"}:
+            raise EngineRequestError(
+                "多来源范围仅支持已确认的 TV、电影或合集 WorkUnit"
+            )
+        files: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for raw in request.source_files or ():
+            if not isinstance(raw, Mapping):
+                raise EngineRequestError("来源范围清单包含无效条目")
+            item = dict(raw)
+            if item.get("is_dir") is True:
+                raise EngineRequestError("来源范围清单不得包含目录条目")
+            path = _safe_remote_path(
+                item.get("full_path"), field="来源范围文件路径", allow_root=False,
+            )
+            if not self._path_in_exactly_one_scope(path, scopes):
+                raise EngineRequestError("来源范围清单包含范围外文件")
+            if path in seen:
+                raise EngineRequestError("来源范围清单包含重复文件")
+            seen.add(path)
+            item["full_path"] = path
+            files.append(item)
+        return scopes, files
+
+    def _require_plan_source_scope_containment(
+        self,
+        plan: object,
+        request: EngineRequest,
+        *,
+        stage: str,
+    ) -> None:
+        """Require every plan source reference to stay inside its WorkUnit."""
+        scoped = self._validated_scoped_source_files(request)
+        if scoped is None:
+            return
+        scopes, _files = scoped
+        plan_root = _safe_remote_path(
+            str(getattr(plan, "source_root", "")),
+            field=f"{stage} source_root",
+            allow_root=False,
+        )
+        if plan_root != request.source_path:
+            raise EngineRequestError(f"{stage} 的 source_root 未保持 WorkUnit 公共来源根")
+        for collection_name in ("files", "cleanup_files", "problem_files"):
+            for item in list(getattr(plan, collection_name, ()) or ()):
+                source = _safe_remote_path(
+                    str(getattr(item, "source_path", "")),
+                    field=f"{stage} {collection_name} source_path",
+                    allow_root=False,
+                )
+                if not self._path_in_exactly_one_scope(source, scopes):
+                    raise EngineRequestError(f"{stage} 计划包含范围外来源: {source}")
+                source_dir = getattr(item, "source_dir", None)
+                if source_dir is not None:
+                    directory = _safe_remote_path(
+                        str(source_dir),
+                        field=f"{stage} {collection_name} source_dir",
+                        allow_root=False,
+                    )
+                    if not self._path_in_exactly_one_scope(directory, scopes):
+                        raise EngineRequestError(f"{stage} 计划包含范围外来源目录: {directory}")
+
+    def _require_persisted_plan_source_scope(
+        self,
+        job: EngineJob,
+        plan: object,
+        *,
+        stage: str,
+    ) -> None:
+        request = EngineRequest.from_persisted_mapping(job.request)
+        self._require_episode_map_path(request, stage=stage)
+        self._require_plan_source_scope_containment(plan, request, stage=stage)
+
+    def _require_episode_map_path(
+        self,
+        request: EngineRequest,
+        *,
+        stage: str,
+    ) -> None:
+        """Keep an internal episode-map replay file inside this state root."""
+        raw = request.episode_map_path
+        if raw is None:
+            return
+        try:
+            state_root = self.state_root.resolve()
+            candidate = Path(raw).resolve(strict=False)
+            candidate.relative_to(state_root)
+        except (OSError, ValueError) as exc:
+            raise EngineRequestError(
+                f"{stage} episode_map_path 不属于当前 state_root"
+            ) from exc
+
     def _build_plan(self, request: EngineRequest) -> object:
         self._ensure_authenticated(self.alist)
+        scoped = self._validated_scoped_source_files(request)
+        source_files = scoped[1] if scoped is not None else None
         if self.planner is not None:
             plan = self.planner(request, self.alist, self.tmdb)
             if isinstance(plan, Mapping):
@@ -4791,27 +3886,36 @@ class SimpleEngineRunner:
                     parent_path=current.parent_path,
                     tmdb_id=int(current.tmdb_id),
                     ignore_orphan_temp=current.ignore_orphan_temp,
+                    source_files=source_files,
                 )
             elif current.media_type == "tv":
-                plan = engine.build_tv_plan_smart(
-                    auto_episode_mode=current.auto_episode_mode,
-                    alist=self.alist,
-                    tmdb_client=self.tmdb,
-                    src_path=current.source_path,
-                    parent_path=current.parent_path,
-                    tmdb_id=int(current.tmdb_id),
-                    season=current.season,
-                    absolute=current.absolute,
-                    prefer_simplified=current.prefer_simplified,
-                    allow_unmapped=current.allow_unmapped,
-                    ignore_orphan_temp=current.ignore_orphan_temp,
-                    episode_map_path=(
+                tv_kwargs: dict[str, object] = {
+                    "auto_episode_mode": current.auto_episode_mode,
+                    "alist": self.alist,
+                    "tmdb_client": self.tmdb,
+                    "src_path": current.source_path,
+                    "parent_path": current.parent_path,
+                    "tmdb_id": int(current.tmdb_id),
+                    "season": current.season,
+                    "absolute": current.absolute,
+                    "prefer_simplified": current.prefer_simplified,
+                    "allow_unmapped": current.allow_unmapped,
+                    "ignore_orphan_temp": current.ignore_orphan_temp,
+                    "episode_map_path": (
                         Path(current.episode_map_path)
                         if current.episode_map_path
                         else None
                     ),
-                    episode_group_id=current.episode_group_id,
-                    media_root=self.library_root,
+                    "episode_group_id": current.episode_group_id,
+                    "allow_release_dash_ordinal": current.allow_release_dash_ordinal,
+                    "media_root": self.library_root,
+                }
+                if source_files is not None:
+                    tv_kwargs["source_files"] = source_files
+                if current.source_declared_seasons:
+                    tv_kwargs["source_declared_seasons"] = current.source_declared_seasons
+                plan = engine.build_tv_plan_smart(
+                    **tv_kwargs,
                 )
             elif current.media_type == "collection":
                 if current.collection_map:
@@ -4846,7 +3950,8 @@ class SimpleEngineRunner:
             validate = getattr(engine, "validate_plan", None)
             if callable(validate):
                 try:
-                    validate(self.alist, plan, media_root=self.library_root)
+                    kwargs: dict[str, object] = {"media_root": self.library_root}
+                    validate(self.alist, plan, **kwargs)
                 except TypeError as exc:
                     # Injected/legacy Engine validators may still expose the
                     # old two-argument contract.  Only signature-level
@@ -4855,6 +3960,9 @@ class SimpleEngineRunner:
                     if "media_root" not in str(exc):
                         raise
                     validate(self.alist, plan)
+        self._require_plan_source_scope_containment(
+            plan, request, stage="计划生成",
+        )
         return plan
 
     @staticmethod
@@ -4915,7 +4023,15 @@ class SimpleEngineRunner:
             raise SimpleEngineError(f"Engine job 已存在: {job_id}")
         original_source = request.source_path
         archive_projection: Mapping[str, object] | None = None
-        if internal_child_of is None and not skip_archive_preprocessing:
+        # A grouped WorkUnit uses the RootJob ingress merely as a common
+        # planner root.  Letting archive preprocessing recurse that shared
+        # root could inspect or stage an unclaimed sibling, so scoped requests
+        # intentionally bypass that broad preprocessor.
+        if (
+            internal_child_of is None
+            and not skip_archive_preprocessing
+            and not request.source_scope_paths
+        ):
             request, archive_projection = self._preprocess_ordinary_request_details(
                 request,
                 job_id=job_id,
@@ -4924,17 +4040,22 @@ class SimpleEngineRunner:
         _pause_checkpoint(effective_pause)
         plan = self._build_plan(request)
         _pause_checkpoint(effective_pause)
+        if internal_child_of is not None:
+            try:
+                _require_internal_child_tv_primary_videos(plan, stage="计划生成")
+            except ValueError as exc:
+                raise EngineRequestError(str(exc)) from exc
+        self._require_plan_work_unit_target_scope(
+            plan,
+            request,
+            stage="计划生成",
+        )
         if selected_root is not None:
             self._require_plan_target_shelf_containment(
                 plan,
                 target_root=selected_root,
                 stage="计划生成",
             )
-        if internal_child_of is not None:
-            try:
-                _require_provider_tv_child_primary_videos(plan, stage="child 计划")
-            except ValueError as exc:
-                raise EngineRequestError(str(exc)) from exc
         engine = __import__("engine.scraper", fromlist=["plan_to_dict"])
         serializer = getattr(engine, "plan_to_dict", None)
         if not callable(serializer):
@@ -4942,11 +4063,6 @@ class SimpleEngineRunner:
         body = serializer(plan)
         if not isinstance(body, Mapping):
             raise SimpleEngineError("Engine 计划序列化结果无效")
-        if internal_child_of is not None:
-            # Keep the child mode in the persisted plan itself.  The summary
-            # is only a queue/UI projection and is not available to the
-            # executor during restart recovery.
-            body = _mark_provider_media_only_body(body)
         now = _now()
         summary = self._summary(plan)
         if request.source_path != original_source:
@@ -4957,7 +4073,6 @@ class SimpleEngineRunner:
             summary.update({
                 "internal_child": True,
                 "root_job_id": internal_child_of,
-                "provider_media_only": True,
             })
         job = EngineJob(
             id=job_id,
@@ -4975,6 +4090,171 @@ class SimpleEngineRunner:
         atomic_write_json(self._job_path(job_id), job.as_dict(), allow_nan=False)
         return job
 
+    def plan_container_artifacts(
+        self,
+        *,
+        root_job_id: str,
+        source_path: str,
+        target_root: str,
+        target_shelf: object,
+        container_title: str,
+        poster_path: str | None = None,
+        backdrop_path: str | None = None,
+        representative_tmdb_id: int | None = None,
+        job_id: str,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> EngineJob:
+        """Persist one metadata-only carrier for a directory container.
+
+        A series container is a real library item even though it has no TMDB
+        identity of its own.  The carrier deliberately has no media or
+        cleanup rows; ``execute_job`` therefore runs the same single writer
+        and exact artifact readback while never moving a source file.  It is
+        hidden as an internal child of the selected RootJob and uses a
+        deterministic id so a retry cannot create a second artifact writer.
+        """
+        root_id = _safe_job_id(root_job_id)
+        identifier = _safe_job_id(job_id)
+        source = _safe_remote_path(
+            source_path, field="container artifact source_path", allow_root=False,
+        )
+        target = _safe_remote_path(
+            target_root, field="container artifact target_root", allow_root=False,
+        )
+        if not isinstance(container_title, str) or not container_title.strip():
+            raise EngineRequestError("container_title 必须是非空字符串")
+        if poster_path is not None and (
+            not isinstance(poster_path, str) or not poster_path.strip()
+        ):
+            raise EngineRequestError("poster_path 必须是非空字符串或省略")
+        if backdrop_path is not None and (
+            not isinstance(backdrop_path, str) or not backdrop_path.strip()
+        ):
+            raise EngineRequestError("backdrop_path 必须是非空字符串或省略")
+        if (
+            representative_tmdb_id is not None
+            and (
+                isinstance(representative_tmdb_id, bool)
+                or not isinstance(representative_tmdb_id, int)
+                or representative_tmdb_id <= 0
+            )
+        ):
+            raise EngineRequestError("representative_tmdb_id 必须是正整数或省略")
+        effective_pause = (
+            pause_requested
+            if pause_requested is not None
+            else self._pause_requested
+        )
+        with self.worker_lock():
+            _pause_checkpoint(effective_pause)
+            root_job = self._read(root_id)
+            if root_job.summary.get("internal_child") is True:
+                raise EngineJobConflictError("容器元数据 carrier 不能挂在内部任务下")
+            if root_job.target_shelf is None:
+                raise EngineRequestError("根任务尚未选择目标货架")
+            selected, shelf_root = self._target_root_for_confirmed_shelf(
+                target_shelf,
+            )
+            if root_job.target_shelf != selected.value or root_job.target_root != shelf_root:
+                raise EngineJobConflictError("容器元数据货架与 RootJob 授权不一致")
+            ingress = self._job_ingress_source(root_job)
+            if source != ingress:
+                raise EngineJobConflictError("容器元数据来源不是 RootJob 的入站来源")
+            if not (target == shelf_root or target.startswith(shelf_root + "/")):
+                raise EngineRequestError("容器元数据目标不属于 RootJob 货架")
+            if self._job_path(identifier).exists():
+                existing = self._read(identifier)
+                summary = existing.summary if isinstance(existing.summary, Mapping) else {}
+                if (
+                    summary.get("container_artifacts") is not True
+                    or summary.get("root_job_id") != root_id
+                    or existing.plan.get("target_root") != target
+                ):
+                    raise EngineJobConflictError(
+                        "同名容器元数据 carrier 的来源、目标或所有权不一致"
+                    )
+                return existing
+
+            from engine.scrapeflow.models import Plan
+
+            metadata: dict[str, object] = {
+                "container_root": target,
+                "container_title": container_title.strip(),
+                "container_nfo_kind": "tvshow",
+                "container_artifacts": True,
+            }
+            if poster_path is not None:
+                metadata["container_poster_path"] = poster_path.strip()
+            if backdrop_path is not None:
+                metadata["container_backdrop_path"] = backdrop_path.strip()
+            if representative_tmdb_id is not None:
+                # Observability only; the root NFO intentionally does not
+                # serialize this id because the container is not a work.
+                metadata["representative_tmdb_id"] = representative_tmdb_id
+            plan = Plan(
+                mode="container",
+                source_root=source,
+                target_root=target,
+                files=[],
+                cleanup_files=[],
+                problem_files=[],
+                warnings=[],
+                metadata=metadata,
+                decision_trace={"source": "root_container_metadata"},
+                scan_report={"container_artifacts": True},
+            )
+            engine = __import__("engine.scraper", fromlist=[
+                "finalize_plan", "plan_to_dict", "validate_plan",
+            ])
+            finalize = getattr(engine, "finalize_plan", None)
+            serializer = getattr(engine, "plan_to_dict", None)
+            validate = getattr(engine, "validate_plan", None)
+            if not callable(finalize) or not callable(serializer) or not callable(validate):
+                raise SimpleEngineError("当前 Engine 缺少容器元数据计划接口")
+            plan = finalize(plan)
+            validate(self.alist, plan, media_root=self.library_root)
+            self._require_plan_target_shelf_containment(
+                plan,
+                target_root=shelf_root,
+                stage="容器元数据计划",
+            )
+            body = serializer(plan)
+            if not isinstance(body, Mapping):
+                raise SimpleEngineError("容器元数据计划序列化结果无效")
+            request = EngineRequest.from_mapping({
+                "source_path": source,
+                "parent_path": shelf_root,
+                "media_type": "tv",
+                "target_shelf": selected.value,
+                "tmdb_id": representative_tmdb_id or 1,
+                "query": container_title.strip(),
+                "season": 1,
+            })
+            now = _now()
+            summary = self._summary(plan)
+            summary.update({
+                "internal_child": True,
+                "root_job_id": root_id,
+                "container_artifacts": True,
+                "container_root": target,
+                "container_title": container_title.strip(),
+            })
+            job = EngineJob(
+                id=identifier,
+                phase="planned",
+                created_at=now,
+                updated_at=now,
+                request=asdict(request),
+                plan=dict(body),
+                summary=summary,
+                target_shelf=selected.value,
+                target_root=shelf_root,
+                selected_at=now,
+            )
+            _pause_checkpoint(effective_pause)
+            atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
+            return job
+
     def mark_internal_child(self, job_id: str, *, root_job_id: str) -> EngineJob:
         """Associate one provider-created child with its visible root job.
 
@@ -4982,24 +4262,22 @@ class SimpleEngineRunner:
         own persisted Engine plan so restart recovery can finish it safely,
         but it must never turn into a second user-facing task or a new source
         of provider work.  Store the relationship in the durable summary so
-        the HTTP composition root and library audit can filter it without
+        the HTTP composition root can filter it without
         guessing from its staging path.
         """
         root_id = _safe_job_id(root_job_id)
         with self.worker_lock():
             job = self._read(job_id)
-            summary = dict(job.summary)
-            summary["internal_child"] = True
-            summary["root_job_id"] = root_id
             try:
-                _require_provider_tv_child_primary_videos(
-                    self._plan_from_job(job), stage="child 标记",
+                _require_internal_child_tv_primary_videos(
+                    self._plan_from_job(job), stage="内部 child 标记",
                 )
             except ValueError as exc:
                 raise EngineRequestError(str(exc)) from exc
-            plan = _mark_provider_media_only_body(job.plan)
-            summary["provider_media_only"] = True
-            updated = replace(job, plan=plan, summary=summary, updated_at=_now())
+            summary = dict(job.summary)
+            summary["internal_child"] = True
+            summary["root_job_id"] = root_id
+            updated = replace(job, summary=summary, updated_at=_now())
             atomic_write_json(self._job_path(job_id), updated.as_dict(), allow_nan=False)
             return updated
 
@@ -5085,33 +4363,7 @@ class SimpleEngineRunner:
                 raise EngineJobConflictError(
                     f"Engine job {job_id} 当前不能规划: {job.phase}"
                 )
-            reconciliation = (
-                job.summary.get("reconciliation")
-                if isinstance(job.summary.get("reconciliation"), Mapping)
-                else {}
-            )
-            reconciliation_outcome = str(reconciliation.get("outcome") or "")
-            merge_existing = reconciliation_outcome == "merge_existing"
-            reconciled_new_work = reconciliation_outcome == "new_work"
-            merge_identity: AutomaticIdentity | None = None
-            merge_work_root: str | None = None
-            reconciled_identity: AutomaticIdentity | None = None
             selected_shelf, selected_root = self._confirmed_target_selection(job)
-            if merge_existing:
-                # This is a post-reconciliation planning boundary.  The
-                # identity and concrete work root are already authoritative;
-                # do not call TMDB/matcher again or ask for a new shelf.
-                merge_identity, selected_shelf, selected_root, merge_work_root = (
-                    self._merge_existing_context(job.summary)
-                )
-            elif reconciled_new_work and not isinstance(job.summary.get("manual_identity"), Mapping):
-                # Once read-only reconciliation has established a genuine
-                # new work, shelf selection is only a policy confirmation.
-                # Reuse that durable Engine identity instead of allowing a
-                # second TMDB/matcher pass to reinterpret the same intake.
-                reconciled_identity = self._reconciled_identity(
-                    reconciliation.get("identity"),
-                )
             original_source = self._job_ingress_source(job)
             intake = EngineRequest.from_mapping({
                 "source_path": original_source,
@@ -5153,7 +4405,6 @@ class SimpleEngineRunner:
             except (EngineRequestError, ArchivePasswordError) as exc:
                 summary = dict(archiving.summary)
                 summary.update({
-                    "automatic_terminal": True,
                     "archive_projection_status": "invalid",
                 })
                 summary = self._without_active_operation(summary)
@@ -5213,17 +4464,19 @@ class SimpleEngineRunner:
             except Exception:
                 pass  # Advisory in P4; P6 planning will consume the ledger.
             # D step: three-shelf reconciliation per confirmed WorkUnit.  The
-            # index spans 电影/番剧/美剧, so an existing work in another shelf
+            # index spans 电影/番剧/欧美剧, so an existing work in another shelf
             # is inherited instead of duplicated (contract rule D).
             try:
                 from local.scrapeflow_api.library_index import (
                     reconcile_root_work_units,
                 )
+                from local.scrapeflow_api.tmdb_episode_catalog import (
+                    TmdbEpisodeCatalog,
+                )
                 reconcile_root_work_units(
-                    self.alist,
-                    self.library_root,
-                    self.state_root,
-                    job_id,
+                    self.alist, self.library_root, self.state_root, job_id,
+                    episode_catalog=TmdbEpisodeCatalog(self.tmdb),
+                    tmdb_client=self.tmdb,
                 )
             except Exception:
                 pass  # Advisory in P5; P6 planning will consume the ledger.
@@ -5235,42 +4488,7 @@ class SimpleEngineRunner:
             if cancelled is not None:
                 return cancelled
             correction = job.summary.get("manual_identity")
-            if merge_existing and merge_identity is not None:
-                request = self._request_from_reconciled_identity(
-                    archive_request.source_path,
-                    identity=replace(
-                        merge_identity,
-                        target_parent=selected_root,
-                        target_shelf=selected_shelf.value,
-                        target_shelf_root=selected_root,
-                    ),
-                    shelf=selected_shelf,
-                    shelf_root=selected_root,
-                )
-                identity = replace(
-                    merge_identity,
-                    target_parent=selected_root,
-                    target_shelf=selected_shelf.value,
-                    target_shelf_root=selected_root,
-                )
-            elif (
-                reconciled_new_work
-                and reconciled_identity is not None
-                and not isinstance(correction, Mapping)
-            ):
-                identity = replace(
-                    reconciled_identity,
-                    target_parent=selected_root,
-                    target_shelf=selected_shelf.value,
-                    target_shelf_root=selected_root,
-                )
-                request = self._request_from_reconciled_identity(
-                    archive_request.source_path,
-                    identity=identity,
-                    shelf=selected_shelf,
-                    shelf_root=selected_root,
-                )
-            elif isinstance(correction, Mapping):
+            if isinstance(correction, Mapping):
                 request, identity = self._request_from_manual_identity(
                     archive_request.source_path,
                     correction,
@@ -5295,13 +4513,6 @@ class SimpleEngineRunner:
                 return cancelled
             try:
                 plan = self._build_plan(request)
-                if merge_existing and merge_identity is not None and merge_work_root is not None:
-                    self._require_merge_existing_plan_target(
-                        plan,
-                        identity=merge_identity,
-                        work_root=merge_work_root,
-                        stage="既有作品合并计划",
-                    )
             except FormalTargetConflictError as exc:
                 summary = dict(planning.summary)
                 summary.update({
@@ -5309,8 +4520,6 @@ class SimpleEngineRunner:
                     "automatic": True,
                     "target_shelf": selected_shelf.value,
                     "selected_target_root": selected_root,
-                    "automatic_terminal": True,
-                    "next_retry_seconds": None,
                 })
                 if isinstance(correction, Mapping):
                     summary["manual_identity"] = dict(correction)
@@ -5342,13 +4551,6 @@ class SimpleEngineRunner:
                 target_root=selected_root,
                 stage="自动计划生成",
             )
-            if merge_existing and merge_identity is not None and merge_work_root is not None:
-                self._require_merge_existing_plan_target(
-                    plan,
-                    identity=merge_identity,
-                    work_root=merge_work_root,
-                    stage="自动计划生成",
-                )
             engine = __import__("engine.scraper", fromlist=["plan_to_dict"])
             serializer = getattr(engine, "plan_to_dict", None)
             if not callable(serializer):
@@ -5356,15 +4558,7 @@ class SimpleEngineRunner:
             body = serializer(plan)
             if not isinstance(body, Mapping):
                 raise SimpleEngineError("Engine 计划序列化结果无效")
-            # Preserve the reconciliation evidence through the hand-off.  It
-            # is the durable explanation for why this root may write into an
-            # existing work and must remain available on restart/UI reads.
-            preserve_reconciliation = merge_existing or reconciled_new_work
-            summary = (
-                {**dict(planning.summary), **self._summary(plan)}
-                if preserve_reconciliation
-                else self._summary(plan)
-            )
+            summary = self._summary(plan)
             summary.update({
                 "identity": identity.as_dict(),
                 "automatic": True,
@@ -5373,8 +4567,6 @@ class SimpleEngineRunner:
                 "resource_gaps": list(
                     (body.get("scan_report") or {}).get("resource_gaps") or []
                 ) if isinstance(body.get("scan_report"), Mapping) else [],
-                "automatic_attempts": int(job.summary.get("automatic_attempts") or 0),
-                "next_retry_seconds": None,
             })
             if isinstance(correction, Mapping):
                 summary["manual_identity"] = dict(correction)
@@ -5392,8 +4584,8 @@ class SimpleEngineRunner:
                 summary=summary,
                 error=None,
             )
-            atomic_write_json(self._job_path(job_id), planned.as_dict(), allow_nan=False)
-            return planned
+        atomic_write_json(self._job_path(job_id), planned.as_dict(), allow_nan=False)
+        return planned
 
     def _invoke_executor(
         self,
@@ -5466,9 +4658,9 @@ class SimpleEngineRunner:
             # second writer invocation.
             lifecycle["cleanup"] = cleanup
 
-        # Do not let a stale prior audit/provider decision authorize cleanup
-        # after a newly executed formal write.  Recovery instead preserves an
-        # existing true decision because it only read back the same write.
+        # A new formal write must not inherit a stale cleanup-ready flag.
+        # Recovery preserves the existing state because it only read back the
+        # same write.
         if reset_cleanup:
             lifecycle["cleanup_ready"] = False
         elif type(lifecycle.get("cleanup_ready")) is not bool:
@@ -5492,10 +4684,6 @@ class SimpleEngineRunner:
             _pause_checkpoint(effective_pause)
             if job.phase == "executed":
                 return job
-            if job.summary.get("audit_owned") is True:
-                raise SimpleEngineError(
-                    "审计创建的根任务只能由补源 child 执行，不能执行正式媒体计划"
-                )
             if job.phase not in {"planned", "retry_wait", "failed"}:
                 raise SimpleEngineError(f"Engine job {job_id} 当前不能执行: {job.phase}")
             engine = __import__("engine.scraper", fromlist=["plan_from_dict"])
@@ -5508,6 +4696,29 @@ class SimpleEngineRunner:
                 plan,
                 stage="计划执行",
             )
+            self._require_persisted_plan_source_scope(
+                job, plan, stage="计划执行",
+            )
+            self._require_persisted_plan_work_unit_target_scope(
+                job, plan, stage="计划执行",
+            )
+            # Plans persisted before the shared AList basename policy may
+            # contain an unsafe final name.  Prove the three-way remote state
+            # and atomically migrate only incomplete rows before this run can
+            # mark itself executing or issue a writer operation.
+            prepared_job = self._prepare_legacy_provider_basename_plan(job, plan)
+            if prepared_job is not job:
+                job = prepared_job
+                plan = parser(job.plan)
+                self._require_persisted_target_shelf_containment(
+                    job, plan, stage="计划执行",
+                )
+                self._require_persisted_plan_source_scope(
+                    job, plan, stage="计划执行",
+                )
+                self._require_persisted_plan_work_unit_target_scope(
+                    job, plan, stage="计划执行",
+                )
             defer_cleanup = (
                 job.summary.get("automatic") is True
                 and job.summary.get("internal_child") is not True
@@ -5516,6 +4727,13 @@ class SimpleEngineRunner:
                 # Do this before persisting ``executing``. A problem-bearing
                 # plan must never look like it began a formal write, even for
                 # an injected executor that would otherwise accept it.
+                if job.summary.get("internal_child") is True:
+                    try:
+                        _require_internal_child_tv_primary_videos(
+                            plan, stage="计划执行",
+                        )
+                    except ValueError as exc:
+                        raise EngineExecutionError(str(exc)) from exc
                 _require_problem_free_plan(plan, stage="计划执行")
                 _require_cleanup_allowlist(plan, stage="计划执行")
             except EngineExecutionError as exc:
@@ -5527,11 +4745,6 @@ class SimpleEngineRunner:
                 )
                 atomic_write_json(self._job_path(job_id), blocked.as_dict(), allow_nan=False)
                 raise
-            if _is_provider_media_only_plan(plan):
-                try:
-                    _require_provider_tv_child_primary_videos(plan, stage="child 执行")
-                except ValueError as exc:
-                    raise EngineExecutionError(str(exc)) from exc
             executing = replace(
                 job,
                 phase="executing",
@@ -5702,6 +4915,15 @@ class SimpleEngineRunner:
         listing = getattr(self.alist, "list", None)
         if not parent or not name or not callable(listing):
             return "missing"
+        # This probe is also used by paused recovery gates before any normal
+        # execution start gate has authenticated the AList client.  An
+        # unauthenticated parent listing is not evidence that task staging is
+        # absent, so authenticate here and preserve the fail-closed
+        # ``unknown`` result if that cannot be done.
+        try:
+            self._ensure_authenticated(self.alist)
+        except Exception:
+            return "unknown"
         try:
             rows = listing(parent, refresh=True)
         except TypeError:
@@ -5719,892 +4941,13 @@ class SimpleEngineRunner:
         ]
         if len(matches) != 1:
             return "ambiguous" if matches else "missing"
+        if (
+            matches[0].get("is_link") is True
+            or matches[0].get("is_symlink") is True
+            or matches[0].get("symlink") is True
+        ):
+            return "ambiguous"
         return "directory" if matches[0].get("is_dir") is True else "file"
-
-    def _duplicate_provider_blockers(self, job_id: str) -> list[str]:
-        """Return active/in-doubt Provider evidence that blocks duplicate consume."""
-        safe_id = _safe_job_id(job_id)
-        directory = self.state_root / "gaps" / re.sub(
-            r"[^a-zA-Z0-9._-]+", "-", safe_id,
-        ).strip(".-")[:96]
-        if not directory.exists():
-            return []
-        if directory.is_symlink() or not directory.is_dir():
-            return ["gap_state_directory_invalid"]
-        try:
-            paths = sorted(directory.glob("*.json"))
-        except OSError:
-            return ["gap_state_directory_unreadable"]
-        blockers: list[str] = []
-        for path in paths:
-            if path.is_symlink() or not path.is_file():
-                blockers.append(path.name)
-                continue
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                blockers.append(path.name)
-                continue
-            if not isinstance(raw, Mapping):
-                blockers.append(path.name)
-                continue
-            phase = str(raw.get("phase") or "").casefold()
-            tier_status = str(raw.get("tier_status") or "").casefold()
-            scope = str(raw.get("last_error_scope") or "").casefold()
-            active_attempt = raw.get("active_attempt")
-            post_audit = raw.get(_POST_ACQUISITION_REAUDIT_KEY)
-            post_audit_pending = post_audit is not None
-            if isinstance(post_audit, Mapping):
-                post_audit_pending = str(post_audit.get("status") or "").casefold() not in {
-                    "cleaned", "completed", "resolved", "closed",
-                }
-            active_attempt_pending = isinstance(active_attempt, Mapping)
-            # A terminal phase is not proof that a serialized attempt was
-            # cleaned: a crash can persist the phase before releasing the
-            # attempt marker.  Keep the source-consume gate conservative and
-            # allow that marker only when the post-acquisition audit records
-            # an explicit cleanup fact.
-            if active_attempt_pending and isinstance(post_audit, Mapping):
-                active_attempt_pending = (
-                    str(post_audit.get("status") or "").casefold() != "cleaned"
-                )
-            if (
-                phase in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
-                or tier_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
-                or scope in _DUPLICATE_IN_DOUBT_SCOPES
-                or active_attempt_pending
-                or post_audit_pending
-            ):
-                blockers.append(path.name)
-        return blockers
-
-    def _existing_gap_hold_paths(
-        self,
-        job: EngineJob,
-    ) -> tuple[str, str, str, str, str]:
-        """Build the only source/hold paths admitted for an ``existing_gap``.
-
-        Reconciliation stores the original intake path as task ownership.  A
-        later hand-off may consume *only* a direct child of ``待刮削`` and may
-        target the task's own archive lane.  Rebuilding both paths here keeps a
-        hand-edited ingress path from widening the move scope.
-        """
-        try:
-            source = self._job_ingress_source(job)
-            # Every persisted source coordinate is an ownership proof.  A
-            # hand-edited ``ingress_source_path`` that merely points at a
-            # different direct child of intake must not be accepted as this
-            # task's source.
-            for field, raw_value in (
-                ("request.source_path", job.request.get("source_path")),
-                ("summary.source_root", job.summary.get("source_root")),
-            ):
-                if raw_value is None:
-                    continue
-                persisted = _safe_remote_path(
-                    raw_value,
-                    field=f"existing_gap {field}",
-                    allow_root=False,
-                )
-                if persisted != source:
-                    raise EngineJobConflictError(
-                        "existing_gap 来源所有权记录不一致；拒绝执行来源交接"
-                    )
-            parent, name = posixpath.split(source.rstrip("/"))
-            expected_parent = f"{self.library_root.rstrip('/')}/待刮削"
-            if parent != expected_parent or not name or name in {".", ".."}:
-                raise EngineJobConflictError(
-                    "existing_gap ingress source 不属于任务待刮削直接子目录"
-                )
-            hold_root = _safe_remote_path(
-                f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/existing-gap-hold",
-                field="existing_gap hold root",
-                allow_root=False,
-            )
-            target = _safe_remote_path(
-                f"{hold_root}/{name}",
-                field="existing_gap hold target",
-                allow_root=False,
-            )
-        except EngineJobConflictError:
-            raise
-        except (EngineRequestError, ValueError) as exc:
-            raise EngineJobConflictError(
-                "existing_gap ingress/hold 路径无效；拒绝执行来源交接"
-            ) from exc
-        return source, parent, name, hold_root, target
-
-    @staticmethod
-    def _existing_gap_marker(summary: Mapping[str, object]) -> Mapping[str, object] | None:
-        marker = summary.get("existing_gap_registration")
-        return dict(marker) if isinstance(marker, Mapping) else None
-
-    def _block_existing_gap_registration(
-        self,
-        job: EngineJob,
-        *,
-        source: str,
-        target: str,
-        status: str,
-        reason: str,
-        observed_count: int | None = None,
-    ) -> EngineJob:
-        """Persist a visible, source-retaining registration block.
-
-        This path deliberately does not move, delete, or otherwise mutate the
-        intake object.  ``reconciliation_uncertain`` keeps the global L gate
-        closed while exposing a stable retry/needs-attention projection.
-        """
-        marker: dict[str, object] = {
-            "status": status,
-            "source": source,
-            "target": target,
-            "reason": redact_error(reason),
-            "updated_at": _now(),
-        }
-        if observed_count is not None:
-            marker["observed_count"] = observed_count
-        summary = dict(job.summary)
-        reconciliation_raw = summary.get("reconciliation")
-        if isinstance(reconciliation_raw, Mapping):
-            reconciliation = dict(reconciliation_raw)
-            reconciliation["status"] = "needs_attention"
-            reconciliation["registration_status"] = "blocked"
-            summary["reconciliation"] = reconciliation
-        summary["existing_gap_registration"] = marker
-        summary["source_fate"] = "retained_needs_attention"
-        summary["automatic_terminal"] = True
-        summary["next_retry_seconds"] = None
-        updated = replace(
-            job,
-            phase="reconciliation_uncertain",
-            summary=summary,
-            updated_at=_now(),
-            error=redact_error(reason),
-        )
-        atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-        return self._read(job.id)
-
-    def _existing_gap_registration_blockers(self, job: EngineJob) -> list[str]:
-        """Return any Provider/child state that makes an E hand-off unsafe."""
-        blockers = self._duplicate_provider_blockers(job.id)
-        replenishment = job.summary.get("replenishment")
-        if isinstance(replenishment, Mapping):
-            status = str(replenishment.get("status") or "").casefold()
-            scope = str(
-                replenishment.get("failure_scope")
-                or replenishment.get("last_error_scope")
-                or ""
-            ).casefold()
-            if status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or (
-                status
-                and replenishment.get("terminal") is not True
-                and status not in _DUPLICATE_TERMINAL_PROVIDER_STATUSES
-            ):
-                blockers.append("root_provider_active")
-            if scope in _DUPLICATE_IN_DOUBT_SCOPES:
-                blockers.append("root_provider_in_doubt")
-        for child in self._owned_children(job):
-            child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-            child_provider = child_summary.get("replenishment")
-            child_status = ""
-            child_scope = ""
-            if isinstance(child_provider, Mapping):
-                child_status = str(child_provider.get("status") or "").casefold()
-                child_scope = str(
-                    child_provider.get("failure_scope")
-                    or child_provider.get("last_error_scope")
-                    or ""
-                ).casefold()
-            if child.phase not in _CLEANUP_TERMINAL_PHASES:
-                blockers.append(f"child_active:{child.id}")
-            if (
-                child_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES
-                or child_scope in _DUPLICATE_IN_DOUBT_SCOPES
-            ):
-                blockers.append(f"child_provider:{child.id}")
-        post_audit = job.summary.get(_POST_ACQUISITION_REAUDIT_KEY)
-        if post_audit and (
-            not isinstance(post_audit, Mapping)
-            or str(post_audit.get("status") or "").casefold()
-            not in {"cleaned", "completed", "resolved", "closed"}
-        ):
-            blockers.append("post_acquisition_reaudit_pending")
-        return sorted(set(blockers))
-
-    def _existing_gap_hold_verified_locked(self, job: EngineJob) -> bool:
-        """Verify a durable existing-gap hold without performing mutations."""
-        summary = job.summary if isinstance(job.summary, Mapping) else {}
-        reconciliation = summary.get("reconciliation")
-        marker = self._existing_gap_marker(summary)
-        if (
-            job.phase != "completed"
-            or not isinstance(reconciliation, Mapping)
-            or reconciliation.get("outcome") != "existing_gap"
-            or reconciliation.get("status") != "completed"
-            or not isinstance(marker, Mapping)
-            or marker.get("status") not in {"moved_to_hold", "already_held"}
-            or summary.get("source_fate") not in {"moved_to_hold", "already_held"}
-        ):
-            return False
-        if marker.get("evidence") != "reconciliation.existing_gap.empty_ingress":
-            return False
-        completed_at = marker.get("completed_at")
-        if not isinstance(completed_at, str) or not completed_at.strip():
-            return False
-        try:
-            datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        try:
-            source, _parent, _name, _hold_root, expected_target = self._existing_gap_hold_paths(job)
-            self._reconciled_existing_context(summary, expected_outcome="existing_gap")
-        except (EngineRequestError, EngineJobConflictError, ValueError):
-            return False
-        if (
-            marker.get("source") == source
-            and marker.get("target") == expected_target
-            and self._remote_entry_kind(source) == "missing"
-            and self._remote_entry_kind(expected_target) == "directory"
-        ) is not True:
-            return False
-        listing = getattr(self.alist, "list", None)
-        if not callable(listing):
-            return False
-        try:
-            try:
-                rows = listing(expected_target, refresh=True)
-            except TypeError:
-                rows = listing(expected_target)
-        except Exception:
-            return False
-        return isinstance(rows, list) and not rows
-
-    def existing_gap_source_hold_verified(self, job_id: str) -> bool:
-        """Read-only proof used by the global intake-empty barrier."""
-        with self.worker_lock():
-            try:
-                return self._existing_gap_hold_verified_locked(self._read(job_id))
-            except (EngineJobNotFoundError, SimpleEngineError):
-                return False
-
-    @staticmethod
-    def _existing_gap_hold_intent_matches(
-        marker: Mapping[str, object] | None,
-        *,
-        source: str,
-        target: str,
-    ) -> bool:
-        """Return whether a durable pre-move receipt authorizes recovery.
-
-        The receipt is intentionally tiny: it records only that this exact
-        task proved its direct-child ingress empty immediately before its one
-        AList move.  It is *not* a completion fact; the target must still be
-        read back as an empty directory before a restarted process can turn
-        it into a completed hold.
-        """
-        if not isinstance(marker, Mapping):
-            return False
-        if (
-            marker.get("status") != "hold_prepared"
-            or marker.get("source") != source
-            or marker.get("target") != target
-            or marker.get("evidence") != "reconciliation.existing_gap.empty_ingress"
-        ):
-            return False
-        prepared_at = marker.get("prepared_at")
-        if not isinstance(prepared_at, str) or not prepared_at.strip():
-            return False
-        try:
-            datetime.fromisoformat(prepared_at.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        return True
-
-    def _complete_existing_gap_hold(
-        self,
-        job: EngineJob,
-        *,
-        source: str,
-        target: str,
-        cancellation_observed_after_commit: bool = False,
-    ) -> EngineJob:
-        """Persist the local completion half after an exact empty hold readback."""
-        completed_marker: dict[str, object] = {
-            "status": "moved_to_hold",
-            "source": source,
-            "target": target,
-            "completed_at": _now(),
-            "evidence": "reconciliation.existing_gap.empty_ingress",
-        }
-        if cancellation_observed_after_commit:
-            completed_marker["cancellation_observed_after_commit"] = True
-        updated_summary = dict(job.summary)
-        updated_summary["existing_gap_registration"] = completed_marker
-        updated_summary["source_fate"] = "moved_to_hold"
-        updated_summary["automatic_terminal"] = True
-        updated_summary["next_retry_seconds"] = None
-        rec = updated_summary.get("reconciliation")
-        if isinstance(rec, Mapping):
-            rec_copy = dict(rec)
-            rec_copy["status"] = "completed"
-            rec_copy["registration_status"] = "held"
-            updated_summary["reconciliation"] = rec_copy
-        updated = replace(
-            job,
-            phase="completed",
-            summary=updated_summary,
-            updated_at=_now(),
-            error=None,
-        )
-        atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-        return self._read(job.id)
-
-    def hold_existing_gap_source(
-        self,
-        job_id: str,
-        *,
-        pause_requested: Callable[[], bool] | None = None,
-    ) -> EngineJob:
-        """Register an ``existing_gap`` source only when it is proven empty.
-
-        Existing-gap reconciliation is intentionally report-only before the
-        global L audit.  The sole E-side hand-off is moving an *empty*,
-        task-owned intake directory into that task's archive hold lane. Any
-        member (video, subtitle, archive, or unknown row) remains in intake
-        and becomes visible ``needs_attention``; no Provider or formal writer
-        is started here.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            effective_pause = (
-                pause_requested if callable(pause_requested) else self._pause_requested
-            )
-            summary = job.summary if isinstance(job.summary, Mapping) else {}
-            reconciliation = summary.get("reconciliation")
-            marker = self._existing_gap_marker(summary)
-
-            if job.phase == "completed":
-                if self._existing_gap_hold_verified_locked(job):
-                    return job
-                raise EngineExecutionError("existing_gap hold 目标回读失败；拒绝重复交接")
-            if job.phase not in {"reconciled", "reconciliation_uncertain", "failed_cleanup"}:
-                raise EngineJobConflictError(
-                    f"任务当前不能登记 existing_gap 来源: {job.phase}"
-                )
-            if not isinstance(reconciliation, Mapping) or reconciliation.get("outcome") != "existing_gap":
-                raise EngineJobConflictError("只有 existing_gap 才能登记空来源 hold")
-            if reconciliation.get("status") not in {"completed", "needs_attention"}:
-                raise EngineJobConflictError("existing_gap 对账证据尚未完成")
-            reason = reconciliation.get("reason")
-            if not isinstance(reason, str) or not reason.strip():
-                raise EngineJobConflictError("existing_gap 缺少完整对账理由")
-            if job.phase == "reconciliation_uncertain" and not (
-                isinstance(marker, Mapping)
-                and marker.get("status") in {
-                    "blocked_nonempty_source",
-                    "blocked_source_not_directory",
-                    "failed",
-                    "hold_prepared",
-                }
-            ):
-                raise EngineJobConflictError("needs_attention 任务缺少 existing_gap 登记阻断证据")
-            if job.phase == "failed_cleanup" and not (
-                isinstance(marker, Mapping)
-                and marker.get("status") in {"failed", "hold_prepared"}
-            ):
-                raise EngineJobConflictError("existing_gap 清理重试证据缺失")
-
-            # Revalidate identity, shelf, and exact matched work root before
-            # touching the task-owned source.
-            self._reconciled_existing_context(summary, expected_outcome="existing_gap")
-            source, parent, name, hold_root, target = self._existing_gap_hold_paths(job)
-            blockers = self._existing_gap_registration_blockers(job)
-            if blockers:
-                raise EngineWorkerBusyError(
-                    "existing_gap 仍有活动或待核对状态: " + ",".join(blockers)
-                )
-            cancelled = self._consume_cancel_request(job)
-            if cancelled is not None:
-                return cancelled
-
-            source_kind = self._remote_entry_kind(source)
-            target_kind = self._remote_entry_kind(target)
-            if source_kind == "unknown" or target_kind == "unknown":
-                raise EngineExecutionError("existing_gap source/hold 回读不可确认")
-            if source_kind in {"file", "ambiguous"}:
-                return self._block_existing_gap_registration(
-                    job,
-                    source=source,
-                    target=target,
-                    status="blocked_source_not_directory",
-                    reason="existing_gap 来源不是唯一目录；已保留入站对象",
-                )
-            if target_kind in {"file", "ambiguous"}:
-                raise EngineJobConflictError("existing_gap hold 目标已被占用")
-            if source_kind == "missing" and target_kind == "directory":
-                # A completed move may crash between the remote AList commit
-                # and the local completion receipt.  Recover only when this
-                # very task persisted its pre-move empty-ingress intent *and*
-                # the derived target is still exactly empty.  A bare matching
-                # directory remains ambiguous and must not turn the global
-                # barrier green.
-                if self._existing_gap_hold_intent_matches(
-                    marker,
-                    source=source,
-                    target=target,
-                ):
-                    listing = getattr(self.alist, "list", None)
-                    if callable(listing):
-                        try:
-                            try:
-                                target_rows = listing(target, refresh=True)
-                            except TypeError:
-                                target_rows = listing(target)
-                        except Exception:
-                            target_rows = None
-                        if isinstance(target_rows, list) and not target_rows:
-                            committed_job = self._read(job_id)
-                            cancellation_observed_after_commit = False
-                            cancel_request = self._read_cancel_request(job_id)
-                            if (
-                                isinstance(cancel_request, Mapping)
-                                and self._cancel_request_matches(committed_job, cancel_request)
-                            ):
-                                self._clear_cancel_request(job_id)
-                                cancellation_observed_after_commit = True
-                            return self._complete_existing_gap_hold(
-                                committed_job,
-                                source=source,
-                                target=target,
-                                cancellation_observed_after_commit=cancellation_observed_after_commit,
-                            )
-                return self._block_existing_gap_registration(
-                    job,
-                    source=source,
-                    target=target,
-                    status="failed",
-                    reason="existing_gap 来源已缺失但 hold 没有可验证空目录登记；已保留目标等待人工确认",
-                )
-            if source_kind == "missing":
-                raise EngineExecutionError("existing_gap source 与 hold 目标均无法回读")
-            if target_kind != "missing":
-                raise EngineJobConflictError("existing_gap source/hold 目标状态冲突")
-
-            listing = getattr(self.alist, "list", None)
-            if not callable(listing):
-                raise EngineExecutionError("AList 客户端缺少 existing_gap 来源读取接口")
-
-            def source_rows() -> list[object]:
-                try:
-                    rows = listing(source, refresh=True)
-                except TypeError:
-                    rows = listing(source)
-                except Exception as exc:
-                    raise EngineExecutionError("existing_gap 来源内容无法确认") from exc
-                if not isinstance(rows, list):
-                    raise EngineExecutionError("existing_gap 来源目录返回格式不可确认")
-                return rows
-
-            rows = source_rows()
-            if rows:
-                return self._block_existing_gap_registration(
-                    job,
-                    source=source,
-                    target=target,
-                    status="blocked_nonempty_source",
-                    reason="existing_gap 来源目录非空；已保留入站对象，等待人工处理",
-                    observed_count=len(rows),
-                )
-
-            ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
-            move = getattr(self.alist, "move", None)
-            if not callable(ensure) or not callable(move):
-                raise EngineExecutionError("AList 客户端缺少 existing_gap hold 接口")
-            hold_kind = self._remote_entry_kind(hold_root)
-            if hold_kind in {"file", "ambiguous", "unknown"}:
-                raise EngineExecutionError("existing_gap hold 根不是可用目录")
-            _pause_checkpoint(effective_pause)
-            if self._consume_cancel_request(self._read(job_id)) is not None:
-                return self._read(job_id)
-            if hold_kind == "missing":
-                _pause_checkpoint(effective_pause)
-                ensure(hold_root)
-                if self._remote_entry_kind(hold_root) != "directory":
-                    raise EngineExecutionError("existing_gap hold 根创建后回读失败")
-            if self._remote_entry_kind(target) != "missing":
-                raise EngineJobConflictError("existing_gap hold 目标已被占用")
-            _pause_checkpoint(effective_pause)
-            latest = self._read(job_id)
-            if self._consume_cancel_request(latest) is not None:
-                return self._read(job_id)
-            # Recheck emptiness immediately before the only remote move.
-            if source_rows():
-                return self._block_existing_gap_registration(
-                    latest,
-                    source=source,
-                    target=target,
-                    status="blocked_nonempty_source",
-                    reason="existing_gap 来源在交接前变为非空；已保留入站对象",
-                )
-            # Persist a narrow intent before the only remote mutation.  It
-            # makes the otherwise unobservable move→local-write crash
-            # recoverable without accepting a hand-created hold directory as
-            # evidence.  The barrier still rejects this non-terminal marker.
-            prepared_summary = dict(latest.summary)
-            prepared_summary["existing_gap_registration"] = {
-                "status": "hold_prepared",
-                "source": source,
-                "target": target,
-                "prepared_at": _now(),
-                "evidence": "reconciliation.existing_gap.empty_ingress",
-            }
-            prepared_summary["source_fate"] = "hold_prepared"
-            prepared = replace(
-                latest,
-                summary=prepared_summary,
-                updated_at=_now(),
-                error=None,
-            )
-            atomic_write_json(self._job_path(job.id), prepared.as_dict(), allow_nan=False)
-            latest = self._read(job_id)
-            _pause_checkpoint(effective_pause)
-            move(parent, hold_root, [name])
-            target_rows: list[object] | None = None
-            listing_after_move = getattr(self.alist, "list", None)
-            if callable(listing_after_move):
-                try:
-                    try:
-                        target_rows = listing_after_move(target, refresh=True)
-                    except TypeError:
-                        target_rows = listing_after_move(target)
-                except Exception:
-                    target_rows = None
-            if (
-                self._remote_entry_kind(source) != "missing"
-                or self._remote_entry_kind(target) != "directory"
-                or not isinstance(target_rows, list)
-                or target_rows
-            ):
-                raise EngineExecutionError("existing_gap 来源交接后回读失败")
-            committed_job = self._read(job_id)
-            cancellation_observed_after_commit = False
-            # The move is the commit point.  An inactive cancellation request
-            # can arrive after the last pre-move checkpoint, so match and
-            # consume it explicitly rather than converting a committed hold
-            # back into ``cancelled`` (which would leave the source absent but
-            # falsely block the next barrier forever).
-            cancel_request = self._read_cancel_request(job_id)
-            if (
-                isinstance(cancel_request, Mapping)
-                and self._cancel_request_matches(committed_job, cancel_request)
-            ):
-                self._clear_cancel_request(job_id)
-                cancellation_observed_after_commit = True
-
-            return self._complete_existing_gap_hold(
-                committed_job,
-                source=source,
-                target=target,
-                cancellation_observed_after_commit=cancellation_observed_after_commit,
-            )
-
-    def consume_duplicate_complete_source(
-        self,
-        job_id: str,
-        *,
-        pause_requested: Callable[[], bool] | None = None,
-    ) -> EngineJob:
-        """Idempotently consume a proven duplicate-complete ingress directory.
-
-        This is intentionally separate from ``finalize_automatic_lifecycle``:
-        duplicate-complete has no formal write fact or cleanup transaction.  A
-        source is moved only after the read-only reconciliation proof and all
-        Provider/child state are rechecked under the existing worker lock.
-        Every remote mutation is followed by exact parent-listing readback;
-        an ambiguous result raises and leaves the job non-terminal.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            effective_pause = (
-                pause_requested if callable(pause_requested) else self._pause_requested
-            )
-            summary = job.summary if isinstance(job.summary, Mapping) else {}
-            reconciliation = summary.get("reconciliation")
-            marker = summary.get("duplicate_complete_consumption")
-            if not isinstance(marker, Mapping):
-                # Older WIP records used this name.  It is accepted only as
-                # an equivalent marker; paths are still rebuilt and checked
-                # against the current job below.
-                marker = summary.get("duplicate_cleanup")
-            marker = marker if isinstance(marker, Mapping) else None
-            expected_source: str | None = None
-            expected_target: str | None = None
-            try:
-                expected_source = self._job_ingress_source(job)
-                source_parent, source_name = posixpath.split(expected_source)
-                if (
-                    source_parent == f"{self.library_root.rstrip('/')}/待刮削"
-                    and source_name not in {"", ".", ".."}
-                ):
-                    expected_target = _safe_remote_path(
-                        f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed/{source_name}",
-                        field="duplicate processed target",
-                        allow_root=False,
-                    )
-            except (EngineRequestError, ValueError):
-                expected_source = expected_target = None
-            if (
-                isinstance(reconciliation, Mapping)
-                and reconciliation.get("outcome") == "duplicate_complete"
-                and isinstance(marker, Mapping)
-                and job.phase == "completed"
-            ):
-                # Repeated scheduler calls are reads, but retain the exact
-                # processed target proof; a missing target is corruption, not
-                # permission to move the source again.
-                target = marker.get("target")
-                if (
-                    expected_source is not None
-                    and expected_target is not None
-                    and marker.get("source") == expected_source
-                    and target == expected_target
-                    and isinstance(target, str)
-                    and marker.get("status") in {"moved_to_processed", "already_consumed"}
-                    and self._remote_entry_kind(target) == "directory"
-                ):
-                    return job
-                raise EngineExecutionError("duplicate_complete processed 目标回读失败")
-            if job.phase not in {"reconciled", "failed_cleanup"}:
-                raise EngineJobConflictError(
-                    f"任务当前不能消费 duplicate_complete 来源: {job.phase}"
-                )
-            if not isinstance(reconciliation, Mapping):
-                raise EngineJobConflictError("duplicate_complete 对账证据缺失")
-            if reconciliation.get("outcome") != "duplicate_complete":
-                raise EngineJobConflictError("只有 duplicate_complete 才能消费来源")
-            if reconciliation.get("status") != "completed":
-                raise EngineJobConflictError("duplicate_complete 对账证据尚未完成")
-            reason = reconciliation.get("reason")
-            if not isinstance(reason, str) or not reason.strip():
-                raise EngineJobConflictError("duplicate_complete 缺少完整对账理由")
-            # Reuse the same identity/shelf/work-root proof used by the
-            # existing-work hand-off, but require the duplicate outcome.
-            self._reconciled_existing_context(
-                summary,
-                expected_outcome="duplicate_complete",
-            )
-            if job.phase == "failed_cleanup" and not (
-                isinstance(marker, Mapping)
-                and marker.get("status") in {"failed", "moved_to_processed", "already_consumed"}
-            ):
-                raise EngineJobConflictError("duplicate_complete 清理重试证据缺失")
-            blockers = self._duplicate_provider_blockers(job.id)
-            replenishment = summary.get("replenishment")
-            if isinstance(replenishment, Mapping):
-                status = str(replenishment.get("status") or "").casefold()
-                scope = str(
-                    replenishment.get("failure_scope")
-                    or replenishment.get("last_error_scope")
-                    or ""
-                ).casefold()
-                if status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or (
-                    status
-                    and replenishment.get("terminal") is not True
-                    and status not in _DUPLICATE_TERMINAL_PROVIDER_STATUSES
-                ):
-                    blockers.append("root_provider_active")
-                if scope in _DUPLICATE_IN_DOUBT_SCOPES:
-                    blockers.append("root_provider_in_doubt")
-            for child in self._owned_children(job):
-                child_summary = child.summary if isinstance(child.summary, Mapping) else {}
-                child_provider = child_summary.get("replenishment")
-                child_scope = ""
-                child_status = ""
-                if isinstance(child_provider, Mapping):
-                    child_status = str(child_provider.get("status") or "").casefold()
-                    child_scope = str(
-                        child_provider.get("failure_scope")
-                        or child_provider.get("last_error_scope")
-                        or ""
-                    ).casefold()
-                if child.phase not in _CLEANUP_TERMINAL_PHASES:
-                    blockers.append(f"child_active:{child.id}")
-                if child_status in _DUPLICATE_ACTIVE_PROVIDER_STATUSES or child_scope in _DUPLICATE_IN_DOUBT_SCOPES:
-                    blockers.append(f"child_provider:{child.id}")
-            if blockers:
-                raise EngineWorkerBusyError(
-                    "duplicate_complete 仍有活动或待核对的补源状态: "
-                    + ",".join(sorted(set(blockers)))
-                )
-
-            try:
-                cancellation_observed_after_commit = False
-                source = self._job_ingress_source(job)
-                parent, name = posixpath.split(source.rstrip("/"))
-                expected_parent = f"{self.library_root.rstrip('/')}/待刮削"
-                if parent != expected_parent or not name or name in {".", ".."}:
-                    raise EngineExecutionError("duplicate_complete ingress source 不属于任务待刮削直接子目录")
-                processed_root = _safe_remote_path(
-                    f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed",
-                    field="duplicate processed root",
-                    allow_root=False,
-                )
-                target = f"{processed_root}/{name}"
-                source_kind = self._remote_entry_kind(source)
-                target_kind = self._remote_entry_kind(target)
-                if source_kind == "unknown" or target_kind == "unknown":
-                    raise EngineExecutionError("duplicate_complete source/processed 回读不可确认")
-                if source_kind == "directory" and target_kind != "missing":
-                    raise EngineExecutionError("duplicate_complete source 与 processed 目标冲突")
-                if source_kind in {"file", "ambiguous"}:
-                    raise EngineExecutionError("duplicate_complete ingress source 不是唯一目录")
-                if source_kind == "missing" and target_kind == "directory":
-                    consumed = {
-                        "status": "already_consumed",
-                        "source": source,
-                        "target": target,
-                    }
-                elif source_kind == "missing":
-                    raise EngineExecutionError("duplicate_complete source/processed 均无法回读")
-                else:
-                    ensure = getattr(self.alist, "ensure_directory", None) or getattr(self.alist, "mkdir", None)
-                    move = getattr(self.alist, "move", None)
-                    if not callable(ensure) or not callable(move):
-                        raise EngineExecutionError("AList 客户端缺少 duplicate source 消费接口")
-                    processed_kind = self._remote_entry_kind(processed_root)
-                    if processed_kind in {"file", "ambiguous", "unknown"}:
-                        raise EngineExecutionError("duplicate_complete processed 根不是可用目录")
-                    _pause_checkpoint(effective_pause)
-                    if self._consume_cancel_request(self._read(job_id)) is not None:
-                        return self._read(job_id)
-                    _pause_checkpoint(effective_pause)
-                    ensure(processed_root)
-                    if self._remote_entry_kind(processed_root) != "directory":
-                        raise EngineExecutionError("processed 目录创建后回读失败")
-                    # A same-name object may have appeared while creating the
-                    # parent. Never let AList's move semantics overwrite it.
-                    if self._remote_entry_kind(target) != "missing":
-                        raise EngineExecutionError("duplicate_complete processed 目标已被占用")
-                    _pause_checkpoint(effective_pause)
-                    latest = self._read(job_id)
-                    if self._consume_cancel_request(latest) is not None:
-                        return self._read(job_id)
-                    _pause_checkpoint(effective_pause)
-                    move(parent, processed_root, [name])
-                    if (
-                        self._remote_entry_kind(source) != "missing"
-                        or self._remote_entry_kind(target) != "directory"
-                    ):
-                        raise EngineExecutionError("duplicate_complete source 消费后回读失败")
-                    # Move is the remote commit point.  If cancellation was
-                    # requested during that operation, consume the stale
-                    # marker and record the observation instead of exposing a
-                    # cancelled job whose source has already been consumed.
-                    committed_job = self._read(job_id)
-                    if self._cancel_requested(committed_job):
-                        self._clear_cancel_request(job_id)
-                        cancellation_observed_after_commit = True
-                    consumed = {
-                        "status": "moved_to_processed",
-                        "source": source,
-                        "target": target,
-                    }
-            except (EnginePauseRequested, EngineCancellationRequested):
-                raise
-            except Exception as exc:
-                # Persist a narrow retry lane, without fabricating a formal
-                # write/readback fact. The source remains owned and untouched
-                # whenever the remote result is ambiguous.
-                failed_marker = dict(marker) if isinstance(marker, Mapping) else {}
-                failed_marker.update({
-                    "status": "failed",
-                    "error": redact_error(exc),
-                    "updated_at": _now(),
-                })
-                failed_summary = dict(summary)
-                failed_summary["duplicate_complete_consumption"] = failed_marker
-                failed_summary["duplicate_cleanup"] = failed_marker
-                failed_summary["cleanup_only_retry"] = True
-                failed_summary["automatic_terminal"] = True
-                failed = replace(
-                    job,
-                    phase="failed_cleanup",
-                    summary=failed_summary,
-                    updated_at=_now(),
-                    error=redact_error(exc),
-                )
-                atomic_write_json(self._job_path(job.id), failed.as_dict(), allow_nan=False)
-                raise
-            marker = {
-                **consumed,
-                "completed_at": _now(),
-                "evidence": "reconciliation.duplicate_complete",
-            }
-            if cancellation_observed_after_commit:
-                marker["cancellation_observed_after_commit"] = True
-            updated_summary = dict(summary)
-            updated_summary["duplicate_complete_consumption"] = marker
-            updated_summary["duplicate_cleanup"] = marker
-            updated_summary["source_fate"] = str(consumed["status"])
-            updated_summary["automatic_terminal"] = True
-            updated_summary["next_retry_seconds"] = None
-            updated = replace(
-                job,
-                phase="completed",
-                summary=updated_summary,
-                updated_at=_now(),
-                error=None,
-            )
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return self._read(job.id)
-
-    def duplicate_complete_consumption_verified(self, job_id: str) -> bool:
-        """Verify the durable duplicate-consumption marker and remote facts.
-
-        The intake-empty barrier uses this read-only predicate so a stale or
-        hand-edited ``completed`` job cannot make the global audit look ready.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            reconciliation = job.summary.get("reconciliation")
-            marker = job.summary.get("duplicate_complete_consumption")
-            if not isinstance(marker, Mapping):
-                marker = job.summary.get("duplicate_cleanup")
-            if (
-                not isinstance(reconciliation, Mapping)
-                or reconciliation.get("outcome") != "duplicate_complete"
-                or job.phase != "completed"
-                or not isinstance(marker, Mapping)
-                or marker.get("status") not in {"moved_to_processed", "already_consumed"}
-            ):
-                return False
-            source = marker.get("source")
-            target = marker.get("target")
-            if not isinstance(source, str) or not isinstance(target, str):
-                return False
-            try:
-                self._reconciled_existing_context(
-                    job.summary,
-                    expected_outcome="duplicate_complete",
-                )
-                expected_source = self._job_ingress_source(job)
-                parent, name = posixpath.split(expected_source)
-                if parent != f"{self.library_root.rstrip('/')}/待刮削" or not name:
-                    return False
-                expected_target = _safe_remote_path(
-                    f"{self.library_root}/ScrapeFlow/归档/{_safe_job_id(job.id)}/processed/{name}",
-                    field="duplicate processed target",
-                    allow_root=False,
-                )
-            except (EngineRequestError, ValueError):
-                return False
-            if source != expected_source or target != expected_target:
-                return False
-            return (
-                self._remote_entry_kind(source) == "missing"
-                and self._remote_entry_kind(target) == "directory"
-            )
 
     def execute_automatic(
         self,
@@ -6615,6 +4958,186 @@ class SimpleEngineRunner:
         """Execute or retry an automatic job."""
         return self.execute_job(job_id, pause_requested=pause_requested)
 
+    def _require_artifact_repair_media_present(self, plan: object) -> None:
+        """Prove an artifact repair cannot replay a media move.
+
+        ``repair_automatic_artifacts`` deliberately reuses the ordinary
+        executor so its NFO/artwork projection and preserve-or-upload policy
+        remain identical to normal ingestion.  Before that executor is
+        entered, every media destination must already exist at its persisted
+        size while the staged source and any interrupted intermediate name are
+        absent.  Anything else is a regular execute/recovery case, never a
+        metadata repair case.
+        """
+        for item in list(getattr(plan, "files", ()) or ()):
+            source = _safe_remote_path(
+                str(getattr(item, "source_path", "") or ""),
+                field="artifact repair source_path",
+                allow_root=False,
+            )
+            source_dir = _safe_remote_path(
+                str(getattr(item, "source_dir", "") or ""),
+                field="artifact repair source_dir",
+                allow_root=False,
+            )
+            target_dir = _safe_remote_path(
+                str(getattr(item, "target_dir", "") or ""),
+                field="artifact repair target_dir",
+                allow_root=False,
+            )
+            original = str(getattr(item, "original_name", "") or "")
+            final = str(getattr(item, "final_name", "") or "")
+            if not original or not final or "/" in original or "/" in final:
+                raise EngineExecutionError("元数据修复计划含有无效媒体文件名")
+            target = _safe_remote_path(
+                posixpath.join(target_dir, final),
+                field="artifact repair target_path",
+                allow_root=False,
+            )
+            expected = getattr(item, "source_size", None)
+            if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+                raise EngineExecutionError(f"元数据修复没有有效媒体大小: {source}")
+            observed_target = self._exact_info(
+                target, wait_for_visibility=False,
+            )
+            if observed_target is None:
+                raise EngineExecutionError(
+                    f"元数据修复拒绝缺失媒体目标: {target}"
+                )
+            actual_size = int(observed_target["size"])
+            if actual_size != expected:
+                raise EngineExecutionError(
+                    "元数据修复拒绝大小不一致的媒体目标: "
+                    f"{target} expected={expected}, actual={actual_size}"
+                )
+            _require_admissible_video_size(
+                item, actual_size, path=target, stage="元数据修复",
+            )
+            if self._exact_info(source, wait_for_visibility=False) is not None:
+                raise EngineExecutionError(
+                    f"元数据修复拒绝仍可见的媒体来源: {source}"
+                )
+            if source_dir != target_dir and original != final:
+                intermediate = _safe_remote_path(
+                    posixpath.join(target_dir, original),
+                    field="artifact repair intermediate_path",
+                    allow_root=False,
+                )
+                if self._exact_info(intermediate, wait_for_visibility=False) is not None:
+                    raise EngineExecutionError(
+                        f"元数据修复拒绝仍可见的中间媒体文件: {intermediate}"
+                    )
+
+    def _is_replenishment_artifact_child(
+        self,
+        job: EngineJob,
+        *,
+        root_job_id: str,
+    ) -> bool:
+        """Whether one direct child is an executed video replenishment plan.
+
+        Internal children also represent container metadata and layout
+        carriers.  Historical NFO backfill must never sweep those unrelated
+        plans, so the exact task-owned media staging shape is part of this
+        predicate rather than inferred from a title or provider marker.
+        """
+        summary = job.summary if isinstance(job.summary, Mapping) else {}
+        if (
+            job.phase != "executed"
+            or summary.get("internal_child") is not True
+            or summary.get("root_job_id") != root_job_id
+            or summary.get("container_artifacts") is True
+        ):
+            return False
+        request = job.request if isinstance(job.request, Mapping) else {}
+        source = request.get("source_path")
+        if not isinstance(source, str):
+            return False
+        try:
+            source = _safe_remote_path(
+                source, field="replenishment child source_path", allow_root=False,
+            )
+        except EngineRequestError:
+            return False
+        prefix = (
+            f"{self.library_root.rstrip('/')}/ScrapeFlow/补源/"
+            f"{root_job_id}/"
+        )
+        if not source.startswith(prefix):
+            return False
+        remainder = source[len(prefix):].split("/")
+        if (
+            len(remainder) != 2
+            or not _JOB_ID_RE.fullmatch(remainder[0])
+            or remainder[1] != "__scrapeflow_media__"
+        ):
+            return False
+        files = job.plan.get("files") if isinstance(job.plan, Mapping) else None
+        metadata = job.plan.get("metadata") if isinstance(job.plan, Mapping) else None
+        media_type = (
+            str(metadata.get("media_type") or metadata.get("type") or "").casefold()
+            if isinstance(metadata, Mapping) else ""
+        )
+        if media_type not in {"", "tv", "movie"}:
+            return False
+        return (
+            isinstance(files, list)
+            and bool(files)
+            and all(
+                isinstance(item, Mapping)
+                and str(item.get("media_kind") or "video") == "video"
+                and is_video_filename(str(item.get("source_path") or ""))
+                and is_video_filename(str(item.get("final_name") or ""))
+                for item in files
+            )
+        )
+
+    def repair_root_artifacts(
+        self,
+        root_job_id: str,
+        *,
+        pause_requested: Callable[[], bool] | None = None,
+    ) -> tuple[EngineJob, list[EngineJob]]:
+        """Repair one visible root and its direct executed video children.
+
+        This is intentionally a narrow historic-backfill orchestration.  It
+        does not discover jobs, regenerate media plans, or manufacture NFOs;
+        each selected child re-enters ``repair_automatic_artifacts`` and thus
+        the ordinary executor's normal NFO/artwork projection.  The repair
+        preflight below ensures every media target already exists exactly, so
+        no selected child can turn this endpoint into a media move.
+        """
+        root = self._read(root_job_id)
+        if self._is_internal_job(root):
+            raise EngineRequestError("内部 child 不能作为根元数据修复目标")
+        # Root aggregation can advance an otherwise valid Engine carrier to
+        # ``completed``/``gaps_pending`` after its formal writer finished.
+        # Do not let that aggregate-only phase hide its executed children.
+        # A root with no persisted executable plan simply has nothing of its
+        # own to repair; direct replenishment children are still considered.
+        if root.phase in {"executed", "completed", "gaps_pending"} and root.plan:
+            repaired_root = self.repair_automatic_artifacts(
+                root_job_id, pause_requested=pause_requested,
+            )
+        else:
+            repaired_root = root
+        candidates = [
+            child.id
+            for child in self.list_jobs()
+            if self._is_replenishment_artifact_child(
+                child, root_job_id=root_job_id,
+            )
+        ]
+        repaired_children: list[EngineJob] = []
+        for child_id in candidates:
+            _pause_checkpoint(
+                pause_requested if pause_requested is not None else self._pause_requested,
+            )
+            repaired_children.append(self.repair_automatic_artifacts(
+                child_id, pause_requested=pause_requested,
+            ))
+        return repaired_root, repaired_children
+
     def repair_automatic_artifacts(
         self,
         job_id: str,
@@ -6623,11 +5146,9 @@ class SimpleEngineRunner:
     ) -> EngineJob:
         """Re-run only a completed plan's deterministic metadata/artwork.
 
-        A full-library audit may discover that a poster or NFO disappeared
-        after the original media move.  Replanning from the now-empty inbound
-        directory would be wrong; the persisted plan is the authoritative
-        target map, and ``SimplePlanExecutor`` already treats an existing
-        target with an absent source as idempotent.
+        The persisted plan is the authoritative target map, so this narrow
+        operator action can restore its NFO/poster artifacts without creating
+        a new task or touching source media.
         """
         with self.worker_lock():
             job = self._read(job_id)
@@ -6637,22 +5158,36 @@ class SimpleEngineRunner:
                 else self._pause_requested
             )
             _pause_checkpoint(effective_pause)
-            if job.phase != "executed":
+            if job.phase not in {"executed", "completed", "gaps_pending"}:
                 raise SimpleEngineError(f"Engine job {job_id} 当前不能修复元数据: {job.phase}")
-            if job.summary.get("audit_owned") is True:
-                raise SimpleEngineError("审计创建的根任务没有可直接重放的元数据计划")
             plan = self._plan_from_job(job)
+            if job.summary.get("internal_child") is True:
+                try:
+                    _require_internal_child_tv_primary_videos(
+                        plan, stage="元数据修复",
+                    )
+                except ValueError as exc:
+                    raise EngineExecutionError(str(exc)) from exc
             self._require_persisted_target_shelf_containment(
                 job,
                 plan,
                 stage="元数据修复",
             )
+            self._require_persisted_plan_source_scope(
+                job, plan, stage="元数据修复",
+            )
+            self._require_persisted_plan_work_unit_target_scope(
+                job, plan, stage="元数据修复",
+            )
+            self._require_artifact_repair_media_present(plan)
             result = self._invoke_executor(
                 plan,
-                defer_cleanup=(
-                    job.summary.get("automatic") is True
-                    and job.summary.get("internal_child") is not True
-                ),
+                # This endpoint is an artifact backfill, never a delayed
+                # source-cleanup path.  The preflight proved all media targets
+                # already exist and sources are absent; defer cleanup also
+                # prevents a historical child repair from deleting any
+                # residual staging object while writing sidecars.
+                defer_cleanup=True,
                 pause_requested=effective_pause,
             )
             summary = dict(job.summary)
@@ -6703,11 +5238,45 @@ class SimpleEngineRunner:
                 return job
             try:
                 plan = self._plan_from_job(job)
+                if job.summary.get("internal_child") is True:
+                    try:
+                        _require_internal_child_tv_primary_videos(
+                            plan, stage="恢复检查",
+                        )
+                    except ValueError as exc:
+                        raise EngineRecoveryMatrixError(
+                            "internal_child_manifest_invalid",
+                            str(exc),
+                        ) from exc
                 self._require_persisted_target_shelf_containment(
                     job,
                     plan,
                     stage="恢复检查",
                 )
+                self._require_persisted_plan_source_scope(
+                    job, plan, stage="恢复检查",
+                )
+                self._require_persisted_plan_work_unit_target_scope(
+                    job, plan, stage="恢复检查",
+                )
+                # Do not classify an interrupted old-name move as source
+                # loss.  First turn any still-unwritten unsafe final names
+                # into their deterministic current equivalents and persist
+                # that continuation before performing the ordinary readback
+                # matrix below.
+                prepared_job = self._prepare_legacy_provider_basename_plan(job, plan)
+                if prepared_job is not job:
+                    job = prepared_job
+                    plan = self._plan_from_job(job)
+                    self._require_persisted_target_shelf_containment(
+                        job, plan, stage="恢复检查",
+                    )
+                    self._require_persisted_plan_source_scope(
+                        job, plan, stage="恢复检查",
+                    )
+                    self._require_persisted_plan_work_unit_target_scope(
+                        job, plan, stage="恢复检查",
+                    )
                 execution = self._readback_plan(
                     plan,
                     allow_pending_cleanup=(
@@ -6734,7 +5303,6 @@ class SimpleEngineRunner:
                     recovery["actual_size"] = exc.actual_size
                 summary = dict(job.summary)
                 summary["recovery"] = recovery
-                summary["automatic_terminal"] = True
                 failed = replace(
                     job,
                     phase="failed_verification",
@@ -6765,7 +5333,7 @@ class SimpleEngineRunner:
                     updated_at=_now(),
                     summary=summary,
                     error=(
-                        "恢复检查确认结果尚不完整，将自动重试: "
+                        "恢复检查确认结果尚不完整，等待用户重试: "
                         f"{redact_error(exc)}"
                     ),
                 )
@@ -6773,14 +5341,13 @@ class SimpleEngineRunner:
                 return failed
             except EngineRequestError as exc:
                 # A persisted-path or target-shelf policy violation is not a
-                # remote visibility transient.  Retrying it would only keep
-                # an invalid plan on the scheduler and risk a later bypass.
+                # remote visibility transient. Retrying it would only keep
+                # an invalid plan and risk a later bypass.
                 summary = dict(job.summary)
                 summary["recovery"] = {
                     "status": "terminal",
                     "reason": "target_shelf_policy_violation",
                 }
-                summary["automatic_terminal"] = True
                 failed = replace(
                     job,
                     phase="failed_verification",
@@ -6806,7 +5373,7 @@ class SimpleEngineRunner:
                     updated_at=_now(),
                     summary=summary,
                     error=(
-                        "恢复检查暂时无法确认远端结果，将自动重试: "
+                        "恢复检查暂时无法确认远端结果，等待用户重试: "
                         f"{redact_error(exc)}"
                     ),
                 )
@@ -6845,6 +5412,300 @@ class SimpleEngineRunner:
             raise SimpleEngineError("Engine 缺少 plan_from_dict")
         return parser(job.plan)
 
+    @staticmethod
+    def has_legacy_provider_basename_plan(job: EngineJob) -> bool:
+        """Whether a persisted job predates the current AList name policy.
+
+        This deliberately inspects only the durable plan.  It does not make
+        a remote-state claim and is used by the WorkUnit coordinator solely
+        to choose exact recovery over unsafe retirement/replanning.
+        """
+        files = job.plan.get("files") if isinstance(job.plan, Mapping) else None
+        if not isinstance(files, list):
+            return False
+        return any(
+            isinstance(item, Mapping)
+            and not is_provider_safe_basename(item.get("final_name"))
+            for item in files
+        )
+
+    @classmethod
+    def has_provider_basename_recovery_intent(cls, job: EngineJob) -> bool:
+        """Whether this carrier must retain its persisted move/rename plan."""
+        if cls.has_legacy_provider_basename_plan(job):
+            return True
+        summary = job.summary if isinstance(job.summary, Mapping) else {}
+        migration = summary.get("remote_basename_migration")
+        return (
+            isinstance(migration, Mapping)
+            and migration.get("status") == "prepared"
+        )
+
+    @staticmethod
+    def _basename_migration_key(path: str) -> str:
+        """Match the Engine's NFC/case-insensitive formal-name collision key."""
+        return unicodedata.normalize("NFC", path).casefold().rstrip(" .")
+
+    def _prepare_legacy_provider_basename_plan(
+        self,
+        job: EngineJob,
+        plan: object,
+    ) -> EngineJob:
+        """Persist a safe continuation for a pre-policy filename plan.
+
+        An AList move and the following rename are separate provider effects.
+        Old plans may therefore have an exact, task-owned original basename
+        in the target directory while their source is already absent.  Before
+        any replay, inspect the strict source/final/intermediate matrix and
+        atomically replace only still-unwritten unsafe final names.  Existing
+        legacy finals remain authoritative and are never renamed or
+        overwritten.
+        """
+        if not self.has_legacy_provider_basename_plan(job):
+            return job
+        raw_files = job.plan.get("files") if isinstance(job.plan, Mapping) else None
+        if not isinstance(raw_files, list):
+            raise EngineRequestError("持久化计划的 files 必须是数组")
+
+        updated_files: list[dict[str, object]] = []
+        migration_rows: list[dict[str, object]] = []
+        changed = False
+
+        for index, raw in enumerate(raw_files):
+            if not isinstance(raw, Mapping):
+                raise EngineRequestError(f"持久化计划 files[{index}] 格式无效")
+            row = dict(raw)
+            final_name = row.get("final_name")
+            if not isinstance(final_name, str) or not final_name:
+                raise EngineRequestError(f"持久化计划 files[{index}].final_name 无效")
+            if is_provider_safe_basename(final_name):
+                updated_files.append(row)
+                continue
+
+            source_path = _safe_remote_path(
+                row.get("source_path"),
+                field=f"持久化计划 files[{index}].source_path",
+                allow_root=False,
+            )
+            source_dir = _safe_remote_path(
+                row.get("source_dir"),
+                field=f"持久化计划 files[{index}].source_dir",
+                allow_root=False,
+            )
+            target_dir = _safe_remote_path(
+                row.get("target_dir"),
+                field=f"持久化计划 files[{index}].target_dir",
+                allow_root=False,
+            )
+            original_name = row.get("original_name")
+            if (
+                not isinstance(original_name, str)
+                or not original_name
+                or "/" in original_name
+                or "\\" in original_name
+                or posixpath.join(source_dir, original_name) != source_path
+            ):
+                raise EngineRequestError(
+                    f"持久化计划 files[{index}] 的来源路径与原文件名不一致"
+                )
+            expected = row.get("source_size")
+            if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+                raise EngineRequestError(
+                    f"持久化计划 files[{index}] 没有有效来源大小"
+                )
+
+            canonical_name = provider_safe_basename(final_name)
+            if not is_provider_safe_basename(canonical_name):
+                raise EngineRequestError(
+                    f"无法生成 AList 兼容的目标文件名: {final_name!r}"
+                )
+            old_target = _safe_remote_path(
+                posixpath.join(target_dir, final_name),
+                field=f"持久化计划 files[{index}].legacy_target",
+                allow_root=False,
+            )
+            canonical_target = _safe_remote_path(
+                posixpath.join(target_dir, canonical_name),
+                field=f"持久化计划 files[{index}].canonical_target",
+                allow_root=False,
+            )
+            intermediate = _safe_remote_path(
+                posixpath.join(target_dir, original_name),
+                field=f"持久化计划 files[{index}].intermediate_target",
+                allow_root=False,
+            )
+
+            observed_old = self._exact_info(old_target, wait_for_visibility=False)
+            observed_source = self._exact_info(source_path, wait_for_visibility=False)
+            observed_intermediate = (
+                self._exact_info(intermediate, wait_for_visibility=False)
+                if intermediate != old_target
+                else observed_old
+            )
+            observed_canonical = (
+                self._exact_info(canonical_target, wait_for_visibility=False)
+                if canonical_target != old_target
+                else observed_old
+            )
+
+            def require_size(
+                observed: Mapping[str, object] | None,
+                *,
+                path: str,
+                reason: str,
+            ) -> None:
+                if observed is None:
+                    return
+                actual = int(observed["size"])
+                if actual != expected:
+                    raise EngineRecoveryMatrixError(
+                        reason,
+                        (
+                            "旧计划文件名迁移发现大小不匹配: "
+                            f"{path} expected={expected}, actual={actual}"
+                        ),
+                        source=source_path,
+                        target=path,
+                        expected_size=expected,
+                        actual_size=actual,
+                    )
+
+            require_size(observed_old, path=old_target, reason="legacy_target_size_mismatch")
+            require_size(observed_source, path=source_path, reason="source_size_mismatch")
+            require_size(
+                observed_intermediate,
+                path=intermediate,
+                reason="intermediate_size_mismatch",
+            )
+            require_size(
+                observed_canonical,
+                path=canonical_target,
+                reason="canonical_target_size_mismatch",
+            )
+
+            if observed_old is not None:
+                if observed_source is not None:
+                    raise EngineRecoveryMatrixError(
+                        "legacy_target_source_conflict",
+                        "旧计划文件名迁移发现来源和既有目标同时存在",
+                        source=source_path,
+                        target=old_target,
+                        expected_size=expected,
+                    )
+                if intermediate != old_target and observed_intermediate is not None:
+                    raise EngineRecoveryMatrixError(
+                        "legacy_target_intermediate_conflict",
+                        "旧计划文件名迁移发现既有目标和中间原文件同时存在",
+                        source=source_path,
+                        target=old_target,
+                        expected_size=expected,
+                    )
+                if canonical_target != old_target and observed_canonical is not None:
+                    raise EngineRecoveryMatrixError(
+                        "legacy_target_canonical_conflict",
+                        "旧计划文件名迁移发现既有目标和规范目标同时存在",
+                        source=source_path,
+                        target=canonical_target,
+                        expected_size=expected,
+                    )
+                # A completed legacy target is an observed library fact.  Do
+                # not rename it merely because today's policy would emit a
+                # cleaner name; retain it in this hybrid plan for readback.
+                migration_rows.append({
+                    "source_path": source_path,
+                    "legacy_final_name": final_name,
+                    "final_name": final_name,
+                    "state": "legacy_final_preserved",
+                })
+                updated_files.append(row)
+                continue
+
+            if observed_canonical is not None:
+                raise EngineRecoveryMatrixError(
+                    "canonical_target_collision",
+                    "旧计划文件名迁移发现规范目标已存在，拒绝覆盖",
+                    source=source_path,
+                    target=canonical_target,
+                    expected_size=expected,
+                )
+            if observed_source is not None:
+                if observed_intermediate is not None:
+                    raise EngineRecoveryMatrixError(
+                        "source_intermediate_conflict",
+                        "旧计划文件名迁移发现来源和中间原文件同时存在",
+                        source=source_path,
+                        target=intermediate,
+                        expected_size=expected,
+                    )
+                state = "source_pending"
+            elif observed_intermediate is not None:
+                state = "rename_pending"
+            else:
+                raise EngineRecoveryMatrixError(
+                    "source_lost",
+                    "旧计划文件名迁移发现来源、既有目标和中间原文件均不存在",
+                    source=source_path,
+                    target=canonical_target,
+                    expected_size=expected,
+                )
+
+            row["final_name"] = canonical_name
+            changed = True
+            migration_rows.append({
+                "source_path": source_path,
+                "legacy_final_name": final_name,
+                "final_name": canonical_name,
+                "state": state,
+            })
+            updated_files.append(row)
+
+        destination_owners: dict[str, str] = {}
+        for index, row in enumerate(updated_files):
+            target_dir = _safe_remote_path(
+                row.get("target_dir"),
+                field=f"持久化计划 files[{index}].target_dir",
+                allow_root=False,
+            )
+            final_name = row.get("final_name")
+            if not isinstance(final_name, str) or not final_name:
+                raise EngineRequestError(f"持久化计划 files[{index}].final_name 无效")
+            target = _safe_remote_path(
+                posixpath.join(target_dir, final_name),
+                field=f"持久化计划 files[{index}].target_path",
+                allow_root=False,
+            )
+            key = self._basename_migration_key(target)
+            previous = destination_owners.get(key)
+            if previous is not None and previous != target:
+                raise EngineRecoveryMatrixError(
+                    "canonical_target_collision",
+                    "旧计划文件名迁移会让多个计划文件落到同一目标",
+                    target=target,
+                )
+            destination_owners[key] = target
+
+        if not changed:
+            return job
+        body = dict(job.plan)
+        body["files"] = updated_files
+        summary = dict(job.summary)
+        summary["remote_basename_migration"] = {
+            "status": "prepared",
+            "prepared_at": _now(),
+            "files": migration_rows,
+        }
+        prepared = replace(
+            job,
+            updated_at=_now(),
+            plan=body,
+            summary=summary,
+        )
+        # Persist before an executor can see the canonical target.  A restart
+        # after this point has one durable, scope-checked continuation plan;
+        # no caller needs to infer it from a mutated intake tree.
+        atomic_write_json(self._job_path(job.id), prepared.as_dict(), allow_nan=False)
+        return prepared
+
     def _exact_info(
         self,
         path: str,
@@ -6874,22 +5735,18 @@ class SimpleEngineRunner:
     ) -> dict[str, object]:
         _require_problem_free_plan(plan, stage="恢复检查")
         _require_cleanup_allowlist(plan, stage="恢复检查")
-        media_only = _is_provider_media_only_plan(plan)
-        files = [
-            item for item in list(getattr(plan, "files", ()) or ())
-            if not media_only or getattr(item, "media_kind", None) == "video"
-        ]
-        if not files:
+        files = list(getattr(plan, "files", ()) or ())
+        metadata = getattr(plan, "metadata", None)
+        artifact_only = (
+            not files
+            and isinstance(metadata, Mapping)
+            and metadata.get("container_artifacts") is True
+        )
+        if not files and not artifact_only:
             raise EngineExecutionError("恢复检查的计划没有媒体文件")
-        if media_only:
-            try:
-                _require_provider_tv_child_primary_videos(plan, stage="child 恢复检查")
-            except ValueError as exc:
-                raise EngineExecutionError(str(exc)) from exc
         verified_files: list[dict[str, object]] = []
         for item in files:
             source = _safe_remote_path(str(getattr(item, "source_path")), field="source_path", allow_root=False)
-            _require_non_test_media_path(source, stage="恢复检查")
             target = _safe_remote_path(
                 posixpath.join(str(getattr(item, "target_dir")), str(getattr(item, "final_name"))),
                 field="target_path",
@@ -6901,12 +5758,100 @@ class SimpleEngineRunner:
             _require_admissible_video_size(
                 item, expected, path=source, stage="恢复检查",
             )
+            # Read the three exact paths once without a visibility backoff.
+            # A missing final plus an intact source, or an exact intermediate
+            # original basename, is already enough evidence for a safe retry;
+            # waiting through the entire provider visibility schedule first
+            # would merely stall recovery and cannot make a move/rename replay
+            # more correct.  Only the otherwise-unexplained absence below
+            # gets the bounded delayed-final probe.
+            immediate_target = self._exact_info(target, wait_for_visibility=False)
+            if immediate_target is None:
+                immediate_source = self._exact_info(source, wait_for_visibility=False)
+                if immediate_source is not None:
+                    immediate_source_size = int(immediate_source["size"])
+                    if immediate_source_size != expected:
+                        raise EngineRecoveryMatrixError(
+                            "source_size_mismatch",
+                            (
+                                "恢复检查源文件大小不匹配: "
+                                f"{source} expected={expected}, "
+                                f"actual={immediate_source_size}"
+                            ),
+                            source=source,
+                            target=target,
+                            expected_size=expected,
+                            actual_size=immediate_source_size,
+                        )
+                    raise EngineRecoveryRetryableError(
+                        "target_missing_source_present",
+                        f"恢复检查发现源文件仍在但目标不存在，可安全重试: {source} -> {target}",
+                        source=source,
+                        target=target,
+                    )
+                original_name = str(getattr(item, "original_name", "") or "")
+                target_dir = _safe_remote_path(
+                    str(getattr(item, "target_dir", "") or ""),
+                    field="immediate_intermediate_target_dir",
+                    allow_root=False,
+                )
+                source_dir = _safe_remote_path(
+                    str(getattr(item, "source_dir", "") or ""),
+                    field="immediate_intermediate_source_dir",
+                    allow_root=False,
+                )
+                if source_dir != target_dir and original_name != str(getattr(item, "final_name", "") or ""):
+                    intermediate = _safe_remote_path(
+                        posixpath.join(target_dir, original_name),
+                        field="immediate_intermediate_target_path",
+                        allow_root=False,
+                    )
+                    observed_intermediate = self._exact_info(
+                        intermediate,
+                        wait_for_visibility=False,
+                    )
+                    if observed_intermediate is not None:
+                        actual_intermediate_size = int(observed_intermediate["size"])
+                        if actual_intermediate_size != expected:
+                            raise EngineRecoveryMatrixError(
+                                "intermediate_size_mismatch",
+                                (
+                                    "恢复检查中间原文件大小不匹配: "
+                                    f"{intermediate} expected={expected}, "
+                                    f"actual={actual_intermediate_size}"
+                                ),
+                                source=source,
+                                target=target,
+                                expected_size=expected,
+                                actual_size=actual_intermediate_size,
+                            )
+                        _require_admissible_video_size(
+                            item,
+                            actual_intermediate_size,
+                            path=intermediate,
+                            stage="恢复检查中间原文件",
+                        )
+                        raise EngineRecoveryRetryableError(
+                            "rename_pending_intermediate",
+                            (
+                                "恢复检查发现跨目录 move 已完成、rename 尚未完成；"
+                                f"可安全继续: {intermediate} -> {target}"
+                            ),
+                            source=source,
+                            target=target,
+                        )
             # Read the target without an expected-size filter first.  The
             # provider helper may return its last observed object when the
             # expected size never appeared; passing ``expected`` here would
             # collapse that durable mismatch into an indistinguishable
-            # absence and could incorrectly trigger a retry.
-            observed_target = self._exact_info(target, expected_size=None)
+            # absence and could incorrectly trigger a retry.  The long
+            # visibility retry is reserved for an otherwise unexplained
+            # source/final/intermediate absence.
+            observed_target = (
+                immediate_target
+                if immediate_target is not None
+                else self._exact_info(target, expected_size=None)
+            )
             if observed_target is not None:
                 actual_target_size = int(observed_target["size"])
                 if actual_target_size != expected:
@@ -6947,9 +5892,98 @@ class SimpleEngineRunner:
                         expected_size=expected,
                         actual_size=actual_target_size,
                     )
+                original_name = str(getattr(item, "original_name", "") or "")
+                target_dir = _safe_remote_path(
+                    str(getattr(item, "target_dir", "") or ""),
+                    field="completed_target_dir",
+                    allow_root=False,
+                )
+                source_dir = _safe_remote_path(
+                    str(getattr(item, "source_dir", "") or ""),
+                    field="completed_source_dir",
+                    allow_root=False,
+                )
+                if source_dir != target_dir and original_name != str(getattr(item, "final_name", "") or ""):
+                    intermediate = _safe_remote_path(
+                        posixpath.join(target_dir, original_name),
+                        field="completed_intermediate_target_path",
+                        allow_root=False,
+                    )
+                    observed_intermediate = self._exact_info(
+                        intermediate,
+                        wait_for_visibility=False,
+                    )
+                    if observed_intermediate is not None:
+                        raise EngineRecoveryMatrixError(
+                            "target_intermediate_conflict",
+                            (
+                                "恢复检查发现最终目标和中间原文件同时存在，"
+                                "拒绝静默覆盖或清理: "
+                                f"{target} / {intermediate}"
+                            ),
+                            source=source,
+                            target=target,
+                            expected_size=expected,
+                            actual_size=int(observed_intermediate["size"]),
+                        )
             else:
                 observed_source = self._exact_info(source, wait_for_visibility=False)
                 if observed_source is None:
+                    original_name = str(getattr(item, "original_name", "") or "")
+                    target_dir = _safe_remote_path(
+                        str(getattr(item, "target_dir", "") or ""),
+                        field="intermediate_target_dir",
+                        allow_root=False,
+                    )
+                    source_dir = _safe_remote_path(
+                        str(getattr(item, "source_dir", "") or ""),
+                        field="intermediate_source_dir",
+                        allow_root=False,
+                    )
+                    intermediate = (
+                        _safe_remote_path(
+                            posixpath.join(target_dir, original_name),
+                            field="intermediate_target_path",
+                            allow_root=False,
+                        )
+                        if source_dir != target_dir and original_name != str(getattr(item, "final_name", "") or "")
+                        else None
+                    )
+                    if intermediate is not None:
+                        observed_intermediate = self._exact_info(
+                            intermediate,
+                            wait_for_visibility=False,
+                        )
+                        if observed_intermediate is not None:
+                            actual_intermediate_size = int(observed_intermediate["size"])
+                            if actual_intermediate_size != expected:
+                                raise EngineRecoveryMatrixError(
+                                    "intermediate_size_mismatch",
+                                    (
+                                        "恢复检查中间原文件大小不匹配: "
+                                        f"{intermediate} expected={expected}, "
+                                        f"actual={actual_intermediate_size}"
+                                    ),
+                                    source=source,
+                                    target=target,
+                                    expected_size=expected,
+                                    actual_size=actual_intermediate_size,
+                                )
+                            _require_admissible_video_size(
+                                item,
+                                actual_intermediate_size,
+                                path=intermediate,
+                                stage="恢复检查中间原文件",
+                            )
+                            raise EngineRecoveryRetryableError(
+                                "rename_pending_intermediate",
+                                (
+                                    "恢复检查发现跨目录 move 已完成、rename 尚未完成；"
+                                    f"可安全继续: {intermediate} -> {target}"
+                                ),
+                                source=source,
+                                target=target,
+                            )
                     raise EngineRecoveryMatrixError(
                         "source_lost",
                         f"恢复检查发现目标和源文件均不存在，来源已丢失: {source} / {target}",
@@ -6979,57 +6013,53 @@ class SimpleEngineRunner:
             verified_files.append({"source": source, "target": target, "size": expected})
 
         verified_artifacts: list[dict[str, object]] = []
-        if not media_only:
-            # A provider child is a media-only transaction.  Recovery checks
-            # the moved video and cleanup source only; it neither requires nor
-            # synthesizes the ordinary root/season/episode artifact set.
-            engine = __import__("engine.scraper", fromlist=["planned_nfos", "planned_artwork"])
-            planned_nfos = getattr(engine, "planned_nfos", None)
-            if callable(planned_nfos):
-                for target, content in planned_nfos(plan):
-                    if not isinstance(target, str) or not isinstance(content, (bytes, bytearray)):
-                        raise EngineExecutionError("Engine NFO 计划格式无效")
-                    # As with media targets, inspect the actual observed size
-                    # before deciding whether the artifact is merely missing
-                    # (safe to replay) or is a durable conflicting object
-                    # (terminal, never overwrite during recovery).
-                    observed = self._exact_info(
-                        target,
-                        wait_for_visibility=True,
-                        expected_size=None,
+        # Recovery uses the same full ordinary artifact projection as the
+        # writer. Existing library artifacts are authoritative: the writer's
+        # preserve-or-upload primitive deliberately never overwrites a
+        # different, already-present NFO/poster, so readback must not turn
+        # that safe preservation into a terminal mismatch.
+        engine = __import__("engine.scraper", fromlist=["planned_nfos", "planned_artwork"])
+        planned_nfos = getattr(engine, "planned_nfos", None)
+        if not callable(planned_nfos):
+            raise EngineExecutionError("Engine 缺少 NFO 目标投影")
+        nfo_rows = planned_nfos(plan)
+        for target, content in nfo_rows:
+            if not isinstance(target, str) or not isinstance(content, (bytes, bytearray)):
+                raise EngineExecutionError("Engine NFO 计划格式无效")
+            # As with media targets, inspect the actual observed size before
+            # deciding whether the artifact is merely missing (safe to replay)
+            # or is a durable conflicting object (terminal, never overwrite
+            # during recovery).
+            observed = self._exact_info(
+                target,
+                wait_for_visibility=True,
+                expected_size=None,
+            )
+            if observed is None:
+                raise EngineExecutionError(f"恢复检查找不到或无法核对 NFO: {target}")
+            verified_artifacts.append({
+                "target": target,
+                "kind": "nfo",
+                "size": int(observed["size"]),
+            })
+        planned_artwork = getattr(engine, "planned_artwork", None)
+        if callable(planned_artwork):
+            for target, _image_path, role in planned_artwork(plan):
+                observed = self._exact_info(
+                    target,
+                    wait_for_visibility=True,
+                    expected_size=None,
+                )
+                if observed is not None and int(observed["size"]) <= 0:
+                    raise EngineRecoveryMatrixError(
+                        "artifact_size_mismatch",
+                        f"恢复检查海报大小无效: {target} actual={observed['size']}",
+                        target=target,
+                        actual_size=int(observed["size"]),
                     )
-                    if observed is not None and int(observed["size"]) != len(content):
-                        raise EngineRecoveryMatrixError(
-                            "artifact_size_mismatch",
-                            (
-                                "恢复检查 NFO 大小不匹配: "
-                                f"{target} expected={len(content)}, actual={observed['size']}"
-                            ),
-                            target=target,
-                            expected_size=len(content),
-                            actual_size=int(observed["size"]),
-                        )
-                    if observed is None:
-                        raise EngineExecutionError(f"恢复检查找不到或无法核对 NFO: {target}")
-                    verified_artifacts.append({"target": target, "kind": "nfo", "size": len(content)})
-            planned_artwork = getattr(engine, "planned_artwork", None)
-            if callable(planned_artwork):
-                for target, _image_path, role in planned_artwork(plan):
-                    observed = self._exact_info(
-                        target,
-                        wait_for_visibility=True,
-                        expected_size=None,
-                    )
-                    if observed is not None and int(observed["size"]) <= 0:
-                        raise EngineRecoveryMatrixError(
-                            "artifact_size_mismatch",
-                            f"恢复检查海报大小无效: {target} actual={observed['size']}",
-                            target=target,
-                            actual_size=int(observed["size"]),
-                        )
-                    if observed is None:
-                        raise EngineExecutionError(f"恢复检查找不到海报: {target}")
-                    verified_artifacts.append({"target": target, "kind": str(role), "size": int(observed["size"])})
+                if observed is None:
+                    raise EngineExecutionError(f"恢复检查找不到海报: {target}")
+                verified_artifacts.append({"target": target, "kind": str(role), "size": int(observed["size"])})
         cleaned: list[str] = []
         pending_cleanup: list[str] = []
         for item in list(getattr(plan, "cleanup_files", ()) or ()):
@@ -7050,7 +6080,6 @@ class SimpleEngineRunner:
             "file_count": len(verified_files),
             "artifacts": verified_artifacts,
             "artifact_count": len(verified_artifacts),
-            "media_only": media_only,
             "cleanup": cleaned,
             "cleanup_count": len(cleaned),
             "cleanup_deferred": allow_pending_cleanup,
@@ -7196,449 +6225,12 @@ class SimpleEngineRunner:
             removed.append(archive_root)
         return removed
 
-    def record_automatic_lifecycle_decision(
-        self,
-        job_id: str,
-        *,
-        audit_status: str,
-        provider_status: str,
-        cleanup_ready: bool,
-        reason: str | None = None,
-    ) -> EngineJob:
-        """Persist the audit/provider decision that gates final cleanup."""
-        if not isinstance(audit_status, str) or not audit_status:
-            raise EngineRequestError("lifecycle audit status 无效")
-        if not isinstance(provider_status, str) or not provider_status:
-            raise EngineRequestError("lifecycle provider status 无效")
-        if type(cleanup_ready) is not bool:
-            raise EngineRequestError("lifecycle cleanup_ready 必须是布尔值")
-        with self.worker_lock():
-            job = self._read(job_id)
-            if job.summary.get("automatic") is not True:
-                return job
-            summary = dict(job.summary)
-            lifecycle_raw = summary.get("lifecycle")
-            lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
-            cleanup_raw = lifecycle.get("cleanup")
-            cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
-            # A delayed audit/provider callback must not re-open a root whose
-            # source/staging evidence was already consumed.  Similarly, do
-            # not let a new decision overwrite the in-progress record that a
-            # finalizer will use for crash recovery.
-            if cleanup.get("status") == "completed":
-                return job
-            if cleanup.get("status") == "running":
-                raise EngineWorkerBusyError("任务最终清理正在执行，不能覆盖生命周期决定")
-            now = _now()
-            lifecycle["audit"] = {
-                "status": audit_status,
-                "updated_at": now,
-            }
-            provider: dict[str, object] = {
-                "status": provider_status,
-                "updated_at": now,
-            }
-            if reason:
-                provider["reason"] = redact_error(reason)
-            lifecycle["provider"] = provider
-            lifecycle["cleanup_ready"] = cleanup_ready
-            summary["lifecycle"] = lifecycle
-            updated = replace(job, summary=summary, updated_at=now)
-            atomic_write_json(self._job_path(job.id), updated.as_dict(), allow_nan=False)
-            return updated
-
-    @staticmethod
-    def _actionable_root_resource_gaps(job: EngineJob) -> list[dict[str, object]]:
-        """Return every durable resource gap that still needs a Provider lane.
-
-        The plan is the durable root contract, while ``summary.resource_gaps``
-        is the latest audit projection.  Either can be newer after a restart
-        or a delayed coordinator callback, so final cleanup must treat them as
-        one fail-closed set.  Only the shared Provider-actionable kinds fence
-        cleanup; informational planner notices such as an unpaired subtitle do
-        not turn into an unrelated source-retention deadlock.
-        """
-        sources: list[object] = []
-        summary_rows = job.summary.get("resource_gaps")
-        if isinstance(summary_rows, list):
-            sources.extend(summary_rows)
-        scan = job.plan.get("scan_report")
-        if isinstance(scan, Mapping):
-            plan_rows = scan.get("resource_gaps")
-            if isinstance(plan_rows, list):
-                sources.extend(plan_rows)
-
-        gaps: list[dict[str, object]] = []
-        seen: set[tuple[str, str, str, str]] = set()
-        for raw in sources:
-            if not isinstance(raw, Mapping):
-                continue
-            kind = str(raw.get("kind") or "").strip().casefold()
-            if kind not in ACTIONABLE_GAP_KINDS:
-                continue
-            # The same audit row is usually persisted in both the plan and
-            # summary.  Deduplicate only for stable diagnostics; either copy
-            # remains sufficient to fence final cleanup.
-            key = (
-                kind,
-                str(raw.get("id") or ""),
-                str(raw.get("label") or ""),
-                str(raw.get("path") or ""),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            gaps.append(dict(raw))
-        return gaps
-
-    def finalize_automatic_lifecycle(
-        self,
-        job_id: str,
-        *,
-        pause_requested: Callable[[], bool] | None = None,
-    ) -> EngineJob:
-        """Finish task-owned source/staging cleanup after audit/provider gates.
-
-        The method is deliberately separate from ``execute_job``.  It is
-        idempotent and only accepts a durable ``lifecycle.cleanup_ready``
-        decision written by the audit/provider coordinator, so a writer or a
-        stale provider callback cannot consume ingress early.
-        """
-        with self.worker_lock():
-            job = self._read(job_id)
-            effective_pause = pause_requested if pause_requested is not None else self._pause_requested
-            cancelled = self._consume_cancel_request(job)
-            if cancelled is not None:
-                return cancelled
-            _pause_checkpoint(effective_pause)
-            if job.summary.get("internal_child") is True:
-                raise EngineJobConflictError("内部 child 不能执行根任务最终清理")
-            if job.summary.get("automatic") is not True:
-                raise EngineRequestError("只有 automatic 根任务使用最终生命周期清理")
-            lifecycle_raw = job.summary.get("lifecycle")
-            lifecycle = dict(lifecycle_raw) if isinstance(lifecycle_raw, Mapping) else {}
-            cleanup_raw = lifecycle.get("cleanup")
-            cleanup = dict(cleanup_raw) if isinstance(cleanup_raw, Mapping) else {}
-            actionable_gaps = self._actionable_root_resource_gaps(job)
-            if actionable_gaps:
-                # ``cleanup_ready`` is coordinator input, not permission to
-                # override an observed missing resource.  In particular,
-                # historical JSON or a late external callback may still carry
-                # ``true`` after a fresh audit has recorded a gap.  Correct
-                # that stale bit before returning so a subsequent caller
-                # cannot make source/staging cleanup appear authorized.
-                state_changed = lifecycle.get("cleanup_ready") is not False
-                lifecycle["cleanup_ready"] = False
-                # A historical coordinator might also have persisted a
-                # completed cleanup before the gap observation reached this
-                # root.  Never let that idempotent marker bypass the fence on
-                # the next call.  Keep any completed-step evidence so, once a
-                # later targeted audit proves the gap gone, retry remains
-                # idempotent and does not replay a remote deletion.
-                if cleanup.get("status") == "completed":
-                    cleanup["status"] = "pending"
-                    cleanup["invalidated_by_resource_gaps_at"] = _now()
-                    lifecycle["cleanup"] = cleanup
-                    state_changed = True
-                if state_changed:
-                    summary = dict(job.summary)
-                    summary["lifecycle"] = lifecycle
-                    job = replace(job, summary=summary, updated_at=_now())
-                    atomic_write_json(
-                        self._job_path(job.id), job.as_dict(), allow_nan=False,
-                    )
-                kinds = ", ".join(sorted({
-                    str(gap.get("kind") or "").strip().casefold()
-                    for gap in actionable_gaps
-                }))
-                raise EngineWorkerBusyError(
-                    "资源缺口尚未消失，拒绝最终清理"
-                    + (f": {kinds}" if kinds else "")
-                )
-            pending_reaudit = self._pending_replenishment_reaudit_states(job.id)
-            if pending_reaudit:
-                # The formal child may have completed, but its provider
-                # staging still belongs to the selected-gap re-audit.  A
-                # coordinator callback cannot use ``cleanup_ready`` to skip
-                # that independently durable state boundary.
-                state_changed = lifecycle.get("cleanup_ready") is not False
-                lifecycle["cleanup_ready"] = False
-                if cleanup.get("status") == "completed":
-                    cleanup["status"] = "pending"
-                    cleanup["invalidated_by_post_acquisition_reaudit_at"] = _now()
-                    lifecycle["cleanup"] = cleanup
-                    state_changed = True
-                if state_changed:
-                    summary = dict(job.summary)
-                    summary["lifecycle"] = lifecycle
-                    job = replace(job, summary=summary, updated_at=_now())
-                    atomic_write_json(
-                        self._job_path(job.id), job.as_dict(), allow_nan=False,
-                    )
-                raise EngineWorkerBusyError(
-                    "补源 staging 尚待定向重审/清理，拒绝最终清理"
-                )
-            if cleanup.get("status") == "completed":
-                # Earlier drafts could leave a successfully retried cleanup
-                # in ``failed_cleanup``.  Normalize that public projection on
-                # the idempotent path without running any remote operation.
-                if job.phase == "failed_cleanup":
-                    normalized = replace(
-                        job,
-                        phase="executed",
-                        updated_at=_now(),
-                        error=None,
-                    )
-                    atomic_write_json(
-                        self._job_path(job.id), normalized.as_dict(), allow_nan=False,
-                    )
-                    return normalized
-                return job
-            formal_write = lifecycle.get("formal_write")
-            if not isinstance(formal_write, Mapping) or formal_write.get("status") != "verified":
-                raise EngineWorkerBusyError("正式写入/回读尚未形成可清理事实")
-            if lifecycle.get("cleanup_ready") is not True:
-                raise EngineWorkerBusyError("审计或补源尚未形成最终清理决定")
-            audit = lifecycle.get("audit")
-            provider = lifecycle.get("provider")
-            if not (
-                isinstance(audit, Mapping)
-                and isinstance(audit.get("status"), str)
-                and audit.get("status")
-                and isinstance(provider, Mapping)
-                and isinstance(provider.get("status"), str)
-                and provider.get("status")
-            ):
-                raise EngineWorkerBusyError("审计/补源决定记录不完整，不能最终清理")
-            if job.phase not in {"executed", "completed", "cleaning", "failed_cleanup"}:
-                raise EngineWorkerBusyError(f"任务当前不能最终清理: {job.phase}")
-            children = self._owned_children(job)
-            if any(
-                child.phase not in _CLEANUP_TERMINAL_PHASES
-                for child in children
-            ):
-                raise EngineWorkerBusyError("任务仍有活动内部子任务，不能最终清理")
-
-            steps_raw = cleanup.get("steps")
-            steps = dict(steps_raw) if isinstance(steps_raw, Mapping) else {}
-            attempts_raw = cleanup.get("attempts")
-            attempts = attempts_raw if isinstance(attempts_raw, int) and not isinstance(attempts_raw, bool) else 0
-            cleanup["status"] = "running"
-            cleanup["attempts"] = attempts + 1
-            cleanup["steps"] = steps
-            cleanup["updated_at"] = _now()
-            cleanup.pop("error", None)
-            lifecycle["cleanup"] = cleanup
-            running_summary = self._with_active_operation(
-                job.summary,
-                kind="final_cleanup",
-            )
-            running_summary["lifecycle"] = lifecycle
-            running = replace(
-                job,
-                phase="cleaning",
-                summary=running_summary,
-                updated_at=_now(),
-                error=None,
-            )
-            atomic_write_json(self._job_path(job.id), running.as_dict(), allow_nan=False)
-
-            current = running
-            missing = object()
-            pause_token = _PAUSE_REQUEST_CHECK.set(effective_pause)
-            cancel_token = _CANCEL_REQUEST_CHECK.set(
-                lambda: self._cancel_requested(current)
-            )
-
-            def prior_result(step: str) -> object:
-                raw = steps.get(step)
-                if isinstance(raw, Mapping) and raw.get("status") == "completed":
-                    return raw.get("result", missing)
-                return missing
-
-            def update_projection(
-                summary: dict[str, object],
-                step: str,
-                result: object,
-            ) -> None:
-                if step == "source_consumption":
-                    if isinstance(result, Mapping):
-                        summary["source_fate"] = str(result.get("status") or "already_consumed")
-                    else:
-                        summary["source_fate"] = "already_consumed"
-                    return
-                staging_raw = summary.get("staging_fate")
-                staging = dict(staging_raw) if isinstance(staging_raw, Mapping) else {}
-                if step == "plan_cleanup":
-                    staging["plan_cleanup"] = result
-                elif step == "archive_remote_staging":
-                    staging["archive_remote_removed"] = result
-                elif step == "archive_local_staging":
-                    staging["archive_local_removed"] = bool(result)
-                summary["staging_fate"] = staging
-
-            def persist_completed_step(step: str, result: object) -> None:
-                nonlocal current
-                now = _now()
-                steps[step] = {
-                    "status": "completed",
-                    "updated_at": now,
-                    "result": _jsonable(result),
-                }
-                cleanup["status"] = "running"
-                cleanup["steps"] = steps
-                cleanup["updated_at"] = now
-                cleanup.pop("error", None)
-                lifecycle["cleanup"] = cleanup
-                summary = dict(current.summary)
-                summary["lifecycle"] = dict(lifecycle)
-                update_projection(summary, step, _jsonable(result))
-                current = replace(
-                    current,
-                    phase="cleaning",
-                    summary=summary,
-                    updated_at=now,
-                    error=None,
-                )
-                atomic_write_json(
-                    self._job_path(current.id), current.as_dict(), allow_nan=False,
-                )
-
-            current_step = "plan_cleanup"
-            try:
-                _cancellation_checkpoint()
-                stored_cleanup = prior_result("plan_cleanup")
-                if isinstance(stored_cleanup, Mapping):
-                    cleanup_result: Mapping[str, object] = dict(stored_cleanup)
-                else:
-                    plan = self._plan_from_job(current)
-                    cleanup_result = SimplePlanExecutor(self.alist, self.tmdb).finalize_cleanup(plan)
-                    if not isinstance(cleanup_result, Mapping):
-                        raise EngineExecutionError("最终清理返回无效结果")
-                    cleanup_result = dict(cleanup_result)
-                    persist_completed_step("plan_cleanup", cleanup_result)
-
-                current_step = "source_consumption"
-                _cancellation_checkpoint()
-                stored_consumed = prior_result("source_consumption")
-                if isinstance(stored_consumed, Mapping):
-                    consumed: Mapping[str, object] | None = dict(stored_consumed)
-                else:
-                    consumed = self._consume_archive_source(current)
-                    consumed_result: Mapping[str, object] = (
-                        dict(consumed)
-                        if isinstance(consumed, Mapping)
-                        else {"status": "already_consumed"}
-                    )
-                    persist_completed_step("source_consumption", consumed_result)
-
-                current_step = "archive_remote_staging"
-                _cancellation_checkpoint()
-                stored_staging = prior_result("archive_remote_staging")
-                if isinstance(stored_staging, list) and all(isinstance(item, str) for item in stored_staging):
-                    staging_removed = list(stored_staging)
-                else:
-                    staging_removed = self._remove_empty_archive_staging(current)
-                    persist_completed_step("archive_remote_staging", staging_removed)
-
-                current_step = "archive_local_staging"
-                _cancellation_checkpoint()
-                stored_local = prior_result("archive_local_staging")
-                if type(stored_local) is bool:
-                    local_archive_removed = stored_local
-                else:
-                    local_archive_removed = self._remove_owned_local_tree(
-                        self.state_root / "archive-staging",
-                        current.id,
-                        label="archive local staging",
-                    )
-                    persist_completed_step("archive_local_staging", local_archive_removed)
-            except EnginePauseRequested:
-                # Keep the cleaning operation and completed-step evidence;
-                # resume can continue the next cleanup boundary idempotently.
-                return self._read(job_id)
-            except EngineCancellationRequested:
-                cancelled = self._consume_cancel_request(current)
-                return cancelled or self._cancelled_job(
-                    current,
-                    reason="cancelled by operator",
-                )
-            except Exception as exc:
-                failed_lifecycle = dict(lifecycle)
-                now = _now()
-                steps[current_step] = {
-                    "status": "failed",
-                    "error": redact_error(exc),
-                    "updated_at": now,
-                }
-                failed_cleanup = dict(cleanup)
-                failed_cleanup.update({
-                    "status": "failed",
-                    "error": redact_error(exc),
-                    "updated_at": now,
-                    "steps": steps,
-                })
-                failed_lifecycle["cleanup"] = failed_cleanup
-                failed_summary = self._without_active_operation(current.summary)
-                failed_summary["cleanup_only_retry"] = True
-                failed_summary["lifecycle"] = failed_lifecycle
-                failed = replace(
-                    current,
-                    phase="failed_cleanup",
-                    summary=failed_summary,
-                    updated_at=now,
-                    error=redact_error(exc),
-                )
-                atomic_write_json(self._job_path(current.id), failed.as_dict(), allow_nan=False)
-                return failed
-            finally:
-                _CANCEL_REQUEST_CHECK.reset(cancel_token)
-                _PAUSE_REQUEST_CHECK.reset(pause_token)
-
-            final_lifecycle = dict(lifecycle)
-            final_cleanup = dict(cleanup)
-            final_cleanup.update({
-                "status": "completed",
-                "updated_at": _now(),
-                "steps": steps,
-            })
-            final_cleanup.pop("error", None)
-            final_lifecycle["cleanup"] = final_cleanup
-            final_summary = self._without_active_operation(current.summary)
-            final_summary.pop("cleanup_only_retry", None)
-            final_summary["lifecycle"] = final_lifecycle
-            final_summary["source_fate"] = str(
-                consumed.get("status") if isinstance(consumed, Mapping) else "already_consumed"
-            )
-            staging_raw = final_summary.get("staging_fate")
-            final_summary["staging_fate"] = {
-                **(dict(staging_raw) if isinstance(staging_raw, Mapping) else {}),
-                "archive_remote_removed": staging_removed,
-                "archive_local_removed": bool(local_archive_removed),
-                "plan_cleanup": dict(cleanup_result),
-            }
-            execution = dict(current.execution) if isinstance(current.execution, Mapping) else {}
-            execution["final_cleanup"] = dict(cleanup_result)
-            if isinstance(consumed, Mapping):
-                execution["archive_source_consumption"] = dict(consumed)
-            completed = replace(
-                current,
-                phase="completed" if job.phase == "completed" else "executed",
-                summary=final_summary,
-                execution=execution,
-                updated_at=_now(),
-                error=None,
-            )
-            atomic_write_json(self._job_path(completed.id), completed.as_dict(), allow_nan=False)
-            self._clear_cancel_request(job_id)
-            return completed
-
     def cancel_job(self, job_id: str, *, reason: str = "cancelled by operator") -> EngineJob:
         """Cancel a queued job immediately or a running one at a safe boundary.
 
         A queued/inactive job changes only its durable projection and never
-        touches AList.  When another process owns the formal-write lock,
-        archive/identity/planning/executing/cleanup phases receive a
+        touches AList.  When the current local writer owns the formal-write
+        lock, archive/identity/planning/executing/cleanup phases receive a
         task-scoped request marker;
         the current remote operation completes, then the owning worker marks
         the job cancelled before another move, upload, or cleanup action.
@@ -7651,14 +6243,11 @@ class SimpleEngineRunner:
             "retry_wait", "failed", "failed_archive", "failed_identity",
             "failed_planning", "failed_provider", "failed_write",
             "failed_verification", "failed_cleanup", "executing", "verifying",
-            "cleaning", "cancelled",
+            "cleaning", "executed", "completed", "cancelled",
         }
         try:
             with self.worker_lock():
                 job = self._read(job_id)
-                if job.phase in {"executed", "completed"}:
-                    self._clear_cancel_request(job_id)
-                    return job
                 if job.phase not in immediate_phases:
                     raise SimpleEngineError(
                         f"Engine job {job_id} 当前不能取消: {job.phase}"
@@ -7668,8 +6257,8 @@ class SimpleEngineRunner:
                     return job
                 return self._cancelled_job(job, reason=normalized_reason)
         except EngineWorkerBusyError:
-            # Fence an idle revision before atomically closing it. Another
-            # task owns the global worker lock, so this job cannot start until
+            # Fence an idle revision before atomically closing it. The local
+            # writer owns the one worker lock, so this job cannot start until
             # that lock is released; its marker protects the tiny release
             # race. Active operations instead consume a marker at their next
             # safe AList/planning boundary.
@@ -7681,6 +6270,7 @@ class SimpleEngineRunner:
                 "planned", "retry_wait", "failed", "failed_archive",
                 "failed_identity", "failed_planning", "failed_provider",
                 "failed_write", "failed_verification", "failed_cleanup",
+                "executed", "completed",
             }
             if job.phase in inactive_phases:
                 self._request_inactive_cancellation(job, reason=normalized_reason)

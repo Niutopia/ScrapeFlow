@@ -29,6 +29,7 @@ _IMPLEMENTATION_NAMES = (
     "_lower_resolution_cleanup_reason",
     "_lower_resolution_subtitle_cleanup_reason",
     "_movie_queries_from_item",
+    "normalize_exported_srt_entries",
     "_normalize_match_title",
     "_planned_cleanup_files",
     "_planned_file_from_entry",
@@ -147,6 +148,11 @@ def build_movie_plan(
             include_bonus=True,
             include_title_extras=True,
         )
+    )
+    scanned_entries, exported_srt_issues = normalize_exported_srt_entries(
+        alist,
+        scanned_entries,
+        original_language=movie.get("original_language"),
     )
     scanned_files = [
         item
@@ -321,13 +327,16 @@ def build_movie_plan(
         names = make_unique_media_names(base_name, files, preserve_editions=True)
     planned = []
     for item, final_name in zip(files, names):
-        planned.append(
-            _planned_file_from_entry(
-                item,
-                final_name=final_name,
-                target_dir=movie_dir,
-            )
+        planned_item = _planned_file_from_entry(
+            item,
+            final_name=final_name,
+            target_dir=movie_dir,
         )
+        if isinstance(planned_item.subtitle_validation, Mapping):
+            proof = dict(planned_item.subtitle_validation)
+            proof["target_coordinate"] = "movie"
+            planned_item.subtitle_validation = proof
+        planned.append(planned_item)
 
     bonus_counts: dict[str, int] = defaultdict(int)
     for item in sorted(bonus_files, key=lambda value: _collision_key(str(value["full_path"]))):
@@ -364,6 +373,11 @@ def build_movie_plan(
         )
     if bonus_files:
         warnings.append(f"已按 Infuse 规则整理 {len(bonus_files)} 个预告/花絮文件")
+    if exported_srt_issues:
+        warnings.append(
+            f"{len(exported_srt_issues)} 个导出 .sc/.tc.srt.txt 字幕未通过"
+            " UTF-8/SRT 内容校验，已保留原位"
+        )
     if multipart_movie:
         warnings.append(
             f"检测到电影被拆为 {len(candidate_part_numbers)} 个连续分段，"
@@ -392,6 +406,15 @@ def build_movie_plan(
             for item in samples
         ],
         scan_report={
+            "deferred_subtitles": [
+                {
+                    "source_path": issue["source_path"],
+                    "action": "preserve_at_source",
+                    "reason": "invalid_exported_srt",
+                    "detail": issue["reason"],
+                }
+                for issue in exported_srt_issues
+            ],
             "resource_gaps": [
                 _resource_gap(
                     "missing_multipart_segment",
@@ -404,7 +427,9 @@ def build_movie_plan(
                 )
                 for number in missing_part_numbers
             ]
-        } if missing_part_numbers else {},
+        }
+        if missing_part_numbers or exported_srt_issues
+        else {},
     )
     _add_snapshot_warnings(plan)
     if not defer_validation:

@@ -145,7 +145,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
     def test_shelf_mapping_is_closed_and_type_matrix_removed(self) -> None:
         self.assertEqual(target_root_for_shelf("/library", "movie"), "/library/电影")
         self.assertEqual(target_root_for_shelf("/library", "anime"), "/library/番剧")
-        self.assertEqual(target_root_for_shelf("/library", "us_tv"), "/library/美剧")
+        self.assertEqual(target_root_for_shelf("/library", "us_tv"), "/library/欧美剧")
         # 2026-08-16 operator decision: the shelf is an archive location, not
         # a media-type constraint.  The identity owns movie/tv, so an anime
         # movie may live inside 番剧 and a TV identity drives TV planning.
@@ -378,7 +378,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         self.assertEqual(resolver_calls, [])
         failed = self.runner.get_job(started.id)
         self.assertEqual(failed.phase, "failed_archive")
-        self.assertTrue(failed.summary["automatic_terminal"])
+        self.assertNotIn("automatic_terminal", failed.summary)
 
     def test_identity_interruption_reuses_persisted_archive_projection(self) -> None:
         preprocessor = ReusableArchivePreprocessor()
@@ -617,7 +617,7 @@ class TargetShelfStartGateTests(unittest.TestCase):
         )
         recovered = self.runner.recover_job(started.id)
         self.assertEqual(recovered.phase, "failed_verification")
-        self.assertTrue(recovered.summary["automatic_terminal"])
+        self.assertNotIn("automatic_terminal", recovered.summary)
         self.assertEqual(
             recovered.summary["recovery"]["reason"],
             "target_shelf_policy_violation",

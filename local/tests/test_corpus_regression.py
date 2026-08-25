@@ -235,7 +235,7 @@ class CorpusIdentityTests(unittest.TestCase):
         self.assertEqual(by_year[1994].identity["tmdb_id"], 100)
         self.assertEqual(by_year[1997].identity["tmdb_id"], 200)
 
-    def test_absolute_number_anime_confirms_through_alias(self) -> None:
+    def test_absolute_number_anime_without_year_stays_uncertain_despite_alias(self) -> None:
         tmdb = FakeTMDB(
             {
                 "绝对动画": [
@@ -250,8 +250,8 @@ class CorpusIdentityTests(unittest.TestCase):
             "absolute_number_anime", tmdb, "root-abs",
         )
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0].identity_status, "confirmed")
-        self.assertEqual(records[0].identity["tmdb_id"], 555)
+        self.assertEqual(records[0].identity_status, "uncertain")
+        self.assertIsNone(records[0].identity)
 
 
 class CorpusReconciliationTests(unittest.TestCase):

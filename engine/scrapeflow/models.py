@@ -38,6 +38,17 @@ class PlannedFile:
     episode_key: str | None = None
     source_size: int | None = None
     source_modified: str | None = None
+    # Optional proof for a source whose provider suffix is not itself a
+    # canonical media extension (for example a content-validated
+    # ``.sc.srt.txt`` export).  The executor still uses ``source_path`` and
+    # ``original_name`` for the physical move; this field only prevents plan
+    # validation from reclassifying a proven sidecar as an arbitrary document.
+    source_media_kind: str | None = None
+    # Bounded full-content proof used by the one-managed-subtitle selector.
+    # It is persisted with the ordinary plan so recovery can re-read the
+    # exact source object and reject a same-size content drift before writing.
+    # ``None`` remains valid for historical/non-text subtitle formats.
+    subtitle_validation: dict[str, Any] | None = None
 
     @property
     def requires_rename(self) -> bool:

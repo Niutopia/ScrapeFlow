@@ -209,7 +209,7 @@ def reusable_candidate_scope(
     alone must never make a film release eligible for a TV gap (or vice
     versa). Gap ids are retained as evidence on each
     entry and are intersected by the runtime, so a verified S01E01 release can
-    help a later audit of the same work without claiming another episode.
+    help a later run for the same work without claiming another episode.
     """
     tier_value = str(tier or "").strip().casefold()
     if tier_value not in PROVIDER_ORDER:
@@ -280,7 +280,7 @@ def _gap_identity(gap: Mapping[str, Any]) -> dict[str, Any] | None:
     if kind == "missing_media":
         gap_id = str(gap.get("id") or "").strip()
         if not gap_id:
-            # Produce a deterministic request coordinate when the audit row
+            # Produce a deterministic request coordinate when the Gap row
             # does not supply one.
             gap_id = f"missing_media:{_normalized_text(label) or 'movie'}"
         return {
@@ -635,7 +635,7 @@ def _has_strict_s00_gap_evidence(
 
     This is deliberately an exception only for an S00 row otherwise matched
     solely by a continuation alias.  A non-generic official special title, or
-    an audit-declared source coordinate plus source series title, can disprove
+    a Gap-declared source coordinate plus source series title, can disprove
     that the continuation suffix is the only identity evidence.  The values
     remain gap-local: they are never copied into ``media.aliases``.
     """
@@ -718,7 +718,7 @@ def _specific_s00_movie_title(
         return None
     # A bare ordinal or an S00 coordinate is episode bookkeeping, never a
     # movie identity.  Keeping this narrow prevents a large special-season
-    # audit from turning generic labels into broad movie searches.
+    # gap set from turning generic labels into broad movie searches.
     if re.fullmatch(r"(?:s\d{1,3}e)?\d{1,4}(?:集|话|話)?", key):
         return None
     has_han = any("\u3400" <= char <= "\u9fff" for char in key)
@@ -842,7 +842,7 @@ def _enrich_small_s00_movie_aliases(
             return
         s00_episode_count += len(episodes)
         # A missing S00 title is not permission to search aliases or labels.
-        # The audit's explicit episode title is the only allowed query.
+        # The Gap's explicit episode title is the only allowed query.
         specific = _specific_s00_movie_title(
             raw_gap.get("title"), tv_identity_keys=tv_identity_keys,
         )
@@ -910,12 +910,12 @@ def enrich_replenishment_plan_aliases(
 ) -> dict[str, Any]:
     """Add authoritative TMDB title aliases to one provider request plan.
 
-    Audit-owned roots are bootstrapped from local NFO files and therefore may
-    only contain a translated title.  Provider releases commonly use TMDB's
-    original or alternative title (for example, an English release for a
-    Chinese NFO).  Fetching aliases for the already-verified TMDB id preserves
-    the strict identity check: aliases come from that exact TMDB record, while
-    the candidate still has to contain one of them in its release evidence.
+    A task's persisted identity can contain only a translated title. Provider
+    releases commonly use TMDB's original or alternative title (for example,
+    an English release for a Chinese NFO). Fetching aliases for the already
+    confirmed TMDB id preserves the strict identity check: aliases come from
+    that exact TMDB record, while the candidate still has to contain one of
+    them in its release name.
 
     This helper is best-effort and leaves the input unchanged when the client
     or response is unavailable.  The bounded copy keeps provider query size
@@ -1344,7 +1344,7 @@ def build_replenishment_requests(
             })
             continue
         gap = dict(raw_gap)
-        # Do not silently discard an unsupported or incomplete audit row.  It
+        # Do not silently discard an unsupported or incomplete Gap row. It
         # must remain visible to the root barrier instead of being mistaken
         # for a plan with no work.
         if _gap_identity(gap) is None:
@@ -1661,7 +1661,7 @@ def _exact_subtitle_file_coverage(
 ) -> set[str]:
     """Return only subtitle gaps explicitly paired to a candidate file.
 
-    A subtitle-only request may contain many audited videos.  Seeing *a*
+    A subtitle-only request may contain many targeted videos. Seeing *a*
     Chinese sidecar in a Torrent is not evidence that it belongs to every one
     of them.  The local adapter has already performed that pairing and emits
     both the exact gap ids in ``file_coverage`` and the selected manifest
@@ -1813,7 +1813,7 @@ def _name_coverage(
     exact_subtitle_gaps = _exact_subtitle_file_coverage(candidate, gap_lookup)
     if exact_subtitle_gaps:
         # Unlike a movie, a subtitle sidecar must be paired with the exact
-        # audited video before selection.  Do not infer that one sidecar
+        # paired video before selection. Do not infer that one sidecar
         # covers siblings in the same subtitle-only request.
         coverage.update(exact_subtitle_gaps)
     explicit_whole_seasons = {

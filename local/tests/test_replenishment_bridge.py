@@ -9,6 +9,7 @@ from pathlib import Path
 from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 
+import local.scrapeflow_api.root_replenishment as root_replenishment
 from local.scrapeflow_api.replenishment_bridge import (
     gap_ledger_requests,
     gap_ledger_selection,
@@ -210,6 +211,84 @@ class GapLedgerRequestTests(unittest.TestCase):
             self.assertIsNone(media_gap["season"])
             self.assertEqual(media_gap["title"], "The Big Short")
 
+    def test_request_reuses_bounded_persisted_tmdb_title_evidence(self) -> None:
+        """Provider discovery receives C's durable formal aliases, not guesses."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_id = "root-tmdb-aliases"
+            unit_id = "unit-tmdb-aliases"
+            identity = {
+                "media_type": "tv",
+                "tmdb_id": 204832,
+                "title": "物理魔法使-马修-",
+                "aliases": ["Mashle", 42, "物理魔法使-马修-"],
+                "decision_trace": {
+                    "official_titles": [
+                        "物理魔法使-马修-",
+                        "マッシュル-MASHLE-",
+                    ],
+                    "aliases_checked": [
+                        "MASHLE",
+                        "Mashle: Magic and Muscles",
+                        *[f"Formal alias {index}" for index in range(48)],
+                        99,
+                    ],
+                    # This has no C/TMDB title-evidence meaning and must not
+                    # expand a provider query.
+                    "directory_guess": ["untrusted release folder"],
+                },
+            }
+            save_work_unit_records(state_root, root_id, [WorkUnitRecord(
+                work_unit_id=unit_id,
+                root_task_id=root_id,
+                boundary_key=unit_id,
+                source_paths=("/待刮削/物理魔法使-马修-",),
+                source_revision=1,
+                role="single_work",
+                media_context="tv",
+                identity_status="confirmed",
+                identity=identity,
+            )])
+            save_gap_ledger(state_root, root_id, [_episode_gap(
+                root_id, unit_id,
+                media_type="tv", tmdb_id=204832, season=1, episode=13,
+            )])
+
+            request = gap_ledger_requests(state_root, root_id)[0]
+
+        aliases = request["media"]["aliases"]
+        # Older C rows did not duplicate this top-level field.  The bridge
+        # restores it only from the resolver's durable TMDB evidence, whose
+        # order is localized title then original title.
+        self.assertEqual(request["media"]["original_title"], "マッシュル-MASHLE-")
+        self.assertEqual(aliases[:4], [
+            "物理魔法使-马修-",
+            "マッシュル-MASHLE-",
+            "Mashle",
+            "Mashle: Magic and Muscles",
+        ])
+        self.assertNotIn("untrusted release folder", aliases)
+        self.assertNotIn("42", aliases)
+        self.assertNotIn("99", aliases)
+        self.assertEqual(len(aliases), 40)
+        self.assertEqual(len({value.casefold() for value in aliases}), len(aliases))
+
+        class _UnavailableTMDB:
+            def get(self, _path: str) -> dict:
+                raise OSError("temporary TMDB outage")
+
+        class _Runner:
+            tmdb = _UnavailableTMDB()
+
+        # The runtime may attempt a best-effort TMDB detail read, but an
+        # intermittent failure must not change the cursor request scope back
+        # to an empty-original-title key.
+        before = root_replenishment._search_query_request_key("magnet", request)
+        root_replenishment._enrich_media_titles(_Runner(), request)
+        after = root_replenishment._search_query_request_key("magnet", request)
+        self.assertEqual(before, after)
+        self.assertEqual(request["media"]["original_title"], "マッシュル-MASHLE-")
+
     def test_empty_ledger_yields_no_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
@@ -305,6 +384,143 @@ class GapLedgerSelectionTests(unittest.TestCase):
             "unchecked_secondary_candidates": 0,
             "source_telemetry": {},
         })
+
+    def test_selection_keeps_only_canonical_scoped_share_misses(self) -> None:
+        request = self._tv_request()
+        request["tier"] = "quark_share"
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            _seed_state(state_root)
+            bundle = gap_ledger_selection(
+                state_root,
+                "root-1",
+                request,
+                search_runner=lambda _request: {
+                    "candidates": [],
+                    "unchecked_secondary_candidates": 1,
+                    "source_telemetry": {
+                        "PanSou": {
+                            "configured": True,
+                            "status": "incomplete",
+                            "source_exhausted": False,
+                            "infrastructure_failures": 0,
+                            "reviewed_resource_miss_locators": [
+                                "quark_share:fixtureShare01",
+                                "https://pan.quark.cn/s/fixtureShare02?pwd=secret",
+                                "quark_share:abc",
+                            ],
+                        },
+                    },
+                },
+            )
+
+        evidence = bundle["search_evidence"]
+        self.assertEqual(evidence["scope"], "candidate")
+        self.assertEqual(
+            evidence["source_telemetry"]["pansou"][
+                "reviewed_resource_miss_locators"
+            ],
+            ["quark_share:fixtureShare01"],
+        )
+
+    def test_selection_carries_closed_magnet_run_counters(self) -> None:
+        request = self._tv_request()
+        request["tier"] = "magnet"
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            _seed_state(state_root)
+            bundle = gap_ledger_selection(
+                state_root,
+                "root-1",
+                request,
+                search_runner=lambda _request: {
+                    "candidates": [],
+                    "search_complete": True,
+                    "source_telemetry": {
+                        "ACG": {
+                            "configured": True,
+                            "status": "complete",
+                            "source_exhausted": True,
+                            "infrastructure_failures": 0,
+                            "query_attempts": 3,
+                            "query_responses": 3,
+                        },
+                    },
+                },
+            )
+
+        facts = bundle["search_evidence"]["source_telemetry"]["acg"]
+        self.assertEqual(facts["query_attempts"], 3)
+        self.assertEqual(facts["query_responses"], 3)
+
+    def test_selection_projects_only_closed_source_failure_codes(self) -> None:
+        request = self._tv_request()
+        request["tier"] = "magnet"
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            _seed_state(state_root)
+            bundle = gap_ledger_selection(
+                state_root,
+                "root-1",
+                request,
+                search_runner=lambda _request: {
+                    "candidates": [],
+                    "source_telemetry": {
+                        "DMHY": {
+                            "configured": True,
+                            "status": "incomplete",
+                            "source_exhausted": False,
+                            "infrastructure_failures": 1,
+                            "infrastructure_failure_types": {
+                                "http_500": 1,
+                                "https://host.invalid/?token=secret": 9,
+                            },
+                        },
+                    },
+                },
+            )
+
+        facts = bundle["search_evidence"]["source_telemetry"]["dmhy"]
+        self.assertEqual(facts["infrastructure_failure_types"], {
+            "http_500": 1,
+            "source_error": 9,
+        })
+        self.assertNotIn("token=secret", repr(facts))
+
+    def test_selection_carries_only_valid_query_cursor(self) -> None:
+        request = self._tv_request()
+        request["tier"] = "quark_share"
+        fingerprint = "a" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            _seed_state(state_root)
+            bundle = gap_ledger_selection(
+                state_root,
+                "root-1",
+                request,
+                search_runner=lambda _request: {
+                    "candidates": [],
+                    "search_complete_no_candidates": False,
+                    "source_telemetry": {
+                        "PanSou": {
+                            "configured": True,
+                            "status": "incomplete",
+                            "source_exhausted": False,
+                            "infrastructure_failures": 0,
+                            "query_cursor": {
+                                "fingerprint": fingerprint,
+                                "offset": 4,
+                                "exhausted": False,
+                            },
+                        },
+                    },
+                },
+            )
+
+        self.assertEqual(
+            bundle["search_evidence"]["source_telemetry"]["pansou"]["query_cursor"],
+            {"fingerprint": fingerprint, "offset": 4, "exhausted": False},
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import unicodedata
 from .media_policy import (
     ARCHIVE_EXTENSIONS,
     AUDIO_EXTENSIONS,
+    DISC_IMAGE_EXTENSIONS,
     DOCUMENT_EXTENSIONS,
     EXECUTABLE_EXTENSIONS,
     FONT_EXTENSIONS,
@@ -187,6 +188,12 @@ def classify_residual(source_path: str, *, reason: str = "") -> ResidualDecision
         if _ADVERTISEMENT_IMAGE_RE.search(name):
             return ResidualDecision(KEEP_UNPLANNED, "advertisement_image", ("advertisement_name",))
         return ResidualDecision(KEEP_UNPLANNED, "unknown_image", (f"extension={suffix}",))
+    if suffix in DISC_IMAGE_EXTENSIONS:
+        return ResidualDecision(
+            KEEP_UNPLANNED,
+            "disc_image_requires_content_expansion",
+            ("opaque_disc_image",),
+        )
     if suffix in VIDEO_EXTENSIONS and _THEME_VIDEO_RE.search(name):
         return ResidualDecision(KEEP_UNPLANNED, "theme_video", ("theme_name",))
     if is_archive_filename(normalized):

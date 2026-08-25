@@ -70,28 +70,9 @@ class QuarkHelperCliTest(unittest.TestCase):
         self.assertTrue(config.docker_sidecar)
         self.assertEqual(config.alist_url, "http://127.0.0.1:5244")
 
-    def test_acceptance_media_root_derives_the_helper_staging_root(self) -> None:
-        media_root = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8"
-        result, _load_token, serve = self._run(["--media-root", media_root])
-
-        self.assertEqual(result, 0)
-        config = serve.call_args.args[0]
-        self.assertEqual(config.media_root, media_root)
-        self.assertEqual(
-            config.staging_root,
-            f"{media_root}/ScrapeFlow/补源",
-        )
-
+    def test_helper_has_no_alternate_media_root_switch(self) -> None:
         with self.assertRaises(SystemExit) as raised:
-            self._run(
-                [],
-                environment={
-                    "SCRAPEFLOW_MEDIA_ROOT": media_root,
-                    "SCRAPEFLOW_QUARK_HELPER_STAGING_ROOT": (
-                        "/quark/影视/ScrapeFlow/补源"
-                    ),
-                },
-            )
+            self._run(["--media-root", "/another-root"])
         self.assertEqual(raised.exception.code, 2)
 
     def test_docker_sidecar_rejects_every_nonfixed_cdp_override(self) -> None:

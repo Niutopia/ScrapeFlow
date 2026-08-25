@@ -18,8 +18,8 @@ Request field contract (one request per ``(media_type, tmdb_id)`` identity):
             "tmdb_id": <int>,                  # positive TMDB id
             "media_type": "movie" | "tv",      # gap ledger media_type
             "title": <str>,                    # work unit identity.title
-            "original_title": <str>,           # identity original_title ("" if absent)
-            "aliases": [<str>, ...],           # title + original_title + identity.aliases
+            "original_title": <str>,           # identity field or C/TMDB formal trace ("" if absent)
+            "aliases": [<str>, ...],           # persisted C/TMDB title evidence
         },
         "gaps": [
             {
@@ -50,7 +50,8 @@ rather than a re-import of legacy plan policy.  The selection boundary
 ``media.title``) for the title gate, and ``gaps[].id``/``kind``/``season`` for
 coverage.  ``media.aliases`` must never be an empty list, because the selector
 treats an explicit empty list as "no alias evidence" and rejects every
-candidate; this module therefore always seeds it with ``title``.
+candidate; this module therefore always seeds it with ``title`` and reuses
+durable C/TMDB title evidence when it is present.
 """
 
 from __future__ import annotations
@@ -69,6 +70,35 @@ from .replenishment import select_replenishment_candidates
 from .replenishment_tiers import TIER_LOCAL_MAGNET
 
 
+_CANONICAL_QUARK_SHARE_LOCATOR_RE = re.compile(
+    r"\Aquark_share:[A-Za-z0-9_-]{6,128}\Z",
+)
+_CANONICAL_TORRENT_LOCATOR_RE = re.compile(
+    r"\Atorrent:(?:[0-9a-f]{40}|[a-z2-7]{32})\Z",
+    re.IGNORECASE,
+)
+_MAX_REVIEWED_RESOURCE_MISSES = 512
+_MAX_REVIEWED_TORRENT_MISSES = 512
+_MAX_MEDIA_ALIASES = 40
+_SAFE_SOURCE_FAILURE_CODES = frozenset({
+    "connection_refused",
+    "connection_reset",
+    "dns_failure",
+    "network_error",
+    "os_error",
+    "runtime_error",
+    "source_error",
+    "timeout",
+    "tls_failure",
+    "unknown_error",
+    "value_error",
+    "xml_parse_error",
+})
+_HTTP_SOURCE_FAILURE_CODE_RE = re.compile(
+    r"\Ahttp_(?:1\d\d|2\d\d|3\d\d|4\d\d|5\d\d)\Z",
+)
+
+
 def _nonempty_strings(values: Sequence[Any], *, limit: int = 40) -> list[str]:
     """Deduplicate trimmed non-empty strings, preserving first-seen order."""
     output: list[str] = []
@@ -85,6 +115,74 @@ def _nonempty_strings(values: Sequence[Any], *, limit: int = 40) -> list[str]:
     return output
 
 
+def _identity_original_title(identity: Mapping[str, Any]) -> str:
+    """Return C's durable TMDB original title without a fresh TMDB read.
+
+    Newer identity rows may persist ``original_title`` directly.  Older rows
+    deliberately retain the resolver's formal TMDB evidence in
+    ``decision_trace.official_titles`` instead.  The resolver builds that
+    list from TMDB's localized title/name followed by its original
+    title/name, preserving that order.  Recover the second formal title when
+    available (or the sole formal title when TMDB exposed only one), rather
+    than falling back to a directory label or a provider/web result.
+
+    This makes the generic-search request fingerprint stable when a later
+    best-effort TMDB detail enrichment is temporarily unavailable.
+    """
+    explicit = identity.get("original_title")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    trace = identity.get("decision_trace")
+    if not isinstance(trace, Mapping):
+        return ""
+    raw_titles = trace.get("official_titles")
+    if not isinstance(raw_titles, (list, tuple)):
+        return ""
+    titles = _nonempty_strings(raw_titles, limit=2)
+    if not titles:
+        return ""
+    return titles[1] if len(titles) > 1 else titles[0]
+
+
+def _identity_media_aliases(
+    identity: Mapping[str, Any],
+    *,
+    title: str,
+    original_title: str,
+) -> list[str]:
+    """Project only persisted C/TMDB title evidence into provider aliases.
+
+    Replenishment must search the exact identity already accepted by C, not a
+    new directory-name guess or a web-search result. ``official_titles`` and
+    ``aliases_checked`` are the title evidence saved by the TMDB resolver in
+    ``decision_trace``; they commonly include the original-script and
+    international release names absent from the display title. Ignore all
+    other trace fields and malformed values, then preserve stable order with a
+    hard limit so one identity cannot broaden provider queries indefinitely.
+    """
+    trace = identity.get("decision_trace")
+    trace_titles: list[Any] = []
+    if isinstance(trace, Mapping):
+        for key in ("official_titles", "aliases_checked"):
+            raw = trace.get(key)
+            if isinstance(raw, (list, tuple)):
+                trace_titles.extend(
+                    value for value in raw if isinstance(value, str)
+                )
+    raw_aliases = identity.get("aliases")
+    identity_aliases = (
+        [value for value in raw_aliases if isinstance(value, str)]
+        if isinstance(raw_aliases, (list, tuple))
+        else []
+    )
+    return _nonempty_strings([
+        title,
+        original_title,
+        *identity_aliases,
+        *trace_titles,
+    ], limit=_MAX_MEDIA_ALIASES)
+
+
 def _source_name(value: object) -> str:
     """Normalize a search-source label to the tier-policy spelling."""
     if not isinstance(value, str):
@@ -96,6 +194,107 @@ def _nonnegative_int(value: object, *, fallback: int) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return fallback
+
+
+def _source_failure_types(value: object) -> dict[str, int]:
+    """Project only closed, non-sensitive source-health failure codes."""
+    if not isinstance(value, Mapping):
+        return {}
+    output: dict[str, int] = {}
+    for raw_code, raw_count in value.items():
+        if not isinstance(raw_code, str) or type(raw_count) is not int:
+            continue
+        count = max(0, min(raw_count, 100_000))
+        if count <= 0:
+            continue
+        code = raw_code.strip().casefold()
+        if (
+            code not in _SAFE_SOURCE_FAILURE_CODES
+            and _HTTP_SOURCE_FAILURE_CODE_RE.fullmatch(code) is None
+        ):
+            code = "source_error"
+        output[code] = min(100_000, output.get(code, 0) + count)
+    return dict(sorted(output.items()))
+
+
+def _validated_query_cursor(value: object) -> dict[str, Any] | None:
+    """Keep a provider-neutral bounded continuation receipt.
+
+    PanSou uses ``offset`` while AnimeTosho uses ``term_index``/``page``.
+    Only the exact request fingerprint and small integer coordinates cross
+    this boundary; no provider URL, query text, or diagnostics are retained.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    fingerprint = value.get("fingerprint")
+    exhausted = value.get("exhausted")
+    if (
+        not isinstance(fingerprint, str)
+        or re.fullmatch(r"[a-f0-9]{64}", fingerprint) is None
+        or not isinstance(exhausted, bool)
+    ):
+        return None
+    output: dict[str, Any] = {
+        "fingerprint": fingerprint,
+        "exhausted": exhausted,
+    }
+    offset = value.get("offset")
+    if (
+        isinstance(offset, int)
+        and not isinstance(offset, bool)
+        and 0 <= offset <= 256
+    ):
+        output["offset"] = offset
+        return output
+    term_index = value.get("term_index")
+    page = value.get("page")
+    if (
+        isinstance(term_index, int)
+        and not isinstance(term_index, bool)
+        and 0 <= term_index <= 256
+        and isinstance(page, int)
+        and not isinstance(page, bool)
+        and 1 <= page <= 256
+    ):
+        output["term_index"] = term_index
+        output["page"] = page
+        return output
+    return None
+
+
+def _reviewed_resource_miss_locators(value: object) -> list[str]:
+    """Project only non-secret canonical Quark locators from telemetry.
+
+    These values are evidence that a particular share was successfully
+    inspected and was unusable for the current request.  URLs, passcodes and
+    arbitrary provider diagnostics never cross this bridge.
+    """
+    if not isinstance(value, list):
+        return []
+    return sorted({
+        item
+        for item in value[:_MAX_REVIEWED_RESOURCE_MISSES]
+        if isinstance(item, str)
+        and _CANONICAL_QUARK_SHARE_LOCATOR_RE.fullmatch(item) is not None
+    })
+
+
+def _reviewed_torrent_miss_locators(value: object) -> list[str]:
+    """Project only infohash locators for validated non-covering manifests.
+
+    A torrent URL is intentionally not durable evidence: it can be mutable,
+    secret-bearing, or point at a different metainfo object later.  The
+    adapter emits this locator only after fetching and validating the torrent
+    manifest and proving that it covers none of the current exact gaps.
+    """
+    if not isinstance(value, list):
+        return []
+    return sorted({
+        item.casefold()
+        for item in value[:_MAX_REVIEWED_TORRENT_MISSES]
+        if isinstance(item, str)
+        and _CANONICAL_TORRENT_LOCATOR_RE.fullmatch(item) is not None
+    })
 
 
 def _search_completion_evidence(
@@ -134,6 +333,10 @@ def _search_completion_evidence(
             failures = _nonnegative_int(
                 raw.get("infrastructure_failures"), fallback=0,
             )
+            failure_types = _source_failure_types(
+                raw.get("infrastructure_failure_types"),
+            )
+            failures = max(failures, sum(failure_types.values()))
             facts = source_telemetry.setdefault(name, {
                 "source_exhausted": False,
                 "infrastructure_failures": 0,
@@ -145,6 +348,71 @@ def _search_completion_evidence(
             facts["infrastructure_failures"] = max(
                 int(facts["infrastructure_failures"]), failures,
             )
+            if failure_types:
+                existing_types = facts.get("infrastructure_failure_types")
+                merged_types = (
+                    dict(existing_types)
+                    if isinstance(existing_types, Mapping)
+                    else {}
+                )
+                for code, count in failure_types.items():
+                    merged_types[code] = min(
+                        100_000,
+                        int(merged_types.get(code, 0)) + count,
+                    )
+                facts["infrastructure_failure_types"] = dict(sorted(merged_types.items()))
+            # These are closed, provider-neutral booleans/enums rather than
+            # upstream warning text.  The root orchestrator can therefore
+            # explain a retry_wait without persisting share URLs, passcodes,
+            # or arbitrary provider diagnostics.
+            if raw.get("configured") is False:
+                facts["configured"] = False
+            elif raw.get("configured") is True and "configured" not in facts:
+                facts["configured"] = True
+            # A source is considered "run" only when its bounded query and
+            # response counters are present and positive.  Carry these closed
+            # counters across the bridge so the root can reject a fabricated
+            # exhausted flag from a source that never actually made a query.
+            for counter in ("query_attempts", "query_responses"):
+                value = _nonnegative_int(raw.get(counter), fallback=-1)
+                if value >= 0:
+                    facts[counter] = max(int(facts.get(counter, 0)), value)
+            status = raw.get("status")
+            if status in {"complete", "incomplete"}:
+                facts["status"] = status
+            reviewed_misses = _reviewed_resource_miss_locators(
+                raw.get("reviewed_resource_miss_locators"),
+            )
+            if reviewed_misses:
+                existing = facts.get("reviewed_resource_miss_locators")
+                facts["reviewed_resource_miss_locators"] = sorted({
+                    *(
+                        existing
+                        if isinstance(existing, list)
+                        else []
+                    ),
+                    *reviewed_misses,
+                })[:_MAX_REVIEWED_RESOURCE_MISSES]
+            reviewed_torrent_misses = _reviewed_torrent_miss_locators(
+                raw.get("reviewed_torrent_miss_locators"),
+            )
+            if reviewed_torrent_misses:
+                existing = facts.get("reviewed_torrent_miss_locators")
+                facts["reviewed_torrent_miss_locators"] = sorted({
+                    *(
+                        existing
+                        if isinstance(existing, list)
+                        else []
+                    ),
+                    *reviewed_torrent_misses,
+                })[:_MAX_REVIEWED_TORRENT_MISSES]
+            # Carry only the bounded deterministic-query cursor.  The raw
+            # PanSou response may contain provider URLs or diagnostics; the
+            # cursor is the sole state needed to resume the next read-only
+            # window and is validated before crossing this bridge.
+            raw_cursor = _validated_query_cursor(raw.get("query_cursor"))
+            if raw_cursor is not None:
+                facts["query_cursor"] = raw_cursor
 
     selector_unchecked = _nonnegative_int(
         selection.get("unchecked_current_tier_candidate_count"), fallback=1,
@@ -269,12 +537,12 @@ def gap_ledger_requests(
 ) -> list[dict[str, Any]]:
     """Build one runtime request per open-gap ``(media_type, tmdb_id)`` identity.
 
-    Open gaps are read from ``gap_ledger_<root_task_id>.json``; the work title,
-    original title and aliases are read from each confirmed work unit's
-    ``identity`` in ``work_units_<root_task_id>.json``.  Closed gaps and gaps
-    whose kind cannot be projected are skipped.  The result is deterministic:
-    identities sort by ``(media_type, tmdb_id)`` and gaps by
-    ``(work_unit_id, kind, gap_id)``.
+    Open gaps are read from ``gap_ledger_<root_task_id>.json``; title evidence
+    is read from each confirmed work unit's ``identity`` (including its
+    persisted C/TMDB ``decision_trace`` title aliases) in
+    ``work_units_<root_task_id>.json``. Closed gaps and gaps whose kind cannot
+    be projected are skipped. The result is deterministic: identities sort by
+    ``(media_type, tmdb_id)`` and gaps by ``(work_unit_id, kind, gap_id)``.
     """
     state_root = Path(state_root)
     identities_by_unit, identities_by_key = _work_unit_identities(
@@ -303,13 +571,12 @@ def gap_ledger_requests(
         identity = identity if isinstance(identity, Mapping) else {}
 
         title = str(identity.get("title") or "").strip()
-        original_title = str(identity.get("original_title") or "").strip()
-        raw_aliases = identity.get("aliases")
-        aliases = _nonempty_strings([
-            title,
-            original_title,
-            *(raw_aliases if isinstance(raw_aliases, list) else []),
-        ])
+        original_title = _identity_original_title(identity)
+        aliases = _identity_media_aliases(
+            identity,
+            title=title,
+            original_title=original_title,
+        )
 
         gap_rows: list[dict[str, Any]] = []
         for gap in sorted(

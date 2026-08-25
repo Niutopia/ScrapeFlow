@@ -18,3 +18,7 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# 一次性基线的废弃生成链与无关文件，不进版本库
+/tools/
+/snake-game.html

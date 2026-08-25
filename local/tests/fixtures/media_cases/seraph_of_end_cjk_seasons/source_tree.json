@@ -1,0 +1,45 @@
+{
+  "root": "/quark/影视/待刮削/终结的炽天使",
+  "children": [
+    {
+      "name": "第一季",
+      "is_dir": true,
+      "children": [
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[01][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1670494890},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[02][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2012122843},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[03][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1665711729},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[04][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2074818387},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[05][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2140709767},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[06][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2201152979},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[07][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2124367720},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[08][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1869975498},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[09][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2307031903},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[10][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1913972440},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[11][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2124223850},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[12][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2311499361},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[NCED][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 230000000},
+        {"name": "[Ygm]Seraph of the End：Vampire Reign[NCOP][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 230000000}
+      ]
+    },
+    {
+      "name": "第二季",
+      "is_dir": true,
+      "children": [
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[01][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1670494890},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[02][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2012122843},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[03][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1665711729},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[04][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2074818387},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[05][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2140709767},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[06][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2201152979},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[07][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2124367720},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[08][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1869975498},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[09][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2307031903},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[10][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 1913972440},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[11][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2124223850},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[12][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 2311499361},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[NCED][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 230000000},
+        {"name": "[Ygm]Seraph of the End：Battle in Nagoya[NCOP][Ma10p_2160p][x265_flac].mkv", "is_dir": false, "size": 230000000}
+      ]
+    }
+  ]
+}

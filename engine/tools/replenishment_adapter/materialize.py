@@ -28,7 +28,7 @@ def _require_executable_torrent_bundle(selection_wrapper: Mapping[str, Any]) -> 
 
 
 class LocalTorrentMaterializer:
-    """Injectable boundary for preflight and isolated acquisition."""
+    """Injectable boundary for candidate checks and task-scoped acquisition."""
 
     def preflight(
         self,
@@ -77,24 +77,4 @@ class LocalTorrentMaterializer:
         _impl._verify_remote_uploads(client, remote_root, uploaded)
 
 
-_DEFAULT = LocalTorrentMaterializer()
-
-
-def preflight(
-    selection_wrapper: Mapping[str, Any],
-    workspace: Path,
-    *,
-    resume_workspace: Path | None = None,
-) -> dict[str, Any]:
-    return _DEFAULT.preflight(
-        selection_wrapper, workspace, resume_workspace=resume_workspace,
-    )
-
-
-def acquire(
-    selection_wrapper: Mapping[str, Any], workspace: Path,
-) -> dict[str, Any]:
-    return _DEFAULT.acquire(selection_wrapper, workspace, automatic=True)
-
-
-__all__ = ["LocalTorrentMaterializer", "acquire", "preflight"]
+__all__ = ["LocalTorrentMaterializer"]

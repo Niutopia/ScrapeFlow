@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import posixpath
 import os
-import re
 from dataclasses import dataclass
 
 
@@ -14,15 +13,10 @@ REPLENISHMENT_ROOT = f"{MEDIA_ROOT}/ScrapeFlow/补源"
 CATEGORY_ROOTS = {
     "tv": f"{MEDIA_ROOT}/番剧",
     "series": f"{MEDIA_ROOT}/番剧",
-    "us_tv": f"{MEDIA_ROOT}/美剧",
+    "us_tv": f"{MEDIA_ROOT}/欧美剧",
     "movie": f"{MEDIA_ROOT}/电影",
     "collection": f"{MEDIA_ROOT}/电影",
 }
-
-_ACCEPTANCE_ROOT_RE = re.compile(
-    r"^(?P<parent>/.+/ScrapeFlow/验收)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:/.*)?$"
-)
-
 
 def _normalize(path: str) -> str:
     normalized = posixpath.normpath("/" + path.lstrip("/"))
@@ -48,38 +42,27 @@ def _within(path: str, parent: str) -> bool:
 
 
 def _configured_media_root() -> str:
-    """Return the same media root contract used by the API composition root.
-
-    The constants above remain the production defaults for compatibility, but
-    routing validation must also understand an isolated acceptance root.  This
-    function intentionally reads only the public root setting; credentials and
-    runtime state never participate in placement decisions.
-    """
+    """Return the media root contract used by the API composition root."""
     value = os.getenv("SCRAPEFLOW_MEDIA_ROOT", "").strip()
     if not value:
         return MEDIA_ROOT
-    return _validate_media_root(value, field="SCRAPEFLOW_MEDIA_ROOT")
+    configured = _validate_media_root(value, field="SCRAPEFLOW_MEDIA_ROOT")
+    if configured != MEDIA_ROOT:
+        raise ValueError("SCRAPEFLOW_MEDIA_ROOT 必须是 /quark/影视")
+    return MEDIA_ROOT
 
 
 def _path_media_root(source: str, target: str, explicit: str | None) -> str:
     if explicit is not None:
         return _validate_media_root(explicit)
-    configured = _configured_media_root()
-    # A planner can be invoked directly (without the API passing its root),
-    # including for an isolated acceptance run. Infer only the narrowly named
-    # ScrapeFlow acceptance namespace; arbitrary shared prefixes stay synthetic.
-    for candidate in (source, target):
-        match = _ACCEPTANCE_ROOT_RE.match(candidate)
-        if match:
-            return f"{match.group('parent')}/{match.group('run')}"
-    return configured
+    return _configured_media_root()
 
 
 def _category_roots(media_root: str) -> dict[str, str]:
     return {
         "tv": f"{media_root}/番剧",
         "series": f"{media_root}/番剧",
-        "us_tv": f"{media_root}/美剧",
+        "us_tv": f"{media_root}/欧美剧",
         "movie": f"{media_root}/电影",
         "collection": f"{media_root}/电影",
     }
@@ -108,7 +91,7 @@ def validate_routing(
 ) -> RoutingContext:
     """Validate the one-way intake -> direct category-root contract.
 
-    Synthetic test roots remain supported. As soon as either path enters the
+    Non-production roots remain supported for focused tests. As soon as either path enters the
     real `/quark/影视` namespace, both sides must obey the production contract.
     """
     source = _normalize(source_root)
@@ -162,8 +145,7 @@ def placement_for(
 ) -> PlacementDecision:
     """Return a placement decision under one explicit root contract.
 
-    Callers that know their isolated/production media root should pass it
-    through instead of relying on the process environment.  The optional
+    Callers may pass the configured media root explicitly.  The optional
     keyword preserves the two-argument API used by older planner fixtures.
     """
     source = _normalize(source_root)
@@ -178,6 +160,6 @@ def placement_for(
             if _within(context.source_root, root + "/ScrapeFlow/补源")
             else "unscraped_to_direct_category"
             if context.production_library
-            else "isolated_roots"
+            else "test_roots"
         ),
     )

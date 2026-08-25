@@ -9,6 +9,8 @@ from engine.scrapeflow.subtitle_content import (
     merge_bilingual_subtitle,
     normalize_subtitle_language,
     parse_subtitle_document,
+    validate_exported_srt_sidecar,
+    validate_managed_subtitle_content,
 )
 
 
@@ -17,6 +19,90 @@ def _utf8(text: str) -> bytes:
 
 
 class SubtitleContentTests(unittest.TestCase):
+    def test_managed_selector_prefers_same_file_bilingual_then_sc_then_tc(self) -> None:
+        bilingual = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "这是简体中文字幕。\nこれはテストです。\n\n"
+            "2\n00:00:04,000 --> 00:00:06,000\n"
+            "我们现在开始测试。\nいま始めます。\n"
+        )
+        simplified = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n"
+        )
+        traditional = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n這是繁體中文字幕。\n"
+        )
+        bilingual_verdict = validate_managed_subtitle_content(
+            bilingual, "ja", declared_size=len(bilingual),
+        )
+        simplified_verdict = validate_managed_subtitle_content(
+            simplified, "ja", declared_size=len(simplified),
+        )
+        traditional_verdict = validate_managed_subtitle_content(
+            traditional, "ja", declared_size=len(traditional),
+        )
+        self.assertEqual(bilingual_verdict["status"], "satisfied")
+        self.assertEqual(bilingual_verdict["preference"], 0)
+        self.assertEqual(bilingual_verdict["selection"], "bilingual")
+        self.assertEqual(simplified_verdict["preference"], 1)
+        self.assertEqual(traditional_verdict["preference"], 2)
+        # Two independent Chinese files are merely two fallback lanes; the
+        # validator never synthesizes a bilingual result from them.
+        self.assertNotEqual(simplified_verdict["selection"], "bilingual")
+        self.assertNotEqual(traditional_verdict["selection"], "bilingual")
+
+    def test_managed_selector_accepts_traditional_bilingual_same_file(self) -> None:
+        bilingual = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "這是繁體中文字幕。\nこれはテストです。\n"
+        )
+        verdict = validate_managed_subtitle_content(
+            bilingual, "ja", declared_size=len(bilingual),
+        )
+        self.assertEqual(verdict["status"], "satisfied")
+        self.assertEqual(verdict["preference"], 0)
+        self.assertEqual(verdict["chinese_language"], "traditional_chinese")
+
+    def test_managed_selector_rejects_size_drift_and_non_srt(self) -> None:
+        valid = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n"
+        )
+        drift = validate_managed_subtitle_content(
+            valid, declared_size=len(valid) + 1,
+        )
+        ass = validate_managed_subtitle_content(
+            _utf8(
+                "[Events]\n"
+                "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,这是测试\n"
+            ),
+        )
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(ass["status"], "unknown")
+
+    def test_exported_sc_and_tc_srt_txt_are_independent_normalized_candidates(self) -> None:
+        simplified = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n"
+        )
+        traditional = _utf8(
+            "1\n00:00:01,000 --> 00:00:03,000\n這是繁體中文字幕。\n"
+        )
+        sc = validate_exported_srt_sidecar(
+            "Show.S01E01.sc.srt.txt", simplified, declared_size=len(simplified),
+        )
+        tc = validate_exported_srt_sidecar(
+            "Show.S01E01.tc.srt.txt", traditional, declared_size=len(traditional),
+        )
+        self.assertIsNotNone(sc)
+        self.assertIsNotNone(tc)
+        assert sc is not None and tc is not None
+        self.assertEqual(sc.normalized_name, "Show.S01E01.zh-CN.srt")
+        self.assertEqual(tc.normalized_name, "Show.S01E01.zh-TW.srt")
+        self.assertEqual(sc.marker, "sc")
+        self.assertEqual(tc.marker, "tc")
+        self.assertIsNone(validate_exported_srt_sidecar(
+            "Show.S01E01.sc.srt.txt", b"not an SRT", declared_size=10,
+        ))
+
     def test_srt_simplified_chinese_satisfies_zh(self) -> None:
         result = classify_subtitle_content(
             _utf8("1\n00:00:01,000 --> 00:00:02,000\n这是一个测试\n"),

@@ -206,6 +206,37 @@ def load_gap_ledger(state_root: Path, root_task_id: str) -> list[Gap]:
     return output
 
 
+def _load_gap_ledger_strict(state_root: Path, root_task_id: str) -> list[Gap]:
+    """Read one ledger without treating corruption as an empty ledger.
+
+    The public/tolerant loader is useful for dashboard aggregation over old
+    local state.  A J-step registration is different: it is about to make a
+    durable claim that missing coordinates were recorded, so an unreadable or
+    malformed existing ledger must stop that claim rather than be silently
+    replaced by an empty list.
+    """
+    path = _ledger_path(state_root, root_task_id)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("缺口账本无法读取") from exc
+    if not isinstance(raw, list):
+        raise ValueError("缺口账本格式无效")
+    output: list[Gap] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("缺口账本包含无效条目")
+        try:
+            output.append(Gap.from_dict(item))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("缺口账本包含无法验证的条目") from exc
+        if len(output) > MAX_GAPS_PER_LEDGER:
+            raise ValueError("缺口账本超过安全上限")
+    return output
+
+
 def save_gap_ledger(
     state_root: Path,
     root_task_id: str,
@@ -244,9 +275,10 @@ def discover_episode_gaps(
         coordinate = parse_gap_token(token)
         if coordinate is not None:
             actual.add(coordinate)
+    ledger = _load_gap_ledger_strict(state_root, root_task_id)
     existing = {
         gap.gap_id: gap
-        for gap in load_gap_ledger(state_root, root_task_id)
+        for gap in ledger
         if gap.work_unit_id == work_unit_id
     }
     # A coordinate is a root-level fact: two units of the same series (e.g.
@@ -254,7 +286,7 @@ def discover_episode_gaps(
     # same (media_type, tmdb_id, season, episode) as separate open rows.
     open_coordinates = {
         (gap.media_type, gap.tmdb_id, gap.season, int(episode))
-        for gap in load_gap_ledger(state_root, root_task_id)
+        for gap in ledger
         if gap.kind == "missing_episode"
         and gap.status == "open"
         and isinstance(gap.episodes, (list, tuple))
@@ -277,7 +309,6 @@ def discover_episode_gaps(
             if (media_type, tmdb_id, season, episode) in open_coordinates:
                 continue
             missing.append((season, episode))
-    ledger = load_gap_ledger(state_root, root_task_id)
     for coordinate in missing:
         token = gap_token(*coordinate)
         gap_id = _episode_gap_id(work_unit_id, token)
@@ -297,10 +328,16 @@ def discover_episode_gaps(
             status="open",
         ))
     save_gap_ledger(state_root, root_task_id, ledger)
-    return [
-        gap for gap in load_gap_ledger(state_root, root_task_id)
-        if gap.work_unit_id == work_unit_id
-    ]
+    # A local write is not accepted until an exact strict readback proves all
+    # pre-existing and newly-added IDs survived.  This keeps J fail-closed on
+    # a damaged filesystem/ledger instead of returning an indistinguishable
+    # empty gap list.
+    readback = _load_gap_ledger_strict(state_root, root_task_id)
+    expected_by_id = {gap.gap_id: gap.as_dict() for gap in ledger}
+    actual_by_id = {gap.gap_id: gap.as_dict() for gap in readback}
+    if actual_by_id != expected_by_id:
+        raise ValueError("缺口账本写后回读不一致")
+    return [gap for gap in readback if gap.work_unit_id == work_unit_id]
 
 
 def register_subtitle_gap(

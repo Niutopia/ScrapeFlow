@@ -21,6 +21,7 @@ import os
 import posixpath
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
 from .archive import (
@@ -41,11 +42,11 @@ from .archive import (
     normalize_member_path,
 )
 from .media_policy import (
-    ARCHIVE_EXTENSIONS,
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    classify_filename,
     extension,
-    is_archive_filename,
+    is_container_candidate_filename,
 )
 from .remote_paths import join_remote, normalize_remote_path, split_remote
 
@@ -197,6 +198,38 @@ class ArchivePreprocessResult:
 _PASSWORD_NAME_HINT_RE = re.compile(r"(?:密码|password|passwd|pwd|pass)", re.I)
 _REMOTE_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Office documents, EPUB/CBZ books, and several other harmless residuals are
+# internally ZIP-based.  Byte magic alone must not turn a ``.docx`` notice
+# beside otherwise ordinary episodes into a media archive, because that would
+# either wrongly extract it or block the source as a mixed archive/media tree.
+# Conversely, a ZIP/7z/RAR signature under a video/unknown name is exactly the
+# renamed-container case that needs the safe staging lane.  Candidate suffixes
+# (archive, disc image, executable) always retain their stricter byte-level
+# treatment regardless of any coarse residual category.
+_ARCHIVE_BEARING_RESIDUAL_KINDS = frozenset({
+    "audio", "document", "font", "image", "manifest", "subtitle", "temporary",
+})
+
+
+def _archive_magic_requires_preprocessing(name: str, detection: object) -> bool:
+    """Whether proven archive bytes are an intake container, not a residual.
+
+    The detector has already proved that the object is readable by the bounded
+    archive lane.  This routing decision is about *source role*, not trust:
+    well-known residual formats such as DOCX retain their ordinary residual
+    role even though their payload happens to be a ZIP, and a ``[Fonts].exe``
+    self-extracting font installer stays a font residual rather than a media
+    container.  Any archive/disc/EXE suffix that is not such a residual, a
+    video-like suffix, or an unknown suffix remains a candidate container and
+    is never silently consumed as a residual.
+    """
+    if not bool(getattr(detection, "is_archive", False)):
+        return False
+    category = classify_filename(name)
+    if category in _ARCHIVE_BEARING_RESIDUAL_KINDS:
+        return False
+    return True
+
 
 def _redactor(values: Iterable[str]) -> Callable[[str], str]:
     secrets = tuple(value for value in values if isinstance(value, str) and value)
@@ -278,6 +311,19 @@ def _entry_name(entry: Mapping[str, Any]) -> str | None:
 
 
 def _entry_size(entry: Mapping[str, Any]) -> int | None:
+    """Return a positive declared size for bounded content reads.
+
+    Callers that need to distinguish an explicitly empty remote object from
+    an unavailable size use :func:`_declared_entry_size` below.  Keeping this
+    legacy projection positive-only preserves the password-marker budget
+    semantics.
+    """
+    parsed = _declared_entry_size(entry)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _declared_entry_size(entry: Mapping[str, Any]) -> int | None:
+    """Return an exact non-negative provider size when one was declared."""
     value = entry.get("size")
     if isinstance(value, bool):
         return None
@@ -285,7 +331,7 @@ def _entry_size(entry: Mapping[str, Any]) -> int | None:
         parsed = int(value)
     except (TypeError, ValueError):
         return None
-    return parsed if parsed > 0 else None
+    return parsed if parsed >= 0 else None
 
 
 def _decode_marker_prefix(data: bytes) -> str:
@@ -423,7 +469,7 @@ def _ensure_local_staging(
         raise ArchivePreprocessingError("task staging root is not a directory")
     # The caller may have inspected archive metadata for a while before it
     # reaches this local write.  Check again at the actual mkdir boundary so
-    # a withdrawn RootJob pilot cannot allocate a new staging tree.
+    # a paused or deselected RootJob cannot allocate a new staging tree.
     _pause_checkpoint(pause_requested)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
@@ -450,6 +496,17 @@ def _fresh_child(
             return candidate
         candidate = root / f"{name}-{index + 1:02d}"
     raise ArchivePreprocessingError("task staging contains too many archive attempts")
+
+
+def _archive_parent_relative(remote: str, source_root: str) -> str:
+    """Return the archive's enclosing folder relative to the source root."""
+    parent = posixpath.dirname(remote.rstrip("/"))
+    root = source_root.rstrip("/")
+    if parent == root or parent == "/" or not parent:
+        return ""
+    if parent.startswith(root + "/"):
+        return parent[len(root) + 1:]
+    return posixpath.basename(parent)
 
 
 def _prepared_from_extraction(
@@ -651,6 +708,7 @@ class ArchivePreprocessingAdapter:
             source_adapter = AListArchiveSource(source_port)
         archives: list[str] = []
         direct_media: list[str] = []
+        renamed_media: list[tuple[str, str, int]] = []
         marker_texts: list[str] = []
         stack = [root]
         visited: set[str] = set()
@@ -681,6 +739,20 @@ class ArchivePreprocessingAdapter:
                 if raw.get("is_dir") is True:
                     stack.append(full)
                     continue
+                # A provider-declared empty object cannot contain an archive
+                # signature or an executable ``MZ`` header.  Some AList
+                # storage backends correctly list such placeholder/readme
+                # files but reject their file-link Range requests.  Do not
+                # turn a harmless zero-byte residual into a pre-planning I/O
+                # failure; retain filename-based safety classification before
+                # skipping the impossible magic probe.
+                declared_size = _declared_entry_size(raw)
+                if declared_size == 0:
+                    if is_container_candidate_filename(name):
+                        raise ArchiveMagicError("零字节容器/伪装文件不能安全预处理")
+                    if _kind_for_path(name) is not None:
+                        direct_media.append(full)
+                    continue
                 try:
                     prefix = source_adapter.read_prefix(
                         full, max_bytes=self.limits.max_magic_scan_bytes,
@@ -690,11 +762,31 @@ class ArchivePreprocessingAdapter:
                 except Exception as exc:
                     raise ArchivePreprocessingError("无法读取来源文件前缀") from exc
                 detection = detect_magic(prefix, filename=name)
-                if detection.is_archive or is_archive_filename(name):
+                if _archive_magic_requires_preprocessing(name, detection):
                     archives.append(full)
+                    continue
+                if classify_filename(name) == "font":
+                    # A ``[Fonts].exe`` self-extracting font installer is a
+                    # resource residual: never execute, never expand, keep it
+                    # at source while the rest of the intake proceeds.  Its
+                    # ``MZ`` header must not trip the executable boundary.
                     continue
                 if detection.kind == "executable":
                     raise ArchiveMagicError("来源目录包含可执行文件")
+                if (
+                    detection.kind == "media"
+                    and detection.format in {"mkv", "mp4"}
+                    and is_container_candidate_filename(name)
+                ):
+                    # A masquerade video (.exe/.bin with media magic) is renamed
+                    # to its real container extension; the executable-named
+                    # object is never executed.
+                    renamed_media.append(
+                        (full, f"{Path(name).stem}.{detection.format}", _entry_size(raw) or 0)
+                    )
+                    continue
+                if is_container_candidate_filename(name):
+                    raise ArchiveMagicError("来源目录容器/伪装文件魔数未知")
                 # The canonical media policy classifies names, while magic is
                 # a separate archive/executable safety boundary.  Requiring
                 # MKV/MP4-only magic here made AVI/TS/M2TS silently disappear
@@ -707,15 +799,68 @@ class ArchivePreprocessingAdapter:
                         marker = _decode_marker_prefix(prefix[:64 * 1024])
                         if marker:
                             marker_texts.append(marker)
+        if renamed_media and not archives and not direct_media:
+            staging_root = _ensure_local_staging(
+                Path(task_staging).resolve(), pause_requested=pause_requested,
+            )
+            renamed_root = _fresh_child(staging_root, "renamed", pause_requested=pause_requested)
+            local_files: list[PreparedArchiveFile] = []
+            marker_values: list[str] = []
+            for full, new_name, size in renamed_media:
+                _pause_checkpoint(pause_requested)
+                if size <= 0:
+                    raise ArchivePreprocessingError("伪装视频大小为 0")
+                dest = renamed_root / new_name
+                source_adapter.download(full, dest, expected_size=size)
+                if dest.stat().st_size != size:
+                    raise ArchivePreprocessingError("伪装视频下载大小不一致")
+                marker_values.extend(_path_marker_values(full))
+                local_files.append(PreparedArchiveFile(
+                    path=str(dest.resolve()),
+                    relative_path=new_name,
+                    size=size,
+                    kind="video",
+                    origin="passthrough",
+                    _password_values=_path_marker_values(full),
+                ))
+            remote_root = join_remote(remote_staging_root, "renamed")
+            uploaded = self._upload_outputs(
+                local_files, renamed_root, remote_root, source_port,
+                pause_requested=pause_requested,
+            )
+            return ArchivePreprocessResult(
+                ingress="ordinary",
+                source_path=remote_root,
+                task_staging=str(Path(task_staging).resolve()),
+                files=tuple(uploaded),
+                changed=True,
+                _password_values=tuple(dict.fromkeys(marker_values)),
+            )
         if not archives:
             return ArchivePreprocessResult(
                 ingress="ordinary",
                 source_path=root,
                 task_staging=str(Path(task_staging).resolve()),
             )
-        if len(archives) > self.max_archives or direct_media:
+        if direct_media:
             raise ArchiveMultiplicityError(
-                "普通入站归档必须是单一归档且不能混入直接媒体"
+                "普通入站归档不能混入直接媒体"
+            )
+        if len(archives) > 1:
+            # A masquerade batch (one SFX/ISO per episode) is expanded archive
+            # by archive into one shared staging directory, preserving each
+            # archive's enclosing season folder so B/W still sees the season
+            # structure.  The executable-named wrappers are never executed.
+            return self._prepare_multiple_remote_archives(
+                archives,
+                source_adapter,
+                source_port,
+                task_staging,
+                remote_staging_root=remote_staging_root,
+                retry_password=retry_password,
+                source_tree_markers=marker_texts,
+                pause_requested=pause_requested,
+                source_root=root,
             )
         selected = (
             selected_by_archive.get(archives[0])
@@ -735,6 +880,99 @@ class ArchivePreprocessingAdapter:
             retry_password=retry_password,
             source_tree_markers=marker_texts,
             pause_requested=pause_requested,
+        )
+
+    def _prepare_multiple_remote_archives(
+        self,
+        archives: Sequence[str],
+        source_adapter: Any,
+        source_port: Any,
+        task_staging: str | Path,
+        *,
+        remote_staging_root: str,
+        retry_password: str | None,
+        source_tree_markers: Iterable[str],
+        pause_requested: Callable[[], bool] | None,
+        source_root: str,
+    ) -> ArchivePreprocessResult:
+        """Expand a masquerade batch (one SFX/ISO per episode) archive by archive.
+
+        Each wrapper is 7-Zip read-only listed and bounded-extracted into a
+        shared staging tree; the enclosing season folder is preserved as the
+        relative path prefix so B/W still sees the season structure.  No wrapper
+        is ever executed or mounted.
+        """
+        staging_root = _ensure_local_staging(
+            Path(task_staging).resolve(), pause_requested=pause_requested,
+        )
+        all_local: list[PreparedArchiveFile] = []
+        marker_values: list[str] = []
+        for index, remote in enumerate(archives):
+            _pause_checkpoint(pause_requested)
+            candidates = _password_candidates_for_remote(
+                source_adapter,
+                remote,
+                retry_password=retry_password,
+                max_candidates=self.limits.max_password_candidates,
+                source_tree_markers=source_tree_markers,
+                pause_requested=pause_requested,
+            )
+            _pause_checkpoint(pause_requested)
+            input_root = _fresh_child(
+                staging_root, f"input-{index}", pause_requested=pause_requested,
+            )
+            listing = self.inspector.inspect_remote(
+                source_adapter,
+                remote,
+                input_root,
+                password_candidates=candidates,
+                pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
+            )
+            _pause_checkpoint(pause_requested)
+            extraction_root = _fresh_child(
+                staging_root, f"extract-{index}", pause_requested=pause_requested,
+            )
+            extracted = self.extractor.extract(
+                listing,
+                extraction_root,
+                selected=None,
+                pause_checkpoint=lambda: _pause_checkpoint(pause_requested),
+            )
+            local_files = _prepared_from_extraction(
+                extraction_root,
+                extracted,
+                password_values=_password_values(candidates),
+            )
+            parent_rel = _archive_parent_relative(remote, source_root)
+            for prepared in local_files:
+                rel = prepared.relative_path
+                if parent_rel and not rel.startswith(parent_rel + "/"):
+                    rel = f"{parent_rel}/{rel}"
+                all_local.append(PreparedArchiveFile(
+                    path=prepared.path,
+                    relative_path=rel,
+                    size=prepared.size,
+                    kind=prepared.kind,
+                    origin=prepared.origin,
+                    _password_values=prepared._password_values,
+                ))
+            marker_values.extend(_password_values(candidates))
+        remote_root = join_remote(remote_staging_root, "renamed")
+        uploaded = self._upload_outputs(
+            all_local,
+            staging_root,
+            remote_root,
+            source_port,
+            pause_requested=pause_requested,
+        )
+        return ArchivePreprocessResult(
+            ingress="ordinary",
+            source_path=remote_root,
+            task_staging=str(staging_root),
+            files=tuple(uploaded),
+            changed=True,
+            archives=tuple(archives),
+            _password_values=tuple(dict.fromkeys(marker_values)),
         )
 
     def prepare_provider_remote(
@@ -939,10 +1177,37 @@ class ArchivePreprocessingAdapter:
         self._validate_local_staging_root(staging, source_path.resolve())
         prefix = _read_local_prefix(source_path, self.limits.max_magic_scan_bytes)
         detection = detect_magic(prefix, filename=source_path.name)
-        suffix_is_archive = is_archive_filename(source_path.name)
+        suffix_requires_container_proof = is_container_candidate_filename(source_path.name)
         if not detection.is_archive:
             if detection.kind == "media":
                 kind = _kind_for_path(source_path)
+                if (
+                    kind is None
+                    and detection.format in {"mkv", "mp4"}
+                    and is_container_candidate_filename(source_path.name)
+                ):
+                    # A masquerade video (.exe/.bin with media magic) is renamed
+                    # to its real container extension in task staging; the
+                    # original executable-named object is never executed.
+                    new_name = f"{Path(source_path.name).stem}.{detection.format}"
+                    dest = staging / new_name
+                    shutil.copy2(source_path, dest)
+                    path_markers = _path_marker_values(source_path)
+                    return ArchivePreprocessResult(
+                        ingress=ingress,
+                        source_path=str(dest.resolve()),
+                        task_staging=str(staging),
+                        files=(PreparedArchiveFile(
+                            path=str(dest.resolve()),
+                            relative_path=new_name,
+                            size=dest.stat().st_size,
+                            kind="video",
+                            origin="passthrough",
+                            _password_values=path_markers,
+                        ),),
+                        changed=True,
+                        _password_values=path_markers,
+                    )
                 if kind is None:
                     raise ArchiveMagicError("source magic identifies media with unsupported suffix")
                 path_markers = _path_marker_values(source_path)
@@ -962,7 +1227,7 @@ class ArchivePreprocessingAdapter:
                 )
             if detection.kind == "executable":
                 raise ArchiveMagicError("executable source is not an archive")
-            if suffix_is_archive or reject_unknown:
+            if suffix_requires_container_proof or reject_unknown:
                 raise ArchiveMagicError("archive magic is unknown")
             # Ordinary residuals are left for the residual policy/audit; this
             # adapter has no deletion authority.
@@ -1057,10 +1322,18 @@ class ArchivePreprocessingAdapter:
             except ArchivePreprocessingError:
                 raise
             detection = detect_magic(prefix, filename=item.name)
-            if detection.is_archive or is_archive_filename(item.name):
+            if _archive_magic_requires_preprocessing(item.name, detection):
                 archive_candidates.append(item)
                 continue
-            if detection.kind == "executable" or (
+            if classify_filename(item.name) == "font":
+                # A ``[Fonts].exe`` font installer is a residual resource;
+                # its ``MZ`` header must not trip the executable boundary.
+                continue
+            if detection.kind == "executable":
+                raise ArchiveMagicError("source tree contains an executable payload")
+            if is_container_candidate_filename(item.name):
+                raise ArchiveMagicError("source tree container/masquerade magic is unknown")
+            if (
                 reject_unknown and detection.kind == "unknown"
                 and extension(item.name) in {".exe", ".bin", ".dat"}
             ):
@@ -1163,7 +1436,7 @@ class ArchivePreprocessingAdapter:
         except Exception as exc:
             raise ArchivePreprocessingError("无法读取远端归档前缀") from exc
         detection = detect_magic(prefix, filename=Path(remote).name)
-        suffix_is_archive = is_archive_filename(Path(remote).name)
+        suffix_requires_container_proof = is_container_candidate_filename(Path(remote).name)
         if not detection.is_archive:
             if detection.kind == "media":
                 kind = _kind_for_path(remote)
@@ -1191,7 +1464,7 @@ class ArchivePreprocessingAdapter:
                 )
             if detection.kind == "executable":
                 raise ArchiveMagicError("远端 executable 不是归档")
-            if suffix_is_archive or reject_unknown:
+            if suffix_requires_container_proof or reject_unknown:
                 raise ArchiveMagicError("远端归档魔数未知")
             return ArchivePreprocessResult(
                 ingress=ingress,

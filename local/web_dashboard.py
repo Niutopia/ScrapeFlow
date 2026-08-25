@@ -315,6 +315,7 @@ button:focus-visible,[role="button"]:focus-visible{
       <span class="forge-status" id="serviceStatus">正在读取状态</span>
     </div>
     <div class="forge-command-actions">
+      <button type="button" class="forge-button forge-button--quiet" id="controlButton">恢复</button>
       <button type="button" class="forge-button forge-button--quiet" id="refreshButton">刷新</button>
     </div>
   </div>
@@ -397,7 +398,7 @@ button:focus-visible,[role="button"]:focus-visible{
       <div class="forge-segment" id="shelfChoices">
         <button type="button" data-shelf="movie">电影</button>
         <button type="button" data-shelf="anime" class="is-selected">番剧</button>
-        <button type="button" data-shelf="us_tv">美剧</button>
+        <button type="button" data-shelf="us_tv">欧美剧</button>
       </div>
     </div>
     <div class="forge-modal__foot">
@@ -453,7 +454,7 @@ button:focus-visible,[role="button"]:focus-visible{
     view:savedView(), filter:"all", busy:false, loading:false, healthError:false, drawerJobId:null, selectedSource:null,
     selectedShelf:"anime", pendingAction:null
   };
-  var terminal = new Set(["completed","completed_with_gaps","executed","cancelled"]);
+  var terminal = new Set(["completed","executed","cancelled"]);
   var attention = new Set([
     "failed","failed_archive","failed_cleanup","failed_identity","failed_planning",
     "failed_provider","failed_verification","failed_write","reconciliation_uncertain",
@@ -463,7 +464,7 @@ button:focus-visible,[role="button"]:focus-visible{
     queued:"已排队",planned:"已排队",reconciling:"正在对账",reconciled:"已对账",
     needs_attention:"需要关注",archive_preprocessing:"归档预处理",identity_matching:"识别内容",
     analyzing:"分析目录",planning:"生成计划",executing:"正在写入",executing_media:"正在写入",
-    verifying:"正在核验",cleaning:"清理暂存",completed:"已完成",completed_with_gaps:"已完成（有缺口）",
+    verifying:"正在核验",cleaning:"清理暂存",completed:"已完成",gaps_pending:"缺口待闭环",
     executed:"已完成",cancelled:"已取消",failed:"失败",failed_archive:"归档失败",
     failed_cleanup:"清理失败",failed_identity:"识别失败",failed_planning:"计划失败",
     failed_provider:"补源失败",failed_verification:"验收失败",failed_write:"写入失败",
@@ -475,7 +476,7 @@ button:focus-visible,[role="button"]:focus-visible{
     pending:"等待处理",running:"处理中",waiting_reconcile:"等待安全对账",
     paused_waiting:"暂停等待"
   };
-  var shelfLabels = {movie:"电影",anime:"番剧",us_tv:"美剧"};
+  var shelfLabels = {movie:"电影",anime:"番剧",us_tv:"欧美剧"};
   var tierLabels = {quark_share:"夸克分享",magnet:"本地磁力"};
 
   function number(value){ return typeof value === "number" && isFinite(value) ? value : 0; }
@@ -484,7 +485,7 @@ button:focus-visible,[role="button"]:focus-visible{
     var bits = String(raw).split("/").filter(Boolean);
     return bits[bits.length - 1] || String(raw);
   }
-  function jobSource(job){ return job && job.source === "全库审计" ? job.id : (job && job.source || job && job.id || ""); }
+  function jobSource(job){ return job && job.source || job && job.id || ""; }
   function phaseLabel(phase){ return phaseLabels[phase] || phase || "未知状态"; }
   function phaseTone(phase){
     if(terminal.has(phase)){ return "ready"; }
@@ -502,6 +503,7 @@ button:focus-visible,[role="button"]:focus-visible{
   }
   function isAttentionJob(job){ return !!(job && attention.has(job.phase)); }
   function isTerminalJob(job){ return !!(job && terminal.has(job.phase) && !rootReplenishmentWait(job)); }
+  function isCancellableJob(job){ return !!(job && !terminal.has(job.phase) && job.phase !== "complete"); }
   function systemPaused(){
     return !!(state.health && state.health.control && state.health.control.paused === true);
   }
@@ -593,8 +595,7 @@ button:focus-visible,[role="button"]:focus-visible{
       service.className = "forge-status" + (state.healthError ? " is-bad" : "");
       return;
     }
-    var alive = !!(state.health.liveness && state.health.liveness.alive === true);
-    if(!alive){
+    if(state.health.ok !== true){
       service.textContent = "API 无响应";
       service.className = "forge-status is-bad";
     } else if(systemPaused()){
@@ -604,6 +605,10 @@ button:focus-visible,[role="button"]:focus-visible{
       service.textContent = "API 可达";
       service.className = "forge-status is-ready";
     }
+    var controlButton = $("#controlButton");
+    var selected = state.health.control && state.health.control.root_job_id;
+    controlButton.disabled = !selected || state.busy;
+    controlButton.textContent = systemPaused() ? "恢复" : "暂停";
   }
   function renderCore(){
     var waiting = state.jobs.filter(isWaiting).length;
@@ -662,11 +667,9 @@ button:focus-visible,[role="button"]:focus-visible{
     var shownPhase = displayPhase(job);
     var tier = tierFor(job);
     var action = '<button type="button" class="forge-button forge-button--small forge-button--quiet" data-action="open" data-job="' + esc(job.id) + '">查看详情</button>';
-    if(waiting){
-      action += (job.allowed_target_shelves || []).map(function(shelf){
-        return '<button type="button" class="forge-button forge-button--small forge-button--signal" data-action="start" data-job="' +
-          esc(job.id) + '" data-shelf="' + esc(shelf) + '">' + esc(shelfLabels[shelf] || shelf) + "</button>";
-      }).join("");
+    if(isCancellableJob(job)){
+      action += '<button type="button" class="forge-button forge-button--small forge-button--danger" data-action="cancel" data-job="' +
+        esc(job.id) + '">取消任务</button>';
     }
     if(detail.gaps > 0 && !waiting && !requiresRootJobSubtitleMigration(job)){
       action += '<button type="button" class="forge-button forge-button--small forge-button--danger" data-action="replenish" data-job="' +
@@ -777,9 +780,17 @@ button:focus-visible,[role="button"]:focus-visible{
     var intakeRequest = options.refreshIntake
       ? api("/api/intake/refresh",{method:"POST",body:"{}"})
       : api("/api/intake");
-    return Promise.all([api("/api/health"),api("/api/jobs"),intakeRequest]).then(function(result){
-      state.health = result[0];
+    // Health is local and fast.  Paint it as soon as it returns instead of
+    // making the header wait for an AList intake listing that may be slow or
+    // temporarily unavailable.  A failed intake refresh is shown by its own
+    // toast; it is not an API connection failure.
+    var healthRequest = api("/api/health").then(function(health){
+      state.health = health;
       state.healthError = false;
+      updateHeader();
+      return health;
+    });
+    return Promise.all([healthRequest,api("/api/jobs"),intakeRequest]).then(function(result){
       var intake = state.health && state.health.intake || {};
       state.intakeRefreshedAt = (options.refreshIntake && result[2].refreshed_at)
         || intake.last_scan_at || state.intakeRefreshedAt;
@@ -809,13 +820,14 @@ button:focus-visible,[role="button"]:focus-visible{
       return false;
     }).finally(function(){ state.loading = false; });
   }
-  function send(path,payload){
+  function send(path,payload,successMessage){
     if(state.busy){ return Promise.resolve(); }
     setBusy(true);
     return api(path,{method:"POST",body:JSON.stringify(payload || {})}).then(function(){
       return load();
-    }).then(function(){
-      toast("操作已保存");
+    }).then(function(refreshed){
+      if(!refreshed){ return null; }
+      toast(successMessage || "操作已保存");
       if(state.drawerJobId){ return loadDrawerData(state.drawerJobId); }
       return null;
     }).catch(function(error){
@@ -883,6 +895,9 @@ button:focus-visible,[role="button"]:focus-visible{
     if(isTerminalJob(job)){
       actions += '<button type="button" class="forge-button forge-button--quiet" data-action="cleanup" data-job="' + esc(job.id) + '">清理任务记录</button>';
     }
+    if(isCancellableJob(job)){
+      actions += '<button type="button" class="forge-button forge-button--danger" data-action="cancel" data-job="' + esc(job.id) + '">取消任务</button>';
+    }
     var units = view.units || [];
     var unitHtml = units.length ? units.map(unitRow).join("") : '<div class="forge-empty">暂时没有可展示的作品单元</div>';
     var unitText = detail.total ? (detail.completed + " / " + detail.total + " 已完成") : "等待单元数据";
@@ -915,10 +930,10 @@ button:focus-visible,[role="button"]:focus-visible{
     setBusy(true);
     api("/api/root-jobs",{method:"POST",body:JSON.stringify({
       path:state.selectedSource,target_shelf:state.selectedShelf
-    })}).then(function(){
+    })}).then(function(){ return api("/api/control/resume",{method:"POST",body:"{}"}); }).then(function(){
       closeCreate();
       return load();
-    }).then(function(){ toast("根任务已建立"); }).catch(function(error){
+    }).then(function(){ toast("任务已建立并开始"); }).catch(function(error){
       toast(error.message,true);
     }).finally(function(){ setBusy(false); });
   }
@@ -952,7 +967,7 @@ button:focus-visible,[role="button"]:focus-visible{
     var action = state.pendingAction;
     if(!action){ return; }
     closeConfirmation();
-    send(action.path,action.payload || {});
+    send(action.path,action.payload || {},action.successMessage);
   }
   function cleanupJob(jobId){
     askForConfirmation({
@@ -968,9 +983,25 @@ button:focus-visible,[role="button"]:focus-visible{
     askForConfirmation({
       title:"手动补源",
       message:"将按当前的补源规则手动触发一次。",
-      hint:"系统仍会先检查暂停状态、门禁和每一阶的安全限制。",
+      hint:"系统会检查暂停状态、任务归属和每一阶的安全限制。",
       confirmLabel:"开始补源",
       path:"/api/jobs/" + encodeURIComponent(jobId) + "/replenish"
+    });
+  }
+  function cancelJob(jobId){
+    var job = jobById(jobId);
+    if(!isCancellableJob(job)){
+      toast("该任务已经结束，不能取消",true);
+      return;
+    }
+    askForConfirmation({
+      title:"取消任务",
+      message:"确定取消“" + jobTitle(job) + "”吗？",
+      hint:"正在执行的步骤会在下一个安全边界停止；不会开始新的写入、移动或提交。",
+      confirmLabel:"确认取消",
+      danger:true,
+      path:"/api/jobs/" + encodeURIComponent(jobId) + "/cancel",
+      successMessage:"已请求取消任务"
     });
   }
   $("#refreshButton").addEventListener("click",function(){
@@ -987,6 +1018,10 @@ button:focus-visible,[role="button"]:focus-visible{
       setRefreshState(false);
       setBusy(false);
     });
+  });
+  $("#controlButton").addEventListener("click",function(){
+    if(state.busy){ return; }
+    send(systemPaused() ? "/api/control/resume" : "/api/control/pause",{});
   });
   $("#createButton").addEventListener("click",openCreate);
   $("#drawerClose").addEventListener("click",closeDrawer);
@@ -1035,12 +1070,9 @@ button:focus-visible,[role="button"]:focus-visible{
     event.stopPropagation();
     var name = action.dataset.action;
     if(name === "open"){ openDrawer(action.dataset.job); }
-    if(name === "start"){
-      var b = action;
-      send(`/api/jobs/${encodeURIComponent(b.dataset.job)}/start`,{target_shelf:b.dataset.shelf});
-    }
     if(name === "cleanup"){ cleanupJob(action.dataset.job); }
     if(name === "replenish"){ replenishJob(action.dataset.job); }
+    if(name === "cancel"){ cancelJob(action.dataset.job); }
     if(name === "confirm"){ confirmCandidate(action); }
   }
   $("#jobBoard").addEventListener("click",function(event){

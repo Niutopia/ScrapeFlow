@@ -57,6 +57,7 @@ _IMPLEMENTATION_NAMES = (
     "_merge_release_seasons_into_long_tmdb_season_by_major_gaps",
     "_movie_queries_from_item",
     "_normalize_cumulative_season_episode_numbers",
+    "normalize_exported_srt_entries",
     "_normalize_match_title",
     "_ova_volume_ordinal",
     "_partition_movie_groups_with_video",
@@ -175,6 +176,16 @@ def bind_compat_runtime(runtime: ModuleType) -> None:
 def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
     """Split explicit multi-season roots and retry proven absolute-number releases."""
     proven_member_season = bool(kwargs.pop("_proven_member_season", False))
+    raw_declared_seasons = kwargs.pop("source_declared_seasons", ())
+    if not isinstance(raw_declared_seasons, (tuple, list, set, frozenset)):
+        raise PlanError("来源声明季度格式无效")
+    source_declared_seasons = {
+        value
+        for value in raw_declared_seasons
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    }
+    if len(source_declared_seasons) != len(raw_declared_seasons):
+        raise PlanError("来源声明季度包含无效或重复值")
     smart_kwargs = dict(kwargs)
     # Explicit episode maps intentionally bypass smart season inference, but
     # the common post-plan resource-gap audit still consumes this collection.
@@ -207,6 +218,13 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     include_bonus=True,
                 )
             ]
+        # Normalize provider-exported SRT sidecars before smart season/movie
+        # partitioning.  The helper retains the exact source path and marks
+        # failed candidates, so the lower-level normal planner can surface a
+        # bounded problem rather than silently treating them as ``.txt``.
+        files, _exported_srt_issues = normalize_exported_srt_entries(
+            kwargs["alist"], files,
+        )
         smart_kwargs["source_files"] = files
         season_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         special_files: list[dict[str, Any]] = []
@@ -2203,6 +2221,98 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
             # sub-plan that aborts the whole series batch.
             season_groups[min(season_groups)].extend(special_files)
             special_files = []
+
+        # A season directory can legitimately contain only external subtitle
+        # sidecars while every video for that published season is absent.  It
+        # is not an executable TV sub-plan: handing it to ``build_tv_plan``
+        # turns the whole otherwise-valid multi-season work into the generic
+        # "no video" failure.  Keep the sidecars in their source directory,
+        # surface that decision in the persisted plan, and let the final
+        # official-season audit create the corresponding media gap.  This is
+        # deliberately narrow: an unplayable group containing anything other
+        # than subtitles remains a planning error, and a source with no
+        # executable season at all still fails closed below.
+        preserved_subtitle_only_seasons: dict[int, list[dict[str, Any]]] = {}
+        if season_groups and any(
+            any(
+                Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+                for item in group
+            )
+            for group in season_groups.values()
+        ):
+            executable_season_groups: dict[int, list[dict[str, Any]]] = {}
+            for season_number, group in season_groups.items():
+                has_video = any(
+                    Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+                    for item in group
+                )
+                if has_video:
+                    executable_season_groups[season_number] = group
+                    continue
+                if (
+                    season_number in source_declared_seasons
+                    and group
+                    and all(
+                    Path(str(item.get("name", ""))).suffix.lower() in SUBTITLE_EXTS
+                    for item in group
+                    )
+                ):
+                    preserved_subtitle_only_seasons[season_number] = list(group)
+                    continue
+                executable_season_groups[season_number] = group
+            if preserved_subtitle_only_seasons:
+                season_groups = defaultdict(list, executable_season_groups)
+                preserved_numbers = ", ".join(
+                    f"{number:02d}" for number in sorted(preserved_subtitle_only_seasons)
+                )
+                special_release_warnings.append(
+                    "以下季度只有外挂字幕、未发现可执行视频；字幕已保留在来源，"
+                    "将由官方季集核对登记视频缺口: Season " + preserved_numbers
+                )
+        # A single-directory whole-series counter spanning every published
+        # positive season (for example ``[01]..[48]`` for a 24+24 two-cour
+        # show) is split by each season's episode count before the ordinary
+        # season-group logic runs.  Non-episode companions stay with season 1.
+        if len(season_groups) == 1 and len(positive_seasons) >= 2:
+            _only_season, _only_group = next(iter(season_groups.items()))
+            _keys = sorted({
+                key.number
+                for item in _only_group
+                if (key := extract_episode_key(str(item.get("name", "")))) is not None
+                and key.kind == "regular"
+                and not key.end_number
+            })
+            _ordered = sorted(
+                positive_seasons,
+                key=lambda item: int(item["season_number"]),
+            )
+            _counts = [int(item["episode_count"]) for item in _ordered]
+            if (
+                _keys
+                and _keys[0] == 1
+                and _keys == list(range(1, _keys[-1] + 1))
+                and _keys[-1] == sum(_counts)
+            ):
+                _split: dict[int, list[dict[str, Any]]] = defaultdict(list)
+                _offset = 0
+                for _season_item, _count in zip(_ordered, _counts):
+                    _season_number = int(_season_item["season_number"])
+                    _lo = _offset + 1
+                    _hi = _offset + _count
+                    _split[_season_number] = [
+                        item
+                        for item in _only_group
+                        if (key := extract_episode_key(str(item.get("name", "")))) is not None
+                        and key.kind == "regular"
+                        and _lo <= key.number <= _hi
+                    ]
+                    _offset = _hi
+                for item in _only_group:
+                    if extract_episode_key(str(item.get("name", ""))) is None:
+                        _split[int(_ordered[0]["season_number"])].append(item)
+                season_groups = defaultdict(
+                    list, {s: g for s, g in _split.items() if g}
+                )
         should_split = bool(movie_groups or child_tv_plans) or (
             bool(season_groups)
             and (
@@ -2211,6 +2321,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 len(season_groups) >= 2
                 or bool(special_files)
                 or bool(edition_group_warnings)
+                or bool(preserved_subtitle_only_seasons)
                 or bool(retained_future_media)
                 or bool(retained_unpublished_season_media)
                 or next(iter(season_groups)) != int(kwargs.get("season") or 1)
@@ -2383,7 +2494,24 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                         for subplan in [*subplans, *movie_plans]
                         for gap in (subplan.scan_report.get("resource_gaps") or [])
                         if isinstance(gap, Mapping)
-                    ]
+                    ],
+                    "deferred_subtitle_only_seasons": [
+                        {
+                            "kind": "subtitle_only_declared_season",
+                            "season": season_number,
+                            "source_paths": sorted(
+                                str(item["full_path"])
+                                for item in season_files
+                            ),
+                            "reason": (
+                                "该季未发现视频；外挂字幕保留在来源，"
+                                "不作为无视频正式库写入"
+                            ),
+                        }
+                        for season_number, season_files in sorted(
+                            preserved_subtitle_only_seasons.items()
+                        )
+                    ],
                 },
             )
             missing_season_gaps = _tv_season_resource_gaps(
@@ -2420,14 +2548,22 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
             canonical_warnings: list[str] = []
             if movie_plans:
                 # These movies were independently identified from tagged or
-                # bounded source groups.  They share an execution plan with
-                # the TV work, but no parent/child work relation was proven.
-                # Keep all exact identities as siblings at the already-safe
-                # movie parent and disable title-derived family containers.
+                # bounded source groups.  When a movie is nested under the main
+                # TV work (``movie_parent == first.target_root``), the TV owns
+                # the container root, so it must not be re-nested under a
+                # same-named directory-only container; passing the TV identity
+                # keeps its root stable while each film stays a child leaf.
+                # A franchise-root sibling keeps the old sibling layout.
+                root_identity = (
+                    WorkIdentity("tmdb.tv", int(first.metadata["tmdb_id"]))
+                    if movie_parent == first.target_root
+                    else None
+                )
                 _movie_root, movie_tree_warnings, _movie_tree_posters = (
                     _plan_canonical_batch_tree(
                         [plan],
                         outer_root=movie_parent,
+                        root_identity=root_identity,
                         allow_family_boundaries=False,
                     )
                 )

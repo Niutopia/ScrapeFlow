@@ -88,6 +88,19 @@ def plan_from_dict(raw: Mapping[str, Any]) -> Plan:
             episode_key=_text(item.get("episode_key"), f"files[{index}].episode_key", optional=True),
             source_size=_size(item.get("source_size"), f"files[{index}].source_size"),
             source_modified=_text(item.get("source_modified"), f"files[{index}].source_modified", optional=True),
+            source_media_kind=_text(
+                item.get("source_media_kind"),
+                f"files[{index}].source_media_kind",
+                optional=True,
+            ),
+            subtitle_validation=(
+                _object(
+                    item["subtitle_validation"],
+                    f"files[{index}].subtitle_validation",
+                )
+                if item.get("subtitle_validation") is not None
+                else None
+            ),
         ))
 
     cleanup: list[PlannedCleanup] = []
@@ -154,7 +167,7 @@ def _subtitle_companion_key(target_dir: str, final_name: str) -> tuple[str, str]
     """
     stem = Path(final_name).stem
     stem = re.sub(
-        r"\.(?:zh-CN|zh-TW|en|ja)(?:\.\d+)*$|\.subtitle(?:\.\d+|\d*)$",
+        r"\.(?:zh-CN(?:-bilingual-(?:ja|en|ko))?|zh-TW|en|ja)(?:\.\d+)*$|\.subtitle(?:\.\d+|\d*)$",
         "",
         stem,
         flags=re.IGNORECASE,
@@ -165,6 +178,20 @@ def _subtitle_companion_key(target_dir: str, final_name: str) -> tuple[str, str]
 def _subtitle_track_rank(items: list[PlannedFile]) -> tuple[object, ...]:
     """Return a deterministic, current-policy rank for one logical track."""
     representative = min(items, key=lambda item: _collision_key(item.source_path))
+    managed_preferences = [
+        int(proof["preference"])
+        for item in items
+        for proof in [item.subtitle_validation]
+        if isinstance(proof, Mapping)
+        and str(proof.get("status") or "").casefold() == "satisfied"
+        and isinstance(proof.get("preference"), int)
+        and not isinstance(proof.get("preference"), bool)
+        and 0 <= int(proof["preference"]) <= 2
+    ]
+    # A content proof outranks every filename-derived language hint.  In
+    # particular, a verified same-file bilingual track (0) must beat a
+    # separately supplied SC (1), while SC still beats TC (2).
+    managed_rank = min(managed_preferences, default=3)
     language_rank = {
         "zh-CN": 0,
         "zh-TW": 1,
@@ -193,6 +220,7 @@ def _subtitle_track_rank(items: list[PlannedFile]) -> tuple[object, ...]:
         re.IGNORECASE,
     ) else 1
     return (
+        managed_rank,
         language_rank,
         subset_rank,
         extension_rank,
@@ -229,28 +257,77 @@ def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
     demoted_ids: set[int] = set()
     demoted: list[dict[str, str]] = []
     for track_groups in tracks.values():
-        if len(track_groups) <= 1:
+        managed_present = any(
+            isinstance(item.subtitle_validation, Mapping)
+            for items in track_groups.values()
+            for item in items
+        )
+        managed_valid_groups = {
+            key: items
+            for key, items in track_groups.items()
+            if any(
+                isinstance(item.subtitle_validation, Mapping)
+                and str(item.subtitle_validation.get("status") or "").casefold()
+                == "satisfied"
+                and isinstance(item.subtitle_validation.get("preference"), int)
+                and not isinstance(item.subtitle_validation.get("preference"), bool)
+                and 0 <= int(item.subtitle_validation["preference"]) <= 2
+                for item in items
+            )
+        }
+        if not managed_present and len(track_groups) <= 1:
             continue
-        preferred_key, preferred_items = min(
-            track_groups.items(),
-            key=lambda pair: _subtitle_track_rank(pair[1]),
-        )
-        preferred_path = min(
-            (item.source_path for item in preferred_items),
-            key=_collision_key,
-        )
+        # When at least one strict SRT proof exists, every other track—including
+        # an unproven legacy ASS/VTT track—is residual.  If all strict
+        # candidates failed proof, do not write any of those candidates.
+        eligible_groups = managed_valid_groups if managed_present else track_groups
+        if not eligible_groups:
+            preferred_key = None
+            preferred_items: list[PlannedFile] = []
+            preferred_path = None
+        else:
+            preferred_key, preferred_items = min(
+                eligible_groups.items(),
+                key=lambda pair: _subtitle_track_rank(pair[1]),
+            )
+            preferred_path = min(
+                (item.source_path for item in preferred_items),
+                key=_collision_key,
+            )
         for track_key, items in track_groups.items():
             if track_key == preferred_key:
                 continue
+            group_has_invalid_managed_proof = any(
+                isinstance(item.subtitle_validation, Mapping)
+                and not (
+                    str(item.subtitle_validation.get("status") or "").casefold()
+                    == "satisfied"
+                    and isinstance(item.subtitle_validation.get("preference"), int)
+                    and not isinstance(item.subtitle_validation.get("preference"), bool)
+                    and 0 <= int(item.subtitle_validation["preference"]) <= 2
+                )
+                for item in items
+            )
             for item in items:
                 demoted_ids.add(id(item))
-                demoted.append({
+                row = {
                     "source_path": item.source_path,
                     "planned_target_path": join_remote(item.target_dir, item.final_name),
                     "action": "defer_until_exact_video_subtitle_closure",
-                    "reason": "alternate_subtitle_track",
-                    "preferred_source_path": preferred_path,
-                })
+                    "reason": (
+                        "managed_subtitle_unverified"
+                        if group_has_invalid_managed_proof
+                        or (managed_present and not managed_valid_groups)
+                        else (
+                            "managed_subtitle_lower_priority"
+                            if managed_present
+                            else "alternate_subtitle_track"
+                        )
+                    ),
+                }
+                if preferred_path is not None:
+                    row["preferred_source_path"] = preferred_path
+                demoted.append(row)
     if not demoted_ids:
         return
 

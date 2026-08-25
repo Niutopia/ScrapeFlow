@@ -292,7 +292,7 @@ def delegated_quark_session(alist_client: Any, destination: str) -> QuarkSession
         # AList v3.62 names this field ``root_folder_id``.  Older storage
         # rows used ``root_id``.  A missing or malformed modern field must
         # never silently fall back to account root ("0"), because that could
-        # turn a dedicated acceptance mount into a writer for the whole Quark
+        # turn a dedicated task mount into a writer for the whole Quark
         # account.  When both schema variants appear, require them to agree.
         if "root_folder_id" in addition:
             root_id = addition["root_folder_id"]

@@ -21,7 +21,6 @@ from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 
 from local.scrapeflow_api.root_replenishment import (
-    PreUpgradeAListStateError,
     _validate_root_subtitle_content,
     load_root_replenishment_state,
     run_root_replenishment,
@@ -152,12 +151,14 @@ class _FakeSubtitleMaterializer:
         payload: bytes | None = None,
         bilingual: bool = False,
         original_language: str | None = None,
+        subtitle_language: str | None = None,
         error: Exception | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None:
         self.payload = payload
         self.bilingual = bilingual
         self.original_language = original_language
+        self.subtitle_language = subtitle_language
         self.error = error
         self.events = events
 
@@ -197,6 +198,8 @@ class _FakeSubtitleMaterializer:
                 "gap_ids": [gap["id"]],
                 "kind": "subtitle",
                 "bilingual": self.bilingual,
+                **({"subtitle_language": self.subtitle_language}
+                   if self.subtitle_language else {}),
                 **({"original_language": self.original_language}
                    if self.original_language else {}),
                 **({"subtitle_marker": {
@@ -581,12 +584,144 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(result["tier"], "quark_share")
             self.assertEqual(result["waiting"], "retry_wait")
             self.assertEqual(result["attempts"][0]["outcome"], "infrastructure")
+            self.assertIn("error", result["attempts"][0])
+            ledger = load_gap_ledger(state_root, "root-1")
+            self.assertEqual(len(ledger[0].attempts), 1)
+            self.assertEqual(ledger[0].attempts[0].status, "infrastructure")
+            self.assertIn("当前层等待重试", ledger[0].attempts[0].error or "")
             self.assertEqual(
                 load_root_replenishment_state(state_root, "root-1")[
                     "exhaustion_proof_by_provider"
                 ],
                 {},
             )
+
+    def test_clean_capped_pansou_misses_are_scoped_and_do_not_fake_infrastructure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            seen: list[dict[str, Any]] = []
+
+            def clean_incomplete_search(request):
+                seen.append(dict(request))
+                return {
+                    "candidates": [],
+                    "unchecked_secondary_candidates": 1,
+                    "source_telemetry": {
+                        "PanSou": {
+                            "configured": True,
+                            "source_exhausted": False,
+                            "infrastructure_failures": 0,
+                            "status": "incomplete",
+                            "reviewed_resource_miss_locators": [
+                                "quark_share:fixtureShare01",
+                            ],
+                        },
+                    },
+                }
+
+            first = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=clean_incomplete_search,
+            )
+            state = load_root_replenishment_state(state_root, "root-1")
+            ledger_attempt_status = load_gap_ledger(
+                state_root, "root-1",
+            )[0].attempts[-1].status
+            second = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=clean_incomplete_search,
+            )
+
+        self.assertEqual(first["tier"], "quark_share")
+        self.assertEqual(first["waiting"], "retry_wait")
+        self.assertEqual(first["attempts"][0]["outcome"], "candidate")
+        self.assertEqual(ledger_attempt_status, "candidate_failed")
+        self.assertEqual(second["tier"], "quark_share")
+        self.assertEqual(len(seen), 2)
+        self.assertNotIn("reviewed_resource_miss_locators", seen[0])
+        self.assertEqual(
+            seen[1]["reviewed_resource_miss_locators"],
+            ["quark_share:fixtureShare01"],
+        )
+        cached = state["search_resource_misses_by_request"]
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(
+            next(iter(cached.values())),
+            ["quark_share:fixtureShare01"],
+        )
+
+    def test_scoped_search_miss_never_crosses_to_another_identity(self) -> None:
+        state: dict[str, Any] = {"search_resource_misses_by_request": {}}
+        request_a = {
+            "media": {"media_type": "tv", "tmdb_id": 101},
+            "gaps": [{"id": "S01E01"}],
+        }
+        request_b = {
+            "media": {"media_type": "tv", "tmdb_id": 102},
+            "gaps": [{"id": "S01E01"}],
+        }
+        key_a = root_replenishment._search_resource_miss_request_key(
+            "quark_share", request_a,
+        )
+        key_b = root_replenishment._search_resource_miss_request_key(
+            "quark_share", request_b,
+        )
+
+        root_replenishment._remember_search_resource_misses(
+            state, key_a, ["quark_share:fixtureShare01"],
+        )
+
+        self.assertNotEqual(key_a, key_b)
+        self.assertEqual(
+            root_replenishment._known_search_resource_misses(state, key_a),
+            ["quark_share:fixtureShare01"],
+        )
+        self.assertEqual(
+            root_replenishment._known_search_resource_misses(state, key_b),
+            [],
+        )
+
+    def test_disabled_search_telemetry_records_safe_same_tier_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+
+            def disabled_search(_request):
+                return {
+                    "candidates": [],
+                    "failure_scope": "infrastructure",
+                    "source_telemetry": {
+                        "PanSou": {
+                            "configured": False,
+                            "source_exhausted": False,
+                            "infrastructure_failures": 1,
+                            "status": "incomplete",
+                        },
+                    },
+                }
+
+            result = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=disabled_search,
+            )
+
+            self.assertEqual(result["tier"], "quark_share")
+            self.assertEqual(result["waiting"], "retry_wait")
+            attempt = load_gap_ledger(state_root, "root-1")[0].attempts[0]
+            self.assertEqual(attempt.status, "infrastructure")
+            self.assertEqual(
+                attempt.error,
+                "pansou 发现器未配置或已禁用；保持当前层等待重试",
+            )
+            state = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(state["attempt_log"][-1]["error"], attempt.error)
 
     def test_search_exception_without_locator_retries_same_tier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -820,6 +955,70 @@ class RootReplenishmentTests(unittest.TestCase):
             )
             self.assertEqual(complete["tier"], "magnet")
             self.assertEqual(complete["state"]["status"], "exhausted")
+
+    def test_magnet_accepts_a_complete_nonempty_configured_source_set(self) -> None:
+        """Disabled canonical indexes do not invalidate a healthy live proof."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+
+            def configured_acg_only(_request):
+                telemetry = {
+                    source: {
+                        "configured": source == "acg",
+                        "source_exhausted": source == "acg",
+                        "infrastructure_failures": 0,
+                        "query_attempts": 1 if source == "acg" else 0,
+                        "query_responses": 1 if source == "acg" else 0,
+                    }
+                    for source in MAGNET_REQUIRED_SOURCES
+                }
+                return {
+                    "candidates": [],
+                    "search_complete": True,
+                    "source_telemetry": telemetry,
+                }
+
+            complete = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=configured_acg_only,
+            )
+
+        self.assertEqual(complete["tier"], "magnet")
+        self.assertEqual(complete["state"]["status"], "exhausted")
+
+    def test_magnet_all_disabled_telemetry_cannot_prove_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+
+            def disabled(_request):
+                return {
+                    "candidates": [],
+                    # Even a malformed affirmative top-level claim is not
+                    # enough when no source was configured and queried.
+                    "search_complete": True,
+                    "source_telemetry": {
+                        source: {
+                            "configured": False,
+                            "source_exhausted": False,
+                            "infrastructure_failures": 0,
+                            "query_attempts": 0,
+                            "query_responses": 0,
+                        }
+                        for source in MAGNET_REQUIRED_SOURCES
+                    },
+                }
+
+            result = run_root_replenishment(
+                self._runner(state_root), state_root, "root-1",
+                search_runner=disabled,
+            )
+
+        self.assertEqual(result["tier"], "magnet")
+        self.assertEqual(result["waiting"], "retry_wait")
 
     def test_unrelated_source_telemetry_does_not_change_share_tier_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1379,7 +1578,12 @@ class RootReplenishmentTests(unittest.TestCase):
             runner = self._runner(
                 state_root, planner=_coverage_planner([("S01E02.mkv", "video")]),
             )
-            observed: list[tuple[str, dict[str, int] | None]] = []
+            observed: list[tuple[
+                str,
+                dict[str, int] | None,
+                tuple[dict[str, object], ...] | None,
+                tuple[str, ...],
+            ]] = []
             original_plan = runner.plan_job
 
             def inspect_child(request, *args, **kwargs):
@@ -1388,6 +1592,8 @@ class RootReplenishmentTests(unittest.TestCase):
                     root_replenishment._fresh_video_staging_inventory(
                         runner, request.source_path,
                     ),
+                    request.source_files,
+                    request.source_scope_paths,
                 ))
                 return original_plan(request, *args, **kwargs)
 
@@ -1402,9 +1608,16 @@ class RootReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(result["gaps_closed"], ["unit-tv::missing_episode::S01E02"])
         self.assertEqual(len(observed), 1)
-        source_root, inventory = observed[0]
+        source_root, inventory, source_files, source_scope_paths = observed[0]
         self.assertTrue(source_root.endswith("/__scrapeflow_media__"))
         self.assertEqual(inventory, {f"{source_root}/S01E02.mkv": FAKE_VIDEO_SIZE})
+        self.assertEqual(source_scope_paths, (source_root,))
+        self.assertEqual(source_files, ({
+            "full_path": f"{source_root}/S01E02.mkv",
+            "name": "S01E02.mkv",
+            "size": FAKE_VIDEO_SIZE,
+            "is_dir": False,
+        },))
 
     def test_close_gap_only_after_coverage_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1724,6 +1937,33 @@ class RootReplenishmentTests(unittest.TestCase):
             ]
             self.assertIn("torrent:https://example.test/S01E02.torrent", excluded)
 
+    def test_candidate_rejection_keeps_bounded_diagnostic_in_gap_ledger(self) -> None:
+        """A rejected torrent must leave actionable, redacted evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_tv_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+
+            result = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=_magnet_search("S01E02"),
+                materializer_factory=lambda _tier: _FakeMaterializer(
+                    error=_CandidateError(
+                        "payload rejected: https://example.test/x?token=secret",
+                    ),
+                ),
+            )
+
+            self.assertEqual(result["attempts"][0]["outcome"], "candidate")
+            gap = next(iter(load_gap_ledger(state_root, "root-1")))
+            attempt = gap.attempts[-1]
+            self.assertEqual(attempt.status, "candidate_failed")
+            self.assertIn("payload rejected", attempt.error or "")
+            self.assertNotIn("secret", attempt.error or "")
+            self.assertLessEqual(len(attempt.error or ""), 200)
+
     def test_subtitle_gap_installs_one_tmdb_verified_bilingual_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
@@ -1832,6 +2072,54 @@ class RootReplenishmentTests(unittest.TestCase):
                 path.endswith((".ja.srt", ".en.srt", ".ko.srt"))
                 for path in alist.files
             ))
+
+    def test_subtitle_gap_accepts_traditional_fallback_as_the_one_managed_track(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self._seed_subtitle_gap(state_root)
+            self._set_tier(state_root, "root-1", "magnet")
+            runner = self._runner(state_root)
+            runner.alist.files["/library/番剧/Fate Zero/S01E01.mkv"] = b"video"
+
+            def install(
+                source, target, *, expected_size, video_path=None,
+                subtitle_language=None, subtitle_validator=None,
+                pause_requested=None,
+            ):
+                self.assertEqual(video_path, "/library/番剧/Fate Zero/S01E01.mkv")
+                self.assertEqual(subtitle_language, "zh-Hant")
+                self.assertTrue(target.endswith(".zh-TW.srt"))
+                self.assertEqual(
+                    subtitle_validator(source, subtitle_language)["status"], "satisfied",
+                )
+                self.assertFalse(pause_requested and pause_requested())
+                payload = runner.alist.files.pop(source)
+                self.assertEqual(len(payload), expected_size)
+                runner.alist.files[target] = payload
+                return {"size": len(payload), "target": target}
+
+            runner.install_subtitle_sidecar = install  # type: ignore[method-assign]
+            traditional_srt = (
+                "1\n00:00:00,000 --> 00:00:02,000\n"
+                "這是一個繁體中文字幕內容我們繼續觀看。\n"
+            ).encode("utf-8")
+            result = run_root_replenishment(
+                runner,
+                state_root, "root-1",
+                search_runner=_magnet_search("S01E01"),
+                materializer_factory=lambda tier: _FakeMaterializer(),
+                subtitle_materializer_factory=lambda: _FakeSubtitleMaterializer(
+                    payload=traditional_srt,
+                    subtitle_language="traditional_chinese",
+                ),
+            )
+            self.assertEqual(result["subtitle_gaps_closed"], [
+                "unit-tv::missing_subtitle::zh",
+            ])
+            self.assertIn(
+                "/library/番剧/Fate Zero/S01E01.zh-TW.srt",
+                runner.alist.files,
+            )
 
     def test_subtitle_uncertain_provider_response_is_not_resubmitted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1991,9 +2279,9 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(calls, ["acquire"])
 
 
-    # --- pre-upgrade AList state refusal -----------------------------------
+    # --- retired AList state is isolated to its own RootJob ----------------
 
-    def test_pre_upgrade_alist_state_is_refused_before_dispatch(self) -> None:
+    def test_retired_alist_state_becomes_task_attention_without_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             self._seed_tv_gap(state_root)
@@ -2002,16 +2290,17 @@ class RootReplenishmentTests(unittest.TestCase):
             save_root_replenishment_state(state_root, "root-1", state)
             calls: list[str] = []
 
-            with self.assertRaisesRegex(PreUpgradeAListStateError, "人工确认并清理"):
-                run_root_replenishment(
-                    self._runner(state_root),
-                    state_root,
-                    "root-1",
-                    search_runner=lambda _request: (_ for _ in ()).throw(
-                        AssertionError("retired state must not search"),
-                    ),
-                    materializer_factory=lambda tier: calls.append(tier),
-                )
+            result = run_root_replenishment(
+                self._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("retired state must not search"),
+                ),
+                materializer_factory=lambda tier: calls.append(tier),
+            )
+            self.assertEqual(result["waiting"], "attention")
+            self.assertIn("AList", result["attention"])
             self.assertEqual(calls, [])
 
 

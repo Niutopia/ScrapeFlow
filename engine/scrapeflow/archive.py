@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import posixpath
@@ -162,6 +163,15 @@ class ArchiveLimits:
     max_source_entries: int = 10_000
     max_password_candidates: int = 5
     command_timeout_seconds: float = 15 * 60
+    # Optical images are containers rather than direct media.  They need more
+    # headroom than ordinary compressed archives (a single Blu-ray image is
+    # commonly 45–50 GiB), but keep independently finite limits so widening
+    # disc support does not also widen generic ZIP/7z/RAR bomb budgets.
+    max_disc_image_bytes: int = 64 * 1024**3
+    max_disc_expanded_bytes: int = 64 * 1024**3
+    max_disc_member_bytes: int = 64 * 1024**3
+    max_disc_expansion_ratio: float = 4.0
+    disc_command_timeout_seconds: float = 90 * 60
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -174,6 +184,9 @@ class ArchiveLimits:
             "max_magic_scan_bytes",
             "max_source_entries",
             "max_password_candidates",
+            "max_disc_image_bytes",
+            "max_disc_expanded_bytes",
+            "max_disc_member_bytes",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -181,8 +194,69 @@ class ArchiveLimits:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.max_members == 0 or self.max_depth == 0 or self.max_source_entries == 0:
             raise ValueError("max_members/max_depth/max_source_entries must be positive")
-        if self.max_expansion_ratio <= 0 or self.command_timeout_seconds <= 0:
+        finite_positive_fields = (
+            "max_expansion_ratio",
+            "command_timeout_seconds",
+            "max_disc_expansion_ratio",
+            "disc_command_timeout_seconds",
+        )
+        if any(
+            not isinstance(getattr(self, name), (int, float))
+            or isinstance(getattr(self, name), bool)
+            or not math.isfinite(float(getattr(self, name)))
+            or float(getattr(self, name)) <= 0
+            for name in finite_positive_fields
+        ):
             raise ValueError("archive ratio and timeout must be positive")
+
+    @classmethod
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> "ArchiveLimits":
+        """Build bounded limits from explicit deployment settings.
+
+        The environment is an optional operational tuning surface, not a
+        per-task escape hatch.  Invalid values fail application startup rather
+        than silently disabling a guard.  Disc-image limits remain separate
+        from ordinary archive limits so a 50 GiB ISO cannot accidentally make
+        a 50 GiB ZIP acceptable.
+        """
+
+        values = os.environ if environ is None else environ
+        integer_settings = {
+            "SCRAPEFLOW_ARCHIVE_MAX_MEMBERS": "max_members",
+            "SCRAPEFLOW_ARCHIVE_MAX_DEPTH": "max_depth",
+            "SCRAPEFLOW_ARCHIVE_MAX_EXPANDED_BYTES": "max_expanded_bytes",
+            "SCRAPEFLOW_ARCHIVE_MAX_MEMBER_BYTES": "max_member_bytes",
+            "SCRAPEFLOW_ARCHIVE_MAX_SOURCE_BYTES": "max_archive_bytes",
+            "SCRAPEFLOW_ARCHIVE_MIN_FREE_BYTES": "min_free_bytes",
+            "SCRAPEFLOW_ARCHIVE_MAX_MAGIC_SCAN_BYTES": "max_magic_scan_bytes",
+            "SCRAPEFLOW_DISC_IMAGE_MAX_SOURCE_BYTES": "max_disc_image_bytes",
+            "SCRAPEFLOW_DISC_IMAGE_MAX_EXPANDED_BYTES": "max_disc_expanded_bytes",
+            "SCRAPEFLOW_DISC_IMAGE_MAX_MEMBER_BYTES": "max_disc_member_bytes",
+        }
+        float_settings = {
+            "SCRAPEFLOW_ARCHIVE_MAX_EXPANSION_RATIO": "max_expansion_ratio",
+            "SCRAPEFLOW_ARCHIVE_COMMAND_TIMEOUT_SECONDS": "command_timeout_seconds",
+            "SCRAPEFLOW_DISC_IMAGE_MAX_EXPANSION_RATIO": "max_disc_expansion_ratio",
+            "SCRAPEFLOW_DISC_IMAGE_COMMAND_TIMEOUT_SECONDS": "disc_command_timeout_seconds",
+        }
+        parsed: dict[str, int | float] = {}
+        for environment_name, field_name in integer_settings.items():
+            raw = values.get(environment_name)
+            if raw is None or not str(raw).strip():
+                continue
+            try:
+                parsed[field_name] = int(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{environment_name} must be an integer") from exc
+        for environment_name, field_name in float_settings.items():
+            raw = values.get(environment_name)
+            if raw is None or not str(raw).strip():
+                continue
+            try:
+                parsed[field_name] = float(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{environment_name} must be a number") from exc
+        return cls(**parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +274,23 @@ class ArchiveMagic:
 
     @property
     def is_archive(self) -> bool:
-        return self.kind == "archive" and self.format in {"zip", "7z", "rar"}
+        """Whether this is a container which the bounded 7-Zip lane may read.
+
+        ``iso`` and ``udf`` deliberately share the established archive lane.
+        They are not directly plannable media: 7-Zip only lists or extracts
+        explicitly selected members into task-owned staging, and never mounts
+        an image or executes an SFX wrapper.
+        """
+
+        return self.kind == "archive" and self.format in {
+            "zip", "7z", "rar", "iso", "udf",
+        }
+
+    @property
+    def is_disc_image(self) -> bool:
+        """Whether the recognized container is an optical-disc filesystem."""
+
+        return self.kind == "archive" and self.format in {"iso", "udf"}
 
 
 _MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
@@ -212,6 +302,18 @@ _MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("zip", b"PK\x07\x08"),
 )
 _EBML_MAGIC = b"\x1a\x45\xdf\xa3"
+# ISO-9660's volume descriptors begin at logical sector 16.  The identifier
+# starts after the one-byte descriptor type.  UDF uses the same Volume
+# Recognition Sequence area, where NSR02/NSR03 identifies its namespace.
+# These are filesystem signatures, not filename guesses; a ``.iso``/``.img``
+# with no corresponding bytes remains an untrusted opaque object.
+_DISC_SECTOR_BYTES = 2048
+_ISO9660_IDENTIFIER_OFFSET = 16 * _DISC_SECTOR_BYTES + 1
+_ISO9660_IDENTIFIER = b"CD001"
+_UDF_VRS_FIRST_SECTOR = 16
+_UDF_VRS_LAST_SECTOR = 32
+_UDF_NAMESPACE_IDENTIFIERS = frozenset({b"NSR02", b"NSR03"})
+_UDF_ANCHOR_SECTOR = 256
 _PASSWORD_MARKER_RE = re.compile(
     r"(?:解压|压缩包|归档)?\s*(?:密码|password|passwd|pass|pwd)\s*[:：=]\s*"
     r"(?P<password>[^\s,，;；/\\]+)",
@@ -254,6 +356,101 @@ def _find_signature(prefix: bytes, signature: bytes, *, embedded: bool) -> int |
     return index if 0 <= index <= 1024 * 1024 else None
 
 
+def _detect_disc_image_magic(data: bytes) -> ArchiveMagic | None:
+    """Recognize ISO-9660/UDF without mounting a source image.
+
+    The caller supplies an already bounded prefix.  A true PE/MZ executable
+    is never trusted from its filename alone: only a complete embedded
+    volume-descriptor proof (or the ordinary ZIP/7z/RAR SFX signatures handled
+    by :func:`_find_signature`) can classify it as a read-only container.
+    """
+
+    if data.startswith(b"MZ"):
+        # A few releases are distributed as a PE-looking wrapper around an
+        # appended disc image.  Treat this exactly like an SFX archive: inspect
+        # bytes only, require a complete volume-descriptor signature, and pass
+        # the resulting source to 7-Zip.  A lone MZ header remains executable
+        # and is rejected by ``detect_magic`` below.
+        for marker in (b"CD001", b"NSR02", b"NSR03"):
+            search_from = 2
+            while True:
+                marker_offset = data.find(marker, search_from)
+                if marker_offset < 0:
+                    break
+                if marker == b"CD001":
+                    image_base = marker_offset - _ISO9660_IDENTIFIER_OFFSET
+                    type_offset = image_base + (16 * _DISC_SECTOR_BYTES)
+                    version_offset = marker_offset + len(marker)
+                    if (
+                        image_base >= 2
+                        and type_offset < len(data)
+                        and data[type_offset] in {1, 2, 255}
+                        and version_offset < len(data)
+                        and data[version_offset] == 1
+                    ):
+                        return ArchiveMagic(
+                            "iso",
+                            "archive",
+                            marker_offset,
+                            True,
+                        )
+                else:
+                    # NSR identifiers are at byte +1 of a 2048-byte VRS
+                    # sector.  Requiring BEA01 in the preceding descriptor
+                    # avoids accepting an arbitrary PE payload containing the
+                    # five ASCII bytes by coincidence.
+                    base = marker_offset - 1
+                    bea = base - _DISC_SECTOR_BYTES
+                    if (
+                        base >= 2
+                        and bea >= 2
+                        and data[bea + 1:bea + 6] == b"BEA01"
+                    ):
+                        return ArchiveMagic("udf", "archive", marker_offset, True)
+                search_from = marker_offset + 1
+        return None
+
+    iso_end = _ISO9660_IDENTIFIER_OFFSET + len(_ISO9660_IDENTIFIER)
+    iso_base = 16 * _DISC_SECTOR_BYTES
+    if (
+        len(data) >= iso_end + 1
+        and data[_ISO9660_IDENTIFIER_OFFSET:iso_end] == _ISO9660_IDENTIFIER
+        and data[iso_base] in {1, 2, 255}
+        and data[_ISO9660_IDENTIFIER_OFFSET + len(_ISO9660_IDENTIFIER)] == 1
+    ):
+        return ArchiveMagic("iso", "archive", _ISO9660_IDENTIFIER_OFFSET)
+
+    # ECMA-167/UDF volume recognition sequences normally begin with BEA01,
+    # followed by NSR02 or NSR03.  NSR itself is the format identifier, so
+    # recognize it even when a source starts in the middle of an otherwise
+    # valid sequence, but only at the fixed descriptor offset of a sector.
+    for sector in range(_UDF_VRS_FIRST_SECTOR + 1, _UDF_VRS_LAST_SECTOR + 1):
+        offset = sector * _DISC_SECTOR_BYTES + 1
+        end = offset + 5
+        previous = (sector - 1) * _DISC_SECTOR_BYTES + 1
+        if (
+            len(data) >= end
+            and data[offset:end] in _UDF_NAMESPACE_IDENTIFIERS
+            and len(data) >= previous + 5
+            and data[previous:previous + 5] == b"BEA01"
+        ):
+            return ArchiveMagic("udf", "archive", offset)
+
+    # Some UDF images omit a readable VRS from the available prefix.  The
+    # Anchor Volume Descriptor Pointer at sector 256 is a second bounded,
+    # structured proof: tag id 2, descriptor version 2/3, and a matching tag
+    # location.  Requiring all three fields avoids treating random bytes as an
+    # image simply because they start with ``\x02\x00``.
+    anchor = _UDF_ANCHOR_SECTOR * _DISC_SECTOR_BYTES
+    if len(data) >= anchor + 16:
+        tag_id = int.from_bytes(data[anchor:anchor + 2], "little")
+        descriptor_version = int.from_bytes(data[anchor + 2:anchor + 4], "little")
+        tag_location = int.from_bytes(data[anchor + 12:anchor + 16], "little")
+        if tag_id == 2 and descriptor_version in {2, 3} and tag_location == _UDF_ANCHOR_SECTOR:
+            return ArchiveMagic("udf", "archive", anchor)
+    return None
+
+
 def detect_magic(prefix: bytes | bytearray | memoryview, *, filename: str = "") -> ArchiveMagic:
     """Detect archive/media/executable magic without ever executing a file.
 
@@ -265,6 +462,13 @@ def detect_magic(prefix: bytes | bytearray | memoryview, *, filename: str = "") 
     if not isinstance(prefix, (bytes, bytearray, memoryview)):
         raise TypeError("prefix must be bytes-like")
     data = bytes(prefix)
+    # Prefer a complete embedded ISO/UDF descriptor over a coincidental ``PK``
+    # byte sequence in the wrapper's payload.  Ordinary MZ SFX ZIP/7z/RAR
+    # remains covered by the signature loop immediately below.
+    if data.startswith(b"MZ"):
+        embedded_disc = _detect_disc_image_magic(data)
+        if embedded_disc is not None:
+            return embedded_disc
     for format_name, signature in _MAGIC_SIGNATURES:
         offset = _find_signature(data, signature, embedded=True)
         if offset is not None:
@@ -274,6 +478,9 @@ def detect_magic(prefix: bytes | bytearray | memoryview, *, filename: str = "") 
                 offset,
                 offset > 0,
             )
+    disc_image = _detect_disc_image_magic(data)
+    if disc_image is not None:
+        return disc_image
     if data.startswith(_EBML_MAGIC):
         return ArchiveMagic("mkv", "media")
     if len(data) >= 8 and data[4:8] == b"ftyp":
@@ -659,15 +866,46 @@ def member_from_mapping(raw: Mapping[str, Any]) -> ArchiveMember:
     )
 
 
+def _is_disc_format(archive_format: str | None) -> bool:
+    return isinstance(archive_format, str) and archive_format.casefold() in {"iso", "udf"}
+
+
+def _source_budget_bytes(limits: ArchiveLimits, archive_format: str | None) -> int:
+    """Return the finite source-input ceiling for the proven container kind."""
+
+    return limits.max_disc_image_bytes if _is_disc_format(archive_format) else limits.max_archive_bytes
+
+
+def _member_budget_bytes(limits: ArchiveLimits, archive_format: str | None) -> int:
+    return limits.max_disc_member_bytes if _is_disc_format(archive_format) else limits.max_member_bytes
+
+
+def _expanded_budget_bytes(limits: ArchiveLimits, archive_format: str | None) -> int:
+    return limits.max_disc_expanded_bytes if _is_disc_format(archive_format) else limits.max_expanded_bytes
+
+
+def _expansion_ratio_limit(limits: ArchiveLimits, archive_format: str | None) -> float:
+    return limits.max_disc_expansion_ratio if _is_disc_format(archive_format) else limits.max_expansion_ratio
+
+
+def _command_timeout(limits: ArchiveLimits, archive_format: str | None) -> float:
+    return limits.disc_command_timeout_seconds if _is_disc_format(archive_format) else limits.command_timeout_seconds
+
+
 def validate_archive_members(
     members: Iterable[ArchiveMember | Mapping[str, Any]],
     *,
     limits: ArchiveLimits | None = None,
     archive_size: int | None = None,
+    archive_format: str | None = None,
 ) -> tuple[ArchiveMember, ...]:
     """Validate member paths, links, collisions and expansion budgets."""
 
     policy = limits or ArchiveLimits()
+    member_budget = _member_budget_bytes(policy, archive_format)
+    expanded_budget = _expanded_budget_bytes(policy, archive_format)
+    source_budget = _source_budget_bytes(policy, archive_format)
+    ratio_budget = _expansion_ratio_limit(policy, archive_format)
     converted: list[ArchiveMember] = []
     for raw in members:
         member = raw if isinstance(raw, ArchiveMember) else member_from_mapping(raw)
@@ -675,7 +913,7 @@ def validate_archive_members(
             raise ArchiveLinkError("archive contains a symbolic or hard link")
         if member.depth > policy.max_depth:
             raise ArchiveBudgetError("archive member directory depth exceeds limit")
-        if not member.is_dir and member.size > policy.max_member_bytes:
+        if not member.is_dir and member.size > member_budget:
             raise ArchiveBudgetError("archive member size exceeds limit")
         converted.append(member)
         if len(converted) > policy.max_members:
@@ -699,14 +937,14 @@ def validate_archive_members(
                 raise ArchiveCollisionError("archive file/directory paths collide")
 
     expanded = sum(member.size for member in converted if not member.is_dir)
-    if expanded > policy.max_expanded_bytes:
+    if expanded > expanded_budget:
         raise ArchiveBudgetError("archive expanded size exceeds limit")
     if archive_size is not None:
         if isinstance(archive_size, bool) or not isinstance(archive_size, int) or archive_size <= 0:
             raise ArchiveBudgetError("archive size is invalid")
-        if archive_size > policy.max_archive_bytes:
+        if archive_size > source_budget:
             raise ArchiveBudgetError("archive size exceeds limit")
-        if expanded and expanded / archive_size > policy.max_expansion_ratio:
+        if expanded and expanded / archive_size > ratio_budget:
             raise ArchiveBudgetError("archive expansion ratio exceeds limit")
     return tuple(sorted(converted, key=lambda item: (item.collision_key, item.is_dir, item.size)))
 
@@ -910,9 +1148,23 @@ class ArchiveRunner(Protocol):
 class Subprocess7zRunner:
     """Production local runner.  It never invokes a shell or executes members."""
 
-    def __init__(self, executable: str | None = None, *, max_output_bytes: int = 4 * 1024 * 1024):
+    def __init__(
+        self,
+        executable: str | None = None,
+        *,
+        max_output_bytes: int = 4 * 1024 * 1024,
+        max_timeout_seconds: float = 2 * 60 * 60,
+    ):
         self.executable = executable or shutil.which("7z") or shutil.which("7zz")
         self.max_output_bytes = max_output_bytes
+        if (
+            isinstance(max_timeout_seconds, bool)
+            or not isinstance(max_timeout_seconds, (int, float))
+            or not math.isfinite(float(max_timeout_seconds))
+            or max_timeout_seconds <= 0
+        ):
+            raise ValueError("max_timeout_seconds must be positive")
+        self.max_timeout_seconds = float(max_timeout_seconds)
 
     def run(
         self,
@@ -941,7 +1193,12 @@ class Subprocess7zRunner:
                 input=input_data,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=min(float(timeout), 30 * 60),
+                # ArchiveLimits supplies the per-container timeout; this
+                # process-level ceiling prevents a malformed caller from
+                # disabling it.  A 45–50 GiB optical image may legitimately
+                # need longer than the old 30-minute ceiling while still
+                # remaining bounded.
+                timeout=min(float(timeout), self.max_timeout_seconds),
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -989,6 +1246,7 @@ def parse_7z_slt_listing(
     output: str,
     *,
     limits: ArchiveLimits | None = None,
+    archive_format: str | None = None,
 ) -> tuple[ArchiveMember, ...]:
     """Parse the stable ``7z l -slt`` key/value form and validate it."""
 
@@ -1033,7 +1291,11 @@ def parse_7z_slt_listing(
             raise ArchiveListingError("7-Zip listing contains an invalid member") from exc
     if not members:
         raise ArchiveListingError("7-Zip listing contains no members")
-    return validate_archive_members(members, limits=limits)
+    return validate_archive_members(
+        members,
+        limits=limits,
+        archive_format=archive_format,
+    )
 
 
 # Common aliases useful to callers migrating old naming without importing a
@@ -1168,7 +1430,7 @@ class ArchiveInspector:
             # missing-first-volume check.
             raise ArchiveVolumeError("archive must be opened from its first volume")
         archive_size = sum(volume.stat().st_size for volume in volumes)
-        if archive_size > self.limits.max_archive_bytes:
+        if archive_size > _source_budget_bytes(self.limits, detection.format):
             raise ArchiveBudgetError("archive size exceeds limit")
 
         candidates: list[PasswordCandidate] = []
@@ -1218,13 +1480,22 @@ class ArchiveInspector:
                 args,
                 password=candidate.value,
                 cwd=path.parent,
-                timeout=self.limits.command_timeout_seconds,
+                timeout=_command_timeout(self.limits, detection.format),
             )
             last_result = result
             if result.returncode != 0:
                 continue
-            members = parse_7z_slt_listing(result.stdout, limits=self.limits)
-            validate_archive_members(members, limits=self.limits, archive_size=archive_size)
+            members = parse_7z_slt_listing(
+                result.stdout,
+                limits=self.limits,
+                archive_format=detection.format,
+            )
+            validate_archive_members(
+                members,
+                limits=self.limits,
+                archive_size=archive_size,
+                archive_format=detection.format,
+            )
             encrypted = any(member.encrypted for member in members)
             return ArchiveListing(
                 archive_path=path,
@@ -1276,7 +1547,10 @@ class ArchiveInspector:
             raise ArchiveFormatError("archive source prefix cannot be read") from exc
         if not isinstance(prefix, (bytes, bytearray, memoryview)):
             raise ArchiveFormatError("archive source prefix is invalid")
-        _require_archive_magic(bytes(prefix)[: self.limits.max_magic_scan_bytes], filename=name)
+        detection = _require_archive_magic(
+            bytes(prefix)[: self.limits.max_magic_scan_bytes],
+            filename=name,
+        )
         if pause_checkpoint is not None:
             pause_checkpoint()
         entries = list(source.list(parent or "/"))
@@ -1307,7 +1581,7 @@ class ArchiveInspector:
             if size is None or size <= 0:
                 raise ArchiveVolumeError("remote archive volume has no valid size")
             total_size += size
-            if total_size > self.limits.max_archive_bytes:
+            if total_size > _source_budget_bytes(self.limits, detection.format):
                 raise ArchiveBudgetError("archive size exceeds limit")
             downloads.append((volume_name, size))
 
@@ -1667,6 +1941,7 @@ class ArchiveExtractor:
             listing.members,
             limits=self.limits,
             archive_size=actual_archive_size,
+            archive_format=listing.archive_format,
         )
         chosen = select_media_members(validated_members, selected)
         if pause_checkpoint is not None:
@@ -1678,7 +1953,7 @@ class ArchiveExtractor:
             pause_checkpoint=pause_checkpoint,
         )
         expected_bytes = sum(member.size for member in chosen)
-        if expected_bytes > self.limits.max_expanded_bytes:
+        if expected_bytes > _expanded_budget_bytes(self.limits, listing.archive_format):
             raise ArchiveBudgetError("selected archive output exceeds expansion limit")
         _check_disk_budget(staging, expected_bytes, self.limits)
 
@@ -1705,7 +1980,7 @@ class ArchiveExtractor:
                 args,
                 password=candidate.value,
                 cwd=staging,
-                timeout=self.limits.command_timeout_seconds,
+                timeout=_command_timeout(self.limits, listing.archive_format),
             )
             if result.returncode == 0:
                 output_paths = _verify_extraction_outputs(staging, chosen)

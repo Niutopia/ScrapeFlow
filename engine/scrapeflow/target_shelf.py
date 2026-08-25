@@ -22,13 +22,13 @@ class TargetShelf(str, Enum):
 _SHELF_SEGMENTS: dict[TargetShelf, str] = {
     TargetShelf.MOVIE: "电影",
     TargetShelf.ANIME: "番剧",
-    TargetShelf.US_TV: "美剧",
+    TargetShelf.US_TV: "欧美剧",
 }
 
 _SHELF_LABELS: dict[TargetShelf, str] = {
     TargetShelf.MOVIE: "电影",
     TargetShelf.ANIME: "番剧",
-    TargetShelf.US_TV: "美剧",
+    TargetShelf.US_TV: "欧美剧",
 }
 
 ALLOWED_TARGET_SHELVES: tuple[str, ...] = tuple(shelf.value for shelf in TargetShelf)

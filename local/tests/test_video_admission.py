@@ -53,6 +53,7 @@ class VideoAdmissionTests(unittest.TestCase):
         self.assertEqual(remote_result["status"], "satisfied")
         self.assertEqual(len(commands), 2)
         for command in commands:
+            self.assertNotIn("-nostdin", command)
             self.assertIn(str(FFPROBE_RW_TIMEOUT_US), command)
             self.assertIn(str(FFPROBE_PROBE_BYTES), command)
             self.assertIn(str(FFPROBE_ANALYZE_DURATION_US), command)

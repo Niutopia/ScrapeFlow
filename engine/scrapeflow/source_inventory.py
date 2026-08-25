@@ -13,11 +13,14 @@ to the AList client protocol.
 from __future__ import annotations
 
 import json
+import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from engine.scrapeflow.media_policy import (
+    DISC_IMAGE_EXTENSIONS,
+    EXECUTABLE_EXTENSIONS,
     POSTER_EXTENSIONS,
     SUBTITLE_EXTENSIONS,
     TEMPORARY_EXTENSIONS,
@@ -30,6 +33,8 @@ from engine.scrapeflow.media_policy import (
 # ---------------------------------------------------------------------------
 
 _VIDEO_EXTS = frozenset(VIDEO_EXTENSIONS)
+_DISC_IMAGE_EXTS = frozenset(DISC_IMAGE_EXTENSIONS)
+_EXECUTABLE_EXTS = frozenset(EXECUTABLE_EXTENSIONS)
 _SUBTITLE_EXTS = frozenset(SUBTITLE_EXTENSIONS)
 _POSTER_EXTS = frozenset(POSTER_EXTENSIONS)
 _TEMP_EXTS = frozenset(TEMPORARY_EXTENSIONS)
@@ -40,6 +45,10 @@ _NFO_EXTS = frozenset({".nfo", ".xml"})
 def classify_object_type(name: str) -> str:
     """Return a canonical object-type string for a filename."""
     suffix = Path(name).suffix.lower()
+    if suffix in _DISC_IMAGE_EXTS:
+        return "disc_image"
+    if suffix in _EXECUTABLE_EXTS:
+        return "executable"
     if suffix in _VIDEO_EXTS:
         return "video"
     if suffix in _SUBTITLE_EXTS:
@@ -66,7 +75,7 @@ class SourceFile:
     path: str
     name: str
     size: int
-    object_type: str   # video / subtitle / poster / nfo / archive / temporary / other
+    object_type: str   # video / disc_image / subtitle / poster / nfo / archive / temporary / other
     modified: str      # ISO-8601 string or empty
 
 
@@ -101,12 +110,115 @@ def count_subtitle_files(node: SourceNode) -> int:
     return total
 
 
+def count_disc_image_files(node: SourceNode) -> int:
+    """Count opaque optical-disc image containers in a SourceNode tree."""
+    total = sum(1 for f in node.files if f.object_type == "disc_image")
+    for child in node.children:
+        total += count_disc_image_files(child)
+    return total
+
+
+def has_disc_image_files(node: SourceNode) -> bool:
+    """Whether exact source ownership includes an uninspected disc image."""
+    return count_disc_image_files(node) > 0
+
+
+def count_executable_files(node: SourceNode) -> int:
+    """Count masquerade ``.exe`` files whose real media type is uninspected."""
+    total = sum(1 for f in node.files if f.object_type == "executable")
+    for child in node.children:
+        total += count_executable_files(child)
+    return total
+
+
+def has_executable_files(node: SourceNode) -> bool:
+    """Whether the source includes a masquerade ``.exe`` needing expansion."""
+    return count_executable_files(node) > 0
+
+
 def collect_all_files(node: SourceNode) -> list[SourceFile]:
     """Flatten the tree into a list of all SourceFile objects (recursive)."""
     result = list(node.files)
     for child in node.children:
         result.extend(collect_all_files(child))
     return result
+
+
+def iter_source_nodes(node: SourceNode) -> list[SourceNode]:
+    """Return ``node`` and every descendant directory in stable tree order."""
+    output = [node]
+    for child in node.children:
+        output.extend(iter_source_nodes(child))
+    return output
+
+
+def validate_source_scope(
+    root_path: str,
+    source_paths: Sequence[str],
+) -> tuple[str, ...]:
+    """Validate a non-overlapping set of exact directory ownership scopes.
+
+    The helper is intentionally pure and narrow: it proves only that the
+    declared paths are normalized descendants of the intake root and cannot
+    overlap one another.  Callers additionally prove that every path exists in
+    the B snapshot before using it for identity, planning, or consumption.
+    """
+    root = str(root_path).rstrip("/") or "/"
+    if not root.startswith("/") or "\\" in root:
+        raise ValueError("来源根路径无效")
+    normalized: list[str] = []
+    for value in source_paths:
+        if not isinstance(value, str) or not value.startswith("/") or "\\" in value:
+            raise ValueError("来源范围包含无效路径")
+        path = value.rstrip("/") or "/"
+        if posixpath.normpath(path) != path or any(part in {"", ".", ".."} for part in path.split("/")[1:]):
+            raise ValueError("来源范围路径不规范")
+        root_prefix = "/" if root == "/" else root + "/"
+        if not (path == root or path.startswith(root_prefix)):
+            raise ValueError("来源范围不属于当前入站根")
+        if path not in normalized:
+            normalized.append(path)
+    if not normalized:
+        raise ValueError("作品单元缺少来源范围")
+    for index, left in enumerate(normalized):
+        for right in normalized[index + 1:]:
+            if left == right or left.startswith(right + "/") or right.startswith(left + "/"):
+                raise ValueError("作品单元来源范围重叠")
+    return tuple(normalized)
+
+
+def build_scoped_source_node(
+    root: SourceNode,
+    source_paths: Sequence[str],
+    *,
+    boundary_key: str,
+    display_label: str,
+) -> SourceNode:
+    """Build a virtual node containing only the exact declared subtrees.
+
+    A WorkUnit that owns several sibling season directories must aggregate
+    evidence across them without accidentally inheriting another sibling (for
+    example an aftershow) or files at the intake root.  A synthetic root keeps
+    this ownership proof local to the pure inventory model.
+    """
+    paths = validate_source_scope(root.path, source_paths)
+    by_path = {candidate.path.rstrip("/"): candidate for candidate in iter_source_nodes(root)}
+    selected: list[SourceNode] = []
+    for path in paths:
+        selected_node = by_path.get(path)
+        if selected_node is None:
+            raise ValueError("来源范围在 B 快照中不存在")
+        selected.append(selected_node)
+    if len(selected) == 1:
+        return selected[0]
+    label = str(display_label).strip() or str(boundary_key).rstrip("/").rsplit("/", 1)[-1]
+    return SourceNode(
+        path=str(boundary_key),
+        name=label,
+        files=(),
+        children=tuple(selected),
+        depth=0,
+    )
 
 
 def has_only_subtitles(node: SourceNode) -> bool:

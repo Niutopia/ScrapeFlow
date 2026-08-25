@@ -1,7 +1,7 @@
 """Passive typed helper for the existing Quark desktop session.
 
 This is deliberately not a Quark proxy.  Its HTTP surface is the two fixed
-actions in ``HELPER_ACTIONS`` (health and share-save) and every cloud operation is constructed here
+actions in ``HELPER_ACTIONS`` (liveness and share-save) and every cloud operation is constructed here
 from a reviewed task payload.  The helper never accepts cookies, arbitrary
 URLs, arbitrary Quark paths, or DevTools commands from its HTTP caller.
 
@@ -10,7 +10,7 @@ endpoint.  Its explicit Docker-sidecar mode may instead cross Docker Desktop's
 fixed host bridge to the historical Quark CDP port, while the Helper HTTP
 server itself remains loopback-only inside the API's network namespace.  It
 has no desktop-process, window-management, or DOM-click capability.  A missing
-renderer or unauthenticated Quark session therefore makes the helper not ready
+renderer or Quark session therefore makes the affected share attempt fail
 rather than attempting recovery.
 """
 
@@ -81,7 +81,7 @@ _CDP_WEBSOCKET_PATH_RE = re.compile(
     r"^/devtools/[A-Za-z0-9._:-]+/[A-Za-z0-9._:-]+$"
 )
 _FORMAL_LIBRARY_COMPONENTS = frozenset({
-    "电影", "番剧", "美剧", "待刮削", "movie", "movies", "anime", "tv",
+    "电影", "番剧", "欧美剧", "美剧", "待刮削", "movie", "movies", "anime", "tv",
     "library", "media",
 })
 
@@ -112,8 +112,6 @@ class QuarkHelperRemoteRejected(QuarkHelperError):
 
 class QuarkSessionPort(Protocol):
     """The only private capability the HTTP service needs from a renderer."""
-
-    async def assert_authenticated(self) -> None: ...
 
     async def share_save(self, payload: Mapping[str, object]) -> Mapping[str, object]: ...
 
@@ -215,19 +213,13 @@ def _safe_cookie_header(value: object) -> str:
 
 
 def validate_staging_root(value: object) -> str:
-    """Accept only a production or exact isolated-provider staging root.
-
-    The CLI/environment cannot turn this Helper into a writer for an arbitrary
-    cloud root.  A task request may only select a root-job/attempt child below
-    the production staging prefix or one staging prefix derived from an exact
-    isolated acceptance media root.
-    """
+    """Accept only ScrapeFlow's fixed task staging parent."""
 
     try:
         return validate_provider_staging_root(value)
     except ProviderStagingPathError as exc:
         raise QuarkHelperValidationError(
-            "staging root must be a production or exact isolated provider root"
+            "staging root must be /quark/影视/ScrapeFlow/补源"
         ) from exc
 
 
@@ -663,8 +655,7 @@ class PassiveQuarkCdp:
             raise QuarkHelperValidationError("staging root is outside the configured Quark mount")
         self._sequence = 0
         self._lock = asyncio.Lock()
-        # Serializes whole typed actions (health listings, parse+submit
-        # sequences).  Separate from ``_lock`` (the CDP evaluation lock) so
+        # Serializes whole typed share actions.  Separate from ``_lock`` (the CDP evaluation lock) so
         # the nested acquisitions never deadlock.  Concurrent bursts against
         # Quark were live-observed to trigger truncated responses.
         self._action_lock = asyncio.Lock()
@@ -678,8 +669,8 @@ class PassiveQuarkCdp:
         """Bind one freshly resolved login to one typed action."""
 
         if self.session_resolver is None:
-            # Kept for the isolated renderer-transport unit tests.  Production
-            # construction always supplies the AList resolver below.
+        # Focused renderer-transport tests omit an AList resolver. Production
+        # construction always supplies the resolver below.
             yield
             return
         async with self._action_lock:
@@ -823,25 +814,6 @@ class PassiveQuarkCdp:
                 if request_sent:
                     raise QuarkHelperLostResponse("Quark renderer response was lost") from exc
                 raise QuarkHelperNotReady("Quark renderer is unavailable") from exc
-
-    @staticmethod
-    def _wsg_capability_expression() -> str:
-        """Read renderer capability flags without network or desktop effects."""
-
-        return """(() => JSON.stringify({
-  kind: "wsg-capabilities",
-  encrypt: !!(globalThis.quantum && globalThis.quantum.wsg && typeof globalThis.quantum.wsg.encrypt === "function"),
-  decrypt: !!((globalThis.quantum && globalThis.quantum.wsg && typeof globalThis.quantum.wsg.decrypt === "function") || (globalThis.chrome && globalThis.chrome.quarkBizPrivate && typeof globalThis.chrome.quarkBizPrivate.encryptOrDecrypt === "function") )
-}))()"""
-
-    async def _probe_wsg_capabilities(self) -> None:
-        result = await self._evaluate_json(self._wsg_capability_expression())
-        if (
-            result.get("kind") != "wsg-capabilities"
-            or result.get("encrypt") is not True
-            or result.get("decrypt") is not True
-        ):
-            raise QuarkHelperNotReady("Quark renderer lacks the required WSG capabilities")
 
     @staticmethod
     def _wsg_transform_expression(*, operation: str, value: object) -> str:
@@ -1227,20 +1199,6 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             self._fid_cache[key] = (now + _FID_CACHE_TTL_SECONDS, parent)
         return parent
 
-    async def assert_authenticated(self) -> None:
-        # A read-only root listing proves both a renderer and its current Quark
-        # session.  The Cookie comes from AList only for this request, is never
-        # read from the renderer, and is never returned.
-        async with self._session_scope(self.staging_root):
-            await self._probe_wsg_capabilities()
-            _mount_path, root_fid = self._active_mount()
-            await self._call_fixed(
-                origin=QUARK_DRIVE_API,
-                path="/file/sort",
-                method="GET",
-                query={"pdir_fid": root_fid, "_page": 1, "_size": 1, "_fetch_total": 0},
-            )
-
     async def share_save(self, payload: Mapping[str, object]) -> Mapping[str, object]:
         destination = str(payload["destination"])
         async with self._session_scope(destination):
@@ -1466,16 +1424,8 @@ class QuarkHostHelperService:
         self.staging_root = validate_staging_root(staging_root)
 
     async def health(self) -> dict[str, object]:
-        try:
-            await self.session.assert_authenticated()
-        except (QuarkHelperRemoteRejected, QuarkHelperLostResponse) as exc:
-            raise QuarkHelperNotReady("Quark session is not authenticated") from exc
         return {
-            "status": "ready",
-            "authenticated": True,
-            "actions": list(HELPER_ACTIONS),
-            "required_actions": list(HELPER_ACTIONS),
-            "passive": True,
+            "status": "ok",
         }
 
     async def share_save(self, payload: Mapping[str, object]) -> dict[str, object]:

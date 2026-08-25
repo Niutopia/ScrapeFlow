@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from engine.scrapeflow.boundary_analysis import WorkCandidate
+from engine.scrapeflow.media_policy import DISC_IMAGE_INSPECTION_REQUIRED
 from engine.scrapeflow.source_inventory import (
     SourceFile,
     SourceNode,
@@ -71,8 +72,75 @@ _SPECIAL_KEYWORD_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Physical-release labels are identity *context*, not episode coordinates.
+# Keep this grammar separate from ``extract_episode_pattern``: an OAD/OVA
+# ordinal is release-local and must not be silently turned into TMDB Season
+# 00 (or Season 01).  The matcher below is intentionally bounded to the
+# common marker vocabulary and accepts both ``OAD01``/``OAD 01`` and
+# ``01 OAD`` forms.  A marker without a number is retained as context but
+# does not contribute to a complete numbered run.
+_PHYSICAL_SPECIAL_MARKER_RE = re.compile(
+    r"(?<![A-Za-z])(?P<marker>OVA|OAV|OAD|SP|SPECIAL)"
+    r"(?:[\s._-]*(?:SERIES|系列))?"
+    r"[\s._-]*[\[(]?\s*0*(?P<number>\d{1,3})\s*[\])]?(?!\d)",
+    re.IGNORECASE,
+)
+_REVERSE_PHYSICAL_SPECIAL_MARKER_RE = re.compile(
+    r"(?<![A-Za-z0-9])0*(?P<number>\d{1,3})[\s._-]*"
+    r"(?P<marker>OVA|OAV|OAD|SP|SPECIAL)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_PHYSICAL_SPECIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z])(?P<marker>OVA|OAV|OAD|SP|SPECIAL)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_STANDALONE_SPECIAL_NUMBER_RE = re.compile(
+    r"(?:^|[\s._\-\[\](){}])0*(\d{1,3})(?=$|[\s._\-\[\](){}])"
+)
+
+# A file with a title immediately before an explicit episode coordinate is
+# particularly strong *search* evidence.  This stays deliberately narrower
+# than episode parsing: it is used only to choose a small, representative
+# sample from an already-owned work-unit tree, never to assert a season or an
+# identity by itself.
+_TITLE_BEARING_EPISODE_MARKER_RE = re.compile(
+    r"""
+    (?:^|[\s._+\-\[\](){}])
+    (?:
+        S\s*0*\d{1,3}\s*E\s*0*\d{1,4}
+        |
+        E\s*0*\d{1,4}(?:\s*[\-–—~～]\s*E\s*0*\d{1,4})?
+    )
+    (?=$|[\s._+\-\[\](){}])
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _KNOWN_RESOLUTIONS = frozenset({480, 576, 720, 1080, 2160, 4320})
 _KNOWN_CODECS = frozenset({"264", "265", "x264", "x265", "h264", "h265", "hevc", "av1", "10bit", "8bit"})
+
+# A directory containing ``01.mp4`` … ``12.mp4`` is common, but an ordinal
+# alone is never a work title, an episode coordinate, or a season assertion.
+# Keep this grammar deliberately much narrower than the generic episode parser:
+# quality tags, decimals, ranges, versions, zero, and mixed video names remain
+# unproven.  It is retained only as a fail-closed source-shape flag for C/U;
+# it must not synthesize ``S01E01`` … ``S01EN`` evidence.
+_NAKED_NUMERIC_VIDEO_STEM_RE = re.compile(r"^0*([1-9]\d{0,2})$")
+_CJK_IDENTITY_CHAR_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff]")
+_CJK_GENERIC_BOUNDARY_LABELS = frozenset({
+    "全集", "全季", "合集", "资源", "资源文档", "文档", "文件", "视频",
+    "影片", "动画", "動漫", "番剧", "番劇", "电视剧", "電視劇", "剧集",
+    "劇集", "未命名", "未知", "发布包", "無標題發布包", "无标题发布包",
+    "アニメ", "アニメ全集",
+})
+_CJK_BOUNDARY_RELEASE_NOISE_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b|\b(?:4k|8k|2160p|1080p|720p|480p)\b|"
+    r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)|"
+    r"(?:简中|繁中|简繁|繁简|中字|双语|內封|内封|內嵌|内嵌|外挂|"
+    r"蓝光|藍光|高清|超清|无删减|無刪減|完整版))",
+    re.IGNORECASE,
+)
+_MIN_NAKED_NUMERIC_EPISODE_RUN = 4
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +259,21 @@ class IdentityEvidence:
     episode_pattern: EpisodePattern | None
     media_shape: str   # "movie" | "tv" | "mixed" | "unknown"
     aliases: tuple[str, ...]
+    # A strictly observed root-level ``01`` … ``N`` video run.  This says
+    # nothing about season or episode coordinates; every such run makes C/U
+    # fail closed unless the separately recorded CJK fallback is eligible.
+    strict_naked_numeric_video_run: bool = False
+    # The only narrow release-label fallback: B/W called it TV-shaped and its
+    # boundary is a meaningful CJK title carrying an explicit year.
+    naked_numeric_cjk_release_eligible: bool = False
+    # Explicit physical special context observed in owned video names/paths.
+    # These fields never assert a TMDB season.  ``special_episode_count`` is
+    # populated only for a complete, unique, contiguous 1..N run where every
+    # owned video carries the same marker family and an attached ordinal.
+    special_markers: tuple[str, ...] = ()
+    special_episode_numbers: tuple[int, ...] = ()
+    special_episode_count: int | None = None
+    special_numbered_run_complete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -203,6 +286,12 @@ class IdentityEvidence:
             "episode_pattern": self.episode_pattern.as_dict() if self.episode_pattern else None,
             "media_shape": self.media_shape,
             "aliases": list(self.aliases),
+            "strict_naked_numeric_video_run": self.strict_naked_numeric_video_run,
+            "naked_numeric_cjk_release_eligible": self.naked_numeric_cjk_release_eligible,
+            "special_markers": list(self.special_markers),
+            "special_episode_numbers": list(self.special_episode_numbers),
+            "special_episode_count": self.special_episode_count,
+            "special_numbered_run_complete": self.special_numbered_run_complete,
         }
 
     @classmethod
@@ -218,6 +307,32 @@ class IdentityEvidence:
             episode_pattern=EpisodePattern.from_dict(ep_raw) if isinstance(ep_raw, Mapping) else None,
             media_shape=str(raw.get("media_shape", "unknown")),
             aliases=tuple(str(x) for x in raw.get("aliases") or ()),
+            # ``naked_numeric_video_run`` was a short-lived pre-split field.
+            # Reading it as an observed run remains safely fail-closed; it
+            # does not grant the new CJK release fallback.
+            strict_naked_numeric_video_run=bool(
+                raw.get(
+                    "strict_naked_numeric_video_run",
+                    raw.get("naked_numeric_video_run", False),
+                )
+            ),
+            naked_numeric_cjk_release_eligible=bool(
+                raw.get("naked_numeric_cjk_release_eligible", False)
+            ),
+            special_markers=tuple(
+                str(x).upper() for x in raw.get("special_markers") or ()
+            ),
+            special_episode_numbers=tuple(
+                int(x) for x in raw.get("special_episode_numbers") or ()
+            ),
+            special_episode_count=(
+                int(raw["special_episode_count"])
+                if raw.get("special_episode_count") is not None
+                else None
+            ),
+            special_numbered_run_complete=bool(
+                raw.get("special_numbered_run_complete", False)
+            ),
         )
 
 
@@ -232,6 +347,268 @@ def _clean_noise_tags(text: str) -> str:
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _naked_numeric_video_ordinal(name: str) -> int | None:
+    """Return an exact file-stem ordinal, never a title/quality fragment."""
+    stem = unicodedata.normalize("NFKC", Path(name).stem).strip()
+    match = _NAKED_NUMERIC_VIDEO_STEM_RE.fullmatch(stem)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if 0 < value <= 999 else None
+
+
+def _is_generic_cjk_boundary_composition(text: str) -> bool:
+    """Return whether all CJK label text is generic release vocabulary.
+
+    Release folders often concatenate otherwise harmless generic nouns, such
+    as ``电视剧全集`` or ``发布包合集``.  Exact-set membership is insufficient:
+    a title is meaningful only when some CJK text remains after the label can
+    no longer be segmented entirely into the bounded generic vocabulary.  This
+    is a lexical safety check, not a work-title lookup.
+    """
+    value = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not value:
+        return False
+    terms = tuple(sorted(_CJK_GENERIC_BOUNDARY_LABELS, key=len, reverse=True))
+    reachable = [False] * (len(value) + 1)
+    reachable[0] = True
+    for index in range(len(value)):
+        if not reachable[index]:
+            continue
+        for term in terms:
+            if value.startswith(term, index):
+                reachable[index + len(term)] = True
+    return reachable[-1]
+
+
+def _meaningful_cjk_boundary_label(label: str) -> bool:
+    """Whether a boundary label can safely anchor naked-number TV evidence.
+
+    This is not a title matcher and never supplies an identity itself.  It
+    merely rejects the release-only labels that would make ``01.mp4`` a
+    dangerous search query: bare package metadata, generic resource labels,
+    and labels too short to be a meaningful CJK work name stay unproven.
+    Cross-script title matching remains entirely in ``identity_matching``.
+    """
+    text = unicodedata.normalize("NFKC", str(label or "")).strip()
+    raw_cjk = "".join(_CJK_IDENTITY_CHAR_RE.findall(text))
+    if _is_generic_cjk_boundary_composition(raw_cjk):
+        return False
+    cleaned = _CJK_BOUNDARY_RELEASE_NOISE_RE.sub(" ", text)
+    title_cjk = "".join(_CJK_IDENTITY_CHAR_RE.findall(cleaned))
+    # A release-only prefix can look non-generic before ``(2024)``/``全12集``
+    # is stripped (for example ``发布包（2024）全12集``).  Re-check the
+    # remaining identity text rather than letting the removed metadata supply
+    # the apparent title length.
+    if _is_generic_cjk_boundary_composition(title_cjk):
+        return False
+    return len(title_cjk) >= 3
+
+
+def _has_strict_naked_numeric_video_run(
+    video_files: Sequence[SourceFile],
+) -> bool:
+    """Prove a complete primary ``01`` … ``N`` video run without coordinates.
+
+    The source must contain at least four videos, every video filename must be
+    exactly one positive numeric stem, the ordinals must be unique, and their
+    sorted values must equal ``1..N``.  Any episode suffix, trailer, special,
+    duplicate encode, or missing number invalidates the entire structural
+    fallback rather than being silently excluded.
+    """
+    if len(video_files) < _MIN_NAKED_NUMERIC_EPISODE_RUN:
+        return False
+    numbers = [_naked_numeric_video_ordinal(file.name) for file in video_files]
+    if any(number is None for number in numbers):
+        return False
+    concrete = tuple(sorted(int(number) for number in numbers if number is not None))
+    if len(set(concrete)) != len(concrete):
+        return False
+    if concrete != tuple(range(1, len(concrete) + 1)):
+        return False
+    return True
+
+
+def _physical_special_marker_evidence(
+    video_files: Sequence[SourceFile],
+) -> tuple[tuple[str, ...], tuple[int, ...], int | None, bool]:
+    """Extract bounded OVA/OAV/OAD/SP context from one owned video scope.
+
+    This is deliberately a source-shape fact, not an identity resolver.  A
+    marker in a parent directory supplies context for a bare child ordinal,
+    while ordinary files in the same scope invalidate the complete numbered
+    run.  The returned count is therefore conservative: it is non-``None``
+    only when every video has one marker family, one positive ordinal, no
+    duplicate, and the exact contiguous run ``1..N``.
+    """
+    if not video_files:
+        return (), (), None, False
+    markers: set[str] = set()
+    numbers: list[int] = []
+    all_numbered = True
+    for file in video_files:
+        text = unicodedata.normalize(
+            "NFKC", f"{file.path} {file.name}"
+        )
+        direct = list(_PHYSICAL_SPECIAL_MARKER_RE.finditer(text))
+        reverse = list(_REVERSE_PHYSICAL_SPECIAL_MARKER_RE.finditer(text))
+        tokens = {
+            str(match.group("marker")).upper()
+            for match in (
+                _PHYSICAL_SPECIAL_TOKEN_RE.finditer(text)
+            )
+        }
+        markers.update(tokens)
+        number: int | None = None
+        # Prefer a marker-attached ordinal.  A year is never a release ordinal.
+        if direct:
+            match = direct[0]
+            value = int(match.group("number"))
+            if not 1900 <= value <= 2099:
+                number = value
+        elif reverse:
+            match = reverse[0]
+            value = int(match.group("number"))
+            if not 1900 <= value <= 2099:
+                number = value
+        else:
+            # ``OAD/01.mkv`` is common.  Only use a bare basename ordinal
+            # when a marker appears in an ancestor path segment; this avoids
+            # treating an ordinary ``Show [01]`` file as a special.
+            marker_in_parent = "/" in text and bool(
+                _PHYSICAL_SPECIAL_TOKEN_RE.search(
+                    text.rsplit("/", 1)[0]
+                )
+            )
+            if marker_in_parent:
+                basename = Path(file.name).stem
+                bare = _STANDALONE_SPECIAL_NUMBER_RE.fullmatch(basename)
+                if bare is not None:
+                    value = int(bare.group(1))
+                    if not 1900 <= value <= 2099:
+                        number = value
+        if number is None or number <= 0 or number > 999:
+            all_numbered = False
+        else:
+            numbers.append(number)
+
+    marker_tuple = tuple(sorted(markers))
+    numbers_tuple = tuple(sorted(set(numbers)))
+    complete = bool(
+        all_numbered
+        and len(marker_tuple) == 1
+        and len(numbers) == len(video_files)
+        and len(numbers_tuple) == len(numbers)
+        and numbers_tuple == tuple(range(1, len(numbers) + 1))
+    )
+    return (
+        marker_tuple,
+        numbers_tuple,
+        len(numbers_tuple) if complete else None,
+        complete,
+    )
+
+
+def physical_special_marker_evidence(
+    files_or_node: Sequence[SourceFile] | SourceNode,
+) -> tuple[tuple[str, ...], tuple[int, ...], int | None, bool]:
+    """Expose the shared bounded physical-special source-shape grammar.
+
+    C/U and D/F deliberately use this exact same parser.  It returns marker
+    families, observed ordinals, a count only for a complete numbered run, and
+    the corresponding completeness flag; callers must still prove TMDB
+    identity and target season independently.
+    """
+    if isinstance(files_or_node, SourceNode):
+        videos = [
+            file for file in collect_all_files(files_or_node)
+            if file.object_type == "video"
+        ]
+    else:
+        videos = list(files_or_node)
+    return _physical_special_marker_evidence(videos)
+
+
+def is_physical_special_video_file(file: SourceFile) -> bool:
+    """Whether one video file carries a physical-special marker with an ordinal.
+
+    This is the single-file predicate behind the shared bounded physical-special
+    grammar (``physical_special_marker_evidence``).  A marker may also live in
+    a parent directory and supply context for a bare child ordinal
+    (``OAD/01.mkv``); the whole-scope completeness decision still runs through
+    ``physical_special_marker_evidence``, never through this predicate alone.
+    """
+    text = unicodedata.normalize("NFKC", f"{file.path} {file.name}")
+    if _PHYSICAL_SPECIAL_MARKER_RE.search(text):
+        return True
+    if _REVERSE_PHYSICAL_SPECIAL_MARKER_RE.search(text):
+        return True
+    marker_in_parent = "/" in text and bool(
+        _PHYSICAL_SPECIAL_TOKEN_RE.search(text.rsplit("/", 1)[0])
+    )
+    if marker_in_parent:
+        basename = Path(file.name).stem
+        return _STANDALONE_SPECIAL_NUMBER_RE.fullmatch(basename) is not None
+    return False
+
+
+def _representative_episode_title_key(name: str) -> str | None:
+    """Return a stable key when a filename carries a title before ``SxxExx``.
+
+    Root-level releases sometimes put a current season's anonymous
+    ``S09E01`` files next to older season directories whose media filenames
+    retain the real title.  Sampling only the first files in tree order then
+    starves C of the useful evidence.  This helper recognizes only an
+    explicit title-prefixed episode marker; it does not turn bare ordinals or
+    a directory name into title evidence.
+    """
+    stem = Path(name).stem.strip(" ._-")
+    marker = _TITLE_BEARING_EPISODE_MARKER_RE.search(stem)
+    if marker is None or marker.start() == 0:
+        return None
+    prefix = _clean_noise_tags(stem[:marker.start()]).strip(" ._-")
+    key = "".join(
+        char for char in unicodedata.normalize("NFKC", prefix).casefold()
+        if char.isalnum()
+    )
+    return key if any(char.isalpha() for char in key) else None
+
+
+def _select_representative_video_files(
+    video_files: Sequence[SourceFile],
+    *,
+    limit: int = 5,
+    title_bearing_limit: int = 4,
+) -> list[SourceFile]:
+    """Choose a bounded, deterministic video sample for identity evidence.
+
+    Prefer distinct title-bearing episode filenames anywhere inside the exact
+    owned source subtree, then fill the remaining slots using the historical
+    tree order.  This retains bounded TMDB input and lets ordinary films or
+    opaque releases continue to use their first media filenames unchanged.
+    """
+    selected: list[SourceFile] = []
+    selected_paths: set[str] = set()
+    title_keys: set[str] = set()
+    for media in video_files:
+        key = _representative_episode_title_key(media.name)
+        if key is None or key in title_keys:
+            continue
+        title_keys.add(key)
+        selected.append(media)
+        selected_paths.add(media.path)
+        if len(selected) >= min(limit, title_bearing_limit):
+            break
+    for media in video_files:
+        if media.path in selected_paths:
+            continue
+        selected.append(media)
+        selected_paths.add(media.path)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def extract_identity_evidence(
@@ -261,13 +638,52 @@ def extract_identity_evidence(
                 aliases.extend(parts)
 
     episode_pattern: EpisodePattern | None = None
+    strict_naked_numeric_video_run = False
+    naked_numeric_cjk_release_eligible = False
+    special_markers: tuple[str, ...] = ()
+    special_episode_numbers: tuple[int, ...] = ()
+    special_episode_count: int | None = None
+    special_numbered_run_complete = False
     if node is not None:
         video_files = [f for f in collect_all_files(node) if f.object_type == "video"]
         if video_files:
             episode_pattern = extract_episode_pattern(video_files)
-            for f in video_files[:5]:
+            (
+                special_markers,
+                special_episode_numbers,
+                special_episode_count,
+                special_numbered_run_complete,
+            ) = physical_special_marker_evidence(video_files)
+            strict_naked_numeric_video_run = _has_strict_naked_numeric_video_run(
+                video_files
+            )
+            # This shape intentionally has no known S/E coordinates.  Today's
+            # generic parser does not recognize bare ``01`` stems, but clear
+            # any future parser result too: a pure ordinal run must never be
+            # silently reinterpreted as season one.
+            if strict_naked_numeric_video_run:
+                episode_pattern = None
+            # ``01.mp4`` is not a queryable title.  A full naked-number run
+            # can only activate a stricter C/U identity guard when B/W already
+            # sees a TV-shaped unit and this boundary itself carries enough
+            # non-generic CJK title signal plus an explicit year.  It
+            # deliberately does *not* add an EpisodePattern: bare ordinals do
+            # not prove S01E01…S01EN.
+            naked_numeric_cjk_release_eligible = (
+                candidate.proposed_media_context == "tv"
+                and _meaningful_cjk_boundary_label(candidate.display_label)
+                and bool(_YEAR_RE.search(candidate.display_label))
+                and strict_naked_numeric_video_run
+            )
+            for f in _select_representative_video_files(video_files):
                 for y_str in _YEAR_RE.findall(f.name):
                     years.add(int(y_str))
+                # A naked ordinal is structural evidence only.  Adding it to
+                # ``representative_names`` would later let ``01`` be sent to
+                # TMDB as a movie title if the meaningful boundary query did
+                # not produce a candidate.
+                if _naked_numeric_video_ordinal(f.name) is not None:
+                    continue
                 cleaned_name = _clean_noise_tags(Path(f.name).stem)
                 if cleaned_name and cleaned_name not in representative_names:
                     representative_names.append(cleaned_name)
@@ -294,6 +710,12 @@ def extract_identity_evidence(
         episode_pattern=episode_pattern,
         media_shape=candidate.proposed_media_context,
         aliases=tuple(sorted(set(aliases))),
+        strict_naked_numeric_video_run=strict_naked_numeric_video_run,
+        naked_numeric_cjk_release_eligible=naked_numeric_cjk_release_eligible,
+        special_markers=special_markers,
+        special_episode_numbers=special_episode_numbers,
+        special_episode_count=special_episode_count,
+        special_numbered_run_complete=special_numbered_run_complete,
     )
 
 
@@ -315,12 +737,29 @@ class WorkUnitRecord:
     source_paths: tuple[str, ...]
     source_revision: int
     role: str
+    # Boundary-analysis display evidence is durable.  A multi-directory
+    # cohort has a synthetic boundary key and must not lose the human title
+    # evidence to that implementation-only key during C/U.
+    display_label: str = ""
+    # Positive seasons explicitly asserted by B/W (for example an otherwise
+    # empty S11 sibling in a verified season cohort).  This is a source-boundary
+    # fact, not an identity override or an externally injected expectation.
+    claimed_seasons: tuple[int, ...] = ()
+    # True only when B/W saw opaque disc-image containers in this exact
+    # source scope.  It stays durable so identity overrides, retries, D/E
+    # lanes, and F cannot mistake title confirmation for content inspection.
+    requires_content_expansion: bool = False
     media_context: str = "unknown"
     identity_status: str = "pending"  # "pending" | "confirmed" | "uncertain" | "failed"
     identity: dict[str, Any] | None = None
     candidate_identities: tuple[dict[str, Any], ...] = ()
     reconciliation_outcome: str | None = None
     matched_work_root: str | None = None
+    # Narrow, system-derived D evidence used to revalidate a later F request.
+    # It is not an identity override and must never be populated from a
+    # browser/API payload.  It records only a fully proved, grammar-tagged
+    # unqualified-episode to unique-TMDB-season mapping.
+    reconciliation_evidence: dict[str, Any] | None = None
     writer_job_id: str | None = None
     # Per-unit E-lane state (P12).  Values:
     #   duplicate_consumed / existing_gap_registered / existing_gap_held /
@@ -329,7 +768,21 @@ class WorkUnitRecord:
     lane_detail: str | None = None
     # Known-gap coordinates the E2 lane must register (from the D verdict).
     uncovered_tokens: tuple[str, ...] = ()
+    # J-step outcome after a successful formal write.  ``None`` means the
+    # unit has not yet reached J; ``registered`` means the official catalog
+    # was checked and the ledger was durably read back (even when no gaps
+    # were found); ``attention`` is evidence/catalog insufficiency; and
+    # ``failed`` is a local ledger persistence/readback failure.  Keeping it
+    # on the WorkUnit rather than an EngineJob summary makes a completed
+    # writer carrier safe to retry at J without writing media a second time.
+    gap_status: str | None = None
+    gap_detail: str | None = None
     attention: str | None = None
+    # A completed WorkUnit may later need a generic, writer-backed hierarchy
+    # correction after its parent-family rule improves.  This is separate from
+    # ``writer_job_id``: the latter remains the immutable original media-write
+    # carrier, while this field records the exact relocation carrier/readback.
+    layout_repair: dict[str, Any] | None = None
     updated_at: str = field(default_factory=_now)
 
     def as_dict(self) -> dict[str, Any]:
@@ -340,17 +793,30 @@ class WorkUnitRecord:
             "source_paths": list(self.source_paths),
             "source_revision": self.source_revision,
             "role": self.role,
+            "display_label": self.display_label,
+            "claimed_seasons": list(self.claimed_seasons),
+            "requires_content_expansion": self.requires_content_expansion,
             "media_context": self.media_context,
             "identity_status": self.identity_status,
             "identity": dict(self.identity) if self.identity else None,
             "candidate_identities": [dict(c) for c in self.candidate_identities],
             "reconciliation_outcome": self.reconciliation_outcome,
             "matched_work_root": self.matched_work_root,
+            "reconciliation_evidence": (
+                dict(self.reconciliation_evidence)
+                if self.reconciliation_evidence is not None else None
+            ),
             "writer_job_id": self.writer_job_id,
             "lane_status": self.lane_status,
             "lane_detail": self.lane_detail,
             "uncovered_tokens": list(self.uncovered_tokens),
+            "gap_status": self.gap_status,
+            "gap_detail": self.gap_detail,
             "attention": self.attention,
+            "layout_repair": (
+                dict(self.layout_repair)
+                if self.layout_repair is not None else None
+            ),
             "updated_at": self.updated_at,
         }
 
@@ -358,6 +824,8 @@ class WorkUnitRecord:
     def from_dict(cls, raw: Mapping[str, Any]) -> WorkUnitRecord:
         ident = raw.get("identity")
         cand_list = raw.get("candidate_identities") or ()
+        reconciliation_evidence = raw.get("reconciliation_evidence")
+        layout_repair = raw.get("layout_repair")
         return cls(
             work_unit_id=str(raw["work_unit_id"]),
             root_task_id=str(raw["root_task_id"]),
@@ -365,19 +833,40 @@ class WorkUnitRecord:
             source_paths=tuple(str(x) for x in raw.get("source_paths") or ()),
             source_revision=int(raw.get("source_revision", 1)),
             role=str(raw.get("role", "single_work")),
+            display_label=str(raw.get("display_label") or ""),
+            claimed_seasons=tuple(
+                sorted({
+                    int(value)
+                    for value in (raw.get("claimed_seasons") or ())
+                    if isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                })
+            ),
+            requires_content_expansion=raw.get("requires_content_expansion") is True,
             media_context=str(raw.get("media_context", "unknown")),
             identity_status=str(raw.get("identity_status", "pending")),
             identity=dict(ident) if isinstance(ident, Mapping) else None,
             candidate_identities=tuple(dict(c) for c in cand_list if isinstance(c, Mapping)),
             reconciliation_outcome=str(raw["reconciliation_outcome"]) if raw.get("reconciliation_outcome") else None,
             matched_work_root=str(raw["matched_work_root"]) if raw.get("matched_work_root") else None,
+            reconciliation_evidence=(
+                dict(reconciliation_evidence)
+                if isinstance(reconciliation_evidence, Mapping) else None
+            ),
             writer_job_id=str(raw["writer_job_id"]) if raw.get("writer_job_id") else None,
             lane_status=str(raw["lane_status"]) if raw.get("lane_status") else None,
             lane_detail=str(raw["lane_detail"]) if raw.get("lane_detail") else None,
             uncovered_tokens=tuple(
                 str(value) for value in (raw.get("uncovered_tokens") or ())
             ),
+            gap_status=str(raw["gap_status"]) if raw.get("gap_status") else None,
+            gap_detail=str(raw["gap_detail"]) if raw.get("gap_detail") else None,
             attention=str(raw["attention"]) if raw.get("attention") else None,
+            layout_repair=(
+                dict(layout_repair)
+                if isinstance(layout_repair, Mapping) else None
+            ),
             updated_at=str(raw.get("updated_at") or _now()),
         )
 
@@ -392,6 +881,7 @@ def create_work_units_from_candidates(
     now_str = _now()
     records: list[WorkUnitRecord] = []
     for cand in candidates:
+        requires_content_expansion = bool(cand.requires_content_expansion)
         record = WorkUnitRecord(
             work_unit_id=cand.work_unit_id,
             root_task_id=root_task_id,
@@ -399,14 +889,29 @@ def create_work_units_from_candidates(
             source_paths=cand.source_paths,
             source_revision=source_revision,
             role=cand.boundary_evidence.role.value,
+            display_label=cand.display_label,
+            claimed_seasons=tuple(sorted({
+                int(value)
+                for value in cand.claimed_seasons
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            })),
+            requires_content_expansion=requires_content_expansion,
             media_context=cand.proposed_media_context,
-            identity_status="pending",
+            identity_status=(
+                "uncertain" if requires_content_expansion else "pending"
+            ),
             identity=None,
             candidate_identities=(),
             reconciliation_outcome=None,
             matched_work_root=None,
+            reconciliation_evidence=None,
             writer_job_id=None,
-            attention=None,
+            gap_status=None,
+            gap_detail=None,
+            attention=(
+                "；".join(cand.boundary_evidence.reasons)
+                if requires_content_expansion else None
+            ),
             updated_at=now_str,
         )
         records.append(record)
@@ -459,6 +964,7 @@ def load_work_unit_records(
 __all__ = [
     "EpisodePattern",
     "extract_episode_pattern",
+    "physical_special_marker_evidence",
     "IdentityEvidence",
     "extract_identity_evidence",
     "WorkUnitRecord",

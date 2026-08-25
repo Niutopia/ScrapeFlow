@@ -26,6 +26,7 @@ from engine.scrapeflow.gap_ledger import (
     save_gap_ledger,
 )
 from engine.scrapeflow.root_boundaries import load_source_snapshot
+from engine.scrapeflow.source_inventory import validate_source_scope
 from engine.scrapeflow.work_units import (
     WorkUnitRecord,
     load_work_unit_records,
@@ -41,7 +42,9 @@ from .simple_engine_runner import (
     _safe_remote_path,   # noqa: PLC2701
 )
 from .unit_execution import (
+    _complete_unit_episode_gap_registration,
     _mark_internal_carrier,
+    _request_for_unit,
     _retire_stale_unit_carrier,
     _unit_job_id,
 )
@@ -89,25 +92,17 @@ def compute_known_gap_tokens(
     return known
 
 
-def _owned_unit_source(
+def _owned_unit_sources(
     runner: SimpleEngineRunner,
     record: WorkUnitRecord,
     root_job,
-) -> str:
-    """Return the validated task-owned boundary source of one unit."""
-    unit_source = (
-        str(record.source_paths[0]).rstrip("/")
-        if record.source_paths
-        else ""
-    )
-    if not unit_source:
-        raise EngineExecutionError("单元缺少来源路径")
+) -> tuple[str, ...]:
+    """Return every validated, non-overlapping task-owned unit source."""
     ingress = str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
-    if not ingress or not (
-        unit_source == ingress or unit_source.startswith(ingress + "/")
-    ):
-        raise EngineExecutionError("单元来源不属于本任务入站目录")
-    return unit_source
+    try:
+        return validate_source_scope(ingress, record.source_paths)
+    except ValueError as exc:
+        raise EngineExecutionError(f"单元来源不属于本任务入站目录: {exc}") from exc
 
 
 def _unit_subtree_is_empty(
@@ -119,10 +114,13 @@ def _unit_subtree_is_empty(
     snapshot = load_source_snapshot(state_root, root_task_id)
     if snapshot is None:
         return False
-    boundary = str(record.source_paths[0]).rstrip("/")
+    try:
+        scopes = validate_source_scope(snapshot["root"], record.source_paths)
+    except ValueError:
+        return False
     for row in snapshot["rows"]:
         full_path = str(row.get("full_path") or "")
-        if full_path == boundary or full_path.startswith(boundary + "/"):
+        if any(full_path == scope or full_path.startswith(scope + "/") for scope in scopes):
             if row.get("is_dir") is not True:
                 return False
     return True
@@ -228,31 +226,37 @@ def _consume_duplicate_unit(
     pause_requested: Callable[[], bool] | None,
 ) -> WorkUnitRecord:
     """E1: move a proven duplicate boundary into the task archive lane."""
-    unit_source = _owned_unit_source(runner, record, root_job)
-    name = posixpath.basename(unit_source)
-    if not name or name in {".", ".."}:
-        raise EngineExecutionError("duplicate 单元边界名无效")
+    unit_sources = _owned_unit_sources(runner, record, root_job)
+    names = [posixpath.basename(source) for source in unit_sources]
+    if any(not name or name in {".", ".."} for name in names) or len(set(names)) != len(names):
+        raise EngineExecutionError("duplicate 单元边界名无效或冲突")
     processed_root = _safe_remote_path(
         f"{runner.library_root}/ScrapeFlow/归档/{_safe_job_id(root_job.id)}/processed",
         field="unit duplicate processed root",
         allow_root=False,
     )
-    target = f"{processed_root}/{name}"
-    source_kind = runner._remote_entry_kind(unit_source)
-    target_kind = runner._remote_entry_kind(target)
-    if record.lane_status == "duplicate_consumed":
-        if source_kind == "missing" and target_kind == "directory":
-            return record
-        raise EngineExecutionError("duplicate 单元消费后回读失败")
-    _move_with_readback(
-        runner,
-        source=unit_source,
-        target_root=processed_root,
-        name=name,
-        field="duplicate 单元消费",
-        pause_requested=pause_requested,
-        root_job=root_job,
+    lane_root = (
+        f"{processed_root}/{record.work_unit_id}"
+        if len(unit_sources) > 1 else processed_root
     )
+    if record.lane_status == "duplicate_consumed":
+        for source, name in zip(unit_sources, names):
+            if (
+                runner._remote_entry_kind(source) != "missing"
+                or runner._remote_entry_kind(f"{lane_root}/{name}") != "directory"
+            ):
+                raise EngineExecutionError("duplicate 单元消费后回读失败")
+        return record
+    for source, name in zip(unit_sources, names):
+        _move_with_readback(
+            runner,
+            source=source,
+            target_root=lane_root,
+            name=name,
+            field="duplicate 单元消费",
+            pause_requested=pause_requested,
+            root_job=root_job,
+        )
     return replace(
         record,
         lane_status="duplicate_consumed",
@@ -313,22 +317,29 @@ def _register_and_hold_existing_gap_unit(
     # Hold only a provably empty boundary subtree; non-empty sources stay in
     # intake and become operator attention.
     if _unit_subtree_is_empty(state_root, root_job.id, record):
-        unit_source = _owned_unit_source(runner, record, root_job)
-        name = posixpath.basename(unit_source)
+        unit_sources = _owned_unit_sources(runner, record, root_job)
+        names = [posixpath.basename(source) for source in unit_sources]
+        if any(not name or name in {".", ".."} for name in names) or len(set(names)) != len(names):
+            raise EngineExecutionError("existing-gap 空目录边界名无效或冲突")
         hold_root = _safe_remote_path(
             f"{runner.library_root}/ScrapeFlow/归档/{_safe_job_id(root_job.id)}/existing-gap-hold",
             field="unit existing-gap hold root",
             allow_root=False,
         )
-        _move_with_readback(
-            runner,
-            source=unit_source,
-            target_root=hold_root,
-            name=name,
-            field="existing-gap 空目录 hold",
-            pause_requested=pause_requested,
-            root_job=root_job,
+        lane_root = (
+            f"{hold_root}/{record.work_unit_id}"
+            if len(unit_sources) > 1 else hold_root
         )
+        for source, name in zip(unit_sources, names):
+            _move_with_readback(
+                runner,
+                source=source,
+                target_root=lane_root,
+                name=name,
+                field="existing-gap 空目录 hold",
+                pause_requested=pause_requested,
+                root_job=root_job,
+            )
         return replace(
             record,
             lane_status="existing_gap_held",
@@ -357,7 +368,16 @@ def _merge_unit(
     if record.lane_status == "merge_done" and record.writer_job_id:
         carrier = runner.get_job(record.writer_job_id)
         if carrier.phase == "executed":
-            return record
+            # A process can finish G/H and persist the merge carrier before
+            # it reaches J.  Resume only the precise gap ledger check here;
+            # never re-plan or replay the formal-library writer.
+            return _complete_unit_episode_gap_registration(
+                runner,
+                state_root,
+                root_job.id,
+                record,
+                carrier.plan,
+            )
         raise EngineExecutionError("归并载体回读失败")
     work_root = record.matched_work_root
     if not work_root:
@@ -372,24 +392,17 @@ def _merge_unit(
         or tmdb_id <= 0
     ):
         raise EngineExecutionError("merge_existing 单元身份无效")
-    unit_source = _owned_unit_source(runner, record, root_job)
-    payload: dict[str, object] = {
-        "source_path": unit_source,
-        # The planner derives the series directory from the TMDB title under
-        # ``parent_path``; passing the work root itself would nest a second
-        # copy (番剧/刀剑神域/刀剑神域).  Pass its parent so the planner
-        # resolves back onto the locked root, exactly like the legacy merge
-        # hand-off, and the target lock below enforces the result.
-        "parent_path": posixpath.dirname(work_root.rstrip("/")),
-        "media_type": media_type,
-        "tmdb_id": tmdb_id,
-    }
-    season = identity.get("season")
-    if isinstance(season, int) and not isinstance(season, bool) and season > 0:
-        payload["season"] = season
-    from .simple_engine_runner import EngineRequest
-
-    request = EngineRequest.from_mapping(payload)
+    # The planner derives the series directory from the TMDB title under the
+    # parent of the locked root; the shared request builder preserves an exact
+    # multi-source manifest instead of broadening to a sibling source tree.
+    request = _request_for_unit(
+        runner,
+        record,
+        root_job.id,
+        state_root,
+        parent_override=posixpath.dirname(work_root.rstrip("/")),
+        target_scope_override=work_root,
+    )
     # A previous attempt may have left a terminal carrier; plan_job refuses
     # existing ids, so retire it first (same rule as new_work units).
     carrier_id = _unit_job_id(record.work_unit_id)
@@ -461,7 +474,7 @@ def _merge_unit(
         raise EngineExecutionError("归并计划媒体类型与既有作品不一致")
     # ``plan_job`` may have performed archive preprocessing.  Recheck after
     # validating the plan and pass the same root predicate into the formal
-    # writer so a pilot scope cannot close in this plan->execute gap.
+    # writer so a pause or task switch cannot cross this plan->execute gap.
     _pause_checkpoint(pause_requested)
     executed = (
         planned
@@ -472,13 +485,23 @@ def _merge_unit(
         if executed.phase in {"executing", "verifying", "cleaning"}:
             raise EnginePauseRequested("归并写入在暂停边界保持可恢复")
         raise EngineExecutionError("归并写入未完成")
-    return replace(
+    merged = replace(
         record,
         writer_job_id=planned.id,
         lane_status="merge_done",
         lane_detail=None,
         attention=None,
         updated_at=_now(),
+    )
+    # E3 still passes through H and then J.  The shared completion helper
+    # records catalog insufficiency as visible attention and local ledger
+    # persistence/readback faults as failed state without replaying the merge.
+    return _complete_unit_episode_gap_registration(
+        runner,
+        state_root,
+        root_job.id,
+        merged,
+        executed.plan,
     )
 
 

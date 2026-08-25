@@ -19,9 +19,8 @@ ACQUISITION_QUARK_FAST_SAVE = "quark_fast_save"
 ACQUISITION_TORRENT = "torrent"
 
 # ``provider_capability_snapshot`` is a declaration of the fixed materializer
-# contract, not a liveness probe.  Keep the helper dependency names and action
-# set here so the API health projection and the independent readiness command
-# cannot silently drift apart.
+# contract, not a liveness probe.  It is used only to reject unsupported
+# candidate shapes before they reach a materializer.
 #
 # The helper contract shrank to the share-save path only (2026-08-17): the
 # CDP/WSG magnet impersonation tier was removed after Quark account-level
@@ -60,9 +59,8 @@ def provider_capability_snapshot() -> dict[str, dict[str, Any]]:
     A new mapping is returned on every call so an API consumer cannot mutate
     the process-wide capability declaration.  ``ready`` is reserved for fixed
     lanes whose candidate kind the current materializer chain accepts.  It is
-    deliberately *not* evidence that an external helper is reachable or
-    authenticated: consumers that need runtime truth must inspect the
-    structured ``health.helper_readiness`` projection instead.
+    deliberately not evidence that an external helper is reachable or
+    authenticated; a real share attempt reports that result on its own task.
     """
     return {
         PROVIDER_QUARK_SHARE: {

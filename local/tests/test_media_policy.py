@@ -4,18 +4,23 @@ from engine.scrapeflow.core import MEDIA_EXTS, SUBTITLE_EXTS, VIDEO_EXTS
 from engine.scrapeflow.media_policy import (
     ARCHIVE_EXTENSIONS,
     AUDIO_EXTENSIONS,
+    DISC_IMAGE_EXTENSIONS,
     DOCUMENT_EXTENSIONS,
     FONT_EXTENSIONS,
     IMAGE_EXTENSIONS,
     MANIFEST_EXTENSIONS,
+    POSTER_EXTENSIONS,
     SUBTITLE_EXTENSIONS,
     TEMPORARY_EXTENSIONS,
     VIDEO_EXTENSIONS,
     classify_filename,
     is_archive_filename,
+    is_container_candidate_filename,
+    is_disc_image_filename,
+    is_executable_filename,
     is_temporary_filename,
 )
-from engine.scrapeflow.media_quality import VIDEO_FILE_EXTENSIONS
+from engine.scrapeflow.media_quality import VIDEO_FILE_EXTENSIONS, media_kind
 from engine.scrapeflow.residual_policy import (
     ARCHIVE_EXTENSIONS as RESIDUAL_ARCHIVE_EXTENSIONS,
     AUDIO_EXTENSIONS as RESIDUAL_AUDIO_EXTENSIONS,
@@ -26,15 +31,11 @@ from engine.scrapeflow.residual_policy import (
     REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES,
     SUBTITLE_EXTENSIONS as RESIDUAL_SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS as RESIDUAL_VIDEO_EXTENSIONS,
+    KEEP_UNPLANNED,
+    classify_residual,
 )
 from engine.tools import _replenishment_local_adapter_impl as torrent_adapter
-from local.scrapeflow_api import automatic_replenishment, replenishment
-from local.scrapeflow_api.simple_library_audit import (
-    POSTER_SUFFIXES,
-    SUBTITLE_SUFFIXES,
-    TEMPORARY_SUFFIXES,
-    VIDEO_SUFFIXES,
-)
+from local.scrapeflow_api import provider_materializers, replenishment
 
 
 class MediaPolicyTests(unittest.TestCase):
@@ -44,24 +45,49 @@ class MediaPolicyTests(unittest.TestCase):
         self.assertEqual(RESIDUAL_VIDEO_EXTENSIONS, VIDEO_EXTENSIONS)
         self.assertEqual(torrent_adapter.VIDEO_EXTENSIONS, VIDEO_EXTENSIONS)
         self.assertEqual(replenishment._VIDEO_SUFFIXES, VIDEO_EXTENSIONS)
-        self.assertEqual(automatic_replenishment._VIDEO_EXTENSIONS, VIDEO_EXTENSIONS)
-        self.assertEqual(VIDEO_SUFFIXES, VIDEO_EXTENSIONS)
+        self.assertEqual(provider_materializers._VIDEO_EXTENSIONS, VIDEO_EXTENSIONS)
 
         self.assertEqual(SUBTITLE_EXTS, SUBTITLE_EXTENSIONS)
         self.assertEqual(RESIDUAL_SUBTITLE_EXTENSIONS, SUBTITLE_EXTENSIONS)
         self.assertEqual(torrent_adapter.SUBTITLE_EXTENSIONS, SUBTITLE_EXTENSIONS)
-        self.assertEqual(automatic_replenishment._SUBTITLE_EXTENSIONS, SUBTITLE_EXTENSIONS)
-        self.assertEqual(SUBTITLE_SUFFIXES, SUBTITLE_EXTENSIONS)
+        self.assertEqual(provider_materializers._SUBTITLE_EXTENSIONS, SUBTITLE_EXTENSIONS)
         self.assertEqual(MEDIA_EXTS, VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS)
 
     def test_required_video_edges_are_consistent(self):
-        for suffix in (".iso", ".mts", ".strm", ".flv", ".rmvb"):
+        for suffix in (".mts", ".strm", ".flv", ".rmvb"):
             with self.subTest(suffix=suffix):
                 self.assertIn(suffix, VIDEO_EXTENSIONS)
                 self.assertEqual(classify_filename(f"release{suffix}"), "video")
                 self.assertTrue(replenishment._candidate_has_video_file({
                     "files": [f"episode{suffix}"],
                 }))
+
+    def test_optical_disc_images_are_opaque_not_direct_video_or_cleanup(self):
+        for suffix in (".iso", ".img", ".cue", ".bin", ".mdf"):
+            with self.subTest(suffix=suffix):
+                name = f"release{suffix}"
+                self.assertIn(suffix, DISC_IMAGE_EXTENSIONS)
+                self.assertNotIn(suffix, VIDEO_EXTENSIONS)
+                self.assertTrue(is_disc_image_filename(name))
+                self.assertEqual(classify_filename(name), "disc_image")
+                self.assertEqual(media_kind(name, video_exts=VIDEO_EXTENSIONS), "disc_image")
+                self.assertFalse(replenishment._candidate_has_video_file({
+                    "files": [f"episode{suffix}"],
+                }))
+                residual = classify_residual(f"/incoming/{name}")
+                self.assertEqual(residual.action, KEEP_UNPLANNED)
+                self.assertFalse(residual.can_cleanup)
+                self.assertEqual(
+                    residual.kind,
+                    "disc_image_requires_content_expansion",
+                )
+
+    def test_container_candidate_policy_requires_magic_proof_for_iso_and_exe(self):
+        for name in ("feature.iso", "feature.img", "release.7z", "wrapper.exe"):
+            with self.subTest(name=name):
+                self.assertTrue(is_container_candidate_filename(name))
+        self.assertTrue(is_executable_filename("wrapper.exe"))
+        self.assertFalse(is_container_candidate_filename("episode.mkv"))
 
     def test_auxiliary_categories_are_explicit_and_retained(self):
         expected = {
@@ -100,8 +126,8 @@ class MediaPolicyTests(unittest.TestCase):
         self.assertEqual(RESIDUAL_IMAGE_EXTENSIONS, IMAGE_EXTENSIONS)
         self.assertEqual(RESIDUAL_MANIFEST_EXTENSIONS, MANIFEST_EXTENSIONS)
         self.assertEqual(REBUILDABLE_DOWNLOAD_TEMP_SUFFIXES, TEMPORARY_EXTENSIONS)
-        self.assertEqual(POSTER_SUFFIXES, {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
-        self.assertEqual(TEMPORARY_SUFFIXES, TEMPORARY_EXTENSIONS)
+        self.assertEqual(POSTER_EXTENSIONS, {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
+        self.assertIn(".part", TEMPORARY_EXTENSIONS)
 
 
 if __name__ == "__main__":

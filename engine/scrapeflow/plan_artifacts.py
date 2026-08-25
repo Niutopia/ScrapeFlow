@@ -68,6 +68,28 @@ def _planned_artwork_impl(
     collision policy.
     """
     requests: list[tuple[str, str, str]] = []
+    # A directory-only series container has no TMDB identity of its own, but
+    # the media-library contract still requires the container folder to be a
+    # visible item with its own artwork.  The root artifact carrier supplies
+    # these already-approved image paths; they are deliberately kept
+    # separate from the child work identities so a container is never
+    # mistaken for another TMDB work.
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    container_root = metadata.get("container_root")
+    if isinstance(container_root, str) and container_root:
+        container_poster = metadata.get("container_poster_path")
+        container_backdrop = metadata.get("container_backdrop_path")
+        if isinstance(container_poster, str) and container_poster:
+            requests.extend(
+                [
+                    (join_remote_fn(container_root, "folder.jpg"), container_poster, "container-folder"),
+                    (join_remote_fn(container_root, "poster.jpg"), container_poster, "container-poster"),
+                ]
+            )
+        if isinstance(container_backdrop, str) and container_backdrop:
+            requests.append(
+                (join_remote_fn(container_root, "fanart.jpg"), container_backdrop, "container-fanart")
+            )
     primary_root = (
         str(plan.metadata.get("series_root"))
         if plan.mode == "mixed" and plan.metadata.get("series_root")
@@ -271,8 +293,37 @@ def _planned_tv_nfos_impl(
     *,
     join_remote_fn: Callable[[str, str], str],
 ) -> list[tuple[str, bytes]]:
+    metadata = plan.metadata if isinstance(plan.metadata, Mapping) else {}
+    container_root = metadata.get("container_root")
+    container_title = metadata.get("container_title")
+    container_kind = metadata.get("container_nfo_kind", "tvshow")
+    if (
+        isinstance(container_root, str)
+        and container_root
+        and isinstance(container_title, str)
+        and container_title
+        and container_kind == "tvshow"
+    ):
+        # Do not attach a TMDB id to a directory-only container.  It is a
+        # grouping item, not a second identity; the child work NFOs remain
+        # authoritative for identity and season metadata.
+        payload = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<!-- ScrapeFlow container metadata; no TMDB identity -->\n"
+            "<tvshow>\n"
+            f"  <title>{html.escape(container_title)}</title>\n"
+            "  <type>collection</type>\n"
+            "</tvshow>\n"
+        ).encode("utf-8")
+        if plan.mode == "container":
+            return [(join_remote_fn(container_root, "tvshow.nfo"), payload)]
+        # A future mixed/batch carrier may carry both this root marker and
+        # ordinary child NFOs.  Keep the root first so deterministic writers
+        # preserve it if a target spelling collides.
+        output = [(join_remote_fn(container_root, "tvshow.nfo"), payload)]
+    else:
+        output = []
     if plan.mode == "batch":
-        output: list[tuple[str, bytes]] = []
         members = plan.metadata.get("member_tv")
         if not isinstance(members, Mapping):
             return output
@@ -330,7 +381,7 @@ def _planned_tv_nfos_impl(
         f'  <uniqueid type="tmdb" default="true">{tmdb_id}</uniqueid>\n'
         "</tvshow>\n"
     ).encode("utf-8")
-    return [(join_remote_fn(series_root, "tvshow.nfo"), payload)]
+    return [*output, (join_remote_fn(series_root, "tvshow.nfo"), payload)]
 
 
 def _planned_tv_episode_nfos_impl(

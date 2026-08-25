@@ -38,6 +38,54 @@ if TYPE_CHECKING:
 
 AUTO_MATCH_MIN_MARGIN = 0.08
 
+# These are physical-release labels which can describe a separately
+# catalogued short TV work.  ``SP``/``SPECIAL`` stay useful planning context,
+# but are too broad to select a different TMDB identity automatically.  OVA,
+# OAV and OAD are bounded enough to require corresponding *official TMDB*
+# evidence when the source is a complete numbered physical-release run.
+_PHYSICAL_SPECIAL_IDENTITY_MARKERS = frozenset({"OVA", "OAV", "OAD"})
+
+# A folder that says only ``Season 02``/``第二季`` identifies a structural
+# position, never a creative work.  C/U may still use it together with the
+# exact B-snapshot parent title, but it must not consume the bounded query
+# budget ahead of that title or a title-bearing representative filename.
+_GENERIC_SEASON_IDENTITY_LABEL_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:season|s)\s*0*\d{1,3}"
+    r"|第\s*(?:\d{1,3}|[一二三四五六七八九十百零〇两]{1,5})\s*季"
+    r"|(?:[一二三四五六七八九十百零〇两]{1,5})\s*季"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+_COORDINATE_ONLY_IDENTITY_LABEL_RE = re.compile(
+    r"^\s*(?:"
+    r"S\s*0*\d{1,3}\s*E\s*0*\d{1,4}"
+    r"|E\s*0*\d{1,4}"
+    r"|第\s*0*\d{1,4}\s*[集话話期]"
+    r"|\[\s*0*\d{1,4}\s*\]"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_generic_season_identity_label(value: object) -> bool:
+    """Return true only for a bare directory-style season label."""
+    return bool(
+        _GENERIC_SEASON_IDENTITY_LABEL_RE.fullmatch(str(value or ""))
+    )
+
+
+def _is_non_structural_identity_evidence(value: object) -> bool:
+    """Whether a C/U label contains a usable work-title clue, not a coordinate."""
+    query = _REPRESENTATIVE_MEDIA_SUFFIX_RE.sub("", str(value or "")).strip()
+    return bool(
+        query
+        and not _is_generic_season_identity_label(query)
+        and not _COORDINATE_ONLY_IDENTITY_LABEL_RE.fullmatch(query)
+        and _usable_release_title_query(query)
+    )
+
 
 def _extract_year(value: Any) -> str:
     text = str(value or "")
@@ -76,6 +124,15 @@ def _title_similarity(query_key: str, title: str) -> float:
     if query_key in title_key or title_key in query_key:
         return max(similarity, 0.92)
     return similarity
+
+
+def _search_language(query: str) -> str | None:
+    """Use TMDB's zh-CN localization for CJK queries so a Chinese release label
+    matches the localized name instead of the English one.  Non-CJK queries keep
+    the client default language."""
+    if re.search(r"[\u3400-\u9fff\u3040-\u30ff]", query or ""):
+        return "zh-CN"
+    return None
 
 
 def _search_query_variants(query: str) -> list[str]:
@@ -161,9 +218,123 @@ def _search_query_variants(query: str) -> list[str]:
     return variants[:7]
 
 
+_BOUNDARY_TRAILING_QUALITY_TAIL_RE = re.compile(
+    r"(?:[\s._+\-]*[【\[(（]?\s*)"
+    r"(?:4k|8k|2160p|1440p|1080p|720p|576p|480p|"
+    r"bluray|blu-?ray|web-?dl|webrip|x26[45]|h26[45]|hevc|av1|"
+    r"10bit|8bit|aac|flac|dts)"
+    r"(?:\s*[】\])）])?\s*$",
+    re.IGNORECASE,
+)
+_BOUNDARY_TRAILING_BATCH_COUNT_RE = re.compile(
+    r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)\s*$",
+)
+
+
+def _clean_boundary_identity_query(value: str) -> str:
+    """Derive a bounded CJK release-label query without rewriting the source.
+
+    The raw boundary label remains the first persisted and queried value.  This
+    helper only adds a second query variant for the narrow, common shape of a
+    separated one-letter shelf prefix plus a CJK title followed by release
+    metadata.  It deliberately removes neither arbitrary bracketed text nor
+    title words: those can be real aliases and remain subject to the normal
+    cross-script guard.  It also does not inspect filenames or derive an
+    episode/season coordinate.
+    """
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    text = re.sub(
+        r"^\s*[A-Za-z]\s+(?=[\u3400-\u9fff\u3040-\u30ff])",
+        "",
+        text,
+    )
+    # Full-width release brackets (【4K】/【日语中字】/【类型：…】/【全 N 集】)
+    # are packaging metadata; drop them, then unwrap a remaining bracket so a
+    # title wrapped as 【Title】 survives the query.  Half-width ``[]`` stays
+    # untouched here (it can be a real alias).
+    text = re.sub(
+        r"【[^】]*(?:4k|8k|2160p|1080p|720p|480p|字幕|中字|类型|全\s*\d+\s*集|内封|内嵌|外挂)[^】]*】",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"【([^】]*)】", r" \1 ", text)
+    # Release metadata (year / count / subtitle / quality) is not part of the
+    # work title.  Strip it unconditionally so a title-bearing folder such as
+    # ``钢之炼金术师（2003）全51集 1080P`` or ``有意义中文剧名（2024）全12集``
+    # matches its TMDB title.  The year is preserved in ``IdentityEvidence.years``
+    # for scoring; only the query is cleaned here.
+    text = re.sub(r"[（(]\s*(?:19|20)\d{2}(?:\s*[.\-/]\s*(?:(?:19|20)\d{2}|\d{1,2}))?\s*[)）]", " ", text)
+    # A trailing parenthetical release-group suffix (（DBD&HKG&X2字幕组 - BDRip
+    # HEVC-10bit FLAC）) is packaging, not title words.
+    text = re.sub(
+        r"[（(][^）)]*(?:字幕组|压制组|压制|BDRip|BDRIP|Blu-?Ray|HEVC|H26[45]|x26[45]|FLAC|AAC|10bit)[^）)]*[)）]\s*$",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)", " ", text)
+    text = re.sub(r"\+\s*(?:OVA|OAV|OAD|SP)(?:\s*\+)?", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?:内封|内嵌|外挂|简英|简中|简日|繁中|繁日|简繁|中英|中日|日英|双语|硬字幕|软字幕|中文字幕)(?:字幕)?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:超清|收藏版|4k|8k|2160p|1440p|1080p|720p|576p|480p|"
+        r"blu-?ray|web-?dl|webrip|x26[45]|h26[45]|hevc|av1|10bit|8bit)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # A trailing release size (110(1).2G / 共75G) and a duplicate marker ``(1)``
+    # are packaging, not title words.  Drop the marker without inserting a
+    # space so the numeric size stays a single token for the next pass.
+    text = re.sub(r"\(\d+\)", "", text)
+    text = re.sub(r"(?:共|约)?\s*\d+(?:\.\d+)?\s*[GT]B?\s*$", " ", text)
+    # A leading numeric/volume prefix is only source ordering, and only when it
+    # precedes a CJK title (``01 寒蝉鸣泣之时``).
+    text = re.sub(r"^\s*0*\d{1,3}[\s._\-]+(?=[\u3400-\u9fff])", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # A trailing season label (第二季/第 2 季/Season 2) is source layout, not
+    # part of the work title.  Strip it so a season subdir whose name repeats
+    # the parent title (排球少年第二季) can still match the parent TMDB entry.
+    text = re.sub(
+        r"[\s_-]*(?:第\s*[0-9一二三四五六七八九十百]+\s*季|season\s*0*\d+)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    # A batch count and a quality tag can appear in either tail order.  Bound
+    # this cleanup to a few passes so malformed labels cannot be over-cleaned.
+    for _ in range(3):
+        before = text
+        text = _BOUNDARY_TRAILING_QUALITY_TAIL_RE.sub("", text)
+        text = _BOUNDARY_TRAILING_BATCH_COUNT_RE.sub("", text)
+        text = text.rstrip(" ._+-")
+        if text == before:
+            break
+    return text
+
+
+def _script_evidence_text(value: str) -> str:
+    """Remove known release tails before classifying title scripts.
+
+    Intake folders may begin with a single Latin bucket letter followed by a
+    CJK title (for example ``B 某剧``).  That routing marker is not a Latin
+    title alias and must not turn an otherwise same-script CJK match into a
+    cross-script match.  The same bounded cleaner also omits tail-only quality
+    and batch-count metadata, while preserving arbitrary bracketed text and
+    actual Latin title words for the cross-script guard.
+    """
+    return _clean_boundary_identity_query(value)
+
+
 def _cross_script_unique_match(query: str, titles: Sequence[str]) -> bool:
-    query_has_latin = bool(re.search(r"[A-Za-z]", query))
-    query_has_cjk = bool(re.search(r"[\u3400-\u9fff\u3040-\u30ff]", query))
+    query_text = _script_evidence_text(query)
+    query_has_latin = bool(re.search(r"[A-Za-z]", query_text))
+    query_has_cjk = bool(re.search(r"[\u3400-\u9fff\u3040-\u30ff]", query_text))
     title_text = " ".join(titles)
     title_has_latin = bool(re.search(r"[A-Za-z]", title_text))
     title_has_cjk = bool(re.search(r"[\u3400-\u9fff\u3040-\u30ff]", title_text))
@@ -236,6 +407,17 @@ def _query_from_source(src: str) -> str:
     )
     name = re.sub(r"\[[^\]]*\]", " ", name)
     name = re.sub(r"\{(?:tmdb|imdb)-[^{}]+\}", " ", name, flags=re.IGNORECASE)
+    # Full-width release brackets (【…】) are common in Chinese packaging:
+    # metadata brackets carry quality/subtitle/genre/count tokens and are
+    # dropped, while a remaining bracket (usually the title wrapper) is
+    # unwrapped so the title inside is kept.
+    name = re.sub(
+        r"【[^】]*(?:4k|8k|2160p|1080p|720p|480p|字幕|中字|类型|全\s*\d+\s*集|内封|内嵌|外挂)[^】]*】",
+        " ",
+        name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(r"【([^】]*)】", r" \1 ", name)
     # A season-range suffix is stripped only when everything after it is a
     # bounded release-package description.  This avoids corrupting legitimate
     # titles such as ``MS01-S03 Project`` or ``标题 收藏版的秘密``.
@@ -579,6 +761,57 @@ def _usable_release_title_query(query: str) -> bool:
     return len(key) >= 4 or bool(re.search(r"[\u3400-\u9fff\u3040-\u30ff]", query))
 
 
+_REPRESENTATIVE_MEDIA_SUFFIX_RE = re.compile(
+    r"\.(?:mkv|mp4|m4v|avi|mov|wmv|flv|webm|ts|m2ts)$",
+    re.IGNORECASE,
+)
+
+
+def _usable_representative_identity_query(value: str) -> bool:
+    """Reject representative media names that are only an episode ordinal.
+
+    ``IdentityEvidence`` is durable and can be constructed by older callers,
+    so filtering naked numeric names only while extracting evidence is not
+    sufficient.  This second check keeps a legacy ``01.mp4`` representative
+    from becoming a movie search query; other release-name checks remain in
+    :func:`_usable_release_title_query`.
+    """
+    query = _REPRESENTATIVE_MEDIA_SUFFIX_RE.sub("", str(value or "")).strip()
+    return bool(query) and _usable_release_title_query(query)
+
+
+def _title_from_representative_episode_filename(value: str) -> str | None:
+    """Extract a bounded work-title query from an explicit episode filename.
+
+    A directory label may be an opaque release package while its video files
+    retain the actual title.  ``Show.Name.S02E03`` is useful identity evidence,
+    but sending the episode suffix to TMDB often produces no search result.
+    Some standalone specials and short companion series use ``Show.Name.E01``
+    or ``Show.Name.E01-E06`` instead of a season-qualified marker.  Those are
+    equally explicit only when a usable title precedes the marker.  A bare
+    ordinal such as ``01`` is never promoted into a title query.
+    """
+    stem = Path(value).stem.strip(" ._-")
+    marker = re.search(
+        r"(?:^|[\s._\-\[\](){}])S\s*\d{1,3}\s*E\s*\d{1,4}"
+        r"(?=$|[\s._\-\[\](){}])",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if marker is None:
+        marker = re.search(
+            r"(?:^|[\s._\-\[\](){}])E\s*\d{1,4}"
+            r"(?:\s*[\-–—~～]\s*E\s*\d{1,4})?"
+            r"(?=$|[\s._\[\](){}])",
+            stem,
+            flags=re.IGNORECASE,
+        )
+    if marker is None:
+        return None
+    title = stem[:marker.start()].strip(" ._-")
+    return title if _usable_release_title_query(title) else None
+
+
 def _season_from_series_variant(
     source_segment: str,
     show: Mapping[str, Any],
@@ -832,6 +1065,18 @@ def _clean_franchise_root_label(src: str) -> str:
         name,
         flags=re.I,
     )
+    # A trailing season range describes package coverage, not the creative
+    # container title. Keep it structurally explicit and suffix-bound so a
+    # genuine token such as ``MS01-S03 Project`` remains untouched.
+    name = re.sub(
+        r"\s*(?:(?:season|s)\s*0*\d{1,3}\s*[-–—~～至到]\s*"
+        r"(?:(?:season|s)\s*)?0*\d{1,3}"
+        r"|第\s*0*\d{1,3}\s*[-–—~～至到]\s*0*\d{1,3}\s*季)"
+        r"\s*(?:全季|全系列|系列合集|合集包|合集)?\s*$",
+        " ",
+        name,
+        flags=re.I,
+    )
     name = re.sub(r"(?:全系列|系列合集|大合集|合集包|系列收藏)", " ", name, flags=re.I)
     name = re.sub(
         r"(?:^|[\s._+＋/&-])(?:\d+|[一二两三四五六七八九十]+)\s*部?\s*"
@@ -881,6 +1126,7 @@ def _media_type_from_source_context(src: str) -> str | None:
         "国剧",
         "日剧",
         "韩剧",
+        "欧美剧",
         "美剧",
         "英剧",
     }
@@ -980,6 +1226,8 @@ def _score_identity_candidate(
     expected_episode_count: int | None,
     min_confidence: float,
     trace_extra: Mapping[str, Any],
+    special_markers: Collection[str] = (),
+    special_episode_count: int | None = None,
 ) -> AutoMatch:
     """Score one raw candidate row with the single shared evidence policy.
 
@@ -1045,6 +1293,34 @@ def _score_identity_candidate(
             0.0 if actual_count == expected_episode_count else -0.08
         )
 
+    # An explicit physical OVA/OAV/OAD run can be a separately catalogued TV
+    # work. It still does not assert a TMDB season: automatic selection needs
+    # both a matching official positive-season count and an official marker in
+    # the candidate's title, season label, or episode title. This blocks a
+    # coincidentally named regular parent from swallowing the short work.
+    special_marker_score = 0.0
+    special_evidence_required = bool(
+        special_episode_count
+        and set(special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
+    )
+    official_special_hits = {
+        str(value).upper()
+        for value in (raw.get("official_special_marker_hits") or ())
+    }
+    official_special_count_match = bool(raw.get("official_special_count_match"))
+    special_detail_checked = bool(raw.get("special_detail_checked"))
+    if special_evidence_required:
+        if not special_detail_checked:
+            special_marker_score = -0.20
+        elif official_special_hits and official_special_count_match:
+            special_marker_score = 0.20
+        elif official_special_hits:
+            special_marker_score = -0.30
+        elif official_special_count_match:
+            special_marker_score = -0.18
+        else:
+            special_marker_score = -0.30
+
     confidence = max(
         0.0,
         min(
@@ -1057,13 +1333,44 @@ def _score_identity_candidate(
             + episode_structure_score,
         ),
     )
+    confidence = max(0.0, min(1.0, confidence + special_marker_score))
     blockers: list[str] = []
     if wrong_year:
         blockers.append("year_conflict")
     if raw["cross_script"] and alias_score < 0.88:
         blockers.append("cross_script_without_alias_evidence")
+    strict_naked_numeric_video_run = bool(
+        raw.get("strict_naked_numeric_video_run")
+    )
+    naked_numeric_cjk_release_eligible = bool(
+        raw.get("naked_numeric_cjk_release_eligible")
+    )
+    if strict_naked_numeric_video_run:
+        # A bare ``01`` … ``N`` file run is intentionally not title or
+        # coordinate evidence.  Every such source shape is guarded.  Only the
+        # narrow CJK release-label fallback can proceed, and then only when
+        # the cleaned boundary itself has an exact same-script official
+        # title/alias, its explicit year agrees exactly, and the normal
+        # ambiguity margin remains in force below.
+        if not naked_numeric_cjk_release_eligible:
+            blockers.append("naked_numeric_requires_meaningful_cjk_year_boundary")
+        if not bool(raw.get("naked_numeric_clean_boundary_query_sent")):
+            blockers.append("naked_numeric_requires_sent_clean_boundary_query")
+        if not bool(raw.get("naked_numeric_same_script_exact_title_or_alias")):
+            blockers.append("naked_numeric_requires_same_script_exact_title_or_alias")
+        if not bool(raw.get("naked_numeric_exact_year")):
+            blockers.append("naked_numeric_requires_exact_year")
+        if raw["media_type"] != "tv":
+            blockers.append("naked_numeric_requires_tv_candidate")
     if confidence < min_confidence:
         blockers.append("below_confidence_threshold")
+    if special_evidence_required:
+        if not special_detail_checked:
+            blockers.append("physical_special_official_evidence_unavailable")
+        elif not official_special_hits:
+            blockers.append("physical_special_marker_not_officially_proven")
+        elif not official_special_count_match:
+            blockers.append("physical_special_episode_count_mismatch")
     status = "rejected" if blockers else "confirmed"
     components = {
         "title_score": round(title_score, 6),
@@ -1072,6 +1379,7 @@ def _score_identity_candidate(
         "year_score": round(year_score, 6),
         "media_type_score": round(media_type_score, 6),
         "episode_structure_score": round(episode_structure_score, 6),
+        "special_marker_score": round(special_marker_score, 6),
         "context_score": round(context_score, 6),
         "final_score": round(confidence, 6),
     }
@@ -1090,6 +1398,24 @@ def _score_identity_candidate(
             "blockers": blockers,
             "expected_episode_count": expected_episode_count,
             "actual_episode_count": actual_count,
+            "physical_special_markers": sorted(str(x) for x in special_markers),
+            "physical_special_episode_count": special_episode_count,
+            "official_special_marker_hits": sorted(official_special_hits),
+            "official_special_count_match": official_special_count_match,
+            "special_detail_checked": special_detail_checked,
+            "strict_naked_numeric_video_run": strict_naked_numeric_video_run,
+            "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
+            "naked_numeric_clean_boundary_query_sent": bool(
+                raw.get("naked_numeric_clean_boundary_query_sent")
+            ),
+            "naked_numeric_same_script_exact_title_or_alias": bool(
+                raw.get("naked_numeric_same_script_exact_title_or_alias")
+            ),
+            "naked_numeric_exact_year": bool(raw.get("naked_numeric_exact_year")),
+            "naked_numeric_boundary_years": list(
+                raw.get("naked_numeric_boundary_years") or ()
+            ),
+            "requires_normal_margin": strict_naked_numeric_video_run,
         },
     )
 
@@ -1133,7 +1459,11 @@ def _select_auto_match(
         float(runner_up.score_components.get("title_score", 0.0)),
         float(runner_up.score_components.get("alias_score", 0.0)),
     ) >= 0.999999
-    exact_title_uniquely_identifies_best = best_exact and not runner_exact
+    exact_title_uniquely_identifies_best = (
+        best_exact
+        and not runner_exact
+        and not bool(best.decision_trace.get("requires_normal_margin"))
+    )
     if (
         runner_up is not None
         and best.confidence - runner_up.confidence + 1e-9
@@ -1210,7 +1540,11 @@ def auto_match_tmdb(
                 search_items.append(item)
 
         for search_query in _search_query_variants(query):
-            response = client.get(f"/search/{candidate_type}", query=search_query)
+            response = client.get(
+                f"/search/{candidate_type}",
+                query=search_query,
+                language=_search_language(search_query),
+            )
             ingest(response, search_query)
             # An exact/expanded official title is decisive. A merely non-empty
             # response is not: punctuation and release noise can make TMDB's
@@ -1223,7 +1557,10 @@ def auto_match_tmdb(
             # that cache key while keeping the retry bounded and deterministic.
             search_query = query.strip()
             response = client.get(
-                f"/search/{candidate_type}", query=search_query, page=1
+                f"/search/{candidate_type}",
+                query=search_query,
+                page=1,
+                language=_search_language(search_query),
             )
             ingest(response, search_query)
         for index, item in enumerate(search_items):
@@ -1326,6 +1663,152 @@ def auto_match_tmdb(
     )
 
 
+def _physical_special_marker_key(value: object) -> str | None:
+    """Normalize the narrow physical-release vocabulary for evidence checks."""
+    marker = str(value or "").strip().upper()
+    if marker == "OAV":
+        return "OVA"
+    if marker in _PHYSICAL_SPECIAL_IDENTITY_MARKERS:
+        return marker
+    return None
+
+
+def _official_physical_special_markers(values: Collection[object]) -> set[str]:
+    """Return OVA/OAD labels literally present in official TMDB text."""
+    output: set[str] = set()
+    for value in values:
+        text = unicodedata.normalize("NFKC", str(value or "")).upper()
+        for marker in re.findall(r"(?<![A-Z])(OVA|OAV|OAD)(?![A-Z])", text):
+            key = _physical_special_marker_key(marker)
+            if key is not None:
+                output.add(key)
+    return output
+
+
+def _tmdb_physical_special_candidate_evidence(
+    client: object,
+    *,
+    tmdb_id: int,
+    aliases: Collection[object],
+    source_markers: Collection[str],
+    source_episode_count: int | None,
+) -> dict[str, object]:
+    """Read bounded official TMDB evidence for a physical-special TV child.
+
+    The result never creates an identity on its own.  It is merely supplied to
+    the normal scorer once an ordinary TMDB search has already produced this
+    candidate.  A detail/season failure is recorded as unavailable so C/U
+    fails closed rather than falling back to a parent show's title similarity.
+    """
+    requested_markers = {
+        key
+        for value in source_markers
+        if (key := _physical_special_marker_key(value)) is not None
+    }
+    result: dict[str, object] = {
+        "special_detail_checked": False,
+        "official_special_marker_hits": (),
+        "official_special_count_match": False,
+        "official_special_season": None,
+    }
+    if not requested_markers or not source_episode_count:
+        return result
+    getter = getattr(client, "get", None)
+    if not callable(getter):
+        return result
+    try:
+        detail = getter(f"/tv/{tmdb_id}")
+    except ApiError:
+        return result
+    except Exception:
+        return result
+    if not isinstance(detail, Mapping):
+        return result
+    result["special_detail_checked"] = True
+    official_texts: list[object] = [
+        *aliases,
+        detail.get("name"),
+        detail.get("original_name"),
+    ]
+    positives: list[tuple[int, int, str]] = []
+    raw_seasons = detail.get("seasons")
+    if not isinstance(raw_seasons, list):
+        return result
+    for season in raw_seasons:
+        if not isinstance(season, Mapping):
+            return result
+        number = season.get("season_number")
+        count = season.get("episode_count")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or number < 0
+            or count < 0
+        ):
+            return result
+        if number > 0 and count > 0:
+            positives.append((number, count, str(season.get("name") or "")))
+            official_texts.append(season.get("name"))
+    # A separate short work must itself have exactly one published positive
+    # season.  A multi-season parent which happens to have an N-episode season
+    # is not sufficient proof for a physical OAD/OVA child.
+    if len(positives) != 1 or positives[0][1] != source_episode_count:
+        result["official_special_marker_hits"] = tuple(sorted(
+            _official_physical_special_markers(official_texts) & requested_markers
+        ))
+        return result
+    season_number = positives[0][0]
+    marker_hits = _official_physical_special_markers(official_texts)
+    # The show's official title is normally enough.  Some TMDB records label
+    # only their episodes, so make one bounded season request for the sole
+    # matching season and look at official episode titles too.
+    if not (marker_hits & requested_markers):
+        try:
+            season_payload = getter(f"/tv/{tmdb_id}/season/{season_number}")
+        except ApiError:
+            season_payload = None
+        except Exception:
+            season_payload = None
+        if isinstance(season_payload, Mapping):
+            episodes = season_payload.get("episodes")
+            if isinstance(episodes, list) and len(episodes) == source_episode_count:
+                for episode in episodes:
+                    if not isinstance(episode, Mapping):
+                        marker_hits = set()
+                        break
+                    official_texts.extend((
+                        episode.get("name"),
+                        episode.get("original_name"),
+                    ))
+                marker_hits = _official_physical_special_markers(official_texts)
+    result.update({
+        "official_special_marker_hits": tuple(sorted(marker_hits & requested_markers)),
+        "official_special_count_match": True,
+        "official_special_season": season_number,
+    })
+    return result
+
+
+def physical_special_candidate_evidence(
+    client: object,
+    *,
+    tmdb_id: int,
+    aliases: Collection[object] = (),
+    source_markers: Collection[str],
+    source_episode_count: int | None,
+) -> dict[str, object]:
+    """Public C/D helper for the shared formal OVA/OAD proof grammar."""
+    return _tmdb_physical_special_candidate_evidence(
+        client,
+        tmdb_id=tmdb_id,
+        aliases=aliases,
+        source_markers=source_markers,
+        source_episode_count=source_episode_count,
+    )
+
+
 def auto_match_from_evidence(
     client: TMDBClient,
     evidence: IdentityEvidence,
@@ -1348,35 +1831,116 @@ def auto_match_from_evidence(
     target_media_type = evidence.media_shape if evidence.media_shape in {"tv", "movie"} else None
     initial_types = [target_media_type] if target_media_type else ["tv", "movie"]
 
-    # Gather search queries in prioritized order
+    # Gather search queries in prioritized order.
     candidate_queries: list[str] = []
 
-    # 1. Combined parent + boundary queries first if parent labels exist (e.g. "Fate Zero", "Fate/Zero")
+    # Direct boundary label, plus a narrowly cleaned CJK release variant.
+    # Preserve the raw label for auditability and normal TMDB behavior; the
+    # clean value is only an additional query, never a persisted rewrite.
+    boundary_label = evidence.boundary_label.strip()
+    clean_boundary_query = _clean_boundary_identity_query(boundary_label)
+    clean_boundary_is_cjk = bool(
+        re.search(r"[\u3400-\u9fff\u3040-\u30ff]", clean_boundary_query)
+    )
+    strict_naked_numeric_guard = bool(evidence.strict_naked_numeric_video_run)
+    naked_numeric_cjk_release_eligible = bool(
+        evidence.naked_numeric_cjk_release_eligible
+    )
+    generic_season_boundary = _is_generic_season_identity_label(boundary_label)
+    if generic_season_boundary and not any(
+        _is_non_structural_identity_evidence(value)
+        for value in (
+            *evidence.parent_labels,
+            *evidence.representative_names,
+            *evidence.normalized_titles,
+            *evidence.aliases,
+        )
+    ):
+        raise PlanError("纯季目录缺少父容器或代表媒体标题证据")
+    # Parent-combination queries can consume the six-query budget.  For the
+    # narrow strict bare-number fallback, the cleaned boundary is the only
+    # title proof allowed, so put it first and later prove it was dispatched.
+    if (
+        strict_naked_numeric_guard
+        and naked_numeric_cjk_release_eligible
+        and clean_boundary_is_cjk
+        and clean_boundary_query
+    ):
+        candidate_queries.append(clean_boundary_query)
+
+    if generic_season_boundary:
+        # ``第一季``/``Season 02`` is only the source layout.  Give the
+        # user-owned container and a title-bearing media sample priority over
+        # that structural leaf, otherwise the six-query cap can make TMDB
+        # confidently select an unrelated show named "第二季".  These remain
+        # normal TMDB search queries and ordinary scoring/ambiguity checks;
+        # the parent never injects an identity.
+        for parent in evidence.parent_labels:
+            p_clean = parent.strip()
+            if not p_clean:
+                continue
+            candidate_queries.append(p_clean)
+            candidate_queries.append(f"{p_clean} {boundary_label}")
+            candidate_queries.append(f"{p_clean}/{boundary_label}")
+        for representative in evidence.representative_names:
+            if _is_generic_season_identity_label(representative):
+                continue
+            title_query = _title_from_representative_episode_filename(
+                representative
+            )
+            if title_query:
+                candidate_queries.append(title_query)
+            elif _is_non_structural_identity_evidence(representative):
+                candidate_queries.append(representative)
+
+    # Combined parent + boundary queries are useful ordinary evidence, but
+    # must not crowd out the strict bare-number proof above.
     for parent in evidence.parent_labels:
         p_clean = parent.strip()
-        b_clean = evidence.boundary_label.strip()
-        if p_clean and b_clean:
-            candidate_queries.append(f"{p_clean} {b_clean}")
-            candidate_queries.append(f"{p_clean}/{b_clean}")
+        if p_clean and boundary_label:
+            candidate_queries.append(f"{p_clean} {boundary_label}")
+            candidate_queries.append(f"{p_clean}/{boundary_label}")
 
-    # 2. Direct boundary label
-    candidate_queries.append(evidence.boundary_label)
+    # A generic season label (``第一季``/``第二季``/``Season 02``) is source
+    # layout, not a work title.  It must never be dispatched as a standalone
+    # query: TMDB would otherwise confidently select an unrelated show whose
+    # title merely contains that label (``中国 第二季``).  Only the parent
+    # title and its combined variants identify the work.
+    if not generic_season_boundary:
+        candidate_queries.append(boundary_label)
+    if (
+        clean_boundary_is_cjk
+        and clean_boundary_query
+        and clean_boundary_query != boundary_label
+        and not generic_season_boundary
+    ):
+        candidate_queries.append(clean_boundary_query)
 
-    # 3. Normalized titles and combined with parent
+    # 3. A representative filename with an explicit ``SxxExx`` marker may
+    # carry a clean title even when the boundary is a release-package label.
+    # Put that derived query ahead of further noisy variants so it remains
+    # inside the bounded search budget.
+    for representative in evidence.representative_names:
+        title_query = _title_from_representative_episode_filename(representative)
+        if title_query:
+            candidate_queries.append(title_query)
+
+    # 4. Normalized titles and combined with parent
     for t in evidence.normalized_titles:
         for parent in evidence.parent_labels:
             if parent.strip() and t.strip():
                 candidate_queries.append(f"{parent.strip()} {t.strip()}")
         candidate_queries.append(t)
 
-    # 4. Aliases and representative names
+    # 5. Aliases and raw representative names
     for a in evidence.aliases:
         for parent in evidence.parent_labels:
             if parent.strip() and a.strip():
                 candidate_queries.append(f"{parent.strip()} {a.strip()}")
         candidate_queries.append(a)
     for r in evidence.representative_names:
-        candidate_queries.append(r)
+        if _usable_representative_identity_query(r):
+            candidate_queries.append(r)
 
     # Deduplicate while preserving order
     seen_q: set[str] = set()
@@ -1387,17 +1951,54 @@ def auto_match_from_evidence(
             seen_q.add(norm_q)
             search_queries.append(norm_q)
 
+    # ``EpisodePattern.total_episodes`` is a set of observed episode ordinals.
+    # For an absolute multi-season release, E01 appears in every season, so
+    # that number is not the show's aggregate TMDB episode count.  Avoid
+    # turning structurally valid multi-season evidence into a false penalty;
+    # single-season evidence remains useful for disambiguation.
     expected_episode_count = (
         evidence.episode_pattern.total_episodes
-        if evidence.episode_pattern and evidence.episode_pattern.total_episodes > 0 and evidence.media_shape == "tv"
+        if (
+            evidence.episode_pattern
+            and evidence.episode_pattern.total_episodes > 0
+            and evidence.media_shape == "tv"
+            and len(evidence.episode_pattern.season_numbers) <= 1
+        )
+        else None
+    )
+    # A complete numbered physical OVA/OAV/OAD run is intentionally separate
+    # from ``expected_episode_count``. The latter describes ordinary episode
+    # structure; the former only becomes identity evidence after TMDB confirms
+    # the candidate's own official short-work shape.
+    physical_special_markers = tuple(sorted({
+        str(marker).upper()
+        for marker in evidence.special_markers
+        if _physical_special_marker_key(marker) is not None
+    }))
+    physical_special_episode_count = (
+        evidence.special_episode_count
+        if evidence.special_numbered_run_complete
+        and evidence.special_episode_count is not None
+        and set(physical_special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
         else None
     )
 
     query_years = {str(y) for y in evidence.years}
+    # ``IdentityEvidence.years`` deliberately aggregates boundary, parent and
+    # filename years for ordinary matching.  A bare numeric run is much more
+    # fragile: its exact-year gate must be anchored to the work boundary
+    # itself, never accidentally satisfied by a container or release-file
+    # date.
+    boundary_years = set(
+        re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", evidence.boundary_label)
+    )
+    clean_boundary_key = (
+        _normalize_match_title(clean_boundary_query)
+        if clean_boundary_is_cjk
+        else ""
+    )
     raw_candidates: list[dict[str, Any]] = []
     searched_types: list[str] = []
-
-    search_query_keys = [_normalize_match_title(sq) for sq in search_queries if _normalize_match_title(sq)]
 
     def collect_type(candidate_type: str) -> None:
         if candidate_type in searched_types:
@@ -1405,6 +2006,24 @@ def auto_match_from_evidence(
         searched_types.append(candidate_type)
         search_items: list[Any] = []
         seen_search_ids: set[int] = set()
+        sent_queries: list[str] = []
+        seen_sent_queries: set[str] = set()
+        sent_clean_boundary_queries: list[str] = []
+        seen_sent_clean_boundary_queries: set[str] = set()
+
+        def record_sent_query(query: str, *, from_clean_boundary: bool) -> None:
+            value = str(query or "").strip()
+            if not value:
+                return
+            if value not in seen_sent_queries:
+                seen_sent_queries.add(value)
+                sent_queries.append(value)
+            if (
+                from_clean_boundary
+                and value not in seen_sent_clean_boundary_queries
+            ):
+                seen_sent_clean_boundary_queries.add(value)
+                sent_clean_boundary_queries.append(value)
 
         def ingest(response: Mapping[str, Any]) -> None:
             for item in list(response.get("results") or [])[:10]:
@@ -1422,13 +2041,36 @@ def auto_match_from_evidence(
         # Search top candidate queries
         for sq in search_queries[:6]:
             for variant in _search_query_variants(sq):
-                response = client.get(f"/search/{candidate_type}", query=variant)
+                record_sent_query(
+                    variant,
+                    from_clean_boundary=(sq == clean_boundary_query),
+                )
+                response = client.get(
+                    f"/search/{candidate_type}",
+                    query=variant,
+                    language=_search_language(variant),
+                )
                 ingest(response)
 
         if not search_items and search_queries:
             first_q = search_queries[0]
-            response = client.get(f"/search/{candidate_type}", query=first_q, page=1)
+            record_sent_query(
+                first_q,
+                from_clean_boundary=(first_q == clean_boundary_query),
+            )
+            response = client.get(
+                f"/search/{candidate_type}",
+                query=first_q,
+                page=1,
+                language=_search_language(first_q),
+            )
             ingest(response)
+
+        sent_query_keys = [
+            _normalize_match_title(query)
+            for query in sent_queries
+            if _normalize_match_title(query)
+        ]
 
         for index, item in enumerate(search_items):
             if not isinstance(item, Mapping) or isinstance(item.get("id"), bool):
@@ -1441,9 +2083,9 @@ def auto_match_from_evidence(
             if not titles:
                 continue
 
-            # Calculate title score against all query variants
+            # Calculate title score only from queries actually sent to TMDB.
             title_score = max(
-                (_title_similarity(k, title) for k in search_query_keys for title in titles),
+                (_title_similarity(k, title) for k in sent_query_keys for title in titles),
                 default=0.0,
             )
 
@@ -1451,8 +2093,70 @@ def auto_match_from_evidence(
                 _alternative_tmdb_titles(client, candidate_type, tmdb_id)
                 if index < 5 else []
             )
+            evidence_titles = [*titles, *aliases]
+            # The boundary can be a CJK release-package label while a
+            # representative filename supplies an exact original-language
+            # title.  The cross-script guard must evaluate the query that
+            # actually earned the strongest title/alias evidence, not always
+            # the boundary label.  Relax that guard only for an exact
+            # same-script title match: a merely prefix-similar release string
+            # must still supply an official alias.
+            matched_query = max(
+                sent_queries,
+                key=lambda query: max(
+                    (
+                        _title_similarity(_normalize_match_title(query), title)
+                        for title in evidence_titles
+                    ),
+                    default=0.0,
+                ),
+                default=evidence.boundary_label,
+            )
+            matched_query_score = max(
+                (
+                    _title_similarity(_normalize_match_title(matched_query), title)
+                    for title in evidence_titles
+                ),
+                default=0.0,
+            )
+            boundary_cross_script = _cross_script_unique_match(
+                evidence.boundary_label, evidence_titles
+            )
+            exact_same_script_evidence = (
+                matched_query_score >= 0.999999
+                and not _cross_script_unique_match(matched_query, evidence_titles)
+            )
+            strict_clean_boundary_query = max(
+                sent_clean_boundary_queries,
+                key=lambda query: max(
+                    (
+                        _title_similarity(_normalize_match_title(query), title)
+                        for title in evidence_titles
+                    ),
+                    default=0.0,
+                ),
+                default="",
+            )
+            strict_clean_boundary_query_score = max(
+                (
+                    _title_similarity(
+                        _normalize_match_title(strict_clean_boundary_query),
+                        title,
+                    )
+                    for title in evidence_titles
+                ),
+                default=0.0,
+            )
+            strict_clean_boundary_same_script_exact = (
+                bool(strict_clean_boundary_query)
+                and strict_clean_boundary_query_score >= 0.999999
+                and not _cross_script_unique_match(
+                    strict_clean_boundary_query,
+                    evidence_titles,
+                )
+            )
             alias_score = max(
-                (_title_similarity(k, title) for k in search_query_keys for title in aliases),
+                (_title_similarity(k, title) for k in sent_query_keys for title in aliases),
                 default=0.0,
             )
 
@@ -1471,6 +2175,19 @@ def auto_match_from_evidence(
                 actual_count = details.get("number_of_episodes")
                 if isinstance(actual_count, int) and not isinstance(actual_count, bool):
                     actual_episode_count = actual_count
+            physical_special_evidence: Mapping[str, object] = {}
+            if (
+                physical_special_episode_count
+                and candidate_type == "tv"
+                and index < 5
+            ):
+                physical_special_evidence = physical_special_candidate_evidence(
+                    client,
+                    tmdb_id=tmdb_id,
+                    aliases=aliases,
+                    source_markers=physical_special_markers,
+                    source_episode_count=physical_special_episode_count,
+                )
             raw_candidates.append({
                 "media_type": candidate_type,
                 "tmdb_id": tmdb_id,
@@ -1480,10 +2197,26 @@ def auto_match_from_evidence(
                 "year": year,
                 "title_score": title_score,
                 "alias_score": alias_score,
-                "cross_script": _cross_script_unique_match(evidence.boundary_label, [*titles, *aliases]),
-                "matched_query": evidence.boundary_label,
+                "cross_script": boundary_cross_script and not exact_same_script_evidence,
+                "matched_query": matched_query,
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
+                "strict_naked_numeric_video_run": strict_naked_numeric_guard,
+                "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
+                "naked_numeric_clean_boundary_query_sent": bool(
+                    sent_clean_boundary_queries
+                ),
+                "naked_numeric_same_script_exact_title_or_alias": (
+                    bool(clean_boundary_key)
+                    and _normalize_match_title(strict_clean_boundary_query)
+                    == clean_boundary_key
+                    and strict_clean_boundary_same_script_exact
+                ),
+                "naked_numeric_exact_year": (
+                    bool(boundary_years) and year in boundary_years
+                ),
+                "naked_numeric_boundary_years": tuple(sorted(boundary_years)),
+                **physical_special_evidence,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
@@ -1494,6 +2227,8 @@ def auto_match_from_evidence(
             prefer_animation=prefer_animation,
             expected_episode_count=expected_episode_count,
             min_confidence=min_confidence,
+            special_markers=physical_special_markers,
+            special_episode_count=physical_special_episode_count,
             trace_extra={
                 "query": evidence.boundary_label,
                 "matched_query_variant": raw.get(
@@ -1539,6 +2274,8 @@ __all__ = [
     "_normalize_match_title",
     "_title_similarity",
     "_search_query_variants",
+    "_clean_boundary_identity_query",
+    "_script_evidence_text",
     "_cross_script_unique_match",
     "_search_item_titles",
     "_alternative_tmdb_titles",
@@ -1549,6 +2286,7 @@ __all__ = [
     "_season_from_source",
     "_explicit_release_season_episode",
     "_usable_release_title_query",
+    "_usable_representative_identity_query",
     "_season_from_series_variant",
     "_source_suggests_collection",
     "_source_suggests_batch",
@@ -1558,4 +2296,5 @@ __all__ = [
     "_media_context_from_source_and_target",
     "auto_match_tmdb",
     "auto_match_from_evidence",
+    "physical_special_candidate_evidence",
 ]

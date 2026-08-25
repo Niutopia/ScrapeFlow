@@ -18,11 +18,12 @@ Pipeline contract:
 - F/G/H: ``execute_new_work_units`` drives the single planner/writer and
          records typed acceptance; J registers precise episode gaps;
 - R    : the aggregate decides the durable root phase (``completed`` /
-         ``reconciliation_uncertain`` / ``failed``).
+         ``gaps_pending`` / ``reconciliation_uncertain`` / ``failed``).
 """
 
 from __future__ import annotations
 
+import json
 import posixpath
 from collections.abc import Mapping
 from dataclasses import replace
@@ -31,17 +32,35 @@ from pathlib import Path
 from typing import Callable
 
 from engine.scrapeflow.intake_source import load_intake_catalog
-from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+from engine.scrapeflow.root_boundaries import (
+    analyze_root_boundaries,
+    load_source_snapshot,
+)
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.unit_identity import resolve_work_unit_identities
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_unit_coalescing import (
+    coalesce_confirmed_tv_season_work_units,
+)
+from engine.scrapeflow.work_units import (
+    load_work_unit_records,
+    save_work_unit_records,
+)
 
 from .library_index import reconcile_root_work_units
 from .redaction import redact_error, redact_value
 from .root_aggregation import aggregate_root_job
-from .simple_engine_runner import EngineJob, EnginePauseRequested, SimpleEngineRunner
+from .simple_engine_runner import (
+    EngineJob,
+    EnginePauseRequested,
+    SimpleEngineRunner,
+)
+from .tmdb_episode_catalog import TmdbEpisodeCatalog
 from .unit_e_lanes import compute_known_gap_tokens, execute_unit_e_lanes
-from .unit_execution import execute_new_work_units
+from .unit_execution import (
+    ContainerMetadataAttention,
+    ensure_container_artifacts,
+    execute_new_work_units,
+)
 
 # Phases the pipeline may re-enter on dispatch.  ``retry_wait`` appears
 # because the scheduler's bounded retry boundary is reused for transient
@@ -50,6 +69,7 @@ from .unit_execution import execute_new_work_units
 RUNNABLE_PHASES = frozenset({"queued", "reconciliation_uncertain", "retry_wait"})
 
 PARK_PHASE = "reconciliation_uncertain"
+GAPS_PENDING_PHASE = "gaps_pending"
 
 
 def _now() -> str:
@@ -83,6 +103,9 @@ def _persist_root(
     error: str | None = None,
 ) -> EngineJob:
     """Persist one bounded root-phase transition without touching the summary."""
+    cancelled = runner.consume_cancellation(job.id)
+    if cancelled is not None:
+        return cancelled
     updated = replace(job, phase=phase, error=error, updated_at=_now())
     atomic_write_json(
         runner._job_path(job.id),  # noqa: SLF001 - pipeline composition
@@ -131,6 +154,67 @@ def _refresh_lane_acceptance(
     save_work_acceptance(
         state_root, root_task_id, list(fresh.values()),
     )
+
+
+def _acceptance_work_unit_ids_for_coalescing(
+    state_root: Path,
+    root_task_id: str,
+) -> frozenset[str] | None:
+    """Return accepted-unit IDs only from a strictly readable H ledger.
+
+    C-stage coalescing is allowed only before any unit's acceptance record.
+    A missing or exact empty ledger is harmless; a symlink, malformed JSON,
+    malformed row, or duplicate row is not evidence of no acceptance and
+    therefore fails closed for the optional coalescing optimization.
+    """
+    path = state_root / f"work_acceptance_{root_task_id}.json"
+    if not path.exists():
+        return frozenset()
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, list):
+        return None
+    output: set[str] = set()
+    for row in raw:
+        if not isinstance(row, Mapping):
+            return None
+        work_unit_id = row.get("work_unit_id")
+        if not isinstance(work_unit_id, str) or not work_unit_id or work_unit_id in output:
+            return None
+        output.add(work_unit_id)
+    return frozenset(output)
+
+
+def _coalesce_confirmed_tv_season_records(
+    state_root: Path,
+    root_task_id: str,
+    records: list,
+) -> list:
+    """Persist a narrow C-stage coalescing only when all proof is local.
+
+    This helper performs no provider access and has no effect if the B/W
+    snapshot or H ledger cannot be exactly verified.  It runs immediately
+    after C/U and before D, so no reconciliation result, writer carrier, or
+    acceptance row can be silently retired.
+    """
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    acceptance_ids = _acceptance_work_unit_ids_for_coalescing(
+        state_root, root_task_id,
+    )
+    if snapshot is None or acceptance_ids is None:
+        return records
+    merged = coalesce_confirmed_tv_season_work_units(
+        records,
+        snapshot,
+        acceptance_work_unit_ids=tuple(sorted(acceptance_ids)),
+    )
+    if merged != records:
+        save_work_unit_records(state_root, root_task_id, merged)
+    return merged
 
 
 def _cleanup_empty_source_shells(
@@ -211,8 +295,8 @@ def _cleanup_empty_source_shells(
             return
         if rows(directory):
             return
-        # This is the exact remote-delete boundary.  A completion check at
-        # the caller is insufficient because a root-scoped pilot can close
+        # This is the exact remote-delete boundary.  Check the selected-root
+        # pause predicate again because the user can pause or switch tasks
         # while the recursive fresh listing is still in progress.
         if paused():
             return
@@ -264,13 +348,55 @@ def run_root_pipeline(
     job = runner.get_job(root_task_id)
     if job.phase not in RUNNABLE_PHASES:
         return job
+
+    def cancelled() -> EngineJob | None:
+        """Consume a root cancellation before a stale snapshot can persist."""
+        return runner.consume_cancellation(root_task_id)
+
+    def stopped() -> bool:
+        """Use the normal pause boundary for either pause or cancellation."""
+        if callable(pause_requested):
+            try:
+                if pause_requested():
+                    return True
+            except Exception:
+                return True
+        try:
+            return runner.cancellation_pending(root_task_id)
+        except Exception:
+            return True
+
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
+    # A selected RootJob can survive an API restart.  Its freshly constructed
+    # AList client has no token yet, whereas B/W immediately performs a
+    # remote listing.  Authenticate through the runner's single guarded
+    # client before that read boundary; otherwise a resumed persisted root
+    # fails with ``尚未登录 AList`` without ever reaching C/D.
+    runner._ensure_authenticated(runner.alist)  # noqa: SLF001 - shared runner guard
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
     source = runner._job_ingress_source(job)  # noqa: SLF001 - pipeline composition
 
-    # B/W: rebuild the ledger only when it does not exist yet.
+    # Opaque ISO/UDF/SFX/masquerade sources deliberately remain in the B/W
+    # intake view.  The existing archive adapter can safely extract into a
+    # task-owned staging root, but a RootJob still owns its original
+    # IntakeSource path: F validates every WorkUnit source scope against that
+    # immutable ingress.  Replacing ``source`` here would therefore create a
+    # snapshot rooted at staging while ownership/cleanup still pointed at the
+    # original source.  Until a durable expansion-to-new-SourceSnapshot
+    # bridge exists, invoking the adapter here would not be a safe pre-B/W
+    # optimization.  B/W records opaque containers as explicit attention and
+    # F refuses them before any planner/writer side effect.
     if not load_work_unit_records(state_root, root_task_id):
         analyze_root_boundaries(
             runner.alist, source, root_task_id=root_task_id, state_root=state_root,
         )
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
     records = load_work_unit_records(state_root, root_task_id)
     if not records:
         # An empty source has no work units; the root is complete with
@@ -285,15 +411,24 @@ def run_root_pipeline(
         root_task_id,
         prefer_animation=(job.target_shelf == "anime"),
     )
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
     records = load_work_unit_records(state_root, root_task_id)
-    if any(record.identity_status in {"pending", "uncertain", "failed"} for record in records):
-        return _persist_root(
-            runner, job, PARK_PHASE,
-            error="部分作品单元身份待确认",
-        )
 
-    # D: three-shelf reconciliation per confirmed unit, fed by the aggregated
-    # known-gap coordinates so ``existing_gap`` can be proven.
+    # C-stage normalization: conservatively combine only same-TMDB TV
+    # siblings whose explicit season directory scopes and file markers agree.
+    # This happens before D creates any reconciliation decision and before F
+    # can create a writer carrier, so no completed work is ever re-keyed.
+    records = _coalesce_confirmed_tv_season_records(
+        state_root, root_task_id, records,
+    )
+
+    # D: reconcile every independently confirmed unit even when a sibling is
+    # parked in C/U.  A source container may legitimately carry a main TV
+    # work plus an ambiguous special/spinoff; the latter must remain visible
+    # as attention without preventing the confirmed sibling from following
+    # the ordinary D→Planner→writer path.
     known_gap_tokens = compute_known_gap_tokens(state_root)
     reconcile_root_work_units(
         runner.alist,
@@ -301,24 +436,30 @@ def run_root_pipeline(
         state_root,
         root_task_id,
         known_gap_tokens_by_identity=known_gap_tokens,
+        # D may use this read-through catalog only for explicit B/W evidence:
+        # a declared empty season or a complete naked-E source whose show
+        # detail proves exactly one positive season.  Any missing/malformed
+        # answer remains fail-closed instead of allowing duplicate consumption.
+        episode_catalog=TmdbEpisodeCatalog(runner.tmdb),
+        tmdb_client=runner.tmdb,
     )
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
     records = load_work_unit_records(state_root, root_task_id)
-    if any(
-        record.reconciliation_outcome in {None, "uncertain"}
-        for record in records
-    ):
-        return _persist_root(
-            runner, job, PARK_PHASE,
-            error="部分作品单元对账结果不确定，等待人工确认",
-        )
+    # A D/U result belongs to that one WorkUnit.  Do not short-circuit the
+    # root here: E/F/G/H can still safely consume or write independently
+    # reconciled siblings, and R will retain the uncertain record as visible
+    # root-level attention after those siblings finish.  This mirrors C/U's
+    # nonblocking behavior without treating a D-uncertain unit as E-lane work.
 
     # Pause/cancel boundary: everything below may move media or write the
     # formal library.
-    if callable(pause_requested) and pause_requested():
+    if stopped():
+        cancelled_job = cancelled()
+        if cancelled_job is not None:
+            return cancelled_job
         return job
-    cancelled = runner._consume_cancel_request(job)  # noqa: SLF001
-    if cancelled is not None:
-        return cancelled
 
     lane_records = [
         record
@@ -330,11 +471,14 @@ def run_root_pipeline(
         # merge into the locked existing work root.
         try:
             execute_unit_e_lanes(
-                runner, state_root, root_task_id, pause_requested=pause_requested,
+                runner, state_root, root_task_id, pause_requested=stopped,
             )
         except EnginePauseRequested:
             # A paused E lane deliberately leaves its durable ledger/carrier
             # for fresh-state recovery.  It is not a business failure.
+            cancelled_job = cancelled()
+            if cancelled_job is not None:
+                return cancelled_job
             return job
         except Exception as exc:
             return _persist_root(
@@ -346,6 +490,9 @@ def run_root_pipeline(
             root_task_id,
             load_work_unit_records(state_root, root_task_id),
         )
+        cancelled_job = cancelled()
+        if cancelled_job is not None:
+            return cancelled_job
 
     new_work_records = [
         record
@@ -359,9 +506,12 @@ def run_root_pipeline(
                 runner,
                 state_root,
                 root_task_id,
-                pause_requested=pause_requested,
+                pause_requested=stopped,
             )
         except EnginePauseRequested:
+            cancelled_job = cancelled()
+            if cancelled_job is not None:
+                return cancelled_job
             return job
         failed = [result for result in results if result.outcome == "failed"]
         if failed:
@@ -370,38 +520,114 @@ def run_root_pipeline(
                 error=f"{len(failed)} 个作品单元执行失败，等待重试",
             )
 
+    # A pure series container is itself a visible library item.  Its child
+    # WorkUnits own the TMDB identities, but the container root still needs a
+    # poster and NFO.  The helper uses the existing single writer through a
+    # deterministic internal artifact carrier; it never moves source media.
+    try:
+        ensure_container_artifacts(
+            runner,
+            state_root,
+            root_task_id,
+            pause_requested=stopped,
+        )
+    except EnginePauseRequested:
+        cancelled_job = cancelled()
+        if cancelled_job is not None:
+            return cancelled_job
+        return job
+    except ContainerMetadataAttention as exc:
+        return _persist_root(
+            runner,
+            job,
+            PARK_PHASE,
+            error=f"容器根元数据需要确认: {redact_error(exc)}",
+        )
+    except Exception as exc:
+        return _persist_root(
+            runner,
+            job,
+            "failed",
+            error=f"容器根元数据写入/回读失败: {redact_error(exc)}",
+        )
+
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
+
     # R: aggregate the ledger into the durable root phase.
     aggregate = aggregate_root_job(state_root, root_task_id)
-    if aggregate.attention:
-        return _persist_root(runner, job, PARK_PHASE)
     if aggregate.failed:
         return _persist_root(runner, job, "failed", error="存在失败的作品单元")
+    # A real technical failure (including a J ledger persistence/readback
+    # fault) must never be hidden behind a separate evidence attention.
+    # Operators need the explicit failed result to distinguish repair work
+    # from an ordinary "需要确认" pause.
+    if aggregate.attention:
+        return _persist_root(runner, job, PARK_PHASE)
     if aggregate.in_progress:
         return _persist_root(
             runner, job, PARK_PHASE,
             error="部分作品单元尚未完成，等待继续处理",
         )
+    # H can have completed the formal media write and exact readback while J
+    # has deliberately left one or more precise coordinates open.  Those
+    # gaps are a normal N-step hand-off to the selected RootJob's two-tier
+    # replenishment lane, not a completed root.
+    if aggregate.open_gaps:
+        return _persist_root(runner, job, GAPS_PENDING_PHASE)
     # Post-completion housekeeping: drop the empty source-dir shells the
     # writer leaves behind in this root's own intake tree.  Strictly
     # emptiness-gated and best-effort — a failure never rolls back the
     # completion, and a paused run skips remote deletes entirely.
-    if not (callable(pause_requested) and pause_requested()):
+    if not stopped():
         try:
             _cleanup_empty_source_shells(
                 runner,
                 state_root,
                 root_task_id,
                 source,
-                pause_requested=pause_requested,
+                pause_requested=stopped,
             )
         except Exception:
             pass
+    cancelled_job = cancelled()
+    if cancelled_job is not None:
+        return cancelled_job
+    return _persist_root(runner, job, "completed")
+
+
+def finalize_root_gap_closure(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+) -> EngineJob:
+    """Close a pending root only after N has durably closed every J Gap.
+
+    This re-reads only the durable ledgers and changes no media.  It is the
+    one R-node transition called after a replenishment turn: a successful
+    H readback alone is never sufficient to mark the root complete.
+    """
+    job = runner.get_job(root_task_id)
+    aggregate = aggregate_root_job(state_root, root_task_id)
+    if aggregate.failed:
+        if job.phase == GAPS_PENDING_PHASE:
+            return _persist_root(runner, job, "failed", error="存在失败的作品单元")
+        return job
+    if aggregate.attention or aggregate.in_progress or aggregate.open_gaps:
+        if job.phase == GAPS_PENDING_PHASE and (aggregate.attention or aggregate.in_progress):
+            return _persist_root(runner, job, PARK_PHASE)
+        return job
+    if job.phase != GAPS_PENDING_PHASE:
+        return job
     return _persist_root(runner, job, "completed")
 
 
 __all__ = [
     "PARK_PHASE",
+    "GAPS_PENDING_PHASE",
     "RUNNABLE_PHASES",
+    "finalize_root_gap_closure",
     "is_intake_bound_root",
     "run_root_pipeline",
 ]

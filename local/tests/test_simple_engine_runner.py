@@ -15,12 +15,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine.scrapeflow.archive import ArchivePasswordError, ArchiveToolError
-from engine.scrapeflow.core import build_tv_plan, parse_ep_files, validate_plan
+from engine.scrapeflow.core import (
+    build_tv_plan,
+    parse_ep_files,
+    validate_plan,
+)
 from engine.scrapeflow.current_plan import finalize_plan, plan_from_dict, plan_to_dict
 from engine.scrapeflow.errors import FormalTargetConflictError, PlanError
 from engine.scrapeflow.media_quality import (
     ABSOLUTE_MINIMUM_VIDEO_BYTES,
-    is_production_test_media_path,
     minimum_video_bytes,
 )
 from engine.scrapeflow.models import Plan, PlannedCleanup, PlannedFile, PlannedProblem
@@ -29,11 +32,17 @@ from engine.scrapeflow.residual_policy import (
     classify_residual,
     cleanup_allowlist_reason,
 )
-from engine.scraper import build_movie_plan, planned_artwork, planned_nfos
+from engine.scraper import (
+    build_movie_plan,
+    build_tv_plan_smart,
+    planned_artwork,
+    planned_nfos,
+)
 from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
     EngineExecutionError,
+    EngineJobConflictError,
     EnginePauseRequested,
     EngineRequest,
     EngineRequestError,
@@ -383,7 +392,13 @@ def provider_tv_child_plan(*, duplicate: bool = False, bonus: bool = False) -> P
         target_root="/library/Example Show",
         files=files,
         warnings=[],
-        metadata={"tmdb_id": 7, "title": "Example Show"},
+        metadata={
+            "tmdb_id": 7,
+            "title": "Example Show",
+            "year": "2020",
+            "poster_path": None,
+            "backdrop_path": None,
+        },
     )
 
 
@@ -534,6 +549,245 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         done = runner.execute_job("engine-test")
         self.assertEqual(done.phase, "executed")
         self.assertEqual(done.execution, {"ok": True})
+
+    def test_container_metadata_carrier_writes_root_nfo_and_artwork_only(self) -> None:
+        """A pure series container gets root metadata through the one writer."""
+        source = "/library/待刮削/Container"
+        self.alist.files[f"{source}/child.mkv"] = FAKE_VIDEO_BYTES
+        tmdb = RecordingTMDB()
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=tmdb,
+            library_root="/library",
+        )
+        root = runner.create_pending_job(source, job_id="engine-root-container")
+        root = runner.start_automatic_job(root.id, target_shelf="anime")
+        carrier = runner.plan_container_artifacts(
+            root_job_id=root.id,
+            source_path=source,
+            target_root="/library/番剧/Container",
+            target_shelf="anime",
+            container_title="Container",
+            poster_path="/poster.jpg",
+            backdrop_path="/backdrop.jpg",
+            representative_tmdb_id=7,
+            job_id="container-artifacts-engine-root-container",
+        )
+        self.assertEqual(carrier.phase, "planned")
+        self.assertEqual(carrier.plan["files"], [])
+        done = runner.execute_job(carrier.id)
+        self.assertEqual(done.phase, "executed")
+        self.assertIn("/library/番剧/Container/poster.jpg", self.alist.files)
+        self.assertIn("/library/番剧/Container/folder.jpg", self.alist.files)
+        self.assertIn("/library/番剧/Container/fanart.jpg", self.alist.files)
+        nfo = self.alist.files["/library/番剧/Container/tvshow.nfo"].decode()
+        self.assertIn("<title>Container</title>", nfo)
+        self.assertNotIn("<tmdbid>", nfo)
+        self.assertEqual(self.alist.moves, [])
+        uploads_before = list(self.alist.uploads)
+        repaired = runner.repair_automatic_artifacts(carrier.id)
+        self.assertEqual(repaired.phase, "executed")
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.uploads, uploads_before)
+
+    def test_public_request_cannot_nominate_internal_workunit_target_scope(self) -> None:
+        """Only the RootJob composition layer may set a WorkUnit scope."""
+        with self.assertRaisesRegex(EngineRequestError, "内部范围"):
+            EngineRequest.from_mapping({
+                "source_path": "/incoming/movie",
+                "parent_path": "/library/番剧",
+                "media_type": "movie",
+                "tmdb_id": 1,
+                "target_scope_root": "/library/欧美剧/Foreign Work",
+            })
+        with self.assertRaisesRegex(EngineRequestError, "内部范围"):
+            EngineRequest.from_mapping({
+                "source_path": "/incoming/show",
+                "parent_path": "/library/番剧",
+                "media_type": "tv",
+                "tmdb_id": 1,
+                "allow_release_dash_ordinal": True,
+            })
+
+    def test_new_workunit_scope_requires_a_child_below_its_authorized_scope(self) -> None:
+        """A selected shelf is not itself a valid new WorkUnit target."""
+        scope = "/library/番剧"
+        request = replace(
+            self.request,
+            parent_path=scope,
+            target_scope_root=scope,
+        )
+        executor_calls: list[object] = []
+
+        def plan_at_scope(_request: EngineRequest, _alist: object, _tmdb: object) -> Plan:
+            return Plan(
+                mode="movie",
+                source_root="/incoming/movie",
+                target_root=scope,
+                files=[PlannedFile(
+                    source_path="/incoming/movie/source.mkv",
+                    source_dir="/incoming/movie",
+                    original_name="source.mkv",
+                    final_name="Scope Test.mkv",
+                    target_dir=scope,
+                    media_kind="video",
+                    source_size=FAKE_VIDEO_SIZE,
+                )],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 1,
+                    "title": "Scope Test",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=plan_at_scope,
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_calls.append(plan) or {"unexpected": True},
+        )
+
+        with self.assertRaisesRegex(EngineRequestError, "允许目标范围外"):
+            runner.plan_job(request, job_id="engine-workunit-at-shelf")
+
+        self.assertEqual(executor_calls, [])
+        self.assertFalse((runner.jobs_root / "engine-workunit-at-shelf.json").exists())
+
+    def test_d_locked_scope_cannot_treat_a_formal_shelf_as_a_work_root(self) -> None:
+        """Malformed D evidence cannot authorize writing at a shelf root."""
+        scope = "/library/番剧"
+        request = replace(
+            self.request,
+            parent_path="/library",
+            target_scope_root=scope,
+        )
+        executor_calls: list[object] = []
+
+        def plan_at_scope(_request: EngineRequest, _alist: object, _tmdb: object) -> Plan:
+            return Plan(
+                mode="movie",
+                source_root="/incoming/movie",
+                target_root=scope,
+                files=[PlannedFile(
+                    source_path="/incoming/movie/source.mkv",
+                    source_dir="/incoming/movie",
+                    original_name="source.mkv",
+                    final_name="Malformed D Scope.mkv",
+                    target_dir=scope,
+                    media_kind="video",
+                    source_size=FAKE_VIDEO_SIZE,
+                )],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 1,
+                    "title": "Malformed D Scope",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=plan_at_scope,
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_calls.append(plan) or {"unexpected": True},
+        )
+
+        with self.assertRaisesRegex(EngineRequestError, "允许目标范围外"):
+            runner.plan_job(request, job_id="engine-workunit-malformed-d-root")
+
+        self.assertEqual(executor_calls, [])
+        self.assertFalse(
+            (runner.jobs_root / "engine-workunit-malformed-d-root.json").exists()
+        )
+
+    def test_persisted_workunit_scope_blocks_escape_before_execution_and_recovery(self) -> None:
+        """A tampered WorkUnit carrier cannot escape its original shelf."""
+        scope = "/library/番剧"
+        request = replace(
+            self.request,
+            parent_path=scope,
+            target_scope_root=scope,
+        )
+        executor_calls: list[object] = []
+
+        def scoped_plan(engine_request: EngineRequest, _alist: object, _tmdb: object) -> Plan:
+            target = f"{engine_request.parent_path}/Scoped Work (1)"
+            return Plan(
+                mode="movie",
+                source_root="/incoming/movie",
+                target_root=target,
+                files=[PlannedFile(
+                    source_path="/incoming/movie/source.mkv",
+                    source_dir="/incoming/movie",
+                    original_name="source.mkv",
+                    final_name="Scoped Work.mkv",
+                    target_dir=target,
+                    media_kind="video",
+                    source_size=FAKE_VIDEO_SIZE,
+                )],
+                warnings=[],
+                metadata={
+                    "tmdb_id": 1,
+                    "title": "Scoped Work",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=scoped_plan,
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_calls.append(plan) or {"unexpected": True},
+        )
+        job = runner.plan_job(request, job_id="engine-workunit-persisted-scope")
+        escaped_root = "/library/欧美剧/Escaped Work (1)"
+        tampered_plan = dict(job.plan)
+        tampered_plan["target_root"] = escaped_root
+        tampered_plan["files"] = [
+            {**item, "target_dir": escaped_root}
+            for item in (job.plan.get("files") or [])
+        ]
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - persisted-plan guard fixture
+            replace(job, plan=tampered_plan).as_dict(),
+            allow_nan=False,
+        )
+
+        with self.assertRaisesRegex(EngineRequestError, "允许目标范围外"):
+            runner.execute_job(job.id)
+        self.assertEqual(executor_calls, [])
+
+        active = runner.get_job(job.id)
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - persisted recovery fixture
+            replace(active, phase="failed").as_dict(),
+            allow_nan=False,
+        )
+        recovered = runner.recover_job(job.id)
+
+        self.assertEqual(recovered.phase, "failed_verification")
+        self.assertEqual(
+            recovered.summary.get("recovery", {}).get("reason"),
+            "target_shelf_policy_violation",
+        )
+        self.assertEqual(executor_calls, [])
 
     def test_pause_boundary_preserves_executing_job_without_writer_replay(self) -> None:
         events: list[str] = []
@@ -769,11 +1023,11 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         failed = runner.plan_automatic_job(queued.id)
 
         self.assertEqual(failed.phase, "failed_planning")
-        self.assertTrue(failed.summary["automatic_terminal"])
         # 存量清退：automatic_stage 镜像已不再由 runner 续写，phase 为唯一权威。
         self.assertNotIn("automatic_stage", failed.summary)
-        self.assertEqual(failed.summary["automatic_attempts"], 0)
-        self.assertIsNone(failed.summary["next_retry_seconds"])
+        self.assertNotIn("automatic_terminal", failed.summary)
+        self.assertNotIn("automatic_attempts", failed.summary)
+        self.assertNotIn("next_retry_seconds", failed.summary)
         self.assertEqual(failed.plan, {})
         self.assertIsNone(failed.execution)
         self.assertNotIn("active_operation", failed.summary)
@@ -826,8 +1080,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
 
         retryable = runner.get_job(queued.id)
         self.assertEqual(retryable.phase, "planning")
-        self.assertFalse(retryable.summary["automatic_terminal"])
-        self.assertEqual(retryable.summary["automatic_attempts"], 0)
+        self.assertNotIn("automatic_terminal", retryable.summary)
+        self.assertNotIn("automatic_attempts", retryable.summary)
         self.assertEqual(retryable.plan, {})
         self.assertIsNone(retryable.execution)
 
@@ -875,15 +1129,15 @@ class SimpleEngineRunnerTests(unittest.TestCase):
 
         failed = runner.get_job(queued.id)
         self.assertEqual(failed.phase, "failed_archive")
-        self.assertTrue(failed.summary["automatic_terminal"])
         # 存量清退：automatic_stage 镜像已不再由 runner 续写，phase 为唯一权威。
         self.assertNotIn("automatic_stage", failed.summary)
-        self.assertEqual(failed.summary["automatic_attempts"], 0)
+        self.assertNotIn("automatic_terminal", failed.summary)
+        self.assertNotIn("automatic_attempts", failed.summary)
         self.assertEqual(events, ["archive_preprocess"])
         identity.assert_not_called()
         self.assertIn(source_file, self.alist.files)
 
-    def test_archive_tool_failure_remains_retryable_at_scheduler_boundary(self) -> None:
+    def test_archive_tool_failure_keeps_phase_for_explicit_retry(self) -> None:
         events: list[str] = []
         source_file = "/incoming/archive/payload.7z"
         self.alist.files[source_file] = b"7z\xbc\xaf'\x1c"
@@ -908,7 +1162,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
 
         retryable = runner.get_job(queued.id)
         self.assertEqual(retryable.phase, "archive_preprocessing")
-        self.assertIsNot(retryable.summary.get("automatic_terminal"), True)
+        self.assertNotIn("automatic_terminal", retryable.summary)
         self.assertEqual(events, ["archive_preprocess"])
         self.assertIn(source_file, self.alist.files)
 
@@ -1026,6 +1280,64 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         once = plan_to_dict(finalized)
         twice = plan_to_dict(finalize_plan(plan_from_dict(once)))
         self.assertEqual(twice, once)
+
+    def test_current_finalizer_uses_content_proof_priority_for_managed_tracks(self) -> None:
+        plan = fake_plan(self.request, self.alist, object())
+        bilingual = PlannedFile(
+            source_path="/incoming/movie/source.zh-CN-bilingual-ja.srt",
+            source_dir="/incoming/movie",
+            original_name="source.zh-CN-bilingual-ja.srt",
+            final_name="Movie (2020).zh-CN-bilingual-ja.srt",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+            subtitle_validation={
+                "status": "satisfied", "selection": "bilingual", "preference": 0,
+                "source_path": "/incoming/movie/source.zh-CN-bilingual-ja.srt",
+                "source_name": "source.zh-CN-bilingual-ja.srt", "size": 100,
+            },
+        )
+        simplified = PlannedFile(
+            source_path="/incoming/movie/source.zh-CN.srt",
+            source_dir="/incoming/movie",
+            original_name="source.zh-CN.srt",
+            final_name="Movie (2020).zh-CN.srt",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+            subtitle_validation={
+                "status": "satisfied", "selection": "simplified_chinese", "preference": 1,
+                "source_path": "/incoming/movie/source.zh-CN.srt",
+                "source_name": "source.zh-CN.srt", "size": 100,
+            },
+        )
+        traditional = PlannedFile(
+            source_path="/incoming/movie/source.zh-TW.srt",
+            source_dir="/incoming/movie",
+            original_name="source.zh-TW.srt",
+            final_name="Movie (2020).zh-TW.srt",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+            subtitle_validation={
+                "status": "satisfied", "selection": "traditional_chinese", "preference": 2,
+                "source_path": "/incoming/movie/source.zh-TW.srt",
+                "source_name": "source.zh-TW.srt", "size": 100,
+            },
+        )
+        plan.files.extend([bilingual, simplified, traditional])
+
+        finalized = finalize_plan(plan)
+
+        self.assertIn(bilingual.source_path, {item.source_path for item in finalized.files})
+        self.assertNotIn(simplified.source_path, {item.source_path for item in finalized.files})
+        self.assertNotIn(traditional.source_path, {item.source_path for item in finalized.files})
+        deferred = finalized.scan_report["deferred_subtitles"]
+        self.assertEqual(
+            {row["source_path"] for row in deferred},
+            {simplified.source_path, traditional.source_path},
+        )
+        self.assertTrue(all(row["reason"] == "managed_subtitle_lower_priority" for row in deferred))
 
     def test_current_finalizer_prefers_normal_release_over_subset_copy(self) -> None:
         plan = fake_plan(self.request, self.alist, object())
@@ -1272,8 +1584,8 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         reloaded = runner.get_job(child.id)
         self.assertTrue(reloaded.summary["internal_child"])
         self.assertEqual(reloaded.summary["root_job_id"], "engine-root-marker")
-        self.assertTrue(reloaded.summary["provider_media_only"])
-        self.assertTrue(reloaded.plan["metadata"]["provider_media_only"])
+        self.assertNotIn("provider_media_only", reloaded.summary)
+        self.assertNotIn("provider_media_only", reloaded.plan["metadata"])
         self.assertIsNone(runner.find_by_source(self.request.source_path))
 
     def test_internal_child_marker_is_written_with_initial_plan(self) -> None:
@@ -1293,93 +1605,17 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(child.summary["root_job_id"], "engine-root-atomic")
         persisted = runner.get_job(child.id)
         self.assertTrue(persisted.summary["internal_child"])
-        self.assertTrue(persisted.summary["provider_media_only"])
-        self.assertTrue(persisted.plan["metadata"]["provider_media_only"])
-
-    def test_audit_episode_title_evidence_survives_projection(self) -> None:
-        projected = SimpleEngineRunner._audit_media_mapping(
-            {
-                "kind": "missing_episode",
-                "label": "Show S00E05",
-                "reason": "missing",
-                "season": 0,
-                "episode": 5,
-                "title": "Dawn OVA",
-                "title_aliases": ["黎明特别篇", "Dawn OVA"],
-                "source_episode_aliases": [{
-                    "season": 1,
-                    "episode": 5,
-                    "series_titles": ["Show", "Show (source)"],
-                }],
-                "media": {
-                    "tmdb_id": 7,
-                    "target_root": "/library/番剧/Show",
-                    "media_type": "tv",
-                },
-            },
-            tmdb_id=7,
-            target_root="/library/番剧/Show",
-            media_type="tv",
-            title="Show",
-            original_title="Show",
-            year="2020",
-            media_format="",
-        )
-        self.assertIsNotNone(projected)
-        assert projected is not None
-        self.assertEqual(projected["title"], "Dawn OVA")
-        self.assertEqual(projected["title_aliases"], ["黎明特别篇"])
-        self.assertEqual(
-            projected["source_episode_aliases"],
-            [{"season": 1, "episode": 5,
-              "series_titles": ["Show", "Show (source)"]}],
-        )
+        self.assertNotIn("provider_media_only", persisted.summary)
+        self.assertNotIn("provider_media_only", persisted.plan["metadata"])
 
     def test_video_admission_configuration_has_an_immutable_floor(self) -> None:
         with patch.dict("os.environ", {"SCRAPEFLOW_MIN_VIDEO_BYTES": "1"}):
             self.assertEqual(minimum_video_bytes(), ABSOLUTE_MINIMUM_VIDEO_BYTES)
 
-    def test_legacy_production_e2e_path_match_is_casefolded_and_narrow(self) -> None:
-        self.assertTrue(is_production_test_media_path(
-            "/quark/影视/待刮削/sCrApEfLoW-e2e-fight/source.mkv",
-        ))
-        self.assertTrue(is_production_test_media_path(
-            "/quark/影视/scrapeflow/补源/E2E-run-1/attempt/source.mkv",
-        ))
-        self.assertFalse(is_production_test_media_path(
-            "/quark/影视/ScrapeFlow/补源/audit-engine-1/attempt/source.mkv",
-        ))
-
-    def test_plan_validation_refuses_a_large_video_from_legacy_e2e_intake(self) -> None:
+    def test_executor_accepts_task_staging_path(self) -> None:
+        source = "/quark/影视/ScrapeFlow/补源/root-1/attempt-1/source.mkv"
         plan = fake_plan(self.request, self.alist, object())
-        plan.source_root = "/quark/影视/待刮削/ScrapeFlow-E2E-Fight"
-        plan.files[0].source_path = f"{plan.source_root}/source.mkv"
-        plan.files[0].source_dir = plan.source_root
-        plan.target_root = "/quark/影视/电影/Movie (2020)"
-        plan.files[0].target_dir = plan.target_root
-
-        with self.assertRaisesRegex(PlanError, "生产 E2E 测试来源路径"):
-            validate_plan(ValidationAList(), plan)
-
-    def test_executor_refuses_a_large_video_from_legacy_e2e_staging(self) -> None:
-        source = "/quark/影视/ScrapeFlow/补源/e2e-fight/attempt/source.mkv"
-        plan = fake_plan(self.request, self.alist, object())
-        plan.source_root = "/quark/影视/ScrapeFlow/补源/e2e-fight/attempt"
-        plan.files[0].source_path = source
-        plan.files[0].source_dir = posixpath.dirname(source)
-        self.alist.files.pop("/incoming/movie/source.mkv")
-        self.alist.files[source] = FAKE_VIDEO_BYTES
-
-        with self.assertRaisesRegex(EngineExecutionError, "生产 E2E 测试来源路径"):
-            SimplePlanExecutor(self.alist).execute(plan)
-
-        self.assertEqual(self.alist.moves, [])
-        self.assertIn(source, self.alist.files)
-
-    def test_normal_audit_staging_path_is_not_mistaken_for_legacy_e2e(self) -> None:
-        source = "/quark/影视/ScrapeFlow/补源/audit-engine-1/attempt/source.mkv"
-        plan = fake_plan(self.request, self.alist, object())
-        plan.source_root = "/quark/影视/ScrapeFlow/补源/audit-engine-1/attempt"
+        plan.source_root = "/quark/影视/ScrapeFlow/补源/root-1/attempt-1"
         plan.files[0].source_path = source
         plan.files[0].source_dir = posixpath.dirname(source)
         self.alist.files.pop("/incoming/movie/source.mkv")
@@ -1395,6 +1631,20 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         plan.files[0].source_size = 1885
 
         with self.assertRaisesRegex(PlanError, "视频文件小于正式库准入下限"):
+            validate_plan(ValidationAList(), plan)
+
+    def test_plan_validation_refuses_disc_image_even_if_serialized_as_video(self) -> None:
+        """A forged/legacy plan cannot bypass B/W by relabelling an ISO."""
+        plan = fake_plan(self.request, self.alist, object())
+        item = plan.files[0]
+        item.source_path = "/incoming/movie/disc.iso"
+        item.source_dir = "/incoming/movie"
+        item.original_name = "disc.iso"
+        item.final_name = "Movie (2020).iso"
+        item.media_kind = "video"
+        item.source_size = 45 * 1024**3
+
+        with self.assertRaisesRegex(PlanError, "光盘镜像容器"):
             validate_plan(ValidationAList(), plan)
 
     def test_executor_refuses_tiny_video_before_any_formal_move(self) -> None:
@@ -1481,22 +1731,121 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             ("/library/Movie (2020)/source.mkv", "Movie (2020).mkv")
         ])
 
-    def test_provider_internal_child_moves_media_without_touching_artifacts(self) -> None:
+    def test_executor_rejects_a_stale_unsafe_final_before_any_move(self) -> None:
+        plan = fake_plan(self.request, self.alist, object())
+        plan.files[0].final_name = "Movie...Legacy.mkv"
+
+        with self.assertRaisesRegex(EngineExecutionError, "AList 不兼容"):
+            SimplePlanExecutor(self.alist).execute(plan)
+
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.renames, [])
+        self.assertIn("/incoming/movie/source.mkv", self.alist.files)
+
+    def test_failed_legacy_plan_migrates_and_renames_exact_intermediate(self) -> None:
+        """A rejected post-move rename remains one durable continuation.
+
+        The old plan has a provider-incompatible title.  Its source has
+        already moved to the target under the original basename, so retrying
+        must atomically repair the plan and issue only that same-directory
+        rename—never re-plan or re-move a missing source.
+        """
+        def legacy_plan(request, alist, tmdb):  # type: ignore[no-untyped-def]
+            plan = fake_plan(request, alist, tmdb)
+            plan.files[0].final_name = "Movie...Legacy.mkv"
+            return plan
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=legacy_plan,
+            validate=False,
+        )
+        job = runner.plan_job(self.request, job_id="engine-legacy-basename")
+        intermediate = "/library/Movie (2020)/source.mkv"
+        self.alist.files[intermediate] = self.alist.files.pop(
+            "/incoming/movie/source.mkv",
+        )
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - durable failure fixture
+            replace(job, phase="failed", error="rename rejected").as_dict(),
+            allow_nan=False,
+        )
+
+        recovered = runner.recover_job(job.id)
+
+        self.assertEqual(recovered.phase, "retry_wait")
+        migrated_final = "Movie-Legacy.mkv"
+        self.assertEqual(recovered.plan["files"][0]["final_name"], migrated_final)
+        migration = recovered.summary["remote_basename_migration"]
+        self.assertEqual(migration["status"], "prepared")
+        self.assertEqual(migration["files"][0]["state"], "rename_pending")
+        self.assertIn(intermediate, self.alist.files)
+        self.assertEqual(self.alist.moves, [])
+
+        resumed = runner.execute_job(recovered.id)
+
+        target = f"/library/Movie (2020)/{migrated_final}"
+        self.assertEqual(resumed.phase, "executed")
+        self.assertIn(target, self.alist.files)
+        self.assertNotIn(intermediate, self.alist.files)
+        self.assertNotIn("/incoming/movie/source.mkv", self.alist.files)
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.renames, [(intermediate, migrated_final)])
+        execution = resumed.execution or {}
+        self.assertEqual(
+            execution["files"][0]["status"],
+            "renamed_after_interrupted_move",
+        )
+
+    def test_legacy_plan_refuses_a_preexisting_canonical_target(self) -> None:
+        def legacy_plan(request, alist, tmdb):  # type: ignore[no-untyped-def]
+            plan = fake_plan(request, alist, tmdb)
+            plan.files[0].final_name = "Movie...Legacy.mkv"
+            return plan
+
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=legacy_plan,
+            validate=False,
+        )
+        job = runner.plan_job(self.request, job_id="engine-legacy-collision")
+        intermediate = "/library/Movie (2020)/source.mkv"
+        canonical = "/library/Movie (2020)/Movie-Legacy.mkv"
+        self.alist.files[intermediate] = self.alist.files.pop(
+            "/incoming/movie/source.mkv",
+        )
+        self.alist.files[canonical] = FAKE_VIDEO_BYTES
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - durable failure fixture
+            replace(job, phase="failed", error="rename rejected").as_dict(),
+            allow_nan=False,
+        )
+
+        recovered = runner.recover_job(job.id)
+
+        self.assertEqual(recovered.phase, "failed_verification")
+        self.assertEqual(
+            recovered.summary["recovery"]["reason"],
+            "canonical_target_collision",
+        )
+        self.assertIn(intermediate, self.alist.files)
+        self.assertIn(canonical, self.alist.files)
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.renames, [])
+
+    def test_internal_child_uses_normal_artifacts_and_preserves_existing_root_metadata(self) -> None:
         plan = provider_media_plan(self.request, self.alist, object())
-        plan.metadata["provider_media_only"] = True
         nfos = planned_nfos(plan)
         artwork = planned_artwork(plan)
         self.assertTrue(nfos)
         self.assertTrue(artwork)
-        # Existing files intentionally have different sizes.  Ordinary roots
-        # reject these conflicts; an internal provider child must leave them
-        # byte-for-byte untouched and must not even enter the artifact lane.
-        existing: dict[str, bytes] = {}
-        for target, _content in nfos:
-            existing[target] = b"existing-nfo"
-        # Keep one existing artwork target with a conflicting size; leave the
-        # remaining artwork absent to prove a media-only child does not fill
-        # genuinely missing sidecars either.
+        # Existing root metadata remains authoritative. Missing episode-side
+        # artifacts still use the ordinary projection; no child-only NFO path.
+        existing: dict[str, bytes] = {nfos[0][0]: b"user-root-nfo"}
         existing_artwork = artwork[0][0]
         existing[existing_artwork] = b"existing-artwork"
         self.alist.files.update(existing)
@@ -1505,45 +1854,30 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         result = SimplePlanExecutor(self.alist, tmdb).execute(plan)
 
         self.assertEqual(result["file_count"], 1)
-        self.assertEqual(result["artifact_count"], 0)
-        self.assertTrue(result["media_only"])
-        self.assertEqual(tmdb.calls, [])
+        self.assertEqual(result["artifact_count"], len(nfos) + len(artwork))
+        self.assertEqual(self.alist.files[nfos[0][0]], b"user-root-nfo")
         for target, content in existing.items():
             self.assertEqual(self.alist.files[target], content)
-        self.assertEqual(
-            self.alist.files[existing_artwork], b"existing-artwork",
-        )
-        self.assertTrue(
-            set(target for target, _path, _role in artwork if target != existing_artwork)
-            .isdisjoint(self.alist.files)
-        )
+        self.assertTrue(tmdb.calls)
+        self.assertTrue(all(target in self.alist.files for target, _ in nfos))
+        self.assertTrue(all(target in self.alist.files for target, _path, _role in artwork))
 
-    def test_provider_internal_child_never_creates_episode_nfo_or_artwork(self) -> None:
-        """A replenishment child moves only media into an established tree."""
-        plan = provider_media_plan(self.request, self.alist, object())
-        plan.metadata["provider_media_only"] = True
-        targets = {
-            target for target, _content in planned_nfos(plan)
-        } | {
-            target for target, _path, _role in planned_artwork(plan)
-        }
+    def test_internal_tv_child_uses_full_normal_nfo_projection(self) -> None:
+        """An internal TV child gets root and episode NFOs from the normal planner."""
+        plan = provider_tv_child_plan()
+        for item in plan.files:
+            self.alist.files[item.source_path] = FAKE_VIDEO_BYTES
+        expected_nfos = dict(planned_nfos(plan))
         result = SimplePlanExecutor(self.alist, RecordingTMDB()).execute(plan)
 
-        self.assertEqual(result["file_count"], 1)
-        self.assertEqual(result["artifact_count"], 0)
-        self.assertTrue(result["media_only"])
-        self.assertTrue(targets.isdisjoint(self.alist.files))
-
-    def test_provider_internal_child_does_not_move_subtitle_companion(self) -> None:
-        plan = provider_media_plan_with_subtitle(self.request, self.alist, object())
-        plan.metadata["provider_media_only"] = True
-        self.alist.files["/incoming/movie/source.zh.srt"] = b"zh\n"
-
-        result = SimplePlanExecutor(self.alist).execute(plan)
-
-        self.assertEqual(result["file_count"], 1)
-        self.assertNotIn("/library/Movie (2020)/Movie (2020).zh.srt", self.alist.files)
-        self.assertIn("/incoming/movie/source.zh.srt", self.alist.files)
+        self.assertEqual(result["file_count"], 2)
+        self.assertEqual(result["artifact_count"], len(expected_nfos))
+        self.assertEqual(
+            {row["target"] for row in result["artifacts"]},
+            set(expected_nfos),
+        )
+        self.assertTrue(all(path in self.alist.files for path in expected_nfos))
+        self.assertIn("/library/Example Show/tvshow.nfo", self.alist.files)
 
     def test_provider_tv_child_plan_rejects_duplicate_episode_before_persisting(self) -> None:
         unsafe = provider_tv_child_plan(duplicate=True)
@@ -1564,18 +1898,6 @@ class SimpleEngineRunnerTests(unittest.TestCase):
 
         self.assertFalse((runner.jobs_root / "engine-duplicate-provider-child.json").exists())
 
-    def test_provider_tv_child_execution_rejects_bonus_before_any_move(self) -> None:
-        plan = provider_tv_child_plan(bonus=True)
-        plan.metadata["provider_media_only"] = True
-        for item in plan.files:
-            self.alist.files[item.source_path] = FAKE_VIDEO_BYTES
-
-        with self.assertRaisesRegex(EngineExecutionError, "附加内容"):
-            SimplePlanExecutor(self.alist).execute(plan)
-
-        self.assertEqual(self.alist.moves, [])
-        self.assertTrue(all(item.source_path in self.alist.files for item in plan.files))
-
     def test_serialized_provider_tv_child_cannot_bypass_unique_episode_guard(self) -> None:
         unsafe = provider_tv_child_plan(duplicate=True)
         runner = SimpleEngineRunner(
@@ -1588,23 +1910,23 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         )
         job = runner.plan_job(self.request, job_id="engine-serialized-provider-child")
         tampered_plan = dict(job.plan)
-        tampered_metadata = dict(tampered_plan["metadata"])
-        tampered_metadata["provider_media_only"] = True
-        tampered_plan["metadata"] = tampered_metadata
         atomic_write_json(
             runner._job_path(job.id),  # noqa: SLF001 - persisted-plan guard fixture
-            replace(job, plan=tampered_plan).as_dict(),
+            replace(
+                job,
+                plan=tampered_plan,
+                summary={**job.summary, "internal_child": True, "root_job_id": "engine-provider-root"},
+            ).as_dict(),
             allow_nan=False,
         )
 
         with self.assertRaisesRegex(EngineExecutionError, "多个视频映射到 S01E01"):
             runner.execute_job(job.id)
 
-        self.assertEqual(runner.get_job(job.id).phase, "planned")
+        self.assertEqual(runner.get_job(job.id).phase, "failed")
 
     def test_provider_tv_child_allows_two_distinct_unique_episode_videos(self) -> None:
         plan = provider_tv_child_plan()
-        plan.metadata["provider_media_only"] = True
         for item in plan.files:
             self.alist.files[item.source_path] = FAKE_VIDEO_BYTES
 
@@ -1713,6 +2035,181 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             [("regular", 1, 2)],
         )
 
+    def test_tv_planner_consumes_a_proven_physical_oad_sp_map(self) -> None:
+        """The D/F-only SP map turns no unproven OAD into Season 00."""
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+        class PlannerTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/99100":
+                    return {
+                        "name": "Example OAD",
+                        "original_name": "Example OAD",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [{"season_number": 1, "episode_count": 5, "name": "OAD"}],
+                    }
+                if path == "/tv/99100/season/1":
+                    return {"episodes": [{
+                        "episode_number": number,
+                        "name": f"OAD #{number}",
+                        "air_date": "2020-01-01",
+                    } for number in range(1, 6)]}
+                if path == "/tv/99100/season/0":
+                    return {"episodes": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_files = [{
+            "name": f"Example [OAD{number:02d}].mkv",
+            "full_path": f"/incoming/Example OAD/Example [OAD{number:02d}].mkv",
+            "size": 2 * 1024 * 1024,
+            "is_dir": False,
+        } for number in range(1, 6)]
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "physical-oad-map.json"
+            mapping_path.write_text(
+                json.dumps({
+                    f"SP{number:02d}": f"S01E{number:02d}"
+                    for number in range(1, 6)
+                }),
+                encoding="utf-8",
+            )
+            plan = build_tv_plan(
+                PlannerAList(), PlannerTMDB(),
+                src_path="/incoming/Example OAD", parent_path="/library/番剧",
+                tmdb_id=99100, season=1, absolute=False,
+                prefer_simplified=True, allow_unmapped=False,
+                episode_map_path=mapping_path, source_files=source_files,
+            )
+        self.assertEqual([item.episode_key for item in plan.files], [
+            f"SP{number:02d}" for number in range(1, 6)
+        ])
+        self.assertEqual([item.final_name for item in plan.files], [
+            f"Example OAD - S01E{number:02d} - OAD #{number}.mkv"
+            for number in range(1, 6)
+        ])
+        self.assertEqual(plan.problem_files, [])
+
+    def test_declared_subtitle_only_season_is_retained_without_blocking_tv_plan(self) -> None:
+        """B/W-proven empty seasons are gaps, never subtitle-only writes.
+
+        This exercises the real smart multi-season split.  Without the B/W
+        declaration it must preserve the existing fail-closed no-video error;
+        with the declaration it plans only the two playable seasons and leaves
+        the Season 02 SUP file outside files, cleanup, and problem rows.
+        """
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class PlannerTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/99":
+                    return {
+                        "name": "Northwind Show",
+                        "original_name": "Northwind Show",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 0},
+                            {"season_number": 1, "episode_count": 1},
+                            {"season_number": 2, "episode_count": 1},
+                            {"season_number": 3, "episode_count": 1},
+                        ],
+                    }
+                if path.startswith("/tv/99/season/"):
+                    season = int(path.rsplit("/", 1)[1])
+                    return {
+                        "episodes": [] if season == 0 else [{
+                            "episode_number": 1,
+                            "name": f"Episode {season}",
+                            "air_date": "2020-01-01",
+                        }],
+                    }
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/quark/影视/待刮削/Northwind"
+        subtitle_path = source_root + "/S02/Northwind.Show.S02E01.sup"
+        source_files = [
+            {
+                "name": "Northwind.Show.S01E01.mkv",
+                "full_path": source_root + "/S01/Northwind.Show.S01E01.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            },
+            {
+                "name": "Northwind.Show.S02E01.sup",
+                "full_path": subtitle_path,
+                "size": 1_024,
+                "is_dir": False,
+            },
+            {
+                "name": "Northwind.Show.S03E01.mkv",
+                "full_path": source_root + "/S03/Northwind.Show.S03E01.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            },
+        ]
+        kwargs = {
+            "auto_episode_mode": True,
+            "alist": PlannerAList(),
+            "tmdb_client": PlannerTMDB(),
+            "src_path": source_root,
+            "parent_path": "/quark/影视/番剧",
+            "tmdb_id": 99,
+            "season": 1,
+            "absolute": False,
+            "prefer_simplified": True,
+            "allow_unmapped": False,
+            "ignore_orphan_temp": False,
+            "source_files": source_files,
+            "media_root": "/quark/影视",
+        }
+
+        with self.assertRaisesRegex(PlanError, "未找到剧集视频文件"):
+            build_tv_plan_smart(**kwargs)
+
+        plan = build_tv_plan_smart(
+            **kwargs,
+            source_declared_seasons=(1, 2, 3),
+        )
+
+        self.assertEqual(
+            {item.source_path for item in plan.files},
+            {
+                source_root + "/S01/Northwind.Show.S01E01.mkv",
+                source_root + "/S03/Northwind.Show.S03E01.mkv",
+            },
+        )
+        self.assertNotIn(subtitle_path, {item.source_path for item in plan.cleanup_files})
+        self.assertNotIn(subtitle_path, {item.source_path for item in plan.problem_files})
+        self.assertEqual(
+            plan.scan_report["deferred_subtitle_only_seasons"],
+            [{
+                "kind": "subtitle_only_declared_season",
+                "season": 2,
+                "source_paths": [subtitle_path],
+                "reason": "该季未发现视频；外挂字幕保留在来源，不作为无视频正式库写入",
+            }],
+        )
+
+        # A declaration is not permission to place subtitles without their
+        # video.  The narrow deferral only applies when another executable
+        # season remains in the same owned WorkUnit.
+        with self.assertRaisesRegex(PlanError, "未找到剧集视频文件"):
+            build_tv_plan_smart(
+                **{
+                    **kwargs,
+                    "source_files": [source_files[1]],
+                    "source_declared_seasons": (2,),
+                },
+            )
+
     def test_preferred_traditional_subtitle_is_deferred_not_a_problem_file(self) -> None:
         """Keep the planner's simplified-preference result non-blocking.
 
@@ -1788,6 +2285,78 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 "reason": "preferred_simplified_subtitle",
             }],
         )
+
+    def test_tv_planner_uses_verified_tc_when_sc_srt_is_invalid(self) -> None:
+        """Filename-preferred SC cannot preempt a content-proven TC fallback."""
+        class PlannerAList:
+            def __init__(self, contents: dict[str, bytes]) -> None:
+                self.contents = contents
+
+            def try_list(self, _path: str, refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def read_file_prefix(self, path: str, *, max_bytes: int) -> bytes:
+                return self.contents[path][:max_bytes]
+
+        class PlannerTMDB:
+            def get(self, path: str, language: str | None = None) -> dict[str, object]:
+                del language
+                if path == "/tv/78":
+                    return {
+                        "name": "Fallback Show",
+                        "original_name": "Fallback Show",
+                        "original_language": "ja",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [],
+                    }
+                if path == "/tv/78/season/1":
+                    return {"episodes": [{"episode_number": 1, "name": "Pilot"}]}
+                if path == "/tv/78/season/0":
+                    return {"episodes": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/incoming/fallback"
+        invalid_sc = source_root + "/Fallback.Show.S01E01.zh-CN.srt"
+        valid_tc = source_root + "/Fallback.Show.S01E01.zh-TW.srt"
+        tc_bytes = (
+            "1\n00:00:01,000 --> 00:00:03,000\n"
+            "這是一個繁體中文字幕測試內容。\n"
+        ).encode("utf-8")
+        plan = build_tv_plan(
+            PlannerAList({invalid_sc: b"not an srt", valid_tc: tc_bytes}),
+            PlannerTMDB(),
+            src_path=source_root,
+            parent_path="/library/番剧",
+            tmdb_id=78,
+            season=1,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            source_files=[
+                {
+                    "name": "Fallback.Show.S01E01.mkv",
+                    "full_path": source_root + "/Fallback.Show.S01E01.mkv",
+                    "size": FAKE_VIDEO_SIZE,
+                    "is_dir": False,
+                },
+                {
+                    "name": "Fallback.Show.S01E01.zh-CN.srt",
+                    "full_path": invalid_sc,
+                    "size": len(b"not an srt"),
+                    "is_dir": False,
+                },
+                {
+                    "name": "Fallback.Show.S01E01.zh-TW.srt",
+                    "full_path": valid_tc,
+                    "size": len(tc_bytes),
+                    "is_dir": False,
+                },
+            ],
+        )
+        self.assertIn(valid_tc, {item.source_path for item in plan.files})
+        self.assertNotIn(invalid_sc, {item.source_path for item in plan.files})
+        self.assertNotIn(invalid_sc, {item.source_path for item in plan.problem_files})
 
     def test_default_executor_retries_a_delayed_alist_rename(self) -> None:
         alist = DelayedRenameAList()
@@ -2161,6 +2730,39 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(cancelled.phase, "cancelled")
         self.assertEqual(cancelled.summary["lifecycle"]["cleanup"]["status"], "cancelled")
 
+    def test_restart_consumes_completed_root_cancel_marker(self) -> None:
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"ok": True},
+        )
+        job = runner.plan_job(self.request, job_id="engine-completed-root-cancel")
+        completed = replace(job, phase="completed")
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - persisted restart fixture
+            completed.as_dict(),
+            allow_nan=False,
+        )
+        runner._request_inactive_cancellation(  # noqa: SLF001 - durable marker fixture
+            completed,
+            reason="stop active replenishment",
+        )
+
+        restarted = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"unexpected": True},
+        )
+
+        self.assertEqual(restarted.get_job(job.id).phase, "cancelled")
+        self.assertFalse(restarted._cancel_request_path(job.id).exists())  # noqa: SLF001
+
     def test_recovery_readback_marks_fully_written_engine_job_completed(self) -> None:
         runner = SimpleEngineRunner(
             self.root,
@@ -2182,7 +2784,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(recovered.phase, "executed")
         self.assertTrue(recovered.execution and recovered.execution["recovered"])
 
-    def test_provider_child_recovery_reads_back_media_without_artifacts(self) -> None:
+    def test_historic_internal_child_artifact_repair_backfills_nfos_without_media_move(self) -> None:
         runner = SimpleEngineRunner(
             self.root,
             alist=self.alist,
@@ -2192,23 +2794,22 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         )
         child = runner.plan_job(
             self.request,
-            job_id="engine-provider-media-only",
+            job_id="engine-provider-artifact-repair",
             internal_child_of="engine-provider-root",
         )
         target = "/library/Movie (2020)/Movie (2020).mkv"
         self.alist.files[target] = self.alist.files.pop("/incoming/movie/source.mkv")
         atomic_write_json(
             runner._job_path(child.id),  # noqa: SLF001 - interrupted child fixture
-            replace(child, phase="failed", error="simulated artifact conflict").as_dict(),
+            replace(child, phase="executed", error=None).as_dict(),
             allow_nan=False,
         )
 
-        recovered = runner.recover_job(child.id)
+        repaired = runner.repair_automatic_artifacts(child.id)
 
-        self.assertEqual(recovered.phase, "executed")
-        self.assertTrue(recovered.execution and recovered.execution["recovered"])
-        self.assertTrue(recovered.execution and recovered.execution["media_only"])
-        self.assertEqual(recovered.execution and recovered.execution["artifact_count"], 0)
+        self.assertEqual(repaired.phase, "executed")
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.files[target], FAKE_VIDEO_BYTES)
         artifact_plan = provider_media_plan(self.request, self.alist, object())
         expected_artifact_targets = {
             target
@@ -2217,7 +2818,102 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         expected_artifact_targets.update(
             target for target, _image_path, _role in planned_artwork(artifact_plan)
         )
-        self.assertTrue(expected_artifact_targets.isdisjoint(self.alist.files))
+        self.assertTrue(expected_artifact_targets.issubset(self.alist.files))
+
+    def test_artifact_repair_refuses_visible_source_and_never_replays_media(self) -> None:
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=RecordingTMDB(),
+            planner=provider_media_plan,
+            validate=False,
+        )
+        child = runner.plan_job(
+            self.request,
+            job_id="engine-provider-repair-conflict",
+            internal_child_of="engine-provider-root",
+        )
+        target = "/library/Movie (2020)/Movie (2020).mkv"
+        self.alist.files[target] = FAKE_VIDEO_BYTES
+        atomic_write_json(
+            runner._job_path(child.id),  # noqa: SLF001 - historic repair fixture
+            replace(child, phase="executed").as_dict(),
+            allow_nan=False,
+        )
+
+        with self.assertRaisesRegex(EngineExecutionError, "仍可见的媒体来源"):
+            runner.repair_automatic_artifacts(child.id)
+
+        self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.files[target], FAKE_VIDEO_BYTES)
+        self.assertIn("/incoming/movie/source.mkv", self.alist.files)
+
+    def test_completed_root_repairs_only_its_executed_replenishment_children(self) -> None:
+        tmdb = RecordingTMDB()
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=tmdb,
+            planner=fake_plan,
+            validate=False,
+            library_root="/library",
+        )
+        root = runner.plan_job(self.request, job_id="engine-root-artifact-completed")
+        root = runner.execute_job(root.id)
+        atomic_write_json(
+            runner._job_path(root.id),  # noqa: SLF001 - aggregate-phase fixture
+            replace(root, phase="completed").as_dict(),
+            allow_nan=False,
+        )
+
+        child_source_root = (
+            f"/library/ScrapeFlow/补源/{root.id}/attempt-1/"
+            "__scrapeflow_media__"
+        )
+        child_source = f"{child_source_root}/child.mkv"
+        child_target_root = "/library/Child Movie (2020)"
+        self.alist.files[child_source] = FAKE_VIDEO_BYTES
+
+        def staged_child_plan(_request: EngineRequest, _alist: object, _tmdb: object) -> Plan:
+            plan = provider_media_plan(self.request, _alist, _tmdb)
+            plan.source_root = child_source_root
+            plan.target_root = child_target_root
+            plan.files[0].source_path = child_source
+            plan.files[0].source_dir = child_source_root
+            plan.files[0].original_name = "child.mkv"
+            plan.files[0].final_name = "Child Movie (2020).mkv"
+            plan.files[0].target_dir = child_target_root
+            plan.metadata["title"] = "Child Movie"
+            return plan
+
+        runner.planner = staged_child_plan
+        child_request = replace(self.request, source_path=child_source_root)
+        child = runner.plan_job(
+            child_request,
+            job_id="replenishment-attempt-1",
+            internal_child_of=root.id,
+        )
+        child = runner.execute_job(child.id)
+        child_plan = runner._plan_from_job(child)  # noqa: SLF001 - durable repair fixture
+        for path, _content in planned_nfos(child_plan):
+            self.alist.files.pop(path, None)
+        for path, _image_path, _role in planned_artwork(child_plan):
+            self.alist.files.pop(path, None)
+        moves_before = list(self.alist.moves)
+
+        repaired_root, repaired_children = runner.repair_root_artifacts(root.id)
+
+        self.assertEqual(repaired_root.phase, "completed")
+        self.assertEqual([row.id for row in repaired_children], [child.id])
+        self.assertEqual(self.alist.moves, moves_before)
+        self.assertIn(f"{child_target_root}/Child Movie (2020).mkv", self.alist.files)
+        self.assertTrue(all(
+            path in self.alist.files for path, _content in planned_nfos(child_plan)
+        ))
+        self.assertTrue(all(
+            path in self.alist.files
+            for path, _image_path, _role in planned_artwork(child_plan)
+        ))
 
     def test_recovery_keeps_unverified_cleanup_pending(self) -> None:
         runner = SimpleEngineRunner(
@@ -2269,17 +2965,6 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             runner.resolve_automatic_request = original  # type: ignore[method-assign]
         self.assertEqual(planned.phase, "planned")
         self.assertEqual(planned.summary["identity"]["tmdb_id"], 1)
-
-    def test_automatic_job_rejects_retired_production_e2e_source(self) -> None:
-        runner = SimpleEngineRunner(
-            self.root,
-            alist=self.alist,
-            tmdb=object(),
-            planner=fake_plan,
-            validate=False,
-        )
-        with self.assertRaisesRegex(Exception, "E2E"):
-            runner.create_automatic_job("/library/待刮削/ScrapeFlow-E2E-Fight-Club-1999")
 
     def test_engine_execution_refuses_another_process_holding_the_worker_lock(self) -> None:
         runner = SimpleEngineRunner(

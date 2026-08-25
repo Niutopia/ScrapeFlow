@@ -145,6 +145,10 @@ class GapLedgerTests(unittest.TestCase):
                 "{{broken", encoding="utf-8",
             )
             self.assertEqual(load_gap_ledger(state_root, "root-g"), [])
+            # Dashboard reads remain tolerant, but a new J registration must
+            # fail closed rather than silently replacing corrupted state.
+            with self.assertRaises(ValueError):
+                self._open_episode_gaps(state_root)
 
 
 if __name__ == "__main__":

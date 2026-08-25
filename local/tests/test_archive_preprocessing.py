@@ -8,6 +8,7 @@ from engine.scrapeflow.archive import (
     ArchiveExtractor,
     ArchiveInspector,
     ArchiveLimits,
+    ArchiveMagicError,
 )
 from engine.scrapeflow.archive_preprocessing import (
     ArchivePreprocessingAdapter,
@@ -20,7 +21,11 @@ from engine.scrapeflow.archive_preprocessing import (
     prepare_provider_archive,
 )
 
-from local.tests.test_archive_domain import FakeRunner, PasswordFallbackRunner
+from local.tests.test_archive_domain import (
+    FakeRunner,
+    PasswordFallbackRunner,
+    iso9660_prefix,
+)
 
 
 class RemoteArchivePort:
@@ -142,6 +147,132 @@ class ArchivePreprocessingTests(unittest.TestCase):
             self.assertTrue(all(path.path.startswith(task_root) for path in result.files))
             self.assertNotIn("fixture", json.dumps(result.to_dict()))
             self.assertNotIn("local-secret", json.dumps(result.to_dict(), ensure_ascii=False))
+
+    def test_iso_and_renamed_exe_are_safely_listed_and_selected_into_task_staging(self):
+        """Disc images use the same bounded 7-Zip lane, never a mount."""
+
+        for name in ("feature.iso", "feature.exe"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "source"
+                root.mkdir()
+                source = root / name
+                source.write_bytes(iso9660_prefix())
+                runner = FakeRunner()
+                result = self._adapter(runner).prepare_ordinary_local(
+                    source,
+                    Path(temp) / "task",
+                )
+
+                self.assertTrue(result.changed)
+                self.assertEqual([args[0] for args, _password in runner.calls], ["l", "x"])
+                self.assertTrue(all(file.path.startswith(result.source_path) for file in result.files))
+                self.assertTrue(source.exists())
+
+    def test_renamed_video_exe_is_copied_to_staging_with_media_extension(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            source = root / "[FSH] Show - 01 [BD].exe"
+            source.write_bytes(b"\x1a\x45\xdf\xa3" + b"matroska-payload")
+            runner = FakeRunner()
+            result = self._adapter(runner).prepare_ordinary_local(
+                source,
+                Path(temp) / "task",
+            )
+            self.assertTrue(result.changed)
+            self.assertEqual(len(result.files), 1)
+            self.assertEqual(result.files[0].kind, "video")
+            self.assertEqual(result.files[0].relative_path, "[FSH] Show - 01 [BD].mkv")
+            self.assertTrue(Path(result.files[0].path).name.endswith(".mkv"))
+            self.assertTrue(source.exists())
+            self.assertEqual(runner.calls, [])
+
+    def test_remote_tree_renames_masquerade_exe_to_media_extension(self):
+        class MasqueradePort:
+            def __init__(self):
+                self.payload = b"\x1a\x45\xdf\xa3" + b"matroska-payload"
+                self.remote = {}
+                self.downloaded: list[str] = []
+                self.uploaded: list[str] = []
+
+            def list(self, path: str, refresh: bool = False):
+                del refresh
+                if path == "/incoming":
+                    return [{"name": "Show S1", "is_dir": True}]
+                if path == "/incoming/Show S1":
+                    return [{"name": "[FSH] Show - 01 [BD].exe", "is_dir": False, "size": len(self.payload)}]
+                return []
+
+            def read_file_prefix(self, path: str, *, max_bytes: int):
+                del max_bytes
+                return self.payload
+
+            def download_file_to_path(self, path: str, destination: Path, *, expected_size: int):
+                if expected_size != len(self.payload):
+                    raise AssertionError(path)
+                destination.write_bytes(self.payload)
+                self.downloaded.append(path)
+
+            def mkdir(self, path: str):
+                pass
+
+            def upload_file(self, target_path: str, source: Path, content_type: str = "application/octet-stream"):
+                del content_type
+                self.remote[target_path] = source.read_bytes()
+                self.uploaded.append(target_path)
+
+            def exact_file_info(self, path: str):
+                payload = self.remote.get(path)
+                return None if payload is None else {"size": len(payload), "version": "fake"}
+
+        adapter = self._adapter(staging_root_validator=lambda path: path.startswith("/tasks/"))
+        port = MasqueradePort()
+        with tempfile.TemporaryDirectory() as temp:
+            result = adapter.prepare_ordinary_remote_tree(
+                "/incoming",
+                port,
+                Path(temp) / "task",
+                remote_staging_root="/tasks/job/attempt",
+            )
+            self.assertTrue(result.changed)
+            self.assertEqual(len(result.files), 1)
+            self.assertEqual(result.files[0].kind, "video")
+            self.assertTrue(result.files[0].relative_path.endswith(".mkv"))
+            self.assertEqual(port.downloaded, ["/incoming/Show S1/[FSH] Show - 01 [BD].exe"])
+            self.assertEqual(len(port.uploaded), 1)
+            self.assertTrue(port.uploaded[0].endswith(".mkv"))
+
+    def test_archive_parent_relative_keeps_season_folder(self):
+        from engine.scrapeflow.archive_preprocessing import _archive_parent_relative
+        self.assertEqual(
+            _archive_parent_relative("/incoming/出包王女 S1/01.exe", "/incoming"),
+            "出包王女 S1",
+        )
+        self.assertEqual(
+            _archive_parent_relative("/incoming/01.exe", "/incoming"),
+            "",
+        )
+
+    def test_real_exe_is_not_executed_or_treated_as_an_ordinary_residual(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            source = root / "real.exe"
+            source.write_bytes(b"MZ\x90\x00real-program")
+            runner = FakeRunner()
+            with self.assertRaises(ArchiveMagicError):
+                self._adapter(runner).prepare_ordinary_local(source, Path(temp) / "task")
+        self.assertEqual(runner.calls, [])
+
+    def test_unknown_disc_or_executable_suffix_cannot_be_silently_skipped(self):
+        for name in ("opaque.iso", "opaque.img", "opaque.exe"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "source"
+                root.mkdir()
+                source = root / name
+                source.write_bytes(b"not a proven container")
+                with self.assertRaises(ArchiveMagicError):
+                    self._adapter().prepare_ordinary_local(source, Path(temp) / "task")
 
     def test_remote_archive_preflight_reads_prefix_and_uploads_only_task_staging(self):
         payload = b"7z\xbc\xaf'\x1cfixture"
@@ -360,8 +491,201 @@ class ArchivePreprocessingTests(unittest.TestCase):
                         port,
                         Path(temp) / "task",
                         remote_staging_root="/tasks/job/attempt",
-                    )
+                )
                 self.assertEqual(port.download_calls, [])
+
+    def test_archive_bearing_document_residual_does_not_block_direct_media(self):
+        """DOCX is ZIP internally, but remains a source residual, not media.
+
+        This guards the generic boundary between actual/renamed media
+        containers and ordinary documents accompanying an episode set.  The
+        document must neither be extracted nor make the directory look like a
+        mixed archive/direct-media source.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            (root / "01.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom")
+            (root / "resource.docx").write_bytes(b"PK\x03\x04office")
+            result = self._adapter().prepare_ordinary_tree(root, Path(temp) / "task")
+            self.assertFalse(result.changed)
+            self.assertEqual(result.archives, ())
+            self.assertEqual([item.relative_path for item in result.files], ["01.mp4"])
+
+        class DocumentResidualPort:
+            def __init__(self) -> None:
+                self.download_calls: list[str] = []
+
+            def list(self, path: str):
+                if path != "/incoming":
+                    raise AssertionError(path)
+                return [
+                    {"name": "01.mp4", "is_dir": False, "size": 16},
+                    {"name": "resource.docx", "is_dir": False, "size": 16},
+                ]
+
+            def read_prefix(self, path: str, *, max_bytes: int):
+                del max_bytes
+                if path.endswith("01.mp4"):
+                    return b"\x00\x00\x00\x18ftypisom"
+                if path.endswith("resource.docx"):
+                    return b"PK\x03\x04office"
+                raise AssertionError(path)
+
+            def download(self, path: str, destination: Path, *, expected_size: int):
+                del destination, expected_size
+                self.download_calls.append(path)
+                raise AssertionError("residual-only tree must not download")
+
+        port = DocumentResidualPort()
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._adapter(
+                staging_root_validator=lambda path: path.startswith("/tasks/")
+            ).prepare_ordinary_remote_tree(
+                "/incoming",
+                port,
+                Path(temp) / "task",
+                remote_staging_root="/tasks/job/attempt",
+            )
+        self.assertFalse(result.changed)
+        self.assertEqual(result.source_path, "/incoming")
+        self.assertEqual(port.download_calls, [])
+
+    def test_font_installer_exe_is_a_residual_and_does_not_block_direct_media(self):
+        """A ``[Fonts].exe`` self-extracting font installer stays at source.
+
+        It is an executable resource (never executed, never expanded), not a
+        disguised media container, so it must not make the directory look like
+        a mixed archive/direct-media source.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            (root / "01.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom")
+            (root / "[Fonts].exe").write_bytes(b"MZ" + b"stub" * 8 + b"PK\x03\x04payload")
+            result = self._adapter().prepare_ordinary_tree(root, Path(temp) / "task")
+            self.assertFalse(result.changed)
+            self.assertEqual(result.archives, ())
+            self.assertEqual([item.relative_path for item in result.files], ["01.mp4"])
+
+    def test_font_installer_pure_pe_exe_is_excluded_not_a_blocking_executable(self):
+        """A pure PE ``[Fonts].exe`` (no ZIP payload) is still a font residual.
+
+        The ``MZ`` header alone must not trip the executable boundary before
+        the font-residual classification can keep it at source.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "source"
+            root.mkdir()
+            (root / "01.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom")
+            (root / "[Fonts].exe").write_bytes(b"MZ\x90\x00" + b"\x00" * 60)
+            result = self._adapter().prepare_ordinary_tree(root, Path(temp) / "task")
+            self.assertFalse(result.changed)
+            self.assertEqual(result.archives, ())
+            self.assertEqual([item.relative_path for item in result.files], ["01.mp4"])
+
+    def test_remote_tree_skips_unreadable_declared_empty_residual(self):
+        """A zero-byte readme cannot carry archive/executable magic.
+
+        Providers can list an empty explanatory file but reject a file-link
+        Range request for it.  The ordinary tree scanner must not turn that
+        residual into a planning failure, while non-empty objects retain the
+        existing magic scan.
+        """
+        class EmptyResidualPort:
+            def __init__(self) -> None:
+                self.prefix_calls: list[str] = []
+
+            def list(self, path: str):
+                self.assert_path(path)
+                return [{"name": "provider-note", "is_dir": False, "size": 0}]
+
+            @staticmethod
+            def assert_path(path: str) -> None:
+                if path != "/incoming":
+                    raise AssertionError(path)
+
+            def read_prefix(self, path: str, *, max_bytes: int):
+                del max_bytes
+                self.prefix_calls.append(path)
+                raise AssertionError("declared-empty residual must not be read")
+
+            def download(self, path: str, destination: Path, *, expected_size: int):
+                del path, destination, expected_size
+                raise AssertionError("residual must not download")
+
+        port = EmptyResidualPort()
+        adapter = self._adapter(staging_root_validator=lambda path: path.startswith("/tasks/"))
+        with tempfile.TemporaryDirectory() as temp:
+            result = adapter.prepare_ordinary_remote_tree(
+                "/incoming", port, Path(temp) / "task",
+                remote_staging_root="/tasks/job/attempt",
+            )
+        self.assertFalse(result.changed)
+        self.assertEqual(result.source_path, "/incoming")
+        self.assertEqual(port.prefix_calls, [])
+
+    def test_remote_tree_rejects_declared_empty_archive_without_reading(self):
+        class EmptyArchivePort:
+            prefix_calls: list[str] = []
+
+            def list(self, path: str):
+                if path != "/incoming":
+                    raise AssertionError(path)
+                return [{"name": "empty.7z", "is_dir": False, "size": 0}]
+
+            def read_prefix(self, path: str, *, max_bytes: int):
+                del path, max_bytes
+                self.prefix_calls.append("unexpected")
+                raise AssertionError("declared-empty archive must fail before read")
+
+            def download(self, path: str, destination: Path, *, expected_size: int):
+                del path, destination, expected_size
+                raise AssertionError("declared-empty archive must not download")
+
+        port = EmptyArchivePort()
+        adapter = self._adapter(staging_root_validator=lambda path: path.startswith("/tasks/"))
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ArchiveMagicError):
+                adapter.prepare_ordinary_remote_tree(
+                    "/incoming", port, Path(temp) / "task",
+                    remote_staging_root="/tasks/job/attempt",
+                )
+        self.assertEqual(port.prefix_calls, [])
+
+    def test_remote_tree_keeps_empty_video_in_archive_multiplicity_check(self):
+        class MixedPort:
+            def __init__(self) -> None:
+                self.prefix_calls: list[str] = []
+
+            def list(self, path: str):
+                if path != "/incoming":
+                    raise AssertionError(path)
+                return [
+                    {"name": "empty.mkv", "is_dir": False, "size": 0},
+                    {"name": "payload.7z", "is_dir": False, "size": 64},
+                ]
+
+            def read_prefix(self, path: str, *, max_bytes: int):
+                del max_bytes
+                self.prefix_calls.append(path)
+                if path.endswith("payload.7z"):
+                    return b"7z\xbc\xaf'\x1cfixture"
+                raise AssertionError(path)
+
+            def download(self, path: str, destination: Path, *, expected_size: int):
+                del path, destination, expected_size
+                raise AssertionError("mixed tree must not download")
+
+        port = MixedPort()
+        adapter = self._adapter(staging_root_validator=lambda path: path.startswith("/tasks/"))
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ArchiveMultiplicityError):
+                adapter.prepare_ordinary_remote_tree(
+                    "/incoming", port, Path(temp) / "task",
+                    remote_staging_root="/tasks/job/attempt",
+                )
+        self.assertEqual(port.prefix_calls, ["/incoming/payload.7z"])
 
     def test_local_tree_rejects_child_file_and_directory_links(self):
         adapter = self._adapter()

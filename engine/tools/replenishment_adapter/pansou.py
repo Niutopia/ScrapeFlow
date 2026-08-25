@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -50,6 +51,7 @@ _MAX_SHARE_ENTRIES = 4096
 # omitted deterministic terms without turning a malformed/unbounded request
 # into unbounded network I/O.
 _MAX_QUERY_PROOF_TERMS = 256
+_SAFE_CURSOR_FINGERPRINT = re.compile(r"^[a-f0-9]{64}$")
 
 
 class PanSouDiscoveryError(RuntimeError):
@@ -250,6 +252,30 @@ def _normalized_share_link(raw: Mapping[str, str]) -> tuple[str, dict[str, str]]
     return f"{PROVIDER_QUARK_SHARE}:{pwd_id}", normalized
 
 
+def _reviewed_resource_miss_locators(request: Mapping[str, Any]) -> set[str]:
+    """Return bounded, canonical misses proven for this exact gap request.
+
+    A prior successful read-only inspection can establish that a specific
+    immutable share neither contains a usable manifest nor covers the current
+    request.  That is distinct from a materializer failure: it is safe to
+    avoid re-inspecting the same share *only* for the request that persisted
+    the proof.  The root coordinator supplies this field from its scoped
+    durable cache; arbitrary locators, URLs and passcodes are rejected here.
+    """
+    raw = request.get("reviewed_resource_miss_locators")
+    if not isinstance(raw, list):
+        return set()
+    prefix = f"{PROVIDER_QUARK_SHARE}:"
+    output: set[str] = set()
+    for value in raw[:_MAX_SHARE_ENTRIES]:
+        if not isinstance(value, str) or not value.startswith(prefix):
+            continue
+        share_id = value[len(prefix):]
+        if _SAFE_SHARE_ID.fullmatch(share_id) is not None:
+            output.add(value)
+    return output
+
+
 def _preferred_share_link(
     current: Mapping[str, str] | None,
     incoming: Mapping[str, str],
@@ -271,7 +297,15 @@ def _preferred_share_link(
 
 def _response_links(value: Mapping[str, Any]) -> tuple[list[dict[str, str]], int]:
     """Return normalized Quark links and response rows not proven inspected."""
+    total = value.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise PanSouDiscoveryError("PanSou response total is invalid")
     result_rows = value.get("results")
+    # PanSou legitimately omits both result containers for a zero-hit query.
+    # Treat only that exact shape as an empty, fully inspected result; a
+    # missing results array with a positive total remains a protocol failure.
+    if result_rows is None and total == 0:
+        result_rows = []
     merged = value.get("merged_by_type")
     if merged is None:
         # Upstream omits the merged map entirely when the requested cloud
@@ -283,9 +317,6 @@ def _response_links(value: Mapping[str, Any]) -> tuple[list[dict[str, str]], int
         raise PanSouDiscoveryError(
             "PanSou res=all response lacks results/merged_by_type"
         )
-    total = value.get("total")
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        raise PanSouDiscoveryError("PanSou response total is invalid")
     unchecked = max(0, total - len(result_rows))
     links: list[dict[str, str]] = []
     for result in result_rows:
@@ -483,6 +514,16 @@ def quark_share_inspector(
     )
 
     def inspect(pwd_id: str, passcode: str) -> Sequence[Mapping[str, Any]]:
+        # A RootJob worker can be constructed after an API restart, before a
+        # normal source read has established its in-memory AList session.  The
+        # share inspector is still read-only, but it needs that session to
+        # delegate the same Quark mount credentials used by the eventual
+        # materializer.  Authenticate lazily here rather than treating an
+        # uninitialised local client as a broken PanSou/Quark provider.
+        if not getattr(alist, "token", None):
+            login = getattr(alist, "login", None)
+            if callable(login):
+                login()
         session = delegated_quark_session(alist, destination)
         return actual_bridge.inspect_share(
             session,
@@ -603,12 +644,34 @@ class PanSouDiscovery:
             )
         if not all_terms:
             return self._incomplete("PanSou request has no safe search term", configured=True)
-        terms = all_terms[:self.max_queries]
+        # Searches are deliberately windowed across explicit retries.  The
+        # cursor is request-scoped and contains only a deterministic-term
+        # fingerprint plus a bounded offset; malformed/stale cursors fail
+        # closed by restarting at offset zero.
+        fingerprint = hashlib.sha256(
+            json.dumps(all_terms, ensure_ascii=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        cursor = request.get("pansou_query_cursor")
+        offset = 0
+        if isinstance(cursor, Mapping):
+            raw_fp = cursor.get("fingerprint")
+            raw_offset = cursor.get("offset")
+            if (
+                isinstance(raw_fp, str)
+                and _SAFE_CURSOR_FINGERPRINT.fullmatch(raw_fp)
+                and raw_fp == fingerprint
+                and isinstance(raw_offset, int)
+                and not isinstance(raw_offset, bool)
+                and 0 <= raw_offset <= len(all_terms)
+            ):
+                offset = raw_offset
+        end_offset = min(len(all_terms), offset + self.max_queries)
+        terms = all_terms[offset:end_offset]
         # Hitting the inspection ceiling is itself an omitted-term proof.  It
         # is intentionally represented by one opaque unit rather than a made
         # up count of terms we did not enumerate.
-        unchecked_query_terms = max(0, len(all_terms) - len(terms)) + (
-            1 if len(all_terms) == _MAX_QUERY_PROOF_TERMS else 0
+        unchecked_query_terms = max(0, len(all_terms) - end_offset) + (
+            1 if len(all_terms) == _MAX_QUERY_PROOF_TERMS and end_offset == len(all_terms) else 0
         )
 
         excluded_rows = request.get("excluded_candidates")
@@ -616,6 +679,7 @@ class PanSouDiscovery:
             str(row.get("locator") or "")
             for row in excluded_rows if isinstance(row, Mapping)
         } if isinstance(excluded_rows, list) else set()
+        reviewed_misses = _reviewed_resource_miss_locators(request)
         attempts = 0
         responses = 0
         unchecked = unchecked_query_terms
@@ -660,20 +724,33 @@ class PanSouDiscovery:
                     raw_by_locator.get(locator), normalized_raw,
                 )
 
-        raw_links = list(raw_by_locator.items())
+        # Filter durable evidence before applying the per-run inspection cap.
+        # Otherwise the first page can be filled entirely by already-known
+        # shares forever, leaving later raw rows permanently unreachable.
+        # Materializer exclusions remain deliberately unchecked: they do not
+        # prove that a previously runnable share is now absent.  In contrast,
+        # ``reviewed_misses`` are scoped to this exact request and come only
+        # from a prior successful read-only manifest inspection.
+        preexcluded = 0
+        previously_reviewed = 0
+        raw_links: list[tuple[str, dict[str, str]]] = []
+        for locator, raw in raw_by_locator.items():
+            if locator in excluded:
+                preexcluded += 1
+                continue
+            if locator in reviewed_misses:
+                previously_reviewed += 1
+                continue
+            raw_links.append((locator, raw))
         if len(raw_links) > self.max_links:
             unchecked += len(raw_links) - self.max_links
             raw_links = raw_links[:self.max_links]
 
         candidates: list[dict[str, Any]] = []
         resource_failures: list[str] = []
+        reviewed_resource_misses: list[str] = []
         inspected = 0
-        preexcluded = 0
-        for locator, raw in raw_links:
-            if locator in excluded:
-                preexcluded += 1
-                inspected += 1
-                continue
+        for index, (locator, raw) in enumerate(raw_links):
             parsed = _quark_share(raw.get("url"))
             if parsed is None:
                 resource_failures.append(locator)
@@ -681,7 +758,7 @@ class PanSouDiscovery:
                 continue
             pwd_id, _share_url, url_passcode = parsed
             if time.monotonic() >= deadline:
-                unchecked += len(raw_links) - inspected
+                unchecked += len(raw_links) - index
                 break
             try:
                 manifest_rows = self.inspector(
@@ -693,6 +770,7 @@ class PanSouDiscovery:
                 candidate = _candidate_from_share(request, raw, manifest_rows)
             except QuarkShareExpiredError:
                 resource_failures.append(locator)
+                reviewed_resource_misses.append(locator)
                 inspected += 1
                 continue
             except (QuarkBridgeError, OSError, TimeoutError) as exc:
@@ -713,6 +791,7 @@ class PanSouDiscovery:
             inspected += 1
             if candidate is None:
                 resource_failures.append(locator)
+                reviewed_resource_misses.append(locator)
                 continue
             candidates.append(candidate)
 
@@ -735,16 +814,32 @@ class PanSouDiscovery:
             and unchecked == 0
         )
         no_candidates = source_exhausted and not candidates
+        # A cursor may advance only after this whole window's deterministic
+        # terms and every returned share have been accounted for.  Transport,
+        # inspection, response-size, or link-cap failures leave the offset in
+        # place so a retry cannot silently skip evidence.
+        window_complete = infrastructure_failures == 0 and unchecked == unchecked_query_terms
+        cursor_offset = end_offset if window_complete else offset
         telemetry = {
             "required": True,
             "configured": True,
             "query_attempts": attempts,
             "query_responses": responses,
             "query_terms_discovered": len(all_terms),
+            "query_terms_offset": offset,
+            "query_cursor": {
+                "fingerprint": fingerprint,
+                "offset": cursor_offset,
+                "exhausted": cursor_offset >= len(all_terms),
+            },
             "query_terms_unchecked": unchecked_query_terms,
             "source_exhausted": source_exhausted,
             "infrastructure_failures": infrastructure_failures,
             "resource_failed_locators": sorted(set(resource_failures)),
+            "reviewed_resource_miss_locators": sorted(
+                set(reviewed_resource_misses),
+            ),
+            "previously_reviewed_miss_count": previously_reviewed,
             "unchecked_secondary_candidates": unchecked,
             "preexcluded_candidate_count": preexcluded,
             "invalid_share_count": invalid_share_count,

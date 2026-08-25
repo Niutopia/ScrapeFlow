@@ -5,14 +5,16 @@ from __future__ import annotations
 import re
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import (
     apply_work_unit_override,
+    requeue_uncertain_work_units,
     resolve_work_unit_identities,
 )
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_units import load_work_unit_records, save_work_unit_records
 
 from local.tests.test_root_boundaries import DictAList, _entries_from_fixture
 
@@ -89,11 +91,12 @@ class WorkUnitIdentityTests(unittest.TestCase):
             self.assertEqual(
                 by_key["/quark/影视/待刮削/Fate系列/空之境界"].identity["tmdb_id"], 100,
             )
-            self.assertEqual(by_key["/quark/影视/待刮削/Fate系列/Fate Zero"].identity_status, "confirmed")
-            self.assertEqual(
-                by_key["/quark/影视/待刮削/Fate系列/Fate Zero"].identity["tmdb_id"], 35507,
-            )
-            # The ambiguous sibling is parked alone; the others proceed.
+            # A four-file pure ordinal run without the narrow CJK+year proof
+            # remains parked; it does not block independently confirmed work.
+            fate_zero = by_key["/quark/影视/待刮削/Fate系列/Fate Zero"]
+            self.assertEqual(fate_zero.identity_status, "uncertain")
+            self.assertIsNone(fate_zero.identity)
+            # The other ambiguous sibling is likewise parked alone.
             ubw = by_key["/quark/影视/待刮削/Fate系列/Fate Stay Night UBW"]
             self.assertEqual(ubw.identity_status, "uncertain")
             self.assertIsNone(ubw.identity)
@@ -157,6 +160,223 @@ class WorkUnitIdentityTests(unittest.TestCase):
             self.assertEqual(record.identity["tmdb_id"], 843241)
             self.assertEqual(record.identity["media_type"], "movie")
 
+    def test_cjk_season_children_use_parent_and_representative_title_evidence(self) -> None:
+        """A titled container must rescue bare ``第一季``/``第二季`` leaves.
+
+        This is a real source-shape regression: the direct child names carry
+        only structural season labels, while the parent and release filenames
+        contain the work title.  A response for ``第二季`` alone deliberately
+        exists, so the assertion proves C/U did not let that generic query
+        select an unrelated TV result.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-seraph-cjk-seasons"
+            _build_snapshot(
+                "seraph_of_end_cjk_seasons", root_task_id, state_root,
+            )
+            tmdb = FakeTMDB(
+                {
+                    "终结的炽天使": [{
+                        "id": 61945,
+                        "name": "Seraph of the End",
+                        "original_name": "Owari no Seraph",
+                        "first_air_date": "2015-04-04",
+                        "genre_ids": [16],
+                    }],
+                    "第二季": [{
+                        "id": 280326,
+                        "name": "汉语",
+                        "original_name": "中国 第二季",
+                        "first_air_date": "",
+                        "genre_ids": [16],
+                    }],
+                },
+                alternative_titles={
+                    "61945": [{"title": "终结的炽天使", "iso_3166_1": "CN"}],
+                },
+            )
+            records = resolve_work_unit_identities(tmdb, state_root, root_task_id)
+
+            self.assertEqual(len(records), 2)
+            self.assertTrue(all(record.identity_status == "confirmed" for record in records))
+            self.assertEqual(
+                {record.identity["tmdb_id"] for record in records if record.identity},
+                {61945},
+            )
+            queries = [
+                str(params.get("query"))
+                for path, params in tmdb.calls
+                if path == "/search/tv"
+            ]
+            self.assertIn("终结的炽天使", queries)
+            self.assertIn("Seraph of the End：Vampire Reign", queries)
+            self.assertIn("Seraph of the End：Battle in Nagoya", queries)
+
+    def test_retry_rechecks_unwritten_auto_match_from_bare_season_query(self) -> None:
+        """Retry must not preserve an old no-writer identity from ``第二季``."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-seraph-retry"
+            _build_snapshot(
+                "seraph_of_end_cjk_seasons", root_task_id, state_root,
+            )
+            initial = load_work_unit_records(state_root, root_task_id)
+            second = next(record for record in initial if record.display_label == "第二季")
+            stale = replace(
+                second,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 280326,
+                    "title": "汉语",
+                    "year": "未知年份",
+                    "confidence": 0.75,
+                    "decision_trace": {
+                        "query": "第二季",
+                        "matched_query_variant": "第二季",
+                    },
+                },
+                candidate_identities=((
+                    {"media_type": "tv", "tmdb_id": 280326, "status": "confirmed"}
+                ),),
+                reconciliation_outcome="new_work",
+                reconciliation_evidence={"kind": "stale"},
+                attention="旧 C 结果",
+            )
+            save_work_unit_records(
+                state_root,
+                root_task_id,
+                [stale if record.work_unit_id == second.work_unit_id else record for record in initial],
+            )
+
+            requeued = requeue_uncertain_work_units(state_root, root_task_id)
+            reopened = next(record for record in requeued if record.work_unit_id == second.work_unit_id)
+            self.assertEqual(reopened.identity_status, "pending")
+            self.assertIsNone(reopened.identity)
+            self.assertIsNone(reopened.reconciliation_outcome)
+            self.assertIsNone(reopened.reconciliation_evidence)
+            self.assertIsNone(reopened.writer_job_id)
+
+            tmdb = FakeTMDB(
+                {
+                    "终结的炽天使": [{
+                        "id": 61945,
+                        "name": "Seraph of the End",
+                        "first_air_date": "2015-04-04",
+                        "genre_ids": [16],
+                    }],
+                    "第二季": [{
+                        "id": 280326,
+                        "name": "汉语",
+                        "first_air_date": "",
+                        "genre_ids": [16],
+                    }],
+                },
+                alternative_titles={
+                    "61945": [{"title": "终结的炽天使", "iso_3166_1": "CN"}],
+                },
+            )
+            resolved = resolve_work_unit_identities(tmdb, state_root, root_task_id)
+            retried = next(record for record in resolved if record.work_unit_id == second.work_unit_id)
+            self.assertEqual(retried.identity_status, "confirmed")
+            self.assertEqual(retried.identity["tmdb_id"], 61945)
+            self.assertIsNone(retried.writer_job_id)
+
+            # A corrected match can retain the generic boundary label, but it
+            # must not be reopened endlessly once a parent/representative
+            # query, rather than the season label itself, earned the match.
+            second_retry = requeue_uncertain_work_units(state_root, root_task_id)
+            stable = next(record for record in second_retry if record.work_unit_id == second.work_unit_id)
+            self.assertEqual(stable.identity_status, "confirmed")
+            self.assertEqual(stable.identity["tmdb_id"], 61945)
+
+    def test_bare_season_without_parent_or_title_evidence_stays_uncertain(self) -> None:
+        """A season coordinate alone cannot become a TMDB identity query."""
+        root = "/incoming/Season 02"
+        entries = {
+            root: [
+                {"name": "S02E01.mkv", "is_dir": False, "size": 10},
+                {"name": "S02E02.mkv", "is_dir": False, "size": 10},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            analyze_root_boundaries(
+                DictAList(entries), root, root_task_id="root-bare-season", state_root=state_root,
+            )
+            tmdb = FakeTMDB({
+                "Season 02": [{
+                    "id": 280326,
+                    "name": "Unrelated Season Two",
+                    "first_air_date": "2020-01-01",
+                    "genre_ids": [16],
+                }],
+            })
+            records = resolve_work_unit_identities(
+                tmdb, state_root, "root-bare-season",
+            )
+
+        self.assertEqual(records[0].identity_status, "uncertain")
+        self.assertIsNone(records[0].identity)
+        self.assertEqual(
+            [path for path, _params in tmdb.calls if path.startswith("/search/")],
+            [],
+        )
+
+    def test_noisy_root_uses_nested_titled_episode_evidence_after_root_files(self) -> None:
+        """Nested titled episodes must not be hidden by root-level ``SxxExx`` files.
+
+        A single TV work can carry a newly released season directly at its
+        root while older seasons remain in folders.  The root files establish
+        season structure but do not themselves contain a title, so identity
+        resolution must also retain a bounded representative from the nested
+        exact source tree.  The TMDB double deliberately recognizes only that
+        nested title; no package or work name is an identity override.
+        """
+        root = "/incoming/发布包-未校验"
+        entries: dict[str, list[dict[str, object]]] = {
+            root: [
+                *[
+                    {"name": f"S09E{episode:02d}.mkv", "is_dir": False, "size": 10}
+                    for episode in range(1, 11)
+                ],
+                {"name": "Season 01", "is_dir": True},
+                {"name": "Season 02", "is_dir": True},
+            ],
+            f"{root}/Season 01": [
+                {"name": "Northwind.Show.S01E01.1080p.mkv", "is_dir": False, "size": 10},
+                {"name": "Northwind.Show.S01E02.1080p.mkv", "is_dir": False, "size": 10},
+            ],
+            f"{root}/Season 02": [
+                {"name": "Northwind.Show.S02E01.1080p.mkv", "is_dir": False, "size": 10},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            analyze_root_boundaries(
+                DictAList(entries), root, root_task_id="root-nested-title", state_root=state_root,
+            )
+            tmdb = FakeTMDB({
+                "Northwind Show": [{
+                    "id": 90210,
+                    "name": "Northwind Show",
+                    "first_air_date": "2015-01-01",
+                    "genre_ids": [18],
+                }],
+            })
+            records = resolve_work_unit_identities(tmdb, state_root, "root-nested-title")
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].identity_status, "confirmed")
+        self.assertEqual(records[0].identity["tmdb_id"], 90210)
+        search_queries = [
+            str(params.get("query"))
+            for path, params in tmdb.calls
+            if path == "/search/tv"
+        ]
+        self.assertIn("Northwind.Show", search_queries)
+
     def test_override_validates_the_confirmation_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
@@ -181,6 +401,133 @@ class WorkUnitIdentityTests(unittest.TestCase):
                 apply_work_unit_override(
                     state_root, root_task_id, "missing-unit", media_type="tv", tmdb_id=1,
                 )
+
+    def test_disc_image_cannot_be_resolved_overridden_or_requeued_as_media(self) -> None:
+        root = "/incoming/opaque-disc"
+        alist = DictAList({
+            root: [{"name": "Season 01", "is_dir": True}],
+            f"{root}/Season 01": [
+                {"name": "Episode collection.iso", "is_dir": False, "size": 45 * 1024**3},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="root-disc-id", state_root=state_root,
+            )
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertTrue(record.requires_content_expansion)
+
+            # Simulate a pre-policy persisted confirmation.  C/U must inspect
+            # the exact B scope rather than trust the old status.
+            stale_confirmed = replace(
+                record,
+                requires_content_expansion=False,
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 123},
+                reconciliation_outcome="new_work",
+                attention=None,
+            )
+            save_work_unit_records(state_root, "root-disc-id", [stale_confirmed])
+            tmdb = FakeTMDB({})
+            resolved = resolve_work_unit_identities(tmdb, state_root, "root-disc-id")
+            parked = resolved[0]
+            self.assertTrue(parked.requires_content_expansion)
+            self.assertEqual(parked.identity_status, "uncertain")
+            self.assertIsNone(parked.identity)
+            self.assertIsNone(parked.reconciliation_outcome)
+            self.assertEqual(tmdb.calls, [])
+
+            with self.assertRaisesRegex(ValueError, "光盘镜像"):
+                apply_work_unit_override(
+                    state_root,
+                    "root-disc-id",
+                    parked.work_unit_id,
+                    media_type="tv",
+                    tmdb_id=123,
+                )
+            retried = requeue_uncertain_work_units(state_root, "root-disc-id")
+            self.assertEqual(retried[0].identity_status, "uncertain")
+            self.assertTrue(retried[0].requires_content_expansion)
+
+    def test_explicit_requeue_reopens_only_uncertain_identity_and_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-fate"
+            _build_snapshot("fate_container", root_task_id, state_root)
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertGreaterEqual(len(records), 3)
+            records[0] = replace(
+                records[0],
+                identity_status="uncertain",
+                identity=None,
+                candidate_identities=({"tmdb_id": 1},),
+                reconciliation_outcome=None,
+                attention="identity evidence needs retry",
+            )
+            records[1] = replace(
+                records[1],
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 35507},
+                reconciliation_outcome="uncertain",
+                matched_work_root=None,
+                attention="library index needs retry",
+            )
+            durable = replace(
+                records[2],
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 201,
+                    "source": "operator_override",
+                },
+                reconciliation_outcome="new_work",
+                writer_job_id="writer-complete",
+                attention=None,
+            )
+            records[2] = durable
+            save_work_unit_records(state_root, root_task_id, records)
+
+            reopened = requeue_uncertain_work_units(state_root, root_task_id)
+
+            self.assertEqual(reopened[0].identity_status, "pending")
+            self.assertIsNone(reopened[0].identity)
+            self.assertEqual(reopened[0].candidate_identities, ())
+            self.assertIsNone(reopened[0].attention)
+            self.assertEqual(reopened[1].identity_status, "confirmed")
+            self.assertEqual(reopened[1].identity["tmdb_id"], 35507)
+            self.assertIsNone(reopened[1].reconciliation_outcome)
+            self.assertIsNone(reopened[1].attention)
+            self.assertEqual(reopened[2], durable)
+
+    def test_explicit_requeue_retries_parked_j_without_discarding_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-j-retry"
+            _build_snapshot("fate_container", root_task_id, state_root)
+            records = load_work_unit_records(state_root, root_task_id)
+            parked = replace(
+                records[0],
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 35507},
+                reconciliation_outcome="new_work",
+                writer_job_id="writer-already-accepted",
+                gap_status="attention",
+                gap_detail="TMDB 季集目录不可用",
+                attention="写后缺口无法核对，需要确认",
+            )
+            records[0] = parked
+            save_work_unit_records(state_root, root_task_id, records)
+
+            reopened = requeue_uncertain_work_units(state_root, root_task_id)
+
+            self.assertEqual(reopened[0].identity, parked.identity)
+            self.assertEqual(reopened[0].reconciliation_outcome, "new_work")
+            self.assertEqual(reopened[0].writer_job_id, "writer-already-accepted")
+            self.assertIsNone(reopened[0].gap_status)
+            self.assertIsNone(reopened[0].gap_detail)
+            self.assertIsNone(reopened[0].attention)
 
 
 if __name__ == "__main__":

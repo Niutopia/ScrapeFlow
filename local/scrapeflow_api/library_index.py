@@ -1,7 +1,7 @@
 """D-node composition: three-shelf LibraryIndex and five-way reconciliation.
 
 Builds a read-only index of confirmed works across the three formal shelves
-(电影 / 番剧 / 美剧) from NFO identities and episode-coordinate coverage, then
+(电影 / 番剧 / 欧美剧) from NFO identities and episode-coordinate coverage, then
 reconciles each confirmed WorkUnit of a root task into exactly one of the five
 contract outcomes: ``uncertain`` / ``merge_existing`` / ``existing_gap`` /
 ``duplicate_complete`` / ``new_work``.
@@ -13,26 +13,52 @@ conflicting multi-shelf presence fails closed as ``uncertain``.
 
 from __future__ import annotations
 
+import posixpath
+import re
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from engine.scrapeflow.media_policy import is_video_filename
-from engine.scrapeflow.replenishment_matching import audit_episode_tokens
-from engine.scrapeflow.root_boundaries import load_source_snapshot
-from engine.scrapeflow.source_inventory import SourceNode, build_source_inventory
+from engine.scrapeflow.boundary_analysis import (
+    _SEASON_EPISODE_RE,
+    _season_number_from_directory_name,
+)
+from engine.scrapeflow.identity_matching import physical_special_candidate_evidence
+from engine.scrapeflow.media_policy import (
+    DISC_IMAGE_INSPECTION_REQUIRED,
+    is_video_filename,
+)
+from engine.scrapeflow.replenishment_matching import (
+    FRACTIONAL_EPISODE_RE,
+    audit_episode_tokens,
+    bare_regular_episode_context_is_safe,
+    bare_regular_episode_number,
+    bracketed_regular_episode_number,
+    release_dash_regular_episode,
+)
+from engine.scrapeflow.root_boundaries import load_source_snapshot, walk_source_rows
+from engine.scrapeflow.source_inventory import (
+    SourceNode,
+    SourceFile,
+    build_scoped_source_node,
+    build_source_inventory,
+    collect_all_files,
+    iter_source_nodes,
+)
 from engine.scrapeflow.work_units import (
     WorkUnitRecord,
+    is_physical_special_video_file,
     load_work_unit_records,
+    physical_special_marker_evidence,
     save_work_unit_records,
 )
 
-from .simple_library_audit import _read_nfo_identity
+from .library_metadata import read_nfo_identity
 
-FORMAL_SHELF_SEGMENTS: tuple[str, ...] = ("电影", "番剧", "美剧")
+FORMAL_SHELF_SEGMENTS: tuple[str, ...] = ("电影", "番剧", "欧美剧")
 SHELF_BY_SEGMENT: dict[str, str] = {
     "电影": "movie",
     "番剧": "anime",
-    "美剧": "us_tv",
+    "欧美剧": "us_tv",
 }
 
 MAX_INDEX_WORKS = 2_000
@@ -46,6 +72,40 @@ OUTCOMES = (
     "duplicate_complete",
     "new_work",
 )
+
+_BARE_EPISODE_EVIDENCE_KIND = "tmdb_single_positive_season_bare_episodes"
+_BRACKETED_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_bracketed_episodes"
+)
+_NAKED_NUMERIC_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_naked_numeric"
+)
+_RELEASE_DASH_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_release_dash_episodes"
+)
+_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_physical_special"
+)
+_SINGLE_SEASON_EPISODE_EVIDENCE_KINDS = frozenset({
+    _BARE_EPISODE_EVIDENCE_KIND,
+    _BRACKETED_EPISODE_EVIDENCE_KIND,
+    _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND,
+    _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
+    _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+})
+
+
+def single_season_episode_evidence_label(evidence_kind: str) -> str:
+    """Return the user-facing name of one finite D/F proof grammar."""
+    if evidence_kind == _BRACKETED_EPISODE_EVIDENCE_KIND:
+        return "纯方括号集号"
+    if evidence_kind == _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND:
+        return "裸数字集号"
+    if evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND:
+        return "发行组短横线集号"
+    if evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND:
+        return "完整 OAD/OVA/OAV 集号"
+    return "裸 E"
 
 
 @dataclass(frozen=True)
@@ -77,6 +137,133 @@ class ReconciliationDecision:
 
 
 @dataclass(frozen=True)
+class SingleSeasonEpisodeProof:
+    """A D-derived, revalidatable season proof for an unqualified run.
+
+    This is deliberately not an identity override.  It records only the
+    evidence shape that was already proved against the current B snapshot and
+    TMDB catalog, so F can repeat that same read-only proof before it sends a
+    season to the planner.  ``evidence_kind`` is deliberately narrow: it
+    distinguishes the parsing grammar F must revalidate, rather than turning
+    a D result into a generic or user-injectable season override.
+    """
+
+    tmdb_id: int
+    season: int
+    episode_count: int
+    episode_tokens: tuple[str, ...]
+    evidence_kind: str = _BARE_EPISODE_EVIDENCE_KIND
+    season_boundaries: tuple[tuple[int, int], ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "kind": self.evidence_kind,
+            "tmdb_id": self.tmdb_id,
+            "season": self.season,
+            "episode_count": self.episode_count,
+            "episode_tokens": list(self.episode_tokens),
+        }
+        if self.season_boundaries:
+            result["season_boundaries"] = [
+                [int(season), int(count)] for season, count in self.season_boundaries
+            ]
+        return result
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SingleSeasonEpisodeProof | None":
+        if not isinstance(value, Mapping):
+            return None
+        evidence_kind = value.get("kind")
+        if (
+            not isinstance(evidence_kind, str)
+            or evidence_kind not in _SINGLE_SEASON_EPISODE_EVIDENCE_KINDS
+        ):
+            return None
+        tmdb_id = _positive_season(value.get("tmdb_id"))
+        season = _positive_season(value.get("season"))
+        episode_count = _positive_season(value.get("episode_count"))
+        raw_tokens = value.get("episode_tokens")
+        if (
+            tmdb_id is None
+            or season is None
+            or episode_count is None
+            or not isinstance(raw_tokens, Sequence)
+            or isinstance(raw_tokens, (str, bytes, bytearray))
+        ):
+            return None
+        tokens = tuple(str(token) for token in raw_tokens)
+        boundaries: tuple[tuple[int, int], ...] = ()
+        raw_boundaries = value.get("season_boundaries")
+        if raw_boundaries is not None:
+            if (
+                not isinstance(raw_boundaries, Sequence)
+                or isinstance(raw_boundaries, (str, bytes, bytearray))
+            ):
+                return None
+            parsed: list[tuple[int, int]] = []
+            for pair in raw_boundaries:
+                if (
+                    not isinstance(pair, Sequence)
+                    or isinstance(pair, (str, bytes, bytearray))
+                    or len(pair) != 2
+                ):
+                    return None
+                season_num = _positive_season(pair[0])
+                count = _positive_season(pair[1])
+                if season_num is None or count is None:
+                    return None
+                parsed.append((season_num, count))
+            if sum(count for _s, count in parsed) != episode_count:
+                return None
+            boundaries = tuple(parsed)
+        if boundaries:
+            expected = tuple(
+                f"S{season_number:02d}E{episode:02d}"
+                for season_number, count in boundaries
+                for episode in range(1, count + 1)
+            )
+        else:
+            expected = tuple(
+                f"S{season:02d}E{episode:02d}"
+                for episode in range(1, episode_count + 1)
+            )
+        if tokens != expected:
+            return None
+        return cls(
+            tmdb_id,
+            season,
+            episode_count,
+            tokens,
+            evidence_kind=str(evidence_kind),
+            season_boundaries=boundaries,
+        )
+
+
+# Kept as a source-compatible name for persisted bare-E evidence and callers
+# added before bracketed single-season proof existed.  New code should refer
+# to the grammar-neutral type above.
+BareEpisodeSeasonProof = SingleSeasonEpisodeProof
+
+
+@dataclass(frozen=True)
+class _TmdbSingleRegularSeasonEvidence:
+    """TMDB proof for one regular season and optional auxiliary specials.
+
+    Season 00 is not a source season inference.  It is retained only as an
+    auxiliary shape check so a published specials bucket does not make an
+    otherwise unique regular season look ambiguous.  A same-sized Season 00
+    remains ambiguous and is rejected by the reader below.
+    """
+
+    season: int
+    regular_episode_count: int
+    specials_episode_count: int | None = None
+    # Episodes beyond ``regular_episode_count`` in the source run (``1..N``
+    # where N > the declared season count) that land in Season 00.
+    overflow_episode_count: int = 0
+
+
+@dataclass(frozen=True)
 class LibraryIndex:
     works: tuple[IndexedWork, ...]
 
@@ -96,12 +283,97 @@ def _safe_child_name(value: object) -> str | None:
     return value
 
 
-def build_library_index(alist: object, media_root: str) -> LibraryIndex:
-    """Walk the three formal shelves and index NFO-confirmed works.
+def _normalise_nfo_identity(value: object) -> dict[str, object] | None:
+    """Return the narrow identity projection accepted by the index."""
+    if not isinstance(value, Mapping):
+        return None
+    raw_id = value.get("tmdb_id")
+    if isinstance(raw_id, bool):
+        return None
+    try:
+        tmdb_id = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    media_type = str(value.get("media_type") or "")
+    if tmdb_id <= 0 or media_type not in {"movie", "tv"}:
+        return None
+    return {
+        "tmdb_id": tmdb_id,
+        "media_type": media_type,
+        "title": str(value.get("title") or ""),
+        "year": str(value.get("year") or ""),
+    }
 
-    A work without a readable, unambiguous NFO identity is not indexable and
-    simply does not participate in cross-shelf dedup (fail closed toward
-    ``new_work`` — the writer's no-overwrite gate stays the final guard).
+
+def _direct_directory_identity(
+    alist: object,
+    directory: str,
+    items: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    """Read an unambiguous work identity from NFOs directly in one directory.
+
+    Every NFO is parsed by XML root rather than filename, so a titled movie
+    NFO is recognised while episode-level NFOs remain outside the work index.
+    Multiple *different* valid identities in the same directory are not
+    arbitrarily selected.
+    """
+    identities: dict[tuple[str, int], dict[str, object]] = {}
+    for item in items:
+        if item.get("is_dir") is True:
+            continue
+        name = _safe_child_name(item.get("name"))
+        if name is None or not name.casefold().endswith(".nfo"):
+            continue
+        nfo_path = posixpath.join(directory, name)
+        # The normal writer emits one episode NFO beside every TV video.  It
+        # cannot be a work root, and reading thousands of such sidecars would
+        # turn the selected-root D step into a library-wide XML audit.  Keep
+        # standard root NFO names eligible; for titled sidecars, an explicit
+        # episode coordinate in the path is enough to exclude them.
+        if (
+            name.casefold() not in {"tvshow.nfo", "movie.nfo"}
+            and audit_episode_tokens(nfo_path)
+        ):
+            continue
+        parsed = _normalise_nfo_identity(
+            read_nfo_identity(alist, nfo_path)
+        )
+        if parsed is None:
+            continue
+        key = (str(parsed["media_type"]), int(parsed["tmdb_id"]))
+        identities.setdefault(key, parsed)
+    return next(iter(identities.values())) if len(identities) == 1 else None
+
+
+def _nearest_identity_root(
+    directory: str,
+    *,
+    top_level_root: str,
+    identities: Mapping[str, Mapping[str, object]],
+) -> str | None:
+    """Find the closest NFO-confirmed work root owning a nested file."""
+    current = directory.rstrip("/") or "/"
+    stop = top_level_root.rstrip("/") or "/"
+    while True:
+        if current in identities:
+            return current
+        if current == stop:
+            return None
+        parent = posixpath.dirname(current) or "/"
+        if parent == current:
+            return None
+        current = parent
+
+
+def build_library_index(alist: object, media_root: str) -> LibraryIndex:
+    """Walk the three formal shelves and index every NFO-confirmed work root.
+
+    A top-level shelf directory can be a user-facing series container.  Its
+    own NFO remains one indexed work, while a nested directory carrying a
+    different readable work NFO becomes a separate indexed work.  Episode
+    coverage is attributed to the closest such NFO directory, never copied
+    into the parent container.  This keeps nested films/spinoffs discoverable
+    without letting their identity or media coverage overwrite the container.
     """
     listing = getattr(alist, "list", None)
     if not callable(listing):
@@ -123,34 +395,33 @@ def build_library_index(alist: object, media_root: str) -> LibraryIndex:
             name = _safe_child_name(row.get("name"))
             if name is None:
                 continue
-            work_root = f"{root}/{name}"
-            identity: dict[str, object] | None = None
-            tokens: set[str] = set()
-            stack = [work_root]
+            top_level_root = posixpath.join(root, name)
+            directory_items: dict[str, list[Mapping[str, object]]] = {}
+            stack = [top_level_root]
             directory_count = 0
             while stack:
                 current = stack.pop()
                 directory_count += 1
                 if directory_count > MAX_WORK_DIRECTORIES:
-                    raise ValueError(f"作品目录深度/数量超过索引上限: {work_root}")
-                # Only the three shelf roots refresh; the nested walk uses
-                # cached listings.  A per-directory refresh on a large Quark
-                # library turns the D step into tens of minutes of re-syncs,
-                # and the inner NFO/episode facts are written by the single
-                # writer with its own fresh readback.
+                    raise ValueError(f"作品目录深度/数量超过索引上限: {top_level_root}")
+                # Only the three shelf roots refresh; nested listings use the
+                # provider cache.  The writer already performs a fresh exact
+                # readback for content it writes.
                 try:
-                    items = listing(current)
+                    raw_items = listing(current)
                 except TypeError:
-                    items = listing(current)
-                if not isinstance(items, list):
+                    raw_items = listing(current)
+                if not isinstance(raw_items, list):
                     continue
-                for item in items:
+                items: list[Mapping[str, object]] = []
+                for item in raw_items:
                     if not isinstance(item, Mapping):
                         continue
                     child_name = _safe_child_name(item.get("name"))
                     if child_name is None:
                         continue
-                    child_path = current.rstrip("/") + "/" + child_name
+                    items.append(item)
+                    child_path = posixpath.join(current, child_name)
                     if item.get("is_dir") is True:
                         stack.append(child_path)
                         continue
@@ -159,44 +430,49 @@ def build_library_index(alist: object, media_root: str) -> LibraryIndex:
                         raise ValueError(
                             f"正式库索引文件数超过安全上限 {MAX_INDEX_FILES}"
                         )
-                    lowered = child_name.casefold()
-                    if current == work_root:
-                        # Only the work root level defines the identity.  A
-                        # Fate-style container holds nested sub-works with
-                        # their own NFOs; descending into them must never
-                        # overwrite the container's identity.
-                        if lowered in {"tvshow.nfo", "movie.nfo"}:
-                            identity = _read_nfo_identity(alist, child_path)
-                        elif lowered.endswith(".nfo"):
-                            # The movie planner names the root NFO
-                            # "<title> (year).nfo"; recognise it by its XML
-                            # root (<movie>/<tvshow> with a tmdbid) instead
-                            # of the filename, and keep episode/special
-                            # NFOs out.
-                            parsed = _read_nfo_identity(alist, child_path)
-                            if parsed is not None and parsed.get("tmdb_id"):
-                                identity = parsed
-                    elif is_video_filename(child_name):
-                        for season, episode in audit_episode_tokens(child_name):
-                            tokens.add(f"S{season:02d}E{episode:02d}")
-            if identity is None:
+                directory_items[current] = items
+
+            identities = {
+                directory: identity
+                for directory, items in directory_items.items()
+                if (identity := _direct_directory_identity(alist, directory, items))
+                is not None
+            }
+            if not identities:
                 continue
-            try:
-                tmdb_id = int(identity["tmdb_id"])
-                media_type = str(identity["media_type"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            works.append(IndexedWork(
-                media_type=media_type,
-                tmdb_id=tmdb_id,
-                shelf=shelf,
-                work_root=work_root,
-                title=str(identity.get("title") or ""),
-                year=str(identity.get("year") or ""),
-                episode_tokens=frozenset(tokens),
-            ))
-            if len(works) > MAX_INDEX_WORKS:
-                raise ValueError(f"正式库作品数超过索引上限 {MAX_INDEX_WORKS}")
+            tokens_by_root: dict[str, set[str]] = {
+                directory: set() for directory in identities
+            }
+            for directory, items in directory_items.items():
+                owner = _nearest_identity_root(
+                    directory,
+                    top_level_root=top_level_root,
+                    identities=identities,
+                )
+                if owner is None:
+                    continue
+                tokens = tokens_by_root[owner]
+                for item in items:
+                    if item.get("is_dir") is True:
+                        continue
+                    child_name = _safe_child_name(item.get("name"))
+                    if child_name is None or not is_video_filename(child_name):
+                        continue
+                    child_path = posixpath.join(directory, child_name)
+                    for season, episode in audit_episode_tokens(child_path):
+                        tokens.add(f"S{season:02d}E{episode:02d}")
+            for work_root, identity in identities.items():
+                works.append(IndexedWork(
+                    media_type=str(identity["media_type"]),
+                    tmdb_id=int(identity["tmdb_id"]),
+                    shelf=shelf,
+                    work_root=work_root,
+                    title=str(identity.get("title") or ""),
+                    year=str(identity.get("year") or ""),
+                    episode_tokens=frozenset(tokens_by_root[work_root]),
+                ))
+                if len(works) > MAX_INDEX_WORKS:
+                    raise ValueError(f"正式库作品数超过索引上限 {MAX_INDEX_WORKS}")
     return LibraryIndex(tuple(works))
 
 
@@ -249,14 +525,41 @@ def decide_reconciliation(
     )
 
 
-def _iter_nodes(node: SourceNode) -> list[SourceNode]:
-    output = [node]
-    for child in node.children:
-        output.extend(_iter_nodes(child))
-    return output
+def _positive_season(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
-def _unit_episode_tokens(node: SourceNode | None) -> frozenset[str]:
+def _default_season_for_record(record: WorkUnitRecord) -> int | None:
+    """Return only an evidence-backed default for an unqualified label.
+
+    A manual C/U confirmation may explicitly select a season.  Otherwise a
+    B/W cohort can provide a default only when it proved exactly one positive
+    season.  A multi-season cohort never borrows its first season for an
+    unqualified filename.
+    """
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    override = _positive_season(identity.get("season"))
+    if override is not None:
+        return override
+    claimed = tuple(
+        season
+        for season in record.claimed_seasons
+        if _positive_season(season) is not None
+    )
+    unique = tuple(sorted(set(claimed)))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _unit_episode_tokens(
+    node: SourceNode | None,
+    *,
+    default_season: int | None = None,
+) -> frozenset[str]:
+    """Return source coordinates without inventing a season for bare files."""
     if node is None:
         return frozenset()
     tokens: set[str] = set()
@@ -266,10 +569,1190 @@ def _unit_episode_tokens(node: SourceNode | None) -> frozenset[str]:
         for file in current.files:
             if file.object_type != "video":
                 continue
-            for season, episode in audit_episode_tokens(file.name):
+            # The full path carries a real ``Season 02`` directory context
+            # when one exists.  Passing only ``file.name`` loses that proof.
+            for season, episode in audit_episode_tokens(
+                file.path,
+                default_season=default_season,
+            ):
                 tokens.add(f"S{season:02d}E{episode:02d}")
         stack.extend(current.children)
     return frozenset(tokens)
+
+
+def _has_video(node: SourceNode) -> bool:
+    return any(file.object_type == "video" for file in collect_all_files(node))
+
+
+def _scope_season_number(path: str) -> int | None:
+    """Use the same bounded season-directory parser as B/W."""
+    return _season_number_from_directory_name(posixpath.basename(path))
+
+
+def _subtitle_coordinates_for_season(node: SourceNode, season: int) -> frozenset[int] | None:
+    """Return exact subtitle coordinates for one declared no-video season.
+
+    A rooted WorkUnit may own one source root rather than one path per season.
+    An empty child directory is not enough to manufacture a missing TMDB
+    season: its subtitle members must still carry one unambiguous, contiguous
+    ``SxxEyy`` sequence matching the child directory's explicit season marker.
+    This repeats the narrow B/W fact at D rather than trusting a loose folder
+    name or a stale persisted claim.
+    """
+    episodes: set[int] = set()
+    for file in collect_all_files(node):
+        if file.object_type != "subtitle":
+            continue
+        match = _SEASON_EPISODE_RE.search(file.name)
+        if match is None:
+            return None
+        file_season, episode = int(match.group(1)), int(match.group(2))
+        if file_season != season or episode <= 0 or episode in episodes:
+            return None
+        episodes.add(episode)
+    if not episodes or episodes != set(range(1, max(episodes) + 1)):
+        return None
+    return frozenset(episodes)
+
+
+def _root_direct_video_seasons(node: SourceNode) -> frozenset[int]:
+    """Return only explicit seasons carried by videos directly at one root."""
+    seasons: set[int] = set()
+    for file in node.files:
+        if file.object_type != "video":
+            continue
+        match = _SEASON_EPISODE_RE.search(file.name)
+        if match is not None:
+            season = int(match.group(1))
+            if season > 0:
+                seasons.add(season)
+    return frozenset(seasons)
+
+
+def _video_coordinates_match_declared_season(node: SourceNode, season: int) -> bool:
+    """Require every video in a marked directory to corroborate its season."""
+    observed: set[int] = set()
+    for file in collect_all_files(node):
+        if file.object_type != "video":
+            continue
+        match = _SEASON_EPISODE_RE.search(file.name)
+        if match is not None:
+            observed.add(int(match.group(1)))
+    return observed == {season}
+
+
+def _declared_empty_seasons_in_root_scope(
+    root: SourceNode,
+    claimed: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    """Revalidate B/W claims when one WorkUnit owns its whole source root.
+
+    A single-root TV can legitimately contain several decorated season
+    directories plus direct files for a later season.  ``source_paths`` is
+    intentionally just that owned root, so pairing it positionally with every
+    claimed season would reject an otherwise proven boundary.  Rebuild the
+    minimal directory-to-season proof from the persisted B snapshot instead:
+    every claimed season must be represented by exactly one direct, explicitly
+    marked child or by direct qualified video; a no-video child additionally
+    needs its contiguous matching subtitle sequence.
+    """
+    by_season: dict[int, list[SourceNode]] = {}
+    for child in root.children:
+        season = _scope_season_number(child.path)
+        if season is not None:
+            by_season.setdefault(season, []).append(child)
+    direct_video_seasons = _root_direct_video_seasons(root)
+    empty: list[int] = []
+    for season in claimed:
+        children = by_season.get(season, [])
+        if len(children) > 1:
+            return None
+        if len(children) == 1:
+            if season in direct_video_seasons:
+                # A rooted source cannot prove two competing physical layouts
+                # for one season.  B/W may only claim an unambiguous owner.
+                return None
+            child = children[0]
+            if _has_video(child):
+                # A named season directory with video must itself corroborate
+                # the same season.  Do not let a mismarked release subtree
+                # validate an unrelated persisted claim.
+                if not _video_coordinates_match_declared_season(child, season):
+                    return None
+                continue
+            if _subtitle_coordinates_for_season(child, season) is None:
+                return None
+            empty.append(season)
+            continue
+        if season not in direct_video_seasons:
+            return None
+    return tuple(empty)
+
+
+def _declared_empty_seasons(
+    record: WorkUnitRecord,
+    nodes_by_path: Mapping[str, SourceNode],
+) -> tuple[int, ...] | None:
+    """Return proved empty claimed seasons, or ``None`` when linkage is weak.
+
+    ``claimed_seasons`` are a B/W boundary fact.  They can drive a catalog
+    request only if each is still linked one-to-one to a snapshot subtree
+    carrying the same explicit directory season marker.  This avoids treating
+    arbitrary empty folders as missing episodes.
+    """
+    claimed = tuple(record.claimed_seasons)
+    if not claimed:
+        return ()
+    if (
+        any(_positive_season(season) is None for season in claimed)
+        or tuple(sorted(set(claimed))) != claimed
+    ):
+        return None
+    # A multi-scope season cohort persists one exact source directory per
+    # claimed season.  A proven mixed boundary may additionally own a generic
+    # SP/Extras scope; it is not a season assertion and must not make the
+    # season proof positional.  Keep the season-directory linkage strict,
+    # including a truly empty final season such as an unpopulated Season 11.
+    if len(record.source_paths) == 1:
+        root_path = record.source_paths[0].rstrip("/")
+        if record.boundary_key.rstrip("/") != root_path:
+            return None
+        root = nodes_by_path.get(root_path)
+        if root is None:
+            return None
+        return _declared_empty_seasons_in_root_scope(root, claimed)
+
+    season_scopes: dict[int, str] = {}
+    for source_path in record.source_paths:
+        season = _scope_season_number(source_path)
+        if season is None:
+            continue
+        if season in season_scopes:
+            return None
+        season_scopes[season] = source_path
+    if tuple(sorted(season_scopes)) != claimed:
+        return None
+    empty: list[int] = []
+    for season in claimed:
+        source_path = season_scopes[season]
+        scope = nodes_by_path.get(source_path.rstrip("/"))
+        if scope is None or _scope_season_number(source_path) != season:
+            return None
+        if not _has_video(scope):
+            empty.append(season)
+    return tuple(empty)
+
+
+def _catalog_tokens_for_seasons(
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    *,
+    tmdb_id: int,
+    seasons: Sequence[int],
+) -> frozenset[str] | None:
+    """Read exact published coordinates for declared empty seasons.
+
+    Catalog errors, absent seasons and malformed episode rows are all evidence
+    failures rather than a reason to consume a source as duplicate media.
+    """
+    if not seasons:
+        return frozenset()
+    if not callable(episode_catalog):
+        return None
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    output: set[str] = set()
+    for season in seasons:
+        rows = payload.get(season)
+        if (
+            not isinstance(rows, Sequence)
+            or isinstance(rows, (str, bytes, bytearray))
+            or not rows
+        ):
+            return None
+        season_tokens: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                return None
+            catalog_season = _positive_season(row.get("season_number"))
+            episode = _positive_season(row.get("episode_number"))
+            if catalog_season != season or episode is None:
+                return None
+            season_tokens.add(f"S{season:02d}E{episode:02d}")
+        if not season_tokens:
+            return None
+        output.update(season_tokens)
+    return frozenset(output)
+
+
+def _scope_row_fingerprint(
+    rows: Sequence[Mapping[str, object]],
+) -> frozenset[tuple[str, bool, int, str]] | None:
+    """Return the B/F source-object tuple, rejecting malformed duplicates."""
+    output: set[tuple[str, bool, int, str]] = set()
+    paths: set[str] = set()
+    for row in rows:
+        full_path = str(row.get("full_path") or "").rstrip("/")
+        if not full_path or full_path in paths:
+            return None
+        paths.add(full_path)
+        raw_size = row.get("size")
+        try:
+            size = int(raw_size or 0)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(raw_size, bool) or size < 0:
+            return None
+        output.add((
+            full_path,
+            row.get("is_dir") is True,
+            size,
+            str(row.get("modified") or ""),
+        ))
+    return frozenset(output)
+
+
+def _path_below_any_scope(path: str, scopes: Sequence[str]) -> bool:
+    return any(path.startswith(scope.rstrip("/") + "/") for scope in scopes)
+
+
+def _fresh_scope_is_directory(alist: object, scope: str) -> bool:
+    """Prove an empty source scope still exists as the exact directory."""
+    listing = getattr(alist, "list", None)
+    if not callable(listing):
+        return False
+    parent = posixpath.dirname(scope.rstrip("/")) or "/"
+    name = posixpath.basename(scope.rstrip("/"))
+    try:
+        rows = listing(parent, refresh=True)
+    except TypeError:
+        try:
+            rows = listing(parent)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(row, Mapping)
+        and row.get("name") == name
+        and row.get("is_dir") is True
+        for row in rows
+    )
+
+
+def _fresh_scopes_match_snapshot(
+    alist: object,
+    snapshot: Mapping[str, object],
+    record: WorkUnitRecord,
+) -> bool:
+    """Require the exact WorkUnit scopes to equal the B snapshot right now.
+
+    A D-derived unqualified-episode proof is only safe for the media objects
+    B/W actually classified.  A source object may have appeared, vanished, or
+    changed while C queried TMDB, so F must never inherit this proof without a
+    fresh directory existence check and the same path/type/size/version tuple.
+    """
+    scopes = tuple(path.rstrip("/") for path in record.source_paths)
+    if not scopes or any(not _fresh_scope_is_directory(alist, scope) for scope in scopes):
+        return False
+    raw_snapshot_rows = snapshot.get("rows")
+    if not isinstance(raw_snapshot_rows, list):
+        return False
+    expected = [
+        row for row in raw_snapshot_rows
+        if isinstance(row, Mapping)
+        and _path_below_any_scope(str(row.get("full_path") or "").rstrip("/"), scopes)
+    ]
+    fresh: list[Mapping[str, object]] = []
+    try:
+        for scope in scopes:
+            fresh.extend(walk_source_rows(alist, scope))
+    except Exception:
+        return False
+    return _scope_row_fingerprint(expected) == _scope_row_fingerprint(fresh)
+
+
+def _strict_bare_episode_number_for_file(file: SourceFile) -> int | None:
+    """Read a naked-E coordinate without mistaking its container for media.
+
+    A release can place ``Show.E01.mkv`` beneath an ``E01-E06`` directory.
+    The directory describes the batch and must not turn each file into a
+    range.  Conversely, a parent ``Season 01``/``S01E01`` or ``OVA``/``SP``
+    is real hierarchy evidence and keeps the strict no-context proof closed.
+    """
+    if not bare_regular_episode_context_is_safe(file.path):
+        return None
+    # Source paths are POSIX provider paths.  Parsing the basename, rather
+    # than the whole path, intentionally confines bare ranges and packed
+    # episode markers to the media member itself.
+    return bare_regular_episode_number(posixpath.basename(file.path.rstrip("/")))
+
+
+def _movie_shaped_child_paths(node: SourceNode) -> set[str]:
+    """Direct children that are movie-shaped (exactly one large video).
+
+    A titled sibling such as a ``剧场版``/``电影`` branch holding exactly one
+    large video is an independent film, not a member of the integer TV run.
+    Its files must be omitted from the regular single-season proof so the film
+    cannot break the ``[01]..[N]`` run of the rooted TV work.
+    """
+    paths: set[str] = set()
+    for child in node.children:
+        videos = [f for f in collect_all_files(child) if f.object_type == "video"]
+        if len(videos) == 1 and videos[0].size >= _MOVIE_SHAPED_MIN_BYTES:
+            paths.add(str(child.path).rstrip("/"))
+    return paths
+
+
+def _regular_episode_primary_videos(
+    node: SourceNode | None,
+) -> list[SourceFile] | None:
+    """Primary regular-episode videos, omitting only a complete SP run.
+
+    NCOP/NCED and fractional videos are always omitted from the integer
+    regular run.  A physical-special family (OAD/OVA/OAV/SP) is omitted only
+    when it itself forms one complete, unique ``1..M`` run; an incomplete or
+    ambiguous special keeps the proof fail-closed (returns ``None``).  A
+    movie-shaped sibling subtree is likewise omitted so an independent film
+    beside the rooted TV work does not invalidate the TV proof.
+    """
+    if node is None:
+        return None
+    videos = [
+        file for file in collect_all_files(node) if file.object_type == "video"
+    ]
+    special = [
+        file for file in videos if is_physical_special_video_file(file)
+    ]
+    if special:
+        _markers, _numbers, count, complete = physical_special_marker_evidence(
+            special
+        )
+        if not complete or count is None:
+            return None
+    special_paths = {file.path for file in special}
+    movie_paths = _movie_shaped_child_paths(node)
+    regular = [
+        file
+        for file in videos
+        if file.path not in special_paths
+        and not _is_non_regular_episode_video(file)
+        and not any(
+            file.path == path or file.path.startswith(path + "/")
+            for path in movie_paths
+        )
+    ]
+    return regular if regular else None
+
+
+def _strict_bare_episode_numbers(node: SourceNode | None) -> tuple[int, ...] | None:
+    """Return exactly E01..EN when *every* source video proves one bare E."""
+    videos = _regular_episode_primary_videos(node)
+    if not videos:
+        return None
+    numbers = [_strict_bare_episode_number_for_file(file) for file in videos]
+    if any(number is None for number in numbers):
+        return None
+    concrete = [int(number) for number in numbers if number is not None]
+    if len(set(concrete)) != len(concrete):
+        return None
+    ordered = tuple(sorted(concrete))
+    if ordered != tuple(range(1, len(concrete) + 1)):
+        return None
+    return ordered
+
+
+def _strict_naked_numeric_episode_number(file: SourceFile) -> int | None:
+    """Read an exact numeric video stem (``01.mp4``) without guessing.
+
+    A numeric stem is weaker than ``E01`` and is therefore admitted only by
+    the complete single-season proof below.  Any season/range/special marker
+    in the full path closes this lane; suffixes such as ``01.1080p`` and
+    duplicate/version labels do not match the exact stem grammar.
+    """
+    path = str(file.path or "").rstrip("/")
+    if not path or not bare_regular_episode_context_is_safe(path):
+        return None
+    name = posixpath.basename(path)
+    stem, dot, _suffix = name.rpartition(".")
+    if not dot:
+        return None
+    match = re.fullmatch(r"0*([1-9]\d{0,2})", stem.strip())
+    if match is None:
+        return None
+    number = int(match.group(1))
+    return number if 0 < number <= 999 else None
+
+
+def _strict_naked_numeric_episode_numbers(
+    node: SourceNode | None,
+) -> tuple[int, ...] | None:
+    """Return exactly numeric ``01`` … ``N`` primary videos, or ``None``."""
+    videos = _regular_episode_primary_videos(node)
+    if not videos:
+        return None
+    numbers = [_strict_naked_numeric_episode_number(file) for file in videos]
+    if any(number is None for number in numbers):
+        return None
+    concrete = [int(number) for number in numbers if number is not None]
+    if len(set(concrete)) != len(concrete):
+        return None
+    ordered = tuple(sorted(concrete))
+    if ordered != tuple(range(1, len(concrete) + 1)):
+        return None
+    return ordered
+
+
+def _strict_release_dash_episode_signature_for_file(
+    file: SourceFile,
+) -> tuple[str, int] | None:
+    """Read one release-style ``Title - 01`` member without inventing S01."""
+    path = str(file.path or "").rstrip("/")
+    if not path or not bare_regular_episode_context_is_safe(path):
+        return None
+    return release_dash_regular_episode(posixpath.basename(path))
+
+
+def _strict_release_dash_episode_members(
+    node: SourceNode | None,
+) -> tuple[tuple[str, int], ...] | None:
+    """Return exact ``(source_path, ordinal)`` members of one dash run.
+
+    Unlike the older bare/bracket proofs, this grammar excludes *no* videos:
+    the unqualified dash ordinal cannot safely distinguish a regular episode
+    from an OVA, trailer, NCOP/NCED, or a second title.  Every video therefore
+    has to carry the same normalized title prefix and one unique ordinal.
+    """
+    if node is None:
+        return None
+    videos = [
+        file for file in collect_all_files(node)
+        if file.object_type == "video"
+    ]
+    if not videos:
+        return None
+    signatures = [
+        _strict_release_dash_episode_signature_for_file(file)
+        for file in videos
+    ]
+    if any(signature is None for signature in signatures):
+        return None
+    concrete = [
+        signature for signature in signatures if signature is not None
+    ]
+    prefixes = {prefix for prefix, _number in concrete}
+    if len(prefixes) != 1:
+        return None
+    numbers = [number for _prefix, number in concrete]
+    if len(set(numbers)) != len(numbers):
+        return None
+    ordered = tuple(sorted(numbers))
+    if ordered != tuple(range(1, len(numbers) + 1)):
+        return None
+    members = tuple(sorted(
+        (str(file.path).rstrip("/"), number)
+        for file, (_prefix, number) in zip(videos, concrete)
+    ))
+    if len({path for path, _number in members}) != len(members):
+        return None
+    return members
+
+
+def _strict_release_dash_episode_numbers(
+    node: SourceNode | None,
+) -> tuple[int, ...] | None:
+    """Return the contiguous release-dash ordinal run, or ``None``."""
+    members = _strict_release_dash_episode_members(node)
+    if members is None:
+        return None
+    return tuple(sorted(number for _path, number in members))
+
+
+def release_dash_episode_source_ordinals(
+    node: SourceNode | None,
+) -> dict[str, int] | None:
+    """Expose the exact D/F release-dash source-key proof.
+
+    F uses this only after it has re-run
+    :func:`prove_single_season_episode_evidence`.  It turns the same strict
+    source members into planner overrides, preventing title digits such as
+    ``The 100 - 01`` from becoming the engine's source key ``E100``.
+    """
+    members = _strict_release_dash_episode_members(node)
+    return dict(members) if members is not None else None
+
+
+def _contains_bare_regular_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        _strict_bare_episode_number_for_file(file) is not None
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+    )
+
+
+def _contains_naked_numeric_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        _strict_naked_numeric_episode_number(file) is not None
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+    )
+
+
+def _contains_release_dash_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        _strict_release_dash_episode_signature_for_file(file) is not None
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+    )
+
+
+_KNOWN_NON_STORY_THEME_MARKER_RE = re.compile(
+    r"\[\s*(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]",
+    re.IGNORECASE,
+)
+
+# A ``[Menu]``/``[Menu01]`` label is a disc menu (光盘菜单), never a member of
+# the integer regular run, so it is omitted from the single-season proof.
+_MENU_MARKER_RE = re.compile(
+    r"\[\s*MENU(?:\s*\d+)?\s*\]",
+    re.IGNORECASE,
+)
+
+# A ``[CM]``/``[TV-CM]`` label is a commercial/preview, never a story episode.
+_COMMERCIAL_MARKER_RE = re.compile(
+    r"\[\s*(?:TV-)?CM(?:\s*\d+)?\s*\]",
+    re.IGNORECASE,
+)
+
+_NON_STORY_THEME_DIRECTORY_RE = re.compile(
+    r"(?:^|/)"
+    r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED)"
+    r"(?:/|$)",
+    re.IGNORECASE,
+)
+
+# One video file at or above this size in a titled sibling is treated as an
+# independent film (movie-shaped) rather than a member of the TV episode run.
+# Kept consistent with ``boundary_analysis._MOVIE_MIN_BYTES``.
+_MOVIE_SHAPED_MIN_BYTES = 200 * 1024 * 1024
+
+# An unnumbered physical-special marker (``[OAD]``/``[OVA]``/``[OAV]``/``[SP]``)
+# is a named special, not a member of the integer ``1..N`` regular run.  It is
+# omitted from the regular single-season proof exactly like NCOP/NCED are.
+_UNNUMBERED_SPECIAL_MARKER_RE = re.compile(
+    r"(?<![A-Za-z])(?:OVA|OAV|OAD|SP)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _is_known_non_story_theme_video(file: SourceFile) -> bool:
+    """Whether a video is one explicitly identified non-story OP/ED asset.
+
+    ``[OP]``/``[ED]`` (with or without ``NC`` and an optional number) are
+    opening/ending theme markers, so they are omitted from the regular-episode
+    proof.  An ``MV``/``PV`` label is not a reliable media role, so it keeps
+    the proof fail-closed until B/W can place it independently.
+    """
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_KNOWN_NON_STORY_THEME_MARKER_RE.search(basename))
+
+
+def _is_bonus_directory_video(file: SourceFile) -> bool:
+    """Whether a video sits inside a recognized non-story OP/ED directory.
+
+    A path segment such as ``NCOP&ED``/``OP&ED``/``NCED`` is strong context
+    that every video inside is a bonus (opening/ending/menu), not a story
+    episode, even when the file's own basename is only ``[MV]``/``[Menu]``.
+    """
+    return bool(_NON_STORY_THEME_DIRECTORY_RE.search(str(file.path or "")))
+
+
+def _is_non_regular_episode_video(file: SourceFile) -> bool:
+    """Whether a video is outside the integer regular-episode run."""
+    return (
+        _is_known_non_story_theme_video(file)
+        or _is_fractional_episode_video(file)
+        or _is_bonus_directory_video(file)
+        or _is_unnumbered_special_video(file)
+        or _is_menu_video(file)
+        or _is_commercial_video(file)
+    )
+
+
+def _is_fractional_episode_video(file: SourceFile) -> bool:
+    """Whether a video carries a fractional episode label (``[11.5]``).
+
+    A fractional special is a distinct source coordinate (handled by the
+    special/fractional mapping), not a member of the integer ``1..N`` regular
+    run.  It must therefore be omitted from the regular single-season proof
+    instead of invalidating it, exactly like NCOP/NCED are.
+    """
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(FRACTIONAL_EPISODE_RE.search(basename))
+
+
+def _is_unnumbered_special_video(file: SourceFile) -> bool:
+    """Whether a video carries an unnumbered OAD/OVA/OAV/SP marker.
+
+    A bare ``[OAD]``/``[OVA]``/``[OAV]``/``[SP]`` is a named special (no
+    ordinal), not a member of the integer regular run, so it must be omitted
+    from the single-season proof like NCOP/NCED rather than invalidating it.
+    """
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_UNNUMBERED_SPECIAL_MARKER_RE.search(basename))
+
+
+def _is_menu_video(file: SourceFile) -> bool:
+    """Whether a video carries a disc-menu ``[Menu]``/``[MenuNN]`` label."""
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_MENU_MARKER_RE.search(basename))
+
+
+def _is_commercial_video(file: SourceFile) -> bool:
+    """Whether a video carries a ``[CM]``/``[TV-CM]`` commercial label."""
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_COMMERCIAL_MARKER_RE.search(basename))
+
+
+def _strict_bracketed_episode_number_for_file(file: SourceFile) -> int | None:
+    """Read one pure ``[01]`` ordinal without erasing hierarchy evidence."""
+    if not bare_regular_episode_context_is_safe(file.path):
+        return None
+    return bracketed_regular_episode_number(
+        posixpath.basename(file.path.rstrip("/"))
+    )
+
+
+def _strict_bracketed_episode_numbers(
+    node: SourceNode | None,
+) -> tuple[int, ...] | None:
+    """Return exactly ``[01]..[N]`` from every primary source video.
+
+    NCOP/NCED/fractional and a complete OAD/OVA/OAV/SP family are omitted from
+    the integer run.  A lone OVA, special, trailer, duplicate encode, or a file
+    with ambiguous brackets still invalidates the entire proof rather than
+    being ignored.
+    """
+    videos = _regular_episode_primary_videos(node)
+    if not videos:
+        return None
+    numbers = [
+        _strict_bracketed_episode_number_for_file(file)
+        for file in videos
+    ]
+    if any(number is None for number in numbers):
+        return None
+    concrete = [int(number) for number in numbers if number is not None]
+    if len(set(concrete)) != len(concrete):
+        return None
+    ordered = tuple(sorted(concrete))
+    if ordered != tuple(range(1, len(concrete) + 1)):
+        return None
+    return ordered
+
+
+def _contains_bracketed_regular_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        not _is_non_regular_episode_video(file)
+        and _strict_bracketed_episode_number_for_file(file) is not None
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+    )
+
+
+def _single_season_episode_numbers(
+    node: SourceNode | None,
+    *,
+    evidence_kind: str,
+) -> tuple[int, ...] | None:
+    """Dispatch one persisted proof grammar to its strict source check."""
+    if evidence_kind == _BARE_EPISODE_EVIDENCE_KIND:
+        return _strict_bare_episode_numbers(node)
+    if evidence_kind == _BRACKETED_EPISODE_EVIDENCE_KIND:
+        return _strict_bracketed_episode_numbers(node)
+    if evidence_kind == _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND:
+        return _strict_naked_numeric_episode_numbers(node)
+    if evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND:
+        return _strict_release_dash_episode_numbers(node)
+    return None
+
+
+def _single_positive_tmdb_season(
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    episode_count: int,
+) -> _TmdbSingleRegularSeasonEvidence | None:
+    """Read show detail that proves one regular season.
+
+    TMDB keeps announced, not-yet-released seasons in the detail response
+    with ``episode_count == 0``.  Those empty future placeholders do not
+    create an episode coordinate and are safe to ignore here.  A published
+    Season 00 is auxiliary metadata, not a coordinate for an unqualified
+    source run: it is accepted only when the regular season is unique and
+    the special count differs from the source count.  A same-sized specials
+    bucket remains indistinguishable from the source and fails closed.
+    """
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+    except Exception:
+        return None
+    if not isinstance(show, Mapping):
+        return None
+    raw_seasons = show.get("seasons")
+    if not isinstance(raw_seasons, list) or not raw_seasons:
+        return None
+    positives: list[tuple[int, int]] = []
+    specials_count: int | None = None
+    for row in raw_seasons:
+        if not isinstance(row, Mapping):
+            return None
+        raw_season = row.get("season_number")
+        raw_count = row.get("episode_count")
+        if (
+            isinstance(raw_season, bool)
+            or not isinstance(raw_season, int)
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_season < 0
+            or raw_count < 0
+        ):
+            return None
+        if raw_season == 0:
+            # Specials have no source coordinate in this proof.  Keep their
+            # count only to reject the genuinely ambiguous same-sized case.
+            if raw_count > 0:
+                if specials_count is not None:
+                    return None
+                specials_count = raw_count
+            continue
+        if raw_count == 0:
+            # Future/announced season placeholder; the episode catalog will
+            # independently confirm all currently published coordinates.
+            continue
+        positives.append((raw_season, raw_count))
+    matching = [
+        (season, count)
+        for season, count in positives
+        if count == episode_count
+    ]
+    # A complete ``1..N`` run proves one published season when exactly one
+    # positive season declares that N, even on a multi-season show (a
+    # container child owns only that season).  A run equal to the sum of
+    # several seasons is handled by the merged-season evidence instead.
+    if len(matching) == 1:
+        season, declared_count = matching[0]
+        overflow_count = 0
+    else:
+        # A ``1..N`` run whose tail (N - declared) exactly equals the published
+        # specials bucket proves the regular season plus an overflow tail that
+        # lands in Season 00 (日在校园 1..14 = 12 regular + 2 OVA).  Only a
+        # unique such season is accepted.
+        overflow = [
+            (season, count)
+            for season, count in positives
+            if count < episode_count
+            and specials_count is not None
+            and episode_count - count == specials_count
+        ]
+        if len(overflow) != 1:
+            return None
+        season, declared_count = overflow[0]
+        overflow_count = episode_count - declared_count
+    if specials_count == episode_count:
+        return None
+    total_seasons = show.get("number_of_seasons")
+    if total_seasons is not None and (
+        isinstance(total_seasons, bool)
+        or not isinstance(total_seasons, int)
+        or total_seasons < 1
+    ):
+        return None
+    total_episodes = show.get("number_of_episodes")
+    if total_episodes is not None and (
+        isinstance(total_episodes, bool)
+        or not isinstance(total_episodes, int)
+        or total_episodes < episode_count
+    ):
+        return None
+    return _TmdbSingleRegularSeasonEvidence(
+        season=season,
+        regular_episode_count=declared_count,
+        specials_episode_count=specials_count,
+        overflow_episode_count=overflow_count,
+    )
+
+
+@dataclass(frozen=True)
+class _TmdbMergedSeasonEvidence:
+    """TMDB proof for a whole-series counter spanning multiple seasons.
+
+    A release that keeps counting ``01..N`` across seasons (``01..24`` season
+    1, ``25..48`` season 2) is one complete unqualified run whose N equals the
+    sum of every positive published season.  ``boundaries`` is the ordered
+    ``(season_number, episode_count)`` list that lets F split the run.
+    """
+
+    boundaries: tuple[tuple[int, int], ...]
+
+
+def _merged_multi_season_evidence(
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    episode_count: int,
+) -> _TmdbMergedSeasonEvidence | None:
+    """Prove a whole-series counter spans every published positive season."""
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+    except Exception:
+        return None
+    if not isinstance(show, Mapping):
+        return None
+    raw_seasons = show.get("seasons")
+    if not isinstance(raw_seasons, list) or not raw_seasons:
+        return None
+    positives: list[tuple[int, int]] = []
+    for row in raw_seasons:
+        if not isinstance(row, Mapping):
+            return None
+        raw_season = row.get("season_number")
+        raw_count = row.get("episode_count")
+        if (
+            isinstance(raw_season, bool)
+            or not isinstance(raw_season, int)
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_season < 0
+            or raw_count < 0
+        ):
+            return None
+        if raw_season > 0 and raw_count > 0:
+            positives.append((raw_season, raw_count))
+    if len(positives) < 2:
+        return None
+    positives.sort(key=lambda pair: pair[0])
+    if sum(count for _season, count in positives) != episode_count:
+        return None
+    return _TmdbMergedSeasonEvidence(tuple(positives))
+
+
+def prove_single_season_episode_evidence(
+    alist: object,
+    state_root: Any,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    *,
+    evidence_kind: str,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    tmdb_client: object | None,
+) -> SingleSeasonEpisodeProof | None:
+    """Prove one strict unqualified TV run is a complete TMDB season.
+
+    ``evidence_kind`` selects a deliberately finite parsing grammar (bare E,
+    pure brackets, exact naked numeric stems, or a homogeneous release-dash
+    title prefix).  Every allowed grammar still requires a fresh B snapshot
+    match, all required source videos to form one unique contiguous 1..N run,
+    and TMDB detail/catalog to prove exactly one positive season of the same
+    N.  It is reusable by D and F so a D proof cannot silently turn into an
+    unverified writer default.
+    """
+    if evidence_kind not in _SINGLE_SEASON_EPISODE_EVIDENCE_KINDS:
+        return None
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    if record.identity_status != "confirmed" or str(identity.get("media_type")) != "tv":
+        return None
+    raw_tmdb_id = identity.get("tmdb_id")
+    if isinstance(raw_tmdb_id, bool):
+        return None
+    try:
+        tmdb_id = int(raw_tmdb_id)
+    except (TypeError, ValueError):
+        return None
+    if tmdb_id <= 0:
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None or not _fresh_scopes_match_snapshot(alist, snapshot, record):
+        return None
+    try:
+        root = build_source_inventory(snapshot["rows"], snapshot["root"])
+        scoped = build_scoped_source_node(
+            root,
+            record.source_paths,
+            boundary_key=record.boundary_key,
+            display_label=record.display_label,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    episode_numbers = _single_season_episode_numbers(
+        scoped,
+        evidence_kind=evidence_kind,
+    )
+    if episode_numbers is None:
+        return None
+    season_evidence = _single_positive_tmdb_season(
+        tmdb_client,
+        tmdb_id=tmdb_id,
+        episode_count=len(episode_numbers),
+    )
+    if season_evidence is None:
+        merged = _merged_multi_season_evidence(
+            tmdb_client,
+            tmdb_id=tmdb_id,
+            episode_count=len(episode_numbers),
+        )
+        if merged is None or not callable(episode_catalog):
+            return None
+        boundaries = merged.boundaries
+        merged_tokens = tuple(
+            f"S{season:02d}E{episode:02d}"
+            for season, count in boundaries
+            for episode in range(1, count + 1)
+        )
+        return SingleSeasonEpisodeProof(
+            tmdb_id=tmdb_id,
+            season=boundaries[0][0],
+            episode_count=len(episode_numbers),
+            episode_tokens=merged_tokens,
+            evidence_kind=evidence_kind,
+            season_boundaries=boundaries,
+        )
+    if not callable(episode_catalog):
+        return None
+    season = season_evidence.season
+    regular_count = season_evidence.regular_episode_count
+    overflow_count = season_evidence.overflow_episode_count
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if any(
+        isinstance(key, bool) or not isinstance(key, int)
+        for key in payload
+    ):
+        return None
+    # A multi-season show's catalog legitimately carries every season; the
+    # proof only needs the one target season to be present and to match the
+    # complete ``1..N`` run.  Extra published seasons do not invalidate it.
+    if season not in payload:
+        return None
+    rows = payload.get(season)
+    if (
+        not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes, bytearray))
+        or len(rows) != regular_count
+    ):
+        return None
+    catalog_numbers: list[int] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return None
+        raw_season = row.get("season_number")
+        number = _positive_season(row.get("episode_number"))
+        if raw_season != season or number is None:
+            return None
+        catalog_numbers.append(number)
+    expected_numbers = tuple(range(1, regular_count + 1))
+    if tuple(sorted(catalog_numbers)) != expected_numbers or len(set(catalog_numbers)) != len(catalog_numbers):
+        return None
+    if 0 in payload:
+        special_rows = payload.get(0)
+        special_count = season_evidence.specials_episode_count
+        if (
+            special_count is None
+            or not isinstance(special_rows, Sequence)
+            or isinstance(special_rows, (str, bytes, bytearray))
+            or len(special_rows) != special_count
+        ):
+            return None
+        special_numbers: list[int] = []
+        for row in special_rows:
+            if not isinstance(row, Mapping):
+                return None
+            if row.get("season_number") != 0:
+                return None
+            number = _positive_season(row.get("episode_number"))
+            if number is None:
+                return None
+            special_numbers.append(number)
+        if (
+            tuple(sorted(special_numbers)) != tuple(range(1, special_count + 1))
+            or len(set(special_numbers)) != len(special_numbers)
+        ):
+            return None
+    tokens = tuple(
+        f"S{season:02d}E{episode:02d}"
+        for episode in episode_numbers[:regular_count]
+    ) + tuple(
+        f"S00E{index:02d}"
+        for index in range(1, overflow_count + 1)
+    )
+    return SingleSeasonEpisodeProof(
+        tmdb_id=tmdb_id,
+        season=season,
+        episode_count=len(episode_numbers),
+        episode_tokens=tokens,
+        evidence_kind=evidence_kind,
+    )
+
+
+def prove_physical_special_single_season_evidence(
+    alist: object,
+    state_root: Any,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    *,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    tmdb_client: object | None,
+) -> SingleSeasonEpisodeProof | None:
+    """Prove a separately catalogued OAD/OVA/OAV work without guessing S00.
+
+    The source must be a complete single-family physical-special run.  TMDB
+    must then prove that the *selected work itself* has exactly one positive
+    season of the same size and an official matching physical marker.  The
+    persisted proof turns only those source SP keys into regular coordinates
+    for D/F; it never maps an OAD ordinal to an unrelated parent Season 00.
+    """
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    if record.identity_status != "confirmed" or str(identity.get("media_type")) != "tv":
+        return None
+    raw_tmdb_id = identity.get("tmdb_id")
+    if isinstance(raw_tmdb_id, bool):
+        return None
+    try:
+        tmdb_id = int(raw_tmdb_id)
+    except (TypeError, ValueError):
+        return None
+    if tmdb_id <= 0:
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None or not _fresh_scopes_match_snapshot(alist, snapshot, record):
+        return None
+    try:
+        root = build_source_inventory(snapshot["rows"], snapshot["root"])
+        scoped = build_scoped_source_node(
+            root,
+            record.source_paths,
+            boundary_key=record.boundary_key,
+            display_label=record.display_label,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    markers, numbers, count, complete = physical_special_marker_evidence(scoped)
+    if not complete or count is None or not markers or not numbers:
+        return None
+    official = physical_special_candidate_evidence(
+        tmdb_client,
+        tmdb_id=tmdb_id,
+        source_markers=markers,
+        source_episode_count=count,
+    )
+    if not (
+        official.get("special_detail_checked") is True
+        and official.get("official_special_count_match") is True
+        and official.get("official_special_marker_hits")
+    ):
+        return None
+    season = _positive_season(official.get("official_special_season"))
+    if season is None or not callable(episode_catalog):
+        return None
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping) or set(payload) != {season}:
+        return None
+    rows = payload.get(season)
+    if (
+        not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes, bytearray))
+        or len(rows) != count
+    ):
+        return None
+    catalog_numbers: list[int] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("season_number") != season:
+            return None
+        number = _positive_season(row.get("episode_number"))
+        if number is None:
+            return None
+        catalog_numbers.append(number)
+    expected_numbers = tuple(range(1, count + 1))
+    if tuple(sorted(catalog_numbers)) != expected_numbers or len(set(catalog_numbers)) != count:
+        return None
+    return SingleSeasonEpisodeProof(
+        tmdb_id=tmdb_id,
+        season=season,
+        episode_count=count,
+        episode_tokens=tuple(
+            f"S{season:02d}E{episode:02d}"
+            for episode in expected_numbers
+        ),
+        evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+    )
+
+
+def prove_bare_episode_single_season(
+    alist: object,
+    state_root: Any,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    *,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    tmdb_client: object | None,
+) -> SingleSeasonEpisodeProof | None:
+    """Compatibility wrapper for the strict naked-``E##`` proof."""
+    return prove_single_season_episode_evidence(
+        alist,
+        state_root,
+        root_task_id,
+        record,
+        evidence_kind=_BARE_EPISODE_EVIDENCE_KIND,
+        episode_catalog=episode_catalog,
+        tmdb_client=tmdb_client,
+    )
+
+
+def prove_bracketed_episode_single_season(
+    alist: object,
+    state_root: Any,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    *,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    tmdb_client: object | None,
+) -> SingleSeasonEpisodeProof | None:
+    """Prove a strict pure-bracket ``[01]`` run as one TMDB season."""
+    return prove_single_season_episode_evidence(
+        alist,
+        state_root,
+        root_task_id,
+        record,
+        evidence_kind=_BRACKETED_EPISODE_EVIDENCE_KIND,
+        episode_catalog=episode_catalog,
+        tmdb_client=tmdb_client,
+    )
 
 
 def reconcile_root_work_units(
@@ -279,6 +1762,8 @@ def reconcile_root_work_units(
     root_task_id: str,
     *,
     known_gap_tokens_by_identity: Mapping[tuple[str, int], Sequence[str]] | None = None,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None = None,
+    tmdb_client: object | None = None,
 ) -> list[WorkUnitRecord]:
     """Run the D step for one root task and persist each unit's decision.
 
@@ -299,10 +1784,33 @@ def reconcile_root_work_units(
     }
     index = build_library_index(alist, media_root)
     node = build_source_inventory(snapshot["rows"], snapshot["root"])
-    nodes_by_path = {candidate.path: candidate for candidate in _iter_nodes(node)}
+    nodes_by_path = {
+        candidate.path.rstrip("/"): candidate
+        for candidate in iter_source_nodes(node)
+    }
     known = known_gap_tokens_by_identity or {}
     updated: list[WorkUnitRecord] = []
     for record in records:
+        if record.requires_content_expansion:
+            # Do not let a stale/forged D verdict reach an E lane that could
+            # archive, hold, or merge an opaque disc image.  C/U normally
+            # establishes this fact; D repeats the barrier defensively.
+            updated.append(replace(
+                record,
+                identity_status="uncertain",
+                identity=None,
+                candidate_identities=(),
+                reconciliation_outcome=None,
+                matched_work_root=None,
+                reconciliation_evidence=None,
+                uncovered_tokens=(),
+                lane_status=None,
+                lane_detail=None,
+                gap_status=None,
+                gap_detail=None,
+                attention=DISC_IMAGE_INSPECTION_REQUIRED,
+            ))
+            continue
         if record.reconciliation_outcome is not None:
             previous = acceptance.get(record.work_unit_id)
             if previous is not None and previous.outcome == "failed":
@@ -310,6 +1818,7 @@ def reconcile_root_work_units(
                     record,
                     reconciliation_outcome=None,
                     matched_work_root=None,
+                    reconciliation_evidence=None,
                     uncovered_tokens=(),
                 )
             else:
@@ -319,21 +1828,161 @@ def reconcile_root_work_units(
             updated.append(record)
             continue
         identity = record.identity or {}
+        season_proof: SingleSeasonEpisodeProof | None = None
         try:
             media_type = str(identity["media_type"])
-            tmdb_id = int(identity["tmdb_id"])
-            decision = decide_reconciliation(
-                index,
-                media_type=media_type,
-                tmdb_id=tmdb_id,
-                unit_tokens=_unit_episode_tokens(
-                    nodes_by_path.get(record.source_paths[0])
-                    if record.source_paths else None
-                ),
-                known_gap_tokens=frozenset(
-                    str(token) for token in known.get((media_type, tmdb_id), ())
-                ),
+            raw_tmdb_id = identity["tmdb_id"]
+            if isinstance(raw_tmdb_id, bool):
+                raise ValueError("TMDB ID 无效")
+            tmdb_id = int(raw_tmdb_id)
+            if media_type not in {"movie", "tv"} or tmdb_id <= 0:
+                raise ValueError("媒体身份类型或 TMDB ID 无效")
+            scoped_node = build_scoped_source_node(
+                node,
+                record.source_paths,
+                boundary_key=record.boundary_key,
+                display_label=record.display_label,
             )
+            default_season = _default_season_for_record(record)
+            unit_tokens = _unit_episode_tokens(
+                scoped_node,
+                default_season=default_season,
+            )
+            physical_special_proof = (
+                prove_physical_special_single_season_evidence(
+                    alist,
+                    state_root,
+                    root_task_id,
+                    record,
+                    episode_catalog=episode_catalog,
+                    tmdb_client=tmdb_client,
+                )
+                if (
+                    media_type == "tv"
+                    and _has_video(scoped_node)
+                    and default_season is None
+                )
+                else None
+            )
+            has_bare_episode = _contains_bare_regular_episode(scoped_node)
+            has_bracketed_episode = _contains_bracketed_regular_episode(scoped_node)
+            has_naked_numeric_episode = _contains_naked_numeric_episode(scoped_node)
+            has_release_dash_episode = _contains_release_dash_episode(scoped_node)
+            if physical_special_proof is not None:
+                season_proof = physical_special_proof
+                unit_tokens = frozenset(season_proof.episode_tokens)
+                decision = None
+            elif (
+                media_type == "tv"
+                and _has_video(scoped_node)
+                and default_season is None
+                and (
+                    has_bare_episode
+                    or has_bracketed_episode
+                    or has_naked_numeric_episode
+                    or has_release_dash_episode
+                )
+            ):
+                # A mixed root (bare E01 beside [02], S01E03/SP/unknown
+                # video) must not let one fragment manufacture Sxx tokens for
+                # the rest.  Only one complete, fresh, catalog-backed proof
+                # grammar may supply the coordinates used by D.  Exact naked
+                # numeric stems (01.mp4…N.mp4) and homogeneous
+                # ``Title - 01`` release runs are separate grammars; neither
+                # becomes evidence merely because a title was found.
+                grammar_count = sum(
+                    (
+                        has_bare_episode,
+                        has_bracketed_episode,
+                        has_naked_numeric_episode,
+                        has_release_dash_episode,
+                    )
+                )
+                if grammar_count != 1:
+                    decision = ReconciliationDecision(
+                        "uncertain", None, None,
+                        (
+                            "TV 来源混合了不同的无季号集号格式；"
+                            "不能安全判定重复",
+                        ),
+                    )
+                else:
+                    if has_bare_episode:
+                        evidence_kind = _BARE_EPISODE_EVIDENCE_KIND
+                    elif has_bracketed_episode:
+                        evidence_kind = _BRACKETED_EPISODE_EVIDENCE_KIND
+                    elif has_naked_numeric_episode:
+                        evidence_kind = _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND
+                    else:
+                        evidence_kind = _RELEASE_DASH_EPISODE_EVIDENCE_KIND
+                    season_proof = prove_single_season_episode_evidence(
+                        alist,
+                        state_root,
+                        root_task_id,
+                        record,
+                        evidence_kind=evidence_kind,
+                        episode_catalog=episode_catalog,
+                        tmdb_client=tmdb_client,
+                    )
+                    if season_proof is None:
+                        evidence_label = single_season_episode_evidence_label(
+                            evidence_kind
+                        )
+                        decision = ReconciliationDecision(
+                            "uncertain", None, None,
+                            (
+                                f"TV {evidence_label}未能证明为完整唯一的 "
+                                "TMDB 正季；不能安全判定重复",
+                            ),
+                        )
+                    else:
+                        unit_tokens = frozenset(season_proof.episode_tokens)
+                        decision = None
+            else:
+                decision = None
+            if decision is not None:
+                pass
+            elif media_type == "tv" and _has_video(scoped_node) and not unit_tokens:
+                decision = ReconciliationDecision(
+                    "uncertain", None, None,
+                    ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
+                )
+            else:
+                empty_seasons = (
+                    _declared_empty_seasons(record, nodes_by_path)
+                    if media_type == "tv"
+                    else ()
+                )
+                if empty_seasons is None:
+                    decision = ReconciliationDecision(
+                        "uncertain", None, None,
+                        ("声明季与来源目录无法一一核对，不能安全推导空季缺口",),
+                    )
+                else:
+                    catalog_tokens = _catalog_tokens_for_seasons(
+                        episode_catalog,
+                        tmdb_id=tmdb_id,
+                        seasons=empty_seasons,
+                    )
+                    if catalog_tokens is None:
+                        decision = ReconciliationDecision(
+                            "uncertain", None, None,
+                            ("声明的空季缺少可核对的官方季集证据",),
+                        )
+                    else:
+                        decision = decide_reconciliation(
+                            index,
+                            media_type=media_type,
+                            tmdb_id=tmdb_id,
+                            unit_tokens=unit_tokens,
+                            known_gap_tokens=(
+                                frozenset(
+                                    str(token)
+                                    for token in known.get((media_type, tmdb_id), ())
+                                )
+                                | catalog_tokens
+                            ),
+                        )
         except (KeyError, TypeError, ValueError) as exc:
             decision = ReconciliationDecision(
                 "uncertain", None, None, (f"单元身份记录无效: {exc}",),
@@ -342,6 +1991,9 @@ def reconcile_root_work_units(
             record,
             reconciliation_outcome=decision.outcome,
             matched_work_root=decision.work_root,
+            reconciliation_evidence=(
+                season_proof.as_dict() if season_proof is not None else None
+            ),
             uncovered_tokens=(
                 tuple(sorted(decision.uncovered_tokens))
                 if decision.outcome == "existing_gap"
@@ -359,6 +2011,8 @@ def reconcile_root_work_units(
 
 __all__ = [
     "FORMAL_SHELF_SEGMENTS",
+    "BareEpisodeSeasonProof",
+    "SingleSeasonEpisodeProof",
     "IndexedWork",
     "LibraryIndex",
     "OUTCOMES",
@@ -366,5 +2020,11 @@ __all__ = [
     "SHELF_BY_SEGMENT",
     "build_library_index",
     "decide_reconciliation",
+    "prove_bracketed_episode_single_season",
+    "prove_bare_episode_single_season",
+    "prove_physical_special_single_season_evidence",
+    "prove_single_season_episode_evidence",
     "reconcile_root_work_units",
+    "release_dash_episode_source_ordinals",
+    "single_season_episode_evidence_label",
 ]

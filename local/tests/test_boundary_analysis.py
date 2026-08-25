@@ -45,6 +45,11 @@ class TestClassifyObjectType(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(classify_object_type(name), "video")
 
+    def test_disc_image_is_not_classified_as_video(self) -> None:
+        for name in ("disc.iso", "disc.img", "disc.cue", "track.bin"):
+            with self.subTest(name=name):
+                self.assertEqual(classify_object_type(name), "disc_image")
+
     def test_subtitle_extensions(self) -> None:
         for name in ("sub.srt", "sub.ass", "sub.ssa"):
             with self.subTest(name=name):
@@ -399,6 +404,155 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_multiseason_root_splits_generic_nested_film_collection(self) -> None:
+        """Season folders and a generic film group own disjoint WorkUnits.
+
+        This covers a normal series root which carries its own ``SP`` material
+        alongside a ``剧场版`` folder.  The nested titles must not be handed to
+        the TV planner as if they were episodes of the main work.
+        """
+        root = "/quark/影视/待刮削/Example Show"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "S01",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "Example.Show.S01E01.mkv",
+                            "is_dir": False,
+                            "size": 1_073_741_824,
+                        },
+                    ],
+                },
+                {
+                    "name": "S02",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "Example.Show.S02E01.mkv",
+                            "is_dir": False,
+                            "size": 1_073_741_824,
+                        },
+                    ],
+                },
+                {
+                    "name": "SP",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "Example.Show.S00E01.mkv",
+                            "is_dir": False,
+                            "size": 536_870_912,
+                        },
+                    ],
+                },
+                {
+                    "name": "剧场版",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "Example Feature (2019)",
+                            "is_dir": True,
+                            "children": [
+                                {
+                                    "name": "Example.Feature.2019.mkv",
+                                    "is_dir": False,
+                                    "size": 2_147_483_648,
+                                },
+                            ],
+                        },
+                        {
+                            "name": "Example Reminiscence (2021)",
+                            "is_dir": True,
+                            "children": [
+                                {
+                                    "name": "Example.Reminiscence.2021.mkv",
+                                    "is_dir": False,
+                                    "size": 2_147_483_648,
+                                },
+                                {
+                                    "name": "Example.Reminiscence.Promo.mkv",
+                                    "is_dir": False,
+                                    "size": 67_108_864,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 3)
+        tv = next(candidate for candidate in candidates if candidate.display_label == "Example Show")
+        self.assertEqual(tv.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+        self.assertEqual(tv.proposed_media_context, "tv")
+        self.assertEqual(tv.source_paths, (f"{root}/S01", f"{root}/S02", f"{root}/SP"))
+        # SP is auxiliary; only explicit S01/S02 folders contribute claims.
+        self.assertEqual(tv.claimed_seasons, (1, 2))
+
+        films = [candidate for candidate in candidates if candidate is not tv]
+        self.assertEqual(
+            {candidate.source_paths for candidate in films},
+            {
+                (f"{root}/剧场版/Example Feature (2019)",),
+                (f"{root}/剧场版/Example Reminiscence (2021)",),
+            },
+        )
+        self.assertTrue(all(
+            candidate.boundary_evidence.role == DirectoryRole.MOVIE_COLLECTION
+            for candidate in films
+        ))
+        all_scopes = [scope for candidate in candidates for scope in candidate.source_paths]
+        for left in all_scopes:
+            for right in all_scopes:
+                if left != right:
+                    self.assertFalse(left.startswith(right + "/"))
+
+    def test_multiseason_root_with_unknown_video_branch_stays_whole(self) -> None:
+        """A non-generic nested branch cannot be silently treated as films."""
+        root = "/quark/影视/待刮削/Example Show"
+        fixture = {
+            "root": root,
+            "children": [
+                *[
+                    {
+                        "name": f"S{season:02d}",
+                        "is_dir": True,
+                        "children": [
+                            {
+                                "name": f"Example.Show.S{season:02d}E01.mkv",
+                                "is_dir": False,
+                                "size": 1_073_741_824,
+                            },
+                        ],
+                    }
+                    for season in (1, 2)
+                ],
+                {
+                    "name": "Aftershow",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": f"Aftershow.E{episode:02d}.mkv",
+                            "is_dir": False,
+                            "size": 536_870_912,
+                        }
+                        for episode in (1, 2)
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source_paths, (root,))
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
     def test_empty_directory_returns_uncertain(self) -> None:
         fixture = {
             "root": "/quark/影视/待刮削/EmptyDir",
@@ -408,6 +562,39 @@ class TestSyntheticCases(unittest.TestCase):
         candidates = analyze_boundaries(node, root_task_id="t")
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.UNCERTAIN)
+
+    def test_optical_disc_images_park_the_whole_source_until_read_only_expansion(self) -> None:
+        """Image filenames must not invent season/title boundaries or video rows."""
+        fixture = {
+            "root": "/quark/影视/待刮削/Disc bundle",
+            "children": [
+                {
+                    "name": "Season 01",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Disc 1.iso", "is_dir": False, "size": 45 * 1024**3},
+                        {"name": "Disc 2.iso", "is_dir": False, "size": 45 * 1024**3},
+                    ],
+                },
+                {
+                    "name": "Season 02",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Disc 1.iso", "is_dir": False, "size": 45 * 1024**3},
+                    ],
+                },
+            ],
+        }
+        node = self._node(fixture)
+        self.assertEqual(count_video_files(node), 0)
+        candidates = analyze_boundaries(node, root_task_id="disc-root")
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.boundary_evidence.role, DirectoryRole.UNCERTAIN)
+        self.assertEqual(candidate.proposed_media_context, "unknown")
+        self.assertTrue(candidate.requires_content_expansion)
+        self.assertEqual(candidate.source_paths, (node.path,))
+        self.assertIn("光盘镜像", candidate.boundary_evidence.reasons[0])
 
     def test_chinese_season_dir_is_season(self) -> None:
         """'第1季' and similar Chinese patterns must match the season rule."""
@@ -420,6 +607,35 @@ class TestSyntheticCases(unittest.TestCase):
         node = self._node(fixture)
         candidates = analyze_boundaries(node, root_task_id="t")
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SEASON)
+
+    def test_chinese_numeral_season_dir_is_season(self) -> None:
+        """Bounded Chinese cardinal season labels are structural evidence."""
+        for label, expected in (("第一季", 1), ("第十一季", 11), ("第二十一季", 21)):
+            with self.subTest(label=label):
+                fixture = {
+                    "root": f"/quark/影视/待刮削/某剧/{label}",
+                    "children": [
+                        {
+                            "name": f"Example.Show.S{expected:02d}E01.mkv",
+                            "is_dir": False,
+                            "size": 1_073_741_824,
+                        },
+                    ],
+                }
+                candidate = analyze_boundaries(self._node(fixture), root_task_id="t")[0]
+                self.assertEqual(candidate.boundary_evidence.role, DirectoryRole.SEASON)
+
+    def test_malformed_chinese_season_label_is_not_a_season(self) -> None:
+        for label in ("第十百季", "第十零季", "第零十季"):
+            with self.subTest(label=label):
+                fixture = {
+                    "root": f"/quark/影视/待刮削/某剧/{label}",
+                    "children": [
+                        {"name": "Example.Show.S01E01.mkv", "is_dir": False, "size": 1_073_741_824},
+                    ],
+                }
+                candidate = analyze_boundaries(self._node(fixture), root_task_id="t")[0]
+                self.assertEqual(candidate.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
     def test_s01_dir_is_season(self) -> None:
         fixture = {
@@ -458,6 +674,229 @@ class TestSyntheticCases(unittest.TestCase):
         ids1 = {c.work_unit_id for c in c1}
         ids2 = {c.work_unit_id for c in c2}
         self.assertEqual(ids1, ids2)
+
+    def test_decorated_multi_season_cohort_keeps_aftershow_separate(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind Bundle",
+            "children": [
+                *[
+                    {
+                        "name": (
+                            f"Northwind.Show.S{season:02d}."
+                            f"{'Blu-ray' if season < 3 else 'WEB-DL'}.x265"
+                        ),
+                        "is_dir": True,
+                        "children": [
+                            {
+                                "name": f"Northwind.Show.S{season:02d}E01.1080p.mkv",
+                                "is_dir": False,
+                                "size": 1073741824,
+                            },
+                        ],
+                    }
+                    for season in (1, 2, 3)
+                ],
+                {
+                    "name": "Northwind.Show.S04.WEB-DL.x265",
+                    "is_dir": True,
+                    "children": [],
+                },
+                {
+                    "name": "Northwind.Aftershow",
+                    "is_dir": True,
+                    "children": [
+                        {"name": f"Northwind.Aftershow.E{episode:02d}.mkv", "is_dir": False, "size": 10}
+                        for episode in range(1, 7)
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 2)
+        cohort = next(candidate for candidate in candidates if len(candidate.source_paths) == 4)
+        aftershow = next(candidate for candidate in candidates if candidate is not cohort)
+        self.assertEqual(cohort.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+        self.assertEqual(cohort.claimed_seasons, (1, 2, 3, 4))
+        self.assertEqual(
+            cohort.source_paths,
+            tuple(
+                (
+                    f"/quark/影视/待刮削/Northwind Bundle/Northwind.Show.S{season:02d}."
+                    f"{'Blu-ray' if season < 3 else 'WEB-DL'}.x265"
+                )
+                for season in range(1, 5)
+            ),
+        )
+        self.assertEqual(aftershow.source_paths, ("/quark/影视/待刮削/Northwind Bundle/Northwind.Aftershow",))
+        self.assertEqual(set(cohort.source_paths).intersection(aftershow.source_paths), set())
+
+    def test_decorated_duplicate_season_editions_fail_closed_without_cohort(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind Bundle",
+            "children": [
+                *[
+                    {
+                        "name": f"Northwind.Show.S01.{release}",
+                        "is_dir": True,
+                        "children": [
+                            {"name": "Northwind.Show.S01E01.mkv", "is_dir": False, "size": 10},
+                        ],
+                    }
+                    for release in ("1080p", "2160p")
+                ],
+                {
+                    "name": "Northwind.Show.S02.1080p",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Northwind.Show.S02E01.mkv", "is_dir": False, "size": 10},
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(len(candidate.source_paths) == 1 for candidate in candidates))
+        self.assertTrue(all(candidate.claimed_seasons == () for candidate in candidates))
+
+    def test_decorated_stale_empty_season_is_not_claimed_as_a_gap(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind Bundle",
+            "children": [
+                {"name": "Northwind.Show.S01.WEB-DL", "is_dir": True, "children": []},
+                *[
+                    {
+                        "name": f"Northwind.Show.S{season:02d}.WEB-DL",
+                        "is_dir": True,
+                        "children": [
+                            {"name": f"Northwind.Show.S{season:02d}E01.mkv", "is_dir": False, "size": 10},
+                        ],
+                    }
+                    for season in (2, 3)
+                ],
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].claimed_seasons, (2, 3))
+        self.assertNotIn(
+            "/quark/影视/待刮削/Northwind Bundle/Northwind.Show.S01.WEB-DL",
+            candidates[0].source_paths,
+        )
+
+    def test_rooted_decorated_subtitle_only_season_is_a_proven_claim(self) -> None:
+        """A declared in-between season may be retained only with exact sidecars.
+
+        The root has ordinary qualified video evidence for several seasons and
+        a Chinese decorated Season 06 directory containing a complete S06E
+        subtitle sequence but no video.  B/W must keep one root-owned TV unit
+        and preserve the declared empty season for J; it must not turn the
+        subtitle directory into a second work or infer an arbitrary season.
+        """
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind Root",
+            "children": [
+                *[
+                    {
+                        "name": f"第 {season} 季 - 1080p BluRay REMUX",
+                        "is_dir": True,
+                        "children": (
+                            [
+                                {
+                                    "name": f"Northwind.Show.S{season:02d}E01.mkv",
+                                    "is_dir": False,
+                                    "size": 1_073_741_824,
+                                },
+                            ]
+                            if season != 6
+                            else [
+                                {
+                                    "name": f"Northwind.Show.S06E{episode:02d}.sup",
+                                    "is_dir": False,
+                                    "size": 1_024,
+                                }
+                                for episode in range(1, 11)
+                            ]
+                        ),
+                    }
+                    for season in range(1, 9)
+                ],
+                *[
+                    {
+                        "name": f"S09E{episode:02d}.mkv",
+                        "is_dir": False,
+                        "size": 1_073_741_824,
+                    }
+                    for episode in range(1, 11)
+                ],
+                {
+                    "name": "第 99 季 - 1080p BluRay REMUX",
+                    "is_dir": True,
+                    "children": [{
+                        "name": "Northwind.Show.S99E01.sup",
+                        "is_dir": False,
+                        "size": 1_024,
+                    }],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+        self.assertEqual(candidate.source_paths, (fixture["root"],))
+        self.assertEqual(candidate.claimed_seasons, tuple(range(1, 10)))
+
+    def test_decorated_subtitle_only_season_needs_two_video_anchors(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind Root",
+            "children": [
+                {
+                    "name": "第 1 季 - 1080p BluRay REMUX",
+                    "is_dir": True,
+                    "children": [{
+                        "name": "Northwind.Show.S01E01.mkv",
+                        "is_dir": False,
+                        "size": 1_073_741_824,
+                    }],
+                },
+                {
+                    "name": "第 2 季 - 1080p BluRay REMUX",
+                    "is_dir": True,
+                    "children": [{
+                        "name": "Northwind.Show.S02E01.sup",
+                        "is_dir": False,
+                        "size": 1_024,
+                    }],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].claimed_seasons, ())
+
+    def test_chinese_decorated_episode_directory_is_not_a_season_boundary(self) -> None:
+        fixture = {
+            "root": "/quark/影视/待刮削/Northwind/第 1 季 S01E01",
+            "children": [{
+                "name": "Northwind.Show.S01E01.mkv",
+                "is_dir": False,
+                "size": 1_073_741_824,
+            }],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
 
 if __name__ == "__main__":

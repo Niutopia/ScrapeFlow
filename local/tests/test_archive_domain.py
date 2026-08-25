@@ -58,14 +58,35 @@ Encrypted = -
 ENCRYPTED_LISTING = LISTING.replace("Encrypted = -", "Encrypted = +")
 
 
+def iso9660_prefix() -> bytes:
+    """Small non-mountable ISO-9660 signature fixture for magic tests."""
+
+    data = bytearray(16 * 2048 + 7)
+    data[16 * 2048] = 1
+    data[16 * 2048 + 1:16 * 2048 + 6] = b"CD001"
+    data[16 * 2048 + 6] = 1
+    return bytes(data)
+
+
+def udf_prefix() -> bytes:
+    """Small UDF VRS fixture: NSR02 at the fixed sector descriptor slot."""
+
+    data = bytearray(17 * 2048 + 6)
+    data[16 * 2048 + 1:16 * 2048 + 6] = b"BEA01"
+    data[17 * 2048 + 1:17 * 2048 + 6] = b"NSR02"
+    return bytes(data)
+
+
 class FakeRunner:
     def __init__(self, listing: str = LISTING):
         self.listing = listing
         self.calls: list[tuple[tuple[str, ...], str]] = []
+        self.timeouts: list[float] = []
 
     def run(self, args, *, password="", cwd=None, timeout=0):
-        del cwd, timeout
+        del cwd
         self.calls.append((tuple(args), password))
+        self.timeouts.append(timeout)
         if args[0] == "l":
             return RunnerResult(0, self.listing, "")
         if args[0] == "x":
@@ -122,6 +143,31 @@ class FakeRemoteSource:
         destination.write_bytes(self.payload)
 
 
+class FakeRemoteImageSource:
+    """A bounded remote ISO source used without any mount-capable port."""
+
+    def __init__(self, payload: bytes, *, name: str = "feature.iso"):
+        self.payload = payload
+        self.name = name
+        self.downloads: list[str] = []
+
+    def list(self, path):
+        if path != "/incoming":
+            raise AssertionError(path)
+        return [{"name": self.name, "is_dir": False, "size": len(self.payload)}]
+
+    def read_prefix(self, path, *, max_bytes):
+        if path != f"/incoming/{self.name}":
+            raise AssertionError(path)
+        return self.payload[:max_bytes]
+
+    def download(self, path, destination, *, expected_size):
+        if path != f"/incoming/{self.name}" or expected_size != len(self.payload):
+            raise AssertionError(path)
+        self.downloads.append(path)
+        destination.write_bytes(self.payload)
+
+
 class ArchiveDomainTests(unittest.TestCase):
     def test_magic_detects_archive_media_and_mz_without_execution(self):
         self.assertTrue(detect_magic(b"7z\xbc\xaf'\x1canything").is_archive)
@@ -130,6 +176,259 @@ class ArchiveDomainTests(unittest.TestCase):
         self.assertTrue(
             detect_magic(b"MZ" + b"x" * 32 + b"PK\x03\x04payload").self_extracting
         )
+
+    def test_magic_recognizes_iso9660_and_udf_only_at_filesystem_offsets(self):
+        iso = detect_magic(iso9660_prefix(), filename="feature.exe")
+        self.assertEqual((iso.format, iso.kind, iso.offset), ("iso", "archive", 16 * 2048 + 1))
+        self.assertTrue(iso.is_disc_image)
+        self.assertTrue(iso.is_archive)
+
+        udf = detect_magic(udf_prefix(), filename="feature.img")
+        self.assertEqual((udf.format, udf.kind, udf.offset), ("udf", "archive", 17 * 2048 + 1))
+        self.assertTrue(udf.is_disc_image)
+
+        # These bytes are deliberately not at a volume-descriptor boundary.
+        self.assertEqual(detect_magic(b"prefix-CD001-not-an-image").kind, "unknown")
+
+    def test_iso_listing_uses_7z_without_mounting_the_image(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = root / "feature.iso"
+            image.write_bytes(iso9660_prefix())
+            listing = ArchiveInspector(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+            ).inspect(image)
+
+        self.assertEqual(listing.archive_format, "iso")
+        self.assertTrue(listing.selected_media)
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l"])
+        # The only external boundary is argv-based 7-Zip listing; no shell,
+        # mount command, or executable wrapper is ever invoked.
+        self.assertEqual(runner.calls[0][0][1:4], ("-slt", "-sccUTF-8", "-y"))
+
+    def test_udf_listing_uses_the_same_bounded_7z_lane(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "feature.udf"
+            image.write_bytes(udf_prefix())
+            listing = ArchiveInspector(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+            ).inspect(image)
+        self.assertEqual(listing.archive_format, "udf")
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l"])
+
+    def test_self_extracting_and_renamed_exe_containers_are_listed_not_run(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sfx = root / "release.exe"
+            sfx.write_bytes(b"MZ" + b"stub" * 8 + b"PK\x03\x04payload")
+            sfx_listing = ArchiveInspector(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+            ).inspect(sfx)
+
+            renamed_image = root / "disc.exe"
+            renamed_image.write_bytes(iso9660_prefix())
+            renamed_listing = ArchiveInspector(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+            ).inspect(renamed_image)
+
+            embedded_image = root / "disc-wrapper.exe"
+            embedded_image.write_bytes(b"MZ" + b"stub" * 8 + iso9660_prefix())
+            embedded_listing = ArchiveInspector(
+                runner,
+                limits=ArchiveLimits(min_free_bytes=0),
+            ).inspect(embedded_image)
+
+        self.assertEqual(sfx_listing.archive_format, "zip")
+        self.assertEqual(renamed_listing.archive_format, "iso")
+        self.assertEqual(embedded_listing.archive_format, "iso")
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l", "l", "l"])
+        self.assertTrue(all(args[0] == "l" for args, _password in runner.calls))
+
+    def test_real_executable_fails_closed_before_7z(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "real.exe"
+            executable.write_bytes(b"MZ\x90\x00a-real-pe-without-an-archive")
+            with self.assertRaises(ArchiveMagicError):
+                ArchiveInspector(
+                    runner,
+                    limits=ArchiveLimits(min_free_bytes=0),
+                ).inspect(executable)
+            # An executable containing an ISO-looking string without a full
+            # descriptor is still an executable, not an accepted container.
+            deceptive = bytearray(b"MZ" + b"stub" * 8 + b"\x00" * len(iso9660_prefix()))
+            marker = len(b"MZ" + b"stub" * 8) + 16 * 2048 + 1
+            deceptive[marker:marker + 5] = b"CD001"
+            self.assertEqual(detect_magic(bytes(deceptive)).kind, "executable")
+        self.assertEqual(runner.calls, [])
+
+    def test_iso_member_path_traversal_is_rejected_before_extraction(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        malicious_listing = """\
+Path = feature.iso
+Type = Iso
+
+----------
+Path = ../escape.m2ts
+Size = 4
+Attributes = A....
+"""
+        runner = FakeRunner(malicious_listing)
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "feature.iso"
+            image.write_bytes(iso9660_prefix())
+            with self.assertRaises(ArchivePathError):
+                ArchiveInspector(
+                    runner,
+                    limits=ArchiveLimits(min_free_bytes=0),
+                ).inspect(image)
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l"])
+
+    def test_disc_limits_are_independent_from_ordinary_archive_limits(self):
+        limits = ArchiveLimits(
+            max_archive_bytes=10,
+            max_expanded_bytes=10,
+            max_member_bytes=10,
+            max_disc_image_bytes=64,
+            max_disc_expanded_bytes=64,
+            max_disc_member_bytes=64,
+            min_free_bytes=0,
+        )
+        member = {"path": "BDMV/STREAM/00001.m2ts", "size": 32}
+        self.assertEqual(
+            validate_archive_members(
+                [member],
+                limits=limits,
+                archive_size=32,
+                archive_format="iso",
+            )[0].size,
+            32,
+        )
+        with self.assertRaises(ArchiveBudgetError):
+            validate_archive_members(
+                [member],
+                limits=limits,
+                archive_size=32,
+                archive_format="zip",
+            )
+        with self.assertRaises(ArchiveBudgetError):
+            validate_archive_members(
+                [{"path": "BDMV/STREAM/00001.m2ts", "size": 1}],
+                limits=limits,
+                archive_size=65,
+                archive_format="iso",
+            )
+
+    def test_disc_listing_uses_disc_timeout_and_source_budget(self):
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        runner = FakeRunner()
+        limits = ArchiveLimits(
+            max_archive_bytes=1024,
+            max_disc_image_bytes=64 * 1024,
+            command_timeout_seconds=1,
+            disc_command_timeout_seconds=2,
+            min_free_bytes=0,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "feature.iso"
+            image.write_bytes(iso9660_prefix())
+            ArchiveInspector(runner, limits=limits).inspect(image)
+            ordinary = Path(temp) / "ordinary.7z"
+            ordinary.write_bytes(b"7z\xbc\xaf'\x1c" + b"x" * (32 * 1024))
+            with self.assertRaises(ArchiveBudgetError):
+                ArchiveInspector(runner, limits=limits).inspect(ordinary)
+        self.assertEqual(runner.timeouts, [2])
+
+    def test_remote_iso_is_staged_only_after_fresh_disk_budget_check(self):
+        from collections import namedtuple
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        payload = iso9660_prefix()
+        source = FakeRemoteImageSource(payload)
+        DiskUsage = namedtuple("DiskUsage", "total used free")
+        with tempfile.TemporaryDirectory() as temp:
+            staging = Path(temp) / "archive-input"
+            with mock.patch(
+                "engine.scrapeflow.archive.shutil.disk_usage",
+                return_value=DiskUsage(total=len(payload), used=0, free=len(payload)),
+            ):
+                with self.assertRaises(ArchiveBudgetError):
+                    ArchiveInspector(
+                        FakeRunner(),
+                        limits=ArchiveLimits(min_free_bytes=1),
+                    ).inspect_remote(source, "/incoming/feature.iso", staging)
+            self.assertTrue(staging.is_dir())
+            self.assertEqual(list(staging.iterdir()), [])
+        self.assertEqual(source.downloads, [])
+
+    def test_remote_disc_rechecks_live_space_after_source_staging_before_extracting(self):
+        from collections import namedtuple
+        from engine.scrapeflow.archive import ArchiveInspector
+
+        payload = iso9660_prefix()
+        source = FakeRemoteImageSource(payload)
+        runner = FakeRunner()
+        DiskUsage = namedtuple("DiskUsage", "total used free")
+        limits = ArchiveLimits(min_free_bytes=1)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            input_root = root / "archive-input"
+            with mock.patch(
+                "engine.scrapeflow.archive.shutil.disk_usage",
+                return_value=DiskUsage(total=len(payload) * 2, used=0, free=len(payload) + 1),
+            ):
+                listing = ArchiveInspector(runner, limits=limits).inspect_remote(
+                    source,
+                    "/incoming/feature.iso",
+                    input_root,
+                )
+            # The source now occupies task staging.  A later free-space check
+            # must reject the selected member output before `7z x` starts.
+            with mock.patch(
+                "engine.scrapeflow.archive.shutil.disk_usage",
+                return_value=DiskUsage(total=100, used=99, free=1),
+            ):
+                with self.assertRaises(ArchiveBudgetError):
+                    ArchiveExtractor(
+                        runner,
+                        limits=limits,
+                        video_validator=lambda *_args: True,
+                    ).extract(listing, root / "selected-output")
+        self.assertEqual(source.downloads, ["/incoming/feature.iso"])
+        self.assertEqual([args[0] for args, _password in runner.calls], ["l"])
+
+    def test_archive_limits_environment_is_bounded_and_invalid_values_fail_closed(self):
+        limits = ArchiveLimits.from_environment({
+            "SCRAPEFLOW_ARCHIVE_MIN_FREE_BYTES": "17",
+            "SCRAPEFLOW_DISC_IMAGE_MAX_SOURCE_BYTES": "123",
+            "SCRAPEFLOW_DISC_IMAGE_COMMAND_TIMEOUT_SECONDS": "8.5",
+        })
+        self.assertEqual(limits.min_free_bytes, 17)
+        self.assertEqual(limits.max_disc_image_bytes, 123)
+        self.assertEqual(limits.disc_command_timeout_seconds, 8.5)
+        with self.assertRaises(ValueError):
+            ArchiveLimits.from_environment({"SCRAPEFLOW_DISC_IMAGE_MAX_SOURCE_BYTES": "many"})
+        with self.assertRaises(ValueError):
+            ArchiveLimits.from_environment({"SCRAPEFLOW_DISC_IMAGE_COMMAND_TIMEOUT_SECONDS": "nan"})
+        with self.assertRaises(ValueError):
+            Subprocess7zRunner(executable="7z", max_timeout_seconds=float("nan"))
 
     def test_member_paths_and_collision_are_fail_closed(self):
         for value in (

@@ -93,6 +93,36 @@ class RootAggregationTests(unittest.TestCase):
             self.assertEqual(aggregate.failed, 0)
             self.assertEqual(aggregate.open_gaps, 1)
             self.assertEqual(aggregate.closed_gaps, 1)
+            # Identity uncertainty remains the stronger root-level stop even
+            # when another accepted unit also has a replenishment Gap.
+            self.assertEqual(aggregate.status, "needs_attention")
+
+    def test_open_gap_is_not_a_completed_root_aggregate(self) -> None:
+        """H acceptance remains visible, but J/N keeps the root pending."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            unit = _unit("u1", identity_status="confirmed", outcome="new_work")
+            save_work_unit_records(state_root, "root-agg", [unit])
+            save_work_acceptance(state_root, "root-agg", [
+                WorkAcceptanceResult(
+                    work_unit_id="u1", outcome="accepted", writer_job_id="unit-u1",
+                    phase="executed", target_root="/library/番剧/Show",
+                    planned_files=1, error=None, recorded_at="2026-08-16T00:00:00Z",
+                ),
+            ])
+            discover_episode_gaps(
+                state_root, "root-agg", "u1",
+                media_type="tv", tmdb_id=1,
+                expected_by_season={1: [1, 2]},
+                actual_tokens=["S01E01"],
+            )
+
+            aggregate = aggregate_root_job(state_root, "root-agg")
+
+            self.assertEqual(aggregate.completed, 1)
+            self.assertEqual(aggregate.open_gaps, 1)
+            self.assertEqual(aggregate.status, "gaps_pending")
+            self.assertEqual(aggregate.as_dict()["status"], "gaps_pending")
 
     def test_public_projection_hides_internal_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

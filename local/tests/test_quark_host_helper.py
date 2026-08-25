@@ -16,7 +16,6 @@ from local.scrapeflow_api.quark_host_helper import (
     DOCKER_SIDECAR_CDP_HOST,
     DOCKER_SIDECAR_CDP_PORT,
     DOCKER_SIDECAR_CDP_URL,
-    HELPER_ACTIONS,
     PassiveQuarkCdp,
     QUARK_DRIVE_API,
     QuarkHelperConfig,
@@ -68,11 +67,6 @@ class FakeSession:
         self.share_result: object = {"status": "submitted", "task_id": "share-task-1"}
         self.calls: list[tuple[str, object]] = []
 
-    async def assert_authenticated(self) -> None:
-        self.calls.append(("health", None))
-        if self.ready_error is not None:
-            raise self.ready_error
-
     async def share_save(self, payload: object) -> object:
         self.calls.append(("share-save", payload))
         if isinstance(self.share_result, Exception):
@@ -111,33 +105,6 @@ class HelperValidationTests(unittest.TestCase):
         ):
             with self.subTest(root=root), self.assertRaises(QuarkHelperValidationError):
                 validate_staging_root(root)
-
-    def test_helper_accepts_only_media_root_derived_acceptance_staging(self) -> None:
-        media_root = "/quark/影视/ScrapeFlow/验收/run-20260811-e30a0b8"
-        staging_root = f"{media_root}/ScrapeFlow/补源"
-        self.assertEqual(validate_staging_root(staging_root), staging_root)
-        config = QuarkHelperConfig(
-            host="127.0.0.1",
-            port=18765,
-            token=TOKEN,
-            cdp_url="http://127.0.0.1:19222/json/list",
-            media_root=media_root,
-            staging_root=staging_root,
-            **ALIST_CONFIG,
-        )
-        self.assertEqual(config.media_root, media_root)
-        self.assertEqual(config.staging_root, staging_root)
-
-        with self.assertRaises(QuarkHelperValidationError):
-            QuarkHelperConfig(
-                host="127.0.0.1",
-                port=18765,
-                token=TOKEN,
-                cdp_url="http://127.0.0.1:19222/json/list",
-                media_root=media_root,
-                staging_root=DEFAULT_STAGING_ROOT,
-                **ALIST_CONFIG,
-            )
 
     def test_config_requires_explicit_safe_cdp_and_loopback_bind(self) -> None:
         with self.assertRaises(QuarkHelperValidationError):
@@ -315,41 +282,6 @@ class AListDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.storage_reads, 1)
         self.assertNotIn("nested-cookie", repr(delegated))
 
-    async def test_health_uses_a_fresh_delegated_cookie_and_root_not_renderer_fetch(self) -> None:
-        delegated = DelegatedQuarkSession(
-            mount_path="/quark/影视",
-            root_fid="delegated-root",
-            cookie="fixture-cookie",
-        )
-        resolver = mock.Mock()
-        resolver.resolve = mock.AsyncMock(return_value=delegated)
-        session = PassiveQuarkCdp(
-            cdp_url="http://127.0.0.1:19222/json/list",
-            staging_root=DEFAULT_STAGING_ROOT,
-            mount_path="/quark",
-            root_fid="0",
-            session_resolver=resolver,
-        )
-        response = {"kind": "response", "status": 200, "text": '{"code":0,"data":{}}'}
-        with mock.patch.object(session, "_probe_wsg_capabilities", new=mock.AsyncMock()), \
-             mock.patch.object(
-                 session, "_delegated_fixed_request", new=mock.AsyncMock(return_value=response)
-             ) as delegated_request, \
-             mock.patch.object(session, "_evaluate_json", new=mock.AsyncMock()) as renderer:
-            await session.assert_authenticated()
-
-        resolver.resolve.assert_awaited_once_with(DEFAULT_STAGING_ROOT)
-        delegated_request.assert_awaited_once_with(
-            delegated,
-            origin=QUARK_DRIVE_API,
-            path="/file/sort",
-            method="GET",
-            query={"pdir_fid": "delegated-root", "_page": 1, "_size": 1, "_fetch_total": 0},
-            body=None,
-        )
-        renderer.assert_not_awaited()
-        self.assertIsNone(session._delegated_session.get())
-
     async def test_delegated_https_read_keeps_cookie_in_memory_and_fixed_origin(self) -> None:
         captured: dict[str, object] = {}
 
@@ -458,21 +390,13 @@ class HelperHttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.request(method, self.url + path, **kwargs)
         return response.status, await response.json()
 
-    async def test_health_requires_bearer_and_proves_authenticated_existing_session(self) -> None:
+    async def test_health_requires_bearer_and_reports_liveness_only(self) -> None:
         status, body = await self.request("GET", "/health", token="wrong")
         self.assertEqual((status, body["error"]), (401, "unauthorized"))
         status, body = await self.request("GET", "/health")
         self.assertEqual(status, 200)
-        self.assertEqual(body["status"], "ready")
-        self.assertTrue(body["authenticated"])
-        self.assertEqual(body["actions"], list(HELPER_ACTIONS))
-        self.assertEqual(self.session.calls, [("health", None)])
-
-    async def test_idle_or_unauthenticated_renderer_is_not_ready(self) -> None:
-        self.session.ready_error = QuarkHelperNotReady("no existing renderer")
-        status, body = await self.request("GET", "/health")
-        self.assertEqual((status, body["error"]), (503, "quark_not_ready"))
-        self.assertNotIn("renderer", json.dumps(body))
+        self.assertEqual(body, {"status": "ok"})
+        self.assertEqual(self.session.calls, [])
 
     async def test_only_fixed_routes_are_available(self) -> None:
         status, body = await self.request("POST", "/v1/quark/request", body={})
@@ -765,42 +689,6 @@ class HelperReentryTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(QuarkHelperInDoubt):
                 await session.share_save(payload)
-
-    async def test_health_requires_passive_wsg_capabilities_before_session_readback(self) -> None:
-        session = PassiveQuarkCdp(
-            cdp_url="http://127.0.0.1:9222/json/list",
-            staging_root=DEFAULT_STAGING_ROOT,
-            mount_path="/quark",
-            root_fid="0",
-        )
-        with mock.patch.object(
-            session,
-            "_evaluate_json",
-            side_effect=[
-                {"kind": "wsg-capabilities", "encrypt": True, "decrypt": True},
-                {"kind": "response", "status": 200, "text": '{"code":0,"data":{"list":[]}}'},
-            ],
-        ) as evaluate:
-            await session.assert_authenticated()
-        first_expression = evaluate.await_args_list[0].args[0]
-        self.assertIn("wsg-capabilities", first_expression)
-        self.assertNotIn("fetch(", first_expression)
-
-    async def test_missing_wsg_is_not_ready_without_attempting_session_network_readback(self) -> None:
-        session = PassiveQuarkCdp(
-            cdp_url="http://127.0.0.1:9222/json/list",
-            staging_root=DEFAULT_STAGING_ROOT,
-            mount_path="/quark",
-            root_fid="0",
-        )
-        with mock.patch.object(
-            session,
-            "_evaluate_json",
-            return_value={"kind": "wsg-capabilities", "encrypt": True, "decrypt": False},
-        ) as evaluate:
-            with self.assertRaises(QuarkHelperNotReady):
-                await session.assert_authenticated()
-        evaluate.assert_awaited_once()
 
     async def test_upstream_rate_limit_and_5xx_are_not_candidate_rejections(self) -> None:
         session = PassiveQuarkCdp(
