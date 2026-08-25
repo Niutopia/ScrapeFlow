@@ -13,19 +13,19 @@ Engine 是 ScrapeFlow 的内部业务规划层，负责作品身份、媒体树�
   → AList 刷新与精确回读
 ```
 
-在 RootJob 创建前，入站发现只登记 IntakeSource，不调用 Engine、TMDB 或正式库对账。RootJob 获授权后，Engine 才参与边界分析后的逐单元只读身份识别和三库对账；这些操作不创建正式作品、不解包归档、不触发写入。new_work 使用创建 RootJob 时选定的 movie、anime 或 us_tv 货架，随后 Engine 在对应的 /电影、/番剧 或 /美剧 一级根内规划具体作品路径。已有匹配锁定已验证的 shelf/work root；身份或对账证据不足时保持 fail-closed，而不是猜测目标路径或虚构额外的货架规则。当前实现事实以仓库源码、测试和 Git 工作树证据核对。
+在 RootJob 创建前，入站发现只登记 IntakeSource，不调用 Engine、TMDB 或正式库对账。RootJob 获授权后，Engine 才参与边界分析后的逐单元只读身份识别和三库对账；这些操作不创建正式作品、不解包归档、不触发写入。new_work 使用创建 RootJob 时选定的 movie、anime 或 us_tv 货架，随后 Engine 在对应的 /电影、/番剧 或 /欧美剧 一级根内规划具体作品路径。已有匹配锁定已验证的 shelf/work root；身份或对账证据不足时保持 fail-closed，而不是猜测目标路径或虚构额外的货架规则。当前实现事实以仓库源码、测试和 Git 工作树证据核对。
 
 Engine 生成普通 JSON 计划。计划包含来源与目标路径、文件动作、元数据、资源缺口和任务拥有的清理项；凭据只从环境变量读取，不进入计划、持久化状态、API 响应或日志。
 
 ## 自动补源边界
 
-当 Provider/audit lane 被显式开启时，正式媒体库缺口才由审计器交给自动调度器。Provider 的结果先写入任务专属 staging：
+已选中且未暂停的 RootJob 会直接处理自己的精确缺口，不需要全库审计、provider gate 或 pilot。视频补源固定按 `quark_share → magnet` 进行，产物先写入任务专属 staging：
 
 ```text
 /quark/影视/ScrapeFlow/补源/<root-job-id>/<attempt-id>
 ```
 
-Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身份，生成内部补源阶段的计划，再由同一个正式库 writer 执行。Provider 不决定正式库位置、TMDB 身份、季集或最终命名；其内部 child 沿用已验证的 identity、具体作品根和同一 writer，不重新自动路由。由正式库 audit 产生的 existing-gap owner 可能没有顶层 `target_shelf` 字段，此时以严格的 shelf/work-root 映射和 child 目标根校验为准。
+Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身份，生成内部补源阶段的计划，再由同一个正式库 writer 执行。Provider 不决定正式库位置、TMDB 身份、季集或最终命名；其内部 child 沿用已验证的 identity、具体作品根和同一 writer，不重新自动路由。
 
 内部补源 child 是 media-only：只整理视频，保留正式库已有的作品/季度 NFO 与海报，不为每个补入集数新建 episode NFO；字幕缺口走独立的目标语言侧车流程。
 
@@ -48,15 +48,11 @@ Engine 随后重新检查 staging 的路径、文件类型、大小和媒体身�
 
 Local 服务负责被动入站登记、用户以来源加货架创建 RootJob、调度、持久化和 API；Engine 负责该 RootJob 的身份和规划判断。两者通过结构化请求和计划交接，任何远端写入都回到 Local 的单写执行路径。完整的长期产品与工程合同见 [`../AGENTS.md`](../AGENTS.md)；当前实现事实以仓库源码、测试和 Git 工作树证据核对，明确标注的历史收敛计划仅作参考。
 
-## 仓库检查
+## 开发回归
 
-在仓库根目录运行统一检查：
+测试仅供开发回归，不是本机部署或运行的前提。在仓库根目录可运行：
 
 ```sh
-SCRAPEFLOW_IGNORE_LOCAL_ENV=1 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest discover -s local/tests -p 'test_*.py'
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest local/tests -q
 git diff --check
-env -i PATH="$PATH" HOME="$HOME" SCRAPEFLOW_HOST_STATE_ROOT=/tmp/scrapeflow-state \
-  docker compose config
-docker build -f Dockerfile.api .
 ```
