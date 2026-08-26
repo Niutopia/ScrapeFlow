@@ -206,6 +206,78 @@ class SimpleServerTests(unittest.TestCase):
             self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
         self.assertFalse((self.state_root / "jobs" / f"{orphan_id}.json").exists())
 
+    def _orphan_fixture(self, phase: str = "cancelled") -> tuple[str, str, EngineJob, WorkUnitRecord]:
+        orphan_id = "engine-orphan-evidence"
+        source = "/library/待刮削/Example"
+        catalog, _ = upsert_intake_source([], source)
+        catalog, _ = bind_root_task(catalog, intake_source_id(source), orphan_id)
+        save_intake_catalog(self.state_root, catalog)
+        from engine.scrapeflow.root_boundaries import build_root_boundary_analysis, persist_root_boundary_analysis
+        snapshot, records = build_root_boundary_analysis(self.remote, source, root_task_id=orphan_id, source_revision=7)
+        persist_root_boundary_analysis(self.state_root, orphan_id, snapshot, records)
+        backup = EngineJob(
+            id=orphan_id, phase=phase, created_at="x", updated_at="x",
+            request={"source_path": source}, plan={}, summary=(
+                {"prewrite_failure_proven": True} if phase == "failed" else {}
+            ), target_shelf="anime", target_root="/library/番剧", selected_at="x",
+        )
+        return orphan_id, source, backup, records[0]
+
+    def test_reopen_orphan_rejects_fplus_evidence_without_overwriting_bw(self) -> None:
+        evidence = ["writer", "episode_map", "acceptance", "gap", "carrier", "staging"]
+        for kind in evidence:
+            with self.subTest(kind=kind):
+                orphan_id, _, backup, record = self._orphan_fixture()
+                units_path = self.state_root / f"work_units_{orphan_id}.json"
+                before = units_path.read_bytes()
+                if kind == "writer":
+                    raw = json.loads(before); raw[0]["writer_job_id"] = "writer-1"; atomic_write_json(units_path, raw)
+                elif kind == "episode_map":
+                    atomic_write_json(self.state_root / f"episode_map_{record.work_unit_id}.json", {"S01E01": 1})
+                elif kind == "acceptance":
+                    atomic_write_json(self.state_root / f"work_acceptance_{orphan_id}.json", {"items": []})
+                elif kind == "gap":
+                    atomic_write_json(self.state_root / f"gap_ledger_{orphan_id}.json", {"gaps": []})
+                elif kind == "carrier":
+                    atomic_write_json(self.state_root / "jobs" / "carrier.json", {
+                        "id": "carrier", "phase": "planned", "created_at": "x", "updated_at": "x",
+                        "request": {}, "plan": {}, "summary": {"root_job_id": orphan_id},
+                    })
+                else:
+                    (self.state_root / "staging" / orphan_id).mkdir(parents=True)
+                before_reopen = units_path.read_bytes()
+                with self.assertRaises(EngineJobConflictError):
+                    self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
+                self.assertFalse((self.state_root / "jobs" / f"{orphan_id}.json").exists())
+                self.assertEqual(units_path.read_bytes(), before_reopen)
+
+    def test_reopen_orphan_rejects_missing_or_malformed_ledger_and_uncertain_terminal(self) -> None:
+        for mode in ("missing", "malformed"):
+            with self.subTest(mode=mode):
+                orphan_id, _, backup, _ = self._orphan_fixture()
+                path = self.state_root / f"work_units_{orphan_id}.json"
+                if mode == "missing":
+                    path.unlink()
+                else:
+                    path.write_text("{bad", encoding="utf-8")
+                with self.assertRaises(EngineJobConflictError):
+                    self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
+        for phase in ("completed", "failed"):
+            with self.subTest(phase=phase):
+                orphan_id, _, backup, _ = self._orphan_fixture(phase)
+                if phase == "failed":
+                    backup = replace(backup, summary={})
+                with self.assertRaises(EngineJobConflictError):
+                    self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
+
+    def test_reopen_orphan_increments_source_revision(self) -> None:
+        orphan_id, _, backup, _ = self._orphan_fixture()
+        reopened = self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
+        self.assertEqual(reopened.id, orphan_id)
+        records = load_work_unit_records(self.state_root, orphan_id)
+        self.assertTrue(records)
+        self.assertTrue(all(record.source_revision == 8 for record in records))
+
     def test_completed_legacy_root_with_open_gap_projects_as_gaps_pending(self) -> None:
         """Public state must not let H hide an unclosed J ledger row."""
         root_id = self.create_root()

@@ -38,6 +38,7 @@ from engine.scraper import (
     planned_artwork,
     planned_nfos,
 )
+from engine.scrapeflow.planning.tv.smart import _preclassify_theme_residuals
 from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
@@ -1481,6 +1482,20 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             self.assertEqual(retry.phase, "retry_wait")
             self.assertNotIn(secret, retry.error or "")
             persisted_error(recovery_runner, recovery_job.id)
+
+    def test_smart_preclassifies_theme_and_mixed_menu_without_episode_false_positive(self) -> None:
+        source = "/incoming/Menu"
+        files = [
+            {"name": "[OP].mkv", "full_path": source + "/Menu/[OP].mkv"},
+            {"name": "[ED].mkv", "full_path": source + "/Menu/[ED].mkv"},
+            {"name": "Show Menu - 01.mkv", "full_path": source + "/Show Menu - 01.mkv"},
+            {"name": "Show Menu - [NCOP].mkv", "full_path": source + "/Show Menu - [NCOP].mkv"},
+        ]
+        retained, residuals = _preclassify_theme_residuals(files)
+        self.assertEqual({item["name"] for item in retained}, {"Show Menu - 01.mkv"})
+        self.assertEqual(len(residuals), 3)
+        self.assertTrue(all(item["action"] == "preserve_at_source" for item in residuals))
+        self.assertTrue(all(item["reason"] == "no_write_source_residual" for item in residuals))
 
     def test_residual_policy_retains_user_attachments_and_allows_only_os_litter(self) -> None:
         cases = {
