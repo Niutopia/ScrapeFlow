@@ -251,6 +251,22 @@ class SimpleApplication:
             selected = self._validate_selected_root_job(root_job_id)
             return self._control_state.set(paused=True, root_job_id=selected)
 
+    def clear_orphan_selection(self) -> dict[str, object]:
+        """Clear only a paused selection whose RootJob record is gone."""
+        with self._automatic_lock:
+            control = self.control()
+            selected = control.get("root_job_id")
+            if control.get("paused") is not True or not isinstance(selected, str):
+                raise EngineRequestError("只能清除 paused 状态下的孤儿选择")
+            if self._worker_future is not None and not self._worker_future.done():
+                raise EngineWorkerBusyError("仍有活动 worker，不能清除孤儿选择")
+            runner = self._get_engine_runner()
+            try:
+                runner.get_job(selected)
+            except EngineJobNotFoundError:
+                return self._control_state.set(paused=True, root_job_id=None)
+            raise EngineJobConflictError("当前选择仍指向存在的 RootJob，拒绝清除")
+
     def _resume_after_control_open(self) -> None:
         if self._closed.is_set():
             return
@@ -2648,6 +2664,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
                         self._root_job_id(payload, required=True),
                     ),
                 )
+            elif path == "/api/control/clear-orphan-selection":
+                if payload:
+                    raise EngineRequestError("清除孤儿选择不接受参数")
+                self._send(200, self.application.clear_orphan_selection())
             elif path == "/api/control/resume":
                 self._send(
                     200,

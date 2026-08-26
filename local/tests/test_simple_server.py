@@ -147,6 +147,16 @@ class SimpleServerTests(unittest.TestCase):
         self.assertNotIn("formal_write_workers", health["operations"])
         self.assertNotIn("provider_workers", health["operations"])
 
+    def test_clear_orphan_selection_requires_missing_job(self) -> None:
+        self.application._control_state.set(  # noqa: SLF001
+            paused=True, root_job_id="engine-missing"
+        )
+        status, payload = self.request(
+            "POST", "/api/control/clear-orphan-selection", {},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"paused": True, "root_job_id": None})
+
     def test_reopen_orphan_requires_exact_backup_and_rebuilds_fresh_bw(self) -> None:
         orphan_id = "engine-orphan"
         source = "/library/待刮削/Example"
