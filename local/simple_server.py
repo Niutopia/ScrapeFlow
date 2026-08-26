@@ -2681,7 +2681,9 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 if operation == "reopen-orphan":
                     self._send(
                         200,
-                        {"job": self.application.reopen_orphan_root_task(job_id, payload)},
+                        {"job": self.application.public_engine_job(
+                            self.application.reopen_orphan_root_task(job_id, payload),
+                        )},
                     )
                     return
                 if operation == "rebuild-boundaries":
