@@ -163,6 +163,11 @@ class SimpleServerTests(unittest.TestCase):
         catalog, _ = upsert_intake_source([], source)
         catalog, _ = bind_root_task(catalog, intake_source_id(source), orphan_id)
         save_intake_catalog(self.state_root, catalog)
+        from engine.scrapeflow.root_boundaries import build_root_boundary_analysis, persist_root_boundary_analysis
+        old_snapshot, old_records = build_root_boundary_analysis(
+            self.remote, source, root_task_id=orphan_id, source_revision=3,
+        )
+        persist_root_boundary_analysis(self.state_root, orphan_id, old_snapshot, old_records)
         backup = EngineJob(
             id=orphan_id,
             phase="cancelled",

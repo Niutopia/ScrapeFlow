@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from ...errors import ApiError, PlanError, ScraperError
 from ...canonical_work_tree import WorkIdentity
 from ...models import AutoMatch, EpisodeKey, Plan, PlannedProblem
+from ...residual_policy import classify_residual
 
 
 _RUNTIME: ModuleType | None = None
@@ -116,6 +117,66 @@ _VALUE_NAMES = (
     "re",
 )
 
+_THEME_MARKER_RE = re.compile(
+    r"\[\s*(?:NCOP|NCED|OP|ED|MENU|PV|CM|TRAILER)\s*\d*(?:v\d+)?\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _preclassify_theme_residuals(
+    files: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove only proven theme/menu videos before unknown-media matching.
+
+    A regular episode coordinate always wins over a residual-looking token.
+    A ``Menu`` directory is removed as a unit only when every playable member
+    is independently classified as theme residual; mixed directories retain
+    their normal episodes and remove only the proven residual members.
+    """
+    videos = [
+        dict(item) for item in files
+        if Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+    ]
+    by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in videos:
+        by_parent[posixpath.dirname(str(item.get("full_path", "")))].append(item)
+    proven: list[dict[str, Any]] = []
+    for item in videos:
+        path = str(item.get("full_path", ""))
+        name = str(item.get("name", ""))
+        if any(
+            key.kind == "regular" and not key.end_number
+            for key in [extract_episode_key(name)]
+            if key is not None
+        ):
+            continue
+        if classify_residual(path).kind != "theme_video":
+            continue
+        parent = posixpath.dirname(path)
+        parent_name = posixpath.basename(parent)
+        all_theme = all(
+            classify_residual(str(member.get("full_path", ""))).kind == "theme_video"
+            and not any(
+                key.kind == "regular" and not key.end_number
+                for key in [extract_episode_key(str(member.get("name", "")))]
+                if key is not None
+            )
+            for member in by_parent[parent]
+        )
+        if _THEME_MARKER_RE.search(name) or _THEME_MARKER_RE.search(parent_name) or all_theme:
+            proven.append(item)
+    removed = {str(item.get("full_path", "")) for item in proven}
+    residuals = [
+        {
+            "source_path": str(item.get("full_path", "")),
+            "action": "preserve_at_source",
+            "reason": "no_write_source_residual",
+            "kind": "theme_menu_video",
+        }
+        for item in proven
+    ]
+    return [item for item in files if str(item.get("full_path", "")) not in removed], residuals
+
 
 def _make_runtime_dispatch(name: str):
     def dispatch(*args: Any, **kwargs: Any) -> Any:
@@ -187,6 +248,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
     if len(source_declared_seasons) != len(raw_declared_seasons):
         raise PlanError("来源声明季度包含无效或重复值")
     smart_kwargs = dict(kwargs)
+    preserved_theme_residuals: list[dict[str, Any]] = []
     # Explicit episode maps intentionally bypass smart season inference, but
     # the common post-plan resource-gap audit still consumes this collection.
     positive_seasons: list[Mapping[str, Any]] = []
@@ -225,6 +287,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         files, _exported_srt_issues = normalize_exported_srt_entries(
             kwargs["alist"], files,
         )
+        files, preserved_theme_residuals = _preclassify_theme_residuals(files)
         smart_kwargs["source_files"] = files
         season_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         special_files: list[dict[str, Any]] = []
@@ -2512,6 +2575,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                             preserved_subtitle_only_seasons.items()
                         )
                     ],
+                    "preserved_source_residuals": list(preserved_theme_residuals),
                 },
             )
             missing_season_gaps = _tv_season_resource_gaps(
@@ -2593,6 +2657,11 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     if warning not in plan.warnings
                 )
             _dedupe_merged_tv_target_variants(plan)
+            if preserved_theme_residuals:
+                plan.scan_report.setdefault("preserved_source_residuals", []).extend(
+                    item for item in preserved_theme_residuals
+                    if item not in plan.scan_report["preserved_source_residuals"]
+                )
             validate_plan(
                 kwargs["alist"], plan,
                 media_root=kwargs.get("media_root"),
@@ -2609,6 +2678,11 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         if missing_season_gaps:
             plan.scan_report.setdefault("resource_gaps", []).extend(
                 missing_season_gaps
+            )
+        if preserved_theme_residuals:
+            plan.scan_report.setdefault("preserved_source_residuals", []).extend(
+                item for item in preserved_theme_residuals
+                if item not in plan.scan_report.get("preserved_source_residuals", [])
             )
         return plan
     except PlanError as seasonal_error:

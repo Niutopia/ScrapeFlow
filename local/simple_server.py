@@ -1575,6 +1575,8 @@ class SimpleApplication:
             load_source_snapshot,
             persist_root_boundary_analysis,
         )
+        from engine.scrapeflow.work_units import load_work_unit_records
+        reopen_revision: list[int] = []
 
         def assert_quiescent(runner: SimpleEngineRunner) -> None:
             control = self.control()
@@ -1621,6 +1623,43 @@ class SimpleApplication:
                 }
                 if any(marker.get(key) != value for key, value in expected.items()):
                     raise EngineJobConflictError("RootJob tombstone 与 backup_job 身份不一致")
+            # Read every old pre-F ledger before allowing replacement.  Missing
+            # or malformed ledgers are uncertainty, never proof of no write.
+            units_path = self.state_root / f"work_units_{job_id}.json"
+            if not units_path.is_file() or units_path.is_symlink():
+                raise EngineJobConflictError("旧 WorkUnit ledger 缺失，无法证明停在写入前")
+            try:
+                raw_units = json.loads(units_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_units, list):
+                    raise ValueError
+                records = load_work_unit_records(self.state_root, job_id)
+                if len(records) != len(raw_units) or not records:
+                    raise ValueError
+            except Exception as exc:
+                raise EngineJobConflictError("旧 WorkUnit ledger malformed，拒绝覆盖") from exc
+            max_revision = 0
+            for raw, record in zip(raw_units, records):
+                if not isinstance(raw, Mapping) or record.root_task_id != job_id:
+                    raise EngineJobConflictError("旧 WorkUnit 所有权或格式无法验证")
+                max_revision = max(max_revision, int(record.source_revision))
+                if record.writer_job_id is not None:
+                    raise EngineJobConflictError("旧 WorkUnit 已有 writer_job_id，拒绝 reopen")
+                map_path = self.state_root / f"episode_map_{record.work_unit_id}.json"
+                if map_path.exists() or map_path.is_symlink():
+                    raise EngineJobConflictError("旧 WorkUnit 存在 episode map，拒绝 reopen")
+                for key in ("writer_job_id", "acceptance", "execution", "plan", "target_root"):
+                    if raw.get(key) not in (None, {}, ""):
+                        raise EngineJobConflictError(f"旧 WorkUnit 含 F+ 字段 {key}，拒绝 reopen")
+            if backup.phase in {"completed", "failed"}:
+                if backup.phase != "failed" or backup.summary.get("prewrite_failure_proven") is not True:
+                    raise EngineJobConflictError("completed/failed 缺少明确写入前证明，拒绝 reopen")
+            # Snapshot and manifest are required inputs, but their revision is
+            # evidence; never reset the fresh generation to a magic 1.
+            snapshot_path = self.state_root / f"work_snapshot_{job_id}.json"
+            manifest_path = self.state_root / f"source_manifest_{job_id}.json"
+            if not snapshot_path.is_file() or not manifest_path.is_file():
+                raise EngineJobConflictError("旧 B/W 证据不完整，拒绝 reopen")
+            reopen_revision[:] = [max_revision + 1]
 
         with self._automatic_lock:
             runner = self._get_engine_runner()
@@ -1632,7 +1671,7 @@ class SimpleApplication:
                 runner.alist,
                 source,
                 root_task_id=job_id,
-                source_revision=1,
+                source_revision=(reopen_revision[0] if reopen_revision else 1),
             )
             if not records:
                 raise EngineJobConflictError("fresh B/W 未发现作品单元")
