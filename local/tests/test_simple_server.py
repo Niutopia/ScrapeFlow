@@ -16,7 +16,12 @@ from unittest.mock import patch
 
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
-from engine.scrapeflow.intake_source import intake_source_id
+from engine.scrapeflow.intake_source import (
+    bind_root_task,
+    intake_source_id,
+    save_intake_catalog,
+    upsert_intake_source,
+)
 from engine.scrapeflow.replacement import build_replacement_manifest
 from engine.scrapeflow.work_units import (
     WorkUnitRecord,
@@ -25,6 +30,7 @@ from engine.scrapeflow.work_units import (
 )
 from local.simple_server import ApplicationError, SimpleApplication, make_server
 from local.scrapeflow_api.simple_engine_runner import (
+    EngineJob,
     EngineJobConflictError,
     EngineRequestError,
     SimpleEngineRunner,
@@ -140,6 +146,50 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(health["operations"]["worker_busy"], 0)
         self.assertNotIn("formal_write_workers", health["operations"])
         self.assertNotIn("provider_workers", health["operations"])
+
+    def test_reopen_orphan_requires_exact_backup_and_rebuilds_fresh_bw(self) -> None:
+        orphan_id = "engine-orphan"
+        source = "/library/待刮削/Example"
+        catalog, _ = upsert_intake_source([], source)
+        catalog, _ = bind_root_task(catalog, intake_source_id(source), orphan_id)
+        save_intake_catalog(self.state_root, catalog)
+        backup = EngineJob(
+            id=orphan_id,
+            phase="cancelled",
+            created_at="2026-08-20T00:00:00Z",
+            updated_at="2026-08-20T00:00:00Z",
+            request={"source_path": source},
+            plan={},
+            summary={"automatic": True},
+            target_shelf="anime",
+            target_root="/library/番剧",
+            selected_at="2026-08-20T00:00:00Z",
+        )
+        reopened = self.application.reopen_orphan_root_task(
+            orphan_id, {"backup_job": backup.as_dict()},
+        )
+        self.assertEqual(reopened.id, orphan_id)
+        self.assertEqual(reopened.phase, "queued")
+        self.assertEqual(self.application.control(), {"paused": True, "root_job_id": orphan_id})
+        self.assertTrue((self.state_root / f"source_manifest_{orphan_id}.json").exists())
+        self.assertEqual(len(load_work_unit_records(self.state_root, orphan_id)), 1)
+        self.assertFalse((self.state_root / f"work_acceptance_{orphan_id}.json").exists())
+        self.assertFalse((self.state_root / f"gap_ledger_{orphan_id}.json").exists())
+
+    def test_reopen_orphan_rejects_mismatched_backup_without_state(self) -> None:
+        orphan_id = "engine-orphan"
+        source = "/library/待刮削/Example"
+        catalog, _ = upsert_intake_source([], source)
+        catalog, _ = bind_root_task(catalog, intake_source_id(source), orphan_id)
+        save_intake_catalog(self.state_root, catalog)
+        backup = EngineJob(
+            id="other-id", phase="cancelled", created_at="x", updated_at="x",
+            request={"source_path": source}, plan={}, summary={},
+            target_shelf="anime", target_root="/library/番剧", selected_at="x",
+        )
+        with self.assertRaises(EngineJobConflictError):
+            self.application.reopen_orphan_root_task(orphan_id, {"backup_job": backup.as_dict()})
+        self.assertFalse((self.state_root / "jobs" / f"{orphan_id}.json").exists())
 
     def test_completed_legacy_root_with_open_gap_projects_as_gaps_pending(self) -> None:
         """Public state must not let H hide an unclosed J ledger row."""

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from engine.scrapeflow.serialization import atomic_write_json
+from engine.scrapeflow.intake_source import save_intake_catalog, upsert_intake_source, bind_root_task
 from local.scrapeflow_api.simple_engine_runner import (
     EngineExecutionError,
     EngineJob,
@@ -116,6 +117,21 @@ class TerminalCleanupTests(unittest.TestCase):
             self.runner.cleanup_terminal_job(retrying.id)
         with self.assertRaises(EngineExecutionError):
             self.runner.cleanup_terminal_job(child.id)
+
+    def test_intake_bound_cleanup_keeps_identity_tombstone(self) -> None:
+        root = _job(
+            "engine-root",
+            summary={"automatic": True, "ingress_source_path": "/incoming/example"},
+        )
+        self._write(root)
+        catalog, _ = upsert_intake_source([], "/incoming/example")
+        catalog, _ = bind_root_task(catalog, catalog[0].source_id, root.id)
+        save_intake_catalog(self.root, catalog)
+        result = self.runner.cleanup_terminal_job(root.id)
+        marker = self.root / "root-job-tombstones" / f"{root.id}.json"
+        self.assertTrue(marker.exists())
+        self.assertEqual(Path(result["identity_tombstone"]).resolve(), marker.resolve())
+        self.assertEqual(marker.read_text(encoding="utf-8").count(root.id), 1)
 
 
 if __name__ == "__main__":

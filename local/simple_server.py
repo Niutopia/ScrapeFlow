@@ -1513,6 +1513,148 @@ class SimpleApplication:
         self.select_root_job(selected.id)
         return selected
 
+    def reopen_orphan_root_task(
+        self,
+        job_id: str,
+        payload: Mapping[str, object],
+    ) -> EngineJob:
+        """Recover one dangling IntakeSource binding under its original id.
+
+        This is deliberately narrower than create/retry: the service must be
+        paused and unselected, the caller supplies the deleted job document as
+        identity evidence (legacy cleanups have no tombstone), and every F+
+        artifact must be absent.  Fresh B/W is discovered before the queued
+        job becomes visible; the job JSON is the commit marker.  A crash
+        before that marker remains an orphan and the same request can safely
+        replace the incomplete B/W generation.
+        """
+        if not isinstance(payload, Mapping) or set(payload) != {"backup_job"}:
+            raise EngineRequestError("orphan reopen 只接受 backup_job 证据")
+        raw_backup = payload.get("backup_job")
+        if not isinstance(raw_backup, Mapping):
+            raise EngineRequestError("backup_job 必须是完整 RootJob 对象")
+        try:
+            backup = EngineJob.from_dict(raw_backup)
+        except Exception as exc:
+            raise EngineRequestError("backup_job 格式或字段无法验证") from exc
+        if backup.id != job_id:
+            raise EngineJobConflictError("backup_job ID 与孤儿绑定 ID 不一致")
+        if backup.phase not in {"cancelled", "failed", "completed"}:
+            raise EngineJobConflictError("backup_job 不是可审计的终态记录")
+        if backup.plan or backup.execution is not None:
+            raise EngineJobConflictError("backup_job 已包含 F/G/H 计划或执行证据")
+        source = backup.request.get("source_path")
+        if not isinstance(source, str):
+            raise EngineJobConflictError("backup_job 缺少来源路径")
+        source = self._validate_automatic_source(source)
+        if backup.target_shelf is None or backup.target_root is None:
+            raise EngineJobConflictError("backup_job 缺少已授权货架")
+        expected_root = target_root_for_shelf(self.remote_root, backup.target_shelf)
+        if backup.target_root != expected_root:
+            raise EngineJobConflictError("backup_job 货架与正式库根不一致")
+
+        from engine.scrapeflow.intake_source import load_intake_catalog
+        from engine.scrapeflow.root_boundaries import (
+            build_root_boundary_analysis,
+            load_source_snapshot,
+            persist_root_boundary_analysis,
+        )
+
+        def assert_quiescent(runner: SimpleEngineRunner) -> None:
+            control = self.control()
+            if control != {"paused": True, "root_job_id": None}:
+                raise EngineJobConflictError("orphan reopen 要求 paused=true 且无 selected root")
+            active = self._worker_future
+            if active is not None and not active.done():
+                raise EngineWorkerBusyError("orphan reopen 时仍有活动 worker")
+            bindings = [
+                item for item in load_intake_catalog(self.state_root)
+                if item.root_task_id == job_id
+            ]
+            if len(bindings) != 1 or bindings[0].canonical_path != source:
+                raise EngineJobConflictError("IntakeSource 必须只绑定该 ID 与该来源")
+            if runner._job_path(job_id).exists() or runner._job_path(job_id).is_symlink():  # noqa: SLF001
+                raise EngineJobConflictError("RootJob 记录已存在，不是孤儿绑定")
+            forbidden = [
+                self.state_root / f"work_acceptance_{job_id}.json",
+                self.state_root / f"gap_ledger_{job_id}.json",
+                self.state_root / f"replenishment_{job_id}.json",
+                self.state_root / "gaps" / job_id,
+                self.state_root / "staging" / job_id,
+                self.state_root / "archive-staging" / job_id,
+                self.state_root / "replenishment_workspace" / job_id,
+                self.state_root / "subtitle_replenishment_workspace" / job_id,
+            ]
+            if any(path.exists() or path.is_symlink() for path in forbidden):
+                raise EngineJobConflictError("RootJob 存在 writer/acceptance/gap/staging 副作用证据")
+            for candidate in runner.list_jobs():
+                summary = candidate.summary if isinstance(candidate.summary, Mapping) else {}
+                if summary.get("root_job_id") == job_id:
+                    raise EngineJobConflictError("RootJob 仍存在内部 carrier/child")
+            tombstone = self.state_root / "root-job-tombstones" / f"{job_id}.json"
+            if tombstone.exists():
+                try:
+                    marker = json.loads(tombstone.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise EngineJobConflictError("RootJob tombstone 无法读取") from exc
+                expected = {
+                    "job_id": job_id,
+                    "source_path": source,
+                    "target_shelf": backup.target_shelf,
+                    "target_root": backup.target_root,
+                }
+                if any(marker.get(key) != value for key, value in expected.items()):
+                    raise EngineJobConflictError("RootJob tombstone 与 backup_job 身份不一致")
+
+        with self._automatic_lock:
+            runner = self._get_engine_runner()
+            assert_quiescent(runner)
+            runner._ensure_authenticated(runner.alist)  # noqa: SLF001
+            if not runner.source_directory_exists(source):
+                raise EngineJobConflictError("待刮削来源不存在，不能 reopen")
+            snapshot, records = build_root_boundary_analysis(
+                runner.alist,
+                source,
+                root_task_id=job_id,
+                source_revision=1,
+            )
+            if not records:
+                raise EngineJobConflictError("fresh B/W 未发现作品单元")
+            with runner.worker_lock():
+                assert_quiescent(runner)
+                persist_root_boundary_analysis(
+                    self.state_root, job_id, snapshot, records,
+                )
+                summary = {
+                    "automatic": True,
+                    "source_root": source,
+                    "ingress_source_path": source,
+                    "mode": "auto",
+                    "target_shelf": backup.target_shelf,
+                    "selected_target_root": backup.target_root,
+                    "orphan_reopened": True,
+                }
+                reopened = replace(
+                    backup,
+                    phase="queued",
+                    updated_at=_now(),
+                    request={"source_path": source},
+                    plan={},
+                    summary=summary,
+                    execution=None,
+                    error=None,
+                )
+                atomic_write_json(
+                    runner._job_path(job_id),  # noqa: SLF001
+                    _redacted_job_payload(reopened),
+                    allow_nan=False,
+                )
+            self._control_state.set(paused=True, root_job_id=job_id)
+            # Prove the committed B/W generation is readable before returning.
+            if load_source_snapshot(self.state_root, job_id) is None:
+                raise EngineJobConflictError("fresh B/W 提交后回读失败")
+            return reopened
+
     def work_units_view(self, job_id: str) -> dict[str, object]:
         """Read-only R-node projection of one root task's work units."""
         runner = self._get_engine_runner()
@@ -2535,6 +2677,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 job_id, operation = urllib.parse.unquote(pieces[3]), pieces[4]
                 if operation == "retry":
                     self._send(200, {"job": self.application.retry_public_job(job_id, payload)})
+                    return
+                if operation == "reopen-orphan":
+                    self._send(
+                        200,
+                        {"job": self.application.reopen_orphan_root_task(job_id, payload)},
+                    )
                     return
                 if operation == "rebuild-boundaries":
                     self._send(

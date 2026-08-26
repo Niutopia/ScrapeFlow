@@ -3061,6 +3061,52 @@ class SimpleEngineRunner:
                     raise EngineExecutionError(f"child 任务 JSON 路径无效: {child.id}")
                 child_paths.append((child.id, path))
 
+            # An IntakeSource binding is the durable identity of a RootJob.
+            # Keep a small, local tombstone before removing its JSON record so
+            # cleanup can never leave an unauditable dangling binding again.
+            # The tombstone is identity evidence only: reopening still has to
+            # prove paused/quiescent state and the absence of every F+ side
+            # effect before rebuilding a fresh B/W generation.
+            tombstone_path: Path | None = None
+            try:
+                from engine.scrapeflow.intake_source import load_intake_catalog
+
+                bindings = [
+                    item for item in load_intake_catalog(self.state_root)
+                    if item.root_task_id == safe_id
+                ]
+            except Exception as exc:
+                raise EngineExecutionError(
+                    "IntakeSource 绑定无法核验，拒绝清理根任务"
+                ) from exc
+            if len(bindings) > 1:
+                raise EngineExecutionError("RootJob 被多个 IntakeSource 绑定，拒绝清理")
+            if bindings:
+                binding = bindings[0]
+                source = self._job_ingress_source(root)
+                if binding.canonical_path != source:
+                    raise EngineExecutionError("RootJob 来源与 IntakeSource 绑定不一致")
+                tombstone_root = self.state_root / "root-job-tombstones"
+                if tombstone_root.is_symlink():
+                    raise EngineExecutionError("RootJob tombstone 根目录不允许符号链接")
+                tombstone_path = tombstone_root / f"{safe_id}.json"
+                atomic_write_json(
+                    tombstone_path,
+                    {
+                        "schema_version": 1,
+                        "job_id": safe_id,
+                        "source_id": binding.source_id,
+                        "source_path": source,
+                        "target_shelf": root.target_shelf,
+                        "target_root": root.target_root,
+                        "created_at": root.created_at,
+                        "selected_at": root.selected_at,
+                        "cleaned_phase": root.phase,
+                        "cleaned_at": _now(),
+                    },
+                    allow_nan=False,
+                )
+
             gaps_root = self.state_root / "gaps"
             staging_root = self.state_root / "staging"
             archive_staging_root = self.state_root / "archive-staging"
@@ -3086,6 +3132,7 @@ class SimpleEngineRunner:
                 "removed_gap": removed_gap,
                 "removed_staging": removed_staging,
                 "removed_archive_staging": removed_archive_staging,
+                "identity_tombstone": str(tombstone_path) if tombstone_path else None,
                 "formal_library_touched": False,
             }
 
