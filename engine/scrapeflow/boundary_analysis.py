@@ -1303,6 +1303,12 @@ def analyze_boundaries(
         candidates: list[WorkCandidate] = []
         for child in titled_children:
             child_context = _propose_media_context(child)
+            # A titled child whose own name carries a season marker (``不死者
+            # 王者 第一季``) is an explicit B/W season fact: D's default-season
+            # derivation can use it even when the child's filenames are bare
+            # bracket ordinals that the unqualified grammar skips.
+            child_season = _season_number_from_directory_name(child.name)
+            child_claimed = (child_season,) if child_season is not None else ()
             candidates.append(WorkCandidate(
                 work_unit_id=_work_unit_id(root_task_id, child.path),
                 boundary_key=child.path,
@@ -1315,6 +1321,7 @@ def analyze_boundaries(
                     reasons=tuple(reasons),
                     competing_roles=tuple(competing),
                 ),
+                claimed_seasons=child_claimed,
             ))
         return candidates
 
