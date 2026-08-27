@@ -259,10 +259,11 @@ def _plan_with_explicit_episode_map(
     unparsed episode.  Route movie-context videos through the same movie
     matcher the smart grouping uses, then combine the TV (map-driven) plan
     with each independent movie plan exactly like the ordinary split path.
-    Unnumbered specials (``[OVA].mkv``) are handed to the lower planner
-    with ``defer_unnumbered_specials`` so the official special-title matcher
-    can resolve them into Season 00 (the same path the smart grouping uses);
-    only a title that matches no official special stays at source.
+    Unnumbered specials (``[OVA].mkv``) are resolved through the same
+    subtitle-title matcher the smart grouping uses: the companion subtitle's
+    bounded content names the official TMDB S00 episode, and the special
+    video inherits that coordinate.  A special with no unique official title
+    stays at source as a visible problem row.
     """
     prefer_animation = _media_context_from_source_and_target(
         str(kwargs["src_path"]), str(kwargs["parent_path"]),
@@ -297,6 +298,110 @@ def _plan_with_explicit_episode_map(
                 movie_groups[matched.tmdb_id].append(item)
                 continue
         remaining.append(dict(item))
+
+    # Resolve unnumbered specials through the subtitle-title matcher before
+    # handing the remaining files to the mapped planner.  This is the exact
+    # same call the smart grouping makes; it reads the companion subtitle's
+    # bounded content and names the official TMDB S00 episode.
+    if remaining:
+        special_candidates = [
+            item for item in remaining
+            if Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+            and (key := extract_episode_key(str(item.get("name", "")))) is not None
+            and key.kind == "special"
+            and key.number == 0
+        ]
+        if special_candidates:
+            pre_groups = parse_ep_files(
+                remaining,
+                prefer_simplified=False,
+                defer_unnumbered_specials=True,
+            )
+            official_special_titles: dict[int, str] = {}
+            official_special_title_variants: dict[int, list[str]] = defaultdict(list)
+            tmdb_id_value = kwargs.get("tmdb_id")
+            tmdb_get = getattr(kwargs.get("tmdb_client"), "get", None)
+            if (
+                isinstance(tmdb_id_value, int)
+                and not isinstance(tmdb_id_value, bool)
+                and callable(tmdb_get)
+            ):
+                try:
+                    special_payload = tmdb_get(
+                        f"/tv/{tmdb_id_value}/season/0"
+                    )
+                except ScraperError:
+                    special_payload = None
+                if isinstance(special_payload, Mapping):
+                    for row in special_payload.get("episodes") or []:
+                        if not isinstance(row, Mapping):
+                            continue
+                        number = row.get("episode_number")
+                        title = row.get("name")
+                        if (
+                            isinstance(number, int)
+                            and not isinstance(number, bool)
+                            and isinstance(title, str)
+                            and title
+                        ):
+                            official_special_titles[number] = title
+                            official_special_title_variants[number].append(title)
+                # Multi-language variants strengthen the title matching.
+                primary_language = str(
+                    getattr(kwargs.get("tmdb_client"), "language", "") or ""
+                )
+                for language in ("zh-CN", "zh-TW", "ja-JP", "en-US"):
+                    if language == primary_language:
+                        continue
+                    try:
+                        translated = tmdb_get(
+                            f"/tv/{tmdb_id_value}/season/0",
+                            language=language,
+                        )
+                    except ScraperError:
+                        continue
+                    if not isinstance(translated, Mapping):
+                        continue
+                    for row in translated.get("episodes") or []:
+                        if not isinstance(row, Mapping):
+                            continue
+                        number = row.get("episode_number")
+                        title = row.get("name")
+                        if (
+                            isinstance(number, int)
+                            and not isinstance(number, bool)
+                            and isinstance(title, str)
+                            and title
+                            and title not in official_special_title_variants[number]
+                        ):
+                            official_special_title_variants[number].append(title)
+            if official_special_titles:
+                show_detail = None
+                if callable(tmdb_get) and isinstance(tmdb_id_value, int):
+                    try:
+                        show_detail = tmdb_get(f"/tv/{tmdb_id_value}")
+                    except ScraperError:
+                        show_detail = None
+                show_titles = []
+                if isinstance(show_detail, Mapping):
+                    for field in ("name", "original_name"):
+                        value = show_detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            show_titles.append(value.strip())
+                _map_unnumbered_special_from_subtitle_title(
+                    kwargs["alist"],
+                    special_candidates,
+                    pre_groups,
+                    {
+                        EpisodeKey("special", number): title
+                        for number, title in official_special_titles.items()
+                    },
+                    series_titles=show_titles,
+                    regular_episode_count=0,
+                    tmdb_client=kwargs["tmdb_client"],
+                    tmdb_id=int(tmdb_id_value),
+                    season=None,
+                )
 
     map_kwargs = dict(smart_kwargs)
     map_kwargs["source_files"] = remaining
