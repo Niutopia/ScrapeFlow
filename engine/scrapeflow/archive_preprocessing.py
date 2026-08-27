@@ -48,7 +48,7 @@ from .media_policy import (
     extension,
     is_container_candidate_filename,
 )
-from .remote_paths import join_remote, normalize_remote_path, split_remote
+from .remote_paths import _has_unsafe_unicode, join_remote, normalize_remote_path, split_remote
 
 
 IngressKind = Literal["ordinary", "provider"]
@@ -735,6 +735,14 @@ class ArchivePreprocessingAdapter:
                 name = _entry_name(raw)
                 if not name or "/" in name or "\\" in name:
                     raise ArchivePreprocessingError("来源目录包含不安全条目名")
+                if _has_unsafe_unicode(name):
+                    # A control/format character in the provider name (for
+                    # example a zero-width space in ``[Fonts​].7z``) makes the
+                    # object unaddressable: no safe remote path can ever be
+                    # built for it, so it can only remain at source as a
+                    # residual.  Skip it here instead of failing the whole
+                    # staging walk.
+                    continue
                 full = join_remote(current, name)
                 if raw.get("is_dir") is True:
                     stack.append(full)

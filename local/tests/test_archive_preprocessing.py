@@ -720,5 +720,67 @@ class ArchivePreprocessingTests(unittest.TestCase):
         self.assertEqual(result.password_sources, ("source-tree-marker",))
 
 
+    def test_unsafe_unicode_entry_is_skipped_not_fatal(self) -> None:
+        """A zero-width space in a provider name cannot fail the walk.
+
+        ``[Fonts​].7z`` (with an invisible ZWSP) can never become a safe
+        remote path; the staging walk must leave it at source instead of
+        aborting the whole source (间谍过家家 F-stage shape).
+        """
+        payload = b"7z\xbc\xaf'\x1cfont-payload"
+
+        class ZwspPort:
+            def list(self, path: str, refresh: bool = False):
+                del refresh
+                if path == "/incoming":
+                    return [
+                        {
+                            "name": "[Group] Show [Fonts\u200b].7z",
+                            "is_dir": False,
+                            "size": len(payload),
+                        },
+                        {
+                            "name": "[Group] Show - 01.mkv",
+                            "is_dir": False,
+                            "size": 1024 * 1024,
+                        },
+                    ]
+                return []
+
+            def read_file_prefix(self, path: str, *, max_bytes: int):
+                if path.endswith(".7z"):
+                    return payload[:max_bytes]
+                return b"\x1aE\xdf\xa3matroska"
+
+            def download_file_to_path(self, path: str, destination: Path, *, expected_size: int):
+                destination.write_bytes(payload if path.endswith(".7z") else b"\x1aE\xdf\xa3matroska")
+
+            def mkdir(self, path: str):
+                pass
+
+            def upload_file(self, target_path: str, source: Path, content_type: str = "application/octet-stream"):
+                pass
+
+            def ensure_directory(self, path: str):
+                pass
+
+        class AllowVideo:
+            def __call__(self, *_args, **_kwargs):
+                return True
+
+        adapter = self._adapter(
+            staging_root_validator=lambda path: path.startswith("/staging"),
+        )
+        result = adapter.prepare_ordinary_remote_tree(
+            "/incoming",
+            ZwspPort(),
+            Path(tempfile.mkdtemp()) / "task",
+            remote_staging_root="/staging/task",
+        )
+        # The ZWSP archive is not staged; the ordinary media still is.
+        self.assertFalse(
+            any("\u200b" in str(item) for item in getattr(result, "files", []))
+        )
+
 if __name__ == "__main__":
     unittest.main()

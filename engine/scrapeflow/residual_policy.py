@@ -98,6 +98,15 @@ class ResidualDecision:
 
 def _normalized_path(path: str) -> str:
     value = unicodedata.normalize("NFKC", path).replace("\\", "/")
+    # Release names sometimes carry zero-width/bidi format characters
+    # (``[Fonts​].7z``); they are invisible noise, so strip them before
+    # label matching.  This only affects classification — actual remote
+    # path validation elsewhere still rejects such names for writes.
+    value = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) not in {"Cf", "Cs", "Co", "Cn"}
+    )
     if not value.startswith("/"):
         value = "/" + value
     return posixpath.normpath(value)
