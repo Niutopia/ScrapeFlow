@@ -423,6 +423,17 @@ _CLEANUP_ACTIVE_PROVIDER_STATUSES = frozenset({
     "subtitle_installing", "child_planning", "child_executing", "final_verifying",
     "cleaning", "child_failed", "retry_wait",
 })
+# A problem row whose reason says the file genuinely stays at the source
+# (an unidentifiable special with no official TMDB match) is informational,
+# not a safety issue: the plan's media writes are all correctly mapped and
+# the residual simply remains untouched.  These rows must not block the
+# formal write of every correctly mapped file.
+_PRESERVE_AT_SOURCE_PROBLEM_RE = re.compile(
+    r"保留原位|保留于源目录|保留在来源|待人工确认|未闭合",
+    re.IGNORECASE,
+)
+
+
 def _require_problem_free_plan(plan: object, *, stage: str) -> None:
     """Refuse every formal-write path while a plan still has open problems.
 
@@ -431,16 +442,29 @@ def _require_problem_free_plan(plan: object, *, stage: str) -> None:
     executor.  Keep this guard in the runner as well as the concrete executor
     so changing ``executor=`` cannot turn a problem-bearing plan into a move,
     upload, or cleanup operation.
+
+    A problem row whose reason explicitly says the file stays at the source
+    (an unidentifiable OVA/SP with no unique official TMDB match) does not
+    block the write: the plan's actual media files are all correctly mapped,
+    and the residual simply remains untouched at source.
     """
     problems = list(getattr(plan, "problem_files", ()) or ())
     if not problems:
         return
-    first = problems[0]
+    blocking = [
+        problem for problem in problems
+        if not _PRESERVE_AT_SOURCE_PROBLEM_RE.search(
+            str(getattr(problem, "reason", "") or "")
+        )
+    ]
+    if not blocking:
+        return
+    first = blocking[0]
     path = str(getattr(first, "source_path", "") or "<unknown>")
     reason = str(getattr(first, "reason", "") or "")
     detail = f": {path}" + (f"（{reason}）" if reason else "")
     raise EngineExecutionError(
-        f"{stage}拒绝含有 {len(problems)} 个未闭合问题文件的计划{detail}"
+        f"{stage}拒绝含有 {len(blocking)} 个未闭合问题文件的计划{detail}"
     )
 
 
