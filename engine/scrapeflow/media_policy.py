@@ -329,6 +329,13 @@ def classify_filename(value: Any) -> str:
         return "subtitle"
     if is_audio_filename(value):
         return "audio"
+    # A basename that advertises a font package is a resource residual
+    # whatever packaging carries it: a self-extracting ``[Fonts].exe`` or a
+    # compressed ``[Fonts].7z``/``[Fonts].zip`` font installer is never a
+    # disguised media container, never a runnable media binary, and never an
+    # intake archive to stage — its payload is fonts for subtitle rendering.
+    if _FONT_LABEL_RE.search(PurePosixPath(value.replace("\\", "/")).name):
+        return "font"
     if is_archive_filename(value):
         return "archive"
     suffix = extension(value)
@@ -340,13 +347,6 @@ def classify_filename(value: Any) -> str:
         return "font"
     if suffix in MANIFEST_EXTENSIONS:
         return "manifest"
-    # An executable whose basename advertises a font package (e.g. ``[Fonts].exe``,
-    # a self-extracting subtitle font installer) is a resource residual, not a
-    # disguised media container and not a runnable media binary.
-    if suffix in EXECUTABLE_EXTENSIONS and _FONT_LABEL_RE.search(
-        PurePosixPath(value.replace("\\", "/")).name
-    ):
-        return "font"
     if suffix in EXECUTABLE_EXTENSIONS:
         return "executable"
     if is_temporary_filename(value):
