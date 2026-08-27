@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 from ...errors import ApiError, PlanError, ScraperError
 from ...canonical_work_tree import WorkIdentity
 from ...models import AutoMatch, EpisodeKey, Plan, PlannedProblem
-from ...residual_policy import classify_residual
+from ...residual_policy import classify_residual, is_bonus_directory_path
 
 
 _RUNTIME: ModuleType | None = None
@@ -132,6 +132,13 @@ def _preclassify_theme_residuals(
     A ``Menu`` directory is removed as a unit only when every playable member
     is independently classified as theme residual; mixed directories retain
     their normal episodes and remove only the proven residual members.
+
+    A video inside a dedicated bonus directory (``EXTRA/``, ``PV/``,
+    ``特典映像/``, ``NCOP&ED/``) is removed by that directory context alone:
+    the context is strong non-story evidence independent of the file's own
+    naming, and a bare bracketed ordinal there is release-local numbering
+    that must never collide with the real episode run (the same vocabulary
+    B/W and D's episode proofs already use).
     """
     videos = [
         dict(item) for item in files
@@ -144,6 +151,9 @@ def _preclassify_theme_residuals(
     for item in videos:
         path = str(item.get("full_path", ""))
         name = str(item.get("name", ""))
+        if is_bonus_directory_path(path):
+            proven.append(item)
+            continue
         if any(
             key.kind == "regular" and not key.end_number
             for key in [extract_episode_key(name)]

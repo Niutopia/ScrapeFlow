@@ -1870,3 +1870,24 @@ class SameSizedSpecialsRuntimeTests(LibraryIndexTests):
                 root_task_id="root-runtime-overlap",
             )
             self.assertNotEqual(record.reconciliation_outcome, "new_work")
+
+
+class SharedBonusDirectoryVocabularyTests(unittest.TestCase):
+    def test_f_preclassification_uses_the_shared_bonus_directory_vocabulary(self) -> None:
+        """F removes bonus-directory videos by directory context alone.
+
+        EXTRA/[SP05] Picture Drama - 01 carries no theme label of its own,
+        yet the EXTRA directory context proves it non-story: the shared
+        vocabulary means B/W, D, and F agree it never enters episode
+        parsing (轮回七次 F-stage shape).
+        """
+        from engine.scrapeflow.residual_policy import is_bonus_directory_path
+        base = "/incoming/Example/EXTRA"
+        self.assertTrue(is_bonus_directory_path(f"{base}/Example [SP05] Picture Drama - 01 (BD).mkv"))
+        self.assertTrue(is_bonus_directory_path("/incoming/Example/PV/Example [01].mkv"))
+        self.assertTrue(is_bonus_directory_path("/incoming/Example/特典映像/Example [01].mkv"))
+        self.assertTrue(is_bonus_directory_path("/incoming/Example/NCOP&ED/NCOP.mkv"))
+        # An identically named file outside a bonus directory keeps its
+        # ordinary classification.
+        self.assertFalse(is_bonus_directory_path("/incoming/Example/Example [SP05] Picture Drama - 01 (BD).mkv"))
+        self.assertFalse(is_bonus_directory_path("/incoming/Example/Example - 01 (BD).mkv"))

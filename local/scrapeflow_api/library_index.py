@@ -40,6 +40,7 @@ from engine.scrapeflow.replenishment_matching import (
     release_dash_regular_episode,
     release_title_ordinal_regular_episode,
 )
+from engine.scrapeflow.residual_policy import BONUS_DIRECTORY_SEGMENT_RE
 from engine.scrapeflow.root_boundaries import load_source_snapshot, walk_source_rows
 from engine.scrapeflow.source_inventory import (
     SourceNode,
@@ -1306,15 +1307,10 @@ _COMMERCIAL_MARKER_RE = re.compile(
 # that must be omitted from the integer regular-run proof instead of
 # colliding with the real episodes.  The earlier fail-closed ruling covered
 # a ``[PV]`` filename *label* in a mixed directory; a directory named
-# ``PV``/``特典映像``/``Bonus`` is different, stronger evidence.
-_NON_STORY_THEME_DIRECTORY_RE = re.compile(
-    r"(?:^|/)"
-    r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED"
-    r"|PV|予告(?:動画)?|特典映像|映像特典|特典|Tokuten"
-    r"|Bonus|Extras?|Menus?)"
-    r"(?:/|$)",
-    re.IGNORECASE,
-)
+# ``PV``/``特典映像``/``Bonus`` is different, stronger evidence.  The
+# vocabulary itself lives in the shared engine residual policy so B/W, D,
+# and F can never disagree about what a bonus directory means.
+_NON_STORY_THEME_DIRECTORY_RE = BONUS_DIRECTORY_SEGMENT_RE
 
 # One video file at or above this size in a titled sibling is treated as an
 # independent film (movie-shaped) rather than a member of the TV episode run.

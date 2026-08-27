@@ -54,6 +54,30 @@ _THEME_VIDEO_RE = re.compile(
     r"(?:\d+(?:v\d+)?)?(?:$|[\s._\-\[\]()])",
     re.I,
 )
+
+# A dedicated bonus directory is strong non-story context for every video
+# inside it, independent of each file's own naming: releases put bare
+# ordinals and SP-marked Menu/NCOP/Picture-Drama assets there (``EXTRA/``,
+# ``PV/``, ``特典映像/``, ``NCOP&ED/``).  B/W's boundary proofs, D's
+# episode-grammar proofs, and F's preclassification all share this one
+# vocabulary so the three stages can never disagree about what a bonus
+# directory means.  A bare bracketed ordinal inside such a directory is
+# release-local numbering, never a regular episode coordinate.
+BONUS_DIRECTORY_SEGMENT_RE = re.compile(
+    r"(?:^|/)"
+    r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED"
+    r"|PV|予告(?:動画)?|特典映像|映像特典|特典|Tokuten"
+    r"|Bonus|Extras?|Menus?)"
+    r"(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def is_bonus_directory_path(source_path: str) -> bool:
+    """Whether a provider path runs through a dedicated bonus directory."""
+    normalized = str(source_path or "").replace("\\", "/")
+    return bool(BONUS_DIRECTORY_SEGMENT_RE.search(normalized))
+
 _ADVERTISEMENT_IMAGE_RE = re.compile(
     r"(?:^|[\s._\-\[\]()])(?:广告|advert(?:isement)?|promo|qr|"
     r"weibo|wechat|qqgroup)(?:$|[\s._\-\[\]()])",

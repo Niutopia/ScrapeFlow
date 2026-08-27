@@ -1496,7 +1496,11 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             persisted_error(recovery_runner, recovery_job.id)
 
     def test_smart_preclassifies_theme_and_mixed_menu_without_episode_false_positive(self) -> None:
-        source = "/incoming/Menu"
+        # The directory is deliberately NOT named like a bonus folder: the
+        # files' own labels drive the classification here.  A real
+        # ``Menu/``/``EXTRA/`` directory is covered by the shared bonus
+        # vocabulary and removes everything inside it.
+        source = "/incoming/Release"
         files = [
             {"name": "[OP].mkv", "full_path": source + "/Menu/[OP].mkv"},
             {"name": "[ED].mkv", "full_path": source + "/Menu/[ED].mkv"},
