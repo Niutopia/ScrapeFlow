@@ -112,8 +112,13 @@ _PURE_BRACKETED_NUMERIC_RE = re.compile(r"\[\s*(\d{1,6})\s*\]")
 # D/F may use it only as one member of a complete, catalog-backed run, so the
 # primitive below deliberately requires one terminal `` - N`` ordinal and
 # preserves the normalized title prefix for an exact sibling comparison.
+# A single bounded finale word after the ordinal (``Title - 12 END``) is the
+# same release convention as the bracketed ``[12 END]`` form the generic
+# episode parser already accepts; it is layout metadata, not a second
+# ordinal or a special-release label.
 _RELEASE_DASH_EPISODE_RE = re.compile(
     r"^(?P<prefix>.+?)\s[-–—]\s*0*(?P<episode>[1-9]\d{0,2})"
+    r"(?:\s+(?P<finale>END|FIN(?:AL)?|完|終|最終話))?"
     r"(?P<tail>(?:\s*(?:\[[^\[\]]+\]|\([^()]+\)))*?)\s*$",
     re.IGNORECASE,
 )

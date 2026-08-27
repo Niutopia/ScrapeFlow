@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import unittest
 
+from engine.scrapeflow.replenishment_matching import release_dash_regular_episode
 from engine.scrapeflow.data.release_lexicon import (
     CROSS_SCRIPT_SEASON_ALIASES,
     NORMALIZED_PARENT_ALIASES,
@@ -26,6 +27,29 @@ from engine.scrapeflow.identity_matching import (
 
 
 class ReleaseLexiconTests(unittest.TestCase):
+    def test_release_dash_grammar_accepts_one_bounded_finale_word(self) -> None:
+        """``Title - 12 END`` is the finale layout, not a second ordinal."""
+        prefix = "[Moozzi2] Loop 7-kaime no Akuyaku Reijou wa"
+        self.assertEqual(
+            release_dash_regular_episode(f"{prefix} - 12 END (BD 1080p).mkv"),
+            ("[moozzi2] loop 7-kaime no akuyaku reijou wa", 12),
+        )
+        self.assertEqual(
+            release_dash_regular_episode("Example Show - 12 FINAL [1080p].mkv"),
+            ("example show", 12),
+        )
+        self.assertEqual(
+            release_dash_regular_episode("Example Show - 12 終 (BD).mkv"),
+            ("example show", 12),
+        )
+        # The finale word is bounded: two of them, a tail ordinal, or a
+        # special-release label still fail closed.
+        self.assertIsNone(
+            release_dash_regular_episode("Example Show - 01 END END (BD).mkv"),
+        )
+        self.assertIsNone(release_dash_regular_episode("Example Show - 01 [02].mkv"))
+        self.assertIsNone(release_dash_regular_episode("Example Show - 01 OVA.mkv"))
+
     def test_source_query_overrides_map_abbreviations_to_canonical_queries(self) -> None:
         for pattern, replacement in SOURCE_QUERY_OVERRIDES:
             self.assertNotEqual(pattern, "")
