@@ -163,12 +163,13 @@ def validate_source_scope(
     root_path: str,
     source_paths: Sequence[str],
 ) -> tuple[str, ...]:
-    """Validate a non-overlapping set of exact directory ownership scopes.
+    """Validate a non-overlapping set of exact ownership scopes.
 
     The helper is intentionally pure and narrow: it proves only that the
     declared paths are normalized descendants of the intake root and cannot
-    overlap one another.  Callers additionally prove that every path exists in
-    the B snapshot before using it for identity, planning, or consumption.
+    overlap one another.  A scope may be either a directory subtree or one
+    exact file; callers additionally prove its object kind against the B
+    snapshot before using it for identity, planning, or consumption.
     """
     root = str(root_path).rstrip("/") or "/"
     if not root.startswith("/") or "\\" in root:
@@ -209,12 +210,35 @@ def build_scoped_source_node(
     this ownership proof local to the pure inventory model.
     """
     paths = validate_source_scope(root.path, source_paths)
-    by_path = {candidate.path.rstrip("/"): candidate for candidate in iter_source_nodes(root)}
+    by_path = {
+        candidate.path.rstrip("/"): candidate
+        for candidate in iter_source_nodes(root)
+    }
+    # Boundary analysis historically dealt only in directory nodes.  A flat
+    # intake container can nevertheless contain several independently titled
+    # feature files; WorkUnit ownership for that shape is one exact file per
+    # unit.  Materialize those files as virtual one-file nodes so every
+    # downstream consumer (C evidence, D proofs, and planner manifests) can
+    # use the same SourceNode contract without widening back to the parent
+    # directory.
+    file_by_path = {
+        file.path.rstrip("/"): file
+        for file in collect_all_files(root)
+    }
     selected: list[SourceNode] = []
     for path in paths:
         selected_node = by_path.get(path)
         if selected_node is None:
-            raise ValueError("来源范围在 B 快照中不存在")
+            source_file = file_by_path.get(path)
+            if source_file is None:
+                raise ValueError("来源范围在 B 快照中不存在")
+            selected_node = SourceNode(
+                path=source_file.path,
+                name=source_file.name,
+                files=(source_file,),
+                children=(),
+                depth=max(0, root.depth + source_file.path.count("/") - root.path.count("/")),
+            )
         selected.append(selected_node)
     if len(selected) == 1:
         return selected[0]

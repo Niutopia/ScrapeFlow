@@ -13,6 +13,8 @@ from pathlib import Path
 from engine.scrapeflow.boundary_analysis import (
     DirectoryRole,
     WorkCandidate,
+    _directory_matches_declared_season,
+    _generic_season_child,
     analyze_boundaries,
 )
 from engine.scrapeflow.source_inventory import (
@@ -349,6 +351,57 @@ class TestSyntheticCases(unittest.TestCase):
     def _node(self, fixture_dict: dict) -> SourceNode:
         return build_source_inventory_from_fixture(fixture_dict)
 
+    def test_flat_independent_feature_files_split_into_exact_movie_units(self) -> None:
+        """Two titled feature files at the root are peer movies, not one job."""
+        root = "/quark/影视/待刮削/paired-films"
+        node = self._node({
+            "root": root,
+            "children": [
+                {
+                    "name": "[Group] First Feature Film [2160p][x265].mkv",
+                    "is_dir": False,
+                    "size": 300 * 1024 * 1024,
+                },
+                {
+                    "name": "[Group] Second Feature Film [2160p][x265].mkv",
+                    "is_dir": False,
+                    "size": 301 * 1024 * 1024,
+                },
+            ],
+        })
+        candidates = analyze_boundaries(node, root_task_id="flat-pair")
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(all(c.proposed_media_context == "movie" for c in candidates))
+        self.assertEqual(
+            {path for c in candidates for path in c.source_paths},
+            {
+                f"{root}/[Group] First Feature Film [2160p][x265].mkv",
+                f"{root}/[Group] Second Feature Film [2160p][x265].mkv",
+            },
+        )
+
+    def test_flat_episode_like_files_remain_one_work(self) -> None:
+        """Explicit episode coordinates must never trigger movie splitting."""
+        root = "/quark/影视/待刮削/show"
+        node = self._node({
+            "root": root,
+            "children": [
+                {
+                    "name": "Show S01E01 [2160p].mkv",
+                    "is_dir": False,
+                    "size": 300 * 1024 * 1024,
+                },
+                {
+                    "name": "Show S01E02 [2160p].mkv",
+                    "is_dir": False,
+                    "size": 301 * 1024 * 1024,
+                },
+            ],
+        })
+        candidates = analyze_boundaries(node, root_task_id="flat-episodes")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_key, root)
+
     def test_single_subdirectory_with_videos_is_single_work(self) -> None:
         fixture = {
             "root": "/quark/影视/待刮削/SomeMovie",
@@ -566,6 +619,116 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].source_paths, (root,))
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
+    def test_decorated_generic_seasons_group_and_keep_year_marked_sibling(self) -> None:
+        """Release noise around season folders must not become TMDB titles."""
+        root = "/quark/影视/待刮削/Rick bundle"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "第一季（2013）全2集 内封字幕 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Rick.And.Morty.S01E01.mkv", "is_dir": False, "size": 2_000_000},
+                        {"name": "Rick.And.Morty.S01E02.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+                {
+                    "name": "第二季（2015）全2集 内封字幕 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Rick.And.Morty.S02E01.mkv", "is_dir": False, "size": 2_000_000},
+                        {"name": "Rick.And.Morty.S02E02.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+                {
+                    "name": "日漫版（2024）全2集",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Rick Anime S01E01.mkv", "is_dir": False, "size": 2_000_000},
+                        {"name": "Rick Anime S01E02.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 2)
+        main = next(candidate for candidate in candidates if candidate.display_label == "Rick bundle")
+        self.assertEqual(main.proposed_media_context, "tv")
+        self.assertEqual(main.claimed_seasons, (1, 2))
+        self.assertEqual(len(main.source_paths), 2)
+        self.assertEqual(
+            next(candidate for candidate in candidates if candidate is not main).display_label,
+            "日漫版（2024）全2集",
+        )
+        sibling = next(candidate for candidate in candidates if candidate is not main)
+        self.assertEqual(sibling.claimed_seasons, (1,))
+
+    def test_decorated_generic_seasons_do_not_split_unproven_aftershow(self) -> None:
+        """A bare titled branch without release evidence stays fail-closed."""
+        root = "/quark/影视/待刮削/Example Show"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "第一季（2013）全2集",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Example.Show.S01E01.mkv", "is_dir": False, "size": 2_000_000},
+                        {"name": "Example.Show.S01E02.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+                {
+                    "name": "第二季（2015）全2集",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Example.Show.S02E01.mkv", "is_dir": False, "size": 2_000_000},
+                        {"name": "Example.Show.S02E02.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+                {
+                    "name": "Aftershow",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Aftershow.E01.mkv", "is_dir": False, "size": 2_000_000},
+                    ],
+                },
+            ],
+        }
+
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source_paths, (root,))
+
+    def test_generic_season_keeps_unknown_bracketed_title_evidence(self) -> None:
+        """Title-shaped bracket contents must not become structural seasons."""
+        for name in (
+            "[Attack on Titan] Season 1",
+            "Season 1 (The Expanse)",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(_generic_season_child(name))
+
+        self.assertEqual(
+            _generic_season_child("第六季（2022）全10集 内封字幕 1080P"),
+            6,
+        )
+
+    def test_declared_season_bare_numeric_run_rejects_duplicate_episode_versions(self) -> None:
+        """Two physical versions of one ordinal are not unique season proof."""
+        node = self._node({
+            "root": "/quark/影视/待刮削/Example Show/Season 01",
+            "children": [
+                {"name": name, "is_dir": False, "size": 2_000_000}
+                for name in ("01.mkv", "01.v2.mkv", "02.mkv", "03.mkv", "04.mkv")
+            ],
+        })
+
+        self.assertFalse(_directory_matches_declared_season(node, 1))
 
     def test_empty_directory_returns_uncertain(self) -> None:
         fixture = {

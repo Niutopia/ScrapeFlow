@@ -14,6 +14,7 @@ from engine.scrapeflow.root_boundaries import (
     walk_source_rows,
 )
 from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.source_inventory import build_scoped_source_node, build_source_inventory
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media_cases"
 
@@ -202,6 +203,40 @@ class RootBoundaryCompositionTests(unittest.TestCase):
 
         self.assertNotIn("source_manifest", snapshot)
         self.assertIn("source_manifest_error", snapshot)
+
+    def test_flat_movie_units_claim_exact_file_scopes(self) -> None:
+        root = "/incoming/paired-films"
+        first = f"{root}/First Feature Film 2160p.mkv"
+        second = f"{root}/Second Feature Film 2160p.mkv"
+        alist = DictAList({
+            root: [
+                {"name": "First Feature Film 2160p.mkv", "is_dir": False, "size": 300 * 1024 * 1024},
+                {"name": "Second Feature Film 2160p.mkv", "is_dir": False, "size": 301 * 1024 * 1024},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="flat-pair", state_root=state_root,
+            )
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                {record.source_paths for record in records},
+                {(first,), (second,)},
+            )
+            snapshot = json.loads(
+                (state_root / "work_snapshot_flat-pair.json").read_text(encoding="utf-8")
+            )
+            node = build_source_inventory(snapshot["rows"], root)
+            for record in records:
+                scoped = build_scoped_source_node(
+                    node,
+                    record.source_paths,
+                    boundary_key=record.boundary_key,
+                    display_label=record.display_label,
+                )
+                self.assertEqual(len(scoped.files), 1)
+                self.assertEqual(scoped.files[0].path, record.source_paths[0])
 
     def test_decorated_sibling_seasons_persist_one_exact_multi_source_unit(self) -> None:
         root = "/incoming/Northwind Bundle"

@@ -435,6 +435,35 @@ class TestIdentityEvidence(unittest.TestCase):
             "寒蝉鸣泣之时",
         )
 
+    def test_boundary_clean_query_strips_streaming_technical_parenthetical(self) -> None:
+        """Technical release fingerprints must not crowd out the title query."""
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "瑞克和莫蒂：日漫版（2024）全10集 日英双语 内封简中字幕 "
+                "1080P（AMZN.WEB-DL.AVC.DDP.2.0）",
+            ),
+            "瑞克和莫蒂:日漫版",
+        )
+
+    def test_boundary_clean_query_strips_genre_bucket_dotted_title_and_season_span(self) -> None:
+        """Container labels such as ``【美剧】金.斯.敦.市.长 1-3季``
+        must yield the ordinary title query without an identity override."""
+        self.assertEqual(
+            _clean_boundary_identity_query("【美剧】金.斯.敦.市.长 1-3季"),
+            "金斯敦市长",
+        )
+        self.assertEqual(
+            _clean_boundary_identity_query("金.斯.敦.市.长 S01-S03"),
+            "金斯敦市长",
+        )
+
+    def test_boundary_clean_query_strips_full_subtitle_language_label(self) -> None:
+        """Full ``简体内嵌`` packaging labels must not become title evidence."""
+        self.assertEqual(
+            _clean_boundary_identity_query("末日三问.简体内嵌4K"),
+            "末日三问",
+        )
+
     def test_evidence_serialization_roundtrip(self) -> None:
         ep = EpisodePattern(season_numbers=(1,), episode_numbers=(1, 2), total_episodes=2, has_specials=False)
         ev1 = IdentityEvidence(

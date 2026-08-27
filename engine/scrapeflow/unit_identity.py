@@ -35,6 +35,7 @@ from .source_inventory import (
     SourceNode,
     build_scoped_source_node,
     build_source_inventory,
+    collect_all_files,
     has_disc_image_files,
     iter_source_nodes,
 )
@@ -99,6 +100,36 @@ def _common_parent_labels(root: SourceNode, units: tuple[SourceNode, ...]) -> tu
     return tuple(common)
 
 
+def _source_nodes_by_path(root: SourceNode) -> dict[str, SourceNode]:
+    """Index directory nodes plus exact-file virtual nodes from one snapshot.
+
+    B/W may assign a flat feature file as the complete source scope of a
+    WorkUnit.  C still needs the same parent-label calculation used for
+    directory scopes; materializing a one-file node here keeps that evidence
+    path generic and avoids falling back to the whole intake directory.
+    """
+    indexed = {
+        candidate.path: candidate for candidate in iter_source_nodes(root)
+    }
+    for source_file in collect_all_files(root):
+        indexed.setdefault(
+            source_file.path,
+            SourceNode(
+                path=source_file.path,
+                name=source_file.name,
+                files=(source_file,),
+                children=(),
+                depth=max(
+                    0,
+                    root.depth
+                    + source_file.path.count("/")
+                    - root.path.count("/"),
+                ),
+            ),
+        )
+    return indexed
+
+
 def _is_generic_season_label(value: object) -> bool:
     """Whether a persisted query is only a structural season leaf."""
     return bool(_GENERIC_SEASON_LABEL_RE.fullmatch(str(value or "")))
@@ -145,9 +176,7 @@ def _automatic_identity_needs_parent_context_recheck(
         return False
     try:
         root = build_source_inventory(snapshot["rows"], snapshot["root"])
-        nodes_by_path = {
-            candidate.path: candidate for candidate in iter_source_nodes(root)
-        }
+        nodes_by_path = _source_nodes_by_path(root)
         scoped_units = tuple(
             nodes_by_path[path]
             for path in record.source_paths
@@ -313,7 +342,7 @@ def resolve_work_unit_identities(
     if not records or snapshot is None:
         return records
     node = build_source_inventory(snapshot["rows"], snapshot["root"])
-    nodes_by_path = {candidate.path: candidate for candidate in iter_source_nodes(node)}
+    nodes_by_path = _source_nodes_by_path(node)
     updated: list[WorkUnitRecord] = []
     for record in records:
         try:

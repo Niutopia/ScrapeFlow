@@ -25,6 +25,7 @@ from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRun
 from local.scrapeflow_api.unit_execution import (
     _clean_container_name,
     _container_layout_targets,
+    _container_plan,
     execute_new_work_units,
     load_work_acceptance,
 )
@@ -280,7 +281,7 @@ class ContainerNestingTests(unittest.TestCase):
         parents = {event["parent_path"] for event in events}
         self.assertEqual(parents, {"/library/番剧/Show A"})
 
-    def test_multiple_tv_identities_are_direct_children_of_pure_container(self) -> None:
+    def test_multi_season_main_tv_owns_root_with_single_season_tv_child(self) -> None:
         files = {
             "/incoming/刀剑神域/第一季/S01E01.mkv": FAKE_VIDEO_BYTES,
             "/incoming/刀剑神域/第二季/S01E01.mkv": FAKE_VIDEO_BYTES,
@@ -307,18 +308,189 @@ class ContainerNestingTests(unittest.TestCase):
                 media_type=media_type,
                 tmdb_id=tmdb_id,
             )
+        # Model the durable B/W season ownership used by the real pipeline.
+        # Two different TV identities alone are not enough to nominate a
+        # main series; the same identity must be proved across several
+        # seasons while every sibling TV is single-season.
+        current = load_work_unit_records(state_root, root_id)
+        season_by_leaf = {"第一季": 1, "第二季": 2, "外传GGO": 1}
+        current = [
+            replace(
+                record,
+                claimed_seasons=(season_by_leaf[record.display_label],),
+            )
+            if record.display_label in season_by_leaf
+            else record
+            for record in current
+        ]
+        save_work_unit_records(state_root, root_id, current)
         reconcile_root_work_units(alist, "/library", state_root, root_id)
 
-        execute_new_work_units(runner, state_root, root_id)
+        current = load_work_unit_records(state_root, root_id)
+        _ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        layout = _container_layout_targets(
+            runner, runner.get_job(root_id), current,
+        )
 
-        self.assertEqual(len(events), 4)
-        main = [e for e in events if e["tmdb_id"] == 45782]
-        self.assertEqual({e["parent_path"] for e in main}, {"/library/番剧/刀剑神域"})
-        # A second confirmed TV identity is a sibling, not a child of the
-        # first TV.  A movie without a proved family marker is also a direct
-        # child of the pure intake container.
-        for event in events:
-            self.assertEqual(event["parent_path"], "/library/番剧/刀剑神域")
+        self.assertEqual(main_tmdb, 45782)
+        self.assertIsNone(container_parent)
+        for record in current:
+            tmdb_id = (record.identity or {}).get("tmdb_id")
+            if tmdb_id == 45782:
+                self.assertEqual(layout[record.work_unit_id]["relation"], "main_tv")
+                self.assertEqual(
+                    layout[record.work_unit_id]["parent_path"], "/library/番剧",
+                )
+            else:
+                self.assertEqual(
+                    layout[record.work_unit_id]["relation"], "nested_under_main",
+                )
+
+    def test_rick_shaped_root_uses_main_tmdb_title_not_release_bundle_name(self) -> None:
+        source = "/incoming/瑞克和MD 1-9季+日漫版 内封+内嵌字幕 4K+1080P"
+        season_names = ("一", "二", "三", "四", "五", "六", "七", "八", "九")
+        files = {
+            f"{source}/第{name}季（20{season:02d}）全1集 内封字幕/"
+            f"S{season:02d}E01.mkv": FAKE_VIDEO_BYTES
+            for season, name in enumerate(season_names, 1)
+        }
+        anime_scope = f"{source}/瑞克和莫蒂：日漫版（2024）全1集"
+        files[f"{anime_scope}/S01E01.mkv"] = FAKE_VIDEO_BYTES
+        state_root, alist, runner, _events = self._setup(files)
+        root_id = self._root(runner, source, shelf="us_tv")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(records), 2)
+        main = next(record for record in records if len(record.claimed_seasons) > 1)
+        anime = next(record for record in records if record.work_unit_id != main.work_unit_id)
+        self.assertEqual(anime.claimed_seasons, (1,))
+        apply_work_unit_override(
+            state_root, root_id, main.work_unit_id,
+            media_type="tv", tmdb_id=60625,
+        )
+        apply_work_unit_override(
+            state_root, root_id, anime.work_unit_id,
+            media_type="tv", tmdb_id=202282,
+        )
+        current = load_work_unit_records(state_root, root_id)
+        normalized = []
+        for record in current:
+            identity = dict(record.identity or {})
+            if record.work_unit_id == main.work_unit_id:
+                identity["title"] = "瑞克和莫蒂"
+                normalized.append(replace(record, identity=identity))
+            else:
+                identity["title"] = "瑞克和莫蒂：日漫版"
+                normalized.append(replace(record, identity=identity))
+        current = normalized
+        save_work_unit_records(state_root, root_id, current)
+
+        ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        layout = _container_layout_targets(
+            runner, runner.get_job(root_id), current,
+        )
+
+        self.assertEqual(main_tmdb, 60625)
+        self.assertIsNone(container_parent)
+        self.assertEqual(ordered[0].work_unit_id, main.work_unit_id)
+        self.assertEqual(layout[main.work_unit_id]["relation"], "main_tv")
+        self.assertEqual(
+            layout[main.work_unit_id]["target_root"],
+            "/library/欧美剧/瑞克和莫蒂",
+        )
+        self.assertEqual(
+            layout[anime.work_unit_id]["relation"],
+            "nested_under_main",
+        )
+        self.assertNotIn(
+            "瑞克和MD 1-9季+日漫版",
+            str(layout[main.work_unit_id]["target_root"]),
+        )
+
+    def test_special_or_version_record_never_becomes_main_tv(self) -> None:
+        files = {
+            "/incoming/Same Identity/Regular/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Same Identity/Backup/S02E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _events = self._setup(files)
+        root_id = self._root(runner, "/incoming/Same Identity")
+        analyze_root_boundaries(
+            alist, "/incoming/Same Identity",
+            root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        regular = self._record_for_source_leaf(records, "Regular")
+        backup = self._record_for_source_leaf(records, "Backup")
+        current = [
+            replace(
+                regular,
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 700},
+                claimed_seasons=(1,),
+            ),
+            replace(
+                backup,
+                role="version_group",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 700},
+                claimed_seasons=(2,),
+            ),
+        ]
+        save_work_unit_records(state_root, root_id, current)
+
+        _ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        layout = _container_layout_targets(
+            runner, runner.get_job(root_id), current,
+        )
+        self.assertIsNone(main_tmdb)
+        self.assertIsNotNone(container_parent)
+        self.assertNotIn(
+            "main_tv",
+            {item["relation"] for item in layout.values()},
+        )
+
+    def test_stale_uncertain_tv_identity_cannot_steal_main_root(self) -> None:
+        files = {
+            "/incoming/Stale Identity/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Stale Identity/Confirmed/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _events = self._setup(files)
+        root_id = self._root(runner, "/incoming/Stale Identity")
+        analyze_root_boundaries(
+            alist, "/incoming/Stale Identity",
+            root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        stale = self._record_for_source_leaf(records, "Main")
+        confirmed = self._record_for_source_leaf(records, "Confirmed")
+        current = [
+            replace(
+                stale,
+                identity_status="uncertain",
+                identity={"media_type": "tv", "tmdb_id": 701},
+                claimed_seasons=(1, 2),
+            ),
+            replace(
+                confirmed,
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 702},
+                claimed_seasons=(1,),
+            ),
+        ]
+        save_work_unit_records(state_root, root_id, current)
+        _ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        self.assertEqual(main_tmdb, 702)
+        self.assertIsNone(container_parent)
 
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
         files = {

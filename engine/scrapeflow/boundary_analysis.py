@@ -26,6 +26,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Sequence
 
 from engine.scrapeflow.source_inventory import (
@@ -93,6 +94,29 @@ _SEASON_SIGNATURE_NOISE_RE = re.compile(
     r"\b(?:19|20)\d{2}\b|\b(?:2160|1080|720|576|480)p\b|\b(?:4k|8k|"
     r"web-?dl|webrip|blu-?ray|bdrip|remux|x26[45]|h26[45]|hevc|av1|"
     r"10bit|8bit|aac|dts|flac)\b",
+    re.IGNORECASE,
+)
+_YEAR_TOKEN_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+
+# A number of real intake trees use a bare structural season marker with
+# release packaging attached to it (for example ``第六季（2022）全10集
+# 内封字幕 1080P``).  Such a directory is still a season sibling; treating
+# the whole decorated label as a creative title makes C query TMDB with
+# ``第六季`` and loses the parent/container evidence.  Keep this classifier
+# deliberately lexical: it only returns a season number when every remaining
+# token is bounded release noise, never when a work title remains.
+_GENERIC_SEASON_PACKAGING_RE = re.compile(
+    r"(?:19|20)\d{2}|(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)|"
+    r"(?:内封|内嵌|外挂|硬字幕|软字幕|字幕|中字|简中|繁中|简繁|繁简|"
+    r"简英|繁英|双语|雙語|蓝光|藍光|原盘|原盤|REMUX|BDRip|WEBRip|"
+    r"WEB-?DL|HEVC|AVC|H26[45]|x26[45]|10bit|8bit|AAC|FLAC|DTS|"
+    r"4K|8K|2160p|1440p|1080p|720p|576p|480p|合集|全季|全系列|"
+    r"收藏版|超清|高清|发布|發布|字幕组|字幕組)",
+    re.IGNORECASE,
+)
+_GENERIC_SEASON_MARKER_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:season|s)\s*0*\d{1,3}(?!\s*e\s*\d)(?![A-Za-z0-9])"
+    r"|第\s*(?:\d{1,3}|[一二三四五六七八九十百零〇两]{1,5})\s*季",
     re.IGNORECASE,
 )
 
@@ -275,16 +299,106 @@ def _season_signature(name: str) -> str | None:
     return normalized or None
 
 
+def _generic_season_child(name: str) -> int | None:
+    """Return the season number for a release-decorated generic season name.
+
+    This is intentionally stricter than ``_season_number_from_directory_name``.
+    A name such as ``Show S01 1080p`` retains ``Show`` and is a titled release
+    branch; only a name whose non-season text is all bounded packaging noise is
+    classified as a structural sibling.
+    """
+    season = _season_number_from_directory_name(name)
+    if season is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(name or "")).strip()
+
+    # Brackets often contain the only title evidence (``[Attack on Titan]")
+    # rather than release packaging.  Remove them only when their *entire*
+    # contents are from the bounded packaging vocabulary.  Unknown, empty,
+    # nested, or unbalanced brackets make this narrow classifier fail closed.
+    def strip_explicit_bracketed_packaging(match: re.Match[str]) -> str:
+        label = match.group(1) if match.group(1) is not None else match.group(2)
+        if not label.strip() or any(token in label for token in "[]()"):
+            return match.group(0)
+        stripped = _GENERIC_SEASON_PACKAGING_RE.sub(" ", label)
+        residual = re.sub(r"[\W_]+", "", stripped, flags=re.UNICODE)
+        return " " if label.strip() and not residual else match.group(0)
+
+    text = re.sub(r"\[([^\]]*)\]|\(([^)]*)\)", strip_explicit_bracketed_packaging, text)
+    if any(token in text for token in "[]()"):
+        return None
+    text = _GENERIC_SEASON_MARKER_RE.sub(" ", text)
+    text = _GENERIC_SEASON_PACKAGING_RE.sub(" ", text)
+    residual = re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+    return season if not residual else None
+
+
+def _generic_season_cohort(
+    node: SourceNode,
+) -> tuple[tuple[SourceNode, ...], tuple[int, ...]]:
+    """Find a conservative cohort of decorated structural season children.
+
+    Every member must have a unique season number and an independently
+    corroborating episode run.  The run may be explicit ``SxxExx`` or a
+    complete exact ``01..N`` numeric release (the latter never becomes an
+    identity query; it is only B/W ownership evidence).  This lets a root
+    such as ``Show/第一季（...）/第二季（...）`` become one WorkUnit while a
+    titled spin-off child remains a separate candidate.
+    """
+    members: list[tuple[SourceNode, int]] = []
+    for child in node.children:
+        season = _generic_season_child(child.name)
+        if season is not None:
+            members.append((child, season))
+    if len(members) < 2 or len({season for _child, season in members}) != len(members):
+        return (), ()
+    verified: list[tuple[SourceNode, int]] = []
+    for child, season in members:
+        if _directory_matches_declared_season(child, season):
+            verified.append((child, season))
+    if len(verified) < 2 or len({season for _child, season in verified}) != len(verified):
+        return (), ()
+    verified.sort(key=lambda item: (item[1], item[0].path))
+    return tuple(child for child, _season in verified), tuple(
+        season for _child, season in verified
+    )
+
+
 def _directory_matches_declared_season(node: SourceNode, season: int) -> bool:
     """Require subtree episode evidence to agree with the directory marker."""
     observed: set[int] = set()
+    videos = []
     for file in collect_all_files(node):
         if file.object_type != "video":
             continue
+        videos.append(file)
         match = _SEASON_EPISODE_RE.search(file.name)
         if match is not None:
             observed.add(int(match.group(1)))
-    return observed == {season}
+    if observed:
+        return observed == {season}
+    # Exact bare numeric releases (01.mkv…N.mkv) are valid structural
+    # corroboration for a directory season, but never identity evidence.  A
+    # complete contiguous run with no duplicate stems is required.
+    if len(videos) < 4:
+        return False
+    numbers: list[int] = []
+    for file in videos:
+        stem = str(file.name).rsplit("/", 1)[-1]
+        # Release names often append codec/group tags to a numeric ordinal
+        # (``01.BluRay...mkv``).  Accept the ordinal only at the beginning
+        # and require a non-digit separator; decimal/quality tokens do not
+        # become episode evidence through this fallback.
+        match = re.match(r"^0*([1-9]\d{0,2})(?:[._ -]|$)", stem.strip())
+        if match is None:
+            return False
+        numbers.append(int(match.group(1)))
+    ordered = sorted(set(numbers))
+    return (
+        len(ordered) >= 4
+        and len(numbers) == len(ordered)
+        and ordered == list(range(1, len(ordered) + 1))
+    )
 
 
 def _decorated_season_cohorts(node: SourceNode) -> list[tuple[str, tuple[SourceNode, ...], tuple[int, ...]]]:
@@ -396,6 +510,22 @@ def _is_titled_child(node: SourceNode) -> bool:
     return True
 
 
+def _has_explicit_year_evidence(node: SourceNode) -> bool:
+    """Whether a residual sibling carries a bounded release/year marker.
+
+    A generic season cohort plus an arbitrary titled branch is not enough to
+    split a root: an ``Aftershow``/``Extras``-like branch may be part of the
+    same unresolved container.  A direct four-digit year in the branch name
+    or one of its files is a small, generic corroboration that the sibling is
+    a separately released work.  This is boundary evidence only, never an
+    identity match or target-path decision.
+    """
+    return any(
+        _YEAR_TOKEN_RE.search(str(item.name or ""))
+        for item in collect_all_files(node)
+    ) or bool(_YEAR_TOKEN_RE.search(str(node.name or "")))
+
+
 def _normalized_role_label(value: str) -> str:
     """Normalize a generic directory-role label without interpreting titles.
 
@@ -444,6 +574,157 @@ def _single_large_video(node: SourceNode) -> bool:
     return False
 
 
+# A flat intake root is sometimes an identity-free package containing several
+# feature files (rather than one directory per feature).  Keep the lexical
+# cleanup here deliberately structural: it removes release/part/episode
+# notation only to decide whether two files are the same *physical title*;
+# it never supplies a TMDB identity or a target path.
+_DIRECT_EPISODE_MARKER_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:S\s*\d{1,3}\s*E\s*\d{1,4}|E(?:P)?\s*\d{1,4})"
+    r"(?:$|[^0-9])",
+    re.IGNORECASE,
+)
+_DIRECT_ORDINAL_BRACKET_RE = re.compile(
+    r"(?:\[|\(|【)\s*0*\d{1,3}(?:\s*v\d+)?\s*(?:\]|\)|】)",
+    re.IGNORECASE,
+)
+_DIRECT_PART_TOKEN_RE = re.compile(
+    r"(?:^|[\s._-])(?:part|pt|disc|disk|cd|vol(?:ume)?|segment|片|碟|篇)"
+    r"\s*0*\d{1,3}(?=$|[\s._-])",
+    re.IGNORECASE,
+)
+_DIRECT_RELEASE_NOISE_RE = re.compile(
+    r"(?:19|20)\d{2}|(?:2160|1440|1080|720|576|480)p|4k|8k|"
+    r"(?:bdrip|blu[- ]?ray|web[- ]?dl|webrip|remux|x26[45]|h26[45]|hevc|av1|"
+    r"10bit|8bit|aac|eac3|ac3|dts|flac|ma10p|hi_?10p)",
+    re.IGNORECASE,
+)
+_DIRECT_TRAILING_ORDINAL_RE = re.compile(
+    r"(?:^|[\s._-])0*[1-9]\d{0,2}$",
+    re.IGNORECASE,
+)
+
+
+def _direct_movie_title_key(file_name: str) -> str | None:
+    """Return a conservative title key for one flat video filename.
+
+    The key is used only by the boundary splitter.  Explicit episode-shaped
+    names, bare ordinals, and release-part markers fail closed so a normal TV
+    episode pack or a multi-disc encode can never be mistaken for a movie
+    collection.  Bracketed release tags are discarded; meaningful CJK/Latin
+    title text remains for C/U to query through the ordinary matcher.
+    """
+    stem = unicodedata.normalize("NFKC", Path(str(file_name)).stem).strip()
+    if not stem or _DIRECT_EPISODE_MARKER_RE.search(stem):
+        return None
+    # A bare numeric release (01.mkv) is episode/part evidence, never a title.
+    if re.fullmatch(r"0*[1-9]\d{0,2}", stem):
+        return None
+
+    def bracket_replacement(match: re.Match[str]) -> str:
+        content = match.group(1) or match.group(2) or match.group(3) or ""
+        # Keep a bracketed creative title (for example ``[君の名は]``), but
+        # discard the bounded release vocabulary and short ASCII group tags.
+        if (
+            not re.search(r"[\u3400-\u9fff\u3040-\u30ff]", content)
+            and not re.search(r"[A-Za-z]{2,}", content)
+        ):
+            return " "
+        if _DIRECT_RELEASE_NOISE_RE.search(content) or re.fullmatch(
+            r"[A-Za-z0-9 _+.-]{1,16}", content.strip()
+        ):
+            return " "
+        return f" {content} "
+
+    stem = re.sub(
+        r"\[([^\]]*)\]|\(([^)]*)\)|【([^】]*)】",
+        bracket_replacement,
+        stem,
+    )
+    stem = _DIRECT_PART_TOKEN_RE.sub(" ", stem)
+    stem = _DIRECT_RELEASE_NOISE_RE.sub(" ", stem)
+    # Common release names append a single ordinal after the title.  Strip it
+    # only at the end and only after the stronger part/episode guards above.
+    stem = _DIRECT_TRAILING_ORDINAL_RE.sub(" ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" ._+-")
+    key = "".join(
+        char.casefold()
+        for char in unicodedata.normalize("NFKC", stem)
+        if char.isalnum()
+    )
+    if not key or key.isdigit() or len(key) < 4:
+        return None
+    return key
+
+
+def _direct_movie_title_is_substantial(file_name: str) -> bool:
+    """Require meaningful title text before splitting a flat file set."""
+    stem = unicodedata.normalize("NFKC", Path(str(file_name)).stem)
+    cjk = re.findall(r"[\u3400-\u9fff\u3040-\u30ff]", stem)
+    latin_words = re.findall(r"[A-Za-z]{2,}", stem)
+    return len(cjk) >= 3 or len(latin_words) >= 2
+
+
+def _split_flat_movie_files(
+    node: SourceNode,
+    *,
+    root_task_id: str,
+    root_videos: int,
+) -> list[WorkCandidate] | None:
+    """Split several independently titled direct feature files.
+
+    This is a pure B/W rule for the identity-free flat-package shape.  It is
+    intentionally narrower than a generic ``root_videos > 1`` rule: every
+    file must be a substantial, large, non-episodic title, all normalized
+    title keys must be unique, and the root may not also contain a
+    video-bearing child directory.  If any proof is missing the caller keeps
+    the historical whole-root boundary and C/U can park it safely.
+    """
+    if root_videos < 2:
+        return None
+    direct_videos = [
+        file for file in node.files if file.object_type == "video"
+    ]
+    if len(direct_videos) < 2 or any(
+        file.size < _MOVIE_MIN_BYTES
+        or not _direct_movie_title_is_substantial(file.name)
+        for file in direct_videos
+    ):
+        return None
+    # A root that also has a video-bearing child is normally a TV/container
+    # layout.  Leave it intact for the season/container rules below.
+    if any(_child_has_video(child) for child in node.children):
+        return None
+    keys = [_direct_movie_title_key(file.name) for file in direct_videos]
+    if any(key is None for key in keys):
+        return None
+    concrete_keys = [key for key in keys if key is not None]
+    if len(set(concrete_keys)) != len(concrete_keys):
+        return None
+
+    candidates: list[WorkCandidate] = []
+    reason = (
+        f"根目录直接含 {len(direct_videos)} 个独立标题的大视频文件；"
+        "文件名无季集/分片坐标且标题键互不重复",
+    )
+    for file in direct_videos:
+        boundary_key = file.path
+        candidates.append(WorkCandidate(
+            work_unit_id=_work_unit_id(root_task_id, boundary_key),
+            boundary_key=boundary_key,
+            source_paths=(boundary_key,),
+            display_label=Path(file.name).stem,
+            proposed_media_context="movie",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.MOVIE_COLLECTION,
+                confidence=0.86,
+                reasons=reason,
+                competing_roles=(DirectoryRole.SINGLE_WORK.value,),
+            ),
+        ))
+    return candidates
+
+
 def _propose_media_context(node: SourceNode) -> str:
     """Heuristic: is this more movie-shaped or TV-shaped?"""
     all_files = collect_all_files(node)
@@ -461,6 +742,37 @@ def _propose_media_context(node: SourceNode) -> str:
         return "tv"
     # 2-3 videos with no season dir → could be short movie trilogy or OVA
     return "unknown"
+
+
+def _explicit_file_claimed_seasons(node: SourceNode) -> tuple[int, ...]:
+    """Return positive seasons proved by every owned video coordinate.
+
+    A titled sibling beside a multi-season cohort is an independent WorkUnit,
+    so it does not pass through ``_single_work_claimed_seasons``.  When every
+    video in that exact sibling scope nevertheless carries an explicit
+    ``SxxExx`` coordinate, those positive season numbers are still ordinary
+    B/W ownership facts.  Persisting them lets the generic container rule
+    distinguish one multi-season main identity from a one-season sibling
+    without consulting a title, TMDB id, or answerbook row.
+
+    Any unqualified video makes the proof fail closed.  Season 00 remains
+    auxiliary coverage and never nominates a main TV identity by itself.
+    """
+    seasons: set[int] = set()
+    videos = [
+        file for file in collect_all_files(node)
+        if file.object_type == "video"
+    ]
+    if not videos:
+        return ()
+    for file in videos:
+        match = _SEASON_EPISODE_RE.search(file.name)
+        if match is None:
+            return ()
+        season = int(match.group(1))
+        if season > 0:
+            seasons.add(season)
+    return tuple(sorted(seasons))
 
 
 def _single_work_claimed_seasons(
@@ -758,6 +1070,19 @@ def analyze_boundaries(
     ]
     root_videos = direct_video_file_count(node)
 
+    # Identity-free flat movie packages (two or more independently titled
+    # feature files directly under the intake root) need one exact WorkUnit
+    # per file before C/U.  Keep this ahead of the broad single-work fallback;
+    # the helper is deliberately conservative and returns ``None`` for TV
+    # episode/part shapes or any mixed video-bearing subtree.
+    flat_movie_split = _split_flat_movie_files(
+        node,
+        root_task_id=root_task_id,
+        root_videos=root_videos,
+    )
+    if flat_movie_split is not None:
+        return flat_movie_split
+
     # --- Rule 1a: season root plus independent film/special collection ---
     # This must happen before decorated-season cohorts and the broad
     # single-work fallback.  It never relies on a title lookup: only explicit
@@ -772,14 +1097,117 @@ def analyze_boundaries(
     if mixed_season_split is not None:
         return mixed_season_split
 
-    # --- Rule 1b: decorated sibling season cohort -----------------------
+    # --- Rule 1b: decorated *generic* season siblings ------------------
+    # Uploaders often add year/count/codec text to an otherwise structural
+    # ``第一季``/``Season 02`` directory.  Group only the members whose exact
+    # episode runs corroborate their season numbers; independently titled
+    # children (for example a spin-off in the same user container) remain
+    # separate WorkUnits and are never absorbed by this rule.
+    generic_children, generic_seasons = _generic_season_cohort(node)
+    generic_cohort_unresolved = False
+    if generic_children and root_videos == 0:
+        grouped_paths = {child.path for child in generic_children}
+        auxiliary_children = tuple(
+            child
+            for child in node.children
+            if child.path not in grouped_paths
+            and _is_tv_auxiliary_group(child)
+            and collect_all_files(child)
+        )
+        residual_video_children = [
+            child
+            for child in node.children
+            if _child_has_video(child)
+            and child.path not in grouped_paths
+            and child.path not in {item.path for item in auxiliary_children}
+        ]
+        # A remaining season-marked branch which failed the exact proof is a
+        # contradiction, not a reason to silently drop it.  Other titled
+        # branches are valid sibling works and are retained below.
+        contradictory_seasons = [
+            child
+            for child in residual_video_children
+            if _season_number_from_directory_name(child.name) is not None
+        ]
+        # Do not split a generic season cohort merely because an arbitrary
+        # titled branch exists (``Aftershow`` is a common same-container
+        # example).  A residual branch needs an additional release/year
+        # corroboration before it becomes a sibling WorkUnit; otherwise the
+        # conservative whole-root rule below retains ownership together.
+        residual_is_provably_titled = all(
+            _is_titled_child(child) and _has_explicit_year_evidence(child)
+            for child in residual_video_children
+        )
+        if not contradictory_seasons and residual_is_provably_titled:
+            ordered_main = tuple(sorted(
+                (*generic_children, *auxiliary_children),
+                key=lambda child: (
+                    _season_number_from_directory_name(child.name) is None,
+                    _season_number_from_directory_name(child.name) or 0,
+                    child.path,
+                ),
+            ))
+            reasons = (
+                f"发现 {len(generic_seasons)} 个带发布噪声但经集号验证的结构季目录",
+            )
+            # A pure multi-season work owns the real intake boundary.  Use a
+            # synthetic key only when independently proved sibling works also
+            # live below that intake; in that case the key prevents the main
+            # unit from claiming the siblings' source objects.  Applying the
+            # synthetic key unconditionally leaked an internal implementation
+            # marker into ordinary single-work boundaries and obscured their
+            # whole-root ownership.
+            main_boundary = (
+                f"{node.path}/@generic-season-root"
+                if residual_video_children
+                else node.path
+            )
+            candidates = [WorkCandidate(
+                work_unit_id=_work_unit_id(root_task_id, main_boundary),
+                boundary_key=main_boundary,
+                source_paths=tuple(child.path for child in ordered_main),
+                display_label=node.name,
+                proposed_media_context="tv",
+                boundary_evidence=BoundaryEvidence(
+                    role=DirectoryRole.SINGLE_WORK,
+                    confidence=0.93,
+                    reasons=reasons,
+                    competing_roles=(DirectoryRole.SERIES_CONTAINER.value,),
+                ),
+                claimed_seasons=generic_seasons,
+            )]
+            for child in residual_video_children:
+                candidates.append(WorkCandidate(
+                    work_unit_id=_work_unit_id(root_task_id, child.path),
+                    boundary_key=child.path,
+                    source_paths=(child.path,),
+                    display_label=child.name,
+                    proposed_media_context=_propose_media_context(child),
+                    boundary_evidence=BoundaryEvidence(
+                        role=DirectoryRole.SERIES_CONTAINER,
+                        confidence=0.85,
+                        reasons=(
+                            "结构季目录之外存在独立有标题视频子目录",
+                        ),
+                        competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
+                    ),
+                    claimed_seasons=_explicit_file_claimed_seasons(child),
+                ))
+            return candidates
+        # A verified generic cohort exists, but at least one sibling is not
+        # independently proven.  Keep the whole root together and suppress
+        # the broader decorated-cohort rule below; otherwise an ``Aftershow``
+        # branch could be split merely because the season labels are noisy.
+        generic_cohort_unresolved = True
+
+    # --- Rule 1c: decorated sibling season cohort -----------------------
     # Some uploaders put every season in a release-named sibling directory,
     # rather than a bare ``Season 01`` directory.  Recognise it only when the
     # directory and its video filenames corroborate each other.  The returned
     # candidates claim only their exact sibling paths, so unrelated aftershows
     # and root-level resource files remain outside the TV unit's ownership.
     cohorts = _decorated_season_cohorts(node)
-    if cohorts and root_videos == 0:
+    if cohorts and root_videos == 0 and not generic_cohort_unresolved:
         claimed_paths = {
             child.path
             for _signature, children, _seasons in cohorts
@@ -830,6 +1258,7 @@ def analyze_boundaries(
                             reasons=reasons,
                             competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
                         ),
+                        claimed_seasons=_explicit_file_claimed_seasons(child),
                     ))
             return candidates
 
@@ -842,6 +1271,7 @@ def analyze_boundaries(
         len(titled_children) >= 2
         and len(bare_season_children) == 0
         and root_videos == 0
+        and not generic_cohort_unresolved
     ):
         reasons = [
             f"发现 {len(titled_children)} 个包含视频的有名字子目录",
@@ -889,6 +1319,7 @@ def analyze_boundaries(
         and root_videos == 0
         and len(node.children) >= 2
         and all(_single_large_video(c) for c in node.children)
+        and not generic_cohort_unresolved
     ):
         evidence = BoundaryEvidence(
             role=DirectoryRole.MOVIE_COLLECTION,
