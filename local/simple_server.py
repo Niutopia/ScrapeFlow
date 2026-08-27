@@ -1255,6 +1255,36 @@ class SimpleApplication:
             return "not-found"
         return self._queue_selected_work(job_id, self._run_automatic_job)
 
+    def _completed_root_needs_planner_gap_rereview(self, root_task_id: str) -> bool:
+        """Read whether an old executed carrier has a strict unledgered season.
+
+        This check is local-state only.  It deliberately does not turn a
+        broad historical display label into authority to reopen a completed
+        RootJob.
+        """
+        try:
+            from local.scrapeflow_api.unit_execution import (
+                has_unmaterialized_planner_season_gaps,
+            )
+
+            return has_unmaterialized_planner_season_gaps(
+                self._get_engine_runner(),
+                self.state_root,
+                root_task_id,
+            )
+        except Exception:
+            return False
+
+    def _queue_completed_root_j_rereview(self, root_task_id: str) -> str:
+        """Queue the narrow J-only repair for one selected completed root."""
+        if self._closed.is_set():
+            return "closed"
+        if not self._automatic_root_allowed(root_task_id):
+            return "paused-or-unselected"
+        if not self._completed_root_needs_planner_gap_rereview(root_task_id):
+            return "no-planner-gap-rereview"
+        return self._queue_selected_work(root_task_id, self._run_completed_root_j_rereview)
+
     def _record_automatic_failure(self, job_id: str, error: Exception) -> None:
         """Make an unexpected intake failure visible for an explicit retry."""
         if not self._automatic_root_allowed(job_id):
@@ -1317,6 +1347,47 @@ class SimpleApplication:
         finally:
             if runner is not None:
                 self._consume_root_cancellation(runner, job_id)
+
+    def _run_completed_root_j_rereview(self, root_task_id: str) -> None:
+        """Repair a strict J omission without re-entering F/G/H.
+
+        An explicit retry reaches this worker only after the local detection
+        proved an executed internal carrier has a canonical planner
+        ``missing_season`` row not yet represented by exact ledger episodes.
+        ``rereview_executed_unit_gaps`` therefore never creates a plan or
+        executes the writer.  If J opens precise gaps, the ordinary selected
+        root replenishment turn follows in this same single-worker slot.
+        """
+        if self._closed.is_set() or not self._automatic_root_allowed(root_task_id):
+            return
+        runner: SimpleEngineRunner | None = None
+        try:
+            from local.scrapeflow_api.root_pipeline import refresh_root_after_j_rereview
+            from local.scrapeflow_api.unit_execution import rereview_executed_unit_gaps
+
+            runner = self._get_engine_runner()
+            rereview_executed_unit_gaps(
+                runner,
+                self.state_root,
+                root_task_id,
+                pause_requested=lambda: self._root_pause_requested(root_task_id),
+            )
+            final = refresh_root_after_j_rereview(runner, self.state_root, root_task_id)
+            if (
+                final.phase == "gaps_pending"
+                and aggregate_root_job(self.state_root, root_task_id).open_gaps > 0
+            ):
+                self._run_root_replenishment(root_task_id)
+        except (EnginePauseRequested, EngineCancellationRequested):
+            return
+        except Exception:
+            # An untrusted legacy carrier cannot be repaired by guessing.  A
+            # later normal retry remains available; this narrow path never
+            # changes media or invents an alternate lifecycle state.
+            return
+        finally:
+            if runner is not None:
+                self._consume_root_cancellation(runner, root_task_id)
 
     def _resume_automatic_jobs(self) -> None:
         """Resume only the currently selected RootJob after an explicit resume."""
@@ -1996,7 +2067,10 @@ class SimpleApplication:
         if not is_intake_bound_root(self.state_root, job_id):
             raise EngineRequestError("重试只支持 IntakeSource 创建的 RootJob")
         if engine_job.phase in {"completed", "gaps_pending"}:
-            if self.control().get("paused") is False:
+            if self._completed_root_needs_planner_gap_rereview(job_id):
+                if self.control().get("paused") is False:
+                    self._queue_completed_root_j_rereview(job_id)
+            elif self.control().get("paused") is False:
                 self._queue_root_replenishment(job_id)
             return self.public_engine_job(engine_job)
         summary = dict(engine_job.summary)

@@ -46,7 +46,11 @@ from engine.scrapeflow.source_inventory import (
     validate_source_scope,
 )
 from engine.scrapeflow.serialization import atomic_write_json
-from engine.scrapeflow.gap_ledger import discover_episode_gaps, parse_gap_token
+from engine.scrapeflow.gap_ledger import (
+    discover_episode_gaps,
+    load_gap_ledger,
+    parse_gap_token,
+)
 from engine.scrapeflow.identity_matching import _clean_franchise_root_label
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.remote_paths import provider_safe_basename
@@ -63,9 +67,11 @@ from .library_index import (
     SingleSeasonEpisodeProof,
     _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
     _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
+    _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND,
     prove_physical_special_single_season_evidence,
     prove_single_season_episode_evidence,
     release_dash_episode_source_ordinals,
+    release_title_ordinal_episode_source_ordinals,
     single_season_episode_evidence_label,
 )
 from .simple_engine_runner import (
@@ -311,7 +317,7 @@ def _require_fresh_source_scope_directories(
     runner: SimpleEngineRunner,
     scopes: tuple[str, ...],
 ) -> None:
-    """Prove every claimed boundary still names one exact remote directory.
+    """Prove every claimed boundary is still the same exact remote object.
 
     A recursive AList listing may return ``[]`` for both an empty directory
     and a path that disappeared.  That ambiguity is especially dangerous for
@@ -322,11 +328,98 @@ def _require_fresh_source_scope_directories(
     """
     for scope in scopes:
         kind = runner._remote_entry_kind(scope)  # noqa: SLF001 - exact AList proof
-        if kind != "directory":
+        if kind not in {"directory", "file"}:
             raise ValueError(
-                f"来源范围已不再是可证明目录 ({kind}): {scope}；"
+                f"来源范围已不再是可证明目录或文件 ({kind}): {scope}；"
                 "请保持暂停并重建边界"
             )
+
+
+def _fresh_exact_file_scope_row(
+    runner: SimpleEngineRunner,
+    scope: str,
+) -> dict[str, Any]:
+    """Read one exact file scope through its parent listing.
+
+    ``AList.list(file)`` is not a portable file read (some drivers return an
+    empty directory-like response), so the parent/name row is the authoritative
+    existence and byte observation.  This keeps flat movie WorkUnits pinned to
+    one object and never widens them to the containing directory.
+    """
+    parent, name = posixpath.split(scope.rstrip("/"))
+    listing = getattr(runner.alist, "list", None)
+    if not parent or not name or not callable(listing):
+        raise ValueError(f"无法读取来源文件父目录: {scope}")
+    try:
+        rows = listing(parent, refresh=True)
+    except TypeError:
+        rows = listing(parent)
+    except Exception as exc:
+        raise ValueError(f"无法读取来源文件父目录: {scope}") from exc
+    if not isinstance(rows, list):
+        raise ValueError(f"来源文件父目录列表无效: {scope}")
+    matches = [
+        row for row in rows
+        if isinstance(row, Mapping) and row.get("name") == name
+    ]
+    if len(matches) != 1 or matches[0].get("is_dir") is True:
+        raise ValueError(f"来源文件范围已不存在或类型变化: {scope}")
+    raw = dict(matches[0])
+    raw["full_path"] = scope
+    return raw
+
+
+def _fresh_scope_rows(
+    runner: SimpleEngineRunner,
+    scopes: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Freshly list directory scopes and exact-file scopes as one row set."""
+    rows: list[dict[str, Any]] = []
+    for scope in scopes:
+        kind = runner._remote_entry_kind(scope)  # noqa: SLF001
+        if kind == "directory":
+            rows.extend(walk_source_rows(runner.alist, scope))
+        elif kind == "file":
+            rows.append(_fresh_exact_file_scope_row(runner, scope))
+        else:
+            raise ValueError(
+                f"来源范围无法 fresh 证明 ({kind}): {scope}；"
+                "不是可证明目录或文件"
+            )
+    return tuple(rows)
+
+
+def _scope_kind_map(
+    runner: SimpleEngineRunner,
+    scopes: tuple[str, ...],
+) -> dict[str, str]:
+    """Return one exact provider kind for each declared scope."""
+    kinds: dict[str, str] = {}
+    for scope in scopes:
+        kind = runner._remote_entry_kind(scope)  # noqa: SLF001
+        if kind not in {"directory", "file"}:
+            raise ValueError(
+                f"来源范围无法 fresh 证明 ({kind}): {scope}；"
+                "不是可证明目录或文件"
+            )
+        kinds[scope] = kind
+    return kinds
+
+
+def _path_in_scoped_objects(
+    path: str,
+    scope_kinds: Mapping[str, str],
+    *,
+    include_scope: bool = False,
+) -> bool:
+    """Test one object path against mixed directory/file scopes."""
+    for scope, kind in scope_kinds.items():
+        if kind == "file":
+            if path == scope:
+                return True
+        elif path.startswith(scope + "/") or (include_scope and path == scope):
+            return True
+    return False
 
 
 def _path_in_scope(path: str, scopes: tuple[str, ...], *, include_scope: bool = True) -> bool:
@@ -372,7 +465,7 @@ def _fresh_scoped_source_files(
     ``require_single_scope_manifest`` to hand the exact fresh manifest to F.
     """
     scopes = _record_source_scopes(runner, root_job, record)
-    _require_fresh_source_scope_directories(runner, scopes)
+    scope_kinds = _scope_kind_map(runner, scopes)
     if len(scopes) <= 1 and not require_single_scope_manifest:
         return scopes, ()
     snapshot = load_source_snapshot(state_root, root_task_id)
@@ -382,11 +475,13 @@ def _fresh_scoped_source_files(
         row
         for row in snapshot["rows"]
         if isinstance(row, Mapping)
-        and _path_in_scope(str(row.get("full_path") or "").rstrip("/"), scopes, include_scope=False)
+        and _path_in_scoped_objects(
+            str(row.get("full_path") or "").rstrip("/"),
+            scope_kinds,
+            include_scope=False,
+        )
     ]
-    fresh_rows: list[dict[str, Any]] = []
-    for scope in scopes:
-        fresh_rows.extend(walk_source_rows(runner.alist, scope))
+    fresh_rows = list(_fresh_scope_rows(runner, scopes))
     expected_fingerprint = _scope_row_fingerprint(expected_rows)
     fresh_fingerprint = _scope_row_fingerprint(fresh_rows)
     if expected_fingerprint != fresh_fingerprint:
@@ -402,13 +497,13 @@ def _fresh_scoped_source_files(
         # the full second fresh listing instead.
         if callable(walk):
             for scope in scopes:
+                if scope_kinds[scope] != "directory":
+                    continue
                 try:
                     walk(scope, refresh=True)
                 except TypeError:
                     walk(scope)
-        post_walk_rows: list[dict[str, Any]] = []
-        for scope in scopes:
-            post_walk_rows.extend(walk_source_rows(runner.alist, scope))
+        post_walk_rows = list(_fresh_scope_rows(runner, scopes))
         if _scope_row_fingerprint(post_walk_rows) != fresh_fingerprint:
             raise ValueError(
                 "fresh 来源清单在快照核验后变化；请保持暂停并重建边界"
@@ -420,6 +515,9 @@ def _fresh_scoped_source_files(
         )
     elif callable(walk):
         for scope in scopes:
+            if scope_kinds[scope] == "file":
+                manifest.append(_fresh_exact_file_scope_row(runner, scope))
+                continue
             try:
                 scoped_files = walk(scope, refresh=True)
             except TypeError:
@@ -440,11 +538,7 @@ def _fresh_scoped_source_files(
         # Test doubles and narrow AList adapters may expose only list(); the
         # fresh boundary walk remains correct, although it lacks the normal
         # extra-directory pruning performed by AListClient.walk.
-        manifest.extend(
-            dict(row)
-            for row in fresh_rows
-            if row.get("is_dir") is not True
-        )
+        manifest.extend(dict(row) for row in fresh_rows if row.get("is_dir") is not True)
     seen: set[str] = set()
     validated: list[Mapping[str, object]] = []
     for raw in manifest:
@@ -502,10 +596,8 @@ def _fresh_exact_source_manifest(
             require_single_scope_manifest=True,
         )
     scopes = _record_source_scopes(runner, root_job, record)
-    _require_fresh_source_scope_directories(runner, scopes)
-    rows: list[dict[str, Any]] = []
-    for scope in scopes:
-        rows.extend(walk_source_rows(runner.alist, scope))
+    scope_kinds = _scope_kind_map(runner, scopes)
+    rows = list(_fresh_scope_rows(runner, scopes))
     # WorkUnit scopes partition a source tree, while the root-level manifest
     # also contains siblings owned by other units/residuals.  Filter only by
     # the declared exact boundary before comparing; an added item in a
@@ -513,12 +605,16 @@ def _fresh_exact_source_manifest(
     # object inside its scope remains fatal.
     expected_objects = tuple(
         obj for obj in expected.objects
-        if _path_in_scope(obj.path, scopes, include_scope=False)
+        if _path_in_scoped_objects(
+            obj.path, scope_kinds, include_scope=False,
+        )
     )
     fresh_rows = [
         row for row in rows
-        if row.get("is_dir") is not True or _path_in_scope(
-            str(row.get("full_path") or "").rstrip("/"), scopes,
+        if _path_in_scoped_objects(
+            str(row.get("full_path") or "").rstrip("/"),
+            scope_kinds,
+            include_scope=False,
         )
     ]
     try:
@@ -544,13 +640,13 @@ def _fresh_exact_source_manifest(
     if callable(walk):
         try:
             for scope in scopes:
+                if scope_kinds[scope] != "directory":
+                    continue
                 try:
                     walk(scope, refresh=True)
                 except TypeError:
                     walk(scope)
-            post_walk_rows: list[dict[str, Any]] = []
-            for scope in scopes:
-                post_walk_rows.extend(walk_source_rows(runner.alist, scope))
+            post_walk_rows = list(_fresh_scope_rows(runner, scopes))
             post_walk = SourceManifest.from_listing_rows(
                 post_walk_rows,
                 root_path=expected.root_path,
@@ -781,15 +877,9 @@ def _container_layout_targets(
     )
     by_tmdb: dict[int, WorkUnitRecord] = {}
     for record in ordered:
-        identity = record.identity if isinstance(record.identity, Mapping) else {}
-        tmdb_id = identity.get("tmdb_id")
-        if (
-            str(identity.get("media_type") or "") == "tv"
-            and isinstance(tmdb_id, int)
-            and not isinstance(tmdb_id, bool)
-            and tmdb_id > 0
-            and not _is_physical_special_record(record)
-        ):
+        if _eligible_main_tv_record(record):
+            identity = record.identity or {}
+            tmdb_id = identity.get("tmdb_id")
             by_tmdb.setdefault(tmdb_id, record)
 
     targets: dict[str, dict[str, object]] = {}
@@ -823,9 +913,8 @@ def _container_layout_targets(
                 relation = "direct_tv"
         elif main_tmdb is not None:
             is_main = (
-                media_type == "tv"
-                and isinstance(tmdb_id, int)
-                and tmdb_id == main_tmdb
+                _eligible_main_tv_record(record)
+                and (record.identity or {}).get("tmdb_id") == main_tmdb
             )
             if is_main:
                 parent_path = shelf_root
@@ -853,6 +942,144 @@ def _container_layout_targets(
     return {record.work_unit_id: targets[record.work_unit_id] for record in ordered if record.work_unit_id in targets}
 
 
+_NON_MAIN_TV_ROLES = frozenset({
+    "special_group",
+    "extras_group",
+    "version_group",
+    "subtitle_group",
+    "release_group",
+    "resource_group",
+    "uncertain",
+})
+
+
+def _eligible_main_tv_record(record: WorkUnitRecord) -> bool:
+    """Whether a persisted unit may provide main-TV hierarchy evidence."""
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    tmdb_id = identity.get("tmdb_id")
+    return (
+        record.identity_status == "confirmed"
+        and not record.requires_content_expansion
+        and str(identity.get("media_type") or "") == "tv"
+        and isinstance(tmdb_id, int)
+        and not isinstance(tmdb_id, bool)
+        and tmdb_id > 0
+        and str(record.role or "").casefold() not in _NON_MAIN_TV_ROLES
+        and not _is_physical_special_record(record)
+    )
+
+
+def _record_proved_positive_seasons(record: WorkUnitRecord) -> set[int]:
+    """Collect durable positive-season facts from an eligible regular TV."""
+    if not _eligible_main_tv_record(record):
+        return set()
+    identity = record.identity or {}
+    seasons = {
+        season
+        for season in record.claimed_seasons
+        if (
+            isinstance(season, int)
+            and not isinstance(season, bool)
+            and season > 0
+        )
+    }
+    identity_season = identity.get("season")
+    if (
+        isinstance(identity_season, int)
+        and not isinstance(identity_season, bool)
+        and identity_season > 0
+    ):
+        seasons.add(identity_season)
+    proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
+    tmdb_id = identity.get("tmdb_id")
+    if proof is not None and proof.tmdb_id == tmdb_id:
+        seasons.add(proof.season)
+    return seasons
+
+
+def _main_tv_record(records: Sequence[WorkUnitRecord]) -> WorkUnitRecord | None:
+    """Return one regular TV record proved to own the container root.
+
+    A confirmed special/version/opaque unit is not a main-series candidate.
+    Multiple physical records for the same TMDB identity are also ambiguous:
+    B/W must first coalesce or explicitly separate their ownership instead of
+    letting every record write as the main TV.
+    """
+    candidates = [record for record in records if _eligible_main_tv_record(record)]
+    if not candidates:
+        return None
+    by_tmdb: dict[int, list[WorkUnitRecord]] = {}
+    for record in candidates:
+        tmdb_id = int((record.identity or {})["tmdb_id"])
+        by_tmdb.setdefault(tmdb_id, []).append(record)
+    for items in by_tmdb.values():
+        if len(items) <= 1:
+            continue
+        # Split season records are safe only when B/W gave every physical
+        # record a non-empty, disjoint positive-season scope.  Empty/stale
+        # siblings (including historical version backups) remain ambiguous.
+        seen_seasons: set[int] = set()
+        for item in items:
+            seasons = _record_proved_positive_seasons(item)
+            if not seasons or seen_seasons.intersection(seasons):
+                return None
+            seen_seasons.update(seasons)
+
+    # A second row carrying the same identity but excluded above (for example
+    # VERSION_GROUP, OVA, or stale uncertain state) is an ownership collision,
+    # not evidence that may be silently folded into the regular unit.
+    for tmdb_id in by_tmdb:
+        same_identity = [
+            record
+            for record in records
+            if (
+                isinstance(record.identity, Mapping)
+                and record.identity.get("media_type") == "tv"
+                and record.identity.get("tmdb_id") == tmdb_id
+            )
+        ]
+        if (
+            len(same_identity) != len(by_tmdb[tmdb_id])
+            or any(not _eligible_main_tv_record(item) for item in same_identity)
+        ):
+            return None
+
+    proved = {
+        tmdb_id: {
+            season
+            for item in items
+            for season in _record_proved_positive_seasons(item)
+        }
+        for tmdb_id, items in by_tmdb.items()
+    }
+    # For a single identity, explicit split-season records collectively prove
+    # the same main TV family; return a representative for callers that need
+    # one stable record id while layout uses the identity for all split parts.
+    if len(by_tmdb) == 1:
+        return candidates[0]
+    multi_season = [
+        tmdb_id for tmdb_id, seasons in proved.items() if len(seasons) > 1
+    ]
+    if (
+        len(multi_season) == 1
+        and all(
+            len(proved[tmdb_id]) == 1
+            for tmdb_id in proved
+            if tmdb_id != multi_season[0]
+        )
+    ):
+        return by_tmdb[multi_season[0]][0]
+    return None
+
+
+def _main_tv_identity(records: Sequence[WorkUnitRecord]) -> int | None:
+    """Return the one structurally proved TV identity that owns the root."""
+    main = _main_tv_record(records)
+    if main is None:
+        return None
+    return int((main.identity or {})["tmdb_id"])
+
+
 def _container_plan(
     runner: SimpleEngineRunner,
     root_job: EngineJob,
@@ -865,48 +1092,29 @@ def _container_plan(
     - one distinct TV identity (e.g. 刀剑神域 + its movies): the main series
       owns the container; TV units plan at the shelf root and the main
       unit's planned target root becomes the parent of every movie unit;
-    - several distinct TV identities or none (e.g. Fate, 空之境界): the
-      container is a pure collection named after the cleaned intake folder
-      (falling back to the first unit's TMDB title/boundary).  Every regular
-      TV identity is a direct child; a formally proved OAD/OVA/SP unit is
-      assigned to its unique family parent by ``_container_layout_targets``.
+    - several distinct TV identities with one proved multi-season main: the
+      main TV owns the root and each proved single-season sibling nests below;
+    - otherwise several TV identities or none (e.g. Fate, 空之境界): the
+      container is a pure collection named after the cleaned intake folder.
+      Every regular TV identity is a direct child; a formally proved
+      OAD/OVA/SP unit is assigned to its unique family parent by
+      ``_container_layout_targets``.
 
     Single-unit roots are returned unchanged with no container parent.
     Returns ``(ordered_records, container_parent, main_tmdb)``.
     """
     if len(records) <= 1:
         return list(records), None, None
-    tv_ids: list[int] = []
-    for record in records:
-        identity = record.identity or {}
-        tmdb_id = identity.get("tmdb_id")
-        if (
-            str(identity.get("media_type") or "") == "tv"
-            and isinstance(tmdb_id, int)
-            and not isinstance(tmdb_id, bool)
-            and tmdb_id > 0
-        ):
-            if tmdb_id not in tv_ids:
-                tv_ids.append(tmdb_id)
-    # A "main series" exists when one TV identity clearly dominates: it is
-    # either the only TV identity, or it owns several units (multiple
-    # seasons) while every other TV identity owns exactly one unit.  The
-    # dominant series then owns the container root and all other units
-    # (movies, spinoff TV) nest under its real target root.
-    main_tmdb: int | None = None
-    if len(tv_ids) == 1:
-        main_tmdb = tv_ids[0]
-    # More than one distinct TV identity is a genuine collection even when a
-    # single identity owns several seasons.  The old "dominant series owns the
-    # container" shortcut incorrectly hid sibling series under the first TV;
-    # direct-child placement is now the generic rule and special-family
-    # nesting is decided separately from formal title evidence.
+    main_tmdb = _main_tv_identity(records)
     if main_tmdb is not None:
         ordered = sorted(records, key=lambda record: (
             0
-            if str((record.identity or {}).get("media_type") or "") == "tv"
-            and not _is_physical_special_record(record)
-            else 1
+            if (
+                _eligible_main_tv_record(record)
+                and (record.identity or {}).get("tmdb_id") == main_tmdb
+            )
+            else 1,
+            record.work_unit_id,
         ))
         return ordered, None, main_tmdb
     shelf = str(root_job.target_shelf or "anime")
@@ -1176,17 +1384,32 @@ def _unit_video_rows(
     state_root: Path,
     root_task_id: str,
     record: WorkUnitRecord,
+    *,
+    strict: bool = False,
 ) -> list[dict[str, Any]]:
     """Return the unit's video-file rows from the persisted B snapshot."""
     snapshot = load_source_snapshot(state_root, root_task_id)
     if snapshot is None or not record.source_paths:
+        if strict:
+            raise GapDiscoveryAttention("缺少可验证的 B 来源快照，无法核对缺口")
         return []
     try:
         scopes = validate_source_scope(snapshot["root"], record.source_paths)
-    except ValueError:
+    except (KeyError, TypeError, ValueError) as exc:
+        if strict:
+            raise GapDiscoveryAttention("B 来源快照损坏或单元范围失配，无法核对缺口") from exc
+        return []
+    raw_rows = snapshot.get("rows")
+    if not isinstance(raw_rows, list):
+        if strict:
+            raise GapDiscoveryAttention("B 来源快照文件清单损坏，无法核对缺口")
         return []
     rows: list[dict[str, Any]] = []
-    for row in snapshot["rows"]:
+    for row in raw_rows:
+        if not isinstance(row, Mapping):
+            if strict:
+                raise GapDiscoveryAttention("B 来源快照含无效清单行，无法核对缺口")
+            continue
         full_path = str(row.get("full_path") or "")
         if row.get("is_dir") is True:
             continue
@@ -1485,6 +1708,50 @@ def _release_dash_episode_map_path(
     return str(path)
 
 
+def _release_title_ordinal_episode_map_path(
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    proof: SingleSeasonEpisodeProof | None,
+) -> str | None:
+    """Build the F-only ``Title 01`` source-key map after D revalidation."""
+    if (
+        proof is None
+        or proof.evidence_kind != _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND
+    ):
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None:
+        return None
+    try:
+        scoped = build_scoped_source_node(
+            build_source_inventory(snapshot["rows"], snapshot["root"]),
+            record.source_paths,
+            boundary_key=record.boundary_key,
+            display_label=record.display_label,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    source_ordinals = release_title_ordinal_episode_source_ordinals(scoped)
+    if source_ordinals is None:
+        return None
+    numbers = tuple(sorted(source_ordinals.values()))
+    expected = tuple(range(1, proof.episode_count + 1))
+    if numbers != expected or tuple(proof.episode_tokens) != tuple(
+        f"S{proof.season:02d}E{number:02d}" for number in expected
+    ):
+        return None
+    mapping = {
+        str(number): f"S{proof.season:02d}E{number:02d}"
+        for number in numbers
+    }
+    if len(mapping) != proof.episode_count:
+        return None
+    path = state_root / f"episode_map_{record.work_unit_id}.json"
+    atomic_write_json(path, mapping, allow_nan=False)
+    return str(path)
+
+
 def _revalidated_reconciliation_season(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -1615,6 +1882,103 @@ def _explicit_single_scope_season(
     return season
 
 
+def _unit_owns_tv_root_scope(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+) -> bool:
+    """Prove that one unit owns the whole TV ingress, including S00.
+
+    The ordinary proof is an exact single-work boundary equal to the RootJob
+    ingress.  A second narrow proof covers a multi-work root whose sole
+    multi-season TV identity is the main series selected by the same container
+    rule used by F.  Only one aggregated main record may take that branch;
+    single-season siblings and split season records cannot invent specials.
+    """
+    try:
+        job = runner.get_job(root_task_id)
+        ingress = str(runner._job_ingress_source(job)).rstrip("/")  # noqa: SLF001
+    except Exception:
+        return False
+    if not ingress:
+        return False
+    try:
+        records = load_work_unit_records(state_root, root_task_id)
+    except Exception:
+        return False
+    persisted = [
+        item for item in records if item.work_unit_id == record.work_unit_id
+    ]
+    if len(persisted) != 1:
+        return False
+    persisted_record = persisted[0]
+    # The caller may hold a stale ``replace()`` instance after another phase
+    # updated the ledger.  Scope ownership is granted only to the exact
+    # persisted structural/identity row, never to a same-id record with
+    # mutated paths, role, claims, or confirmation state.
+    for field in (
+        "root_task_id",
+        "boundary_key",
+        "source_paths",
+        "source_revision",
+        "role",
+        "display_label",
+        "claimed_seasons",
+        "requires_content_expansion",
+        "identity_status",
+        "identity",
+        "reconciliation_evidence",
+    ):
+        if getattr(record, field) != getattr(persisted_record, field):
+            return False
+    record = persisted_record
+    if str((record.identity or {}).get("media_type") or "") != "tv":
+        return False
+
+    boundary = str(record.boundary_key).rstrip("/")
+    if (
+        record.role == "single_work"
+        and len(record.source_paths) == 1
+        and boundary == str(record.source_paths[0]).rstrip("/")
+        and boundary == ingress
+        and _season_number_from_directory_name(posixpath.basename(boundary)) is None
+    ):
+        # An exact-root unit owns specials only when B/W durably proves it is
+        # the sole WorkUnit in that ingress.  A sibling record means the root
+        # scope overlaps another owner, so walking it for J would be unsafe.
+        return len(records) == 1
+
+    main_tmdb = _main_tv_identity(records)
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    if main_tmdb is None or identity.get("tmdb_id") != main_tmdb:
+        return False
+    main_record = _main_tv_record(records)
+    if main_record is None or main_record.work_unit_id != record.work_unit_id:
+        return False
+    proved_seasons = _record_proved_positive_seasons(record)
+    if len(proved_seasons) <= 1:
+        return False
+    scoped_seasons: set[int] = set()
+    for path in record.source_paths:
+        scope = str(path).rstrip("/")
+        if not scope.startswith(ingress + "/"):
+            return False
+        season = _season_number_from_directory_name(posixpath.basename(scope))
+        if season is not None and season > 0:
+            scoped_seasons.add(season)
+            continue
+        # B/W may attach a clearly-labelled SP/OVA/Extras directory to the
+        # same aggregated TV unit.  It is auxiliary evidence, not a positive
+        # season scope; allow it only under the explicit special marker.
+        if not _SPECIAL_RELATION_MARKER_RE.search(posixpath.basename(scope)):
+            return False
+    # A claimed range alone is not a physical ownership proof.  Require at
+    # least two distinct B/W season-directory scopes, and require each scope
+    # to agree with the durable season facts used by the container rule.
+    return len(scoped_seasons) > 1 and scoped_seasons.issubset(proved_seasons)
+
+
 def _request_for_unit(
     runner: SimpleEngineRunner,
     record: WorkUnitRecord,
@@ -1634,8 +1998,14 @@ def _request_for_unit(
     if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
         raise ValueError("单元身份缺少有效 tmdb_id")
     scopes = _record_source_scopes(runner, root_job, record)
-    _require_fresh_source_scope_directories(runner, scopes)
+    scope_kinds = _scope_kind_map(runner, scopes)
     source_path = scopes[0]
+    # The legacy planners accept a directory ``src_path`` while the internal
+    # manifest pins the exact file.  Keep that public planner root at the
+    # file's parent for a one-file WorkUnit; the scope/manifest gates below
+    # still reject every sibling object.
+    if len(scopes) == 1 and scope_kinds[scopes[0]] == "file":
+        source_path = posixpath.dirname(scopes[0]) or "/"
     parent_path = parent_override or shelf_root
     payload: dict[str, object] = {
         "source_path": source_path,
@@ -1654,6 +2024,10 @@ def _request_for_unit(
     is_release_dash_proof = (
         proof is not None
         and proof.evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND
+    )
+    is_release_title_ordinal_proof = (
+        proof is not None
+        and proof.evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND
     )
     if proof_season is not None:
         if (
@@ -1708,28 +2082,37 @@ def _request_for_unit(
         raise ValueError("WorkUnit 目标范围不属于 Planner 父目录")
     request = replace(request, target_scope_root=target_scope)
     # Multi-scope WorkUnits already hand an exact fresh manifest to F.  A
-    # release-dash proof needs that same pin even for one scope: otherwise an
-    # object added after the D/F proof could be discovered by the planner and
-    # consume the narrowly enabled dash parser without ever being proven.
+    # D/F-only title-ordinal grammars need that same pin even for one scope:
+    # otherwise an object added after the proof could be discovered by the
+    # planner and consume a narrowly enabled parser without being proven.
     fresh_scopes: tuple[str, ...] | None = None
     manifest: tuple[Mapping[str, object], ...] | None = None
     if load_source_manifest(state_root, root_task_id) is not None:
         fresh_scopes, manifest = _fresh_exact_source_manifest(
             runner, state_root, root_task_id, record, root_job,
         )
-    elif len(scopes) > 1 or is_release_dash_proof:
+    elif (
+        len(scopes) > 1
+        or any(kind == "file" for kind in scope_kinds.values())
+        or is_release_dash_proof
+        or is_release_title_ordinal_proof
+    ):
         fresh_scopes, manifest = _fresh_scoped_source_files(
             runner,
             state_root,
             root_task_id,
             record,
             root_job,
-            require_single_scope_manifest=is_release_dash_proof,
+            require_single_scope_manifest=(
+                is_release_dash_proof or is_release_title_ordinal_proof
+            ),
         )
     if fresh_scopes is not None and manifest is not None:
         source_path = request.source_path
         if len(fresh_scopes) > 1:
             source_path = str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
+        elif scope_kinds.get(fresh_scopes[0]) == "file":
+            source_path = posixpath.dirname(fresh_scopes[0]) or "/"
         request = replace(
             request,
             source_path=source_path,
@@ -1751,6 +2134,17 @@ def _request_for_unit(
             )
         request = replace(request, allow_release_dash_ordinal=True)
     if map_path is None:
+        map_path = _release_title_ordinal_episode_map_path(
+            state_root, root_task_id, record, proof,
+        )
+    if is_release_title_ordinal_proof:
+        if proof_season is None or map_path is None:
+            raise ValueError(
+                "D 同标题裸序号集号证据无法重建 F 显式映射；"
+                "请保持暂停并重建边界/对账"
+            )
+        request = replace(request, allow_release_title_ordinal=True)
+    if map_path is None:
         map_path = _physical_special_episode_map_path(
             state_root, root_task_id, record, proof,
         )
@@ -1761,6 +2155,136 @@ def _request_for_unit(
     if map_path is not None:
         request = replace(request, episode_map_path=map_path)
     return request
+
+
+_LEGACY_PLANNER_MISSING_SEASON_LABEL_RE = re.compile(
+    r"^Season (?P<season>[0-9]{2}) (?P<season_name>\S(?:.*\S)?)$"
+)
+
+
+def _strict_planner_missing_seasons(
+    executed_plan: Mapping[str, Any],
+) -> dict[int, int]:
+    """Return the exact missing-season facts carried by one executed plan.
+
+    ``scan_report.resource_gaps`` is planner evidence, not an alternate gap
+    ledger.  New plans carry a numeric ``season`` field.  For the already
+    executed carriers produced before that field existed, accept only the
+    exact canonical label emitted by ``_tv_season_resource_gaps`` together
+    with its complete accompanying schema.  Anything looser would turn a
+    human display label into a new source of episode ownership.
+    """
+    scan_report = executed_plan.get("scan_report")
+    if scan_report is None:
+        return {}
+    if not isinstance(scan_report, Mapping):
+        raise GapDiscoveryAttention("已执行计划的缺口报告格式无效")
+    raw_gaps = scan_report.get("resource_gaps")
+    if raw_gaps is None:
+        return {}
+    if not isinstance(raw_gaps, list):
+        raise GapDiscoveryAttention("已执行计划的缺口报告格式无效")
+
+    output: dict[int, int] = {}
+    for raw_gap in raw_gaps:
+        if not isinstance(raw_gap, Mapping) or raw_gap.get("kind") != "missing_season":
+            continue
+        label = raw_gap.get("label")
+        season_name = raw_gap.get("season_name")
+        expected_count = raw_gap.get("expected_episode_count")
+        reason = raw_gap.get("reason")
+        if (
+            not isinstance(label, str)
+            or not label
+            or not isinstance(season_name, str)
+            or not season_name
+            or season_name != season_name.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count <= 0
+            or raw_gap.get("files") != []
+        ):
+            raise GapDiscoveryAttention("已执行计划的缺季记录缺少严格坐标")
+
+        raw_season = raw_gap.get("season")
+        if raw_season is None:
+            # Historical carrier compatibility is deliberately narrow: only
+            # the exact old generator's fixed label is usable as a fallback.
+            match = _LEGACY_PLANNER_MISSING_SEASON_LABEL_RE.fullmatch(label)
+            if match is None or match.group("season_name") != season_name:
+                raise GapDiscoveryAttention("已执行计划的缺季记录缺少严格坐标")
+            season = int(match.group("season"))
+        elif isinstance(raw_season, int) and not isinstance(raw_season, bool):
+            season = raw_season
+        else:
+            raise GapDiscoveryAttention("已执行计划的缺季记录缺少严格坐标")
+        if season <= 0 or label != f"Season {season:02d} {season_name}":
+            raise GapDiscoveryAttention("已执行计划的缺季记录缺少严格坐标")
+
+        prior = output.get(season)
+        if prior is not None and prior != expected_count:
+            raise GapDiscoveryAttention("已执行计划的缺季记录彼此冲突")
+        output[season] = expected_count
+    return output
+
+
+def _strict_catalog_season_episodes(
+    rows: object,
+    *,
+    expected_count: int,
+) -> list[int]:
+    """Prove the currently published prefix of one planner missing season.
+
+    ``expected_episode_count`` in a planner report comes from season metadata,
+    which may include future episodes.  ``TmdbEpisodeCatalog`` deliberately
+    exposes only rows published today, so J must not turn a normal in-progress
+    season into attention merely because that prefix is shorter than the
+    metadata total.  We still require a non-empty, unique, gap-free ``1..N``
+    prefix no longer than that total before registering any coordinate.
+    """
+    if not isinstance(rows, list):
+        raise GapDiscoveryAttention("TMDB 无法证明已执行计划的缺季坐标")
+    episodes: list[int] = []
+    for row in rows:
+        number = row.get("episode_number") if isinstance(row, Mapping) else None
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise GapDiscoveryAttention("TMDB 无法证明已执行计划的缺季坐标")
+        episodes.append(number)
+    published_count = len(episodes)
+    expected = list(range(1, published_count + 1))
+    if (
+        published_count <= 0
+        or published_count > expected_count
+        or sorted(episodes) != expected
+    ):
+        raise GapDiscoveryAttention("TMDB 与已执行计划的缺季坐标不一致")
+    return expected
+
+
+def _planner_missing_season_is_materialized(
+    ledger: Sequence[Any],
+    record: WorkUnitRecord,
+    tmdb_id: int,
+    season: int,
+) -> bool:
+    """Whether J has ever durably projected this planner season into gaps.
+
+    The executed carrier's expected count is a planning-time season total,
+    not a durable promise about how many episodes were published that day.
+    One exact ledger row is therefore enough to prove the bridge ran.  Future
+    episode publication belongs to a fresh ordinary audit, never repeated
+    reopening of this historical carrier.
+    """
+    return any(
+        gap.work_unit_id == record.work_unit_id
+        and gap.kind == "missing_episode"
+        and gap.media_type == "tv"
+        and gap.tmdb_id == tmdb_id
+        and gap.season == season
+        for gap in ledger
+    )
 
 
 def _register_unit_episode_gaps(
@@ -1788,6 +2312,7 @@ def _register_unit_episode_gaps(
     tmdb_id = identity.get("tmdb_id")
     if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
         return []
+    planner_missing_seasons = _strict_planner_missing_seasons(executed_plan)
 
     plan_files = [
         item for item in (executed_plan.get("files") or [])
@@ -1814,7 +2339,9 @@ def _register_unit_episode_gaps(
     if not has_video_row:
         # Whole-directory move plans do not enumerate videos; the B snapshot
         # is the durable record of what this unit actually carried.
-        source_rows = _unit_video_rows(state_root, root_task_id, record)
+        source_rows = _unit_video_rows(
+            state_root, root_task_id, record, strict=True,
+        )
         source_has_video = bool(source_rows)
         for row in source_rows:
             name = str(row.get("name") or "")
@@ -1844,7 +2371,18 @@ def _register_unit_episode_gaps(
     # Keep that B/W fact so J can record exact official gaps instead of
     # silently erasing the season from the result.
     owned = (owned & verified_seasons) | declared
-    if not owned:
+    # A root-scoped WorkUnit owns the complete TV boundary, including the
+    # provider's published Season 00.  This is deliberately narrower than
+    # ``role == single_work``: the durable B/W scope must be exactly the
+    # RootJob ingress, with no explicit season-directory marker.  Season
+    # sub-units (and sibling units in a container) therefore retain the
+    # 470537d fail-closed ownership rule and cannot invent S00 gaps.
+    owns_tv_root = _unit_owns_tv_root_scope(
+        runner, state_root, root_task_id, record,
+    )
+    if owns_tv_root and record.media_context == "tv":
+        owned.add(0)
+    if not owned and not planner_missing_seasons:
         if source_has_video:
             raise GapDiscoveryAttention(
                 "写后视频无法证明季集坐标，无法核对缺口"
@@ -1874,6 +2412,17 @@ def _register_unit_episode_gaps(
         ]
         if episodes:
             expected_by_season[season] = episodes
+    # The planner has already proven that these positive seasons contain no
+    # source or formal-library video.  Re-read their official catalog now and
+    # materialize only its exact published SxxEyy coordinates in the normal
+    # episode ledger.  Never manufacture a season-level second ledger row.
+    for season, expected_count in planner_missing_seasons.items():
+        if season in verified_seasons:
+            raise GapDiscoveryAttention("已执行计划的缺季与已写季集冲突")
+        expected_by_season[season] = _strict_catalog_season_episodes(
+            expected.get(season),
+            expected_count=expected_count,
+        )
     if not expected_by_season:
         return []
     try:
@@ -1896,6 +2445,8 @@ def _complete_unit_episode_gap_registration(
     root_task_id: str,
     record: WorkUnitRecord,
     executed_plan: Mapping[str, Any],
+    *,
+    force: bool = False,
 ) -> WorkUnitRecord:
     """Run J once and preserve any uncertainty without replaying G/H.
 
@@ -1905,7 +2456,11 @@ def _complete_unit_episode_gap_registration(
     recorded on the WorkUnit so a later explicit retry can resume J from the
     executed carrier instead of planning or moving the media again.
     """
-    if record.gap_status == "registered":
+    # Normal pipeline retries preserve a successfully registered J result:
+    # they must not make an already-completed sibling depend on a later TMDB
+    # read.  The dedicated completed-carrier repair passes ``force=True``
+    # only after proving a strict planner season fact is absent from ledger.
+    if record.gap_status == "registered" and not force:
         return record
     try:
         _register_unit_episode_gaps(
@@ -1938,6 +2493,136 @@ def _complete_unit_episode_gap_registration(
         attention=None,
         updated_at=_now(),
     )
+
+
+def rereview_executed_unit_gaps(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> list[WorkUnitRecord]:
+    """Re-run J only for this root's already-executed internal carriers.
+
+    This is intentionally narrower than ``execute_new_work_units``: it never
+    calls the planner or writer.  It exists for an operator retry of a root
+    completed before a new, generic J proof became available.
+    """
+    records = load_work_unit_records(state_root, root_task_id)
+    ledger = load_gap_ledger(state_root, root_task_id)
+    updated: list[WorkUnitRecord] = []
+    changed = False
+
+    def paused() -> bool:
+        if not callable(pause_requested):
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            return True
+
+    for record in records:
+        if paused():
+            raise EnginePauseRequested("根任务暂停已在缺口重审边界生效")
+        revised = record
+        if record.reconciliation_outcome == "new_work" and record.writer_job_id:
+            try:
+                carrier = runner.get_job(record.writer_job_id)
+            except Exception:
+                carrier = None
+            if (
+                carrier is not None
+                and carrier.phase == "executed"
+                and _is_owned_internal_carrier(carrier, root_task_id)
+            ):
+                identity = record.identity if isinstance(record.identity, Mapping) else {}
+                tmdb_id = identity.get("tmdb_id")
+                try:
+                    planned = _strict_planner_missing_seasons(carrier.plan)
+                except GapDiscoveryAttention:
+                    planned = {}
+                if (
+                    str(identity.get("media_type") or "") == "tv"
+                    and isinstance(tmdb_id, int)
+                    and not isinstance(tmdb_id, bool)
+                    and tmdb_id > 0
+                    and any(
+                        not _planner_missing_season_is_materialized(
+                            ledger, record, tmdb_id, season,
+                        )
+                        for season in planned
+                    )
+                ):
+                    revised = _complete_unit_episode_gap_registration(
+                        runner,
+                        state_root,
+                        root_task_id,
+                        record,
+                        carrier.plan,
+                        force=True,
+                    )
+                    # A root may have more than one strict historical
+                    # carrier.  Later records must see this J write and stay
+                    # untouched once their own season is materialized.
+                    ledger = load_gap_ledger(state_root, root_task_id)
+        changed = changed or revised.as_dict() != record.as_dict()
+        updated.append(revised)
+    if changed:
+        save_work_unit_records(state_root, root_task_id, updated)
+    return updated
+
+
+def has_unmaterialized_planner_season_gaps(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+) -> bool:
+    """Whether one executed carrier has a strict missing-season fact J lacks.
+
+    The check is local-state only.  It does not query AList/TMDB, does not
+    mutate a ledger, and deliberately refuses malformed historical labels.
+    """
+    try:
+        records = load_work_unit_records(state_root, root_task_id)
+        ledger = load_gap_ledger(state_root, root_task_id)
+    except Exception:
+        return False
+    for record in records:
+        identity = record.identity if isinstance(record.identity, Mapping) else {}
+        tmdb_id = identity.get("tmdb_id")
+        if (
+            record.reconciliation_outcome != "new_work"
+            or not record.writer_job_id
+            or str(identity.get("media_type") or "") != "tv"
+            or isinstance(tmdb_id, bool)
+            or not isinstance(tmdb_id, int)
+            or tmdb_id <= 0
+        ):
+            continue
+        try:
+            carrier = runner.get_job(record.writer_job_id)
+        except Exception:
+            continue
+        if (
+            carrier.phase != "executed"
+            or not _is_owned_internal_carrier(carrier, root_task_id)
+        ):
+            continue
+        try:
+            planned = _strict_planner_missing_seasons(carrier.plan)
+        except GapDiscoveryAttention:
+            # An inexact legacy report is not enough authority to reopen a
+            # completed root.  It remains a no-op until a normal replanning
+            # path produces a structured fact.
+            continue
+        if not planned:
+            continue
+        for season in planned:
+            if not _planner_missing_season_is_materialized(
+                ledger, record, tmdb_id, season,
+            ):
+                return True
+    return False
 
 
 def execute_new_work_units(
@@ -2454,6 +3139,8 @@ __all__ = [
     "_container_layout_targets",
     "execute_new_work_units",
     "ensure_container_artifacts",
+    "has_unmaterialized_planner_season_gaps",
     "load_work_acceptance",
+    "rereview_executed_unit_gaps",
     "save_work_acceptance",
 ]

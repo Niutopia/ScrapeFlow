@@ -132,6 +132,58 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(status, 201)
         return str(payload["job"]["id"])
 
+    def _completed_root_with_unmaterialized_planner_season(self) -> str:
+        """Build an old completed carrier with the strict legacy J fact."""
+        root_id = self.create_root()
+        writer_id = "unit-planner-season-gap"
+        record = WorkUnitRecord(
+            work_unit_id="unit-planner-season-gap",
+            root_task_id=root_id,
+            boundary_key="/library/待刮削/Example",
+            source_paths=("/library/待刮削/Example",),
+            source_revision=1,
+            role="single_work",
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 101, "title": "Example"},
+            reconciliation_outcome="new_work",
+            writer_job_id=writer_id,
+            gap_status="registered",
+        )
+        save_work_unit_records(self.state_root, root_id, [record])
+        carrier = EngineJob(
+            id=writer_id,
+            phase="executed",
+            created_at="2026-08-26T00:00:00Z",
+            updated_at="2026-08-26T00:00:00Z",
+            request={},
+            plan={
+                "files": [{"final_name": "S01E01.mkv", "media_kind": "video"}],
+                "target_root": "/library/番剧/Example",
+                "scan_report": {"resource_gaps": [{
+                    "kind": "missing_season",
+                    "label": "Season 04 Fourth Season",
+                    "reason": "planner proved no source or formal-library video",
+                    "files": [],
+                    "season_name": "Fourth Season",
+                    "expected_episode_count": 2,
+                }]},
+            },
+            summary={"internal_child": True, "root_job_id": root_id},
+        )
+        atomic_write_json(
+            self.runner._job_path(writer_id),  # noqa: SLF001 - durable carrier fixture
+            carrier.as_dict(),
+            allow_nan=False,
+        )
+        completed = replace(self.runner.get_job(root_id), phase="completed")
+        atomic_write_json(
+            self.runner._job_path(root_id),  # noqa: SLF001 - durable root fixture
+            completed.as_dict(),
+            allow_nan=False,
+        )
+        return root_id
+
     def test_health_is_small_local_status(self) -> None:
         status, health = self.request("GET", "/api/health")
 
@@ -402,6 +454,39 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(control, {"paused": False, "root_job_id": root_id})
         self.assertEqual(queued, [root_id])
+
+    def test_resume_does_not_backfill_a_completed_planner_gap(self) -> None:
+        """A historical J repair is explicit retry only, never resume work."""
+        root_id = self._completed_root_with_unmaterialized_planner_season()
+        self.application._control_state.set(paused=False, root_job_id=root_id)  # noqa: SLF001
+
+        with patch.object(
+            self.application, "_queue_completed_root_j_rereview",
+        ) as rereview, patch.object(
+            self.application, "_queue_root_replenishment",
+        ) as replenish:
+            self.application._resume_automatic_jobs()  # noqa: SLF001 - scheduler boundary
+
+        rereview.assert_not_called()
+        replenish.assert_not_called()
+
+    def test_explicit_retry_of_completed_planner_gap_queues_j_only(self) -> None:
+        root_id = self._completed_root_with_unmaterialized_planner_season()
+        self.application._control_state.set(paused=False, root_job_id=root_id)  # noqa: SLF001
+
+        with patch.object(
+            self.application,
+            "_queue_completed_root_j_rereview",
+            return_value="queued",
+        ) as rereview, patch.object(
+            self.application,
+            "_queue_root_replenishment",
+        ) as replenishment:
+            status, _payload = self.request("POST", f"/api/jobs/{root_id}/retry", {})
+
+        self.assertEqual(status, 200)
+        rereview.assert_called_once_with(root_id)
+        replenishment.assert_not_called()
 
     def test_select_endpoint_keeps_the_scheduler_paused(self) -> None:
         root_id = self.create_root()

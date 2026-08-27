@@ -30,6 +30,7 @@ from local.scrapeflow_api.root_pipeline import (
     _coalesce_confirmed_tv_season_records,
     finalize_root_gap_closure,
     is_intake_bound_root,
+    refresh_root_after_j_rereview,
     run_root_pipeline,
 )
 from local.scrapeflow_api.root_aggregation import aggregate_root_job
@@ -295,6 +296,16 @@ class RootPipelineTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "gaps_pending")
         self.assertEqual(aggregate_root_job(state_root, root_task_id).status, "gaps_pending")
+        # A narrow J-only rereview must project the same existing R state
+        # without re-entering B/W/C/D/F/G/H.
+        stale_completed = replace(runner.get_job(root_task_id), phase="completed")
+        atomic_write_json(
+            runner._job_path(root_task_id),  # noqa: SLF001 - stale-root fixture
+            stale_completed.as_dict(),
+            allow_nan=False,
+        )
+        rereviewed = refresh_root_after_j_rereview(runner, state_root, root_task_id)
+        self.assertEqual(rereviewed.phase, "gaps_pending")
         gap = load_gap_ledger(state_root, root_task_id)[0]
         save_gap_ledger(state_root, root_task_id, [replace(gap, status="closed")])
         closed = finalize_root_gap_closure(runner, state_root, root_task_id)

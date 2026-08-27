@@ -11,7 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine.scrapeflow.errors import PlanError
+from engine.scrapeflow.core import _tv_season_resource_gaps
 from engine.scrapeflow.current_plan import plan_to_dict
+from engine.scrapeflow.gap_ledger import load_gap_ledger, save_gap_ledger
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
@@ -31,8 +33,11 @@ from local.scrapeflow_api.unit_execution import (
     GapDiscoveryAttention,
     _register_unit_episode_gaps,
     _request_for_unit,
+    _unit_owns_tv_root_scope,
+    _complete_unit_episode_gap_registration,
     execute_new_work_units,
     load_work_acceptance,
+    rereview_executed_unit_gaps,
 )
 
 from local.tests.test_library_index import IndexAList, _nfo_tv
@@ -125,6 +130,36 @@ class MultiSeasonTMDB:
                         for number in range(1, count + 1)
                     ],
                 }
+        return {}
+
+
+class MultiIdentityTMDB:
+    """TMDB double for a main TV identity plus a separate TV child."""
+
+    def __init__(self, catalogs: dict[int, dict[int, int]]) -> None:
+        self.catalogs = catalogs
+
+    def get(self, path: str, **params: object) -> dict:
+        del params
+        for tmdb_id, seasons in self.catalogs.items():
+            if path == f"/tv/{tmdb_id}":
+                return {
+                    "seasons": [
+                        {"season_number": season, "name": f"Season {season}"}
+                        for season in seasons
+                    ],
+                }
+            for season, count in seasons.items():
+                if path == f"/tv/{tmdb_id}/season/{season}":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2020-01-01",
+                            }
+                            for number in range(1, count + 1)
+                        ],
+                    }
         return {}
 
 
@@ -576,6 +611,556 @@ class UnitExecutionTests(unittest.TestCase):
             {f"S01E{episode:02d}" for episode in range(2, 11)},
         )
 
+    def test_planner_missing_season_emits_a_structured_season_coordinate(self) -> None:
+        plan = Plan(
+            mode="tv",
+            source_root="/incoming/Example",
+            target_root="/library/欧美剧/Example",
+            files=[],
+            warnings=[],
+            metadata={},
+        )
+
+        gaps = _tv_season_resource_gaps(
+            BareEpisodePlanningAList({}),
+            plan,
+            series_dir="/library/欧美剧/Example",
+            official_seasons=[{
+                "season_number": 4,
+                "name": "Fourth Season",
+                "air_date": "2000-01-01",
+                "episode_count": 10,
+            }],
+        )
+
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["season"], 4)
+        self.assertEqual(gaps[0]["label"], "Season 04 Fourth Season")
+        self.assertEqual(gaps[0]["expected_episode_count"], 10)
+
+    def test_planner_missing_season_registers_exact_structured_and_legacy_coordinates(self) -> None:
+        """J accepts the current field and only the old canonical fallback."""
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                source = "/incoming/one"
+                state_root, alist, runner, _p, _e = self._setup(
+                    {f"{source}/Example/S01E01.mkv": FAKE_VIDEO_BYTES},
+                    tmdb=MultiSeasonTMDB(101, {1: 1, 4: 2}),
+                )
+                root_task_id = f"root-missing-season-{'legacy' if legacy else 'structured'}"
+                pending = runner.create_pending_job(source, job_id=root_task_id)
+                runner.start_automatic_job(pending.id, target_shelf="anime")
+                analyze_root_boundaries(
+                    alist, source, root_task_id=root_task_id, state_root=state_root,
+                )
+                record = replace(
+                    load_work_unit_records(state_root, root_task_id)[0],
+                    media_context="tv",
+                    identity={"media_type": "tv", "tmdb_id": 101},
+                )
+                resource_gap = {
+                    "kind": "missing_season",
+                    "label": "Season 04 Fourth Season",
+                    "reason": "planner proved no source or formal-library video",
+                    "files": [],
+                    "season_name": "Fourth Season",
+                    "expected_episode_count": 2,
+                }
+                if not legacy:
+                    resource_gap["season"] = 4
+                executed_plan = {
+                    "files": [{"final_name": "S01E01.mkv", "media_kind": "video"}],
+                    "target_root": "/library/番剧/Example",
+                    "scan_report": {"resource_gaps": [resource_gap]},
+                }
+
+                _register_unit_episode_gaps(
+                    runner, state_root, root_task_id, record, executed_plan,
+                )
+
+                self.assertEqual(
+                    {
+                        gap.gap_id.rsplit("::", 1)[1]
+                        for gap in load_gap_ledger(state_root, root_task_id)
+                    },
+                    {"S04E01", "S04E02"},
+                )
+
+    def test_planner_missing_season_rejects_a_noncanonical_legacy_label(self) -> None:
+        source = "/incoming/one"
+        state_root, alist, runner, _p, _e = self._setup(
+            {f"{source}/Example/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiSeasonTMDB(101, {1: 1, 4: 2}),
+        )
+        root_task_id = "root-missing-season-malformed"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity={"media_type": "tv", "tmdb_id": 101},
+        )
+        executed_plan = {
+            "files": [{"final_name": "S01E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {"resource_gaps": [{
+                "kind": "missing_season",
+                "label": "Season 4 Fourth Season",
+                "reason": "planner proved no source or formal-library video",
+                "files": [],
+                "season_name": "Fourth Season",
+                "expected_episode_count": 2,
+            }]},
+        }
+
+        with self.assertRaises(GapDiscoveryAttention):
+            _register_unit_episode_gaps(
+                runner, state_root, root_task_id, record, executed_plan,
+            )
+        self.assertEqual(load_gap_ledger(state_root, root_task_id), [])
+
+    def test_planner_missing_in_progress_season_registers_only_published_prefix(self) -> None:
+        class PartiallyPublishedTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/tv/101":
+                    return {"seasons": [
+                        {"season_number": 1, "name": "Season 1"},
+                        {"season_number": 4, "name": "Season 4"},
+                    ]}
+                if path == "/tv/101/season/1":
+                    return {"episodes": [{"episode_number": 1, "air_date": "2000-01-01"}]}
+                if path == "/tv/101/season/4":
+                    return {"episodes": [
+                        {"episode_number": 1, "air_date": "2000-01-01"},
+                        *[
+                            {"episode_number": episode, "air_date": "2099-01-01"}
+                            for episode in range(2, 11)
+                        ],
+                    ]}
+                return {}
+
+        source = "/incoming/one"
+        state_root, alist, runner, _p, _e = self._setup(
+            {f"{source}/Example/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=PartiallyPublishedTMDB(),
+        )
+        root_task_id = "root-missing-season-in-progress"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity={"media_type": "tv", "tmdb_id": 101},
+        )
+        executed_plan = {
+            "files": [{"final_name": "S01E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {"resource_gaps": [{
+                "kind": "missing_season",
+                "season": 4,
+                "label": "Season 04 Season 4",
+                "reason": "planner proved no source or formal-library video",
+                "files": [],
+                "season_name": "Season 4",
+                "expected_episode_count": 10,
+            }]},
+        }
+
+        _register_unit_episode_gaps(
+            runner, state_root, root_task_id, record, executed_plan,
+        )
+
+        self.assertEqual(
+            {
+                gap.gap_id.rsplit("::", 1)[1]
+                for gap in load_gap_ledger(state_root, root_task_id)
+            },
+            {"S04E01"},
+        )
+
+    def test_ordinary_retry_keeps_registered_j_without_a_second_catalog_read(self) -> None:
+        source = "/incoming/one"
+        state_root, alist, runner, _planner_events, executor_events = self._setup(
+            {f"{source}/Example/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=CatalogTMDB(101, 1),
+        )
+        root_task_id = "root-ordinary-j-retry"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        execute_new_work_units(runner, state_root, root_task_id)
+        self.assertEqual(
+            load_work_unit_records(state_root, root_task_id)[0].gap_status,
+            "registered",
+        )
+
+        with patch(
+            "local.scrapeflow_api.unit_execution._register_unit_episode_gaps",
+            side_effect=AssertionError("ordinary retry must not repeat J"),
+        ) as registered:
+            execute_new_work_units(runner, state_root, root_task_id)
+
+        registered.assert_not_called()
+        self.assertEqual(len(executor_events), 1)
+
+    def test_explicit_rereview_materializes_planner_gap_without_replanning_or_writing(self) -> None:
+        source = "/incoming/one"
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            {f"{source}/Example/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiSeasonTMDB(101, {1: 1, 4: 2}),
+        )
+        base_planner = _recording_planner(planner_events)
+
+        def planner(request, alist_port, tmdb_port):
+            plan = base_planner(request, alist_port, tmdb_port)
+            plan.scan_report["resource_gaps"] = [{
+                "kind": "missing_season",
+                "label": "Season 04 Fourth Season",
+                "reason": "planner proved no source or formal-library video",
+                "files": [],
+                "season_name": "Fourth Season",
+                "expected_episode_count": 2,
+            }]
+            return plan
+
+        runner.planner = planner
+        root_task_id = "root-explicit-j-rereview"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_task_id)
+        execute_new_work_units(runner, state_root, root_task_id)
+        # Simulate the historical false "registered" outcome before this
+        # bridge existed.  The executed carrier remains the sole evidence.
+        save_gap_ledger(state_root, root_task_id, [])
+        before_plans = len(planner_events)
+        before_writes = len(executor_events)
+
+        rereviewed = rereview_executed_unit_gaps(runner, state_root, root_task_id)
+
+        self.assertEqual(rereviewed[0].gap_status, "registered")
+        self.assertEqual(len(planner_events), before_plans)
+        self.assertEqual(len(executor_events), before_writes)
+        self.assertEqual(
+            {
+                gap.gap_id.rsplit("::", 1)[1]
+                for gap in load_gap_ledger(state_root, root_task_id)
+            },
+            {"S04E01", "S04E02"},
+        )
+
+    def test_complete_tv_root_registers_s00_and_regular_gaps(self) -> None:
+        source = "/incoming/Oshi Root"
+        files = {
+            f"{source}/Show [{episode:02d}].mkv": FAKE_VIDEO_BYTES
+            for episode in range(1, 25)
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files, tmdb=MultiSeasonTMDB(203737, {0: 2, 1: 35}),
+        )
+        root_task_id = "root-s00-full"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        record = replace(
+            record,
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203737},
+        )
+        save_work_unit_records(state_root, root_task_id, [record])
+        executed_plan = {
+            "files": [
+                {"final_name": f"S01E{episode:02d}.mkv", "media_kind": "video"}
+                for episode in range(1, 25)
+            ],
+            "target_root": "/library/番剧/Oshi Root",
+        }
+        _register_unit_episode_gaps(runner, state_root, root_task_id, record, executed_plan)
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+        tokens = {gap.gap_id.rsplit("::", 1)[1] for gap in load_gap_ledger(state_root, root_task_id)}
+        self.assertEqual(
+            tokens,
+            {"S00E01", "S00E02"} | {f"S01E{episode:02d}" for episode in range(25, 36)},
+        )
+        _register_unit_episode_gaps(runner, state_root, root_task_id, record, executed_plan)
+        self.assertEqual(len(load_gap_ledger(state_root, root_task_id)), 13)
+
+    def test_j_parks_when_whole_directory_plan_lacks_b_snapshot(self) -> None:
+        source = "/incoming/Missing B Snapshot"
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            {f"{source}/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiSeasonTMDB(203736, {1: 3}),
+        )
+        root_task_id = "root-j-missing-b-snapshot"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        record = replace(
+            record,
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203736},
+            claimed_seasons=(1,),
+        )
+        save_work_unit_records(state_root, root_task_id, [record])
+        (state_root / f"work_snapshot_{root_task_id}.json").unlink()
+
+        revised = _complete_unit_episode_gap_registration(
+            runner,
+            state_root,
+            root_task_id,
+            record,
+            {"files": [], "target_root": "/library/番剧/Missing B Snapshot"},
+        )
+        self.assertEqual(revised.gap_status, "attention")
+        self.assertIn("来源快照", revised.gap_detail or "")
+
+    def test_exact_tv_root_does_not_own_s00_when_work_unit_ledger_fails(self) -> None:
+        source = "/incoming/Unreadable Root"
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            {f"{source}/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiSeasonTMDB(203739, {0: 2, 1: 1}),
+        )
+        root_task_id = "root-s00-unreadable-ledger"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203739},
+        )
+
+        with patch(
+            "local.scrapeflow_api.unit_execution.load_work_unit_records",
+            side_effect=OSError("corrupt ledger"),
+        ):
+            self.assertFalse(
+                _unit_owns_tv_root_scope(
+                    runner, state_root, root_task_id, record,
+                )
+            )
+
+    def test_exact_tv_root_does_not_own_s00_when_sibling_overlaps(self) -> None:
+        source = "/incoming/Overlapping Root"
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            {f"{source}/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiSeasonTMDB(203740, {0: 2, 1: 1}),
+        )
+        root_task_id = "root-s00-overlapping-ledger"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        root_record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203740},
+        )
+        sibling = replace(
+            root_record,
+            work_unit_id="nested-sibling",
+            boundary_key=f"{source}/Sibling",
+            source_paths=(f"{source}/Sibling",),
+            identity={"media_type": "tv", "tmdb_id": 203741, "season": 1},
+            claimed_seasons=(1,),
+        )
+        save_work_unit_records(
+            state_root, root_task_id, [root_record, sibling],
+        )
+
+        self.assertFalse(
+            _unit_owns_tv_root_scope(
+                runner, state_root, root_task_id, root_record,
+            )
+        )
+
+    def test_claimed_multiseason_without_distinct_season_scopes_does_not_own_s00(self) -> None:
+        source = "/incoming/Stale Multiseason Claim"
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            {f"{source}/Season 01/S01E01.mkv": FAKE_VIDEO_BYTES},
+            tmdb=MultiIdentityTMDB({
+                203742: {0: 2, 1: 1, 2: 1},
+                203743: {0: 1, 1: 1},
+            }),
+        )
+        root_task_id = "root-s00-stale-multiseason-claim"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="us_tv")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        template = load_work_unit_records(state_root, root_task_id)[0]
+        main = replace(
+            template,
+            work_unit_id="stale-main",
+            boundary_key=f"{source}/@generic-season-root",
+            source_paths=(f"{source}/Season 01",),
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203742},
+            claimed_seasons=(1, 2),
+        )
+        child = replace(
+            template,
+            work_unit_id="single-season-child",
+            boundary_key=f"{source}/Child",
+            source_paths=(f"{source}/Child",),
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 203743, "season": 1},
+            claimed_seasons=(1,),
+        )
+        save_work_unit_records(state_root, root_task_id, [main, child])
+
+        self.assertFalse(
+            _unit_owns_tv_root_scope(
+                runner, state_root, root_task_id, main,
+            )
+        )
+
+    def test_multi_season_main_tv_owns_s00_but_single_season_child_does_not(self) -> None:
+        source = "/incoming/瑞克和MD 1-9季+日漫版 内封+内嵌字幕 4K+1080P"
+        season_names = ("一", "二", "三", "四", "五", "六", "七", "八", "九")
+        files = {
+            f"{source}/第{name}季（20{season:02d}）全1集 内封字幕/"
+            f"S{season:02d}E01.mkv": FAKE_VIDEO_BYTES
+            for season, name in enumerate(season_names, 1)
+        }
+        anime_scope = f"{source}/瑞克和莫蒂：日漫版（2024）全10集"
+        files.update({
+            f"{anime_scope}/S01E{episode:02d}.mkv": FAKE_VIDEO_BYTES
+            for episode in range(1, 11)
+        })
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiIdentityTMDB({
+                60625: {0: 37, **{season: 1 for season in range(1, 10)}},
+                202282: {0: 2, 1: 10},
+            }),
+        )
+        root_task_id = "root-s00-multi-season-main"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="us_tv")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 2)
+        main = next(record for record in records if len(record.claimed_seasons) > 1)
+        child = next(record for record in records if record.work_unit_id != main.work_unit_id)
+        self.assertEqual(child.claimed_seasons, (1,))
+        main = replace(
+            main,
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 60625},
+        )
+        child = replace(
+            child,
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 202282, "season": 1},
+        )
+        save_work_unit_records(state_root, root_task_id, [main, child])
+
+        _register_unit_episode_gaps(
+            runner,
+            state_root,
+            root_task_id,
+            main,
+            {
+                "files": [
+                    {
+                        "final_name": f"S{season:02d}E01.mkv",
+                        "media_kind": "video",
+                    }
+                    for season in range(1, 10)
+                ],
+                "target_root": "/library/欧美剧/Rick and Morty",
+            },
+        )
+        _register_unit_episode_gaps(
+            runner,
+            state_root,
+            root_task_id,
+            child,
+            {
+                "files": [
+                    {
+                        "final_name": f"S01E{episode:02d}.mkv",
+                        "media_kind": "video",
+                    }
+                    for episode in range(1, 11)
+                ],
+                "target_root": "/library/欧美剧/Rick and Morty/Anime Child",
+            },
+        )
+
+        gaps = load_gap_ledger(state_root, root_task_id)
+        self.assertEqual(
+            {gap.gap_id.rsplit("::", 1)[1] for gap in gaps},
+            {f"S00E{episode:02d}" for episode in range(1, 38)},
+        )
+        self.assertTrue(all(gap.work_unit_id == main.work_unit_id for gap in gaps))
+
+    def test_explicit_season_unit_never_claims_s00(self) -> None:
+        source = "/incoming/Oshi Root/Season 02"
+        files = {f"{source}/Show S02E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files, tmdb=MultiSeasonTMDB(203738, {0: 2, 1: 35, 2: 24}),
+        )
+        root_task_id = "root-s00-season-unit"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        record = replace(record, media_context="tv", identity={"media_type": "tv", "tmdb_id": 203738})
+        executed_plan = {
+            "files": [{"final_name": "S02E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Oshi Root",
+        }
+        _register_unit_episode_gaps(runner, state_root, root_task_id, record, executed_plan)
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+        tokens = {gap.gap_id.rsplit("::", 1)[1] for gap in load_gap_ledger(state_root, root_task_id)}
+        self.assertNotIn("S00E01", tokens)
+        self.assertNotIn("S00E02", tokens)
+
     def test_complete_bare_e_proof_is_revalidated_for_f_and_read_by_j(self) -> None:
         """D's automatic season proof is not an EngineRequest default.
 
@@ -775,6 +1360,61 @@ class UnitExecutionTests(unittest.TestCase):
                         _request_for_unit(runner, record, root_task_id, state_root)
                     self.assertEqual(alist.move_calls, [])
 
+    def test_title_ordinal_proof_is_revalidated_for_f(self) -> None:
+        """F consumes only the D-proven ``Title 01`` map and gate."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb_id = 99130
+            tmdb = BareEpisodePlanningTMDB(tmdb_id, 3)
+            source = "/quark/影视/待刮削/Title Ordinal 0"
+            names = [
+                f"[4K_EA] One Season Show {episode:02d} [WebRip].mkv"
+                for episode in range(1, 4)
+            ]
+            alist = BareEpisodePlanningAList(
+                {f"{source}/{name}": FAKE_VIDEO_BYTES for name in names}
+            )
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-title-ordinal-f"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_title_ordinal_episodes",
+            )
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(request.season, 1)
+            self.assertTrue(request.allow_release_title_ordinal)
+            mapping = json.loads(Path(str(request.episode_map_path)).read_text())
+            self.assertEqual(
+                mapping,
+                {str(episode): f"S01E{episode:02d}" for episode in range(1, 4)},
+            )
+            plan = runner._build_plan(request)  # noqa: SLF001
+            self.assertEqual(
+                [item.episode_key for item in plan.files if item.media_kind == "video"],
+                ["E01", "E02", "E03"],
+            )
+
     def test_release_dash_manifest_rejects_file_added_between_proof_and_planner(self) -> None:
         """The F handoff may not widen after its fresh D proof.
 
@@ -926,15 +1566,16 @@ class UnitExecutionTests(unittest.TestCase):
                 primary_tokens,
                 {f"S01E{episode:02d}" for episode in range(1, 13)},
             )
+            bracketed_gaps = _register_unit_episode_gaps(
+                runner,
+                state_root,
+                root_task_id,
+                record,
+                plan_to_dict(plan),
+            )
             self.assertEqual(
-                _register_unit_episode_gaps(
-                    runner,
-                    state_root,
-                    root_task_id,
-                    record,
-                    plan_to_dict(plan),
-                ),
-                [],
+                {gap.gap_id.rsplit("::", 1)[1] for gap in bracketed_gaps},
+                {"S00E01", "S00E02"},
             )
 
             old_name = (

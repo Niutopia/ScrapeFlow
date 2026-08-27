@@ -623,11 +623,42 @@ def finalize_root_gap_closure(
     return _persist_root(runner, job, "completed")
 
 
+def refresh_root_after_j_rereview(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+) -> EngineJob:
+    """Run only the existing R aggregation after a J-only carrier rereview.
+
+    No source discovery, reconciliation, planning, writer, cleanup, or
+    provider action happens here.  It simply projects the one durable Gap
+    ledger back onto the ordinary completed/gaps_pending/attention/failed
+    root phases.
+    """
+    job = runner.get_job(root_task_id)
+    aggregate = aggregate_root_job(state_root, root_task_id)
+    if aggregate.failed:
+        return _persist_root(runner, job, "failed", error="存在失败的作品单元")
+    if aggregate.attention:
+        return _persist_root(runner, job, PARK_PHASE)
+    if aggregate.in_progress:
+        return _persist_root(
+            runner,
+            job,
+            PARK_PHASE,
+            error="部分作品单元尚未完成，等待继续处理",
+        )
+    if aggregate.open_gaps:
+        return _persist_root(runner, job, GAPS_PENDING_PHASE)
+    return _persist_root(runner, job, "completed")
+
+
 __all__ = [
     "PARK_PHASE",
     "GAPS_PENDING_PHASE",
     "RUNNABLE_PHASES",
     "finalize_root_gap_closure",
     "is_intake_bound_root",
+    "refresh_root_after_j_rereview",
     "run_root_pipeline",
 ]
