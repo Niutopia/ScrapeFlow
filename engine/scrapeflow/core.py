@@ -7189,15 +7189,20 @@ def build_tv_plan(
             for path in unparsed_paths
             if Path(path).suffix.lower() in SUBTITLE_EXTS
         ]
-        problem_files = [
-            *(
-                PlannedProblem(
-                    source_path=path,
-                    reason="无法唯一识别的附加视频；保留原位并标记规划未闭合",
-                )
-                for path in unparsed_videos
-            ),
+        # A deferred special-context video stays at source as a warning,
+        # never as a plan-blocking problem row (same rule as the first pass
+        # above; the smart grouping appends unresolved specials to the
+        # nearest season sub-plan for the same effect).
+        blocking_videos = [
+            path for path in unparsed_videos
+            if not _has_special_context({
+                "full_path": path,
+                "name": split_remote(path)[1],
+            })
         ]
+        if blocking_videos:
+            _raise_unparsed_media(blocking_videos, "剧集")
+        problem_files = []
         if unparsed_videos:
             warnings.append(
                 f"{len(unparsed_videos)} 个无法唯一识别的附加视频将保留于"
