@@ -1222,9 +1222,18 @@ _COMMERCIAL_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A dedicated bonus directory is strong context that every video inside it is
+# a non-story extra, exactly like an ``NCOP&ED`` directory: a release puts
+# bare ordinals there (``PV/[01]``, ``特典映像/[01]``, ``menu/[Menu01]``)
+# that must be omitted from the integer regular-run proof instead of
+# colliding with the real episodes.  The earlier fail-closed ruling covered
+# a ``[PV]`` filename *label* in a mixed directory; a directory named
+# ``PV``/``特典映像``/``Bonus`` is different, stronger evidence.
 _NON_STORY_THEME_DIRECTORY_RE = re.compile(
     r"(?:^|/)"
-    r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED)"
+    r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED"
+    r"|PV|予告(?:動画)?|特典映像|映像特典|特典|Tokuten"
+    r"|Bonus|Extras?|Menus?)"
     r"(?:/|$)",
     re.IGNORECASE,
 )

@@ -1215,6 +1215,40 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_evidence["season"], 1)
             self.assertEqual(record.reconciliation_evidence["episode_count"], 12)
 
+    def test_bracketed_proof_excludes_dedicated_bonus_directory_ordinals(self) -> None:
+        """A dedicated ``PV``/``特典映像``/``menu`` directory is bonus context.
+
+        Releases put bare ordinals inside bonus directories
+        (``PV/[01].mkv``, ``特典映像/[01].mkv``); those collide with the real
+        episode run if treated as primary videos.  The directory itself is
+        strong non-story context (same tier as ``NCOP&ED``), so the proof
+        must omit them instead of failing closed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99041, {1: 4})
+            names = [
+                f"[Raws] Example Show [{episode:02d}][1080P].mkv"
+                for episode in range(1, 5)
+            ] + [
+                "PV/[Raws] Example Show [01][1080P].mkv",
+                "PV/[Raws] Example Show [02][1080P].mkv",
+                "特典映像/[Raws] Example Show [01][1080P].mkv",
+                "特典映像/[Raws] Example Show [02][1080P].mkv",
+                "menu/[Raws] Example Show [Menu01].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bracketed-bonus-dirs",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence and record.reconciliation_evidence["episode_count"],
+                4,
+            )
+
     def test_bracketed_proof_fails_closed_for_ambiguous_special_or_extra_video(self) -> None:
         cases = (
             (
