@@ -1632,6 +1632,7 @@ class TitledMovieNfoTests(unittest.TestCase):
 class FailedAcceptanceRedecisionTests(unittest.TestCase):
     def test_failed_acceptance_reopens_the_decision(self) -> None:
         files = _sample_library()
+        files["/incoming/Big Buck Bunny (2008)/大雄兔 (2008).mkv"] = b"v"
         files["/library/电影/Big Buck Bunny (2008)/大雄兔 (2008).nfo"] = _nfo_movie(
             10378, "Big Buck Bunny", "2008",
         )
@@ -1670,6 +1671,52 @@ class FailedAcceptanceRedecisionTests(unittest.TestCase):
             # fixed index now proves the duplicate.
             second = reconcile_root_work_units(alist, "/library", state_root, root_task_id)
             self.assertEqual(second[0].reconciliation_outcome, "duplicate_complete")
+
+    def test_failed_acceptance_keeps_decision_when_source_is_consumed(self) -> None:
+        """A partial write must not discard its durable D verdict.
+
+        When the writer moved the media and only an artifact upload failed,
+        the fresh source no longer equals the B snapshot.  Re-evaluating D
+        from the consumed source can prove nothing (deadlock); the verdict
+        stays and F's already-present readback completes the artifacts.
+        """
+        files = _sample_library()
+        files["/incoming/Big Buck Bunny (2008)/大雄兔 (2008).mkv"] = b"v"
+        alist = IndexAList(files)
+        import tempfile
+        from pathlib import Path
+        from local.scrapeflow_api.unit_execution import (
+            WorkAcceptanceResult, save_work_acceptance,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-partial-write"
+            analyze_root_boundaries(
+                alist, "/incoming/Big Buck Bunny (2008)",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="movie", tmdb_id=10378,
+            )
+            empty = IndexAList({})
+            first = reconcile_root_work_units(empty, "/library", state_root, root_task_id)
+            self.assertEqual(first[0].reconciliation_outcome, "new_work")
+            save_work_acceptance(state_root, root_task_id, [
+                WorkAcceptanceResult(
+                    work_unit_id=records[0].work_unit_id, outcome="failed",
+                    writer_job_id=None, phase="failed", target_root="",
+                    planned_files=0, error="AList 上传失败: timeout",
+                    recorded_at="2026-08-27T00:00:00Z",
+                ),
+            ])
+            # The source directory no longer holds the video: the write
+            # consumed it (only the infrastructure artifact upload failed).
+            consumed = IndexAList({})
+            second = reconcile_root_work_units(consumed, "/library", state_root, root_task_id)
+            self.assertEqual(second[0].reconciliation_outcome, "new_work")
+            self.assertEqual(second[0].matched_work_root, first[0].matched_work_root)
 
 
 class NestedWorkNfoTests(unittest.TestCase):

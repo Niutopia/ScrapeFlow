@@ -2069,13 +2069,27 @@ def reconcile_root_work_units(
         if record.reconciliation_outcome is not None:
             previous = acceptance.get(record.work_unit_id)
             if previous is not None and previous.outcome == "failed":
-                record = replace(
-                    record,
-                    reconciliation_outcome=None,
-                    matched_work_root=None,
-                    reconciliation_evidence=None,
-                    uncovered_tokens=(),
-                )
+                # Re-evaluate only while the source still equals the B
+                # snapshot.  A partial write may have legitimately consumed
+                # the source media before an infrastructure failure (e.g. an
+                # artifact upload timeout); in that state the fresh source
+                # can no longer prove any episode grammar, and discarding a
+                # durable verdict would deadlock the retry.  F's
+                # already-present readback then completes the remaining
+                # artifacts.  The stale-library-view case this branch was
+                # built for (e.g. "target already exists") leaves the source
+                # untouched, so it still re-evaluates.
+                if _fresh_scopes_match_snapshot(alist, snapshot, record):
+                    record = replace(
+                        record,
+                        reconciliation_outcome=None,
+                        matched_work_root=None,
+                        reconciliation_evidence=None,
+                        uncovered_tokens=(),
+                    )
+                else:
+                    updated.append(record)
+                    continue
             else:
                 updated.append(record)
                 continue
