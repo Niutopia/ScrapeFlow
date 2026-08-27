@@ -3211,5 +3211,92 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             runner.execute_job(job.id)
 
 
+    def test_explicit_episode_map_path_still_preclassifies_bonus_residuals(self) -> None:
+        """An explicit episode map must not skip bonus preclassification.
+
+        The release-dash D proof hands F a source-key episode map; that path
+        bypasses the smart season grouping, but provided source files must
+        still be preclassified so ``EXTRA/[SP00] Menu - 01`` never reaches
+        the episode parser (轮回七次 F-stage shape).
+        """
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+        class PlannerTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/99101":
+                    return {
+                        "name": "Example Dash",
+                        "original_name": "Example Dash",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [{"season_number": 1, "episode_count": 2, "name": "S1"}],
+                    }
+                if path == "/tv/99101/season/1":
+                    return {"episodes": [{
+                        "episode_number": number,
+                        "name": f"Episode {number}",
+                        "air_date": "2020-01-01",
+                    } for number in (1, 2)]}
+                if path == "/tv/99101/season/0":
+                    return {"episodes": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_files = [
+            {
+                "name": f"Example Dash - {number:02d} (BD 1080p).mkv",
+                "full_path": f"/incoming/Example Dash/Example Dash - {number:02d} (BD 1080p).mkv",
+                "size": 2 * 1024 * 1024,
+                "is_dir": False,
+            }
+            for number in (1, 2)
+        ] + [
+            {
+                "name": "Example Dash [SP00] Menu - 01 (BD 1080p).mkv",
+                "full_path": "/incoming/Example Dash/EXTRA/Example Dash [SP00] Menu - 01 (BD 1080p).mkv",
+                "size": 2 * 1024 * 1024,
+                "is_dir": False,
+            },
+            {
+                "name": "Example Dash [SP05] Picture Drama - 01 (BD 1080p).mkv",
+                "full_path": "/incoming/Example Dash/EXTRA/Example Dash [SP05] Picture Drama - 01 (BD 1080p).mkv",
+                "size": 2 * 1024 * 1024,
+                "is_dir": False,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "dash-map.json"
+            mapping_path.write_text(
+                json.dumps({"01": "S01E01", "02": "S01E02"}),
+                encoding="utf-8",
+            )
+            plan = build_tv_plan_smart(
+                auto_episode_mode=True,
+                alist=PlannerAList(), tmdb_client=PlannerTMDB(),
+                src_path="/incoming/Example Dash", parent_path="/library/番剧",
+                tmdb_id=99101, season=1, absolute=False,
+                prefer_simplified=True, allow_unmapped=False,
+                episode_map_path=mapping_path, source_files=source_files,
+            )
+        # The episode keys carry the map's explicit SxxEyy coordinates for
+        # the two planned episodes (EpisodeKey.display form).
+        self.assertEqual(
+            sorted(item.episode_key for item in plan.files),
+            ["E01", "E02"],
+        )
+        self.assertEqual(
+            sorted(item.final_name for item in plan.files),
+            [
+                "Example Dash - S01E01 - Episode 1.mkv",
+                "Example Dash - S01E02 - Episode 2.mkv",
+            ],
+        )
+        residuals = plan.scan_report.get("preserved_source_residuals") or []
+        self.assertEqual(len(residuals), 2)
+        self.assertTrue(
+            all(item["action"] == "preserve_at_source" for item in residuals)
+        )
+
 if __name__ == "__main__":
     unittest.main()

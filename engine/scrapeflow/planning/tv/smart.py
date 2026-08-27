@@ -262,22 +262,18 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
     # Explicit episode maps intentionally bypass smart season inference, but
     # the common post-plan resource-gap audit still consumes this collection.
     positive_seasons: list[Mapping[str, Any]] = []
-    if auto_episode_mode and kwargs.get("episode_map_path") is None:
-        smart_kwargs["auto_special_title_match"] = True
-        smart_kwargs["auto_align_subtitles"] = True
-        provided_files = kwargs.get("source_files")
-        files = [dict(item) for item in provided_files] if provided_files is not None else [
-            dict(item)
-            for item in kwargs["alist"].walk(
-                kwargs["src_path"],
-                ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
-            )
-        ]
+    # Provided source files are normalized and preclassified before any path
+    # is chosen: the explicit episode-map path (a D proof's source-key map)
+    # otherwise skips the smart grouping below entirely, and bonus-directory
+    # residuals must never reach the episode parser on either path
+    # (``EXTRA/[SP00] Menu - 01`` raised "发现未编号特别篇", 轮回七次 shape).
+    provided_files = kwargs.get("source_files")
+    if provided_files is not None:
+        files = [dict(item) for item in provided_files]
         # Keep the smart wrapper consistent with ``build_tv_plan``: a work
         # whose only playable media lives under an Extras/SP container must
-        # get the evidence-based bonus rescan before we freeze ``source_files``.
-        # Otherwise the pre-scan masks the lower-level fallback and falsely
-        # reports a subtitle-only directory.
+        # get the evidence-based bonus rescan before we freeze
+        # ``source_files``.
         if not any(
             Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
             for item in _filter_media(files)
@@ -290,15 +286,53 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     include_bonus=True,
                 )
             ]
-        # Normalize provider-exported SRT sidecars before smart season/movie
-        # partitioning.  The helper retains the exact source path and marks
-        # failed candidates, so the lower-level normal planner can surface a
-        # bounded problem rather than silently treating them as ``.txt``.
         files, _exported_srt_issues = normalize_exported_srt_entries(
             kwargs["alist"], files,
         )
         files, preserved_theme_residuals = _preclassify_theme_residuals(files)
         smart_kwargs["source_files"] = files
+        provided_files = files
+    if auto_episode_mode and kwargs.get("episode_map_path") is None:
+        smart_kwargs["auto_special_title_match"] = True
+        smart_kwargs["auto_align_subtitles"] = True
+        if provided_files is not None:
+            files = provided_files
+        else:
+            files = [
+                dict(item)
+                for item in kwargs["alist"].walk(
+                    kwargs["src_path"],
+                    ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
+                )
+            ]
+            # Keep the smart wrapper consistent with ``build_tv_plan``: a
+            # work whose only playable media lives under an Extras/SP
+            # container must get the evidence-based bonus rescan before we
+            # freeze ``source_files``.  Otherwise the pre-scan masks the
+            # lower-level fallback and falsely reports a subtitle-only
+            # directory.
+            if not any(
+                Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+                for item in _filter_media(files)
+            ):
+                files = [
+                    dict(item)
+                    for item in kwargs["alist"].walk(
+                        kwargs["src_path"],
+                        ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
+                        include_bonus=True,
+                    )
+                ]
+            # Normalize provider-exported SRT sidecars before smart
+            # season/movie partitioning.  The helper retains the exact
+            # source path and marks failed candidates, so the lower-level
+            # normal planner can surface a bounded problem rather than
+            # silently treating them as ``.txt``.
+            files, _exported_srt_issues = normalize_exported_srt_entries(
+                kwargs["alist"], files,
+            )
+            files, preserved_theme_residuals = _preclassify_theme_residuals(files)
+            smart_kwargs["source_files"] = files
         season_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         special_files: list[dict[str, Any]] = []
         movie_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
