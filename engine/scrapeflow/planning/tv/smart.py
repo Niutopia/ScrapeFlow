@@ -244,6 +244,158 @@ def bind_compat_runtime(runtime: ModuleType) -> None:
         globals()[name] = dispatch
 
 
+def _plan_with_explicit_episode_map(
+    kwargs: Mapping[str, Any],
+    smart_kwargs: dict[str, Any],
+    files: Sequence[Mapping[str, Any]],
+    *,
+    preserved_theme_residuals: list[dict[str, Any]],
+) -> Plan:
+    """Plan one proven absolute-number release around its explicit map.
+
+    The D proof's source-key map only covers the episode files.  A movie
+    beside the release (``剧场版 代号：白/`` holding one confirmed film) has
+    no map coordinate, so the lower ``build_tv_plan`` would reject it as an
+    unparsed episode.  Route movie-context videos through the same movie
+    matcher the smart grouping uses, then combine the TV (map-driven) plan
+    with each independent movie plan exactly like the ordinary split path.
+    """
+    prefer_animation = _media_context_from_source_and_target(
+        str(kwargs["src_path"]), str(kwargs["parent_path"]),
+    )[1]
+    movie_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    remaining: list[dict[str, Any]] = []
+    for item in files:
+        name = str(item.get("name", ""))
+        if (
+            _has_movie_context(item)
+            and Path(name).suffix.lower() in VIDEO_EXTS
+            and extract_episode_key(name) is None
+        ):
+            matched = None
+            for movie_query in _movie_queries_from_item(item):
+                if not _usable_release_title_query(movie_query):
+                    continue
+                try:
+                    candidate, _ = auto_match_tmdb(
+                        kwargs["tmdb_client"],
+                        movie_query,
+                        media_type="movie",
+                        min_confidence=0.88,
+                        prefer_animation=prefer_animation,
+                    )
+                except ScraperError:
+                    continue
+                if candidate.status == "confirmed":
+                    matched = candidate
+                    break
+            if matched is not None:
+                movie_groups[matched.tmdb_id].append(item)
+                continue
+        remaining.append(dict(item))
+
+    map_kwargs = dict(smart_kwargs)
+    map_kwargs["source_files"] = remaining
+    plan = build_tv_plan(**map_kwargs)
+    if not movie_groups:
+        if preserved_theme_residuals:
+            plan.scan_report.setdefault("preserved_source_residuals", []).extend(
+                item
+                for item in preserved_theme_residuals
+                if item
+                not in plan.scan_report.get("preserved_source_residuals", [])
+            )
+        return plan
+
+    executable_movie_groups, orphan_movie_files = (
+        _partition_movie_groups_with_video(movie_groups)
+    )
+    movie_parent = split_remote(plan.target_root)[0]
+    try:
+        placement_for(
+            str(kwargs["src_path"]),
+            movie_parent,
+            media_root=kwargs.get("media_root"),
+        )
+    except ValueError:
+        movie_parent = plan.target_root
+    movie_plans = [
+        build_movie_plan(
+            kwargs["alist"],
+            kwargs["tmdb_client"],
+            src_path=str(kwargs["src_path"]),
+            # Independent movies nest under the TV work root as siblings of
+            # its episodes, never loose beside its ``tvshow.nfo``.
+            parent_path=movie_parent,
+            tmdb_id=movie_tmdb_id,
+            ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
+            source_files=movie_files,
+            defer_validation=True,
+        )
+        for movie_tmdb_id, movie_files in sorted(executable_movie_groups.items())
+    ]
+    metadata = dict(plan.metadata)
+    metadata["series_root"] = plan.target_root
+    metadata["member_posters"] = {
+        movie_plan.target_root: movie_plan.metadata["poster_path"]
+        for movie_plan in movie_plans
+        if isinstance(movie_plan.metadata.get("poster_path"), str)
+        and movie_plan.metadata.get("poster_path")
+    }
+    metadata["member_movies"] = {
+        movie_plan.target_root: {
+            "tmdb_id": movie_plan.metadata["tmdb_id"],
+            "title": movie_plan.metadata["title"],
+            "year": movie_plan.metadata["year"],
+        }
+        for movie_plan in movie_plans
+    }
+    combined = Plan(
+        mode="mixed",
+        source_root=plan.source_root,
+        target_root=normalize_remote_path(posixpath.commonpath([
+            plan.target_root,
+            *(movie_plan.target_root for movie_plan in movie_plans),
+        ])),
+        files=[*plan.files, *(item for p in movie_plans for item in p.files)],
+        cleanup_files=_dedupe_cleanup_files([
+            *plan.cleanup_files,
+            *(item for p in movie_plans for item in p.cleanup_files),
+        ]),
+        problem_files=[
+            *plan.problem_files,
+            *(item for p in movie_plans for item in p.problem_files),
+            *(
+                PlannedProblem(
+                    source_path=str(item.get("full_path", "")),
+                    reason="已匹配到独立电影，但没有对应视频；保留原位待人工确认",
+                )
+                for item in orphan_movie_files
+            ),
+        ],
+        warnings=list(dict.fromkeys([
+            *plan.warnings,
+            *(warning for p in movie_plans for warning in p.warnings),
+            f"已识别 {len(movie_plans)} 部独立电影；放入与电视剧作品目录并列的独立电影目录",
+        ])),
+        metadata=metadata,
+        scan_report={
+            "resource_gaps": [
+                dict(gap)
+                for p in [plan, *movie_plans]
+                for gap in (p.scan_report.get("resource_gaps") or [])
+                if isinstance(gap, Mapping)
+            ],
+            "preserved_source_residuals": list(preserved_theme_residuals),
+        },
+    )
+    validate_plan(
+        kwargs["alist"], combined,
+        media_root=kwargs.get("media_root"),
+    )
+    return combined
+
+
 def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
     """Split explicit multi-season roots and retry proven absolute-number releases."""
     proven_member_season = bool(kwargs.pop("_proven_member_season", False))
@@ -292,6 +444,11 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         files, preserved_theme_residuals = _preclassify_theme_residuals(files)
         smart_kwargs["source_files"] = files
         provided_files = files
+        if kwargs.get("episode_map_path") is not None:
+            return _plan_with_explicit_episode_map(
+                kwargs, smart_kwargs, files,
+                preserved_theme_residuals=preserved_theme_residuals,
+            )
     if auto_episode_mode and kwargs.get("episode_map_path") is None:
         smart_kwargs["auto_special_title_match"] = True
         smart_kwargs["auto_align_subtitles"] = True
