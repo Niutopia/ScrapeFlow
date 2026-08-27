@@ -6919,6 +6919,17 @@ def build_tv_plan(
         path for path in unparsed_paths if Path(path).suffix.lower() in VIDEO_EXTS
     ]
     if unparsed_videos and auto_special_title_match:
+        # A deferred special (``[OVA].mkv`` with no official title match)
+        # is a genuine "stays at source" case, not a plan-blocking problem:
+        # the smart grouping's own path appends unresolved specials to the
+        # nearest season sub-plan for the same effect.  Only a video that
+        # is not special-context blocks here.
+        non_special_unparsed = [
+            path for path in unparsed_videos
+            if not _has_special_context({"full_path": path, "name": split_remote(path)[1]})
+        ]
+        if non_special_unparsed:
+            _raise_unparsed_media(non_special_unparsed, "剧集")
         warnings.append(
             f"{len(unparsed_videos)} 个无法唯一识别的附加视频将保留于"
             "源目录自动规划未闭合；"
@@ -6934,15 +6945,7 @@ def build_tv_plan(
             f"{len(retained_subtitles)} 个无对应视频或无法唯一编号的字幕将保留于"
             "源目录自动规划未闭合，不影响其余媒体整理"
         )
-    problem_files = [
-        *(
-            PlannedProblem(
-                source_path=path,
-                reason="无法唯一识别的附加视频；保留原位并标记规划未闭合",
-            )
-            for path in unparsed_videos
-        ),
-    ]
+    problem_files = []
     if exported_srt_issues:
         warnings.append(
             f"{len(exported_srt_issues)} 个导出 .sc/.tc.srt.txt 字幕未通过"
