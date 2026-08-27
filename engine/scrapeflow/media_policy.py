@@ -54,13 +54,19 @@ VIDEO_EXTENSIONS = frozenset({
 # archive extraction must never mount or directly consume a disc image.  The
 # bounded archive-inspection lane may still recognize its on-disk filesystem
 # magic and use 7-Zip to list/selectively extract members into task staging.
+#
+# ``.cue`` is deliberately NOT an opaque image: it is the plain-text track
+# index that accompanies a CD audio rip (beside ``.flac``/``.ape`` tracks,
+# with a ``.log``), so it can never be mounted or hide media.  Treating it as
+# an image made one soundtrack ``OST`` subdirectory park a whole 26-episode
+# release at the content-expansion gate (大剑 shape).  It is instead an audio
+# sidecar resource: never video, never cleanup, and kept at source.
 DISC_IMAGE_EXTENSIONS = frozenset({
     ".b5t",
     ".b6t",
     ".bin",
     ".ccd",
     ".cdi",
-    ".cue",
     ".dmg",
     ".img",
     ".iso",
@@ -102,6 +108,7 @@ AUDIO_EXTENSIONS = frozenset({
     ".aac",
     ".ac3",
     ".ape",
+    ".cue",
     ".dts",
     ".dtshd",
     ".eac3",

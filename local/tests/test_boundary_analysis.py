@@ -48,9 +48,15 @@ class TestClassifyObjectType(unittest.TestCase):
                 self.assertEqual(classify_object_type(name), "video")
 
     def test_disc_image_is_not_classified_as_video(self) -> None:
-        for name in ("disc.iso", "disc.img", "disc.cue", "track.bin"):
+        for name in ("disc.iso", "disc.img", "track.bin"):
             with self.subTest(name=name):
                 self.assertEqual(classify_object_type(name), "disc_image")
+
+    def test_cue_sheet_is_audio_sidecar_not_disc_image(self) -> None:
+        # A CD-audio CUE beside FLAC tracks must not trigger the opaque
+        # disc-image boundary; an OST folder parks no release.
+        self.assertEqual(classify_object_type("ost.cue"), "audio")
+        self.assertEqual(classify_object_type("track.flac"), "audio")
 
     def test_subtitle_extensions(self) -> None:
         for name in ("sub.srt", "sub.ass", "sub.ssa"):

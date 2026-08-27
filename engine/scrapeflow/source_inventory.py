@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Sequence
 
 from engine.scrapeflow.media_policy import (
+    AUDIO_EXTENSIONS,
     DISC_IMAGE_EXTENSIONS,
     EXECUTABLE_EXTENSIONS,
     POSTER_EXTENSIONS,
@@ -41,6 +42,7 @@ _POSTER_EXTS = frozenset(POSTER_EXTENSIONS)
 _TEMP_EXTS = frozenset(TEMPORARY_EXTENSIONS)
 _ARCHIVE_EXTS = frozenset({".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"})
 _NFO_EXTS = frozenset({".nfo", ".xml"})
+_AUDIO_EXTS = frozenset(AUDIO_EXTENSIONS)
 
 
 def classify_object_type(name: str) -> str:
@@ -64,6 +66,10 @@ def classify_object_type(name: str) -> str:
         return "poster"
     if suffix in _NFO_EXTS:
         return "nfo"
+    if suffix in _AUDIO_EXTS:
+        # Detached audio (a soundtrack OST, a CUE track index) is a retained
+        # resource; it is neither boundary evidence nor consumable media.
+        return "audio"
     if suffix in _ARCHIVE_EXTS:
         return "archive"
     if suffix in _TEMP_EXTS:

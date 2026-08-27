@@ -63,7 +63,7 @@ class MediaPolicyTests(unittest.TestCase):
                 }))
 
     def test_optical_disc_images_are_opaque_not_direct_video_or_cleanup(self):
-        for suffix in (".iso", ".img", ".cue", ".bin", ".mdf"):
+        for suffix in (".iso", ".img", ".bin", ".mdf"):
             with self.subTest(suffix=suffix):
                 name = f"release{suffix}"
                 self.assertIn(suffix, DISC_IMAGE_EXTENSIONS)
@@ -81,6 +81,26 @@ class MediaPolicyTests(unittest.TestCase):
                     residual.kind,
                     "disc_image_requires_content_expansion",
                 )
+
+    def test_cue_sheet_is_an_audio_sidecar_not_an_opaque_disc_image(self):
+        # A CD-audio CUE is a plain-text track index beside FLAC tracks; it
+        # can never be mounted or hide media, so a soundtrack OST folder must
+        # not park the whole release at the content-expansion gate.
+        name = "CLAYMORE TV Animation O. S. T..cue"
+        self.assertNotIn(".cue", DISC_IMAGE_EXTENSIONS)
+        self.assertFalse(is_disc_image_filename(name))
+        self.assertFalse(is_container_candidate_filename(name))
+        self.assertEqual(classify_filename(name), "audio")
+        self.assertNotIn(".cue", VIDEO_EXTENSIONS)
+        self.assertFalse(replenishment._candidate_has_video_file({
+            "files": [name],
+        }))
+        residual = classify_residual(f"/incoming/OST/{name}")
+        self.assertEqual(residual.action, KEEP_UNPLANNED)
+        self.assertFalse(residual.can_cleanup)
+        self.assertEqual(residual.kind, "detached_audio")
+        # The raw payload of a cue (a lone .bin) remains an opaque image.
+        self.assertTrue(is_disc_image_filename("soundtrack.bin"))
 
     def test_container_candidate_policy_requires_magic_proof_for_iso_and_exe(self):
         for name in ("feature.iso", "feature.img", "release.7z", "wrapper.exe"):
