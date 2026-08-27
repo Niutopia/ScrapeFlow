@@ -1249,6 +1249,62 @@ class LibraryIndexTests(unittest.TestCase):
                 4,
             )
 
+    def test_sp_marker_in_bonus_directory_is_release_naming_not_a_special_family(self) -> None:
+        """``[SP01] NCOP [02 [ Type-A ]]`` in ``NCOP&ED/`` is not a special run.
+
+        Bonus-directory NCOP files often carry an ``SP`` release marker with
+        duplicated variant ordinals (Type-A/B/C).  Their context already
+        proves them non-story, so they must not enter the physical-special
+        family completeness check and break the TV proof (黑色五叶草 shape).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99042, {1: 4})
+            names = [
+                f"[Raws] Example Show [{episode:03d}][Ma10p].mkv"
+                for episode in range(1, 5)
+            ] + [
+                "NCOP&ED/[Raws] Example Show [SP01] NCOP [01][Ma10p].mkv",
+                "NCOP&ED/[Raws] Example Show [SP01] NCOP [02 [ Type-A ]][Ma10p].mkv",
+                "NCOP&ED/[Raws] Example Show [SP01] NCOP [02 [ Type-B ]][Ma10p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-sp-in-bonus-dir",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence and record.reconciliation_evidence["episode_count"],
+                4,
+            )
+
+    def test_incomplete_special_family_outside_bonus_context_still_fails_closed(self) -> None:
+        """An SP-marked story run with duplicate ordinals keeps failing closed.
+
+        The bonus-context exclusion must not swallow a genuinely incomplete
+        physical-special family among story-candidate files.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99043, {1: 4})
+            names = [
+                f"[Raws] Example Show [{episode:03d}][Ma10p].mkv"
+                for episode in range(1, 5)
+            ] + [
+                "OAD/[Raws] Example Show [SP01].mkv",
+                "OAD/[Raws] Example Show [SP02].mkv",
+                "OAD/[Raws] Example Show [SP02].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-incomplete-special-family",
+            )
+            self.assertNotEqual(record.reconciliation_outcome, "new_work")
+
     def test_bracketed_proof_fails_closed_for_ambiguous_special_or_extra_video(self) -> None:
         cases = (
             (

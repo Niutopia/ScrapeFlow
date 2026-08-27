@@ -931,6 +931,14 @@ def _regular_episode_primary_videos(
     ambiguous special keeps the proof fail-closed (returns ``None``).  A
     movie-shaped sibling subtree is likewise omitted so an independent film
     beside the rooted TV work does not invalidate the TV proof.
+
+    An ``SP`` marker inside an already-proven non-story context (a theme
+    video, a bonus/menu/commercial directory, or a theme label) is release
+    naming for that asset, not an independent physical-special ordinal
+    (``[SP01] NCOP [02 [ Type-A ]]`` inside ``NCOP&ED/``).  Such files are
+    excluded from the special family before the completeness requirement;
+    the family check only governs SP-marked files that could otherwise be
+    story episodes.
     """
     if node is None:
         return None
@@ -938,7 +946,15 @@ def _regular_episode_primary_videos(
         file for file in collect_all_files(node) if file.object_type == "video"
     ]
     special = [
-        file for file in videos if is_physical_special_video_file(file)
+        file
+        for file in videos
+        if is_physical_special_video_file(file)
+        and not (
+            _is_known_non_story_theme_video(file)
+            or _is_bonus_directory_video(file)
+            or _is_menu_video(file)
+            or _is_commercial_video(file)
+        )
     ]
     if special:
         _markers, _numbers, count, complete = physical_special_marker_evidence(
