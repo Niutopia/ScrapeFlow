@@ -2851,7 +2851,7 @@ def normalize_exported_srt_entries(
         # First project the provider's ``.sc/.tc.srt.txt`` spelling to a
         # parser-facing SRT basename.  The physical source path is untouched.
         if EXPORTED_SRT_SUFFIX_RE.search(name) is not None:
-            reason = "导出字幕不是可验证的 UTF-8 SRT"
+            reason = "导出字幕不是可验证的 UTF-8 SRT/ASS 文档"
             if declared_size is not None and declared_size > max_bytes:
                 reason = f"导出字幕超过 {max_bytes} 字节内容校验上限"
             elif not path or not callable(reader):
@@ -10418,7 +10418,7 @@ def validate_plan(
             proof = exported_srt_proofs.get(source_path)
             if (
                 proof is None
-                or proof.get("format") != "srt"
+                or proof.get("format") not in {"srt", "ass"}
                 or proof.get("size") != item.source_size
                 or proof.get("source_name") != original_name
                 or proof.get("language") not in {"zh-CN", "zh-TW"}

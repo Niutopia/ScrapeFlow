@@ -63,15 +63,19 @@ _ENGLISH_SIGNAL_WORDS = frozenset({
 # object in memory.
 MAX_MERGED_SUBTITLE_BYTES = MAX_PREFIX_BYTES
 
-# DBD-Raws and a few other providers export UTF-8 SRT sidecars through a text
-# endpoint, appending a language marker and a second ``.txt`` suffix (for
-# example ``Show.S02E13.sc.srt.txt``).  These are not generic text files: they
-# may enter the normal subtitle planner only after the complete, bounded SRT
+# DBD-Raws and a few other providers export UTF-8 subtitle sidecars through a
+# text endpoint, appending a language marker and a second ``.txt`` suffix (for
+# example ``Show.S02E13.sc.srt.txt``).  The same export lane also carries ASS
+# documents (``Show[01].sc.ass.txt``).  These are not generic text files: they
+# may enter the normal subtitle planner only after the complete, bounded
 # document has been validated.  Keep the cap independent from the larger
 # archive/download limits so a malformed text object cannot become an
 # unbounded planner read.
 EXPORTED_SRT_MAX_BYTES = MAX_MERGED_SUBTITLE_BYTES
-EXPORTED_SRT_SUFFIX_RE = re.compile(r"\.(?P<marker>sc|tc)\.srt\.txt$", re.IGNORECASE)
+EXPORTED_SRT_SUFFIX_RE = re.compile(
+    r"\.(?P<marker>sc|tc)\.(?P<format>srt|ass|ssa)\.txt$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,18 +559,19 @@ def validate_exported_srt_sidecar(
     declared_size: int | None = None,
     max_bytes: int = EXPORTED_SRT_MAX_BYTES,
 ) -> ExportedSrtNormalization | None:
-    """Validate and canonically name a ``.sc/.tc.srt.txt`` sidecar.
+    """Validate and canonically name a ``.sc/.tc.srt.txt``/``.ass.txt`` sidecar.
 
     The suffix is only a language *claim*.  A caller must provide the bounded
     bytes read from the exact source object; a missing payload, a non-UTF-8
-    stream, a malformed SRT, or a size mismatch fails closed.  The returned
-    name is a planner-only virtual basename.  The caller must retain the
-    original ``full_path`` so the normal writer moves the exact source object
-    and never creates a second provider-specific copy.
+    stream, a malformed document of the declared kind, or a size mismatch
+    fails closed.  The returned name is a planner-only virtual basename.  The
+    caller must retain the original ``full_path`` so the normal writer moves
+    the exact source object and never creates a second provider-specific copy.
 
     ``sc`` maps to the project's canonical ``zh-CN`` lane and ``tc`` maps to
-    ``zh-TW``.  Only a final, case-insensitive ``.srt.txt`` suffix is accepted;
-    an arbitrary ``.txt`` file or an embedded marker is never promoted.
+    ``zh-TW``.  Only a final, case-insensitive ``.srt.txt``/``.ass.txt``
+    suffix is accepted; an arbitrary ``.txt`` file or an embedded marker is
+    never promoted.
     """
     if not isinstance(name, str) or not name or "/" in name or "\\" in name:
         return None
@@ -600,8 +605,19 @@ def validate_exported_srt_sidecar(
     except UnicodeDecodeError:
         return None
     document = parse_subtitle_document(raw, max_bytes=max_bytes)
-    if document is None or document.format != "srt":
+    if document is None:
         return None
+    # The declared export format must match the parsed document: a
+    # ``.sc.ass.txt`` carrying SRT bytes (or the reverse) is not promoted.
+    declared_format = match.group("format").casefold()
+    if declared_format == "srt":
+        if document.format != "srt":
+            return None
+        extension = "srt"
+    else:
+        if document.format != "ass":
+            return None
+        extension = "ass"
     marker = match.group("marker").casefold()
     language = "zh-CN" if marker == "sc" else "zh-TW"
     # Remove exactly the provider export suffix, preserving the release stem
@@ -610,7 +626,7 @@ def validate_exported_srt_sidecar(
     stem = name[: match.start()]
     if not stem or stem in {".", ".."}:
         return None
-    normalized_name = f"{stem}.{language}.srt"
+    normalized_name = f"{stem}.{language}.{extension}"
     # Ensure the resulting basename remains a single safe path component.  A
     # Unicode control or separator in the source name must be rejected by the
     # normal source validator before this helper is called; this check keeps
@@ -623,6 +639,7 @@ def validate_exported_srt_sidecar(
         language=language,
         marker=marker,
         size=len(raw),
+        format=extension,
     )
 
 

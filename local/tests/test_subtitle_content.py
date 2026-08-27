@@ -103,6 +103,42 @@ class SubtitleContentTests(unittest.TestCase):
             "Show.S01E01.sc.srt.txt", b"not an SRT", declared_size=10,
         ))
 
+    def test_exported_ass_txt_sidecar_is_promoted_with_format_proof(self) -> None:
+        """A ``.sc/.tc.ass.txt`` export is promoted to a canonical ASS sidecar.
+
+        The declared export format must match the parsed document, so SRT
+        bytes behind an ``.ass.txt`` suffix never pass.
+        """
+        ass = _utf8(
+            "[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+            "MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,这是简体字幕\n"
+        )
+        sc = validate_exported_srt_sidecar(
+            "Show[01].sc.ass.txt", ass, declared_size=len(ass),
+        )
+        self.assertIsNotNone(sc)
+        assert sc is not None
+        self.assertEqual(sc.normalized_name, "Show[01].zh-CN.ass")
+        self.assertEqual(sc.language, "zh-CN")
+        self.assertEqual(sc.format, "ass")
+        tc = validate_exported_srt_sidecar(
+            "Show[01].tc.ass.txt", ass, declared_size=len(ass),
+        )
+        self.assertIsNotNone(tc)
+        assert tc is not None
+        self.assertEqual(tc.normalized_name, "Show[01].zh-TW.ass")
+        # SRT content behind an .ass.txt suffix is a format mismatch.
+        srt = _utf8("1\n00:00:01,000 --> 00:00:03,000\n这是简体中文字幕。\n")
+        self.assertIsNone(validate_exported_srt_sidecar(
+            "Show[01].sc.ass.txt", srt, declared_size=len(srt),
+        ))
+        # ASS content behind an .srt.txt suffix is likewise rejected.
+        self.assertIsNone(validate_exported_srt_sidecar(
+            "Show[01].sc.srt.txt", ass, declared_size=len(ass),
+        ))
+
     def test_srt_simplified_chinese_satisfies_zh(self) -> None:
         result = classify_subtitle_content(
             _utf8("1\n00:00:01,000 --> 00:00:02,000\n这是一个测试\n"),
