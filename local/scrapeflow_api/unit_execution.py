@@ -192,6 +192,12 @@ class WorkAcceptanceResult:
     planned_files: int
     error: str | None
     recorded_at: str
+    # The durable plan receipt of a FAILED attempt: the exact source→target
+    # →size mapping the interrupted writer was executing.  The failed
+    # carrier is retired, so this receipt is the only record of what the
+    # interrupted write was doing; a later retry continues from it instead
+    # of inferring consumption from the mutated provider source.
+    planned_receipt: tuple[Mapping[str, Any], ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -203,10 +209,23 @@ class WorkAcceptanceResult:
             "planned_files": self.planned_files,
             "error": self.error,
             "recorded_at": self.recorded_at,
+            "planned_receipt": (
+                [dict(item) for item in self.planned_receipt]
+                if self.planned_receipt is not None
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "WorkAcceptanceResult":
+        receipt_raw = raw.get("planned_receipt")
+        receipt: tuple[Mapping[str, Any], ...] | None = None
+        if isinstance(receipt_raw, list):
+            receipt = tuple(
+                dict(item)
+                for item in receipt_raw
+                if isinstance(item, Mapping)
+            )
         return cls(
             work_unit_id=str(raw["work_unit_id"]),
             outcome=str(raw.get("outcome", "failed")),
@@ -218,6 +237,7 @@ class WorkAcceptanceResult:
             planned_files=int(raw.get("planned_files", 0)),
             error=str(raw["error"]) if raw.get("error") else None,
             recorded_at=str(raw.get("recorded_at") or _now()),
+            planned_receipt=receipt,
         )
 
 
@@ -649,6 +669,20 @@ def _consumed_source_snapshot_rows(
     rows = snapshot.get("rows")
     if not isinstance(rows, list):
         return None
+    # The failed attempt's persisted plan receipt is the exact consumed set:
+    # every snapshot file object the interrupted writer was executing.  It
+    # does not depend on what the provider source looks like now, so a
+    # mid-move interruption (some objects still present) resumes precisely —
+    # present objects move normally, already-moved objects read back.
+    receipt_paths: set[str] | None = None
+    if previous.planned_receipt is not None:
+        receipt_paths = {
+            str(item.get("source_path") or "").rstrip("/")
+            for item in previous.planned_receipt
+            if str(item.get("source_path") or "").strip()
+        }
+        if not receipt_paths:
+            receipt_paths = None
     fresh_paths = {
         str(row.get("full_path") or "").rstrip("/")
         for row in fresh_rows
@@ -661,12 +695,16 @@ def _consumed_source_snapshot_rows(
         path = str(row.get("full_path") or "").rstrip("/")
         if not _path_in_scoped_objects(path, scope_kinds, include_scope=True):
             continue
+        if receipt_paths is not None:
+            if path in receipt_paths:
+                consumed.append(dict(row))
+            continue
         if path in fresh_paths:
             continue
         consumed.append(dict(row))
     if not consumed:
-        # Nothing was consumed: this is ordinary drift, not a resumable
-        # interrupted write.
+        # Nothing was consumed and no receipt exists: this is ordinary
+        # drift, not a resumable interrupted write.
         return None
     return tuple(consumed)
 
@@ -3256,7 +3294,24 @@ def execute_new_work_units(
         except Exception as exc:
             # Keep writer_job_id unset so the next run re-plans the unit;
             # retire the just-planned carrier so plan_job's existing-id
-            # guard cannot pin a stale plan either.
+            # guard cannot pin a stale plan either.  The carrier's full plan
+            # survives as a receipt on the acceptance record: the retry's
+            # consumed-source continuation reads it instead of inferring
+            # consumption from the mutated provider source.
+            receipt: tuple[Mapping[str, Any], ...] | None = None
+            if planned is not None:
+                receipt = tuple(
+                    {
+                        "source_path": str(item.get("source_path") or ""),
+                        "target_path": posixpath.join(
+                            str(item.get("target_dir") or ""),
+                            str(item.get("final_name") or ""),
+                        ),
+                        "size": item.get("source_size"),
+                    }
+                    for item in (planned.plan.get("files") or [])
+                    if isinstance(item, Mapping)
+                ) or None
             try:
                 _retire_stale_unit_carrier(runner, carrier_id)
             except Exception:
@@ -3267,10 +3322,15 @@ def execute_new_work_units(
                 outcome="failed",
                 writer_job_id=None,
                 phase="failed",
-                target_root="",
-                planned_files=0,
+                target_root=(
+                    str(planned.plan.get("target_root") or "")
+                    if planned is not None
+                    else ""
+                ),
+                planned_files=len(receipt or ()),
                 error=redact_error(exc),
                 recorded_at=_now(),
+                planned_receipt=receipt,
             ))
             # A sibling cannot safely become the first writer beneath an
             # unaccepted main TV root.  Preserve this exact failure and leave

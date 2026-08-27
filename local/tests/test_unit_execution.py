@@ -2862,3 +2862,28 @@ class ConsumedSourceContinuationTests(unittest.TestCase):
         alist.files["/library/番剧/Work (101)/S01E01.mkv"] = b"corrupted"
         second = execute_new_work_units(runner, state_root, "root-cont")
         self.assertEqual(second[0].outcome, "failed")
+
+    def test_receipt_backs_continuation_when_source_was_mutated(self) -> None:
+        """A persisted plan receipt beats source-shape inference.
+
+        The failed attempt's receipt names exactly what the interrupted
+        writer was executing.  Even when the provider source now holds
+        different objects (so absent-fresh inference finds nothing), the
+        continuation still plans the receipt's objects: present ones move
+        normally, already-moved ones read back.
+        """
+        files = {"/incoming/one/S01E01.mkv": FAKE_VIDEO_BYTES}
+        runner, state_root, alist, plan_calls, records = self._setup_root(files)
+        reconcile_root_work_units(alist, "/library", state_root, "root-cont")
+        first = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(first[0].outcome, "failed")
+        self.assertIsNotNone(first[0].planned_receipt)
+        # A brand-new sibling appears in the source after the failure.  The
+        # receipt still drives the continuation for its own object.
+        alist.files["/incoming/one/NEW.mkv"] = FAKE_VIDEO_BYTES
+        second = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(second[0].outcome, "accepted")
+        # The receipt's object reached the library; the unrelated sibling
+        # stayed in the source.
+        self.assertIn("/library/番剧/Work (101)/S01E01.mkv", alist.files)
+        self.assertIn("/incoming/one/NEW.mkv", alist.files)
