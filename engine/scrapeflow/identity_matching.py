@@ -230,6 +230,53 @@ _BOUNDARY_TRAILING_BATCH_COUNT_RE = re.compile(
     r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)\s*$",
 )
 
+# Half-width bracket groups in a release label are either packaging (group
+# name, codec, resolution, subtitle language, episode span) or title
+# evidence: a bracket-only release carries the work title inside them
+# (``[DBD-Raws][大剑][1080P]``), and a bracketed Latin alias is legitimate
+# cross-script evidence (``[Meaningful Show]``).  Discard only groups that
+# match the bounded packaging vocabulary or carry no letters at all.
+_HALF_WIDTH_BRACKET_PACKAGING_RE = re.compile(
+    r"(?:全集|合集|全系列|特典|映像|花絮|扫图|图集|字幕|简繁|繁简|简中|繁中|中字|"
+    r"内封|内嵌|外挂|双语|国语|粤语|台配|美版|日版|台版|港版|"
+    r"(?:19|20)\d{2}|"
+    r"\d{1,4}\s*[-~]\s*\d{1,4}|全\s*\d{1,4}\s*集|"
+    r"(?:BD|DVD|WEB|BDrip|TV)?[\s._-]*(?:1080|2160|720|480)[pP]|"
+    r"BD(?:rip)?|WEB[-]?DL|WEBRip|Remux|"
+    r"(?:hi[\s._-]*)?10[pP]|8bit|10bit|HEVC|AVC|AV1|x26[45]|h26[45]|"
+    r"FLAC|AAC|DDP|DTS|MKV|MP4|Fin)",
+    re.IGNORECASE,
+)
+
+
+def _unwrap_half_width_title_brackets(text: str) -> str:
+    """Keep bracketed titles/aliases; drop bounded release packaging tags.
+
+    Anime release folders put the work title inside half-width brackets
+    (``[DBD-Raws][大剑][01-26TV全集+特典映像][1080P]...``).  A blanket strip
+    would lose the only title evidence; unwrapping every bracket would push
+    group/codec tags into the query.  A group survives only when it carries
+    letters and none of the packaging vocabulary matches; a group with a CJK
+    title is unwrapped in place so its text joins the query.  A single-token
+    Latin bracket is a release-group tag (``[DBD-Raws]``), while a
+    multi-word Latin bracket is ordinary alias evidence
+    (``[Meaningful Show]``) and stays verbatim.
+    """
+
+    def replacement(match: re.Match[str]) -> str:
+        content = match.group(1).strip()
+        if not content:
+            return " "
+        if _HALF_WIDTH_BRACKET_PACKAGING_RE.search(content):
+            return " "
+        if not re.search(r"[㐀-鿿぀-ヿ]", content):
+            if re.fullmatch(r"[^\s]+", content):
+                return " "
+            return match.group(0)
+        return f" {content} "
+
+    return re.sub(r"\[([^\]]*)\]", replacement, text)
+
 
 def _clean_boundary_identity_query(value: str) -> str:
     """Derive a bounded CJK release-label query without rewriting the source.
@@ -268,6 +315,10 @@ def _clean_boundary_identity_query(value: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"【([^】]*)】", r" \1 ", text)
+    # Half-width brackets need the opposite split: a bracket-only release
+    # carries the work title inside them, so unwrap CJK title groups and drop
+    # the packaging ones instead of leaving the raw group tags in the query.
+    text = _unwrap_half_width_title_brackets(text)
     # Release metadata (year / count / subtitle / quality) is not part of the
     # work title.  Strip it unconditionally so a title-bearing folder such as
     # ``钢之炼金术师（2003）全51集 1080P`` or ``有意义中文剧名（2024）全12集``
@@ -300,7 +351,8 @@ def _clean_boundary_identity_query(value: str) -> str:
     )
     text = re.sub(
         r"(?:超清|收藏版|4k|8k|2160p|1440p|1080p|720p|576p|480p|"
-        r"blu-?ray|web-?dl|webrip|x26[45]|h26[45]|hevc|av1|10bit|8bit)",
+        r"blu-?ray|bdrip|web-?dl|webrip|x26[45]|h26[45]|hevc|av1|"
+        r"hi[\s._-]*10p|ma10p|10[\s._-]*bit|8bit)",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -350,7 +402,9 @@ def _clean_boundary_identity_query(value: str) -> str:
         text = text.rstrip(" ._+-")
         if text == before:
             break
-    return text
+    # A bracket group whose inner tokens were all stripped above must not
+    # survive as an empty pair of delimiters in the final query.
+    return re.sub(r"\[\s*\]", " ", text).strip()
 
 
 def _script_evidence_text(value: str) -> str:

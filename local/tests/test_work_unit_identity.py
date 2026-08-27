@@ -464,6 +464,40 @@ class TestIdentityEvidence(unittest.TestCase):
             "末日三问",
         )
 
+    def test_boundary_clean_query_unwraps_bracket_only_release_titles(self) -> None:
+        """A bracket-only release carries the work title inside ``[]``.
+
+        The clean query must unwrap the CJK title group and drop the
+        group/codec/packaging brackets instead of sending the raw release
+        fingerprint to TMDB.
+        """
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "[DBD-Raws][大剑][01-26TV全集+特典映像][1080P][BDRip]"
+                "[HEVC-10bit][简繁外挂][FLAC][MKV]",
+            ),
+            "大剑",
+        )
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "[VCB-Studio] 轮回七次的恶役千金 10-bit 1080p HEVC BDRip [Fin]",
+            ),
+            "轮回七次的恶役千金",
+        )
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "[DBD-Raws][物理魔法使马修 神觉者候补选拔试验篇]"
+                "[01-12TV全集][美版][1080P][BDRip]",
+            ),
+            "物理魔法使马修神觉者候补选拔试验篇",
+        )
+        # A multi-word bracketed Latin alias is still title evidence and
+        # stays verbatim; a bare ordinal bracket never becomes a query.
+        self.assertEqual(
+            _clean_boundary_identity_query("B 有意义中文剧名 [Meaningful Show]"),
+            "有意义中文剧名 [Meaningful Show]",
+        )
+
     def test_evidence_serialization_roundtrip(self) -> None:
         ep = EpisodePattern(season_numbers=(1,), episode_numbers=(1, 2), total_episodes=2, has_specials=False)
         ev1 = IdentityEvidence(
