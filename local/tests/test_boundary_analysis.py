@@ -960,7 +960,13 @@ class TestSyntheticCases(unittest.TestCase):
 
         self.assertEqual(len(candidates), 3)
         self.assertTrue(all(len(candidate.source_paths) == 1 for candidate in candidates))
-        self.assertTrue(all(candidate.claimed_seasons == () for candidate in candidates))
+        # Duplicate editions stay separate candidates (fail closed); each
+        # still records the explicit season marker from its own directory
+        # name as a B/W claimed-season fact.
+        self.assertEqual(
+            [candidate.claimed_seasons for candidate in candidates],
+            [(1,), (1,), (2,)],
+        )
 
     def test_decorated_stale_empty_season_is_not_claimed_as_a_gap(self) -> None:
         fixture = {
