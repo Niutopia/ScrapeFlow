@@ -1200,3 +1200,53 @@ class SelectOwnershipIsolationTests(SimpleServerTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_boundary_rebuild_discards_automatic_uncertain_parks(self) -> None:
+        """An operator source change may discard automatic D=uncertain parks.
+
+        ``uncertain`` is a parked state, not a write-side decision: after the
+        operator deletes release folders (轮回七次 shape), the stale units
+        and their parks must give way to a fresh B/W rebuild.
+        """
+        root_id = self._prepare_rebuildable_boundary_root()
+        records = load_work_unit_records(self.state_root, root_id)
+        parked_units = [
+            replace(
+                record,
+                identity_status="confirmed",
+                identity={"source": "automatic", "tmdb_id": 17, "media_type": "tv"},
+                reconciliation_outcome="uncertain",
+                attention="TV 证据不足挂起",
+            )
+            for record in records
+        ]
+        save_work_unit_records(self.state_root, root_id, parked_units)
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-boundaries", {},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["phase"], "queued")
+        fresh = load_work_unit_records(self.state_root, root_id)
+        self.assertTrue(all(record.reconciliation_outcome is None for record in fresh))
+
+    def test_boundary_rebuild_keeps_blocking_write_side_facts(self) -> None:
+        """A lane/gap fact still blocks rebuild even under an uncertain park."""
+        root_id = self._prepare_rebuildable_boundary_root()
+        records = load_work_unit_records(self.state_root, root_id)
+        tainted = replace(
+            records[0],
+            identity_status="confirmed",
+            identity={"source": "automatic", "tmdb_id": 17, "media_type": "tv"},
+            reconciliation_outcome="uncertain",
+            lane_status="existing_gap_registered",
+        )
+        save_work_unit_records(self.state_root, root_id, [tainted, *records[1:]])
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-boundaries", {},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn("对账或写入", str(payload.get("error", "")))

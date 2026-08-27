@@ -2284,13 +2284,22 @@ class SimpleApplication:
             # A failed root may discard only automatic D=new_work decisions
             # when the zero-file receipt above proves F never persisted a
             # carrier or reached a formal target.  Any other D/lane fact is
-            # still outside this recovery surface.
+            # still outside this recovery surface.  An automatic
+            # D=uncertain is different: it is a parked state ("证据不足"),
+            # never a write-side decision, and every write-side fact is
+            # still blocked independently below.  An operator rebuilding
+            # boundaries after changing the source (for example deleting
+            # release folders) must be able to discard those stale parks so
+            # C/D re-derive from the fresh snapshot.
             if (
                 (
                     record.reconciliation_outcome is not None
                     and not (
-                        allow_automatic_reconciliation_reset
-                        and record.reconciliation_outcome == "new_work"
+                        (
+                            allow_automatic_reconciliation_reset
+                            and record.reconciliation_outcome == "new_work"
+                        )
+                        or record.reconciliation_outcome == "uncertain"
                     )
                 )
                 or record.matched_work_root is not None
