@@ -1106,16 +1106,22 @@ def _strict_release_dash_episode_members(
 ) -> tuple[tuple[str, int], ...] | None:
     """Return exact ``(source_path, ordinal)`` members of one dash run.
 
-    Unlike the older bare/bracket proofs, this grammar excludes *no* videos:
-    the unqualified dash ordinal cannot safely distinguish a regular episode
-    from an OVA, trailer, NCOP/NCED, or a second title.  Every video therefore
-    has to carry the same normalized title prefix and one unique ordinal.
+    Unlike the older bare/bracket proofs, this grammar excludes no videos by
+    *file shape*: the unqualified dash ordinal cannot safely distinguish a
+    regular episode from an OVA, trailer, NCOP/NCED, or a second title.
+    Every candidate video therefore has to carry the same normalized title
+    prefix and one unique ordinal.  A video inside a dedicated bonus
+    directory (``EXTRA/``, ``PV/``, ``特典映像/``) is still excluded by that
+    directory context — the context is strong evidence independent of the
+    ordinal grammar, exactly like the bracketed/bare proofs.
     """
     if node is None:
         return None
     videos = [
-        file for file in collect_all_files(node)
+        file
+        for file in collect_all_files(node)
         if file.object_type == "video"
+        and not _is_bonus_directory_video(file)
     ]
     if not videos:
         return None

@@ -1755,3 +1755,37 @@ class NestedWorkNfoTests(unittest.TestCase):
         tv = index.entries_for("tv", 77661)
         self.assertEqual(len(tv), 1)
         self.assertEqual(tv[0].episode_tokens, {"S02E03"})
+
+class ReleaseDashExtraDirectoryTests(LibraryIndexTests):
+    def test_release_dash_proof_excludes_dedicated_extra_directory(self) -> None:
+        """``EXTRA/[SP00] Menu - 01`` does not break the dash run.
+
+        The dash grammar excludes no video by its own file shape, but a
+        dedicated bonus directory is strong non-story context: SP-marked
+        Menu/NCOP/Picture-Drama assets inside ``EXTRA/`` must be omitted
+        from the run instead of colliding with the real episodes
+        (轮回七次 Moozzi2 shape).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99044, {1: 4})
+            names = [
+                f"Example Show - {episode:02d} (BD 1080p).mkv"
+                for episode in range(1, 5)
+            ] + [
+                "EXTRA/Example Show [SP00] Menu - 01 (BD 1080p).mkv",
+                "EXTRA/Example Show [SP01] NCOP (BD 1080p).mkv",
+                "EXTRA/Example Show [SP05] Picture Drama - 01 (BD 1080p).mkv",
+                "EXTRA/Example Show [SP05] Picture Drama - 02 (BD 1080p).mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-dash-extra-dir",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence and record.reconciliation_evidence["episode_count"],
+                4,
+            )
