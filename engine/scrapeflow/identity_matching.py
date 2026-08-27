@@ -402,6 +402,14 @@ def _clean_boundary_identity_query(value: str) -> str:
         text = text.rstrip(" ._+-")
         if text == before:
             break
+    # A quality tag between the shelf letter and the CJK title (``F 4k 拂晓
+    # 的尤娜``) blocked the first-pass prefix strip.  Run it again now that
+    # the noise is gone.
+    text = re.sub(
+        r"^\s*[A-Za-z]\s+(?=[㐀-鿿぀-ヿ])",
+        "",
+        text,
+    )
     # A bracket group whose inner tokens were all stripped above must not
     # survive as an empty pair of delimiters in the final query.
     return re.sub(r"\[\s*\]", " ", text).strip()
