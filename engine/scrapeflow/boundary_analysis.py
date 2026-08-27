@@ -734,6 +734,11 @@ def _propose_media_context(node: SourceNode) -> str:
     # One large video → movie
     if len(video_files) == 1 and video_files[0].size >= _MOVIE_MIN_BYTES:
         return "movie"
+    # The node's own name is a season marker (``不死者之王 第一季`` is a
+    # season-scoped candidate, not a movie-shaped standalone): a season
+    # directory is TV evidence regardless of its child naming.
+    if _season_number_from_directory_name(node.name) is not None:
+        return "tv"
     # Multiple videos, any season dir in children → tv
     if any(_season_number_from_directory_name(c.name) is not None for c in node.children):
         return "tv"
