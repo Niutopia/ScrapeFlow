@@ -1732,6 +1732,14 @@ def _multi_season_absolute_map_path(
     if not seasons:
         return None
     ordered = sorted(seasons)
+    # A single season whose episode count exactly equals the source run is
+    # the obvious answer: the ordinary planner with a ``season`` hint handles
+    # it, and an explicit map is both unnecessary and dangerous — a later
+    # pair of seasons can coincidentally sum to the same count (黑执事 S1=24
+    # beside S4+S5=11+13=24) and would silently re-map S1 episodes into the
+    # wrong seasons.
+    if any(len(seasons[season]) == total for season in ordered):
+        return None
     chosen: list[int] | None = None
     for start in ordered:
         suffix = [season for season in ordered if season >= start]

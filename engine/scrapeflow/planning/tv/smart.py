@@ -259,6 +259,10 @@ def _plan_with_explicit_episode_map(
     unparsed episode.  Route movie-context videos through the same movie
     matcher the smart grouping uses, then combine the TV (map-driven) plan
     with each independent movie plan exactly like the ordinary split path.
+    Unnumbered specials (``[OVA].mkv``) are handed to the lower planner
+    with ``defer_unnumbered_specials`` so the official special-title matcher
+    can resolve them into Season 00 (the same path the smart grouping uses);
+    only a title that matches no official special stays at source.
     """
     prefer_animation = _media_context_from_source_and_target(
         str(kwargs["src_path"]), str(kwargs["parent_path"]),
@@ -296,6 +300,11 @@ def _plan_with_explicit_episode_map(
 
     map_kwargs = dict(smart_kwargs)
     map_kwargs["source_files"] = remaining
+    # Unnumbered specials beside the mapped run must go through the official
+    # special-title matcher, not abort the plan.  This is the same flag the
+    # smart grouping sets; it makes ``parse_ep_files`` defer unnumbered
+    # specials so the lower planner can resolve them into Season 00.
+    map_kwargs["auto_special_title_match"] = True
     plan = build_tv_plan(**map_kwargs)
     if not movie_groups:
         if preserved_theme_residuals:
