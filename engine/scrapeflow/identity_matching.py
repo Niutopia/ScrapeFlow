@@ -904,6 +904,16 @@ def _title_from_representative_episode_filename(value: str) -> str | None:
             flags=re.IGNORECASE,
         )
     if marker is None:
+        # A Chinese release may write the season and episode as ``第1季 03``
+        # instead of ``S01E03``.  The bounded form (a Chinese season label
+        # followed by a bare ordinal at the end of the stem) is the same
+        # explicit coordinate evidence, and the title before it is the
+        # work name (东京喰种 第1季 03 → 东京喰种).
+        marker = re.search(
+            r"[\s._\-]*第\s*\d{1,3}\s*季[\s._\-]*0*\d{1,4}\s*$",
+            stem,
+        )
+    if marker is None:
         return None
     title = stem[:marker.start()].strip(" ._-")
     return title if _usable_release_title_query(title) else None

@@ -1545,3 +1545,17 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_chinese_season_ordinal_filename_yields_title_query(self) -> None:
+        """``东京喰种 第1季 03.mkv`` has explicit CJK season coordinates."""
+        self.assertEqual(
+            _title_from_representative_episode_filename(
+                "[4K_NW] 东京喰种 第1季 03.mkv"
+            ),
+            "[4K_NW] 东京喰种",
+        )
+        self.assertIsNone(
+            _title_from_representative_episode_filename(
+                "第1季 03.mkv"
+            )
+        )
