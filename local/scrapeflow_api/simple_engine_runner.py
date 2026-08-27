@@ -581,6 +581,10 @@ class EngineRequest:
     # external request option: F sets it only alongside a freshly revalidated
     # release-dash proof and its explicit source-key map.
     allow_release_dash_ordinal: bool = False
+    # D/F-only gate for the narrow ``Title 01`` grammar.  It is never an
+    # external request option: F sets it only beside a freshly revalidated
+    # homogeneous title-ordinal proof and its explicit source-key map.
+    allow_release_title_ordinal: bool = False
     # The following fields are internal-only WorkUnit ownership/placement
     # evidence.  They are persisted with the internal carrier so
     # execute/recovery can re-check the same boundary, but no HTTP request may
@@ -608,6 +612,7 @@ class EngineRequest:
             or "source_declared_seasons" in payload
             or "target_scope_root" in payload
             or "allow_release_dash_ordinal" in payload
+            or "allow_release_title_ordinal" in payload
             or "episode_map_path" in payload
         ):
             raise EngineRequestError("WorkUnit 内部范围仅允许由服务端流程生成")
@@ -692,10 +697,13 @@ class EngineRequest:
         raw_declared_seasons = raw.pop("source_declared_seasons", None)
         raw_target_scope = raw.pop("target_scope_root", None)
         raw_release_dash_ordinal = raw.pop("allow_release_dash_ordinal", False)
+        raw_release_title_ordinal = raw.pop("allow_release_title_ordinal", False)
         raw_episode_map_path = raw.pop("episode_map_path", None)
         request = cls.from_mapping(raw)
         if type(raw_release_dash_ordinal) is not bool:
             raise EngineRequestError("持久化 release-dash 集号开关必须是布尔值")
+        if type(raw_release_title_ordinal) is not bool:
+            raise EngineRequestError("持久化 title-ordinal 集号开关必须是布尔值")
         episode_map_path: str | None = None
         if raw_episode_map_path is not None:
             if (
@@ -735,6 +743,7 @@ class EngineRequest:
                 target_scope_root=target_scope_root,
                 source_declared_seasons=declared_seasons,
                 allow_release_dash_ordinal=raw_release_dash_ordinal,
+                allow_release_title_ordinal=raw_release_title_ordinal,
                 episode_map_path=episode_map_path,
             )
         if not isinstance(raw_scopes, (list, tuple)):
@@ -757,6 +766,7 @@ class EngineRequest:
             source_declared_seasons=declared_seasons,
             target_scope_root=target_scope_root,
             allow_release_dash_ordinal=raw_release_dash_ordinal,
+            allow_release_title_ordinal=raw_release_title_ordinal,
             episode_map_path=episode_map_path,
         )
 
@@ -3848,6 +3858,20 @@ class SimpleEngineRunner:
         )
         if plan_root != request.source_path:
             raise EngineRequestError(f"{stage} 的 source_root 未保持 WorkUnit 公共来源根")
+        # A flat movie WorkUnit pins one exact file while the legacy planner
+        # still carries its parent directory as ``source_root``/``source_dir``.
+        # Permit that single, verifiable parent relation only for the exact
+        # file scope; never let a sibling file or directory inherit the scope.
+        file_scopes = {
+            scope
+            for scope in scopes
+            if any(
+                isinstance(raw, Mapping)
+                and raw.get("is_dir") is not True
+                and str(raw.get("full_path") or "").rstrip("/") == scope
+                for raw in (_files or ())
+            )
+        }
         for collection_name in ("files", "cleanup_files", "problem_files"):
             for item in list(getattr(plan, collection_name, ()) or ()):
                 source = _safe_remote_path(
@@ -3864,7 +3888,16 @@ class SimpleEngineRunner:
                         field=f"{stage} {collection_name} source_dir",
                         allow_root=False,
                     )
-                    if not self._path_in_exactly_one_scope(directory, scopes):
+                    directory_in_scope = self._path_in_exactly_one_scope(
+                        directory, scopes,
+                    )
+                    exact_file_parent = any(
+                        scope in file_scopes
+                        and source == scope
+                        and directory == (posixpath.dirname(scope) or "/")
+                        for scope in file_scopes
+                    )
+                    if not directory_in_scope and not exact_file_parent:
                         raise EngineRequestError(f"{stage} 计划包含范围外来源目录: {directory}")
 
     def _require_persisted_plan_source_scope(
@@ -3955,6 +3988,7 @@ class SimpleEngineRunner:
                     ),
                     "episode_group_id": current.episode_group_id,
                     "allow_release_dash_ordinal": current.allow_release_dash_ordinal,
+                    "allow_release_title_ordinal": current.allow_release_title_ordinal,
                     "media_root": self.library_root,
                 }
                 if source_files is not None:

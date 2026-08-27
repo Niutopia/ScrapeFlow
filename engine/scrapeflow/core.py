@@ -123,7 +123,10 @@ from .remote_paths import (
     safe_name,
     split_remote,
 )
-from .replenishment_matching import release_dash_regular_episode
+from .replenishment_matching import (
+    release_dash_regular_episode,
+    release_title_ordinal_regular_episode,
+)
 from .residual_policy import (
     classify_residual,
     cleanup_allowlist_reason,
@@ -2035,6 +2038,7 @@ def parse_ep_files(
     prefer_simplified: bool = False,
     defer_unnumbered_specials: bool = False,
     allow_release_dash_ordinal: bool = False,
+    allow_release_title_ordinal: bool = False,
 ) -> dict[EpisodeKey, list[dict[str, Any]]]:
     groups: dict[EpisodeKey, list[dict[str, Any]]] = defaultdict(list)
     for raw_item in files:
@@ -2058,6 +2062,11 @@ def parse_ep_files(
         release_dash = (
             release_dash_regular_episode(name)
             if allow_release_dash_ordinal
+            else None
+        )
+        release_title_ordinal = (
+            release_title_ordinal_regular_episode(name)
+            if allow_release_title_ordinal
             else None
         )
         multi_text = DATE_NOISE_RE.sub(" ", name)
@@ -2118,6 +2127,8 @@ def parse_ep_files(
             key = EpisodeKey("regular", int(titled_season_dash_episode.group(1)))
         if key is None and release_dash is not None:
             key = EpisodeKey("regular", release_dash[1])
+        if key is None and release_title_ordinal is not None:
+            key = EpisodeKey("regular", release_title_ordinal[1])
         if key is None and dual_number_episode is not None:
             key = EpisodeKey("regular", int(dual_number_episode.group(1)))
         if key is None and multi_match and multi_match.group(1) != multi_match.group(2):
@@ -3440,6 +3451,10 @@ def _tv_season_resource_gaps(
             f"Season {number:02d} {title}",
             f"TMDB 已发布该季{expected_text}，但源目录和现有目标库均没有任何该季视频",
         )
+        # J must never infer a season coordinate from a display label.  The
+        # label remains useful to an operator, but this is the durable
+        # machine coordinate consumed by the same per-episode gap ledger.
+        gap["season"] = number
         if title:
             gap["season_name"] = title
         if isinstance(expected, int) and not isinstance(expected, bool) and expected > 0:
@@ -6704,6 +6719,7 @@ def build_tv_plan(
     auto_special_title_match: bool = False,
     auto_align_subtitles: bool = False,
     allow_release_dash_ordinal: bool = False,
+    allow_release_title_ordinal: bool = False,
     source_files: Sequence[Mapping[str, Any]] | None = None,
     media_root: str | None = None,
 ) -> Plan:
@@ -6852,6 +6868,7 @@ def build_tv_plan(
         prefer_simplified=False,
         defer_unnumbered_specials=auto_special_title_match,
         allow_release_dash_ordinal=allow_release_dash_ordinal,
+        allow_release_title_ordinal=allow_release_title_ordinal,
     )
     subtitle_alignment_applied = bool(
         auto_align_subtitles and _align_subtitles_to_video_sequence(all_groups)
@@ -6955,6 +6972,7 @@ def build_tv_plan(
             prefer_simplified=True,
             defer_unnumbered_specials=auto_special_title_match,
             allow_release_dash_ordinal=allow_release_dash_ordinal,
+            allow_release_title_ordinal=allow_release_title_ordinal,
         )
         if prefer_simplified
         else all_groups

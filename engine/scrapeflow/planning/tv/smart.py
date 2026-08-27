@@ -603,6 +603,36 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 item["_episode_key_override"] = explicit_episode
             movie_tmdb_id = _embedded_movie_tmdb_id(item)
             source_episode_key = extract_episode_key(str(item.get("name", "")))
+            # A regular episode can legitimately contain a movie-like word in
+            # its title (for example ``...-大电影``).  When the file carries an
+            # explicit SxxEyy coordinate that agrees with an enclosing season
+            # directory, that structural evidence wins over the loose movie
+            # keyword heuristic below.  Keep the parent-season requirement so
+            # a genuinely independent, top-level movie is still fail-closed
+            # and reaches the movie matcher.
+            explicit_filename_season: int | None = None
+            explicit_filename_match = re.search(
+                r"S(?:eason)?\s*0*(\d{1,3})\s*E\s*0*\d+",
+                str(item.get("name", "")),
+                re.IGNORECASE,
+            )
+            if explicit_filename_match is not None:
+                explicit_filename_season = int(explicit_filename_match.group(1))
+            explicit_parent_tv_episode = (
+                inferred_season_from_parent
+                and explicit_filename_season is not None
+                and explicit_filename_season == inferred_season
+                and source_episode_key is not None
+                and source_episode_key.kind == "regular"
+                # An explicit embedded movie identity is authoritative.  A
+                # parent directory explicitly labelled as a movie/collection
+                # is likewise not converted into TV merely because a child
+                # filename happens to contain an SxxEyy token.
+                and movie_tmdb_id is None
+                and not _has_movie_context({
+                    "full_path": posixpath.dirname(full_path),
+                })
+            )
             ova_volume = None
             for segment in reversed(segments[:-1]):
                 ova_volume = _ova_volume_ordinal(segment)
@@ -667,7 +697,10 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 # Season 05 or episode 05.  Let the independently evidenced
                 # movie matcher below consume it before any season-number
                 # inheritance can turn the folder ordinal into an episode.
-                and not _has_movie_context(item)
+                and (
+                    explicit_parent_tv_episode
+                    or not _has_movie_context(item)
+                )
                 and not _special_context_overrides_parent_season(item)
                 and (
                     inferred_season_from_parent

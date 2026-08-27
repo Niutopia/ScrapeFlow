@@ -248,6 +248,15 @@ def _clean_boundary_identity_query(value: str) -> str:
         "",
         text,
     )
+    # A leading full-width genre bucket (``【美剧】``/``【番剧】``) is
+    # source routing metadata, not part of the work title.  Keep this list
+    # deliberately bounded and anchored so arbitrary title brackets remain
+    # ordinary evidence.
+    text = re.sub(
+        r"^\s*【(?:美剧|欧美剧|英剧|韩剧|日剧|国产剧|港剧|台剧|番剧|动画|动漫|电影|纪录片)】\s*",
+        "",
+        text,
+    )
     # Full-width release brackets (【4K】/【日语中字】/【类型：…】/【全 N 集】)
     # are packaging metadata; drop them, then unwrap a remaining bracket so a
     # title wrapped as 【Title】 survives the query.  Half-width ``[]`` stays
@@ -265,10 +274,18 @@ def _clean_boundary_identity_query(value: str) -> str:
     # matches its TMDB title.  The year is preserved in ``IdentityEvidence.years``
     # for scoring; only the query is cleaned here.
     text = re.sub(r"[（(]\s*(?:19|20)\d{2}(?:\s*[.\-/]\s*(?:(?:19|20)\d{2}|\d{1,2}))?\s*[)）]", " ", text)
-    # A trailing parenthetical release-group suffix (（DBD&HKG&X2字幕组 - BDRip
-    # HEVC-10bit FLAC）) is packaging, not title words.
+    # A trailing parenthetical release-group/technical suffix (for example
+    # ``（DBD&HKG&X2字幕组 - BDRip HEVC-10bit FLAC）`` or
+    # ``（AMZN.WEB-DL.AVC.DDP.2.0）``) is packaging, not title words.  The
+    # latter shape is common for otherwise title-bearing CJK folders whose
+    # files are bare ordinals; leaving it attached makes TMDB receive a
+    # release fingerprint instead of the actual title and can exhaust the
+    # bounded query variants before the exact title is tried.
     text = re.sub(
-        r"[（(][^）)]*(?:字幕组|压制组|压制|BDRip|BDRIP|Blu-?Ray|HEVC|H26[45]|x26[45]|FLAC|AAC|10bit)[^）)]*[)）]\s*$",
+        r"[（(][^）)]*(?:字幕组|压制组|压制|BDRip|BDRIP|Blu-?Ray|"
+        r"AMZN|WEB[- .]?DL|WEBRip|REMUX|AVC|H26[45]|x26[45]|HEVC|"
+        r"FLAC|AAC|DDP|DTS(?:-HD)?|TrueHD|EAC3|AC3|10bit|8bit)"
+        r"[^）)]*[)）]\s*$",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -276,7 +293,7 @@ def _clean_boundary_identity_query(value: str) -> str:
     text = re.sub(r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)", " ", text)
     text = re.sub(r"\+\s*(?:OVA|OAV|OAD|SP)(?:\s*\+)?", " ", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"(?:内封|内嵌|外挂|简英|简中|简日|繁中|繁日|简繁|中英|中日|日英|双语|硬字幕|软字幕|中文字幕)(?:字幕)?",
+        r"(?:内封|内嵌|外挂|简体|繁体|简英|简中|简日|繁中|繁日|简繁|中英|中日|日英|双语|硬字幕|软字幕|中文字幕)(?:字幕)?",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -306,6 +323,24 @@ def _clean_boundary_identity_query(value: str) -> str:
         text,
         flags=re.IGNORECASE,
     ).strip()
+    # Release containers also encode a season span (``1-3季`` or
+    # ``S01-S03``).  It is layout evidence, not a title token; strip only a
+    # trailing, explicitly bounded span.
+    text = re.sub(
+        r"[\s._-]*(?:\d{1,3}\s*[-~至]\s*\d{1,3}\s*季|"
+        r"S\s*0*\d{1,3}\s*[-~至]\s*S?\s*0*\d{1,3})\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Chinese release labels commonly put dots between every title
+    # character (``金.斯.敦.市.长``).  Collapse only separators surrounded by
+    # CJK characters; punctuation in an actual title remains untouched.
+    text = re.sub(
+        r"(?<=[\u3400-\u9fff\u3040-\u30ff])[\s._+\-]+(?=[\u3400-\u9fff\u3040-\u30ff])",
+        "",
+        text,
+    )
     # A batch count and a quality tag can appear in either tail order.  Bound
     # this cleanup to a few passes so malformed labels cannot be over-cleaned.
     for _ in range(3):

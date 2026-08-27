@@ -26,6 +26,10 @@ from engine.scrapeflow.media_quality import (
     ABSOLUTE_MINIMUM_VIDEO_BYTES,
     minimum_video_bytes,
 )
+from engine.scrapeflow.replenishment_matching import (
+    release_dash_regular_episode,
+    release_title_ordinal_regular_episode,
+)
 from engine.scrapeflow.models import Plan, PlannedCleanup, PlannedFile, PlannedProblem
 from engine.scrapeflow.residual_policy import (
     REBUILDABLE_STAGING_TEMP_CLEANUP_REASON,
@@ -609,6 +613,14 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 "media_type": "tv",
                 "tmdb_id": 1,
                 "allow_release_dash_ordinal": True,
+            })
+        with self.assertRaisesRegex(EngineRequestError, "内部范围"):
+            EngineRequest.from_mapping({
+                "source_path": "/incoming/show",
+                "parent_path": "/library/番剧",
+                "media_type": "tv",
+                "tmdb_id": 1,
+                "allow_release_title_ordinal": True,
             })
 
     def test_new_workunit_scope_requires_a_child_below_its_authorized_scope(self) -> None:
@@ -2050,6 +2062,57 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             [("regular", 1, 2)],
         )
 
+    def test_title_ordinal_parser_is_explicitly_gated_and_leading_tags_fail_closed(self) -> None:
+        """The bounded ``Title 01`` lane never becomes a global parser rule."""
+        source = [
+            {
+                "name": (
+                    f"[4K_EA] One Season Show {episode:02d} "
+                    "[简体内嵌][WebRip].mkv"
+                ),
+                "full_path": f"/incoming/one/{episode:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            }
+            for episode in range(1, 4)
+        ]
+        gated = parse_ep_files(source, allow_release_title_ordinal=True)
+        self.assertEqual([key.display for key in gated], ["E01", "E02", "E03"])
+
+        # The ordinary parser may still have legacy ways to read a trailing
+        # ordinal; the D/F gate is what makes this grammar *authoritative*.
+        # It is never enabled by a public EngineRequest.
+        self.assertEqual(
+            [key.display for key in parse_ep_files(source)],
+            ["E01", "E02", "E03"],
+        )
+        unsafe = [
+            {
+                "name": f"[01] One Season Show {episode:02d}.mkv",
+                "full_path": f"/incoming/unsafe/{episode:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            }
+            for episode in (1, 2)
+        ]
+        self.assertIsNone(
+            release_title_ordinal_regular_episode(unsafe[0]["name"]),
+        )
+        self.assertIsNone(
+            release_title_ordinal_regular_episode(unsafe[1]["name"]),
+        )
+        for name in (
+            "One Season Show 01 [01.5].mkv",
+            "One Season Show 01 (24.5).mkv",
+            "One Season Show 01 [01到02].mkv",
+            "One Season Show 01 [2024到2025].mkv",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(release_title_ordinal_regular_episode(name))
+        self.assertIsNone(
+            release_dash_regular_episode("One Season Show - 01 [01.5].mkv"),
+        )
+
     def test_tv_planner_consumes_a_proven_physical_oad_sp_map(self) -> None:
         """The D/F-only SP map turns no unproven OAD into Season 00."""
         class PlannerAList:
@@ -2224,6 +2287,81 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                     "source_declared_seasons": (2,),
                 },
             )
+
+    def test_explicit_episode_coordinate_overrides_movie_word_in_episode_title(self) -> None:
+        """A season episode titled ``大电影`` remains a TV file.
+
+        Release filenames commonly include words such as ``电影`` in an
+        episode title.  The enclosing season plus an agreeing SxxEyy token is
+        stronger structural evidence than the generic movie-context
+        heuristic; the planner must not even query the movie namespace.
+        """
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class PlannerTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/60625":
+                    return {
+                        "name": "Example Show",
+                        "original_name": "Example Show",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [{"season_number": 7, "episode_count": 1}],
+                    }
+                if path == "/tv/60625/season/7":
+                    return {
+                        "episodes": [{
+                            "episode_number": 8,
+                            "name": "数字者的崛起：大电影",
+                            "air_date": "2020-01-01",
+                            "runtime": 22,
+                        }],
+                    }
+                if path == "/tv/60625/season/0":
+                    return {"episodes": []}
+                if path.startswith("/search/movie"):
+                    raise AssertionError("a structured S07E08 episode must not search movies")
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/incoming/Example Show"
+        source_path = (
+            source_root
+            + "/第七季（2020）全1集/Example Show - S07E08 - 数字者的崛起-大电影.mkv"
+        )
+        plan = build_tv_plan_smart(
+            auto_episode_mode=True,
+            alist=PlannerAList(),
+            tmdb_client=PlannerTMDB(),
+            src_path=source_root,
+            parent_path="/library/欧美剧",
+            tmdb_id=60625,
+            season=7,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            ignore_orphan_temp=False,
+            source_files=[{
+                "name": Path(source_path).name,
+                "full_path": source_path,
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            }],
+            media_root="/quark/影视",
+            source_declared_seasons=(7,),
+        )
+
+        self.assertEqual(plan.mode, "tv")
+        self.assertNotIn("member_movies", plan.metadata)
+        self.assertEqual(len(plan.files), 1)
+        item = plan.files[0]
+        self.assertEqual(item.episode_key, "E08")
+        self.assertEqual(item.target_dir, "/library/欧美剧/Example Show/Season 07")
+        self.assertIn("S07E08", item.final_name)
 
     def test_preferred_traditional_subtitle_is_deferred_not_a_problem_file(self) -> None:
         """Keep the planner's simplified-preference result non-blocking.
