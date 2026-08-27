@@ -22,7 +22,11 @@ from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,
     _season_number_from_directory_name,
 )
-from engine.scrapeflow.identity_matching import physical_special_candidate_evidence
+from engine.scrapeflow.identity_matching import (
+    _clean_boundary_identity_query,
+    _normalize_match_title,
+    physical_special_candidate_evidence,
+)
 from engine.scrapeflow.media_policy import (
     DISC_IMAGE_INSPECTION_REQUIRED,
     is_video_filename,
@@ -34,6 +38,7 @@ from engine.scrapeflow.replenishment_matching import (
     bare_regular_episode_number,
     bracketed_regular_episode_number,
     release_dash_regular_episode,
+    release_title_ordinal_regular_episode,
 )
 from engine.scrapeflow.root_boundaries import load_source_snapshot, walk_source_rows
 from engine.scrapeflow.source_inventory import (
@@ -83,6 +88,9 @@ _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND = (
 _RELEASE_DASH_EPISODE_EVIDENCE_KIND = (
     "tmdb_single_positive_season_release_dash_episodes"
 )
+_RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_title_ordinal_episodes"
+)
 _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND = (
     "tmdb_single_positive_season_physical_special"
 )
@@ -91,6 +99,7 @@ _SINGLE_SEASON_EPISODE_EVIDENCE_KINDS = frozenset({
     _BRACKETED_EPISODE_EVIDENCE_KIND,
     _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND,
     _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
+    _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND,
     _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
 })
 
@@ -103,6 +112,8 @@ def single_season_episode_evidence_label(evidence_kind: str) -> str:
         return "裸数字集号"
     if evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND:
         return "发行组短横线集号"
+    if evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND:
+        return "同标题裸序号集号"
     if evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND:
         return "完整 OAD/OVA/OAV 集号"
     return "裸 E"
@@ -1073,6 +1084,72 @@ def _strict_release_dash_episode_numbers(
     return tuple(sorted(number for _path, number in members))
 
 
+def _strict_release_title_ordinal_episode_signature_for_file(
+    file: SourceFile,
+) -> tuple[str, int] | None:
+    """Read one strict ``Title 01`` release member."""
+    path = str(file.path or "").rstrip("/")
+    if not path or not bare_regular_episode_context_is_safe(path):
+        return None
+    return release_title_ordinal_regular_episode(posixpath.basename(path))
+
+
+def _strict_release_title_ordinal_episode_members(
+    node: SourceNode | None,
+) -> tuple[tuple[str, int], ...] | None:
+    """Return one homogeneous, contiguous ``Title 01`` source run."""
+    if node is None:
+        return None
+    videos = [
+        file for file in collect_all_files(node)
+        if file.object_type == "video"
+    ]
+    if not videos:
+        return None
+    signatures = [
+        _strict_release_title_ordinal_episode_signature_for_file(file)
+        for file in videos
+    ]
+    # This grammar excludes no video: a trailer, special, duplicate, or
+    # second prefix therefore invalidates the complete proof.
+    if any(signature is None for signature in signatures):
+        return None
+    concrete = [signature for signature in signatures if signature is not None]
+    prefixes = {prefix for prefix, _number in concrete}
+    if len(prefixes) != 1:
+        return None
+    numbers = [number for _prefix, number in concrete]
+    if len(set(numbers)) != len(numbers):
+        return None
+    ordered = tuple(sorted(numbers))
+    if ordered != tuple(range(1, len(ordered) + 1)):
+        return None
+    members = tuple(sorted(
+        (str(file.path).rstrip("/"), number)
+        for file, (_prefix, number) in zip(videos, concrete)
+    ))
+    if len({path for path, _number in members}) != len(members):
+        return None
+    return members
+
+
+def _strict_release_title_ordinal_episode_numbers(
+    node: SourceNode | None,
+) -> tuple[int, ...] | None:
+    members = _strict_release_title_ordinal_episode_members(node)
+    if members is None:
+        return None
+    return tuple(sorted(number for _path, number in members))
+
+
+def release_title_ordinal_episode_source_ordinals(
+    node: SourceNode | None,
+) -> dict[str, int] | None:
+    """Expose the exact D/F source-key proof for ``Title 01`` runs."""
+    members = _strict_release_title_ordinal_episode_members(node)
+    return dict(members) if members is not None else None
+
+
 def release_dash_episode_source_ordinals(
     node: SourceNode | None,
 ) -> dict[str, int] | None:
@@ -1112,6 +1189,16 @@ def _contains_release_dash_episode(node: SourceNode | None) -> bool:
         return False
     return any(
         _strict_release_dash_episode_signature_for_file(file) is not None
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+    )
+
+
+def _contains_release_title_ordinal_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        _strict_release_title_ordinal_episode_signature_for_file(file) is not None
         for file in collect_all_files(node)
         if file.object_type == "video"
     )
@@ -1287,7 +1374,52 @@ def _single_season_episode_numbers(
         return _strict_naked_numeric_episode_numbers(node)
     if evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND:
         return _strict_release_dash_episode_numbers(node)
+    if evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND:
+        return _strict_release_title_ordinal_episode_numbers(node)
     return None
+
+
+def _title_ordinal_prefix_matches_record(
+    prefix: str,
+    record: WorkUnitRecord,
+) -> bool:
+    """Require automatic C evidence to agree with the filename title prefix.
+
+    Operator overrides intentionally skip this auxiliary check: their public
+    confirmation surface contains only ``media_type + tmdb_id`` and existing
+    tests/operations must remain valid.  Automatic identities carry the
+    boundary label and the matcher decision trace, which are sufficient for a
+    normalized exact alias check without introducing another matcher.  A
+    containment match would let a longer, different release title borrow a
+    short TMDB title as identity evidence.
+    """
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    if str(identity.get("source") or "") == "operator_override":
+        return True
+    prefix_key = _normalize_match_title(prefix)
+    if not prefix_key:
+        return False
+    candidates: list[object] = [record.display_label, identity.get("title")]
+    trace = identity.get("decision_trace")
+    if isinstance(trace, Mapping):
+        for trace_key in ("official_titles", "aliases_checked"):
+            aliases = trace.get(trace_key)
+            if (
+                isinstance(aliases, Sequence)
+                and not isinstance(aliases, (str, bytes, bytearray))
+            ):
+                candidates.extend(aliases)
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        text = candidate.strip()
+        if not text:
+            continue
+        cleaned = _clean_boundary_identity_query(text)
+        key = _normalize_match_title(cleaned)
+        if key and prefix_key == key:
+            return True
+    return False
 
 
 def _single_positive_tmdb_season(
@@ -1555,6 +1687,20 @@ def prove_single_season_episode_evidence(
         )
     except (KeyError, TypeError, ValueError):
         return None
+    if evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND:
+        members = _strict_release_title_ordinal_episode_members(scoped)
+        if not members:
+            return None
+        first_prefix: str | None = None
+        for path, _number in members:
+            parsed = release_title_ordinal_regular_episode(posixpath.basename(path))
+            if parsed is not None:
+                first_prefix = parsed[0]
+                break
+        if first_prefix is None or not _title_ordinal_prefix_matches_record(
+            first_prefix, record,
+        ):
+            return None
     episode_numbers = _single_season_episode_numbers(
         scoped,
         evidence_kind=evidence_kind,
@@ -1952,6 +2098,9 @@ def reconcile_root_work_units(
             has_bracketed_episode = _contains_bracketed_regular_episode(scoped_node)
             has_naked_numeric_episode = _contains_naked_numeric_episode(scoped_node)
             has_release_dash_episode = _contains_release_dash_episode(scoped_node)
+            has_release_title_ordinal_episode = _contains_release_title_ordinal_episode(
+                scoped_node
+            )
             if physical_special_proof is not None:
                 season_proof = physical_special_proof
                 unit_tokens = frozenset(season_proof.episode_tokens)
@@ -1965,6 +2114,7 @@ def reconcile_root_work_units(
                     or has_bracketed_episode
                     or has_naked_numeric_episode
                     or has_release_dash_episode
+                    or has_release_title_ordinal_episode
                 )
             ):
                 # A mixed root (bare E01 beside [02], S01E03/SP/unknown
@@ -1980,6 +2130,7 @@ def reconcile_root_work_units(
                         has_bracketed_episode,
                         has_naked_numeric_episode,
                         has_release_dash_episode,
+                        has_release_title_ordinal_episode,
                     )
                 )
                 if grammar_count != 1:
@@ -1997,6 +2148,8 @@ def reconcile_root_work_units(
                         evidence_kind = _BRACKETED_EPISODE_EVIDENCE_KIND
                     elif has_naked_numeric_episode:
                         evidence_kind = _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND
+                    elif has_release_title_ordinal_episode:
+                        evidence_kind = _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND
                     else:
                         evidence_kind = _RELEASE_DASH_EPISODE_EVIDENCE_KIND
                     season_proof = prove_single_season_episode_evidence(
@@ -2110,5 +2263,6 @@ __all__ = [
     "prove_single_season_episode_evidence",
     "reconcile_root_work_units",
     "release_dash_episode_source_ordinals",
+    "release_title_ordinal_episode_source_ordinals",
     "single_season_episode_evidence_label",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import apply_work_unit_override
@@ -14,6 +15,7 @@ from local.scrapeflow_api.library_index import (
     SingleSeasonEpisodeProof,
     _merged_multi_season_evidence,
     _single_positive_tmdb_season,
+    _title_ordinal_prefix_matches_record,
     build_library_index,
     decide_reconciliation,
     reconcile_root_work_units,
@@ -583,6 +585,123 @@ class LibraryIndexTests(unittest.TestCase):
                 },
             )
 
+    def test_complete_title_ordinal_source_gets_a_revalidatable_single_season_proof(self) -> None:
+        """A homogeneous ``Title 01`` run is a bounded D/F grammar."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99090, {1: 6})
+            names = [
+                (
+                    "[4K_EA] One Season Show "
+                    f"{episode:02d} [简体内嵌][WebRip].mkv"
+                )
+                for episode in range(1, 7)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-title-ordinal-complete",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_title_ordinal_episodes",
+            )
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("episode_tokens"),
+                [f"S01E{episode:02d}" for episode in range(1, 7)],
+            )
+
+    def test_title_ordinal_proof_fails_closed_for_competing_shape(self) -> None:
+        cases = (
+            (
+                "different-prefix",
+                ["[4K] One Season Show 01 [WebRip].mkv", "[4K] Other Show 02 [WebRip].mkv"],
+            ),
+            (
+                "duplicate-ordinal",
+                ["[4K] One Season Show 01 [WebRip].mkv", "[4K] One Season Show 01 [v2].mkv"],
+            ),
+            (
+                "non-contiguous",
+                ["[4K] One Season Show 01 [WebRip].mkv", "[4K] One Season Show 03 [WebRip].mkv"],
+            ),
+            (
+                "extra-title-number",
+                ["[4K] One Season Show 2 01 [WebRip].mkv", "[4K] One Season Show 2 02 [WebRip].mkv"],
+            ),
+            (
+                "leading-ordinal-tag",
+                ["[01] One Season Show 01 [WebRip].mkv", "[01] One Season Show 02 [WebRip].mkv"],
+            ),
+            (
+                "leading-year-tag-with-whitespace",
+                [
+                    " [2024] One Season Show 01 [WebRip].mkv",
+                    " [2024] One Season Show 02 [WebRip].mkv",
+                ],
+            ),
+            (
+                "trailing-year-tag",
+                [
+                    "[4K] One Season Show 01 [2024].mkv",
+                    "[4K] One Season Show 02 [2024].mkv",
+                ],
+            ),
+            (
+                "special-tail",
+                ["[4K] One Season Show 01 [WebRip].mkv", "[4K] One Season Show 02 [OVA].mkv"],
+            ),
+            (
+                "extra-video",
+                ["[4K] One Season Show 01 [WebRip].mkv", "[4K] One Season Show 02 [WebRip].mkv", "trailer.mkv"],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            for index, (label, names) in enumerate(cases):
+                with self.subTest(label=label):
+                    _alist, _state_root, record = self._reconcile_bare_episode_source(
+                        names,
+                        StrictBareEpisodeTMDB(99100 + index, {1: 2}),
+                        state_root=state_root,
+                        root_task_id=f"root-title-ordinal-reject-{index}",
+                    )
+                    self.assertEqual(record.reconciliation_outcome, "uncertain")
+                    self.assertIsNone(record.reconciliation_evidence)
+
+    def test_title_ordinal_identity_prefix_requires_an_exact_automatic_alias(self) -> None:
+        automatic = SimpleNamespace(
+            display_label="One Season Show",
+            identity={
+                "source": "tmdb",
+                "title": "One Season Show",
+                "decision_trace": {
+                    "official_titles": ["One Season Show"],
+                    "aliases_checked": ["One Season Show (2024)"],
+                },
+            },
+        )
+        self.assertTrue(
+            _title_ordinal_prefix_matches_record("one season show", automatic),
+        )
+        self.assertFalse(
+            _title_ordinal_prefix_matches_record(
+                "another one season show", automatic,
+            ),
+        )
+        # A malformed scalar alias list must not be iterated character by
+        # character and accidentally validate a one-letter title prefix.
+        malformed = SimpleNamespace(
+            display_label="",
+            identity={
+                "source": "tmdb",
+                "decision_trace": {"official_titles": "A"},
+            },
+        )
+        self.assertFalse(_title_ordinal_prefix_matches_record("a", malformed))
+
     def test_release_dash_proof_fails_closed_for_prefix_special_video_or_catalog_drift(self) -> None:
         cases = (
             (
@@ -624,6 +743,22 @@ class LibraryIndexTests(unittest.TestCase):
                     "[Group] Example Show - 02 [01-02].mkv",
                 ],
                 StrictBareEpisodeTMDB(99068, {1: 2}),
+            ),
+            (
+                "tail-year-tag",
+                [
+                    "[Group] Example Show - 01 [WebRip].mkv",
+                    "[Group] Example Show - 02 [ 2024 ].mkv",
+                ],
+                StrictBareEpisodeTMDB(99069, {1: 2}),
+            ),
+            (
+                "tail-long-range",
+                [
+                    "[Group] Example Show - 01 [WebRip].mkv",
+                    "[Group] Example Show - 02 [2024-2025].mkv",
+                ],
+                StrictBareEpisodeTMDB(99070, {1: 2}),
             ),
             (
                 "other-video",

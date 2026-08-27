@@ -129,10 +129,10 @@ _RELEASE_DASH_COMPACT_SPECIAL_RE = re.compile(
     re.IGNORECASE,
 )
 _RELEASE_DASH_TAIL_ORDINAL_RE = re.compile(
-    r"(?:\[|\()\s*0*[1-9]\d{0,2}\s*(?:\]|\))",
+    r"(?:\[|\()\s*\d+\s*(?:\]|\))",
 )
 _RELEASE_DASH_TAIL_RANGE_RE = re.compile(
-    r"(?:\[|\()\s*0*\d{1,3}\s*[-~–—]\s*0*\d{1,3}\s*(?:\]|\))",
+    r"(?:\[|\()\s*\d+\s*[-~–—至到]\s*\d+\s*(?:\]|\))",
 )
 # These labels are release-side presentation material, not an episode of the
 # story.  Keep this tail-only so an ordinary title containing (say) ``ED`` is
@@ -149,6 +149,21 @@ _RELEASE_DASH_TAIL_NON_STORY_TAG_RE = re.compile(
 _RELEASE_DASH_TAIL_EXPLICIT_EPISODE_RE = re.compile(
     r"(?:\[|\()[^\]\)]*?(?<![A-Za-z0-9])E(?:P)?\s*0*[1-9]\d{0,3}",
     re.IGNORECASE,
+)
+# A bounded release shape used by a few anime packs is ``Title 01`` with
+# optional bracketed release tags after the ordinal.  It is intentionally a
+# separate grammar from ``Title - 01``: the title prefix must be digit-free,
+# so ordinary planning never has to guess which number is the episode.
+_RELEASE_TITLE_ORDINAL_EPISODE_RE = re.compile(
+    r"^(?P<prefix>.+?)\s+0*(?P<episode>[1-9]\d{0,2})"
+    r"(?P<tail>(?:\s*(?:\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）))*?)\s*$",
+    re.IGNORECASE,
+)
+# A numeric tag may be a year, resolution, ordinal, or range.  None is
+# reliable title/release metadata for the narrow ``Title 01`` proof, so keep
+# this deliberately unbounded rather than silently accepting ``[2024]``.
+_RELEASE_TITLE_ORDINAL_PURE_NUMBER_TAG_RE = re.compile(
+    r"^\d+(?:\s*[-~–—至到]\s*\d+)?$",
 )
 ANIME_EPISODE_RANGE_RE = re.compile(
     r"(?<!\d)\(\s*0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})\s*\)(?!\d)",
@@ -477,6 +492,8 @@ def release_dash_regular_episode(value: Any) -> tuple[str, int] | None:
     stem = stem.strip()
     if not stem:
         return None
+    if FRACTIONAL_EPISODE_RE.search(stem):
+        return None
     # A title may contain ordinary punctuation, but a second `` - N`` is a
     # competing ordinal (or a packed release) and must not be guessed.
     if len(_RELEASE_DASH_ORDINAL_RE.findall(stem)) != 1:
@@ -503,6 +520,95 @@ def release_dash_regular_episode(value: Any) -> tuple[str, int] | None:
     ).strip()
     if not prefix or not any(character.isalpha() for character in prefix):
         return None
+    number = int(match.group("episode"))
+    return (prefix, number) if 0 < number <= 999 else None
+
+
+def release_title_ordinal_regular_episode(value: Any) -> tuple[str, int] | None:
+    """Return ``(title_prefix, ordinal)`` for one strict ``Title 01`` file.
+
+    This is a D/F-only primitive.  It accepts one terminal bare ordinal and
+    only bracketed/parenthesized release tags after it.  A title prefix may
+    not contain another digit, a dash immediately before the ordinal, or a
+    special/explicit coordinate marker.  The caller still has to prove one
+    homogeneous contiguous run against the selected TMDB season.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return None
+    if _RELEASE_DASH_COMPACT_SPECIAL_RE.search(text):
+        return None
+    if episode_ranges(text) or season_markers(text):
+        return None
+    name = re.split(r"[/\\]", text.rstrip("/"))[-1]
+    stem, dot, _suffix = name.rpartition(".")
+    if not dot:
+        stem = name
+    stem = stem.strip()
+    if FRACTIONAL_EPISODE_RE.search(stem):
+        return None
+    match = _RELEASE_TITLE_ORDINAL_EPISODE_RE.fullmatch(stem)
+    if match is None:
+        return None
+    prefix = match.group("prefix") or ""
+    # The dash grammar owns ``Title - 01``.  Keeping this lane disjoint
+    # avoids a two-grammar D result for the same source.
+    if re.search(r"[-–—]\s*$", prefix):
+        return None
+    # Remove only leading bracketed release-group tags.  Their contents are
+    # not identity evidence; the remaining prefix is the title proof shared
+    # by every member of the run.
+    leading_groups: list[str] = []
+    leading_rest = prefix
+    while True:
+        leading_match = re.match(
+            r"^\s*(?P<tag>\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）)",
+            leading_rest,
+        )
+        if leading_match is None:
+            break
+        # Keep only the bracketed tag.  ``group(0)`` includes optional leading
+        # whitespace, which would otherwise make `` [2024]`` evade the same
+        # pure-number rejection as ``[2024]``.
+        leading_groups.append(leading_match.group("tag"))
+        leading_rest = leading_rest[leading_match.end():]
+    for group in leading_groups:
+        inner = unicodedata.normalize("NFKC", group[1:-1]).strip()
+        if _RELEASE_TITLE_ORDINAL_PURE_NUMBER_TAG_RE.fullmatch(inner):
+            return None
+        if re.search(
+            r"(?<![A-Za-z0-9])E(?:P)?\s*0*[1-9]\d{0,3}|"
+            r"(?<![A-Za-z0-9])(?:OVA|OAV|OAD|SP|CM|OP(?:ED)?|ED|MENU)"
+            r"(?:\s*0*\d{0,3})?(?![A-Za-z0-9])",
+            inner,
+            re.IGNORECASE,
+        ):
+            return None
+    prefix = re.sub(
+        r"^(?:\s*(?:\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）)\s*)+",
+        "",
+        prefix,
+    ).strip()
+    prefix = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", prefix)).casefold()
+    if not prefix or not any(character.isalpha() for character in prefix):
+        return None
+    # A second unqualified number in the title is ambiguous (``Show 2 01``),
+    # as is a pure numeric/range tail or an explicit competing episode tag.
+    if re.search(r"\d", prefix):
+        return None
+    tail = match.group("tail") or ""
+    for group in re.findall(r"\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）", tail):
+        inner = unicodedata.normalize("NFKC", group[1:-1]).strip()
+        if _RELEASE_TITLE_ORDINAL_PURE_NUMBER_TAG_RE.fullmatch(inner):
+            return None
+        if re.search(r"(?<![A-Za-z0-9])E(?:P)?\s*0*[1-9]\d{0,3}", inner, re.IGNORECASE):
+            return None
+        if re.search(
+            r"(?<![A-Za-z0-9])(?:CM|OP(?:ED)?|ED|MENU|OVA|OAV|OAD|MV|PV|TRAILER|TEASER|PROMO)(?:\s*0*\d{0,3})?(?![A-Za-z0-9])",
+            inner,
+            re.IGNORECASE,
+        ):
+            return None
     number = int(match.group("episode"))
     return (prefix, number) if 0 < number <= 999 else None
 
@@ -678,5 +784,6 @@ __all__ = [
     "bare_regular_episode_number", "bracketed_regular_episode_number",
     "coverage_tokens", "episode_ranges",
     "expanded_episode_ids", "fractional_episode_tokens", "normalized_text",
-    "parse_chinese_number", "release_dash_regular_episode", "season_markers",
+    "parse_chinese_number", "release_dash_regular_episode",
+    "release_title_ordinal_regular_episode", "season_markers",
 ]
