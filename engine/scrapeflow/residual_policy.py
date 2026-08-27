@@ -66,7 +66,7 @@ _THEME_VIDEO_RE = re.compile(
 BONUS_DIRECTORY_SEGMENT_RE = re.compile(
     r"(?:^|/)"
     r"(?:NC(?:OP|ED)(?:\s*[&+／/]\s*(?:NC)?ED)?|OP\s*[&+／/]\s*ED"
-    r"|PV|予告(?:動画)?|特典映像|映像特典|特典|Tokuten"
+    r"|SPs?|MV|PV|予告(?:動画)?|特典映像|映像特典|特典|Tokuten"
     r"|Bonus|Extras?|Menus?)"
     r"(?:/|$)",
     re.IGNORECASE,

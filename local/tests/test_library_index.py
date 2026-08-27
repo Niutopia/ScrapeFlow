@@ -1891,3 +1891,91 @@ class SharedBonusDirectoryVocabularyTests(unittest.TestCase):
         # ordinary classification.
         self.assertFalse(is_bonus_directory_path("/incoming/Example/Example [SP05] Picture Drama - 01 (BD).mkv"))
         self.assertFalse(is_bonus_directory_path("/incoming/Example/Example - 01 (BD).mkv"))
+
+
+class SeasonQualifiedContainerTests(LibraryIndexTests):
+    def test_season_dir_members_do_not_enter_unqualified_proofs(self) -> None:
+        """A root release plus season-organized release folders (间谍过家家).
+
+        The root holds one unqualified ``[01]..[N]`` release whose count is
+        the merged sum of every published season; the wrapper carries the
+        same show as per-season release folders.  The season-directory
+        members are qualified by their hierarchy and must not poison the
+        unqualified run proof with cross-release duplicate ordinals.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99048, {0: 1, 1: 4, 2: 2},
+            )
+            names = [
+                f"Example Show [{episode:02d}][1080p].mkv"
+                for episode in range(1, 7)
+            ] + [
+                # Season-organized multi-release wrapper: two editions of S1
+                # and one of S2, all with duplicate ordinals.
+                "Wrapper/01.第一季/ReleaseA/Example Show [01][1080p].mkv",
+                "Wrapper/01.第一季/ReleaseB/Example Show [01][1080p].mkv",
+                "Wrapper/02.第二季/ReleaseA/Example Show [01][1080p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-season-qualified-container",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            evidence = record.reconciliation_evidence
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertEqual(evidence["episode_count"], 6)
+            self.assertEqual(
+                evidence.get("season_boundaries") or [],
+                [[1, 4], [2, 2]],
+            )
+
+    def test_filename_qualified_mixed_shape_still_fails_closed(self) -> None:
+        """An ``SxxExx`` filename beside unqualified files stays ambiguous.
+
+        Qualification must come from the directory hierarchy; a qualified
+        NAME mixed into the same directory as unqualified files keeps the
+        historical mixed-shape failure.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99049, {1: 2})
+            names = [
+                "Example Show E01.mkv",
+                "Example Show S01E02.mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-mixed-qualified-name",
+            )
+            self.assertNotEqual(record.reconciliation_outcome, "new_work")
+
+    def test_bracket_zero_is_a_special_not_a_run_member(self) -> None:
+        """``[00]`` is a prologue coordinate, not part of ``1..N``."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99050, {1: 4})
+            names = [
+                "Example Show [00][1080p].mkv",
+            ] + [
+                f"Example Show [{episode:02d}][1080p].mkv"
+                for episode in range(1, 5)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bracket-zero",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence
+                and record.reconciliation_evidence["episode_count"],
+                4,
+            )

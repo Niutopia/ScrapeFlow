@@ -962,19 +962,69 @@ def _strict_bare_episode_number_for_file(file: SourceFile) -> int | None:
 
 
 def _movie_shaped_child_paths(node: SourceNode) -> set[str]:
-    """Direct children that are movie-shaped (exactly one large video).
+    """Descendant directories that are movie-shaped (exactly one large video).
 
-    A titled sibling such as a ``剧场版``/``电影`` branch holding exactly one
-    large video is an independent film, not a member of the integer TV run.
-    Its files must be omitted from the regular single-season proof so the film
+    A titled release folder holding exactly one large video is an
+    independent film, not a member of the integer TV run — whether it sits
+    beside the root (``剧场版 代号：白/``) or one level deeper inside the
+    movie-labeled branch (``剧场版 代号：白/[某字幕组]/film.mp4``).  Its
+    files must be omitted from the regular single-season proof so the film
     cannot break the ``[01]..[N]`` run of the rooted TV work.
     """
     paths: set[str] = set()
-    for child in node.children:
+    stack = list(node.children)
+    while stack:
+        child = stack.pop()
         videos = [f for f in collect_all_files(child) if f.object_type == "video"]
         if len(videos) == 1 and videos[0].size >= _MOVIE_SHAPED_MIN_BYTES:
             paths.add(str(child.path).rstrip("/"))
+            continue
+        stack.extend(child.children)
     return paths
+
+
+def _season_qualified_video(file: SourceFile) -> bool:
+    """Whether a video sits under an explicit season-marked directory.
+
+    A video inside ``01.第一季/``, ``Season 2/``, or ``S03/`` derives its
+    coordinate from that directory hierarchy: it is not an *unqualified*
+    release ordinal, and a season-organized multi-release container (root
+    release plus per-season release folders, 间谍过家家 shape) must not run
+    its season-qualified members through the strict unqualified proofs —
+    their duplicate ordinals across releases would fail a proof that never
+    applied to them.
+
+    An explicit ``SxxExx`` in the *filename* deliberately does NOT qualify:
+    a qualified name mixed into the same directory as unqualified files is
+    the ambiguous mixed shape the proofs must keep failing closed on.
+    """
+    path = str(file.path or "")
+    segments = [segment for segment in path.split("/") if segment]
+    return any(
+        _season_number_from_directory_name(segment) is not None
+        for segment in segments[:-1]
+    )
+
+
+_BRACKET_ZERO_ORDINAL_RE = re.compile(r"\[\s*0+\s*\]")
+
+
+def _bracket_zero_prologue_video(file: SourceFile) -> bool:
+    """Whether a video's only coordinate is a bracketed ``[00]`` prologue.
+
+    ``[00]`` is the special-season coordinate (S00), never a member of the
+    integer ``1..N`` regular run; the shared bracket grammar deliberately
+    rejects it, which would otherwise poison the whole run as an
+    unparseable primary video.  Unlike an SP/OVA marker there is no special
+    label to key a family on, so the exclusion is by the coordinate itself.
+    """
+    basename = posixpath.basename(file.path.rstrip("/"))
+    if not _BRACKET_ZERO_ORDINAL_RE.search(basename):
+        return False
+    # A file that also carries a positive ordinal elsewhere keeps its
+    # ordinary classification.
+    positive = bracketed_regular_episode_number(basename)
+    return positive is None or positive > 0
 
 
 def _regular_episode_primary_videos(
@@ -1026,6 +1076,8 @@ def _regular_episode_primary_videos(
         for file in videos
         if file.path not in special_paths
         and not _is_non_regular_episode_video(file)
+        and not _season_qualified_video(file)
+        and not _bracket_zero_prologue_video(file)
         and not any(
             file.path == path or file.path.startswith(path + "/")
             for path in movie_paths
@@ -1243,13 +1295,27 @@ def release_dash_episode_source_ordinals(
     return dict(members) if members is not None else None
 
 
+def _unqualified_episode_videos(node: SourceNode) -> list[SourceFile]:
+    """Videos that drive the strict unqualified-episode grammars.
+
+    Season-qualified videos (an explicit ``SxxExx`` name or a season-marked
+    parent directory) already carry their coordinates; the unqualified
+    grammars exist only for genuinely unqualified release ordinals.
+    """
+    return [
+        file
+        for file in collect_all_files(node)
+        if file.object_type == "video"
+        and not _season_qualified_video(file)
+    ]
+
+
 def _contains_bare_regular_episode(node: SourceNode | None) -> bool:
     if node is None:
         return False
     return any(
         _strict_bare_episode_number_for_file(file) is not None
-        for file in collect_all_files(node)
-        if file.object_type == "video"
+        for file in _unqualified_episode_videos(node)
     )
 
 
@@ -1258,8 +1324,7 @@ def _contains_naked_numeric_episode(node: SourceNode | None) -> bool:
         return False
     return any(
         _strict_naked_numeric_episode_number(file) is not None
-        for file in collect_all_files(node)
-        if file.object_type == "video"
+        for file in _unqualified_episode_videos(node)
     )
 
 
@@ -1268,8 +1333,7 @@ def _contains_release_dash_episode(node: SourceNode | None) -> bool:
         return False
     return any(
         _strict_release_dash_episode_signature_for_file(file) is not None
-        for file in collect_all_files(node)
-        if file.object_type == "video"
+        for file in _unqualified_episode_videos(node)
     )
 
 
@@ -1278,8 +1342,7 @@ def _contains_release_title_ordinal_episode(node: SourceNode | None) -> bool:
         return False
     return any(
         _strict_release_title_ordinal_episode_signature_for_file(file) is not None
-        for file in collect_all_files(node)
-        if file.object_type == "video"
+        for file in _unqualified_episode_videos(node)
     )
 
 
@@ -1396,12 +1459,20 @@ def _is_commercial_video(file: SourceFile) -> bool:
 
 
 def _strict_bracketed_episode_number_for_file(file: SourceFile) -> int | None:
-    """Read one pure ``[01]`` ordinal without erasing hierarchy evidence."""
+    """Read one pure ``[01]`` ordinal without erasing hierarchy evidence.
+
+    ``[00]`` is a special coordinate (S00), never a member of the integer
+    ``1..N`` regular run; it is rejected here so a single prologue file
+    cannot invalidate an otherwise complete bracket run.
+    """
     if not bare_regular_episode_context_is_safe(file.path):
         return None
-    return bracketed_regular_episode_number(
+    number = bracketed_regular_episode_number(
         posixpath.basename(file.path.rstrip("/"))
     )
+    if number is not None and number <= 0:
+        return None
+    return number
 
 
 def _strict_bracketed_episode_numbers(
@@ -1438,8 +1509,7 @@ def _contains_bracketed_regular_episode(node: SourceNode | None) -> bool:
     return any(
         not _is_non_regular_episode_video(file)
         and _strict_bracketed_episode_number_for_file(file) is not None
-        for file in collect_all_files(node)
-        if file.object_type == "video"
+        for file in _unqualified_episode_videos(node)
     )
 
 
