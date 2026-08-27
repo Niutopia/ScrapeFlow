@@ -1267,11 +1267,28 @@ class RootPipelineTests(unittest.TestCase):
 
 
 class CleaningIndexAList(IndexAList):
-    """IndexAList plus explicit empty-directory removal for shell cleanup."""
+    """IndexAList plus real delete semantics for source-root cleanup."""
 
     def __init__(self, files: dict[str, bytes] | None = None) -> None:
         super().__init__(files)
         self.remove_empty_calls: list[str] = []
+        self.remove_calls: list[tuple[str, list[str]]] = []
+
+    def remove(self, parent: str, names: list[str]) -> bool:
+        """Delete named entries (files and empty dirs) from the parent."""
+        self.remove_calls.append((parent.rstrip("/"), list(names)))
+        for name in names:
+            target = f"{parent.rstrip('/')}/{name}"
+            self.files.pop(target, None)
+            # Only delete the directory when nothing remains below it.
+            if not any(
+                path.startswith(target + "/") for path in self.files
+            ) and not any(
+                directory.startswith(target + "/")
+                for directory in self.dirs
+            ):
+                self.dirs.discard(target)
+        return True
 
     def remove_empty_dir(self, path: str) -> bool:
         normalized = path.rstrip("/") or "/"
@@ -1312,7 +1329,7 @@ class NoopRemoveEmptyAList(CleaningIndexAList):
 
 
 class SourceShellCleanupTests(unittest.TestCase):
-    """Empty source-dir shells are dropped after a root completes."""
+    """A completed root's entire intake tree is deleted, residuals included."""
 
     def _setup(
         self,
@@ -1379,7 +1396,13 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertNotIn("/incoming/My Show", alist.dirs)
         self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
 
-    def test_completion_keeps_nonempty_source_and_unclaimed_junk(self) -> None:
+    def test_completion_deletes_residual_files_and_whole_source_root(self) -> None:
+        """Residual junk (themes/MVs/backup subs) is deleted with the tree.
+
+        Operator ruling 2026-08-27: the intake area is staging — after the
+        media is verified in the library the entire source root goes,
+        including files the plan never claimed.
+        """
         files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
         state_root, alist, runner, executor_events = self._setup(files)
         root_task_id = self._root(runner, "/incoming/My Show")
@@ -1387,7 +1410,7 @@ class SourceShellCleanupTests(unittest.TestCase):
 
         def executor(plan):
             result = original(plan)
-            # A leftover junk file the plan never claimed keeps its shell.
+            # A leftover residual file the plan never claimed.
             alist.files["/incoming/My Show/notes.txt"] = b"junk"
             alist.dirs.add("/incoming/My Show")
             alist.dirs.add("/incoming/My Show/Extras")
@@ -1399,9 +1422,9 @@ class SourceShellCleanupTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "completed")
         self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
-        self.assertNotIn("/incoming/My Show", alist.remove_empty_calls)
-        self.assertIn("/incoming/My Show", alist.dirs)
-        self.assertIn("/incoming/My Show/notes.txt", alist.files)
+        self.assertIn("/incoming/My Show", alist.remove_empty_calls)
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+        self.assertNotIn("/incoming/My Show/notes.txt", alist.files)
 
     def test_parked_root_never_triggers_shell_cleanup(self) -> None:
         files = {"/incoming/Mystery Show/S01E01.mkv": FAKE_VIDEO_BYTES}
@@ -1479,9 +1502,9 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertNotIn("/incoming/My Show", alist.dirs)
         self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
 
-    def test_pause_after_remove_empty_blocks_fallback_explicit_delete(self) -> None:
+    def test_pause_blocks_every_remote_delete_boundary(self) -> None:
         """Each remote delete gets its own root-scoped pause checkpoint."""
-        from local.scrapeflow_api.root_pipeline import _cleanup_empty_source_shells
+        from local.scrapeflow_api.root_pipeline import _cleanup_consumed_source_root
 
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -1500,24 +1523,23 @@ class SourceShellCleanupTests(unittest.TestCase):
         root_task_id = self._root(runner, "/incoming/My Show")
         checks = {"count": 0}
 
-        def pause_after_first_delete_boundary() -> bool:
+        def pause_after_first_listing() -> bool:
             checks["count"] += 1
-            # visit(source), visit(extras), post-listing checks, then the
-            # explicit-remove checkpoint after remove_empty_dir.
-            return checks["count"] >= 5
+            # The first paused listing leaves the whole tree untouched.
+            return checks["count"] >= 1
 
-        _cleanup_empty_source_shells(
+        _cleanup_consumed_source_root(
             runner,
             state_root,
             root_task_id,
             "/incoming/My Show",
-            pause_requested=pause_after_first_delete_boundary,
+            pause_requested=pause_after_first_listing,
         )
 
-        self.assertIn("/incoming/My Show/Extras", alist.remove_empty_calls)
+        # Paused at the very first boundary: nothing was deleted at all.
         self.assertEqual(alist.remove_calls, [])
+        self.assertEqual(alist.remove_empty_calls, [])
         self.assertIn("/incoming/My Show/Extras", alist.dirs)
-
 
 if __name__ == "__main__":
     unittest.main()

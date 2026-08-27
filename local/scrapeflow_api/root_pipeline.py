@@ -217,7 +217,7 @@ def _coalesce_confirmed_tv_season_records(
     return merged
 
 
-def _cleanup_empty_source_shells(
+def _cleanup_consumed_source_root(
     runner: SimpleEngineRunner,
     state_root: Path,
     root_task_id: str,
@@ -225,15 +225,20 @@ def _cleanup_empty_source_shells(
     *,
     pause_requested: Callable[[], bool] | None = None,
 ) -> list[str]:
-    """Remove only verifiably empty dirs in a completed root's own intake tree.
+    """Delete a completed root's entire intake tree, residuals included.
 
-    Ownership is proven by the durable catalog binding (S step), never by path
-    naming: the catalog entry must bind this exact root task to this exact
-    source path.  Only directories that list as empty are removed; every
-    removal is confirmed through a fresh parent listing, and files or
-    non-empty directories are never touched.  The source root itself is
-    removed when it ends up empty, which lets the intake monitor mark the
-    catalog entry missing on its next scan.
+    Operator ruling (2026-08-27): the intake area is staging, not storage.
+    Once a root's media is verified in the formal library, the whole source
+    tree — residual themes, MVs, backup subtitles, screenshots, font packs —
+    is deleted by default so the operator never cleans up manually.
+
+    Ownership is proven by the durable catalog binding (S step), never by
+    path naming.  Every file delete and directory removal is confirmed
+    through a fresh parent listing; the pause predicate is re-checked
+    before each remote side effect.  A Quark/AList driver that acknowledges
+    a delete without applying it is retried through the bounded parent-name
+    remove fallback, and the whole walk simply stops when the provider
+    keeps reporting the tree.
     """
     try:
         bound = any(
@@ -249,7 +254,8 @@ def _cleanup_empty_source_shells(
         return []
     listing = getattr(runner.alist, "list", None)
     remove_empty = getattr(runner.alist, "remove_empty_dir", None)
-    if not callable(listing) or not callable(remove_empty):
+    remove = getattr(runner.alist, "remove", None)
+    if not callable(listing) or not callable(remove_empty) or not callable(remove):
         return []
 
     def rows(path: str) -> list[Mapping[str, object]]:
@@ -274,10 +280,69 @@ def _cleanup_empty_source_shells(
         except Exception:
             return True
 
-    def visit(directory: str) -> None:
+    def delete_file(parent: str, name: str) -> bool:
+        """Delete one file and prove it disappeared through a fresh listing."""
         if paused():
-            return
-        for item in rows(directory):
+            return False
+        try:
+            remove(parent, [name])
+        except Exception:
+            return False
+        try:
+            after = rows(parent)
+        except Exception:
+            return True
+        return not any(item.get("name") == name for item in after)
+
+    def delete_directory(directory: str) -> bool:
+        """Remove one directory (empty or not) with bounded retries."""
+        if paused():
+            return False
+        parent = posixpath.dirname(directory) or "/"
+        name = posixpath.basename(directory)
+        for _attempt in range(3):
+            if paused():
+                return False
+            try:
+                remove_empty(directory)
+            except Exception:
+                pass
+            try:
+                parent_rows = rows(parent)
+            except Exception:
+                return True
+            if not any(item.get("name") == name for item in parent_rows):
+                removed.append(directory)
+                return True
+            # Quark sometimes acknowledges remove_empty_directory without
+            # deleting; the explicit parent-name remove is the bounded
+            # fallback for the driver no-op.
+            try:
+                remove(parent, [name])
+            except Exception:
+                pass
+            try:
+                parent_rows = rows(parent)
+            except Exception:
+                return True
+            if not any(item.get("name") == name for item in parent_rows):
+                removed.append(directory)
+                return True
+        return False
+
+    def visit(directory: str) -> bool:
+        """Depth-first delete of everything below ``directory``."""
+        if paused():
+            return False
+        try:
+            entries = rows(directory)
+        except Exception:
+            # A provider that cannot list the directory has nothing more to
+            # delete; treat it as already gone.
+            return True
+        for item in entries:
+            if paused():
+                return False
             name = item.get("name")
             if (
                 not isinstance(name, str)
@@ -287,49 +352,22 @@ def _cleanup_empty_source_shells(
                 or "\\" in name
             ):
                 raise RuntimeError(f"AList 源目录出现不安全条目: {directory}")
+            child = posixpath.join(directory, name)
             if item.get("is_dir") is True:
-                visit(posixpath.join(directory, name))
-                if paused():
-                    return
-        if paused():
-            return
-        if rows(directory):
-            return
-        # This is the exact remote-delete boundary.  Check the selected-root
-        # pause predicate again because the user can pause or switch tasks
-        # while the recursive fresh listing is still in progress.
-        if paused():
-            return
-        deleted = remove_empty(directory)
-        parent = posixpath.dirname(directory) or "/"
-        name = posixpath.basename(directory)
-        try:
-            parent_rows = rows(parent)
-        except Exception:
-            parent_rows = []
-        if not any(item.get("name") == name for item in parent_rows):
-            removed.append(directory)
-            return
-        if deleted is not False:
-            # Some drivers (Quark via AList) accept remove_empty_directory
-            # with HTTP success but never delete.  The directory was just
-            # verified empty through a fresh listing, so an explicit remove
-            # of that single name is the bounded fallback.
-            try:
-                remove = getattr(runner.alist, "remove", None)
-                if callable(remove):
-                    # The fallback is a separate remote delete and needs its
-                    # own checkpoint even though remove_empty just ran.
-                    if paused():
-                        return
-                    remove(parent, [name])
-                    parent_rows = rows(parent)
-                    if not any(item.get("name") == name for item in parent_rows):
-                        removed.append(directory)
-            except Exception:
-                pass
+                if not visit(child):
+                    return False
+                if not delete_directory(child):
+                    return False
+            else:
+                if not delete_file(directory, str(name)):
+                    return False
+        return True
 
-    visit(source)
+    if not visit(source):
+        return removed
+    # The source root itself: delete it the same way so the intake monitor
+    # marks the catalog entry missing on its next scan.
+    delete_directory(source)
     return removed
 
 
@@ -576,13 +614,14 @@ def run_root_pipeline(
     # replenishment lane, not a completed root.
     if aggregate.open_gaps:
         return _persist_root(runner, job, GAPS_PENDING_PHASE)
-    # Post-completion housekeeping: drop the empty source-dir shells the
-    # writer leaves behind in this root's own intake tree.  Strictly
-    # emptiness-gated and best-effort — a failure never rolls back the
-    # completion, and a paused run skips remote deletes entirely.
+    # Post-completion housekeeping: delete the root's entire intake tree,
+    # residual resources included (operator ruling 2026-08-27 — the intake
+    # area is staging, not storage).  Best-effort: a provider that keeps
+    # reporting the tree simply leaves it for the next pass, and a paused
+    # run skips remote deletes entirely.
     if not stopped():
         try:
-            _cleanup_empty_source_shells(
+            _cleanup_consumed_source_root(
                 runner,
                 state_root,
                 root_task_id,
