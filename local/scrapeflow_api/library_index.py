@@ -1509,6 +1509,74 @@ def _title_ordinal_prefix_matches_record(
     return False
 
 
+def _season_runtime_profile(
+    tmdb_client: object | None,
+    tmdb_id: int,
+    season: int,
+) -> list[int | None] | None:
+    """Read one season's published per-episode runtimes, fail-closed."""
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        payload = getter(f"/tv/{tmdb_id}/season/{season}")
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    rows = payload.get("episodes")
+    if not isinstance(rows, list) or not rows:
+        return None
+    runtimes: list[int | None] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return None
+        value = row.get("runtime")
+        if value is None:
+            runtimes.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        runtimes.append(value)
+    return runtimes
+
+
+def _same_sized_specials_resolved_by_runtimes(
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    season: int,
+    specials_count: int,
+    regular_count: int,
+) -> bool:
+    """Resolve a same-sized specials bucket via published runtimes.
+
+    When TMDB's specials bucket declares exactly as many episodes as the
+    source run, the counts alone cannot tell a regular season from the
+    specials.  The two buckets' published runtime profiles can: a uniformly
+    short specials bucket (every episode under the contract's 18-minute
+    episode threshold) against a uniformly full-length regular season
+    (every episode at or above it) cannot be the same content (轮回七次
+    shape: 12 one-minute Picture Dramas beside twelve 24-minute episodes).
+    Missing, partial, or overlapping runtime data keeps the fail-closed
+    verdict.
+    """
+    special_runtimes = _season_runtime_profile(tmdb_client, tmdb_id, 0)
+    regular_runtimes = _season_runtime_profile(tmdb_client, tmdb_id, season)
+    if (
+        special_runtimes is None
+        or regular_runtimes is None
+        or len(special_runtimes) != specials_count
+        or len(regular_runtimes) != regular_count
+        or not special_runtimes
+        or not regular_runtimes
+    ):
+        return False
+    return all(
+        value is not None and value < 18 for value in special_runtimes
+    ) and all(value is not None and value >= 18 for value in regular_runtimes)
+
+
 def _single_positive_tmdb_season(
     tmdb_client: object | None,
     *,
@@ -1594,7 +1662,13 @@ def _single_positive_tmdb_season(
             return None
         season, declared_count = overflow[0]
         overflow_count = episode_count - declared_count
-    if specials_count == episode_count:
+    if specials_count == episode_count and not _same_sized_specials_resolved_by_runtimes(
+        tmdb_client,
+        tmdb_id=tmdb_id,
+        season=season,
+        specials_count=specials_count,
+        regular_count=declared_count,
+    ):
         return None
     total_seasons = show.get("number_of_seasons")
     if total_seasons is not None and (

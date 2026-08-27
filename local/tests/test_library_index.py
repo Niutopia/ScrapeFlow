@@ -124,10 +124,12 @@ class StrictBareEpisodeTMDB:
         seasons: dict[int, int],
         *,
         payload_counts: dict[int, int] | None = None,
+        episode_runtimes: dict[int, list[int | None]] | None = None,
     ) -> None:
         self.tmdb_id = tmdb_id
         self.seasons = dict(seasons)
         self.payload_counts = dict(payload_counts or seasons)
+        self.episode_runtimes = dict(episode_runtimes or {})
 
     def get(self, path: str, **_params: object) -> dict[str, object]:
         if path == f"/tv/{self.tmdb_id}":
@@ -151,12 +153,18 @@ class StrictBareEpisodeTMDB:
             }
         for season, count in self.payload_counts.items():
             if path == f"/tv/{self.tmdb_id}/season/{season}":
+                runtimes = self.episode_runtimes.get(season)
                 return {
                     "episodes": [
                         {
                             "episode_number": episode,
                             "air_date": "2020-01-01",
                             "name": f"Episode {episode}",
+                            "runtime": (
+                                runtimes[episode - 1]
+                                if runtimes is not None and episode - 1 < len(runtimes)
+                                else 24
+                            ),
                         }
                         for episode in range(1, count + 1)
                     ],
@@ -1789,3 +1797,76 @@ class ReleaseDashExtraDirectoryTests(LibraryIndexTests):
                 record.reconciliation_evidence and record.reconciliation_evidence["episode_count"],
                 4,
             )
+
+
+class SameSizedSpecialsRuntimeTests(LibraryIndexTests):
+    def test_same_sized_specials_bucket_resolved_by_runtime_profiles(self) -> None:
+        """A same-sized S00 bucket is unambiguous when runtimes separate it.
+
+        轮回七次 shape: TMDB declares 12 one-minute specials beside twelve
+        24-minute regular episodes.  The published runtime profiles resolve
+        the run to the regular season; missing or overlapping profiles keep
+        the fail-closed verdict.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            resolved = StrictBareEpisodeTMDB(
+                99045, {0: 4, 1: 4},
+                episode_runtimes={0: [1, 1, 1, 1], 1: [24, 24, 24, 24]},
+            )
+            names = [
+                f"Example Show - {episode:02d} (BD 1080p).mkv"
+                for episode in range(1, 5)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                resolved,
+                state_root=state_root,
+                root_task_id="root-runtime-resolved",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence and record.reconciliation_evidence["season"],
+                1,
+            )
+
+    def test_same_sized_specials_bucket_without_runtime_proof_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            # Specials carry no runtime data: the ambiguity stays closed.
+            ambiguous = StrictBareEpisodeTMDB(
+                99046, {0: 4, 1: 4},
+                episode_runtimes={0: [None, None, None, None], 1: [24, 24, 24, 24]},
+            )
+            names = [
+                f"Example Show - {episode:02d} (BD 1080p).mkv"
+                for episode in range(1, 5)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                ambiguous,
+                state_root=state_root,
+                root_task_id="root-runtime-missing",
+            )
+            self.assertNotEqual(record.reconciliation_outcome, "new_work")
+
+    def test_same_sized_specials_bucket_with_overlapping_runtimes_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            # Both buckets are full-length: counts and runtimes agree, so the
+            # run stays ambiguous.
+            same_shape = StrictBareEpisodeTMDB(
+                99047, {0: 4, 1: 4},
+                episode_runtimes={0: [24, 24, 24, 24], 1: [24, 24, 24, 24]},
+            )
+            names = [
+                f"Example Show - {episode:02d} (BD 1080p).mkv"
+                for episode in range(1, 5)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                same_shape,
+                state_root=state_root,
+                root_task_id="root-runtime-overlap",
+            )
+            self.assertNotEqual(record.reconciliation_outcome, "new_work")
