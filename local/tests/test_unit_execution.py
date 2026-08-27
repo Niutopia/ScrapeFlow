@@ -2776,3 +2776,89 @@ class FailedUnitRetryTests(unittest.TestCase):
         self.assertEqual(len(plan_calls), 2)
         records = load_work_unit_records(state_root, "root-fail")
         self.assertIsNotNone(records[0].writer_job_id)
+
+
+class ConsumedSourceContinuationTests(unittest.TestCase):
+    """A partially written source is continued, not deadlocked.
+
+    Shape under test: the writer moved every planned media object and the
+    run then failed during artifacts (before the carrier persisted).  The
+    retry must re-plan from the consumed B-snapshot objects; the executor
+    re-reads each moved target byte-exactly (already_present) and only
+    regenerates the missing artifacts.
+    """
+
+    def _setup_root(self, files):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = IndexAList(dict(files))
+        plan_calls: list[dict] = []
+        fail_once = {"remaining": 1}
+
+        def executor(plan):
+            for item in plan.files:
+                source = f"{item.source_dir.rstrip('/')}/{item.original_name}"
+                target = f"{item.target_dir.rstrip('/')}/{item.final_name}"
+                if source in alist.files:
+                    # First (failing) pass: perform the real move, then fail
+                    # during artifacts.
+                    alist.move(item.source_dir, item.target_dir, [item.original_name])
+                else:
+                    # Continuation pass: the target must already hold the
+                    # exact bytes (already_present readback).
+                    payload = alist.files.get(target)
+                    if payload is None:
+                        raise RuntimeError(f"continuation target missing: {target}")
+                    if item.source_size is not None and len(payload) != item.source_size:
+                        raise RuntimeError(f"continuation target size drift: {target}")
+            if fail_once["remaining"] > 0:
+                fail_once["remaining"] -= 1
+                raise RuntimeError("injected artifact failure after moves")
+            return {"ok": True, "files": [], "file_count": 0, "artifacts": [], "artifact_count": 0, "cleanup": [], "cleanup_count": 0}
+
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=object(),
+            planner=_recording_planner(plan_calls), validate=False,
+            library_root="/library", executor=executor,
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-cont")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-cont", state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-cont")
+        apply_work_unit_override(
+            state_root, "root-cont", records[0].work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        return runner, state_root, alist, plan_calls, records
+
+    def test_consumed_source_continues_after_artifact_failure(self) -> None:
+        files = {"/incoming/one/S01E01.mkv": FAKE_VIDEO_BYTES}
+        runner, state_root, alist, plan_calls, records = self._setup_root(files)
+        reconcile_root_work_units(alist, "/library", state_root, "root-cont")
+        first = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(first[0].outcome, "failed")
+        # The executor already performed the moves: the source is consumed
+        # and the library holds the media.
+        self.assertNotIn("/incoming/one/My Show/S01E01.mkv", alist.files)
+        self.assertIn(
+            "/library/番剧/Work (101)/S01E01.mkv", alist.files,
+        )
+        # The retry continues from the consumed snapshot instead of failing
+        # on the drifted source.
+        second = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(second[0].outcome, "accepted")
+        self.assertEqual(len(plan_calls), 2)
+
+    def test_consumed_source_with_wrong_target_bytes_stays_failed(self) -> None:
+        files = {"/incoming/one/S01E01.mkv": FAKE_VIDEO_BYTES}
+        runner, state_root, alist, plan_calls, records = self._setup_root(files)
+        reconcile_root_work_units(alist, "/library", state_root, "root-cont")
+        first = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(first[0].outcome, "failed")
+        # Corrupt the moved target: the continuation readback must not pass.
+        alist.files["/library/番剧/Work (101)/S01E01.mkv"] = b"corrupted"
+        second = execute_new_work_units(runner, state_root, "root-cont")
+        self.assertEqual(second[0].outcome, "failed")

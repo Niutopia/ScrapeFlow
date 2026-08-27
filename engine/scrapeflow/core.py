@@ -10794,6 +10794,23 @@ def validate_plan(
         for item in plan.files:
             if _collision_key(normalize_remote_path(item.target_dir)) != _collision_key(target_dir):
                 continue
+            # A consumed-source continuation plans objects this task already
+            # moved: the target holds the exact bytes and the provider source
+            # is gone.  That is the executor's ``already_present`` readback
+            # precondition, not an occupancy conflict.  Everything else — a
+            # target occupied while the source is still visible, or a size
+            # disagreement — stays a hard conflict.
+            item_source_dir = normalize_remote_path(item.source_dir)
+            item_source_listing = source_listings.get(item_source_dir, [])
+            item_source_present = any(
+                isinstance(entry.get("name"), str)
+                and _collision_key(str(entry["name"])) == _collision_key(item.original_name)
+                for entry in item_source_listing
+            )
+            exact_resumption = (
+                not item_source_present
+                and item.source_size is not None
+            )
             for entry in content:
                 name = entry.get("name")
                 if not isinstance(name, str) or _collision_key(name) != _collision_key(item.final_name):
@@ -10807,6 +10824,15 @@ def validate_plan(
                     and not entry.get("is_dir")
                     and occupying_item.requires_rename
                 ):
+                    continue
+                if (
+                    exact_resumption
+                    and not entry.get("is_dir")
+                    and _entry_size_value(entry) == item.source_size
+                ):
+                    # Exact resumption: the target already holds this object
+                    # and its provider source disappeared (this task's own
+                    # earlier move).  The executor re-reads it byte-exactly.
                     continue
                 kind = "目录" if entry.get("is_dir") else "文件"
                 raise FormalTargetConflictError(
@@ -10822,6 +10848,13 @@ def validate_plan(
                 if _collision_key(current_path) == _collision_key(
                     normalize_remote_path(item.source_path)
                 ):
+                    continue
+                if (
+                    exact_resumption
+                    and _entry_size_value(entry) == item.source_size
+                ):
+                    # Exact continuation readback of an already-moved object;
+                    # see the same-name branch above.
                     continue
                 if _collision_key(name) == _collision_key(item.final_name):
                     # The same-name case was already checked above; retaining

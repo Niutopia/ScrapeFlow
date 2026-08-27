@@ -574,6 +574,103 @@ def _fresh_scoped_source_files(
     return scopes, tuple(validated)
 
 
+def _snapshot_scope_kinds(
+    scopes: tuple[str, ...],
+    *,
+    state_root: Path,
+    root_task_id: str,
+) -> dict[str, str] | None:
+    """Derive scope kinds from the B snapshot when the provider cannot answer.
+
+    A consumed-source continuation may find its source directories removed
+    entirely, so ``_scope_kind_map``'s fresh provider probe fails.  The B
+    snapshot is the durable record of each scope's kind; a scope that exists
+    there only as a file was a one-file WorkUnit.
+    """
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None:
+        return None
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list):
+        return None
+    by_path = {
+        str(row.get("full_path") or "").rstrip("/"): row
+        for row in rows
+        if isinstance(row, Mapping)
+    }
+    kinds: dict[str, str] = {}
+    for scope in scopes:
+        row = by_path.get(scope.rstrip("/"))
+        if row is None:
+            return None
+        kinds[scope] = "directory" if row.get("is_dir") is True else "file"
+    return kinds
+
+
+def _consumed_source_snapshot_rows(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    scope_kinds: Mapping[str, str],
+    fresh_rows: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, object], ...] | None:
+    """Recognize a source this root's own interrupted write consumed.
+
+    A write may move every planned media object and then fail during the
+    artifact (NFO/poster) phase, before its internal carrier was ever
+    persisted.  The retry then finds a partly emptied source: fresh
+    manifests can prove nothing and the durable verdict may be gone.
+    Continuation is safe exactly when both hold:
+
+    - the unit's last acceptance record FAILED (a completed unit never
+      re-enters F, and a never-started unit has nothing to continue), and
+    - at least one snapshot media object in the unit's scope is absent
+      fresh (something was actually consumed).
+
+    The continuation manifest is exactly the consumed set: snapshot file
+    rows in scope that no longer exist fresh.  The planner rebuilds the
+    identical plan for them (same source names and sizes), and the
+    executor's no-overwrite matrix turns each already-moved file into an
+    exact ``already_present`` byte readback before regenerating artifacts.
+    Objects that still exist fresh (residuals, unplanned extras) are not
+    handed over, so they can never widen the plan.
+    """
+    acceptance = {
+        row.work_unit_id: row
+        for row in load_work_acceptance(state_root, root_task_id)
+    }
+    previous = acceptance.get(record.work_unit_id)
+    if previous is None or previous.outcome != "failed":
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None:
+        return None
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list):
+        return None
+    fresh_paths = {
+        str(row.get("full_path") or "").rstrip("/")
+        for row in fresh_rows
+        if row.get("is_dir") is not True
+    }
+    consumed: list[Mapping[str, object]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("is_dir") is True:
+            continue
+        path = str(row.get("full_path") or "").rstrip("/")
+        if not _path_in_scoped_objects(path, scope_kinds, include_scope=True):
+            continue
+        if path in fresh_paths:
+            continue
+        consumed.append(dict(row))
+    if not consumed:
+        # Nothing was consumed: this is ordinary drift, not a resumable
+        # interrupted write.
+        return None
+    return tuple(consumed)
+
+
 def _fresh_exact_source_manifest(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -630,6 +727,15 @@ def _fresh_exact_source_manifest(
         )
         declared.require_fresh_match(fresh)
     except SourceObjectValidationError as exc:
+        consumed = _consumed_source_snapshot_rows(
+            runner, state_root, root_task_id, record, scope_kinds, rows,
+        )
+        if consumed is not None:
+            # This root's own interrupted write consumed the whole source
+            # before its carrier persisted.  Continue from the B snapshot;
+            # the executor's no-overwrite matrix re-reads every moved file
+            # exactly and only regenerates the missing artifacts.
+            return scopes, consumed
         raise ValueError(
             "精确来源对象清单已漂移或无效；请保持暂停并重建边界"
         ) from exc
@@ -1998,7 +2104,28 @@ def _request_for_unit(
     if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
         raise ValueError("单元身份缺少有效 tmdb_id")
     scopes = _record_source_scopes(runner, root_job, record)
-    scope_kinds = _scope_kind_map(runner, scopes)
+    # Detect a consumed-source continuation before any scope-shape gate: the
+    # interrupted write may have emptied or removed the source directories,
+    # so ``_scope_kind_map`` itself can fail on a legitimate continuation.
+    continuation_manifest: tuple[Mapping[str, object], ...] | None = None
+    continuation_scope_kinds: Mapping[str, str] | None = None
+    try:
+        scope_kinds = _scope_kind_map(runner, scopes)
+    except ValueError:
+        continuation_scope_kinds = _snapshot_scope_kinds(
+            scopes, state_root=state_root, root_task_id=root_task_id,
+        )
+        if continuation_scope_kinds is None:
+            raise
+        consumed = _consumed_source_snapshot_rows(
+            runner, state_root, root_task_id, record,
+            continuation_scope_kinds,
+            list(_fresh_scope_rows(runner, scopes)),
+        )
+        if consumed is None:
+            raise
+        continuation_manifest = consumed
+        scope_kinds = continuation_scope_kinds
     source_path = scopes[0]
     # The legacy planners accept a directory ``src_path`` while the internal
     # manifest pins the exact file.  Keep that public planner root at the
@@ -2017,9 +2144,27 @@ def _request_for_unit(
     scope_season = _explicit_single_scope_season(
         state_root, root_task_id, record, scopes,
     )
-    proof_season = _revalidated_reconciliation_season(
-        runner, state_root, root_task_id, record,
-    )
+    # A consumed-source continuation must short-circuit every fresh-source
+    # gate below: the D proof revalidator and the exact manifest both read
+    # the (now consumed) provider source and would fail before the planner
+    # could rebuild the continuation plan.
+    if continuation_manifest is None:
+        try:
+            proof_season = _revalidated_reconciliation_season(
+                runner, state_root, root_task_id, record,
+            )
+        except ValueError:
+            consumed = _consumed_source_snapshot_rows(
+                runner, state_root, root_task_id, record,
+                scope_kinds,
+                list(_fresh_scope_rows(runner, scopes)),
+            )
+            if consumed is None:
+                raise
+            continuation_manifest = consumed
+            proof_season = None
+    else:
+        proof_season = None
     proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
     is_release_dash_proof = (
         proof is not None
@@ -2081,6 +2226,16 @@ def _request_for_unit(
     ):
         raise ValueError("WorkUnit 目标范围不属于 Planner 父目录")
     request = replace(request, target_scope_root=target_scope)
+    # A consumed-source continuation bypasses every fresh manifest gate: the
+    # provider source is gone by construction, and the continuation manifest
+    # (consumed B-snapshot objects) is already pinned on the request below.
+    if continuation_manifest is not None:
+        request = replace(
+            request,
+            source_files=continuation_manifest,
+            source_scope_paths=scopes,
+        )
+        return request
     # Multi-scope WorkUnits already hand an exact fresh manifest to F.  A
     # D/F-only title-ordinal grammars need that same pin even for one scope:
     # otherwise an object added after the proof could be discovered by the

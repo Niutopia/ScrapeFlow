@@ -536,6 +536,62 @@ def decide_reconciliation(
     )
 
 
+def _resumable_consumed_source_decision(
+    alist: object,
+    snapshot: Mapping[str, object],
+    state_root: object,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    index: LibraryIndex,
+    *,
+    media_type: str,
+    tmdb_id: int,
+    label: str,
+) -> ReconciliationDecision | None:
+    """Recognize a source this root's own interrupted write consumed.
+
+    A write may move every planned media object and then fail during the
+    artifact (NFO/poster) phase, before its internal carrier was persisted.
+    On retry the fresh source no longer matches the B snapshot, so no
+    episode grammar can be re-proven and the ordinary proof path would park
+    the unit forever.  Continuation back into ``new_work`` is warranted
+    exactly when:
+
+    - the unit's last acceptance record FAILED (a never-started unit has
+      nothing to continue; a completed unit never re-enters this path),
+    - the fresh source really drifted (something was consumed), and
+    - the formal library now holds an entry for this exact identity —
+      the interrupted write did reach the library.
+
+    Safety does not depend on this verdict alone: F hands the executor the
+    consumed snapshot objects only, and the executor's no-overwrite matrix
+    turns each into an exact ``already_present`` byte readback or fails
+    hard.  A continuation can therefore never create a wrong library
+    object; it only completes readback and regenerates artifacts.
+    """
+    from .unit_execution import load_work_acceptance
+
+    acceptance = {
+        row.work_unit_id: row
+        for row in load_work_acceptance(state_root, root_task_id)
+    }
+    previous = acceptance.get(record.work_unit_id)
+    if previous is None or previous.outcome != "failed":
+        return None
+    if _fresh_scopes_match_snapshot(alist, snapshot, record):
+        # The source is intact: ordinary re-evaluation applies.
+        return None
+    if not index.entries_for(media_type, tmdb_id):
+        return None
+    return ReconciliationDecision(
+        "new_work", None, None,
+        (
+            f"来源已被本任务的中断写入消耗（{label}无法从空源重新证明）；"
+            "正式库已持有该身份，续接补完剩余对象",
+        ),
+    )
+
+
 def _positive_season(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -2204,12 +2260,25 @@ def reconcile_root_work_units(
                         evidence_label = single_season_episode_evidence_label(
                             evidence_kind
                         )
-                        decision = ReconciliationDecision(
-                            "uncertain", None, None,
-                            (
-                                f"TV {evidence_label}未能证明为完整唯一的 "
-                                "TMDB 正季；不能安全判定重复",
-                            ),
+                        decision = (
+                            _resumable_consumed_source_decision(
+                                alist,
+                                snapshot,
+                                state_root,
+                                root_task_id,
+                                record,
+                                index,
+                                media_type=media_type,
+                                tmdb_id=tmdb_id,
+                                label=f"{evidence_label}证据",
+                            )
+                            or ReconciliationDecision(
+                                "uncertain", None, None,
+                                (
+                                    f"TV {evidence_label}未能证明为完整唯一的 "
+                                    "TMDB 正季；不能安全判定重复",
+                                ),
+                            )
                         )
                     else:
                         unit_tokens = frozenset(season_proof.episode_tokens)
@@ -2219,9 +2288,22 @@ def reconcile_root_work_units(
             if decision is not None:
                 pass
             elif media_type == "tv" and _has_video(scoped_node) and not unit_tokens:
-                decision = ReconciliationDecision(
-                    "uncertain", None, None,
-                    ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
+                decision = (
+                    _resumable_consumed_source_decision(
+                        alist,
+                        snapshot,
+                        state_root,
+                        root_task_id,
+                        record,
+                        index,
+                        media_type=media_type,
+                        tmdb_id=tmdb_id,
+                        label="季集坐标",
+                    )
+                    or ReconciliationDecision(
+                        "uncertain", None, None,
+                        ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
+                    )
                 )
             else:
                 empty_seasons = (
