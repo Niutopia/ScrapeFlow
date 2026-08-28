@@ -5051,21 +5051,38 @@ def _remap_suffix_oav_on_air_versions(
     only when TMDB says an ordinary season ends at N, a plain N video exists,
     and the release also contains N+1 as the separately numbered extra.  The
     complete three-way boundary is required; a lone OAV marker is never enough.
+
+    A ``[N OAV]`` filename parses as an *unnumbered* special (the parser
+    deliberately keeps its ordinal out of the special sequence), so the
+    boundary items can also arrive in the ``special 0`` bucket rather than as
+    ``special N``.  Claim only the members whose own name carries the
+    ``N OAV`` suffix; other unnumbered extras in that bucket stay untouched.
     """
     warnings: list[str] = []
     official_boundaries = set(official_season_counts.values())
     for boundary in sorted(official_boundaries):
-        source_key = EpisodeKey("special", boundary)
         target_key = EpisodeKey("regular", boundary)
         next_key = EpisodeKey("regular", boundary + 1)
-        source_items = groups.get(source_key)
-        if not source_items or target_key not in groups or next_key not in groups:
-            continue
         suffix_marker = re.compile(
             rf"(?:^|[\s._\-\[()])0*{boundary}[ ._-]+OAV(?:$|[\s._\-\])()])",
             re.IGNORECASE,
         )
-        if not all(suffix_marker.search(str(item.get("name", ""))) for item in source_items):
+        numbered_items = list(groups.get(EpisodeKey("special", boundary), ()))
+        if numbered_items and not all(
+            suffix_marker.search(str(item.get("name", ""))) for item in numbered_items
+        ):
+            # Preserve the original fail-closed rule: a numbered ``special N``
+            # group that is not entirely ``N OAV`` evidence blocks this
+            # boundary instead of being selectively cherry-picked.
+            continue
+        zero_key = EpisodeKey("special", 0)
+        zero_items = list(groups.get(zero_key, ()))
+        unnumbered_items = [
+            item for item in zero_items
+            if suffix_marker.search(str(item.get("name", "")))
+        ]
+        source_items = numbered_items + unnumbered_items
+        if not source_items or target_key not in groups or next_key not in groups:
             continue
         if not any(
             Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
@@ -5075,7 +5092,16 @@ def _remap_suffix_oav_on_air_versions(
             for item in groups[next_key]
         ):
             continue
-        groups.pop(source_key)
+        groups.pop(EpisodeKey("special", boundary), None)
+        if unnumbered_items:
+            claimed = {id(item) for item in unnumbered_items}
+            remaining_zero = [
+                item for item in zero_items if id(item) not in claimed
+            ]
+            if remaining_zero:
+                groups[zero_key] = remaining_zero
+            else:
+                groups.pop(zero_key, None)
         for item in source_items:
             item["_episode_kind_override"] = "regular"
             item["_episode_key_override"] = boundary

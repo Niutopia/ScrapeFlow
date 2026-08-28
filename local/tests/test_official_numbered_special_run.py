@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 
 from engine.scrapeflow.core import (
@@ -233,3 +234,115 @@ class SameMarkerOvaRunTimelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuffixOavOnAirVersionTests(unittest.TestCase):
+    """A ``[N OAV]`` unnumbered-special bucket entry can prove On-Air Version."""
+
+    @staticmethod
+    def _files(source: str, names: list[str]) -> list[dict[str, object]]:
+        return [
+            {"name": name, "full_path": f"{source}/{name}"} for name in names
+        ]
+
+    def test_unnumbered_oav_bucket_entry_is_claimed_as_on_air_version(self) -> None:
+        # The episode parser routes ``[13 OAV]`` to the unnumbered ``special
+        # 0`` bucket (its ordinal deliberately never becomes special 13), so
+        # the On-Air disambiguation must also claim matching members from
+        # that bucket.  With the complete boundary evidence — official season
+        # ends at E13, a plain E13 video, and E14 as the separately numbered
+        # extra — the OAV is the E13 On-Air Version, not a Season 00 special.
+        from engine.scrapeflow.core import _remap_suffix_oav_on_air_versions
+
+        source = "/incoming/Show"
+        names = [
+            f"[Grp] Show [{number:02d}][1080p].mkv" for number in range(1, 13)
+        ] + [
+            "[Grp] Show [13 OAV][1080p].mkv",
+            "[Grp] Show [13][1080p].mkv",
+            "[Grp] Show [14][1080p].mkv",
+        ]
+        files = self._files(source, names)
+        groups: dict = {}
+        for item in files:
+            key = (
+                EpisodeKey("special", 0)
+                if "OAV" in str(item["name"])
+                else EpisodeKey("regular", int(re.search(r"\[(\d+)", str(item["name"])).group(1)))
+            )
+            groups.setdefault(key, []).append(item)
+        warnings = _remap_suffix_oav_on_air_versions(groups, {1: 13})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("On-Air Version", warnings[0])
+        on_air = groups[EpisodeKey("regular", 13)]
+        self.assertEqual(
+            sorted(str(item["name"]) for item in on_air),
+            ["[Grp] Show [13 OAV][1080p].mkv", "[Grp] Show [13][1080p].mkv"],
+        )
+        claimed = [
+            item for item in on_air
+            if str(item["name"]) == "[Grp] Show [13 OAV][1080p].mkv"
+        ]
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0].get("_edition_override"), "On-Air Version")
+        self.assertEqual(claimed[0].get("_episode_kind_override"), "regular")
+        self.assertEqual(claimed[0].get("_episode_key_override"), 13)
+        # The unnumbered bucket is gone once every member was claimed.
+        self.assertNotIn(EpisodeKey("special", 0), groups)
+
+    def test_unnumbered_bucket_keeps_non_matching_members(self) -> None:
+        # Only the members whose own name carries the ``N OAV`` suffix are
+        # claimed from the shared unnumbered bucket; an unrelated generic
+        # ``OVA`` file stays behind.
+        from engine.scrapeflow.core import _remap_suffix_oav_on_air_versions
+
+        source = "/incoming/Show"
+        names = [
+            f"[Grp] Show [{number:02d}][1080p].mkv" for number in range(1, 13)
+        ] + [
+            "[Grp] Show [13 OAV][1080p].mkv",
+            "[Grp] Show [13][1080p].mkv",
+            "[Grp] Show [14][1080p].mkv",
+            "[Grp] Show OVA[1080p].mkv",
+        ]
+        files = self._files(source, names)
+        groups: dict = {}
+        for item in files:
+            name = str(item["name"])
+            if "OVA" in name and "OAV" not in name:
+                key = EpisodeKey("special", 0)
+            elif "OAV" in name:
+                key = EpisodeKey("special", 0)
+            else:
+                key = EpisodeKey("regular", int(re.search(r"\[(\d+)", name).group(1)))
+            groups.setdefault(key, []).append(item)
+        warnings = _remap_suffix_oav_on_air_versions(groups, {1: 13})
+        self.assertEqual(len(warnings), 1)
+        remaining = [str(i["name"]) for i in groups[EpisodeKey("special", 0)]]
+        self.assertEqual(remaining, ["[Grp] Show OVA[1080p].mkv"])
+
+    def test_boundary_without_plain_video_stays_fail_closed(self) -> None:
+        # The three-way boundary is still required: without a plain E13 the
+        # OAV bucket member is not claimed.
+        from engine.scrapeflow.core import _remap_suffix_oav_on_air_versions
+
+        source = "/incoming/Show"
+        names = [
+            f"[Grp] Show [{number:02d}][1080p].mkv" for number in range(1, 13)
+        ] + [
+            "[Grp] Show [13 OAV][1080p].mkv",
+            "[Grp] Show [14][1080p].mkv",
+        ]
+        files = self._files(source, names)
+        groups: dict = {}
+        for item in files:
+            key = (
+                EpisodeKey("special", 0)
+                if "OAV" in str(item["name"])
+                else EpisodeKey("regular", int(re.search(r"\[(\d+)", str(item["name"])).group(1)))
+            )
+            groups.setdefault(key, []).append(item)
+        warnings = _remap_suffix_oav_on_air_versions(groups, {1: 13})
+        self.assertEqual(warnings, [])
+        self.assertIn(EpisodeKey("special", 0), groups)
+        self.assertNotIn(EpisodeKey("regular", 13), groups)
