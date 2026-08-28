@@ -90,6 +90,37 @@ def _is_bonus_directory_identity_label(value: object) -> bool:
     return bool(text) and bool(BONUS_DIRECTORY_SEGMENT_RE.fullmatch(text))
 
 
+_MOVIE_FORM_LABEL_RE = re.compile(
+    r"^[\s：:．.・\-—－]*(?:剧场版|劇場版|电影|電影|映画|movie|film)[\s：:．.・\-—－]*$",
+    re.IGNORECASE,
+)
+_MOVIE_FORM_TOKEN_RE = re.compile(
+    r"剧场版|劇場版|电影|電影|映画|\b(?:movies?|films?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_movie_form_label(value: object) -> bool:
+    """Whether a boundary label is ONLY a theatrical movie-form marker.
+
+    ``剧场版``/``劇場版``/``电影``/``電影``/``映画``/``movie``/``film`` are
+    release-layout tokens, not titles: a unit whose whole boundary label is one
+    of them asserts the form of its work while carrying no title substance, so
+    the parent label supplies the only title query.  The form token itself is
+    still identity evidence and must not be dropped from scoring.
+    """
+    text = str(value or "").strip()
+    return bool(text) and bool(_MOVIE_FORM_LABEL_RE.fullmatch(text))
+
+
+def _titles_carry_movie_form_token(titles: Iterable[str]) -> bool:
+    """Whether any official title/alias carries the theatrical form token."""
+    return any(
+        _MOVIE_FORM_TOKEN_RE.search(str(title or ""))
+        for title in titles
+    )
+
+
 def _is_non_structural_identity_evidence(value: object) -> bool:
     """Whether a C/U label contains a usable work-title clue, not a coordinate."""
     query = _REPRESENTATIVE_MEDIA_SUFFIX_RE.sub("", str(value or "")).strip()
@@ -1509,6 +1540,23 @@ def _score_identity_candidate(
             0.0 if actual_count == expected_episode_count else -0.08
         )
 
+    # A boundary whose whole label is a theatrical movie-form marker
+    # (``剧场版``/``电影``/``movie``) asserts the form of its work while
+    # carrying no title substance, so the parent label supplies the only
+    # title query.  Prefix containment can then hand the match to any
+    # franchise-titled sibling — an event recording, a TV special — whose
+    # title merely starts with the parent name.  The declared form token is
+    # affirmative evidence about that dispute: an official title that carries
+    # it is aligned with the unit's declared form (+bonus), and a sibling
+    # without it is misaligned once the pool contains an aligned candidate
+    # (penalty, gated so an unmarked pool keeps its historical scoring).
+    movie_form_alignment_score = 0.0
+    if raw.get("movie_form_label_boundary"):
+        if raw.get("movie_form_token_in_titles"):
+            movie_form_alignment_score = 0.12
+        elif raw.get("movie_form_pool_has_aligned"):
+            movie_form_alignment_score = -0.15
+
     # An explicit physical OVA/OAV/OAD run can be a separately catalogued TV
     # work. It still does not assert a TMDB season: automatic selection needs
     # both a matching official positive-season count and an official marker in
@@ -1560,7 +1608,8 @@ def _score_identity_candidate(
             + year_score
             + media_type_score
             + context_score
-            + episode_structure_score,
+            + episode_structure_score
+            + movie_form_alignment_score,
         ),
     )
     season_fragment_score = 0.0
@@ -1617,6 +1666,7 @@ def _score_identity_candidate(
         "year_score": round(year_score, 6),
         "media_type_score": round(media_type_score, 6),
         "episode_structure_score": round(episode_structure_score, 6),
+        "movie_form_alignment_score": round(movie_form_alignment_score, 6),
         "special_marker_score": round(special_marker_score, 6),
         "season_fragment_score": round(season_fragment_score, 6),
         "context_score": round(context_score, 6),
@@ -1645,6 +1695,8 @@ def _score_identity_candidate(
             "parent_special_run_shape": parent_special_run_shape,
             "strict_naked_numeric_video_run": strict_naked_numeric_video_run,
             "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
+            "movie_form_label_boundary": bool(raw.get("movie_form_label_boundary")),
+            "movie_form_token_in_titles": bool(raw.get("movie_form_token_in_titles")),
             "naked_numeric_clean_boundary_query_sent": bool(
                 raw.get("naked_numeric_clean_boundary_query_sent")
             ),
@@ -1854,12 +1906,23 @@ def auto_match_tmdb(
                 "alias_score": alias_score,
                 "cross_script": _cross_script_unique_match(matched_query, [*titles, *aliases]),
                 "matched_query": matched_query,
+                "movie_form_label_boundary": _is_pure_movie_form_label(query),
+                "movie_form_token_in_titles": _titles_carry_movie_form_token(
+                    [*titles, *aliases]
+                ),
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
+        # Same movie-form alignment arbitration as the evidence path: the
+        # misalignment penalty stays dormant without an aligned pool sibling.
+        if raw.get("movie_form_label_boundary"):
+            raw["movie_form_pool_has_aligned"] = any(
+                bool(item.get("movie_form_token_in_titles"))
+                for item in raw_candidates
+            )
         return _score_identity_candidate(
             raw,
             query_years={query_year} if query_year else set(),
@@ -2183,6 +2246,11 @@ def auto_match_from_evidence(
     clean_boundary_is_cjk = bool(
         re.search(r"[\u3400-\u9fff\u3040-\u30ff]", clean_boundary_query)
     )
+    # A boundary whose whole label is a theatrical movie-form marker asserts
+    # the form of its work.  That token is ordinary identity evidence for the
+    # candidates below: an official title that carries it is aligned with the
+    # declared form, a franchise sibling that does not is misaligned.
+    boundary_movie_form_label = _is_pure_movie_form_label(boundary_label)
     strict_naked_numeric_guard = bool(evidence.strict_naked_numeric_video_run)
     naked_numeric_cjk_release_eligible = bool(
         evidence.naked_numeric_cjk_release_eligible
@@ -2595,6 +2663,10 @@ def auto_match_from_evidence(
                 "alias_score": alias_score,
                 "cross_script": boundary_cross_script and not exact_same_script_evidence,
                 "matched_query": matched_query,
+                "movie_form_label_boundary": boundary_movie_form_label,
+                "movie_form_token_in_titles": _titles_carry_movie_form_token(
+                    [*titles, *aliases]
+                ),
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
@@ -2617,6 +2689,15 @@ def auto_match_from_evidence(
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
+        # The misalignment penalty arbitrates between siblings: it stays
+        # dormant unless the collected pool actually contains an aligned
+        # candidate, so a franchise whose theatrical feature is catalogued
+        # without the form token keeps its historical scoring untouched.
+        if raw.get("movie_form_label_boundary"):
+            raw["movie_form_pool_has_aligned"] = any(
+                bool(item.get("movie_form_token_in_titles"))
+                for item in raw_candidates
+            )
         return _score_identity_candidate(
             raw,
             query_years=query_years,

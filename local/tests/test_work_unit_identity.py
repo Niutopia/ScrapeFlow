@@ -733,6 +733,94 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         sent = [params.get("query") for _path, params in client.call_log]
         self.assertIn("Gintama ~The Final~", sent)
 
+    def test_pure_movie_form_label_boundary_aligns_with_form_token(self) -> None:
+        """A boundary that is only a movie-form label must not lose its token.
+
+        A unit labeled exactly ``剧场版`` carries no title substance: the query
+        that reaches TMDB is the parent label (``五等分的花嫁``).  Prefix
+        containment then hands the match to any franchise-titled entry — an
+        anniversary event recording whose title merely starts with the parent
+        name — while the real theatrical feature whose own title carries the
+        剧场版 token scores below the automatic threshold.  The form token is
+        affirmative evidence: a candidate whose official title carries it is
+        aligned with the unit's declared form, a franchise sibling that does
+        not is misaligned once the pool contains an aligned candidate.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "五等分的花嫁": [
+                    {
+                        "id": 1507125,
+                        "title": "五等分的花嫁横滨竞技场五周年纪念活动",
+                        "release_date": "2025-02-19",
+                        "genre_ids": [16],
+                    },
+                    {
+                        "id": 820067,
+                        "title": "五等分的新娘 剧场版",
+                        "release_date": "2022-05-20",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-movie-form-label",
+            boundary_label="剧场版",
+            parent_labels=("W 4k 五等分的花嫁",),
+            representative_names=(),
+            normalized_titles=(),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.88
+        )
+        self.assertEqual(best.tmdb_id, 820067)
+        self.assertEqual(best.status, "confirmed")
+        event = next(c for c in candidates if c.tmdb_id == 1507125)
+        self.assertLess(event.confidence, best.confidence)
+
+    def test_pure_movie_form_label_boundary_keeps_unmarked_pool_untouched(self) -> None:
+        """The misalignment penalty stays dormant without an aligned candidate.
+
+        When no candidate in the pool carries the form token (a franchise whose
+        theatrical feature is catalogued without one), scoring must behave
+        exactly as before: the misalignment penalty only arbitrates between
+        siblings once at least one sibling is aligned.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "言叶之庭": [
+                    {
+                        "id": 172811,
+                        "title": "言叶之庭",
+                        "release_date": "2013-05-31",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-garden-of-words",
+            boundary_label="剧场版",
+            parent_labels=("M 4k 言叶之庭",),
+            representative_names=(),
+            normalized_titles=(),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.88
+        )
+        self.assertEqual(best.tmdb_id, 172811)
+        self.assertEqual(best.status, "confirmed")
+        self.assertGreaterEqual(best.confidence, 0.88)
+
     def test_nested_parent_combos_cannot_crowd_out_boundary_queries(self) -> None:
         """Two nested parent labels must not exhaust the query budget.
 
