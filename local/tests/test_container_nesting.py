@@ -26,6 +26,7 @@ from local.scrapeflow_api.unit_execution import (
     _clean_container_name,
     _container_layout_targets,
     _container_plan,
+    _is_physical_special_record,
     execute_new_work_units,
     load_work_acceptance,
 )
@@ -491,6 +492,99 @@ class ContainerNestingTests(unittest.TestCase):
         )
         self.assertEqual(main_tmdb, 702)
         self.assertIsNone(container_parent)
+
+    def test_bundled_ova_files_do_not_demote_a_multiseason_main(self) -> None:
+        """A verified multi-season cohort keeps main-TV candidacy despite OVA extras.
+
+        A release cohort routinely bundles OVA files beside the regular
+        episodes.  Those marker files are extra coverage of the same work, so
+        the cohort must stay a regular TV: demoting it would hand the
+        container's main slot to an unrelated single-season sibling and plan
+        the regular seasons below that sibling's work root.
+        """
+        source = "/incoming/示例合集"
+        files = {
+            f"{source}/示例剧 第一季/S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 第一季/S01E11(OVA).mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 第二季/S02E01.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 第三季/S03E01.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 爆焰外传/[Ygm] Example Spinoff [01][1080P].mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 剧场版 传说/movie.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _events = self._setup(files)
+        root_id = self._root(runner, source)
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        cohort = [
+            record for record in records
+            if record.claimed_seasons == (1, 2, 3)
+        ]
+        self.assertEqual(len(cohort), 1)
+        main = cohort[0]
+        spinoff = self._record_for_source_leaf(records, "示例剧 爆焰外传")
+        movie = self._record_for_source_leaf(records, "示例剧 剧场版 传说")
+        current = [
+            replace(
+                main,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 9202,
+                    "title": "示例剧",
+                    "decision_trace": {
+                        "physical_special_markers": ["OVA"],
+                        "official_titles": ["示例剧"],
+                    },
+                },
+                reconciliation_outcome="new_work",
+            ),
+            replace(
+                spinoff,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 9101,
+                    "title": "示例剧 爆焰",
+                    "decision_trace": {
+                        "official_titles": ["示例剧 爆焰"],
+                    },
+                },
+                reconciliation_outcome="duplicate_complete",
+                matched_work_root="/library/番剧/示例合集/示例剧 爆焰",
+            ),
+            replace(movie, identity_status="uncertain", identity=None),
+        ]
+        save_work_unit_records(state_root, root_id, current)
+
+        # The single-season marker shape stays demotable: the boundary can
+        # derive one claimed season from a season word in the directory name
+        # alone (``第二季 OVA``), so only the ≥2 structural proof wins.
+        self.assertFalse(_is_physical_special_record(current[0]))
+        self.assertTrue(
+            _is_physical_special_record(
+                replace(current[0], claimed_seasons=(1,))
+            )
+        )
+
+        _ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        layout = _container_layout_targets(
+            runner, runner.get_job(root_id), current,
+        )
+        self.assertIsNone(main_tmdb)
+        self.assertEqual(container_parent, "/library/番剧/示例合集")
+        self.assertEqual(layout[main.work_unit_id]["relation"], "direct_tv")
+        self.assertEqual(
+            layout[main.work_unit_id]["target_root"],
+            "/library/番剧/示例合集/示例剧",
+        )
+        self.assertNotIn(
+            "示例剧 爆焰",
+            str(layout[main.work_unit_id]["target_root"]),
+        )
 
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
         files = {

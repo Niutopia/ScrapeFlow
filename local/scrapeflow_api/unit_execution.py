@@ -879,6 +879,21 @@ def _is_physical_special_record(record: WorkUnitRecord) -> bool:
     role = str(record.role or "").casefold()
     if role in {"special_group", "extras_group"}:
         return True
+    # Two or more distinct positive claimed seasons are B/W's structural
+    # proof of a regular multi-season work (verified season directories or
+    # explicit SxxExx coordinates on every owned video).  Bundled OVA/SP
+    # marker files inside such a cohort are extra coverage of the same work,
+    # not evidence that the whole unit is an auxiliary release: the demotion
+    # would hand the container's main-TV slot to an unrelated sibling and
+    # plan the regular seasons under that sibling's work root.  A single
+    # claimed season stays demotable because the boundary can derive it from
+    # a season word in the directory name alone (``第二季 OVA``).
+    if sum(
+        1
+        for season in record.claimed_seasons
+        if isinstance(season, int) and not isinstance(season, bool) and season > 0
+    ) >= 2:
+        return False
     trace = identity.get("decision_trace")
     if isinstance(trace, Mapping):
         for key in ("physical_special_markers", "official_special_marker_hits"):
