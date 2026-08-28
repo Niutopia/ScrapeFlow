@@ -27,6 +27,7 @@ from engine.scrapeflow.archive import ArchivePasswordError
 from engine.scrapeflow.archive_preprocessing import ArchivePauseRequested
 from engine.scrapeflow.errors import FormalTargetConflictError
 from engine.scrapeflow.gap_ledger import load_gap_ledger
+from engine.scrapeflow.media_naming import edition_tag
 from engine.scrapeflow.media_quality import (
     is_video_filename,
     minimum_video_bytes,
@@ -320,8 +321,15 @@ def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
             errors.append(f"内部 TV child 原文件名集号与最终集号不一致: {label}")
             continue
         episode_id = next(iter(final_ids))
-        owners.setdefault(episode_id, []).append(label)
-    for episode_id, labels in owners.items():
+        # Named editions are independent rows of the same episode — the
+        # planner itself compares editions separately (a director's cut or
+        # On-Air Version is never discarded as a duplicate), and the edition
+        # tag is part of the final filename so the two rows land as distinct
+        # target files.  Only the same episode *with the same* edition tag is
+        # a duplicate primary video.
+        edition = edition_tag(final_name) or ""
+        owners.setdefault((episode_id, edition), []).append(label)
+    for (episode_id, _edition), labels in owners.items():
         if len(labels) > 1:
             errors.append(
                 f"内部 TV child 将多个视频映射到 {episode_id}: "
