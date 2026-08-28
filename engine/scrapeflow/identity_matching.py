@@ -1387,6 +1387,20 @@ def _score_identity_candidate(
         ):
             parent_bonus = max(parent_bonus, 0.04)
 
+    # A regular multi-season parent keeps its OVA/OAD releases in Season 00,
+    # and the confirmed identity of such a release is the parent show itself.
+    # The bounded S00 catalog evidence recorded by the detail probe is what
+    # makes that parent shape a legal target; the release-local ordinals are
+    # later positioned by D's named-arc proof, so the count need not match
+    # here.  It is weaker than a standalone proof (no marker/count match of
+    # the short work itself), hence the smaller bonus.
+    parent_special_run_shape = bool(
+        special_episode_count
+        and set(special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
+        and raw.get("official_season0_episode_count") is not None
+        and raw.get("official_season0_numbers")
+    )
+
     year_score = 0.0
     wrong_year = False
     if query_years:
@@ -1398,14 +1412,25 @@ def _score_identity_candidate(
         else:
             try:
                 candidate_year_int = int(candidate_year)
-                deltas = [
-                    abs(candidate_year_int - int(year))
-                    for year in query_years
-                    if year.isdigit()
-                ]
-                minimum_delta = min(deltas) if deltas else 0
-                wrong_year = minimum_delta >= 2
-                year_score = -0.30 if wrong_year else -0.12
+                if parent_special_run_shape:
+                    # A physical special is released after its parent show
+                    # premiered, so an earlier first-air year is the expected
+                    # shape, not a conflict.  Only a source year that predates
+                    # the show's premiere is impossible.
+                    wrong_year = any(
+                        year.isdigit() and int(year) < candidate_year_int
+                        for year in query_years
+                    )
+                    year_score = -0.30 if wrong_year else 0.0
+                else:
+                    deltas = [
+                        abs(candidate_year_int - int(year))
+                        for year in query_years
+                        if year.isdigit()
+                    ]
+                    minimum_delta = min(deltas) if deltas else 0
+                    wrong_year = minimum_delta >= 2
+                    year_score = -0.30 if wrong_year else -0.12
             except ValueError:
                 year_score = -0.06
 
@@ -1446,7 +1471,19 @@ def _score_identity_candidate(
     }
     official_special_count_match = bool(raw.get("official_special_count_match"))
     special_detail_checked = bool(raw.get("special_detail_checked"))
-    if special_evidence_required:
+    # A regular multi-season parent keeps its OVA/OAD releases in Season 00,
+    # and the confirmed identity of such a release is the parent show itself.
+    # The bounded S00 catalog evidence recorded by the detail probe is what
+    # makes that parent shape a legal target; the release-local ordinals are
+    # later positioned by D's named-arc proof, so the count need not match
+    # here.  It is weaker than a standalone proof (no marker/count match of
+    # the short work itself), hence the smaller bonus.
+    parent_special_run_shape = bool(
+        special_evidence_required
+        and raw.get("official_season0_episode_count") is not None
+        and raw.get("official_season0_numbers")
+    )
+    if special_evidence_required and not parent_special_run_shape:
         if not special_detail_checked:
             special_marker_score = -0.20
         elif official_special_hits and official_special_count_match:
@@ -1457,6 +1494,8 @@ def _score_identity_candidate(
             special_marker_score = -0.18
         else:
             special_marker_score = -0.30
+    elif parent_special_run_shape:
+        special_marker_score = 0.12
 
     confidence = max(
         0.0,
@@ -1509,7 +1548,7 @@ def _score_identity_candidate(
             blockers.append("naked_numeric_requires_tv_candidate")
     if confidence < min_confidence:
         blockers.append("below_confidence_threshold")
-    if special_evidence_required:
+    if special_evidence_required and not parent_special_run_shape:
         if not special_detail_checked:
             blockers.append("physical_special_official_evidence_unavailable")
         elif not official_special_hits:
@@ -1549,6 +1588,7 @@ def _score_identity_candidate(
             "official_special_marker_hits": sorted(official_special_hits),
             "official_special_count_match": official_special_count_match,
             "special_detail_checked": special_detail_checked,
+            "parent_special_run_shape": parent_special_run_shape,
             "strict_naked_numeric_video_run": strict_naked_numeric_video_run,
             "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
             "naked_numeric_clean_boundary_query_sent": bool(
@@ -2094,6 +2134,31 @@ def auto_match_from_evidence(
         )
     ):
         raise PlanError("纯季目录缺少父容器或代表媒体标题证据")
+    # A complete numbered physical OVA/OAV/OAD run is released as part of a
+    # parent show, and its own arc label frequently matches no TV search at
+    # all (an arc query can return only the split movie halves of the same
+    # release).  The user-owned parent label is ordinary identity evidence
+    # for that source shape, so its cleaned standalone form is dispatched
+    # ahead of the arc queries to bring the parent show into the bounded
+    # candidate pool.
+    physical_special_markers = tuple(sorted({
+        str(marker).upper()
+        for marker in evidence.special_markers
+        if _physical_special_marker_key(marker) is not None
+    }))
+    physical_special_episode_count = (
+        evidence.special_episode_count
+        if evidence.special_numbered_run_complete
+        and evidence.special_episode_count is not None
+        and set(physical_special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
+        else None
+    )
+    if physical_special_episode_count:
+        for parent in evidence.parent_labels:
+            for p_variant in _parent_identity_query_variants(parent):
+                cleaned = _clean_boundary_identity_query(p_variant).strip()
+                if cleaned and not _is_generic_season_identity_label(cleaned):
+                    candidate_queries.append(cleaned)
     # Parent-combination queries can consume the six-query budget.  For the
     # narrow strict bare-number fallback, the cleaned boundary is the only
     # title proof allowed, so put it first and later prove it was dispatched.
@@ -2214,22 +2279,6 @@ def auto_match_from_evidence(
             and evidence.media_shape == "tv"
             and len(evidence.episode_pattern.season_numbers) <= 1
         )
-        else None
-    )
-    # A complete numbered physical OVA/OAV/OAD run is intentionally separate
-    # from ``expected_episode_count``. The latter describes ordinary episode
-    # structure; the former only becomes identity evidence after TMDB confirms
-    # the candidate's own official short-work shape.
-    physical_special_markers = tuple(sorted({
-        str(marker).upper()
-        for marker in evidence.special_markers
-        if _physical_special_marker_key(marker) is not None
-    }))
-    physical_special_episode_count = (
-        evidence.special_episode_count
-        if evidence.special_numbered_run_complete
-        and evidence.special_episode_count is not None
-        and set(physical_special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
         else None
     )
 

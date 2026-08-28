@@ -1708,6 +1708,72 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             auto_match_from_evidence(client, evidence)
         self.assertEqual(ctx.exception.candidates[0]["status"], "rejected")
 
+    def test_complete_oad_run_confirms_parent_show_with_season00_catalog(self) -> None:
+        """A named-arc OAD run resolves to its parent show, not the split movies.
+
+        The arc label matches the two split movie entries of the same release
+        exactly, and the arc query alone never surfaces the parent show.  The
+        user-owned parent label dispatches the parent query, and the parent's
+        official Season 00 catalog (bounded TMDB evidence) makes the parent
+        shape the legal identity despite its earlier first-air year.
+        """
+        season0_episodes = [
+            {"episode_number": number, "air_date": "2007-01-01", "name": f"短篇 {number}"}
+            for number in range(1, 8)
+        ] + [
+            {"episode_number": 8, "air_date": "2016-05-13", "name": "示例剧 爱染香篇 前篇"},
+            {"episode_number": 9, "air_date": "2016-06-10", "name": "示例剧 爱染香篇 后篇"},
+            {"episode_number": 10, "air_date": "2018-01-01", "name": "周年感谢祭"},
+            {"episode_number": 11, "air_date": "2019-01-01", "name": "番外兔子"},
+        ]
+        client = FakeTMDBClient(
+            search_results={
+                "示例剧 爱染香篇": [
+                    {"id": 977916, "title": "示例剧 爱染香篇 前篇", "release_date": "2016-05-13", "genre_ids": [16]},
+                    {"id": 1119841, "title": "示例剧 爱染香篇 后篇", "release_date": "2016-06-10", "genre_ids": [16]},
+                ],
+                "示例剧": [
+                    {"id": 57041, "name": "示例剧", "first_air_date": "2006-04-04", "genre_ids": [16]},
+                ],
+            },
+            details={
+                "/tv/57041": {
+                    "name": "示例剧",
+                    "original_name": "示例剧",
+                    "seasons": [
+                        {"season_number": 0, "episode_count": 11, "name": "特别篇"},
+                        {"season_number": 1, "episode_count": 201, "name": "第 1 季"},
+                    ],
+                },
+                "/tv/57041/season/0": {"episodes": season0_episodes},
+                "/tv/977916": {"name": "示例剧 爱染香篇 前篇"},
+                "/tv/1119841": {"name": "示例剧 爱染香篇 后篇"},
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-oad-parent-arc",
+            boundary_label="示例剧 爱染香篇",
+            parent_labels=("Y 4k 示例剧",),
+            representative_names=("示例剧 OAD 2016 01",),
+            normalized_titles=("示例剧 爱染香篇",),
+            years=(2016,),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+            special_markers=("OAD",),
+            special_episode_numbers=(1, 2),
+            special_episode_count=2,
+            special_numbered_run_complete=True,
+        )
+        best, candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.media_type, "tv")
+        self.assertEqual(best.tmdb_id, 57041)
+        self.assertTrue(best.decision_trace["parent_special_run_shape"])
+        self.assertEqual(best.decision_trace["blockers"], [])
+        movies = [item for item in candidates if item.media_type == "movie"]
+        for candidate in movies:
+            self.assertEqual(candidate.status, "rejected")
+
     def test_invalid_input_validation(self) -> None:
         client = FakeTMDBClient()
         evidence_empty = IdentityEvidence(
