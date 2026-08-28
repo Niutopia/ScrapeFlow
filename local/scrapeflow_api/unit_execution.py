@@ -154,6 +154,70 @@ def _retire_stale_unit_carrier(runner: SimpleEngineRunner, carrier_id: str) -> N
         path.unlink()
 
 
+def _carrier_plan_identity_matches(
+    plan: object,
+    identity: Mapping[str, object],
+) -> bool:
+    """Whether an executed carrier's durable plan still proves this record.
+
+    A receipt rollback or an operator reconfirmation can change a record's
+    confirmed identity after its carrier already executed.  The plan's own
+    metadata is the only durable evidence of the identity that write used;
+    comparing identities (never names, paths, or job ids) keeps the rule
+    generic.  Missing evidence never proves a mismatch, so the carrier is
+    preserved in that case.
+    """
+    if not isinstance(plan, Mapping):
+        return True
+    metadata = plan.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return True
+    carrier_tmdb = metadata.get("tmdb_id")
+    record_tmdb = identity.get("tmdb_id")
+    if (
+        isinstance(carrier_tmdb, int) and not isinstance(carrier_tmdb, bool)
+        and isinstance(record_tmdb, int) and not isinstance(record_tmdb, bool)
+        and carrier_tmdb != record_tmdb
+    ):
+        return False
+    mode = str(plan.get("mode") or "")
+    media_type = str(identity.get("media_type") or "")
+    if mode == "movie" and media_type == "tv":
+        return False
+    if mode == "tv" and media_type == "movie":
+        return False
+    return True
+
+
+def _retire_superseded_unit_carrier(
+    runner: SimpleEngineRunner,
+    carrier_id: str,
+) -> None:
+    """Remove an executed unit carrier whose write the record superseded.
+
+    ``_retire_stale_unit_carrier`` deliberately never removes an executed
+    carrier because ``executed`` is the durable Engine write fact.  The one
+    sanctioned exception is a carrier whose durable plan identity no longer
+    matches the record's confirmed identity: a receipt rollback (or an
+    operator reconfirmation) retired that write, so the ``executed`` fact
+    describes an object the formal library no longer holds.  Removing the
+    local JSON frees the deterministic carrier id for the corrected
+    re-plan; the rollback receipt remains the audit trail.
+    """
+    try:
+        carrier = runner.get_job(carrier_id)
+    except Exception:
+        return
+    summary = carrier.summary if isinstance(carrier.summary, Mapping) else {}
+    if summary.get("internal_child") is not True:
+        return
+    if carrier.phase != "executed":
+        return
+    path = runner._job_path(carrier_id)  # noqa: SLF001 - carrier composition
+    if path.exists():
+        path.unlink()
+
+
 def _unit_job_id(work_unit_id: str) -> str:
     return f"unit-{work_unit_id}"
 
@@ -3224,6 +3288,30 @@ def execute_new_work_units(
                 recorded_at=_now(),
             ))
             continue
+        if record.writer_job_id is not None:
+            # An executed carrier is proof only for the identity its durable
+            # plan was built under.  A receipt rollback or operator
+            # reconfirmation can change the record's identity after the
+            # carrier executed: that ``executed`` fact then belongs to the
+            # retired write, not to this record.  Accepting it would skip
+            # the corrected write and let R's intake cleanup delete the
+            # restored source file as an unconsumed residual.  Retire the
+            # superseded carrier so the planning path below re-plans from
+            # the current source state under the confirmed identity.
+            try:
+                existing_carrier = runner.get_job(record.writer_job_id)
+            except Exception:
+                existing_carrier = None
+            if (
+                existing_carrier is not None
+                and existing_carrier.phase == "executed"
+                and not _carrier_plan_identity_matches(
+                    existing_carrier.plan, identity,
+                )
+            ):
+                _retire_superseded_unit_carrier(runner, existing_carrier.id)
+                record = replace(record, writer_job_id=None)
+                changed = True
         if record.writer_job_id is not None:
             # Already planned and executed; re-verify the carrier state.
             carrier = runner.get_job(record.writer_job_id)

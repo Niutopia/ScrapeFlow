@@ -3268,3 +3268,142 @@ class ConsumedSourceContinuationTests(unittest.TestCase):
         self.assertEqual(third[0].outcome, "accepted")
         self.assertIn("/library/番剧/Work (101)/S01E01.mkv", alist.files)
         self.assertNotIn("/incoming/one/S01E01.mkv", alist.files)
+
+
+class SupersededExecutedCarrierTests(unittest.TestCase):
+    """F must not reuse an executed carrier built under a superseded identity."""
+
+    def test_superseded_executed_carrier_replans_under_corrected_identity(self) -> None:
+        """A receipt rollback invalidates the old executed write.
+
+        The carrier executed under the wrong TMDB identity; a receipt
+        rollback restored the source file while the record kept pointing at
+        that executed carrier.  After the record is re-confirmed to the
+        correct identity, F must retire the superseded carrier and re-plan
+        from the restored source instead of accepting the stale write fact
+        (which would let R's intake cleanup delete the restored file).
+        """
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = FakeAList()
+        alist.files["/incoming/one/S01E01.mkv"] = FAKE_VIDEO_BYTES
+        plan_calls: list[dict] = []
+        right_target = "/library/番剧/Work (101)"
+
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=object(),
+            planner=_recording_planner(plan_calls), validate=False,
+            library_root="/library",
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-superseded")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-superseded",
+            state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, "root-superseded")[0]
+        apply_work_unit_override(
+            state_root, "root-superseded", record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, "root-superseded")
+        record = load_work_unit_records(state_root, "root-superseded")[0]
+
+        # The historical wrong write: an executed internal carrier whose
+        # durable plan carries the superseded identity (tmdb 201).
+        request = _request_for_unit(runner, record, "root-superseded", state_root)
+        carrier = runner.plan_job(
+            request,
+            job_id=f"unit-{record.work_unit_id}",
+            internal_child_of="root-superseded",
+        )
+        wrong_plan = dict(carrier.plan)
+        wrong_plan["metadata"] = {
+            "tmdb_id": 201, "title": "Wrong Work", "year": "2020",
+            "poster_path": None, "backdrop_path": None,
+        }
+        executed = replace(
+            carrier, phase="executed",
+            plan=wrong_plan, execution={"file_count": 1},
+        )
+        atomic_write_json(
+            runner._job_path(carrier.id),  # noqa: SLF001 - durable carrier fixture
+            executed.as_dict(),
+            allow_nan=False,
+        )
+
+        # Receipt rollback state: the wrongly placed media is back at the
+        # source, while the record still references the executed wrong
+        # carrier.  The B snapshot matches the restored source exactly.
+        save_work_unit_records(
+            state_root, "root-superseded",
+            [replace(record, writer_job_id=carrier.id)],
+        )
+        plans_before = len(plan_calls)
+
+        results = execute_new_work_units(runner, state_root, "root-superseded")
+
+        self.assertEqual([result.outcome for result in results], ["accepted"])
+        self.assertEqual(len(plan_calls), plans_before + 1)
+        self.assertEqual(plan_calls[-1]["tmdb_id"], 101)
+        self.assertIn(f"{right_target}/S01E01.mkv", alist.files)
+        self.assertNotIn("/incoming/one/S01E01.mkv", alist.files)
+        records = load_work_unit_records(state_root, "root-superseded")
+        self.assertEqual(
+            records[0].writer_job_id, f"unit-{records[0].work_unit_id}",
+        )
+        replanned = runner.get_job(records[0].writer_job_id)
+        self.assertEqual(replanned.phase, "executed")
+        self.assertEqual(
+            (replanned.plan.get("metadata") or {}).get("tmdb_id"), 101,
+        )
+
+    def test_executed_carrier_of_same_identity_is_still_reused(self) -> None:
+        """An executed carrier matching the confirmed identity stays proof."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = FakeAList()
+        alist.files["/incoming/one/S01E01.mkv"] = FAKE_VIDEO_BYTES
+        plan_calls: list[dict] = []
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=object(),
+            planner=_recording_planner(plan_calls), validate=False,
+            library_root="/library",
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-reuse")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-reuse", state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, "root-reuse")[0]
+        apply_work_unit_override(
+            state_root, "root-reuse", record.work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, "root-reuse")
+        record = load_work_unit_records(state_root, "root-reuse")[0]
+        request = _request_for_unit(runner, record, "root-reuse", state_root)
+        carrier = runner.plan_job(
+            request,
+            job_id=f"unit-{record.work_unit_id}",
+            internal_child_of="root-reuse",
+        )
+        executed = replace(carrier, phase="executed", execution={"file_count": 1})
+        atomic_write_json(
+            runner._job_path(carrier.id),  # noqa: SLF001 - durable carrier fixture
+            executed.as_dict(),
+            allow_nan=False,
+        )
+        save_work_unit_records(
+            state_root, "root-reuse", [replace(record, writer_job_id=carrier.id)],
+        )
+        plans_before = len(plan_calls)
+
+        results = execute_new_work_units(runner, state_root, "root-reuse")
+
+        self.assertEqual([result.outcome for result in results], ["accepted"])
+        self.assertEqual(len(plan_calls), plans_before)
+        records = load_work_unit_records(state_root, "root-reuse")
+        self.assertEqual(records[0].writer_job_id, carrier.id)
