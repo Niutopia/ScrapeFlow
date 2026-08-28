@@ -1415,7 +1415,83 @@ class UnitExecutionTests(unittest.TestCase):
                 ["E01", "E02", "E03"],
             )
 
-    def test_release_dash_manifest_rejects_file_added_between_proof_and_planner(self) -> None:
+    def test_bracketed_proof_is_revalidated_for_f(self) -> None:
+        """F consumes the D-proven ``[01]`` map, not the movie keyword.
+
+        A bracketed episode run is often released beside theatrical films
+        inside one ``剧场版``-labelled folder.  The smart planner's loose
+        movie-context heuristic used to hijack exactly that shape and fail
+        closed on movie auto-match; the revalidated D bracketed proof must
+        route the unit through the explicit episode-map path instead.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb_id = 99150
+            tmdb = BareEpisodePlanningTMDB(tmdb_id, 2)
+            source = "/quark/影视/待刮削/Bracket Run 0"
+            run_dir = f"{source}/剧场版 Show The Final"
+            names = [
+                f"[Ygm] Show ~Semi-Final~ [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+                for episode in range(1, 3)
+            ]
+            alist = BareEpisodePlanningAList(
+                {f"{run_dir}/{name}": FAKE_VIDEO_BYTES for name in names}
+            )
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-f"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertEqual(len(records), 1)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("kind"),
+                "tmdb_single_positive_season_bracketed_episodes",
+            )
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(request.season, 1)
+            mapping = json.loads(Path(str(request.episode_map_path)).read_text())
+            self.assertEqual(mapping, {"1": "S01E01", "2": "S01E02"})
+            plan = runner._build_plan(request)  # noqa: SLF001 - F planner seam
+            self.assertEqual(
+                [item.episode_key for item in plan.files if item.media_kind == "video"],
+                ["E01", "E02"],
+            )
+            self.assertEqual(
+                {
+                    token
+                    for item in plan.files
+                    if item.media_kind == "video"
+                    for season, episode in audit_episode_tokens(item.final_name)
+                    for token in (f"S{season:02d}E{episode:02d}",)
+                },
+                {"S01E01", "S01E02"},
+            )
+
+            old_path = f"{run_dir}/{names[-1]}"
+            new_path = f"{run_dir}/[Ygm] Show ~Semi-Final~ [03][Ma10p_2160p].mkv"
+            alist.files[new_path] = alist.files.pop(old_path)
+            with self.assertRaisesRegex(ValueError, "D 纯方括号集号 季集证据"):
+                _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(alist.move_calls, [])
         """The F handoff may not widen after its fresh D proof.
 
         The injected fourth file appears after the release-dash proof and the

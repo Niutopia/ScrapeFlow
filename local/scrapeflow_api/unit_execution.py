@@ -65,9 +65,11 @@ from engine.scrapeflow.work_units import (
 from .redaction import redact_error
 from .library_index import (
     SingleSeasonEpisodeProof,
+    _BRACKETED_EPISODE_EVIDENCE_KIND,
     _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
     _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
     _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND,
+    bracketed_episode_source_ordinals,
     prove_physical_special_single_season_evidence,
     prove_single_season_episode_evidence,
     release_dash_episode_source_ordinals,
@@ -1904,6 +1906,55 @@ def _release_dash_episode_map_path(
     return str(path)
 
 
+def _bracketed_episode_map_path(
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    proof: SingleSeasonEpisodeProof | None,
+) -> str | None:
+    """Build the F-only ``[01]`` source-key map after D revalidation.
+
+    A bracketed episode run often lives beside theatrical films inside one
+    ``剧场版``-labelled folder.  The smart planner's loose movie keyword must
+    not hijack those proved episodes, so F plans the unit through the explicit
+    episode-map path instead of the smart grouping.  The shared bracket rule
+    already wins over title digits in ``extract_episode_key``, and any parser
+    divergence from this strict grammar fails closed as an unmapped key.
+    """
+    if proof is None or proof.evidence_kind != _BRACKETED_EPISODE_EVIDENCE_KIND:
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None:
+        return None
+    try:
+        scoped = build_scoped_source_node(
+            build_source_inventory(snapshot["rows"], snapshot["root"]),
+            record.source_paths,
+            boundary_key=record.boundary_key,
+            display_label=record.display_label,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    source_ordinals = bracketed_episode_source_ordinals(scoped)
+    if source_ordinals is None:
+        return None
+    numbers = tuple(sorted(source_ordinals.values()))
+    expected = tuple(range(1, proof.episode_count + 1))
+    if numbers != expected or tuple(proof.episode_tokens) != tuple(
+        f"S{proof.season:02d}E{number:02d}" for number in expected
+    ):
+        return None
+    mapping = {
+        str(number): f"S{proof.season:02d}E{number:02d}"
+        for number in numbers
+    }
+    if len(mapping) != proof.episode_count:
+        return None
+    path = state_root / f"episode_map_{record.work_unit_id}.json"
+    atomic_write_json(path, mapping, allow_nan=False)
+    return str(path)
+
+
 def _release_title_ordinal_episode_map_path(
     state_root: Path,
     root_task_id: str,
@@ -2264,6 +2315,10 @@ def _request_for_unit(
         proof is not None
         and proof.evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND
     )
+    is_bracketed_proof = (
+        proof is not None
+        and proof.evidence_kind == _BRACKETED_EPISODE_EVIDENCE_KIND
+    )
     if proof_season is not None:
         if (
             isinstance(season, int)
@@ -2327,9 +2382,10 @@ def _request_for_unit(
         )
         return request
     # Multi-scope WorkUnits already hand an exact fresh manifest to F.  A
-    # D/F-only title-ordinal grammars need that same pin even for one scope:
-    # otherwise an object added after the proof could be discovered by the
-    # planner and consume a narrowly enabled parser without being proven.
+    # D/F-only grammar (release-dash, title-ordinal, bracketed) needs that
+    # same pin even for one scope: otherwise an object added after the proof
+    # could be discovered by the planner and consume a narrowly enabled
+    # parser without being proven.
     fresh_scopes: tuple[str, ...] | None = None
     manifest: tuple[Mapping[str, object], ...] | None = None
     if load_source_manifest(state_root, root_task_id) is not None:
@@ -2341,6 +2397,7 @@ def _request_for_unit(
         or any(kind == "file" for kind in scope_kinds.values())
         or is_release_dash_proof
         or is_release_title_ordinal_proof
+        or is_bracketed_proof
     ):
         fresh_scopes, manifest = _fresh_scoped_source_files(
             runner,
@@ -2349,7 +2406,9 @@ def _request_for_unit(
             record,
             root_job,
             require_single_scope_manifest=(
-                is_release_dash_proof or is_release_title_ordinal_proof
+                is_release_dash_proof
+                or is_release_title_ordinal_proof
+                or is_bracketed_proof
             ),
         )
     if fresh_scopes is not None and manifest is not None:
@@ -2389,6 +2448,16 @@ def _request_for_unit(
                 "请保持暂停并重建边界/对账"
             )
         request = replace(request, allow_release_title_ordinal=True)
+    if map_path is None:
+        map_path = _bracketed_episode_map_path(
+            state_root, root_task_id, record, proof,
+        )
+    if is_bracketed_proof:
+        if proof_season is None or map_path is None:
+            raise ValueError(
+                "D 纯方括号集号证据无法重建 F 显式映射；"
+                "请保持暂停并重建边界/对账"
+            )
     if map_path is None:
         map_path = _physical_special_episode_map_path(
             state_root, root_task_id, record, proof,

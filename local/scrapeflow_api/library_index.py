@@ -1688,6 +1688,36 @@ def _strict_bracketed_episode_number_for_file(file: SourceFile) -> int | None:
     return number
 
 
+def _strict_bracketed_episode_members(
+    node: SourceNode | None,
+) -> tuple[tuple[str, int], ...] | None:
+    """Return exact ``(source_path, ordinal)`` members of one ``[01]`` run.
+
+    This is the member-level view of :func:`_strict_bracketed_episode_numbers`
+    used by the D/F proof chain: F turns the same strict members into an
+    explicit episode map, so every planner override stays tied to one
+    revalidated source file instead of a bare ordinal.
+    """
+    videos = _regular_episode_primary_videos(node)
+    if not videos:
+        return None
+    members: list[tuple[str, int]] = []
+    for file in videos:
+        number = _strict_bracketed_episode_number_for_file(file)
+        if number is None:
+            return None
+        members.append((str(file.path).rstrip("/"), int(number)))
+    numbers = [number for _path, number in members]
+    if len(set(numbers)) != len(numbers):
+        return None
+    ordered = tuple(sorted(numbers))
+    if ordered != tuple(range(1, len(numbers) + 1)):
+        return None
+    if len({path for path, _number in members}) != len(members):
+        return None
+    return tuple(sorted(members))
+
+
 def _strict_bracketed_episode_numbers(
     node: SourceNode | None,
 ) -> tuple[int, ...] | None:
@@ -1698,22 +1728,24 @@ def _strict_bracketed_episode_numbers(
     with ambiguous brackets still invalidates the entire proof rather than
     being ignored.
     """
-    videos = _regular_episode_primary_videos(node)
-    if not videos:
+    members = _strict_bracketed_episode_members(node)
+    if members is None:
         return None
-    numbers = [
-        _strict_bracketed_episode_number_for_file(file)
-        for file in videos
-    ]
-    if any(number is None for number in numbers):
-        return None
-    concrete = [int(number) for number in numbers if number is not None]
-    if len(set(concrete)) != len(concrete):
-        return None
-    ordered = tuple(sorted(concrete))
-    if ordered != tuple(range(1, len(concrete) + 1)):
-        return None
-    return ordered
+    return tuple(sorted(number for _path, number in members))
+
+
+def bracketed_episode_source_ordinals(
+    node: SourceNode | None,
+) -> dict[str, int] | None:
+    """Expose the exact D/F source-key proof for ``[01]`` runs.
+
+    F uses this only after re-running
+    :func:`prove_single_season_episode_evidence`: the strict members become
+    the planner's explicit episode map, so an enclosing movie-label directory
+    (``剧场版``) cannot hijack a proved bracketed episode run.
+    """
+    members = _strict_bracketed_episode_members(node)
+    return dict(members) if members is not None else None
 
 
 def _contains_bracketed_regular_episode(node: SourceNode | None) -> bool:
@@ -2988,6 +3020,7 @@ __all__ = [
     "ReconciliationDecision",
     "SHELF_BY_SEGMENT",
     "build_library_index",
+    "bracketed_episode_source_ordinals",
     "decide_reconciliation",
     "prove_bracketed_episode_single_season",
     "prove_bare_episode_single_season",
