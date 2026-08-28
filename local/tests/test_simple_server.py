@@ -1250,3 +1250,168 @@ if __name__ == "__main__":
 
         self.assertEqual(status, 409)
         self.assertIn("对账或写入", str(payload.get("error", "")))
+
+    def _prepare_partially_written_root(self) -> str:
+        """One parked uncertain unit beside a sibling with write-side facts.
+
+        The source shape mirrors a bundled release: a season folder already
+        written by G and one mixed feature/mini-series folder whose C match
+        parked uncertain before a generic B/W fix was deployed.  The ledger
+        is hand-built to the PRE-fix boundary (the whole mixed folder is one
+        unit), while the snapshot and exact-object manifest reflect the tree.
+        """
+        from engine.scrapeflow.root_boundaries import (
+            build_root_boundary_analysis,
+            persist_root_boundary_analysis,
+        )
+
+        big = 2 * 1024 ** 3
+        self.remote.entries["/library/待刮削/Example"] = [
+            {"name": "Northwind.Show.S01.1080p", "is_dir": True},
+            {"name": "Northwind Feature The Final", "is_dir": True},
+        ]
+        self.remote.entries["/library/待刮削/Example/Northwind.Show.S01.1080p"] = [
+            {"name": f"Northwind.Show.S01E{episode:02d}.1080p.mkv", "is_dir": False, "size": big}
+            for episode in (1, 2)
+        ]
+        final_folder = "/library/待刮削/Example/Northwind Feature The Final"
+        self.remote.entries[final_folder] = [
+            {"name": "Northwind ~The Final~ 2160p.mkv", "is_dir": False, "size": 13 * 1024 ** 3},
+            {"name": "Northwind ~The Semi-Final~ [01] 2160p.mkv", "is_dir": False, "size": big},
+            {"name": "Northwind ~The Semi-Final~ [02] 2160p.mkv", "is_dir": False, "size": big},
+        ]
+        root_id = self.create_root()
+        snapshot, _records = build_root_boundary_analysis(
+            self.remote, "/library/待刮削/Example", root_task_id=root_id,
+        )
+        persist_root_boundary_analysis(
+            self.state_root, root_id, snapshot, _records,
+        )
+        written = next(
+            record for record in _records
+            if record.source_paths == (
+                "/library/待刮削/Example/Northwind.Show.S01.1080p",
+            )
+        )
+        written = replace(
+            written,
+            identity_status="confirmed",
+            identity={"source": "automatic", "tmdb_id": 17, "media_type": "tv"},
+            reconciliation_outcome="new_work",
+            writer_job_id="unit-written",
+            gap_status="registered",
+        )
+        parked = WorkUnitRecord(
+            work_unit_id="unit-parked-bundle",
+            root_task_id=root_id,
+            boundary_key=final_folder,
+            source_paths=(final_folder,),
+            source_revision=1,
+            role="series_container",
+            display_label="Northwind Feature The Final",
+            claimed_seasons=(),
+            media_context="unknown",
+            identity_status="uncertain",
+            attention="自动匹配缺少可验证的标题/别名证据",
+        )
+        save_work_unit_records(
+            self.state_root, root_id, [written, parked],
+        )
+        parked_job = replace(
+            self.runner.get_job(root_id),
+            phase="reconciliation_uncertain",
+        )
+        atomic_write_json(
+            self.runner._job_path(root_id),  # noqa: SLF001 - durable fixture
+            parked_job.as_dict(),
+            allow_nan=False,
+        )
+        return root_id
+
+    def test_uncertain_unit_rebuild_splits_mixed_folder_after_partial_write(self) -> None:
+        """A deployed B/W fix must reach a never-written mixed folder.
+
+        The whole-root rebuild fails closed once a sibling carries writer/gap
+        facts; the narrower uncertain-unit surface re-derives only the parked
+        unit's scope, keeps the written sibling byte-identical, and queues the
+        root for a fresh C/D/E pass over the split candidates.
+        """
+        root_id = self._prepare_partially_written_root()
+        final_folder = "/library/待刮削/Example/Northwind Feature The Final"
+
+        # Whole-root surface must refuse: the sibling has write-side facts.
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-boundaries", {},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("对账或写入", str(payload.get("error", "")))
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-uncertain-units", {},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["phase"], "queued")
+        self.assertEqual(
+            self.application.control(), {"paused": True, "root_job_id": root_id}
+        )
+        records = load_work_unit_records(self.state_root, root_id)
+        by_paths = {record.source_paths: record for record in records}
+        feature = f"{final_folder}/Northwind ~The Final~ 2160p.mkv"
+        run_one = f"{final_folder}/Northwind ~The Semi-Final~ [01] 2160p.mkv"
+        run_two = f"{final_folder}/Northwind ~The Semi-Final~ [02] 2160p.mkv"
+        self.assertIn((feature,), by_paths)
+        self.assertIn((run_one, run_two), by_paths)
+        self.assertEqual(by_paths[(feature,)].media_context, "movie")
+        self.assertEqual(by_paths[(run_one, run_two)].media_context, "tv")
+        # The written sibling keeps its identity/D/J facts byte-identical.
+        written = next(
+            record for record in records
+            if record.source_paths == (
+                "/library/待刮削/Example/Northwind.Show.S01.1080p",
+            )
+        )
+        self.assertEqual(written.identity_status, "confirmed")
+        self.assertEqual(written.writer_job_id, "unit-written")
+        self.assertEqual(written.gap_status, "registered")
+        # Fresh units are pending at the new revision and own no facts.
+        for record in records:
+            if record is written:
+                continue
+            self.assertEqual(record.source_revision, 2)
+            self.assertEqual(record.identity_status, "pending")
+            self.assertIsNone(record.identity)
+            self.assertIsNone(record.reconciliation_outcome)
+
+    def test_uncertain_unit_rebuild_requires_paused_selected_root(self) -> None:
+        root_id = self._prepare_partially_written_root()
+        self.application._control_state.set(  # noqa: SLF001
+            paused=False, root_job_id=root_id,
+        )
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-uncertain-units", {},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("暂停态", str(payload.get("error", "")))
+
+    def test_uncertain_unit_rebuild_refuses_written_uncertain_unit(self) -> None:
+        """A D-written record masquerading as uncertain must stop the surface."""
+        root_id = self._prepare_partially_written_root()
+        records = load_work_unit_records(self.state_root, root_id)
+        parked = next(
+            record for record in records if record.identity_status == "uncertain"
+        )
+        tainted = replace(parked, reconciliation_outcome="new_work")
+        save_work_unit_records(
+            self.state_root, root_id,
+            [record for record in records if record is not parked] + [tainted],
+        )
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/rebuild-uncertain-units", {},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("对账或写入", str(payload.get("error", "")))

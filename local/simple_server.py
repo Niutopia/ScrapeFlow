@@ -2098,6 +2098,135 @@ class SimpleApplication:
             self._queue_automatic_job(job_id)
         return self.public_engine_job(retried)
 
+    def rebuild_uncertain_unit_boundaries(
+        self,
+        job_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Re-derive ONLY the parked C-uncertain units' boundaries for one root.
+
+        The whole-root ``rebuild-boundaries`` surface must fail closed once any
+        sibling unit carries write-side facts, because re-analysing a
+        partially consumed source tree cannot reproduce those siblings'
+        scopes.  A generic B/W rule deployed after such a partial write still
+        needs a recovery point: this narrower surface re-runs the boundary
+        analysis on each never-written C-uncertain unit's own single scope,
+        keeps every other record byte-identical, and leaves the root paused
+        and queued for the operator to resume.  It neither performs shelf
+        selection nor starts a worker.
+        """
+        if not isinstance(payload, Mapping) or payload:
+            raise EngineRequestError("未决单元边界重建请求必须是空 JSON 对象")
+        selected = self._validate_selected_root_job(job_id)
+        control = self.control()
+        if control.get("paused") is not True or control.get("root_job_id") != selected:
+            raise EngineRequestError("未决单元边界重建必须在当前已选 RootJob 的暂停态执行")
+        from engine.scrapeflow.root_boundaries import (
+            load_source_manifest,
+            rederive_uncertain_unit_boundary,
+            source_object_claims_for_records,
+        )
+        from engine.scrapeflow.source_objects import (
+            validate_unique_source_object_ownership,
+        )
+        from engine.scrapeflow.work_units import save_work_unit_records
+        from local.scrapeflow_api.root_pipeline import is_intake_bound_root
+
+        with self._automatic_lock:
+            active = self._worker_future
+            if active is not None and not active.done():
+                raise EngineWorkerBusyError("任务仍有活动 worker，不能重建未决单元边界")
+            runner = self._get_engine_runner()
+            before = runner.get_job(selected)
+            if before.phase != "reconciliation_uncertain":
+                raise EngineJobConflictError(
+                    f"当前任务阶段不能重建未决单元边界: {before.phase}"
+                )
+            summary = before.summary if isinstance(before.summary, Mapping) else {}
+            if "active_operation" in summary or "replenishment" in summary:
+                raise EngineJobConflictError("任务已有活动或补源状态，不能重建未决单元边界")
+            cancel_marker = runner._cancel_request_path(selected)  # noqa: SLF001 - exact local marker
+            if cancel_marker.exists() or cancel_marker.is_symlink():
+                raise EngineJobConflictError("任务已有取消请求，不能重建未决单元边界")
+            if not is_intake_bound_root(self.state_root, selected):
+                raise EngineRequestError("未决单元边界重建只支持 IntakeSource 创建的 RootJob")
+            records = self._rebuild_boundary_records(selected)
+            uncertain = [
+                record for record in records
+                if record.identity_status == "uncertain"
+            ]
+            if not uncertain:
+                raise EngineRequestError("没有 C 未决单元，无需重建未决边界")
+            ingress = str(runner._job_ingress_source(before)).rstrip("/")  # noqa: SLF001 - root composition
+            for record in uncertain:
+                if record.requires_content_expansion or len(record.source_paths) != 1:
+                    raise EngineJobConflictError(
+                        f"未决单元 {record.work_unit_id} 的边界形状不能安全重建，请人工处理"
+                    )
+                scope = str(record.source_paths[0]).rstrip("/")
+                if scope == ingress:
+                    raise EngineJobConflictError("整根边界请使用目录边界重建接口")
+                if not runner.source_directory_exists(scope):
+                    raise EngineJobConflictError("未决单元来源目录已不存在，不能重建边界")
+            source_revision = max(
+                record.source_revision for record in records
+            ) + 1
+            # The fresh AList walk of each uncertain scope runs outside the
+            # writer lock; the final lock and re-check below rejects any
+            # concurrent change to the durable root or ledger.
+            replacements = [
+                rederive_uncertain_unit_boundary(
+                    runner.alist,
+                    record,
+                    root_task_id=selected,
+                    source_revision=source_revision,
+                )
+                for record in uncertain
+            ]
+            with runner.worker_lock():
+                latest = runner.get_job(selected)
+                if (
+                    latest.phase != before.phase
+                    or latest.updated_at != before.updated_at
+                ):
+                    raise EngineJobConflictError("RootJob 状态已变化，请刷新后再重试")
+                current = self._rebuild_boundary_records(selected)
+                if [item.work_unit_id for item in current] != [
+                    item.work_unit_id for item in records
+                ]:
+                    raise EngineJobConflictError("WorkUnit 账本已变化，请刷新后再重试")
+                control = self.control()
+                if (
+                    control.get("paused") is not True
+                    or control.get("root_job_id") != selected
+                ):
+                    raise EngineJobConflictError("控制状态已变化，不能重建未决单元边界")
+                combined = [
+                    record
+                    for record in records
+                    if record.identity_status != "uncertain"
+                ]
+                for group in replacements:
+                    combined.extend(group)
+                save_work_unit_records(self.state_root, selected, combined)
+                manifest = load_source_manifest(self.state_root, selected)
+                if manifest is not None:
+                    validate_unique_source_object_ownership(
+                        source_object_claims_for_records(manifest, combined)
+                    )
+                rebuilt = replace(
+                    latest,
+                    phase="queued",
+                    updated_at=_now(),
+                    error=None,
+                )
+                atomic_write_json(
+                    runner._job_path(selected),  # noqa: SLF001 - root state boundary
+                    _redacted_job_payload(rebuilt),
+                    allow_nan=False,
+                )
+        return self.public_engine_job(rebuilt)
+
     def _rebuild_boundary_records(self, root_job_id: str) -> list[object]:
         """Read one existing B/W ledger strictly enough to replace it safely.
 
@@ -2832,6 +2961,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(
                         200,
                         {"job": self.application.rebuild_public_job_boundaries(job_id, payload)},
+                    )
+                    return
+                if operation == "rebuild-uncertain-units":
+                    self._send(
+                        200,
+                        {"job": self.application.rebuild_uncertain_unit_boundaries(job_id, payload)},
                     )
                     return
                 if operation == "cancel":

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .boundary_analysis import analyze_boundaries
 from .serialization import atomic_write_json
@@ -162,28 +162,106 @@ def build_root_boundary_analysis(
         source_revision=source_revision,
     )
     if exact is not None:
-        claims: list[SourceObjectClaim] = []
-        for record in records:
-            owned = tuple(
-                obj
-                for obj in exact.objects
-                if any(
-                    obj.path == scope or obj.path.startswith(scope + "/")
-                    for scope in record.source_paths
-                )
-                and not obj.is_directory
-            )
-            if owned:
-                claims.append(SourceObjectClaim(
-                    owner_kind="work_unit",
-                    owner_id=record.work_unit_id,
-                    objects=owned,
-                ))
         # A source object may be intentionally residual, but it may not be
         # claimed by two WorkUnits.  The exact check is local and read-only;
         # an overlap parks the B/W rebuild instead of widening F's scope.
-        validate_unique_source_object_ownership(claims)
+        validate_unique_source_object_ownership(
+            source_object_claims_for_records(exact, records)
+        )
     return snapshot, records
+
+
+def source_object_claims_for_records(
+    manifest: SourceManifest,
+    records: Sequence[WorkUnitRecord],
+) -> list[SourceObjectClaim]:
+    """Map every record's scope to the exact non-directory objects it owns."""
+    claims: list[SourceObjectClaim] = []
+    for record in records:
+        owned = tuple(
+            obj
+            for obj in manifest.objects
+            if any(
+                obj.path == scope or obj.path.startswith(scope + "/")
+                for scope in record.source_paths
+            )
+            and not obj.is_directory
+        )
+        if owned:
+            claims.append(SourceObjectClaim(
+                owner_kind="work_unit",
+                owner_id=record.work_unit_id,
+                objects=owned,
+            ))
+    return claims
+
+
+def rederive_uncertain_unit_boundary(
+    alist: object,
+    record: WorkUnitRecord,
+    *,
+    root_task_id: str,
+    source_revision: int,
+) -> list[WorkUnitRecord]:
+    """Re-derive one parked C-uncertain unit's boundary from a fresh walk.
+
+    The whole-root rebuild surface must fail closed once any sibling unit
+    carries write-side facts, because re-analysing a partially consumed
+    source tree cannot reproduce those siblings' scopes.  A generic B/W rule
+    deployed after such a partial write still needs a recovery point: this
+    surgical helper re-runs ``analyze_boundaries`` on ONLY the never-written
+    uncertain unit's own single-directory scope, so every sibling record can
+    stay byte-identical.  The scope is walked fresh from AList; a vanished
+    or empty listing fails closed and keeps the parked record.  Callers must
+    already have proved the record is a C park; the helper re-proves the
+    absence of write-side facts defensively.
+    """
+    if record.root_task_id != root_task_id:
+        raise ValueError("单元不属于该根任务")
+    if record.identity_status != "uncertain" or record.requires_content_expansion:
+        raise ValueError("只有 C 未决且无需内容展开的单元才能重建边界")
+    if (
+        record.reconciliation_outcome is not None
+        or record.matched_work_root is not None
+        or record.writer_job_id is not None
+        or record.lane_status is not None
+        or record.lane_detail is not None
+        or record.uncovered_tokens
+        or record.gap_status is not None
+        or record.gap_detail is not None
+    ):
+        raise ValueError("单元已进入对账或写入阶段，不能重建边界")
+    if (record.identity or {}).get("source") == "operator_override":
+        raise ValueError("存在人工身份确认，不能重建边界")
+    if len(record.source_paths) != 1:
+        raise ValueError("多来源边界的未决单元不能安全重建，请人工处理")
+    scope = str(record.source_paths[0]).rstrip("/")
+    if not scope or scope == "/":
+        raise ValueError("单元边界无效，不能重建")
+    rows = walk_source_rows(alist, scope)
+    if not rows:
+        raise ValueError("单元来源目录为空或不可读取，不能重建边界")
+    node = build_source_inventory(rows, scope)
+    candidates = analyze_boundaries(node, root_task_id=root_task_id)
+    if not candidates:
+        raise ValueError("新的目录分析未发现可验证作品单元，已保留原状态")
+    records = create_work_units_from_candidates(
+        candidates,
+        root_task_id,
+        source_revision=source_revision,
+    )
+    scopes = sorted({
+        str(path).rstrip("/")
+        for item in records
+        for path in item.source_paths
+    })
+    for path in scopes:
+        if path != scope and not path.startswith(scope + "/"):
+            raise ValueError("重建边界越出了原单元来源范围，已保留原状态")
+    for index in range(1, len(scopes)):
+        if scopes[index].startswith(scopes[index - 1] + "/"):
+            raise ValueError("重建边界出现嵌套覆盖，已保留原状态")
+    return records
 
 
 def persist_root_boundary_analysis(
@@ -277,5 +355,7 @@ __all__ = [
     "load_source_snapshot",
     "load_source_manifest",
     "persist_root_boundary_analysis",
+    "rederive_uncertain_unit_boundary",
+    "source_object_claims_for_records",
     "walk_source_rows",
 ]
