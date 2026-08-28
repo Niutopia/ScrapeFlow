@@ -3463,6 +3463,57 @@ def _tv_season_resource_gaps(
     return gaps
 
 
+def special_season_window_candidates(
+    show: Mapping[str, Any],
+    season_data: Mapping[str, Any],
+    specials_data: Mapping[str, Any],
+    season: int,
+) -> list[EpisodeKey]:
+    """S00 episodes airing within the season's official timeline, in order.
+
+    The window opens at the season's first regular air date and closes at the
+    first air date of any later positive season (open-ended for the final
+    season, which can receive an OVA years later through a game or
+    anniversary release).
+    """
+    regular_dates = sorted(
+        str(item.get("air_date"))
+        for item in (season_data.get("episodes") or [])
+        if isinstance(item, Mapping)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
+    )
+    if not regular_dates:
+        return []
+    season_start = datetime.fromisoformat(regular_dates[0]).date()
+    later_season_starts = sorted(
+        datetime.fromisoformat(str(item.get("air_date"))).date()
+        for item in (show.get("seasons") or [])
+        if isinstance(item, Mapping)
+        and isinstance(item.get("season_number"), int)
+        and int(item["season_number"]) > season
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
+    )
+    window_end = (
+        later_season_starts[0]
+        if later_season_starts
+        else datetime.max.date()
+    )
+    candidates = sorted(
+        (
+            datetime.fromisoformat(str(item.get("air_date"))).date(),
+            EpisodeKey("special", int(item["episode_number"])),
+        )
+        for item in (specials_data.get("episodes") or [])
+        if isinstance(item, Mapping)
+        and isinstance(item.get("episode_number"), int)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
+        and season_start
+        <= datetime.fromisoformat(str(item.get("air_date"))).date()
+        < window_end
+    )
+    return [key for _, key in candidates]
+
+
 def _build_tv_episode_map(
     tmdb_client: TMDBClient,
     show: Mapping[str, Any],
@@ -3544,47 +3595,11 @@ def _build_tv_episode_map(
         if special_titles is not None:
             special_titles[key] = title
     if special_season_candidates is not None and not absolute and season_data is not None:
-        regular_dates = sorted(
-            str(item.get("air_date"))
-            for item in (season_data.get("episodes") or [])
-            if isinstance(item, Mapping)
-            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
+        candidates = special_season_window_candidates(
+            show, season_data, specials_data, season
         )
-        if regular_dates:
-            season_start = datetime.fromisoformat(regular_dates[0]).date()
-            season_end = datetime.fromisoformat(regular_dates[-1]).date()
-            later_season_starts = sorted(
-                datetime.fromisoformat(str(item.get("air_date"))).date()
-                for item in (show.get("seasons") or [])
-                if isinstance(item, Mapping)
-                and isinstance(item.get("season_number"), int)
-                and int(item["season_number"]) > season
-                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
-            )
-            window_end = (
-                later_season_starts[0]
-                if later_season_starts
-                # The final season can receive an OVA years later through a
-                # game or anniversary release. With no later season boundary,
-                # keep the official post-season timeline open instead of
-                # dropping a verified TMDB special after an arbitrary cutoff.
-                else datetime.max.date()
-            )
-            candidates = sorted(
-                (
-                    datetime.fromisoformat(str(item.get("air_date"))).date(),
-                    EpisodeKey("special", int(item["episode_number"])),
-                )
-                for item in (specials_data.get("episodes") or [])
-                if isinstance(item, Mapping)
-                and isinstance(item.get("episode_number"), int)
-                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("air_date") or ""))
-                and season_start
-                <= datetime.fromisoformat(str(item.get("air_date"))).date()
-                < window_end
-            )
-            if candidates:
-                special_season_candidates[season] = [key for _, key in candidates]
+        if candidates:
+            special_season_candidates[season] = candidates
     return mapping
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
@@ -22,7 +23,11 @@ from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,
     _season_number_from_directory_name,
 )
-from engine.scrapeflow.core import _special_arc_title_key
+from engine.scrapeflow.core import (
+    _pending_special_release_ordinal,
+    _special_arc_title_key,
+    special_season_window_candidates,
+)
 from engine.scrapeflow.identity_matching import (
     AUTO_MATCH_MIN_MARGIN,
     _clean_boundary_identity_query,
@@ -687,6 +692,70 @@ def _unit_episode_tokens(
 
 def _has_video(node: SourceNode) -> bool:
     return any(file.object_type == "video" for file in collect_all_files(node))
+
+
+_SPECIAL_MARKER_RE = re.compile(r"OVBSP|OVA|OAV|OAD")
+
+
+def _season_scoped_special_run_tokens(
+    scoped_node: SourceNode,
+    *,
+    tmdb_client: object | None,
+    tmdb_id: int,
+    season: int | None,
+) -> frozenset[str]:
+    """Derive S00 coordinates for a season-scoped same-marker OVA run.
+
+    A physical release can ship one season's bonus videos as a same-marker
+    run (``[12(OVA)]``/``[13(OVA)]``) whose filenames carry no episode
+    grammar.  The season identity plus the official timeline still yields
+    unambiguous coordinates: every video carries a special marker and one
+    distinct release ordinal, and the season's official S00 window holds
+    exactly as many slots as the run has videos.  The bijection fixes the
+    token set without pairing individual files — F pairs them by release
+    order when writing.  Anything looser stays fail-closed (empty set), so
+    the unit keeps its manual-confirmation surface.
+    """
+    if tmdb_client is None or season is None or season <= 0:
+        return frozenset()
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return frozenset()
+    videos = [
+        file
+        for file in collect_all_files(scoped_node)
+        if file.object_type == "video"
+    ]
+    if not videos:
+        return frozenset()
+    ordinals: list[int] = []
+    for file in videos:
+        normalized = unicodedata.normalize("NFKC", file.name).upper()
+        if not _SPECIAL_MARKER_RE.search(normalized):
+            # A non-special video in scope breaks the run bijection.
+            return frozenset()
+        ordinal = _pending_special_release_ordinal({"name": file.name})
+        if ordinal is None:
+            return frozenset()
+        ordinals.append(ordinal)
+    if len(set(ordinals)) != len(ordinals):
+        return frozenset()
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+        season_data = getter(f"/tv/{tmdb_id}/season/{season}")
+        specials_data = getter(f"/tv/{tmdb_id}/season/0")
+    except Exception:
+        return frozenset()
+    if not isinstance(show, Mapping) or not isinstance(season_data, Mapping):
+        return frozenset()
+    if not isinstance(specials_data, Mapping):
+        specials_data = {"episodes": []}
+    window = special_season_window_candidates(
+        show, season_data, specials_data, season
+    )
+    if len(window) != len(videos):
+        return frozenset()
+    return frozenset(f"S00E{key.number:02d}" for key in window)
 
 
 def _scope_season_number(path: str) -> int | None:
@@ -3105,10 +3174,35 @@ def reconcile_root_work_units(
                         ),
                     )
                 if decision is None:
-                    decision = ReconciliationDecision(
-                        "uncertain", None, None,
-                        ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
+                    # A season-scoped same-marker OVA run carries no episode
+                    # grammar, but the season identity plus the official
+                    # timeline can still prove its S00 coordinates.  The
+                    # verdict is computed inline (not persisted as a season
+                    # proof receipt) because the coordinates describe Season
+                    # 00 while the identity season stays the run's own
+                    # season.
+                    special_run_tokens = _season_scoped_special_run_tokens(
+                        scoped_node,
+                        tmdb_client=tmdb_client,
+                        tmdb_id=tmdb_id,
+                        season=default_season,
                     )
+                    if special_run_tokens:
+                        decision = decide_reconciliation(
+                            index,
+                            media_type=media_type,
+                            tmdb_id=tmdb_id,
+                            unit_tokens=special_run_tokens,
+                            known_gap_tokens=frozenset(
+                                str(token)
+                                for token in known.get((media_type, tmdb_id), ())
+                            ),
+                        )
+                    else:
+                        decision = ReconciliationDecision(
+                            "uncertain", None, None,
+                            ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
+                        )
             else:
                 empty_seasons = (
                     _declared_empty_seasons(record, nodes_by_path)

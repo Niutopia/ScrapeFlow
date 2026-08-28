@@ -1089,7 +1089,153 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
 
-    def test_naked_numeric_proof_ignores_an_empty_future_tmdb_season(self) -> None:
+    def test_season_scoped_ova_run_derives_its_window_coordinates(self) -> None:
+        """A season-confirmed same-marker OVA run proves its S00 coordinates.
+
+        ``W 4k 某剧 第三季OVA`` holds ``[12(OVA)]``/``[13(OVA)]`` with no
+        episode grammar, but the operator-confirmed season 3 plus the official
+        timeline (two S00 slots inside season 3's window) fixes the token set.
+        D must reuse the F pairing rule instead of staying uncertain, and must
+        not persist a Season 00 proof receipt against the season-3 identity.
+        """
+
+        class SeasonScopedTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 4, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 10, "name": "第 1 季"},
+                            {"season_number": 2, "episode_count": 10, "name": "第 2 季"},
+                            {"season_number": 3, "episode_count": 11, "name": "第 3 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    return {
+                        "episodes": [
+                            {"episode_number": 1, "air_date": "2016-06-24", "name": "OAD1"},
+                            {"episode_number": 2, "air_date": "2017-07-24", "name": "OAD2"},
+                            {"episode_number": 3, "air_date": "2025-04-25", "name": "OVA1"},
+                            {"episode_number": 4, "air_date": "2025-04-25", "name": "OVA2"},
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/3":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2024-04-01" if number == 1 else "2024-04-08",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 12)
+                        ]
+                    }
+                if path.startswith(f"/tv/{self.tmdb_id}/season/"):
+                    return {"episodes": []}
+                return {}
+
+        def library_files() -> dict[str, bytes]:
+            files: dict[str, bytes] = {
+                "/library/番剧/示例剧/tvshow.nfo": _nfo_tv(99054, "示例剧", "2016"),
+            }
+            for season in (1, 2, 3):
+                for episode in range(1, 11 if season == 3 else 10 + 1):
+                    files[
+                        f"/library/番剧/示例剧/Season {season:02d}/S{season:02d}E{episode:02d}.mkv"
+                    ] = b"v"
+            return files
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-season-scoped-ova"
+            tmdb = SeasonScopedTMDB(99054)
+            alist = IndexAList(library_files() | {
+                "/incoming/W 4k 某剧 第三季OVA/[Grp] 某剧 [12(OVA)][2160p].mkv": b"v",
+                "/incoming/W 4k 某剧 第三季OVA/[Grp] 某剧 [13(OVA)][2160p].mkv": b"v",
+            })
+            analyze_root_boundaries(
+                alist, "/incoming/W 4k 某剧 第三季OVA",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id, season=3,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "merge_existing")
+            self.assertIsNone(record.reconciliation_evidence)
+            self.assertEqual(record.attention, None)
+
+    def test_season_scoped_ova_run_fails_closed_on_window_mismatch(self) -> None:
+        """A run longer than the official window keeps its manual surface."""
+
+        class MismatchedWindowTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 3, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 10, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    return {
+                        "episodes": [
+                            {"episode_number": 1, "air_date": "2016-06-24", "name": "OAD1"},
+                            {"episode_number": 2, "air_date": "2017-07-24", "name": "OAD2"},
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2020-01-01",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 11)
+                        ]
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-season-scoped-ova-mismatch"
+            tmdb = MismatchedWindowTMDB(99055)
+            alist = IndexAList({
+                "/incoming/W 4k 某剧 第一季OVA/[Grp] 某剧 [11(OVA)].mkv": b"v",
+                "/incoming/W 4k 某剧 第一季OVA/[Grp] 某剧 [12(OVA)].mkv": b"v",
+                "/incoming/W 4k 某剧 第一季OVA/[Grp] 某剧 [13(OVA)].mkv": b"v",
+            })
+            analyze_root_boundaries(
+                alist, "/incoming/W 4k 某剧 第一季OVA",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id, season=1,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+            self.assertIn("缺少可证明的季集坐标", record.attention or "")
         """TMDB's zero-episode announced season has no coordinate to infer."""
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
