@@ -3178,3 +3178,93 @@ class ConsumedSourceContinuationTests(unittest.TestCase):
         # stayed in the source.
         self.assertIn("/library/番剧/Work (101)/S01E01.mkv", alist.files)
         self.assertIn("/incoming/one/NEW.mkv", alist.files)
+
+    def test_preplan_failure_keeps_previous_receipt_for_continuation(self) -> None:
+        """A receipt-less attempt must not erase the interrupted write's receipt.
+
+        An operator rollback of a wrong partial write restores the source
+        objects under fresh provider mtimes, so the next retry can only
+        resume through the previous failed attempt's planned receipt.  When
+        that retry itself fails before planning anything (here an injected
+        planner conflict, like the source occupant check), persisting the
+        new failure without the old receipt would destroy the continuation
+        evidence and leave the root with no sanctioned resume path.
+        """
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = IndexAList({"/incoming/one/S01E01.mkv": FAKE_VIDEO_BYTES})
+        alist.modified["/incoming/one/S01E01.mkv"] = "T1"
+        plan_calls: list[dict] = []
+        planner_calls = {"count": 0}
+        base_planner = _recording_planner(plan_calls)
+        fail_once = {"remaining": 1}
+
+        def flaky_planner(request, _alist, _tmdb):
+            planner_calls["count"] += 1
+            if planner_calls["count"] == 2:
+                raise PlanError("injected occupant conflict")
+            return base_planner(request, _alist, _tmdb)
+
+        def executor(plan):
+            for item in plan.files:
+                source = f"{item.source_dir.rstrip('/')}/{item.original_name}"
+                target = f"{item.target_dir.rstrip('/')}/{item.final_name}"
+                if source in alist.files:
+                    alist.move(item.source_dir, item.target_dir, [item.original_name])
+                else:
+                    payload = alist.files.get(target)
+                    if payload is None or (
+                        item.source_size is not None
+                        and len(payload) != item.source_size
+                    ):
+                        raise RuntimeError(f"continuation target missing: {target}")
+            if fail_once["remaining"] > 0:
+                fail_once["remaining"] -= 1
+                raise RuntimeError("injected artifact failure after moves")
+            return {"ok": True, "files": [], "file_count": 0, "artifacts": [], "artifact_count": 0, "cleanup": [], "cleanup_count": 0}
+
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=object(),
+            planner=flaky_planner, validate=False,
+            library_root="/library", executor=executor,
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-preplan")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-preplan",
+            state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-preplan")
+        apply_work_unit_override(
+            state_root, "root-preplan", records[0].work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, "root-preplan")
+
+        # First attempt: the writer moves the media and fails during
+        # artifacts, leaving a receipt-bearing failed acceptance record.
+        first = execute_new_work_units(runner, state_root, "root-preplan")
+        self.assertEqual(first[0].outcome, "failed")
+        self.assertIsNotNone(first[0].planned_receipt)
+
+        # Operator rollback: the wrongly placed media returns to the source
+        # under a fresh provider mtime (the rename/move touched it).
+        payload = alist.files.pop("/library/番剧/Work (101)/S01E01.mkv")
+        alist.files["/incoming/one/S01E01.mkv"] = payload
+        alist.modified["/incoming/one/S01E01.mkv"] = "T2"
+
+        # Second attempt: the manifest drift is bridged by the receipt, but
+        # planning itself fails.  The persisted failure must keep the receipt.
+        second = execute_new_work_units(runner, state_root, "root-preplan")
+        self.assertEqual(second[0].outcome, "failed")
+        self.assertIn("injected occupant conflict", str(second[0].error))
+        self.assertIsNotNone(second[0].planned_receipt)
+        self.assertEqual(len(second[0].planned_receipt or ()), 1)
+
+        # Third attempt: the carried receipt still bridges the drift; the
+        # restored source object moves normally and the unit is accepted.
+        third = execute_new_work_units(runner, state_root, "root-preplan")
+        self.assertEqual(third[0].outcome, "accepted")
+        self.assertIn("/library/番剧/Work (101)/S01E01.mkv", alist.files)
+        self.assertNotIn("/incoming/one/S01E01.mkv", alist.files)

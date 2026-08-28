@@ -3461,6 +3461,7 @@ def execute_new_work_units(
             # consumed-source continuation reads it instead of inferring
             # consumption from the mutated provider source.
             receipt: tuple[Mapping[str, Any], ...] | None = None
+            carried_target_root = ""
             if planned is not None:
                 receipt = tuple(
                     {
@@ -3474,6 +3475,30 @@ def execute_new_work_units(
                     for item in (planned.plan.get("files") or [])
                     if isinstance(item, Mapping)
                 ) or None
+                carried_target_root = str(planned.plan.get("target_root") or "")
+            if receipt is None:
+                # An attempt that produced no plan receipt (a request/planner
+                # failure before any file was planned) executes nothing, so
+                # the previous failed attempt's receipt is still the exact
+                # record of the last interrupted write.  Persisting a
+                # receipt-less record in its place would destroy the
+                # consumed-source continuation evidence the next retry reads,
+                # and a receipt-documented source rollback would be left with
+                # no sanctioned resume path at all.  Carry it forward; the
+                # continuation itself re-validates every object against the
+                # fresh source (present objects move, already-moved ones read
+                # back).
+                previous = {
+                    row.work_unit_id: row
+                    for row in load_work_acceptance(state_root, root_task_id)
+                }.get(record.work_unit_id)
+                if (
+                    previous is not None
+                    and previous.outcome == "failed"
+                    and previous.planned_receipt
+                ):
+                    receipt = tuple(previous.planned_receipt)
+                    carried_target_root = str(previous.target_root or "")
             try:
                 _retire_stale_unit_carrier(runner, carrier_id)
             except Exception:
@@ -3484,11 +3509,7 @@ def execute_new_work_units(
                 outcome="failed",
                 writer_job_id=None,
                 phase="failed",
-                target_root=(
-                    str(planned.plan.get("target_root") or "")
-                    if planned is not None
-                    else ""
-                ),
+                target_root=carried_target_root,
                 planned_files=len(receipt or ()),
                 error=redact_error(exc),
                 recorded_at=_now(),

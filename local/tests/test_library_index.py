@@ -47,6 +47,10 @@ class IndexAList:
         self.files: dict[str, bytes] = dict(files or {})
         self.dirs: set[str] = set()
         self.move_calls: list[tuple[str, str, list[str]]] = []
+        # Optional per-path provider mtimes.  Absent entries leave rows
+        # without ``modified`` (the default read shape); tests that need
+        # exact-manifest drift set an entry, then change it.
+        self.modified: dict[str, str] = {}
         for full_path in self.files:
             parts = full_path.strip("/").split("/")[:-1]
             current = ""
@@ -78,11 +82,14 @@ class IndexAList:
                 continue
             remainder = full_path[len(prefix):]
             if remainder and "/" not in remainder:
-                rows[remainder] = {
+                row: dict[str, object] = {
                     "name": remainder,
                     "is_dir": False,
                     "size": len(self.files[full_path]),
                 }
+                if full_path in self.modified:
+                    row["modified"] = self.modified[full_path]
+                rows[remainder] = row
         return [rows[name] for name in sorted(rows)]
 
     def read_file_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
