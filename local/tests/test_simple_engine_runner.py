@@ -1502,16 +1502,54 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         # vocabulary and removes everything inside it.
         source = "/incoming/Release"
         files = [
-            {"name": "[OP].mkv", "full_path": source + "/Menu/[OP].mkv"},
-            {"name": "[ED].mkv", "full_path": source + "/Menu/[ED].mkv"},
+            {"name": "[OP].mkv", "full_path": source + "/Plain/[OP].mkv"},
+            {"name": "[ED].mkv", "full_path": source + "/Plain/[ED].mkv"},
             {"name": "Show Menu - 01.mkv", "full_path": source + "/Show Menu - 01.mkv"},
             {"name": "Show Menu - [NCOP].mkv", "full_path": source + "/Show Menu - [NCOP].mkv"},
         ]
-        retained, residuals = _preclassify_theme_residuals(files)
+        retained, residuals, withheld_bonus = _preclassify_theme_residuals(files)
         self.assertEqual({item["name"] for item in retained}, {"Show Menu - 01.mkv"})
         self.assertEqual(len(residuals), 3)
+        self.assertEqual(withheld_bonus, [])
         self.assertTrue(all(item["action"] == "preserve_at_source" for item in residuals))
         self.assertTrue(all(item["reason"] == "no_write_source_residual" for item in residuals))
+
+    def test_preclassifier_withholds_bonus_directory_videos_for_official_evidence(self) -> None:
+        # A named mini-series under ``SPs/`` is removed from the episode
+        # parser exactly as before, but is returned in the third bucket so
+        # the smart planner can retry it against official Season 00
+        # evidence; the residual row keeps the member fail-closed until an
+        # evidence mapper re-admits it.
+        source = "/incoming/Release"
+        files = [
+            {
+                "name": "Mini Anime - 01.mkv",
+                "full_path": source + "/SPs/Mini Anime - 01.mkv",
+            },
+            {
+                "name": "Mini Anime - 02.mkv",
+                "full_path": source + "/SPs/Mini Anime - 02.mkv",
+            },
+            {
+                "name": "Show - 01.mkv",
+                "full_path": source + "/Show - 01.mkv",
+            },
+        ]
+        retained, residuals, withheld_bonus = _preclassify_theme_residuals(files)
+        self.assertEqual(
+            {item["name"] for item in retained}, {"Show - 01.mkv"}
+        )
+        self.assertEqual(
+            {item["name"] for item in withheld_bonus},
+            {"Mini Anime - 01.mkv", "Mini Anime - 02.mkv"},
+        )
+        self.assertEqual(
+            {row["source_path"] for row in residuals},
+            {
+                source + "/SPs/Mini Anime - 01.mkv",
+                source + "/SPs/Mini Anime - 02.mkv",
+            },
+        )
 
     def test_sole_season_bare_run_merges_via_official_alternative_title(self) -> None:
         """A romaji bare run merges through the official alias list.
@@ -1619,6 +1657,160 @@ class SimpleEngineRunnerTests(unittest.TestCase):
                 for item in plan.files
                 if "/第二季/" in item.source_path
             )
+        )
+
+    def test_smart_plan_reclaims_only_officially_proven_sp_directory_mini_series(self) -> None:
+        """``SPs/`` members reach Season 00 only with official ordinal proof.
+
+        The preclassifier withholds bonus-directory videos from the episode
+        parser, but once the multilingual Season 00 rows are loaded a
+        reset-numbered mini-series whose official titles embed their own
+        ``第N话`` ordinals must be re-admitted as specials.  Without that
+        official numbering the same directory stays fail-closed residuals.
+        """
+
+        class ReclaimAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        def make_tmdb(special_names: dict[int, str]) -> object:
+            class PlannerTMDB:
+                def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                    if path == "/tv/210":
+                        return {
+                            "name": "Northwind Show",
+                            "original_name": "Northwind Show",
+                            "first_air_date": "2020-01-01",
+                            "seasons": [{"season_number": 1, "episode_count": 2}],
+                        }
+                    if path == "/tv/210/season/1":
+                        return {
+                            "episodes": [
+                                {
+                                    "episode_number": 1,
+                                    "name": "启程",
+                                    "air_date": "2020-01-01",
+                                    "runtime": 24,
+                                },
+                                {
+                                    "episode_number": 2,
+                                    "name": "山道",
+                                    "air_date": "2020-01-08",
+                                    "runtime": 24,
+                                },
+                            ],
+                        }
+                    if path == "/tv/210/season/0":
+                        return {
+                            "episodes": [
+                                {
+                                    "episode_number": number,
+                                    "name": name,
+                                    "air_date": f"2020-02-{2 * number:02d}",
+                                    "runtime": 3,
+                                }
+                                for number, name in sorted(special_names.items())
+                            ],
+                        }
+                    if path == "/tv/210/alternative_titles":
+                        return {"results": []}
+                    raise AssertionError(f"unexpected TMDB path: {path}")
+
+            return PlannerTMDB()
+
+        source_root = "/quark/影视/待刮削/Northwind"
+        source_files = [
+            {
+                "name": "Northwind.Show.S01E01.mkv",
+                "full_path": source_root + "/Northwind.Show.S01E01.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            },
+            {
+                "name": "Northwind.Show.S01E02.mkv",
+                "full_path": source_root + "/Northwind.Show.S01E02.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            },
+            *(
+                {
+                    "name": f"Mini Anime - {number:02d}.mkv",
+                    "full_path": source_root + f"/SPs/Mini Anime - {number:02d}.mkv",
+                    "size": FAKE_VIDEO_SIZE,
+                    "is_dir": False,
+                }
+                for number in (1, 2, 3)
+            ),
+        ]
+        kwargs = {
+            "auto_episode_mode": True,
+            "alist": ReclaimAList(),
+            "tmdb_client": make_tmdb({
+                1: "第1话 迷你动画 启程",
+                2: "第2话 迷你动画 山道",
+                3: "第3话 迷你动画 归途",
+            }),
+            "src_path": source_root,
+            "parent_path": "/quark/影视/番剧",
+            "tmdb_id": 210,
+            "season": 1,
+            "absolute": False,
+            "prefer_simplified": True,
+            "allow_unmapped": False,
+            "ignore_orphan_temp": False,
+            "source_files": source_files,
+            "source_declared_seasons": (1,),
+            "media_root": "/quark/影视",
+        }
+
+        plan = build_tv_plan_smart(**kwargs)
+        self.assertEqual(
+            sorted(item.episode_key for item in plan.files),
+            ["E01", "E02", "SP01", "SP02", "SP03"],
+        )
+        special_names = sorted(
+            item.final_name
+            for item in plan.files
+            if item.episode_key.startswith("SP")
+        )
+        self.assertTrue(all("S00E" in name for name in special_names))
+        self.assertEqual(len(special_names), 3)
+        residuals = plan.scan_report.get("preserved_source_residuals", [])
+        self.assertFalse(
+            any("/SPs/" in str(row.get("source_path", "")) for row in residuals)
+        )
+
+        # No embedded official ordinals: the same SPs directory must stay a
+        # fail-closed preserved-at-source residual instead of being guessed.
+        unnumbered = build_tv_plan_smart(
+            **{
+                **kwargs,
+                "tmdb_client": make_tmdb({
+                    1: "迷你动画 启程",
+                    2: "迷你动画 山道",
+                    3: "迷你动画 归途",
+                }),
+            }
+        )
+        self.assertEqual(
+            sorted(item.episode_key for item in unnumbered.files),
+            ["E01", "E02"],
+        )
+        self.assertEqual(
+            {
+                str(row.get("source_path", ""))
+                for row in unnumbered.scan_report.get(
+                    "preserved_source_residuals", []
+                )
+            },
+            {
+                source_root + f"/SPs/Mini Anime - {number:02d}.mkv"
+                for number in (1, 2, 3)
+            },
         )
 
     def test_residual_policy_retains_user_attachments_and_allows_only_os_litter(self) -> None:

@@ -125,7 +125,11 @@ _THEME_MARKER_RE = re.compile(
 
 def _preclassify_theme_residuals(
     files: Sequence[Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     """Remove only proven theme/menu videos before unknown-media matching.
 
     A regular episode coordinate always wins over a residual-looking token.
@@ -138,7 +142,11 @@ def _preclassify_theme_residuals(
     the context is strong non-story evidence independent of the file's own
     naming, and a bare bracketed ordinal there is release-local numbering
     that must never collide with the real episode run (the same vocabulary
-    B/W and D's episode proofs already use).
+    B/W and D's episode proofs already use).  The withheld bonus-directory
+    videos are also returned as a third bucket so the smart planner can
+    retry them against official Season 00 evidence once it has the TMDB
+    special rows; only members an evidence mapper explicitly proves are
+    re-admitted, so unproven bonus content stays fail-closed.
     """
     videos = [
         dict(item) for item in files
@@ -148,11 +156,12 @@ def _preclassify_theme_residuals(
     for item in videos:
         by_parent[posixpath.dirname(str(item.get("full_path", "")))].append(item)
     proven: list[dict[str, Any]] = []
+    bonus_directory_videos: list[dict[str, Any]] = []
     for item in videos:
         path = str(item.get("full_path", ""))
         name = str(item.get("name", ""))
         if is_bonus_directory_path(path):
-            proven.append(item)
+            bonus_directory_videos.append(item)
             continue
         if any(
             key.kind == "regular" and not key.end_number
@@ -176,6 +185,7 @@ def _preclassify_theme_residuals(
         if _THEME_MARKER_RE.search(name) or _THEME_MARKER_RE.search(parent_name) or all_theme:
             proven.append(item)
     removed = {str(item.get("full_path", "")) for item in proven}
+    removed.update(str(item.get("full_path", "")) for item in bonus_directory_videos)
     residuals = [
         {
             "source_path": str(item.get("full_path", "")),
@@ -183,9 +193,13 @@ def _preclassify_theme_residuals(
             "reason": "no_write_source_residual",
             "kind": "theme_menu_video",
         }
-        for item in proven
+        for item in [*proven, *bonus_directory_videos]
     ]
-    return [item for item in files if str(item.get("full_path", "")) not in removed], residuals
+    return (
+        [item for item in files if str(item.get("full_path", "")) not in removed],
+        residuals,
+        bonus_directory_videos,
+    )
 
 
 def _make_runtime_dispatch(name: str):
@@ -525,6 +539,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         raise PlanError("来源声明季度包含无效或重复值")
     smart_kwargs = dict(kwargs)
     preserved_theme_residuals: list[dict[str, Any]] = []
+    withheld_bonus_videos: list[dict[str, Any]] = []
     # Explicit episode maps intentionally bypass smart season inference, but
     # the common post-plan resource-gap audit still consumes this collection.
     positive_seasons: list[Mapping[str, Any]] = []
@@ -555,7 +570,9 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         files, _exported_srt_issues = normalize_exported_srt_entries(
             kwargs["alist"], files,
         )
-        files, preserved_theme_residuals = _preclassify_theme_residuals(files)
+        files, preserved_theme_residuals, withheld_bonus_videos = (
+            _preclassify_theme_residuals(files)
+        )
         smart_kwargs["source_files"] = files
         provided_files = files
         if kwargs.get("episode_map_path") is not None:
@@ -602,7 +619,9 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
             files, _exported_srt_issues = normalize_exported_srt_entries(
                 kwargs["alist"], files,
             )
-            files, preserved_theme_residuals = _preclassify_theme_residuals(files)
+            files, preserved_theme_residuals, withheld_bonus_videos = (
+                _preclassify_theme_residuals(files)
+            )
             smart_kwargs["source_files"] = files
         season_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         special_files: list[dict[str, Any]] = []
@@ -775,6 +794,54 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 f"{disc_extra_count} 个特典小动画/OVA 已依官方短片时长、"
                 "发行断档和源季序映射到全局 Season 00 编号"
             )
+        # The preclassifier withheld bonus-directory videos because their bare
+        # ordinals are release-local, yet a named mini-series under ``SPs/``
+        # or ``特典映像/`` is exactly the shape the official-evidence mappers
+        # above prove (multilingual special titles, runtimes, release runs).
+        # Retry the withheld members on a private pool and re-admit only
+        # those that received an explicit Season 00 override; the rest keep
+        # their preserved-at-source residual rows, so unproven bonus content
+        # remains fail-closed and never reaches the episode parser.
+        if withheld_bonus_videos:
+            bonus_pool = [dict(item) for item in withheld_bonus_videos]
+            bonus_disc_extra_count = _map_disc_extras_by_official_release_runs(
+                bonus_pool,
+                show=show_for_season_names,
+                positive_seasons=positive_seasons,
+                special_runtimes=official_special_runtimes,
+                special_air_dates=official_special_air_dates,
+                special_title_variants=official_special_title_variants,
+            )
+            special_release_warnings.extend(
+                _map_explicit_special_release_runs(
+                    bonus_pool,
+                    official_special_title_variants,
+                    official_special_air_dates,
+                )
+            )
+            reclaimed_bonus_specials = [
+                item
+                for item in bonus_pool
+                if item.get("_episode_kind_override") == "special"
+                and isinstance(item.get("_episode_key_override"), int)
+                and not isinstance(item.get("_episode_key_override"), bool)
+            ]
+            if reclaimed_bonus_specials:
+                if bonus_disc_extra_count:
+                    special_release_warnings.append(
+                        f"{bonus_disc_extra_count} 个特典目录内小动画/OVA 已依"
+                        "官方短片时长、发行断档和源季序映射到全局 Season 00 编号"
+                    )
+                files.extend(reclaimed_bonus_specials)
+                reclaimed_paths = {
+                    str(item.get("full_path", ""))
+                    for item in reclaimed_bonus_specials
+                }
+                preserved_theme_residuals = [
+                    row
+                    for row in preserved_theme_residuals
+                    if str(row.get("source_path", "")) not in reclaimed_paths
+                ]
         # A suffix such as ``[13 OAV]`` describes an extra released after
         # episode 13, not necessarily OAV number 13.  Resolve this before the
         # smart planner splits regular seasons and special folders; after that
@@ -2859,7 +2926,9 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     if movie_plans else []
                 ),
                 *([independent_e00_warning] if independent_e00_warning else []),
-                *special_release_warnings,
+                # The bonus-directory reclaim pass and the in-flow special-run
+                # mapper can prove the same run twice; keep one warning.
+                *dict.fromkeys(special_release_warnings),
                 *(warning for subplan in subplans for warning in subplan.warnings),
                 *(warning for movie_plan in movie_plans for warning in movie_plan.warnings),
             ]
