@@ -684,6 +684,50 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             fragment.decision_trace.get("blockers", []),
         )
 
+    def test_bare_season_label_is_never_dispatched_standalone(self) -> None:
+        """A generic season leaf must not leak back in as its own query.
+
+        ``normalized_titles`` carries the boundary label itself, so a unit
+        scoped to ``第二季`` used to smuggle the bare label through the
+        query budget even though the boundary slot refuses to dispatch it.
+        TMDB then confidently returned an unrelated show whose title merely
+        contains the label (``中国 第二季``), which once got wrongly
+        confirmed.  Every evidence slot must respect the same rule.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "第二季": [
+                    {
+                        "id": 280326,
+                        "name": "汉语",
+                        "first_air_date": "2022-01-01",
+                        "genre_ids": [],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-season-two",
+            boundary_label="第二季",
+            parent_labels=(),
+            # The guard demands at least one non-structural clue, mimicking a
+            # title-bearing representative under the season folder.
+            representative_names=("Some Show S2",),
+            normalized_titles=("第二季",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        with self.assertRaises(PlanError):
+            auto_match_from_evidence(client, evidence)
+        dispatched = {
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/")
+        }
+        self.assertNotIn("第二季", dispatched)
+
     def test_disambiguates_same_title_by_year(self) -> None:
         # Two TMDB results with exact same title but different years
         client = FakeTMDBClient(

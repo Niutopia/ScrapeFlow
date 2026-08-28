@@ -2160,14 +2160,24 @@ def auto_match_from_evidence(
         if _usable_representative_identity_query(r):
             candidate_queries.append(r)
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order.  A bare season label
+    # (``第一季``/``Season 02``) must never be dispatched as a standalone
+    # query regardless of which evidence slot produced it: the boundary guard
+    # above only covers the boundary label itself, while other slots
+    # (``normalized_titles`` routinely carries that same structural leaf as a
+    # title) would otherwise smuggle it back into the budget and let TMDB
+    # confidently select an unrelated show whose title merely contains the
+    # label (``中国 第二季``).
     seen_q: set[str] = set()
     search_queries: list[str] = []
     for q in candidate_queries:
         norm_q = q.strip()
-        if norm_q and norm_q not in seen_q:
-            seen_q.add(norm_q)
-            search_queries.append(norm_q)
+        if not norm_q or norm_q in seen_q:
+            continue
+        if _is_generic_season_identity_label(norm_q):
+            continue
+        seen_q.add(norm_q)
+        search_queries.append(norm_q)
 
     # ``EpisodePattern.total_episodes`` is a set of observed episode ordinals.
     # For an absolute multi-season release, E01 appears in every season, so
