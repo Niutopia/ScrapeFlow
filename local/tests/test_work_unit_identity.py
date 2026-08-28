@@ -1012,6 +1012,115 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         self.assertEqual(best.status, "confirmed")
         self.assertTrue(best.decision_trace.get("arc_movie_singleton"))
 
+    def test_confirmed_tv_parent_still_probes_the_movie_arc_namespace(self) -> None:
+        """A confirmed parent show does not hide the arc's own movie entry.
+
+        Marker-gated arc evidence with a tv media shape searches only the tv
+        namespace, and the parent show confirms there at 1.0 — so the
+        opposite-namespace fallback never collects the movie pool and the
+        arc-singleton rule has no movie hits to decide on.  The combined
+        parent+arc queries must still probe the movie namespace: their
+        singleton result is the arc's own catalogue placement, exactly as
+        when the tv search surfaces nothing.
+        """
+
+        class ExactQueryTMDBClient:
+            def __init__(self) -> None:
+                self.searched: list[tuple[str, str]] = []
+
+            def get(self, path: str, **params: Any) -> dict[str, Any]:
+                if not path.startswith("/search/"):
+                    return {}
+                query = str(params.get("query", ""))
+                self.searched.append((path, query))
+                movie_results = {
+                    "五等分的花嫁": [
+                        {
+                            "id": 1507125,
+                            "title": "五等分的花嫁横滨竞技场五周年纪念活动",
+                            "release_date": "2025-02-19",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 820067,
+                            "title": "五等分的新娘 剧场版",
+                            "release_date": "2022-05-20",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "新婚旅行篇": [
+                        {
+                            "id": 353592,
+                            "title": "大木家のたのしい旅行 新婚地獄篇",
+                            "release_date": "1991-01-01",
+                            "genre_ids": [35],
+                        },
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁 新婚旅行篇": [
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁/新婚旅行篇": [
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                tv_results = {
+                    "五等分的花嫁": [
+                        {
+                            "id": 84669,
+                            "name": "五等分的花嫁",
+                            "first_air_date": "2019-01-11",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                results = (
+                    movie_results if path == "/search/movie" else tv_results
+                ).get(query, [])
+                return {"results": results}
+
+        client = ExactQueryTMDBClient()
+        evidence = IdentityEvidence(
+            work_unit_id="wu-arc-movie-singleton-tv-shape",
+            boundary_label="新婚旅行篇",
+            parent_labels=("W 4k 五等分的花嫁",),
+            representative_names=("新婚旅行篇", "Go-Toubun no Hanayome"),
+            normalized_titles=("新婚旅行篇",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+            special_markers=("OVA",),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.88
+        )
+        self.assertEqual(best.media_type, "movie")
+        self.assertEqual(best.tmdb_id, 1287324)
+        self.assertEqual(best.status, "confirmed")
+        self.assertTrue(best.decision_trace.get("arc_movie_singleton"))
+
     def test_physical_special_arc_with_two_movie_hits_keeps_failing_closed(self) -> None:
         """A two-entry arc release has no provable standalone identity.
 

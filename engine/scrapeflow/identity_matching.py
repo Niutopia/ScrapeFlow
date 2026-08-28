@@ -2821,6 +2821,46 @@ def auto_match_from_evidence(
                 score(item) for item in raw_candidates
                 if int(item["tmdb_id"]) not in excluded_ids
             ]
+    # The opposite namespace is collected above only when the hinted one
+    # failed to confirm.  A marker-gated arc can still be catalogued only as
+    # a standalone movie while its parent show confirms at 1.0 in the tv
+    # namespace, so that fallback never runs and the singleton rule below
+    # has no movie placement evidence at all.  Probe the uncollected
+    # opposite namespace with ONLY the combined parent+arc queries — the
+    # bare parent query would flood the pool with the whole franchise and
+    # could collapse the ambiguity margin of a parent-absorption arc.  The
+    # probe runs only when the tv namespace itself cannot place the arc
+    # (a tv arc hit is the parent-absorption evidence, so a show that the
+    # combined query already surfaces needs no probe at all).  A singleton
+    # movie placement upgrades into a full movie collection so the ordinary
+    # singleton rule can decide; anything else leaves the confirmed
+    # hinted-namespace resolution untouched.
+    if (
+        special_marker_gate
+        and "movie" not in searched_types
+        and not (arc_query_hits.get("tv") or set())
+    ):
+        for sq in search_queries[:6]:
+            for variant in _search_query_variants(sq):
+                if not _is_parent_arc_combined_query(variant, boundary_label):
+                    continue
+                try:
+                    probe_response = client.get(
+                        "/search/movie",
+                        query=variant,
+                        language=_search_language(variant),
+                    )
+                except ApiError:
+                    probe_response = {}
+                arc_query_hits.setdefault("movie", set()).update(
+                    _search_result_ids(probe_response)
+                )
+        if len(arc_query_hits.get("movie") or set()) == 1:
+            collect_type("movie")
+            candidates = [
+                score(item) for item in raw_candidates
+                if int(item["tmdb_id"]) not in excluded_ids
+            ]
     # A physical special release named for its arc is sometimes catalogued
     # only as a standalone movie: no tv search can place the arc (every
     # combined parent+arc query returns nothing in the tv namespace), so the
