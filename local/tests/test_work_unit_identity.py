@@ -464,6 +464,44 @@ class TestIdentityEvidence(unittest.TestCase):
             "末日三问",
         )
 
+    def test_boundary_clean_query_strips_multitrack_and_main_feature_residue(self) -> None:
+        """Release labels with trilingual tracks and a main-feature word.
+
+        A packaging label can carry a reversed language pair (``日中双语``),
+        a multi-script track label (``日英台三语``) and a main-feature layout
+        word (``正片``).  Each is release metadata, not a title token: the
+        clean query must collapse to the bare work title so TMDB receives an
+        exact matchable string.
+        """
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "01 犬夜叉正片（2000）全167集 日中双语 内封+内嵌字幕 1080P",
+            ),
+            "犬夜叉",
+        )
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "04 犬夜叉完结篇（2009）全26集 日英台三语 外挂简中字幕 "
+                "1080P（x265 10bit FLAC DBD-Raws）",
+            ),
+            "犬夜叉完结篇",
+        )
+
+    def test_boundary_clean_query_strips_season_span_behind_separator_residue(self) -> None:
+        """A season span blocked by ``+`` residue still cleans up.
+
+        ``外挂+内嵌字幕`` leaves a bare ``+`` between the two stripped words;
+        the trailing ``+`` blocks the one-shot season-span strip, so the
+        bounded tail passes must re-run it once the separator residue is
+        gone.
+        """
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P",
+            ),
+            "半妖的夜叉姬",
+        )
+
     def test_boundary_clean_query_unwraps_bracket_only_release_titles(self) -> None:
         """A bracket-only release carries the work title inside ``[]``.
 

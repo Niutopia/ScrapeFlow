@@ -381,6 +381,15 @@ _BOUNDARY_TRAILING_QUALITY_TAIL_RE = re.compile(
 _BOUNDARY_TRAILING_BATCH_COUNT_RE = re.compile(
     r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)\s*$",
 )
+# A release season span can sit behind separator residue left by the language
+# and embed words stripped above (``外挂+内嵌字幕`` leaves a bare ``+``).
+# The span strip below only matches a trailing span, so re-run it inside the
+# bounded tail passes once that residue is gone.
+_BOUNDARY_TRAILING_SEASON_SPAN_RE = re.compile(
+    r"[\s._-]*(?:\d{1,3}\s*[-~至]\s*\d{1,3}\s*季|"
+    r"S\s*0*\d{1,3}\s*[-~至]\s*S?\s*0*\d{1,3})\s*$",
+    re.IGNORECASE,
+)
 
 # Half-width bracket groups in a release label are either packaging (group
 # name, codec, resolution, subtitle language, episode span) or title
@@ -495,12 +504,37 @@ def _clean_boundary_identity_query(value: str) -> str:
     )
     text = re.sub(r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)", " ", text)
     text = re.sub(r"\+\s*(?:OVA|OAV|OAD|SP)(?:\s*\+)?", " ", text, flags=re.IGNORECASE)
+    # A language label can also be a reversed or multi-script track list
+    # (``日中双语``/``日英台三语``) — track metadata, not title words.  The
+    # run is bounded to script/country characters and must be closed by a
+    # track-count suffix, so arbitrary title words are never touched.
     text = re.sub(
-        r"(?:内封|内嵌|外挂|简体|繁体|简英|简中|简日|繁中|繁日|简繁|中英|中日|日英|双语|硬字幕|软字幕|中文字幕)(?:字幕)?",
+        r"(?:国|粤|英|日|韩|中|台|法|德|泰|俄|西)[语配]?"
+        r"(?:\s*[,，/&与和]?\s*"
+        r"(?:国|粤|英|日|韩|中|台|法|德|泰|俄|西)[语配]?)+"
+        r"\s*(?:三|四|双)?[语音轨]{1,2}",
+        " ",
+        text,
+    )
+    # An embed word can carry a language qualifier and a ``字幕`` closer
+    # (``内封简中字幕``); strip the whole phrase as one unit so the qualifier
+    # never survives as orphaned residue.
+    text = re.sub(
+        r"(?:内封|内嵌|外挂)\s*(?:中文|简中|繁中|简繁|简日|中字|双语)?\s*(?:字幕)?",
         " ",
         text,
         flags=re.IGNORECASE,
     )
+    text = re.sub(
+        r"(?:简体|繁体|简英|简中|简日|繁中|繁日|简繁|中英|中日|日英|双语|硬字幕|软字幕|中文字幕)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # A main-feature layout word (``正片``) distinguishes the regular run
+    # inside a mixed release container; it is source layout, never a title
+    # token of the work itself.
+    text = re.sub(r"正片", " ", text)
     text = re.sub(
         r"(?:超清|收藏版|4k|8k|2160p|1440p|1080p|720p|576p|480p|"
         r"blu-?ray|bdrip|web-?dl|webrip|x26[45]|h26[45]|hevc|av1|"
@@ -547,11 +581,15 @@ def _clean_boundary_identity_query(value: str) -> str:
     )
     # A batch count and a quality tag can appear in either tail order.  Bound
     # this cleanup to a few passes so malformed labels cannot be over-cleaned.
+    # The season-span strip re-runs here too: separator residue left between
+    # stripped words (``外挂+内嵌字幕`` -> ``+``) blocks the one-shot strip
+    # above until an earlier pass has rstripped it away.
     for _ in range(3):
         before = text
         text = _BOUNDARY_TRAILING_QUALITY_TAIL_RE.sub("", text)
         text = _BOUNDARY_TRAILING_BATCH_COUNT_RE.sub("", text)
         text = text.rstrip(" ._+-")
+        text = _BOUNDARY_TRAILING_SEASON_SPAN_RE.sub("", text)
         if text == before:
             break
     # A quality tag between the shelf letter and the CJK title (``F 4k 拂晓
