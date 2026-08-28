@@ -11,6 +11,7 @@ from __future__ import annotations
 import difflib
 import re
 import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Collection, Mapping, Sequence, TYPE_CHECKING
 
@@ -117,6 +118,72 @@ def _titles_carry_movie_form_token(titles: Iterable[str]) -> bool:
     """Whether any official title/alias carries the theatrical form token."""
     return any(
         _MOVIE_FORM_TOKEN_RE.search(str(title or ""))
+        for title in titles
+    )
+
+
+def _is_parent_arc_combined_query(query: object, boundary_label: object) -> bool:
+    """Whether one dispatched query is a parent+arc combination.
+
+    The combination is the only query that can prove where an arc label is
+    catalogued: it carries the franchise anchor and the arc together, so its
+    result set is the arc's own catalogue placement rather than the
+    franchise-wide pool the bare parent query returns.
+    """
+    text = str(query or "").strip()
+    boundary = str(boundary_label or "").strip()
+    if not text or not boundary:
+        return False
+    return bool(
+        re.search(re.escape(boundary), text, re.IGNORECASE)
+        and text.lower() != boundary.lower()
+    )
+
+
+def _search_result_ids(response: object) -> tuple[int, ...]:
+    """Return the bounded id list of one search response, shape-safely."""
+    if not isinstance(response, Mapping):
+        return ()
+    results = response.get("results")
+    if not isinstance(results, list):
+        return ()
+    output: list[int] = []
+    for item in results:
+        if not isinstance(item, Mapping) or isinstance(item.get("id"), bool):
+            continue
+        try:
+            output.append(int(item["id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return tuple(output)
+
+
+def _candidate_anchors_in_parent_franchise(
+    candidate: Mapping[str, Any],
+    parent_labels: Sequence[str],
+) -> bool:
+    """Whether a candidate's official names anchor in the parent franchise.
+
+    A standalone catalogue entry for an arc still carries the franchise's
+    name inside its own official title (``五等分的新娘＊`` inside the
+    ``五等分的花嫁`` franchise): the prefix-similarity threshold is the
+    engine's own containment scale, so the same scale decides whether the
+    singleton belongs to the parent's franchise at all.
+    """
+    parent_keys = [
+        _normalize_match_title(_clean_boundary_identity_query(parent))
+        for parent in parent_labels
+    ]
+    parent_keys = [key for key in parent_keys if key]
+    if not parent_keys:
+        return False
+    titles = [
+        str(t)
+        for t in (*(candidate.get("titles") or ()), *(candidate.get("aliases") or ()))
+    ]
+    return any(
+        _title_similarity(parent_key, title) >= 0.6
+        for parent_key in parent_keys
         for title in titles
     )
 
@@ -2463,6 +2530,14 @@ def auto_match_from_evidence(
     )
     raw_candidates: list[dict[str, Any]] = []
     searched_types: list[str] = []
+    # Per-namespace ids surfaced by the combined parent+arc queries.  Those
+    # combinations are the only queries that place the *arc itself* in the
+    # catalogue; the bare parent query only floods the pool with the whole
+    # franchise.
+    arc_query_hits: dict[str, set[int]] = {}
+    special_marker_gate = tuple(
+        marker for marker in evidence.special_markers if str(marker or "").strip()
+    )
 
     def collect_type(candidate_type: str) -> None:
         if candidate_type in searched_types:
@@ -2514,6 +2589,12 @@ def auto_match_from_evidence(
                     query=variant,
                     language=_search_language(variant),
                 )
+                if special_marker_gate and _is_parent_arc_combined_query(
+                    variant, boundary_label
+                ):
+                    arc_query_hits.setdefault(candidate_type, set()).update(
+                        _search_result_ids(response)
+                    )
                 ingest(response)
 
         if not search_items and search_queries:
@@ -2740,6 +2821,55 @@ def auto_match_from_evidence(
                 score(item) for item in raw_candidates
                 if int(item["tmdb_id"]) not in excluded_ids
             ]
+    # A physical special release named for its arc is sometimes catalogued
+    # only as a standalone movie: no tv search can place the arc (every
+    # combined parent+arc query returns nothing in the tv namespace), so the
+    # parent-absorption doctrine has no Season 00 window to write into.
+    # When the same combined queries return exactly one movie anchored in
+    # the parent franchise, that film is the arc's own catalogue entry —
+    # the OVA/SP halves become its parts through multipart movie planning.
+    # The singleton is decisive placement evidence, so it outranks the
+    # parent show that only the bare franchise query surfaced; a split
+    # two-part release (two ids) or an unanchored hit stays fail-closed.
+    if special_marker_gate:
+        movie_arc_hits = arc_query_hits.get("movie") or set()
+        if not (arc_query_hits.get("tv") or set()) and len(movie_arc_hits) == 1:
+            singleton_id = next(iter(movie_arc_hits))
+            singleton_raw = next(
+                (
+                    raw
+                    for raw in raw_candidates
+                    if raw.get("media_type") == "movie"
+                    and int(raw.get("tmdb_id", 0)) == singleton_id
+                ),
+                None,
+            )
+            if singleton_raw is not None and _candidate_anchors_in_parent_franchise(
+                singleton_raw, evidence.parent_labels
+            ):
+                winner = next(
+                    (
+                        item
+                        for item in candidates
+                        if item.media_type == "movie"
+                        and int(item.tmdb_id) == singleton_id
+                    ),
+                    None,
+                )
+                if winner is not None:
+                    winner = replace(
+                        winner,
+                        confidence=max(winner.confidence, min_confidence, 0.9)
+                        if winner.confidence < min_confidence
+                        or winner.status != "confirmed"
+                        else winner.confidence,
+                        status="confirmed",
+                        decision_trace={
+                            **winner.decision_trace,
+                            "arc_movie_singleton": True,
+                        },
+                    )
+                    return winner, candidates
     return _select_auto_match(
         candidates,
         query_label=evidence.boundary_label,

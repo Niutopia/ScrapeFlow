@@ -896,6 +896,185 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         dispatched = {query for _path, query in client.searched}
         self.assertNotIn("剧场版", dispatched)
 
+    def test_physical_special_arc_without_tv_catalogue_resolves_to_its_movie_singleton(self) -> None:
+        """An arc no TV search can place is its own movie entry, not the parent.
+
+        A physical special release named for its arc (``新婚旅行篇``) is
+        sometimes catalogued only as a standalone movie: every combined
+        parent+arc query returns nothing in the tv namespace, while the same
+        combined query returns exactly one movie anchored in the parent
+        franchise.  The parent-absorption doctrine has no Season 00 window
+        to write into there, so that singleton movie is the arc's provable
+        identity — the OVA halves become its parts through multipart movie
+        planning.
+        """
+
+        class ExactQueryTMDBClient:
+            def __init__(self) -> None:
+                self.searched: list[tuple[str, str]] = []
+
+            def get(self, path: str, **params: Any) -> dict[str, Any]:
+                if not path.startswith("/search/"):
+                    return {}
+                query = str(params.get("query", ""))
+                self.searched.append((path, query))
+                movie_results = {
+                    "五等分的花嫁": [
+                        {
+                            "id": 1507125,
+                            "title": "五等分的花嫁横滨竞技场五周年纪念活动",
+                            "release_date": "2025-02-19",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 820067,
+                            "title": "五等分的新娘 剧场版",
+                            "release_date": "2022-05-20",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 1153706,
+                            "title": "五等分的新娘∽",
+                            "release_date": "2023-07-14",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "新婚旅行篇": [
+                        {
+                            "id": 353592,
+                            "title": "大木家のたのしい旅行 新婚地獄篇",
+                            "release_date": "1991-01-01",
+                            "genre_ids": [35],
+                        },
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁 新婚旅行篇": [
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁/新婚旅行篇": [
+                        {
+                            "id": 1287324,
+                            "title": "五等分的新娘＊",
+                            "release_date": "2024-09-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                tv_results = {
+                    "五等分的花嫁": [
+                        {
+                            "id": 84669,
+                            "name": "五等分的新娘",
+                            "first_air_date": "2019-01-11",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                results = (
+                    movie_results if path == "/search/movie" else tv_results
+                ).get(query, [])
+                return {"results": results}
+
+        client = ExactQueryTMDBClient()
+        evidence = IdentityEvidence(
+            work_unit_id="wu-arc-movie-singleton",
+            boundary_label="新婚旅行篇",
+            parent_labels=("W 4k 五等分的花嫁",),
+            representative_names=("新婚旅行篇", "Go-Toubun no Hanayome"),
+            normalized_titles=("新婚旅行篇",),
+            years=(),
+            episode_pattern=None,
+            media_shape="unknown",
+            aliases=(),
+            special_markers=("OVA",),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.88
+        )
+        self.assertEqual(best.media_type, "movie")
+        self.assertEqual(best.tmdb_id, 1287324)
+        self.assertEqual(best.status, "confirmed")
+        self.assertTrue(best.decision_trace.get("arc_movie_singleton"))
+
+    def test_physical_special_arc_with_two_movie_hits_keeps_failing_closed(self) -> None:
+        """A two-entry arc release has no provable standalone identity.
+
+        When the combined parent+arc query returns two movies (a split
+        two-part release), there is no singleton to prove a standalone film
+        identity.  The arc keeps its ordinary scoring, which fails closed
+        here instead of silently confirming one half of the pair.
+        """
+
+        class TwoPartArcTMDBClient:
+            def get(self, path: str, **params: Any) -> dict[str, Any]:
+                if not path.startswith("/search/"):
+                    return {}
+                query = str(params.get("query", ""))
+                if path == "/search/tv":
+                    return {
+                        "results": (
+                            [
+                                {
+                                    "id": 57041,
+                                    "name": "示例剧",
+                                    "first_air_date": "2006-04-04",
+                                    "genre_ids": [16],
+                                },
+                            ]
+                            if query == "示例剧"
+                            else []
+                        )
+                    }
+                movie_results = {
+                    "示例剧 爱染香篇": [
+                        {
+                            "id": 977916,
+                            "title": "示例剧 爱染香篇 前篇",
+                            "release_date": "2016-05-13",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 1119841,
+                            "title": "示例剧 爱染香篇 后篇",
+                            "release_date": "2016-06-10",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                return {"results": movie_results.get(query, [])}
+
+        client = TwoPartArcTMDBClient()
+        evidence = IdentityEvidence(
+            work_unit_id="wu-arc-two-parts",
+            boundary_label="爱染香篇",
+            parent_labels=("Y 4k 示例剧",),
+            representative_names=("爱染香篇",),
+            normalized_titles=("爱染香篇",),
+            years=(2016,),
+            episode_pattern=None,
+            media_shape="unknown",
+            aliases=(),
+            special_markers=("OAD",),
+        )
+        with self.assertRaises(AutoMatchAmbiguityError):
+            auto_match_from_evidence(client, evidence)
+
     def test_nested_parent_combos_cannot_crowd_out_boundary_queries(self) -> None:
         """Two nested parent labels must not exhaust the query budget.
 
