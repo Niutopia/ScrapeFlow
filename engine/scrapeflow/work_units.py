@@ -476,16 +476,22 @@ def _physical_special_marker_evidence(
         markers.update(tokens)
         number: int | None = None
         # Prefer a marker-attached ordinal.  A year is never a release ordinal.
+        # ``OAD 2016 [01]`` places the release year between the marker and
+        # the real bracketed ordinal, so examine every marker-attached match
+        # and keep the first non-year value instead of silently dropping the
+        # ordinal just because it is not adjacent to the marker.
         if direct:
-            match = direct[0]
-            value = int(match.group("number"))
-            if not 1900 <= value <= 2099:
-                number = value
+            for match in direct:
+                value = int(match.group("number"))
+                if not 1900 <= value <= 2099:
+                    number = value
+                    break
         elif reverse:
-            match = reverse[0]
-            value = int(match.group("number"))
-            if not 1900 <= value <= 2099:
-                number = value
+            for match in reverse:
+                value = int(match.group("number"))
+                if not 1900 <= value <= 2099:
+                    number = value
+                    break
         else:
             # ``OAD/01.mkv`` is common.  Only use a bare basename ordinal
             # when a marker appears in an ancestor path segment; this avoids
@@ -502,6 +508,21 @@ def _physical_special_marker_evidence(
                     value = int(bare.group(1))
                     if not 1900 <= value <= 2099:
                         number = value
+        if number is None:
+            # ``Show OAD 2016 [01]`` carries the marker in its own stem while
+            # the release ordinal sits in a standalone bracket behind the
+            # year, out of reach of the marker-attached patterns above.
+            # Accept exactly one standalone delimited ordinal from that
+            # marker-bearing stem so the run keeps its release-local number.
+            stem = unicodedata.normalize("NFKC", Path(file.name).stem)
+            if _PHYSICAL_SPECIAL_TOKEN_RE.search(stem):
+                standalone = {
+                    int(match.group(1))
+                    for match in _STANDALONE_SPECIAL_NUMBER_RE.finditer(stem)
+                    if 0 < int(match.group(1)) <= 999
+                }
+                if len(standalone) == 1:
+                    number = next(iter(standalone))
         if number is None or number <= 0 or number > 999:
             all_numbered = False
         else:
