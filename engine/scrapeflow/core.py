@@ -5320,6 +5320,25 @@ def _special_release_source_ordinal(item: Mapping[str, Any]) -> int | None:
     return next(iter(bracket_numbers)) if len(bracket_numbers) == 1 else None
 
 
+def _pending_special_release_ordinal(item: Mapping[str, Any]) -> int | None:
+    """Return one leading-digit release bracket ordinal (``[12(OVA)]`` → 12).
+
+    A same-marker run numbers its physical extras in release order, and the
+    number may carry a parenthesised form suffix (``[12(OVA)]``) that the
+    pure-numeric bracket parser above rejects.  Only a bracket whose content
+    starts with digits counts, so release tags (``[Ma10p_2160p]``) and group
+    labels never supply an ordinal.  Two distinct leading-digit brackets are
+    ambiguous and stay unordered.
+    """
+    name = str(item.get("name", ""))
+    numbers = {
+        int(match.group(1))
+        for match in re.finditer(r"\[\s*0*(\d{1,3})(?!\d)", name)
+        if 0 < int(match.group(1)) <= 999
+    }
+    return next(iter(numbers)) if len(numbers) == 1 else None
+
+
 def _special_arc_title_key(value: str) -> str:
     """Normalize one official arc title while retaining its identity words."""
     normalized = unicodedata.normalize("NFKC", value).strip()
@@ -6730,6 +6749,38 @@ def _map_unnumbered_specials(
                     f"根据第 {season} 季官方时间线将 {marker} "
                     f"自动映射为 {target_key.display}"
                 )
+        elif release_groups and sum(
+            len(items) for items in pending.values()
+        ) == len(candidates):
+            # A same-marker run ships one physical extra per release ordinal
+            # (``[12(OVA)]``/``[13(OVA)]`` after a complete season), so the
+            # marker spellings no longer pair one-to-one with the window
+            # slots.  When the whole pending run matches the unused window
+            # exactly and every item carries a distinct release ordinal,
+            # pair them in release order: marker priority first — the same
+            # order the one-to-one zip above trusts — then each item's own
+            # ordinal.  Ambiguous or missing ordinals stay unmapped.
+            flat: list[tuple[int, int, str, dict[str, Any]]] = []
+            complete = True
+            for marker in release_groups:
+                for item in pending[marker]:
+                    ordinal = _pending_special_release_ordinal(item)
+                    if ordinal is None:
+                        complete = False
+                        break
+                    flat.append((priorities[marker], ordinal, marker, item))
+                if not complete:
+                    break
+            if complete and len({row[1] for row in flat}) == len(flat):
+                flat.sort(key=lambda row: row[:3])
+                for row, target_key in zip(flat, candidates):
+                    _priority, _ordinal, _marker, item = row
+                    groups.setdefault(target_key, []).append(item)
+                    warnings.append(
+                        f"根据第 {season} 季官方时间线将 "
+                        f"{str(item.get('name', ''))} 按发行序自动映射为 "
+                        f"{target_key.display}"
+                    )
     return warnings
 
 
