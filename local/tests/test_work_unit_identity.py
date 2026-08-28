@@ -778,6 +778,54 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         self.assertEqual(best.tmdb_id, 732203)
         self.assertEqual(best.status, "confirmed")
 
+    def test_leading_movie_label_stripped_query_recovers_the_entry(self) -> None:
+        """``剧场版`` prefix is release layout, not part of the TMDB title.
+
+        A boundary labeled ``剧场版 夏目友人帐 唤石者与怪异的访客`` used to
+        dispatch only that verbatim label: TMDB's own entry title omits the
+        leading movie label, so the search returned nothing and the unit
+        parked as uncertain.  The prefix-stripped standalone form must get a
+        fallback budget slot — the original query stays first, and candidate
+        scoring still has to prove the title.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "夏目友人帐 唤石者与怪异的访客": [
+                    {
+                        "id": 773621,
+                        "title": "剧场版 夏目友人帐 唤石者与怪异的访客",
+                        "release_date": "2021-01-16",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-natsume-movie",
+            boundary_label="剧场版 夏目友人帐 唤石者与怪异的访客",
+            parent_labels=(),
+            representative_names=("剧场版 夏目友人帐 唤石者与怪异的访客",),
+            normalized_titles=("剧场版 夏目友人帐 唤石者与怪异的访客",),
+            years=(2021,),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 773621)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/movie")
+        ]
+        self.assertIn("夏目友人帐 唤石者与怪异的访客", dispatched)
+        # The verbatim label keeps the first budget slot.
+        self.assertLess(
+            dispatched.index("剧场版 夏目友人帐 唤石者与怪异的访客"),
+            dispatched.index("夏目友人帐 唤石者与怪异的访客"),
+        )
+
     def test_cleaned_latin_query_without_title_substance_stays_undispatched(self) -> None:
         """A cleaner that collapses the label to noise must not waste budget.
 

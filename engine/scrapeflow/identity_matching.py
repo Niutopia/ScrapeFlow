@@ -152,6 +152,23 @@ def _search_query_variants(query: str) -> list[str]:
     ).strip()
     if attached_shelf != normalized and attached_shelf:
         variants.append(attached_shelf)
+    # A leading movie label (``剧场版``/``电影``) is release layout, not the
+    # work title: TMDB's own entry title omits it, so the verbatim label can
+    # match nothing even though the entry exists.  Dispatch the
+    # prefix-stripped standalone form as a fallback query only — the original
+    # stays first and candidate scoring still has to prove the title.
+    without_movie_label_prefix = re.sub(
+        r"^\s*(?:剧场版|劇場版|电影|電影)\s*[：:\-—]*\s*",
+        "",
+        normalized,
+        flags=re.I,
+    ).strip()
+    if (
+        without_movie_label_prefix != normalized
+        and without_movie_label_prefix
+        and without_movie_label_prefix not in variants
+    ):
+        variants.append(without_movie_label_prefix)
     # Release folders often encode a month as ``(2013.10)``.  A preceding
     # punctuation-normalization pass can turn that into ``(2013 10)``; remove
     # the whole parenthetical date rather than leaving a stray ``10`` that
