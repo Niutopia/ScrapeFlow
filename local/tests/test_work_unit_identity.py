@@ -2029,6 +2029,96 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         for candidate in movies:
             self.assertEqual(candidate.status, "rejected")
 
+    def test_single_unnumbered_ova_resolves_to_parent_show(self) -> None:
+        """An unnumbered single OVA directory confirms its parent show.
+
+        ``X 4k 示例剧/示例剧 猫老师的跑腿/[Ygm] Example OVA ….mkv`` is a
+        single unnumbered OVA: B/W proposes ``movie`` for the lone file, the
+        arc label matches no TMDB search at all, and the release has no
+        numbered-run evidence.  The physical OVA marker still proves the
+        parent-attached source shape, so the cleaned parent query leads the
+        budget and the tv type leads the search — the parent show owns the
+        identity, and the sibling movie entries never tie it out.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "示例剧": [
+                    {"id": 69500, "name": "示例剧", "first_air_date": "2008-07-08", "genre_ids": [16]},
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-ova-single",
+            boundary_label="示例剧 猫老师的跑腿",
+            parent_labels=("X 4k 示例剧",),
+            representative_names=("示例剧 猫老师的跑腿",),
+            normalized_titles=("示例剧 猫老师的跑腿",),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+            special_markers=("OVA",),
+            special_episode_numbers=(),
+            special_episode_count=None,
+            special_numbered_run_complete=False,
+        )
+        best, candidates = auto_match_from_evidence(
+            client, evidence, prefer_animation=True,
+        )
+        self.assertEqual(best.media_type, "tv")
+        self.assertEqual(best.tmdb_id, 69500)
+        self.assertEqual(best.status, "confirmed")
+        search_calls = [
+            (path, str(params.get("query", "")))
+            for path, params in client.call_log
+            if path.startswith("/search/")
+        ]
+        self.assertEqual(search_calls[0][0], "/search/tv")
+        self.assertFalse(any(path == "/search/movie" for path, _ in search_calls))
+        self.assertIn("示例剧", [query for _, query in search_calls])
+
+    def test_standalone_ova_film_keeps_the_movie_fallback(self) -> None:
+        """A physical special that really is a film still confirms as movie.
+
+        The tv-leading override for OVA-marked units must not trap a
+        standalone OVA film on the tv type: when the tv search finds nothing
+        confirmed, the ordinary other-type fallback still collects the movie
+        entry and confirms it.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Standalone OVA Film": [
+                    {
+                        "id": 555,
+                        "title": "Standalone OVA Film",
+                        "release_date": "2015-01-01",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-ova-film",
+            boundary_label="Standalone OVA Film",
+            parent_labels=(),
+            representative_names=("Standalone OVA Film",),
+            normalized_titles=("Standalone OVA Film",),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+            special_markers=("OVA",),
+            special_episode_numbers=(),
+            special_episode_count=None,
+            special_numbered_run_complete=False,
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, prefer_animation=True,
+        )
+        self.assertEqual(best.media_type, "movie")
+        self.assertEqual(best.tmdb_id, 555)
+        self.assertEqual(best.status, "confirmed")
+
     def test_invalid_input_validation(self) -> None:
         client = FakeTMDBClient()
         evidence_empty = IdentityEvidence(

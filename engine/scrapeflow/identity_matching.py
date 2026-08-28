@@ -2138,6 +2138,16 @@ def auto_match_from_evidence(
 
     excluded_ids = {int(value) for value in (excluded_tmdb_ids or ())}
     target_media_type = evidence.media_shape if evidence.media_shape in {"tv", "movie"} else None
+    # A physical OVA/OAV/OAD release is catalogued as a Season 00 episode of
+    # its parent show.  A single video file makes B/W propose ``movie``
+    # because one file cannot distinguish an OVA episode from a film, yet the
+    # tv type owns this identity: lead with tv and keep the movie type as the
+    # ordinary fallback for a special that really is a standalone film.
+    if target_media_type == "movie" and any(
+        _physical_special_marker_key(marker) is not None
+        for marker in evidence.special_markers
+    ):
+        target_media_type = "tv"
     initial_types = [target_media_type] if target_media_type else ["tv", "movie"]
 
     # Gather search queries in prioritized order.
@@ -2173,13 +2183,15 @@ def auto_match_from_evidence(
         )
     ):
         raise PlanError("纯季目录或特典目录缺少父容器或代表媒体标题证据")
-    # A complete numbered physical OVA/OAV/OAD run is released as part of a
-    # parent show, and its own arc label frequently matches no TV search at
-    # all (an arc query can return only the split movie halves of the same
-    # release).  The user-owned parent label is ordinary identity evidence
+    # A physical OVA/OAV/OAD release is part of a parent show, and its own
+    # arc label frequently matches no TV search at all (an arc query can
+    # return only the split movie halves of the same release, or nothing at
+    # all when the arc is an unnumbered single catalogued only as a Season 00
+    # episode).  The user-owned parent label is ordinary identity evidence
     # for that source shape, so its cleaned standalone form is dispatched
     # ahead of the arc queries to bring the parent show into the bounded
-    # candidate pool.
+    # candidate pool — for a complete numbered run and for an unnumbered
+    # single alike.
     physical_special_markers = tuple(sorted({
         str(marker).upper()
         for marker in evidence.special_markers
@@ -2192,7 +2204,7 @@ def auto_match_from_evidence(
         and set(physical_special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
         else None
     )
-    if physical_special_episode_count:
+    if physical_special_episode_count or physical_special_markers:
         for parent in evidence.parent_labels:
             for p_variant in _parent_identity_query_variants(parent):
                 cleaned = _clean_boundary_identity_query(p_variant).strip()
