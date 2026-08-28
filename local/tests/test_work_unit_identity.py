@@ -821,6 +821,81 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         self.assertEqual(best.status, "confirmed")
         self.assertGreaterEqual(best.confidence, 0.88)
 
+    def test_pure_movie_form_label_never_dispatches_standalone_queries(self) -> None:
+        """A bare ``剧场版`` must never reach TMDB as its own query.
+
+        The form label carries no title substance, so a standalone dispatch
+        returns unrelated shows whose titles merely contain the token
+        (``龙珠剧场版``).  Those franchise siblings then sit within the
+        ambiguity margin of the correctly aligned feature and block the
+        automatic match.  The label is suppressed from every evidence slot,
+        exactly like a bare season leaf; parent and combined queries carry
+        the identity.
+        """
+
+        class ExactQueryTMDBClient:
+            def __init__(self) -> None:
+                self.searched: list[tuple[str, str]] = []
+
+            def get(self, path: str, **params: Any) -> dict[str, Any]:
+                if not path.startswith("/search/"):
+                    return {}
+                query = str(params.get("query", ""))
+                self.searched.append((path, query))
+                results = {
+                    "剧场版": [
+                        {
+                            "id": 154779,
+                            "name": "龙珠剧场版",
+                            "first_air_date": "1986-12-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁": [
+                        {
+                            "id": 820067,
+                            "title": "五等分的新娘 剧场版",
+                            "release_date": "2022-05-20",
+                            "genre_ids": [16],
+                        },
+                        {
+                            "id": 1507125,
+                            "title": "五等分的花嫁横滨竞技场五周年纪念活动",
+                            "release_date": "2025-02-19",
+                            "genre_ids": [16],
+                        },
+                    ],
+                    "五等分的花嫁 剧场版": [
+                        {
+                            "id": 820067,
+                            "title": "五等分的新娘 剧场版",
+                            "release_date": "2022-05-20",
+                            "genre_ids": [16],
+                        },
+                    ],
+                }
+                return {"results": results.get(query, [])}
+
+        client = ExactQueryTMDBClient()
+        evidence = IdentityEvidence(
+            work_unit_id="wu-movie-form-standalone",
+            boundary_label="剧场版",
+            parent_labels=("W 4k 五等分的花嫁",),
+            representative_names=("剧场版", "Go-Toubun no Hanayome The Movie"),
+            normalized_titles=("剧场版",),
+            years=(),
+            episode_pattern=None,
+            media_shape="unknown",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.88
+        )
+        self.assertEqual(best.tmdb_id, 820067)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = {query for _path, query in client.searched}
+        self.assertNotIn("剧场版", dispatched)
+
     def test_nested_parent_combos_cannot_crowd_out_boundary_queries(self) -> None:
         """Two nested parent labels must not exhaust the query budget.
 
