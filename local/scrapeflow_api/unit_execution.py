@@ -1445,11 +1445,6 @@ def ensure_container_artifacts(
         raw_plan = carrier.plan if isinstance(carrier.plan, Mapping) else {}
         if raw_plan.get("target_root") == container_parent:
             return None
-    inputs = _container_artifact_inputs(runner, records, container_parent)
-    if inputs is None:
-        # No accepted child means there is no safe image identity to borrow;
-        # leave the root untouched until one sibling reaches H.
-        return None
     container_title = posixpath.basename(container_parent.rstrip("/"))
     if not container_title:
         raise ContainerMetadataAttention("容器根目录没有可用的清洗名称")
@@ -1472,19 +1467,32 @@ def ensure_container_artifacts(
         metadata = existing.plan.get("metadata") if isinstance(existing.plan, Mapping) else {}
         if not isinstance(metadata, Mapping):
             raise ContainerMetadataAttention("容器元数据 carrier 缺少持久化元数据")
-        expected = {
-            "container_title": container_title,
-            "container_poster_path": inputs.get("poster_path"),
-            "container_backdrop_path": inputs.get("backdrop_path"),
-        }
-        for key, value in expected.items():
-            if value is None:
-                continue
-            if metadata.get(key) != value:
-                raise ContainerMetadataAttention(
-                    f"容器元数据证据发生漂移: {key}"
-                )
+        # The persisted artwork identity is sticky.  The representative is
+        # the first proved child at carrier-creation time; re-running that
+        # argmin over a sibling set that grows as late units execute would
+        # "drift" on every root run and park the root behind an attention
+        # with no confirmation surface.  Only the loss of the provenance
+        # child reopens the choice: a rolled-back representative means the
+        # borrowed artwork no longer belongs to any executed sibling.
+        representative = metadata.get("representative_tmdb_id")
+        if (
+            isinstance(representative, int)
+            and not isinstance(representative, bool)
+            and not any(
+                (record.identity or {}).get("tmdb_id") == representative
+                and record.writer_job_id
+                for record in records
+            )
+        ):
+            raise ContainerMetadataAttention(
+                f"容器元数据代表单元已失效: tmdb/{representative}"
+            )
     else:
+        inputs = _container_artifact_inputs(runner, records, container_parent)
+        if inputs is None:
+            # No accepted child means there is no safe image identity to
+            # borrow; leave the root untouched until one sibling reaches H.
+            return None
         existing = runner.plan_container_artifacts(
             root_job_id=root_task_id,
             source_path=runner._job_ingress_source(root_job),  # noqa: SLF001

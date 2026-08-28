@@ -698,6 +698,88 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertIsNone(ensure_container_artifacts(runner, self.root, root.id))
         self.assertEqual(self.alist.uploads, uploads_before)
 
+    def test_container_representative_artwork_is_sticky_across_late_siblings(self) -> None:
+        """A persisted container artwork identity does not drift on rerun.
+
+        The representative is chosen once from the first proved child; a
+        sibling that executes later (and sorts earlier) must not turn every
+        following root run into an unconfirmable drift attention.  Only the
+        loss of the provenance child reopens the choice.
+        """
+        source = "/library/待刮削/Container"
+        self.alist.files[f"{source}/child.mkv"] = FAKE_VIDEO_BYTES
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=RecordingTMDB(),
+            library_root="/library",
+        )
+        root = runner.create_pending_job(source, job_id="engine-root-sticky")
+        root = runner.start_automatic_job(root.id, target_shelf="anime")
+        self._persist_unit_carrier(
+            runner,
+            job_id="unit-carrier-b",
+            root_job_id=root.id,
+            target_root="/library/番剧/Container/B Work",
+            metadata={"poster_path": "/first.jpg", "tmdb_id": 8},
+        )
+        records = [
+            WorkUnitRecord(
+                work_unit_id="unit-a",
+                root_task_id=root.id,
+                boundary_key=f"{source}/A",
+                source_paths=(f"{source}/A",),
+                source_revision=1,
+                role="single_work",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 7, "title": "A"},
+                claimed_seasons=(1,),
+            ),
+            WorkUnitRecord(
+                work_unit_id="unit-b",
+                root_task_id=root.id,
+                boundary_key=f"{source}/B",
+                source_paths=(f"{source}/B",),
+                source_revision=1,
+                role="single_work",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 8, "title": "B"},
+                claimed_seasons=(1,),
+                writer_job_id="unit-carrier-b",
+            ),
+        ]
+        save_work_unit_records(self.root, root.id, records)
+        carrier = ensure_container_artifacts(runner, self.root, root.id)
+        self.assertIsNotNone(carrier)
+        self.assertEqual(carrier.phase, "executed")
+        # The late sibling executes and sorts before the representative.
+        self._persist_unit_carrier(
+            runner,
+            job_id="unit-carrier-a",
+            root_job_id=root.id,
+            target_root="/library/番剧/Container/A Work",
+            metadata={"poster_path": "/late.jpg", "tmdb_id": 7},
+        )
+        records[0] = replace(
+            records[0], writer_job_id="unit-carrier-a",
+        )
+        save_work_unit_records(self.root, root.id, records)
+        uploads_before = list(self.alist.uploads)
+        repaired = ensure_container_artifacts(runner, self.root, root.id)
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.phase, "executed")
+        self.assertEqual(self.alist.uploads, uploads_before)
+        # The representative's own write was rolled back: its borrowed
+        # artwork no longer belongs to any executed sibling.
+        save_work_unit_records(self.root, root.id, [
+            replace(records[0], writer_job_id=None),
+            records[1],
+        ])
+        records[1] = replace(records[1], writer_job_id=None)
+        save_work_unit_records(self.root, root.id, records)
+        with self.assertRaisesRegex(ContainerMetadataAttention, "代表单元已失效"):
+            ensure_container_artifacts(runner, self.root, root.id)
+
     def test_public_request_cannot_nominate_internal_workunit_target_scope(self) -> None:
         """Only the RootJob composition layer may set a WorkUnit scope."""
         with self.assertRaisesRegex(EngineRequestError, "内部范围"):
