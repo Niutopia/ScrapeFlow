@@ -826,6 +826,67 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             dispatched.index("夏目友人帐 唤石者与怪异的访客"),
         )
 
+    def test_midstring_movie_label_stripped_query_recovers_the_entry(self) -> None:
+        """A wedged ``剧场版`` token is release layout, not part of the title.
+
+        A boundary labeled ``为美好的世界献上祝福！剧场版 红传说`` used to
+        dispatch only the verbatim label and its punctuation relaxation: the
+        movie-label token sits mid-title, so the prefix rule cannot reach it,
+        TMDB's own entry title omits the token, and the search returned
+        nothing.  The token-stripped form must get a fallback budget slot —
+        the original stays first and candidate scoring still proves the match.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "为美好的世界献上祝福! 红传说": [
+                    {
+                        "id": 532067,
+                        "title": "为美好的世界献上祝福！红传说",
+                        "release_date": "2019-08-30",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        label = "为美好的世界献上祝福！剧场版 红传说"
+        evidence = IdentityEvidence(
+            work_unit_id="wu-konosuba-crimson",
+            boundary_label=label,
+            parent_labels=(),
+            representative_names=(label,),
+            normalized_titles=(label,),
+            years=(2019,),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 532067)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/movie")
+        ]
+        self.assertIn("为美好的世界献上祝福! 红传说", dispatched)
+        # The verbatim label keeps the first budget slot.
+        self.assertLess(
+            dispatched.index(label),
+            dispatched.index("为美好的世界献上祝福! 红传说"),
+        )
+
+    def test_midstring_movie_label_variant_keeps_short_stripped_husks_out(self) -> None:
+        """A label whose whole substance is the movie token stays verbatim.
+
+        ``电影少女`` is a real title whose only leading token is ``电影``:
+        stripping it mid-string would leave the two-character husk ``少女``,
+        which cannot prove anything.  The stripped form must stay out of the
+        query budget while the verbatim label keeps its slot.
+        """
+        variants = _search_query_variants("电影少女")
+        self.assertIn("电影少女", variants)
+        self.assertNotIn("少女", variants)
+
     def test_cleaned_latin_query_without_title_substance_stays_undispatched(self) -> None:
         """A cleaner that collapses the label to noise must not waste budget.
 

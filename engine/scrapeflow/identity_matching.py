@@ -171,7 +171,9 @@ def _search_query_variants(query: str) -> list[str]:
     # work title: TMDB's own entry title omits it, so the verbatim label can
     # match nothing even though the entry exists.  Dispatch the
     # prefix-stripped standalone form as a fallback query only — the original
-    # stays first and candidate scoring still has to prove the title.
+    # stays first, the remainder must stay long enough to remain a title
+    # (``电影少女`` is a real title, not a label plus one), and candidate
+    # scoring still has to prove the title.
     without_movie_label_prefix = re.sub(
         r"^\s*(?:剧场版|劇場版|电影|電影)\s*[：:\-—]*\s*",
         "",
@@ -180,10 +182,30 @@ def _search_query_variants(query: str) -> list[str]:
     ).strip()
     if (
         without_movie_label_prefix != normalized
-        and without_movie_label_prefix
+        and len(without_movie_label_prefix) >= 4
         and without_movie_label_prefix not in variants
     ):
         variants.append(without_movie_label_prefix)
+    # The movie-label token is release layout wherever it sits: a label can
+    # wedge it mid-title (``为美好的世界献上祝福！剧场版 红传说``) exactly as it
+    # can lead with it.  Dispatch the token-stripped form as a fallback query
+    # only — the original stays first, the remainder must stay long enough to
+    # remain a title, and candidate scoring still has to prove the match.
+    without_movie_label_token = re.sub(
+        r"[\s：:．.・\-—－]*(?:剧场版|劇場版|电影|電影)[\s：:．.・\-—－]*",
+        " ",
+        normalized,
+        flags=re.I,
+    )
+    without_movie_label_token = re.sub(
+        r"\s+", " ", without_movie_label_token,
+    ).strip()
+    if (
+        without_movie_label_token != normalized
+        and len(without_movie_label_token) >= 4
+        and without_movie_label_token not in variants
+    ):
+        variants.append(without_movie_label_token)
     # Release folders often encode a month as ``(2013.10)``.  A preceding
     # punctuation-normalization pass can turn that into ``(2013 10)``; remove
     # the whole parenthetical date rather than leaving a stray ``10`` that
