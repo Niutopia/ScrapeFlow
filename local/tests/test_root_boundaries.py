@@ -238,6 +238,84 @@ class RootBoundaryCompositionTests(unittest.TestCase):
                 self.assertEqual(len(scoped.files), 1)
                 self.assertEqual(scoped.files[0].path, record.source_paths[0])
 
+    def test_mixed_feature_and_bracket_run_folder_splits_two_units(self) -> None:
+        """A feature film beside a bracket-numbered mini-series is two units.
+
+        One release folder can bundle a theatrical feature with a
+        same-titled ``[01]``/``[02]`` short series.  The flat splitter must
+        emit one exact-file-scope movie candidate for the feature and one
+        tv-shaped candidate owning the complete bracketed run, instead of
+        parking the whole folder as an unidentifiable mix.
+        """
+        root = "/incoming/Y 4k 银魂"
+        folder = f"{root}/银魂 剧场版 The Final"
+        feature = folder + "/[Ygm] Gintama ~The Final~ [Ma10p_2160p][x265_flac_DTS5.1_ass].mkv"
+        run_one = folder + "/[Ygm] Gintama ~The Semi-Final~ [01][Ma10p_2160p][x265_flac_ass].mkv"
+        run_two = folder + "/[Ygm] Gintama ~The Semi-Final~ [02][Ma10p_2160p][x265_flac_ass].mkv"
+        big = 2 * 1024 ** 3
+        alist = DictAList({
+            root: [
+                {"name": "银魂 第一季", "is_dir": True},
+                {"name": "银魂 剧场版 The Final", "is_dir": True},
+            ],
+            f"{root}/银魂 第一季": [
+                {"name": f"[Ygm] Gintama S01E{number:02d}.mkv", "is_dir": False, "size": big}
+                for number in (1, 2)
+            ],
+            folder: [
+                {"name": Path(feature).name, "is_dir": False, "size": 13 * 1024 ** 3},
+                {"name": Path(run_one).name, "is_dir": False, "size": big},
+                {"name": Path(run_two).name, "is_dir": False, "size": big},
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="final-mix", state_root=Path(directory),
+            )
+        by_paths = {record.source_paths: record for record in records}
+        self.assertIn((feature,), by_paths)
+        self.assertIn((run_one, run_two), by_paths)
+        movie = by_paths[(feature,)]
+        self.assertEqual(movie.media_context, "movie")
+        series = by_paths[(run_one, run_two)]
+        self.assertEqual(series.media_context, "tv")
+        self.assertEqual(series.display_label, "Gintama ~The Semi-Final~")
+
+    def test_marker_run_and_numbered_sequence_folders_stay_whole(self) -> None:
+        """Fail-closed shapes for the child-level flat split.
+
+        A marker-bearing run (``Gintama OAD 2016 [01]``) is physical-special
+        evidence anchored by its directory label, and a numbered
+        same-franchise sequence (``01. 俯瞰风景``) is one collection.  Both
+        must keep their whole-directory boundary.
+        """
+        root = "/incoming/Guarded Bundle"
+        oad_folder = f"{root}/银魂 爱染香篇"
+        numbered_folder = f"{root}/剧场版合集"
+        big = 2 * 1024 ** 3
+        alist = DictAList({
+            root: [
+                {"name": "银魂 爱染香篇", "is_dir": True},
+                {"name": "剧场版合集", "is_dir": True},
+            ],
+            oad_folder: [
+                {"name": f"[Ygm] Gintama OAD 2016 [{number:02d}].mkv", "is_dir": False, "size": big}
+                for number in (1, 2)
+            ],
+            numbered_folder: [
+                {"name": f"0{number}. 俯瞰风景{number}.mkv", "is_dir": False, "size": big}
+                for number in (1, 2, 3)
+            ],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            records = analyze_root_boundaries(
+                alist, root, root_task_id="guarded", state_root=Path(directory),
+            )
+        self.assertEqual(
+            {record.source_paths for record in records},
+            {(oad_folder,), (numbered_folder,)},
+        )
+
     def test_decorated_sibling_seasons_persist_one_exact_multi_source_unit(self) -> None:
         root = "/incoming/Northwind Bundle"
         entries: dict[str, list[dict[str, object]]] = {

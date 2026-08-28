@@ -585,7 +585,7 @@ _DIRECT_EPISODE_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _DIRECT_ORDINAL_BRACKET_RE = re.compile(
-    r"(?:\[|\(|【)\s*0*\d{1,3}(?:\s*v\d+)?\s*(?:\]|\)|】)",
+    r"(?:\[|\(|【)\s*0*(\d{1,3})(?:\s*v\d+)?\s*(?:\]|\)|】)",
     re.IGNORECASE,
 )
 _DIRECT_PART_TOKEN_RE = re.compile(
@@ -603,16 +603,30 @@ _DIRECT_TRAILING_ORDINAL_RE = re.compile(
     r"(?:^|[\s._-])0*[1-9]\d{0,2}$",
     re.IGNORECASE,
 )
+# A same-titled release run whose shared title carries a physical-special
+# marker (OVA/OAD/OAV/SP/SPECIAL) is special-episode evidence, not a bundled
+# mini-series: the enclosing directory label is the identity anchor that C/D
+# use for the parent-show Season 00 proof, so the flat-series split must not
+# dissolve it.  Fail closed and keep the whole-directory boundary.
+_DIRECT_RUN_PHYSICAL_SPECIAL_RE = re.compile(
+    r"(?<![A-Za-z])(?:OVA|OAV|OAD|SP|SPECIAL)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+# ``01. 俯瞰风景.mkv`` opens with a standalone release ordinal: the folder
+# is a numbered same-franchise sequence (one collection), not a package of
+# independently titled features.  The flat splitter must fail closed there.
+_DIRECT_LEADING_ORDINAL_RE = re.compile(
+    r"^\s*0*\d{1,3}\s*[.、,，\-_）)\]]?\s*\S",
+)
 
 
-def _direct_movie_title_key(file_name: str) -> str | None:
-    """Return a conservative title key for one flat video filename.
+def _direct_movie_title_text(file_name: str) -> str | None:
+    """Return the lexical title text of one flat video filename.
 
-    The key is used only by the boundary splitter.  Explicit episode-shaped
-    names, bare ordinals, and release-part markers fail closed so a normal TV
-    episode pack or a multi-disc encode can never be mistaken for a movie
-    collection.  Bracketed release tags are discarded; meaningful CJK/Latin
-    title text remains for C/U to query through the ordinary matcher.
+    This is the shared cleaning pipeline behind ``_direct_movie_title_key``.
+    The returned text keeps human-readable spacing so a same-titled release
+    run can reuse it as a boundary display label.  The same fail-closed
+    guards (episode-shaped names, bare ordinals) apply.
     """
     stem = unicodedata.normalize("NFKC", Path(str(file_name)).stem).strip()
     if not stem or _DIRECT_EPISODE_MARKER_RE.search(stem):
@@ -647,9 +661,24 @@ def _direct_movie_title_key(file_name: str) -> str | None:
     # only at the end and only after the stronger part/episode guards above.
     stem = _DIRECT_TRAILING_ORDINAL_RE.sub(" ", stem)
     stem = re.sub(r"\s+", " ", stem).strip(" ._+-")
+    return stem or None
+
+
+def _direct_movie_title_key(file_name: str) -> str | None:
+    """Return a conservative title key for one flat video filename.
+
+    The key is used only by the boundary splitter.  Explicit episode-shaped
+    names, bare ordinals, and release-part markers fail closed so a normal TV
+    episode pack or a multi-disc encode can never be mistaken for a movie
+    collection.  Bracketed release tags are discarded; meaningful CJK/Latin
+    title text remains for C/U to query through the ordinary matcher.
+    """
+    text = _direct_movie_title_text(file_name)
+    if text is None:
+        return None
     key = "".join(
         char.casefold()
-        for char in unicodedata.normalize("NFKC", stem)
+        for char in unicodedata.normalize("NFKC", text)
         if char.isalnum()
     )
     if not key or key.isdigit() or len(key) < 4:
@@ -665,6 +694,34 @@ def _direct_movie_title_is_substantial(file_name: str) -> bool:
     return len(cjk) >= 3 or len(latin_words) >= 2
 
 
+def _direct_bracketed_ordinal_run(file_names: Sequence[str]) -> bool:
+    """Prove a complete 1..N standalone bracketed-ordinal release run.
+
+    Every name must carry exactly one ``[01]``-style standalone ordinal
+    bracket and no explicit episode coordinate or part token.  The collected
+    ordinals must be exactly ``1..N`` with no gaps or duplicates.  This is
+    the release-local episode shape of a bundled mini-series; it is never a
+    movie-collection proof.  Release-tag brackets (``[Ma10p_2160p]``,
+    ``[x265]``) cannot match the ordinal grammar, and a bracketed year or
+    resolution is either four digits or breaks the 1..N completeness, so
+    both fail closed here.
+    """
+    ordinals: list[int] = []
+    for name in file_names:
+        stem = unicodedata.normalize("NFKC", Path(str(name)).stem)
+        if _DIRECT_EPISODE_MARKER_RE.search(stem) or _DIRECT_PART_TOKEN_RE.search(stem):
+            return False
+        matches = [
+            int(match.group(1))
+            for match in _DIRECT_ORDINAL_BRACKET_RE.finditer(stem)
+        ]
+        if len(matches) != 1:
+            return False
+        ordinals.append(matches[0])
+    unique = set(ordinals)
+    return len(unique) == len(ordinals) and unique == set(range(1, len(ordinals) + 1))
+
+
 def _split_flat_movie_files(
     node: SourceNode,
     *,
@@ -675,10 +732,13 @@ def _split_flat_movie_files(
 
     This is a pure B/W rule for the identity-free flat-package shape.  It is
     intentionally narrower than a generic ``root_videos > 1`` rule: every
-    file must be a substantial, large, non-episodic title, all normalized
-    title keys must be unique, and the root may not also contain a
-    video-bearing child directory.  If any proof is missing the caller keeps
-    the historical whole-root boundary and C/U can park it safely.
+    file must be a substantial, large, non-episodic title, and the root may
+    not also contain a video-bearing child directory.  Uniquely keyed files
+    become movie candidates; files sharing one title key must prove a
+    complete ``[01]..[N]`` bracketed-ordinal run, which becomes one
+    tv-shaped exact-file-scope candidate (a bundled mini-series released
+    beside feature films).  If any proof is missing the caller keeps the
+    historical whole-root boundary and C/U can park it safely.
     """
     if root_videos < 2:
         return None
@@ -691,38 +751,109 @@ def _split_flat_movie_files(
         for file in direct_videos
     ):
         return None
+    # A numbered same-franchise sequence (``01. 俯瞰风景.mkv`` …) is one
+    # collection, never a package of independently titled features.
+    if any(
+        _DIRECT_LEADING_ORDINAL_RE.match(
+            unicodedata.normalize("NFKC", Path(str(file.name)).stem)
+        )
+        for file in direct_videos
+    ):
+        return None
     # A root that also has a video-bearing child is normally a TV/container
     # layout.  Leave it intact for the season/container rules below.
     if any(_child_has_video(child) for child in node.children):
         return None
+    texts = [_direct_movie_title_text(file.name) for file in direct_videos]
     keys = [_direct_movie_title_key(file.name) for file in direct_videos]
     if any(key is None for key in keys):
         return None
-    concrete_keys = [key for key in keys if key is not None]
-    if len(set(concrete_keys)) != len(concrete_keys):
-        return None
+
+    # Group files by their normalized title key.  A singleton group is one
+    # feature film; a repeated key is only acceptable as a complete
+    # bracketed-ordinal release run (one bundled mini-series).
+    grouped: dict[str, list[int]] = {}
+    for index, key in enumerate(keys):
+        assert key is not None
+        grouped.setdefault(key, []).append(index)
+    for key, indices in grouped.items():
+        if len(indices) == 1:
+            continue
+        # A marker-bearing run (``Show OAD 2016 [01]``) is physical-special
+        # evidence owned by the whole-directory boundary; see the regex note.
+        if _DIRECT_RUN_PHYSICAL_SPECIAL_RE.search(texts[indices[0]] or ""):
+            return None
+        if not _direct_bracketed_ordinal_run(
+            [direct_videos[index].name for index in indices]
+        ):
+            return None
 
     candidates: list[WorkCandidate] = []
+    movie_count = sum(1 for indices in grouped.values() if len(indices) == 1)
+    series_count = len(grouped) - movie_count
     reason = (
-        f"根目录直接含 {len(direct_videos)} 个独立标题的大视频文件；"
-        "文件名无季集/分片坐标且标题键互不重复",
+        f"目录 '{node.name}' 直接含 {movie_count} 个独立标题的大视频文件"
+        + (
+            f"与 {series_count} 个同标题完整括号序号短剧集发布"
+            if series_count
+            else ""
+        )
+        + "；文件名无季集/分片坐标"
     )
-    for file in direct_videos:
-        boundary_key = file.path
+    for key, indices in grouped.items():
+        if len(indices) == 1:
+            file = direct_videos[indices[0]]
+            candidates.append(WorkCandidate(
+                work_unit_id=_work_unit_id(root_task_id, file.path),
+                boundary_key=file.path,
+                source_paths=(file.path,),
+                display_label=Path(file.name).stem,
+                proposed_media_context="movie",
+                boundary_evidence=BoundaryEvidence(
+                    role=DirectoryRole.MOVIE_COLLECTION,
+                    confidence=0.86,
+                    reasons=reason,
+                    competing_roles=(DirectoryRole.SINGLE_WORK.value,),
+                ),
+            ))
+            continue
+        source_paths = tuple(
+            direct_videos[index].path for index in sorted(indices)
+        )
+        display_label = texts[indices[0]] or key
         candidates.append(WorkCandidate(
-            work_unit_id=_work_unit_id(root_task_id, boundary_key),
-            boundary_key=boundary_key,
-            source_paths=(boundary_key,),
-            display_label=Path(file.name).stem,
-            proposed_media_context="movie",
+            work_unit_id=_work_unit_id(root_task_id, f"{node.path}/@flat-series/{key}"),
+            boundary_key=f"{node.path}/@flat-series/{key}",
+            source_paths=source_paths,
+            display_label=display_label,
+            proposed_media_context="tv",
             boundary_evidence=BoundaryEvidence(
-                role=DirectoryRole.MOVIE_COLLECTION,
+                role=DirectoryRole.SINGLE_WORK,
                 confidence=0.86,
                 reasons=reason,
-                competing_roles=(DirectoryRole.SINGLE_WORK.value,),
+                competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
             ),
         ))
     return candidates
+
+
+def _titled_child_split(
+    child: SourceNode,
+    *,
+    root_task_id: str,
+) -> list[WorkCandidate] | None:
+    """Attempt the flat multi-title split inside one titled child directory.
+
+    A titled child normally stays one whole WorkUnit, but a release folder
+    can pack several independently titled feature files — a theatrical
+    feature beside a bracket-numbered mini-series.  The conservative flat
+    splitter decides; ``None`` keeps the ordinary whole-child boundary.
+    """
+    return _split_flat_movie_files(
+        child,
+        root_task_id=root_task_id,
+        root_videos=direct_video_file_count(child),
+    )
 
 
 def _propose_media_context(node: SourceNode) -> str:
@@ -1182,6 +1313,10 @@ def analyze_boundaries(
                 claimed_seasons=generic_seasons,
             )]
             for child in residual_video_children:
+                child_split = _titled_child_split(child, root_task_id=root_task_id)
+                if child_split is not None:
+                    candidates.extend(child_split)
+                    continue
                 candidates.append(WorkCandidate(
                     work_unit_id=_work_unit_id(root_task_id, child.path),
                     boundary_key=child.path,
@@ -1251,6 +1386,12 @@ def analyze_boundaries(
                     f"发现 {len(residual_titled)} 个未归入季度 cohort 的有名字子目录",
                 )
                 for child in residual_titled:
+                    child_split = _titled_child_split(
+                        child, root_task_id=root_task_id
+                    )
+                    if child_split is not None:
+                        candidates.extend(child_split)
+                        continue
                     candidates.append(WorkCandidate(
                         work_unit_id=_work_unit_id(root_task_id, child.path),
                         boundary_key=child.path,
@@ -1302,6 +1443,14 @@ def analyze_boundaries(
         )
         candidates: list[WorkCandidate] = []
         for child in titled_children:
+            # A release folder can pack several independently titled feature
+            # files (a theatrical feature beside a bracket-numbered
+            # mini-series).  Split those exact file scopes before the
+            # whole-child candidate below.
+            child_split = _titled_child_split(child, root_task_id=root_task_id)
+            if child_split is not None:
+                candidates.extend(child_split)
+                continue
             child_context = _propose_media_context(child)
             # A titled child whose own name carries a season marker (``不死者
             # 王者 第一季``) is an explicit B/W season fact: D's default-season
