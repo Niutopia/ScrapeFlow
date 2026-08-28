@@ -870,6 +870,117 @@ def _catalog_tokens_for_seasons(
     return frozenset(output)
 
 
+_OWNED_SEASON_TOKEN_RE = re.compile(r"^S(\d{2,})E\d{2,}$")
+
+
+def _owned_season_catalog_gap_tokens(
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    index: LibraryIndex,
+    *,
+    media_type: str,
+    tmdb_id: int,
+) -> frozenset[str] | None:
+    """Catalog episodes missing from the library work's already-owned seasons.
+
+    Only seasons the library already covers participate: an unowned season
+    is not a gap claim this shape may invent.  A season without catalog rows
+    proves nothing either way and contributes no tokens, but a catalog that
+    cannot be read at all proves nothing, so the caller keeps its fail-closed
+    verdict instead of silently consuming the source.
+    """
+    existing_tokens: set[str] = set()
+    for work in index.entries_for(media_type, tmdb_id):
+        existing_tokens.update(work.episode_tokens)
+    owned_seasons: set[int] = set()
+    for token in existing_tokens:
+        match = _OWNED_SEASON_TOKEN_RE.match(str(token))
+        if match is not None:
+            owned_seasons.add(int(match.group(1)))
+    if not owned_seasons:
+        return frozenset()
+    if not callable(episode_catalog):
+        return None
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    output: set[str] = set()
+    for season in owned_seasons:
+        rows = payload.get(season)
+        if (
+            not isinstance(rows, Sequence)
+            or isinstance(rows, (str, bytes, bytearray))
+            or not rows
+        ):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            episode = _positive_season(row.get("episode_number"))
+            if episode is None:
+                continue
+            token = f"S{season:02d}E{episode:02d}"
+            if token not in existing_tokens:
+                output.add(token)
+    return frozenset(output)
+
+
+def _residual_only_reconciliation(
+    node: SourceNode | None,
+    index: LibraryIndex,
+    *,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    media_type: str,
+    tmdb_id: int,
+    known_gap_tokens: frozenset[str],
+) -> ReconciliationDecision | None:
+    """Classify an extras-only confirmed TV unit whose work already exists.
+
+    A source whose every video is proven never-written residual media
+    (theme/menu/commercial/bonus-directory) has no story coordinates to
+    contribute, and the planner would never write any of those files, so
+    parking the unit uncertain forever adds no safety.  When the formal
+    library already holds this identity the unit is instead classified by
+    that identity: catalog episodes missing from the library's already-owned
+    seasons register as gaps (existing_gap), otherwise the source is a pure
+    duplicate (duplicate_complete).
+
+    Fractional and unnumbered-special videos are deliberately outside this
+    vocabulary — they are story media with their own mapping paths, so
+    consuming them without a write would lose media.  A library without this
+    identity also stays uncertain: an extras-only source can never found a
+    new work root.
+    """
+    if node is None or media_type != "tv":
+        return None
+    videos = [
+        file for file in collect_all_files(node) if file.object_type == "video"
+    ]
+    if not videos:
+        return None
+    if not all(_is_proven_non_story_residual_video(file) for file in videos):
+        return None
+    if not index.entries_for(media_type, tmdb_id):
+        return None
+    owned_gap_tokens = _owned_season_catalog_gap_tokens(
+        episode_catalog,
+        index,
+        media_type=media_type,
+        tmdb_id=tmdb_id,
+    )
+    if owned_gap_tokens is None:
+        return None
+    return decide_reconciliation(
+        index,
+        media_type=media_type,
+        tmdb_id=tmdb_id,
+        unit_tokens=frozenset(),
+        known_gap_tokens=known_gap_tokens | owned_gap_tokens,
+    )
+
+
 def _scope_row_fingerprint(
     rows: Sequence[Mapping[str, object]],
 ) -> frozenset[tuple[str, bool, int, str]] | None:
@@ -1432,6 +1543,24 @@ def _is_non_regular_episode_video(file: SourceFile) -> bool:
         or _is_fractional_episode_video(file)
         or _is_bonus_directory_video(file)
         or _is_unnumbered_special_video(file)
+        or _is_menu_video(file)
+        or _is_commercial_video(file)
+    )
+
+
+def _is_proven_non_story_residual_video(file: SourceFile) -> bool:
+    """Whether a video is proven never-written residual media.
+
+    This is the D-side subset of the non-story vocabulary whose members the
+    planner never writes as story media: theme videos, disc menus,
+    commercials and bonus-directory residents.  Fractional and
+    unnumbered-special videos are excluded — they are story coordinates with
+    their own mapping paths, so consuming them without a write would lose
+    media.
+    """
+    return (
+        _is_known_non_story_theme_video(file)
+        or _is_bonus_directory_video(file)
         or _is_menu_video(file)
         or _is_commercial_video(file)
     )
@@ -2562,23 +2691,34 @@ def reconcile_root_work_units(
             if decision is not None:
                 pass
             elif media_type == "tv" and _has_video(scoped_node) and not unit_tokens:
-                decision = (
-                    _resumable_consumed_source_decision(
-                        alist,
-                        snapshot,
-                        state_root,
-                        root_task_id,
-                        record,
+                decision = _resumable_consumed_source_decision(
+                    alist,
+                    snapshot,
+                    state_root,
+                    root_task_id,
+                    record,
+                    index,
+                    media_type=media_type,
+                    tmdb_id=tmdb_id,
+                    label="季集坐标",
+                )
+                if decision is None:
+                    decision = _residual_only_reconciliation(
+                        scoped_node,
                         index,
+                        episode_catalog=episode_catalog,
                         media_type=media_type,
                         tmdb_id=tmdb_id,
-                        label="季集坐标",
+                        known_gap_tokens=frozenset(
+                            str(token)
+                            for token in known.get((media_type, tmdb_id), ())
+                        ),
                     )
-                    or ReconciliationDecision(
+                if decision is None:
+                    decision = ReconciliationDecision(
                         "uncertain", None, None,
                         ("TV 来源视频缺少可证明的季集坐标，不能安全判定重复",),
                     )
-                )
             else:
                 empty_seasons = (
                     _declared_empty_seasons(record, nodes_by_path)

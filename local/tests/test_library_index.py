@@ -1521,6 +1521,120 @@ class LibraryIndexTests(unittest.TestCase):
                 ("S03E01", "S03E02"),
             )
 
+    def test_residual_only_source_reconciles_by_library_identity(self) -> None:
+        """A theme-video-only TV source is classified by its library identity.
+
+        The planner never writes theme/menu/commercial/bonus-directory media,
+        so an all-residual source has no story coordinates to contribute and
+        must not park uncertain forever once the formal library already holds
+        the identity: catalog episodes missing from the library's owned
+        seasons register as gaps, and a fully covered work consumes the
+        source as a duplicate.  Without the library identity the same source
+        stays fail-closed — an extras-only source can never found a work
+        root.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-residual-only"
+            source = "/incoming/Residual Show"
+            files = {
+                "/library/番剧/Residual Show/tvshow.nfo": _nfo_tv(
+                    99045, "Residual Show", "2020",
+                ),
+                "/library/番剧/Residual Show/Season 00/S00E01.mkv": b"v",
+                "/library/番剧/Residual Show/Season 00/S00E02.mkv": b"v",
+                "/library/番剧/Residual Show/Season 01/S01E01.mkv": b"v",
+                "/library/番剧/Residual Show/Season 01/S01E02.mkv": b"v",
+                f"{source}/[Group] Residual Show [NCOP][Ma10p].mkv": b"v",
+                f"{source}/[Group] Residual Show [NCED][Ma10p].mkv": b"v",
+                f"{source}/menu/[Group] Residual Show [Menu01].mkv": b"v",
+            }
+            alist = IndexAList(files)
+            alist.dirs.add(f"{source}/SPs")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=99045,
+            )
+
+            catalog = {
+                0: [
+                    {"season_number": 0, "episode_number": 1},
+                    {"season_number": 0, "episode_number": 2},
+                    {"season_number": 0, "episode_number": 3},
+                ],
+                1: [
+                    {"season_number": 1, "episode_number": 1},
+                    {"season_number": 1, "episode_number": 2},
+                ],
+            }
+            gapped = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=lambda _identity: catalog,
+            )
+            self.assertEqual(gapped[0].reconciliation_outcome, "existing_gap")
+            self.assertEqual(gapped[0].uncovered_tokens, ("S00E03",))
+
+            with tempfile.TemporaryDirectory() as second:
+                covered_root = Path(second)
+                covered_task = "root-residual-only-covered"
+                covered_alist = IndexAList(files)
+                covered_alist.dirs.add(f"{source}/SPs")
+                analyze_root_boundaries(
+                    covered_alist, source,
+                    root_task_id=covered_task, state_root=covered_root,
+                )
+                covered_record = load_work_unit_records(
+                    covered_root, covered_task,
+                )[0]
+                apply_work_unit_override(
+                    covered_root, covered_task, covered_record.work_unit_id,
+                    media_type="tv", tmdb_id=99045,
+                )
+                # Add the missing library episode so the owned seasons are
+                # fully covered: the same residual source is a pure duplicate.
+                covered_alist.files[
+                    "/library/番剧/Residual Show/Season 00/S00E03.mkv"
+                ] = b"v"
+                duplicate = reconcile_root_work_units(
+                    covered_alist, "/library", covered_root, covered_task,
+                    episode_catalog=lambda _identity: catalog,
+                )
+                self.assertEqual(
+                    duplicate[0].reconciliation_outcome, "duplicate_complete",
+                )
+
+            with tempfile.TemporaryDirectory() as third:
+                unknown_root = Path(third)
+                unknown_task = "root-residual-only-unknown"
+                unknown_alist = IndexAList({
+                    key: value for key, value in files.items()
+                    if key.startswith("/incoming/")
+                })
+                unknown_alist.dirs.add(f"{source}/SPs")
+                analyze_root_boundaries(
+                    unknown_alist, source,
+                    root_task_id=unknown_task, state_root=unknown_root,
+                )
+                unknown_record = load_work_unit_records(
+                    unknown_root, unknown_task,
+                )[0]
+                apply_work_unit_override(
+                    unknown_root, unknown_task, unknown_record.work_unit_id,
+                    media_type="tv", tmdb_id=99046,
+                )
+                unknown = reconcile_root_work_units(
+                    unknown_alist, "/library", unknown_root, unknown_task,
+                    episode_catalog=lambda _identity: catalog,
+                )
+                self.assertEqual(unknown[0].reconciliation_outcome, "uncertain")
+                self.assertIn(
+                    "季集坐标", unknown[0].attention or "",
+                )
+
     def test_rooted_declared_subtitle_only_season_is_reconciled_as_exact_gap(self) -> None:
         """A rooted multi-season TV need not expose one WorkUnit scope per season.
 
