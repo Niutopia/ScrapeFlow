@@ -9,10 +9,11 @@ from types import SimpleNamespace
 
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import apply_work_unit_override
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_units import WorkUnitRecord, load_work_unit_records
 
 from local.scrapeflow_api.library_index import (
     SingleSeasonEpisodeProof,
+    _fresh_scopes_match_snapshot,
     _merged_multi_season_evidence,
     _single_positive_tmdb_season,
     _title_ordinal_prefix_matches_record,
@@ -2343,3 +2344,120 @@ class SeasonQualifiedContainerTests(LibraryIndexTests):
                 and record.reconciliation_evidence["episode_count"],
                 4,
             )
+
+
+class ScopeFreshnessTests(unittest.TestCase):
+    """The freshness gate compares per-scope snapshot shapes to the walk."""
+
+    @staticmethod
+    def _record(paths: list[str]) -> "WorkUnitRecord":
+        return WorkUnitRecord(
+            work_unit_id="wu-fresh",
+            root_task_id="root-fresh",
+            boundary_key="boundary",
+            source_paths=tuple(paths),
+            source_revision=1,
+            role="work",
+        )
+
+    def test_directory_scope_with_own_snapshot_row_still_matches(self) -> None:
+        """A scope directory's own snapshot row must not break freshness.
+
+        The B snapshot is a walk of the parent root, so a directory scope's
+        own row is always among the snapshot rows; ``walk_source_rows``
+        never returns the scope itself.  The expected rows must therefore
+        follow each scope's snapshot shape instead of blindly including
+        every row whose path touches a scope — otherwise every directory
+        scope below the root would fail freshness forever.
+        """
+        scope = "/incoming/root/示例剧"
+        alist = IndexAList({
+            f"{scope}/示例剧 OVA [01].mkv": b"video",
+            f"{scope}/示例剧 OVA [02].mkv": b"video",
+        })
+        snapshot = {
+            "rows": [
+                {
+                    "full_path": scope,
+                    "name": "示例剧",
+                    "is_dir": True,
+                    "size": 0,
+                    "modified": "",
+                },
+                {
+                    "full_path": f"{scope}/示例剧 OVA [01].mkv",
+                    "name": "示例剧 OVA [01].mkv",
+                    "is_dir": False,
+                    "size": 5,
+                    "modified": "",
+                },
+                {
+                    "full_path": f"{scope}/示例剧 OVA [02].mkv",
+                    "name": "示例剧 OVA [02].mkv",
+                    "is_dir": False,
+                    "size": 5,
+                    "modified": "",
+                },
+            ]
+        }
+        self.assertTrue(
+            _fresh_scopes_match_snapshot(alist, snapshot, self._record([scope]))
+        )
+
+    def test_flat_split_file_scope_still_matches(self) -> None:
+        """A flat-split file scope compares its exact snapshot file row."""
+        scope = "/incoming/root/Example Show [01].mkv"
+        alist = IndexAList({
+            scope: b"video",
+            "/incoming/root/Example Show [02].mkv": b"video",
+        })
+        snapshot = {
+            "rows": [
+                {
+                    "full_path": scope,
+                    "name": "Example Show [01].mkv",
+                    "is_dir": False,
+                    "size": 5,
+                    "modified": "",
+                },
+                {
+                    "full_path": "/incoming/root/Example Show [02].mkv",
+                    "name": "Example Show [02].mkv",
+                    "is_dir": False,
+                    "size": 5,
+                    "modified": "",
+                },
+            ]
+        }
+        self.assertTrue(
+            _fresh_scopes_match_snapshot(alist, snapshot, self._record([scope]))
+        )
+
+    def test_directory_scope_drift_fails_closed(self) -> None:
+        """A file that appeared inside the scope after B must fail freshness."""
+        scope = "/incoming/root/示例剧"
+        alist = IndexAList({
+            f"{scope}/示例剧 OVA [01].mkv": b"video",
+            f"{scope}/示例剧 OVA [02].mkv": b"video",
+        })
+        snapshot = {
+            "rows": [
+                {
+                    "full_path": scope,
+                    "name": "示例剧",
+                    "is_dir": True,
+                    "size": 0,
+                    "modified": "",
+                },
+                {
+                    "full_path": f"{scope}/示例剧 OVA [01].mkv",
+                    "name": "示例剧 OVA [01].mkv",
+                    "is_dir": False,
+                    "size": 0,
+                    "modified": "",
+                },
+            ]
+        }
+        self.assertFalse(
+            _fresh_scopes_match_snapshot(alist, snapshot, self._record([scope]))
+        )

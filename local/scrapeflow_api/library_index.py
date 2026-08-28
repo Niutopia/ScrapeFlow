@@ -1114,14 +1114,30 @@ def _fresh_scopes_match_snapshot(
             fresh.append(dict(scope_row, full_path=scope))
     except Exception:
         return False
-    expected = [
-        row for row in raw_snapshot_rows
-        if isinstance(row, Mapping)
-        and (
-            _path_below_any_scope(str(row.get("full_path") or "").rstrip("/"), scopes)
-            or str(row.get("full_path") or "").rstrip("/") in scopes
+    expected: list[Mapping[str, object]] = []
+    for scope in scopes:
+        scope_rows = [
+            row
+            for row in raw_snapshot_rows
+            if isinstance(row, Mapping)
+            and str(row.get("full_path") or "").rstrip("/") == scope
+        ]
+        if len(scope_rows) == 1 and scope_rows[0].get("is_dir") is not True:
+            # A flat-split file scope: the snapshot row is the exact file the
+            # fresh side proves from its parent listing.
+            expected.append(scope_rows[0])
+            continue
+        # A directory scope (or the snapshot walk root itself, which never
+        # carries its own row): the expected rows are strictly below the
+        # scope, mirroring ``walk_source_rows`` children-only semantics.
+        expected.extend(
+            row
+            for row in raw_snapshot_rows
+            if isinstance(row, Mapping)
+            and _path_below_any_scope(
+                str(row.get("full_path") or "").rstrip("/"), (scope,)
+            )
         )
-    ]
     return _scope_row_fingerprint(expected) == _scope_row_fingerprint(fresh)
 
 
