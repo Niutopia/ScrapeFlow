@@ -2411,6 +2411,98 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
             {f"SP{number:02d}": f"S01E{number:02d}" for number in range(1, 6)},
         )
 
+    def test_named_arc_oad_proof_maps_release_ordinals_onto_official_window(self) -> None:
+        """A named-arc Season 00 proof maps ``SP01``/``SP02`` to ``S00E08``/``E09``.
+
+        The D proof carries the official window the release ordinals were
+        proved onto.  F must use those proved tokens instead of guessing a
+        1-based Season 00 position.
+        """
+        class ParentArcTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "first_air_date": "2006-04-04",
+                        "number_of_seasons": 2,
+                        "number_of_episodes": 212,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 11, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 201, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    names = {
+                        1: "短篇 1", 2: "短篇 2", 3: "短篇 3", 4: "短篇 4",
+                        5: "短篇 5", 6: "短篇 6", 7: "短篇 7",
+                        8: "示例剧 爱染香篇 前篇",
+                        9: "示例剧 爱染香篇 后篇",
+                        10: "周年感谢祭",
+                        11: "番外兔子",
+                    }
+                    air = {8: "2016-05-13", 9: "2016-06-10"}
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": air.get(number, "2007-01-01"),
+                                "name": names[number],
+                            }
+                            for number in range(1, 12)
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2006-04-04",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 202)
+                        ]
+                    }
+                return {}
+
+        source = "/incoming/示例剧 爱染香篇"
+        files = {
+            f"{source}/示例剧 OAD 2016 [{number:02d}][Ma10p_2160p].mkv": FAKE_VIDEO_BYTES
+            for number in (1, 2)
+        }
+        tmdb = ParentArcTMDB(99101)
+        state_root, alist, runner = self._setup(files, tmdb)
+        root_task_id = "root-named-arc-map"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = load_work_unit_records(state_root, root_task_id)[0]
+        apply_work_unit_override(
+            state_root, root_task_id, record.work_unit_id,
+            media_type="tv", tmdb_id=99101,
+        )
+        record = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )[0]
+        self.assertEqual(
+            record.reconciliation_evidence and record.reconciliation_evidence["episode_tokens"],
+            ["S00E08", "S00E09"],
+        )
+        request = _request_for_unit(runner, record, root_task_id, state_root)
+        self.assertEqual(request.season, 0)
+        self.assertIsNotNone(request.episode_map_path)
+        mapping = json.loads(Path(request.episode_map_path).read_text(encoding="utf-8"))
+        self.assertEqual(
+            mapping,
+            {"SP01": "S00E08", "SP02": "S00E09"},
+        )
+
     def test_single_season_block_keeps_the_ordinary_path(self) -> None:
         files = {
             f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES

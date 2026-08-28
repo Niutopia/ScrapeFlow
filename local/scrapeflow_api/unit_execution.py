@@ -1825,10 +1825,28 @@ def _physical_special_episode_map_path(
         or not markers
     ):
         return None
-    mapping = {
-        f"SP{number:02d}": f"S{proof.season:02d}E{number:02d}"
-        for number in numbers
-    }
+    # The D proof carries the official episode tokens the release ordinals
+    # were mapped onto.  For a named-arc Season 00 run those tokens are not
+    # ``S00E01..S00EN`` — the arc starts wherever the parent show catalogued
+    # it (``S00E08``/``S00E09``) — so the map must use the proved tokens
+    # instead of guessing 1-based positions.
+    proof_tokens = tuple(str(token).upper() for token in proof.episode_tokens)
+    expected_local = tuple(
+        f"S{proof.season:02d}E{number:02d}" for number in numbers
+    )
+    if proof_tokens == expected_local:
+        mapping = {f"SP{number:02d}": token for number, token in zip(numbers, expected_local)}
+    else:
+        if len(proof_tokens) != len(numbers):
+            return None
+        season_prefix = f"S{proof.season:02d}E"
+        for token in proof_tokens:
+            if not token.startswith(season_prefix):
+                return None
+            episode_ordinal = token[len(season_prefix):]
+            if not episode_ordinal.isdigit():
+                return None
+        mapping = {f"SP{number:02d}": token for number, token in zip(numbers, proof_tokens)}
     path = state_root / f"episode_map_{record.work_unit_id}.json"
     atomic_write_json(path, mapping, allow_nan=False)
     return str(path)

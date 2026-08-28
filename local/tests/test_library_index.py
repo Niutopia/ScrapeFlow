@@ -915,6 +915,172 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
 
+    def test_named_arc_oad_run_maps_onto_parent_season00_window(self) -> None:
+        """A named-arc OAD run maps onto the parent's official S00 window.
+
+        ``示例剧 爱染香篇 OAD 2016 [01][02]`` is officially catalogued as
+        part-titled Season 00 episodes E08/E09 of the multi-season parent
+        show.  D must prove that named window (not 1-based guessing) so the
+        release-local ordinals land on ``S00E08``/``S00E09``.
+        """
+        class ParentShowTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "number_of_seasons": 2,
+                        "number_of_episodes": 212,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 11, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 201, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    names = {
+                        1: "短篇 1", 2: "短篇 2", 3: "短篇 3", 4: "短篇 4",
+                        5: "短篇 5", 6: "短篇 6", 7: "短篇 7",
+                        8: "示例剧 爱染香篇 前篇",
+                        9: "示例剧 爱染香篇 后篇",
+                        10: "周年感谢祭",
+                        11: "番外兔子",
+                    }
+                    air = {
+                        8: "2016-05-13",
+                        9: "2016-06-10",
+                    }
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": air.get(number, "2007-01-01"),
+                                "name": names[number],
+                            }
+                            for number in range(1, 12)
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2006-04-04",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 202)
+                        ]
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-named-arc-oad"
+            tmdb = ParentShowTMDB(99052)
+            files = {
+                "/incoming/示例剧 爱染香篇/示例剧 OAD 2016 [01].mkv": b"v",
+                "/incoming/示例剧 爱染香篇/示例剧 OAD 2016 [02].mkv": b"v",
+            }
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, "/incoming/示例剧 爱染香篇",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_physical_special",
+                    "tmdb_id": 99052,
+                    "season": 0,
+                    "episode_count": 2,
+                    "episode_tokens": ["S00E08", "S00E09"],
+                },
+            )
+
+    def test_named_arc_oad_run_rejects_mismatched_release_year(self) -> None:
+        """A named window aired outside the source year window fails closed."""
+
+        class DatedParentTMDB:
+            def __init__(self, tmdb_id: int, year: str) -> None:
+                self.tmdb_id = tmdb_id
+                self.year = year
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 3, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 12, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    return {
+                        "episodes": [
+                            {"episode_number": 1, "air_date": "2010-01-01", "name": "短篇"},
+                            {
+                                "episode_number": 2,
+                                "air_date": self.year,
+                                "name": "示例剧 爱染香篇 前篇",
+                            },
+                            {
+                                "episode_number": 3,
+                                "air_date": self.year,
+                                "name": "示例剧 爱染香篇 后篇",
+                            },
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2006-04-04",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 13)
+                        ]
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-named-arc-oad-year"
+            tmdb = DatedParentTMDB(99053, "2019-01-01")
+            files = {
+                "/incoming/示例剧 爱染香篇/示例剧 OAD 2016 [01].mkv": b"v",
+                "/incoming/示例剧 爱染香篇/示例剧 OAD 2016 [02].mkv": b"v",
+            }
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, "/incoming/示例剧 爱染香篇",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
     def test_naked_numeric_proof_ignores_an_empty_future_tmdb_season(self) -> None:
         """TMDB's zero-episode announced season has no coordinate to infer."""
         with tempfile.TemporaryDirectory() as directory:

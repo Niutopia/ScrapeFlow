@@ -22,12 +22,15 @@ from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,
     _season_number_from_directory_name,
 )
+from engine.scrapeflow.core import _special_arc_title_key
 from engine.scrapeflow.identity_matching import (
+    AUTO_MATCH_MIN_MARGIN,
     _clean_boundary_identity_query,
     _normalize_match_title,
     _official_physical_special_markers,
     _physical_special_marker_key,
     _season0_marker_and_ordinal,
+    _title_similarity,
     physical_special_candidate_evidence,
 )
 from engine.scrapeflow.media_policy import (
@@ -248,13 +251,33 @@ class SingleSeasonEpisodeProof:
                 for season_number, count in boundaries
                 for episode in range(1, count + 1)
             )
+        elif evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND:
+            # A named-arc Season 00 run proves the release ordinals map onto
+            # an official window that may start anywhere (``S00E08``/``E09``),
+            # so only the token grammar and count are checked here.  The
+            # persisted receipt is re-proved against the live catalog before
+            # F uses it, which is what actually pins the window.
+            expected = None
         else:
             expected = tuple(
                 f"S{season:02d}E{episode:02d}"
                 for episode in range(1, episode_count + 1)
             )
-        if tokens != expected:
+        if expected is not None and tokens != expected:
             return None
+        if expected is None:
+            prefix = f"S{season:02d}E"
+            ordinals: set[int] = set()
+            for token in tokens:
+                suffix = token[len(prefix):]
+                if not token.startswith(prefix) or not suffix.isdigit():
+                    return None
+                ordinal = int(suffix)
+                if ordinal <= 0 or ordinal in ordinals:
+                    return None
+                ordinals.add(ordinal)
+            if len(ordinals) != episode_count:
+                return None
         return cls(
             tmdb_id,
             season,
@@ -2217,6 +2240,82 @@ def prove_single_season_episode_evidence(
     )
 
 
+_ARC_LABEL_SPECIAL_MARKER_RE = re.compile(
+    r"(?<![A-Z])(?:OVA|OAV|OAD|SP|SPECIAL)(?![A-Z])",
+    re.IGNORECASE,
+)
+
+
+def _named_arc_season00_run(
+    published: Mapping[int, str],
+    *,
+    published_years: Mapping[int, int],
+    run_length: int,
+    boundary_label: str,
+    source_years: Sequence[int],
+) -> tuple[int, ...] | None:
+    """Return the one official Season 00 window titled as the source arc.
+
+    A physical special released as ``银魂 爱染香篇 [01][02]`` is catalogued as
+    part-titled Season 00 episodes of the parent show.  The boundary label
+    minus its physical marker words must be a concrete arc name (at least four
+    identity characters, so a bare franchise title never qualifies), every
+    episode of the window must carry that arc name in its official title, and
+    the official air years must sit inside the source release-year window.
+    Exactly one such window may exist, or the best must beat the runner-up by
+    the global ambiguity margin.
+    """
+    if run_length < 2 or not source_years:
+        return None
+    label_text = _ARC_LABEL_SPECIAL_MARKER_RE.sub(
+        " ", str(boundary_label or "")
+    )
+    label_key = _special_arc_title_key(label_text)
+    if len(label_key) < 4:
+        return None
+    episode_scores: dict[int, float] = {}
+    for number, title in published.items():
+        title_key = _special_arc_title_key(title)
+        if not title_key:
+            continue
+        score = _title_similarity(label_key, title_key)
+        if label_key in title_key:
+            score = max(score, 0.95)
+        elif len(title_key) >= 4 and title_key in label_key:
+            score = max(score, 0.95)
+        if score >= 0.90:
+            episode_scores[number] = score
+    ranked: list[tuple[float, tuple[int, ...]]] = []
+    for start in sorted(episode_scores):
+        window = tuple(range(start, start + run_length))
+        if not all(number in episode_scores for number in window):
+            continue
+        years = [published_years.get(number) for number in window]
+        if any(year is None for year in years):
+            continue
+        if any(
+            min(abs(int(year) - int(source)) for source in source_years) > 1
+            for year in years
+            if year is not None
+        ):
+            continue
+        # The weakest episode is the safety boundary; the mean only breaks
+        # ties between otherwise fully qualifying windows.
+        scores = [episode_scores[number] for number in window]
+        ranked.append(
+            (
+                min(scores) * 0.8 + (sum(scores) / len(scores)) * 0.2,
+                window,
+            )
+        )
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < AUTO_MATCH_MIN_MARGIN:
+        return None
+    return ranked[0][1]
+
+
 def _season00_physical_special_evidence(
     official: Mapping[str, object],
     *,
@@ -2224,19 +2323,29 @@ def _season00_physical_special_evidence(
     tmdb_id: int,
     source_markers: tuple[str, ...],
     source_numbers: tuple[int, ...],
+    boundary_label: str = "",
+    source_years: tuple[int, ...] = (),
 ) -> SingleSeasonEpisodeProof | None:
     """Prove a complete OVA/OAD run is the parent show's official Season 00.
 
     This is the parent-identity branch of the shared physical-special grammar:
     the confirmed identity is a regular multi-season show whose published
-    Season 00 holds its specials.  Two bounded official evidence classes may
+    Season 00 holds its specials.  Three bounded official evidence classes may
     map the release ordinals to ``S00E01..S00EN``:
 
     * every source ordinal is named by the official Season 00 episode title
       of that number (``OVA2 PINTO`` for source ordinal 2);
     * the source run covers the *complete* published Season 00 and the
       official Season 00 text (season name or episode titles) carries the
-      same physical marker family.
+      same physical marker family;
+    * a named-arc run: the boundary label is a concrete arc name (not the
+      parent franchise title itself), and exactly one consecutive official
+      Season 00 window of the same length carries that arc name in every
+      episode title (``银魂 爱染香篇 前篇``/``后篇`` for source ``[01]``/``[02]``)
+      with air years inside the source release-year window.  The release-local
+      ordinals then map onto that official window, which may start anywhere
+      in Season 00 (``S00E08``/``S00E09``), and must beat the runner-up window
+      by the global ambiguity margin.
 
     Anything looser stays ``None``: a partial run without per-ordinal title
     proof can never be positioned by release ordinals alone.
@@ -2281,6 +2390,7 @@ def _season00_physical_special_evidence(
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
         return None
     published: dict[int, str] = {}
+    published_years: dict[int, int] = {}
     for row in rows:
         if not isinstance(row, Mapping) or row.get("season_number") != 0:
             return None
@@ -2288,6 +2398,10 @@ def _season00_physical_special_evidence(
         if number is None:
             return None
         published[number] = str(row.get("name") or "")
+        air_date = str(row.get("air_date") or "")
+        air_year_match = re.match(r"(\d{4})-", air_date)
+        if air_year_match:
+            published_years[number] = int(air_year_match.group(1))
     if not published:
         return None
     # Evidence class 1: each source ordinal is named by the official Season 00
@@ -2307,7 +2421,30 @@ def _season00_physical_special_evidence(
             _official_physical_special_markers(official_titles) & requested_markers
         )
     if not ordinal_named and not count_match:
-        return None
+        # Evidence class 3: a named-arc run.  A physical special released as
+        # ``银魂 爱染香篇 [01][02]`` is officially catalogued as part-titled
+        # Season 00 episodes of the parent show.  Exactly one consecutive
+        # official window of the source length, every episode officially
+        # titled with the boundary arc name and aired in the source's release
+        # year window, positions the release-local ordinals.
+        named_run = _named_arc_season00_run(
+            published,
+            published_years=published_years,
+            run_length=count,
+            boundary_label=boundary_label,
+            source_years=source_years,
+        )
+        if named_run is None:
+            return None
+        return SingleSeasonEpisodeProof(
+            tmdb_id=tmdb_id,
+            season=0,
+            episode_count=count,
+            episode_tokens=tuple(
+                f"S00E{number:02d}" for number in named_run
+            ),
+            evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+        )
     return SingleSeasonEpisodeProof(
         tmdb_id=tmdb_id,
         season=0,
@@ -2370,6 +2507,17 @@ def prove_physical_special_single_season_evidence(
     markers, numbers, count, complete = physical_special_marker_evidence(scoped)
     if not complete or count is None or not markers or not numbers:
         return None
+    # The named-arc Season 00 proof is anchored to the release label and the
+    # explicit release years, never to a bare ordinal guess.
+    source_year_tokens = set(
+        re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", str(record.display_label or " "))
+    )
+    for file in collect_all_files(scoped):
+        if file.object_type == "video":
+            source_year_tokens.update(
+                re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", file.name)
+            )
+    source_years = tuple(sorted(int(y) for y in source_year_tokens))
     official = physical_special_candidate_evidence(
         tmdb_client,
         tmdb_id=tmdb_id,
@@ -2387,6 +2535,8 @@ def prove_physical_special_single_season_evidence(
             tmdb_id=tmdb_id,
             source_markers=markers,
             source_numbers=numbers,
+            boundary_label=record.display_label,
+            source_years=source_years,
         )
     season = _positive_season(official.get("official_special_season"))
     if season is None or not callable(episode_catalog):
