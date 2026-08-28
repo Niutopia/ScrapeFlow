@@ -640,6 +640,8 @@ def finalize_root_gap_closure(
     runner: SimpleEngineRunner,
     state_root: Path,
     root_task_id: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
 ) -> EngineJob:
     """Close a pending root only after N has durably closed every J Gap.
 
@@ -659,6 +661,20 @@ def finalize_root_gap_closure(
         return job
     if job.phase != GAPS_PENDING_PHASE:
         return job
+    # Post-completion housekeeping, identical to the direct-completion path:
+    # a root whose gaps closed must not keep its intake tree forever (the
+    # operator ruling applies to every completed root, regardless of which
+    # path completed it).  Best-effort, never blocking the phase transition.
+    try:
+        _cleanup_consumed_source_root(
+            runner,
+            state_root,
+            root_task_id,
+            runner._job_ingress_source(job),  # noqa: SLF001 - pipeline composition
+            pause_requested=pause_requested,
+        )
+    except Exception:
+        pass
     return _persist_root(runner, job, "completed")
 
 

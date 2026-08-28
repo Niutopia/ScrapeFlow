@@ -311,6 +311,71 @@ class RootPipelineTests(unittest.TestCase):
         closed = finalize_root_gap_closure(runner, state_root, root_task_id)
         self.assertEqual(closed.phase, "completed")
 
+    def test_gap_closure_cleans_the_consumed_intake_tree(self) -> None:
+        """A root completed through gap closure deletes its intake tree too.
+
+        The direct-completion path already deletes the source (operator
+        ruling 2026-08-27: intake is staging, not storage).  A root that
+        reaches ``completed`` via ``finalize_root_gap_closure`` after its
+        gaps closed must obey the same rule instead of leaving the tree
+        for manual cleanup forever.
+        """
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/S01E02.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, _alist, runner, _planner_events, _executor_events = self._setup(files)
+        job = self._new_path_root(runner, "/incoming/My Show", "anime")
+        root_task_id = job.id
+        # Seed the ordinary B/W/C/D/F/H records first, then plant an open gap
+        # so R parks the root in gaps_pending.
+        from local.scrapeflow_api import root_pipeline
+        original_execute = root_pipeline.execute_new_work_units
+
+        def execute_then_register(*args, **kwargs):
+            result = original_execute(*args, **kwargs)
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            identity = record.identity or {}
+            save_gap_ledger(state_root, root_task_id, [Gap(
+                gap_id=f"{record.work_unit_id}::missing_episode::S01E03",
+                root_task_id=root_task_id,
+                work_unit_id=record.work_unit_id,
+                kind="missing_episode",
+                media_type="tv",
+                tmdb_id=int(identity["tmdb_id"]),
+                season=1,
+                episodes=(3,),
+                subtitle_path=None,
+                subtitle_language=None,
+                status="open",
+            )])
+            return result
+
+        with patch(
+            "local.scrapeflow_api.root_pipeline.execute_new_work_units",
+            side_effect=execute_then_register,
+        ):
+            parked = run_root_pipeline(runner, state_root, root_task_id)
+        self.assertEqual(parked.phase, "gaps_pending")
+
+        # Swap in a deleting AList double, close the gap, and let the
+        # finalize transition run the same intake cleanup as a direct
+        # completion.
+        runner.alist = CleaningIndexAList({
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/S01E02.mkv": FAKE_VIDEO_BYTES,
+        })
+        gap = load_gap_ledger(state_root, root_task_id)[0]
+        save_gap_ledger(state_root, root_task_id, [replace(gap, status="closed")])
+        closed = finalize_root_gap_closure(runner, state_root, root_task_id)
+        self.assertEqual(closed.phase, "completed")
+        listing = runner.alist.list("/incoming", refresh=True)
+        self.assertEqual(
+            [row["name"] for row in listing],
+            [],
+            "gap-closure completion must delete the consumed intake tree",
+        )
+
     def test_pipeline_authenticates_a_resumed_root_before_boundary_read(self) -> None:
         files = {
             "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
