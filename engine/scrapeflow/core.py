@@ -5406,6 +5406,75 @@ def _unique_named_special_run(
     return ranked[0][1]
 
 
+_OFFICIAL_TITLE_EPISODE_ORDINAL_RE = re.compile(
+    r"(?:第\s*0*(\d{1,3})\s*[话話回集]|Episode\s*0*(\d{1,3})\b)",
+    re.IGNORECASE,
+)
+
+
+def _official_special_title_ordinal(title: str) -> int | None:
+    """Return the episode ordinal a TMDB special title embeds in itself.
+
+    TMDB zh-CN/ja-JP special titles for a reset-numbered mini-series carry
+    the episode number inside the title (``迷你动画「〇〇的魔法」第1话：…``,
+    ``OO Magic Episode 1: …``).  That embedded ordinal is official numbering
+    evidence, unlike a bare directory ordinal.  An untranslated placeholder
+    whose entire title is just the row position (``第 12 集`` for S00E12)
+    restates the episode number and carries no mini-series evidence, so it
+    is rejected by the empty-remainder rule.
+    """
+    text = str(title or "")
+    match = _OFFICIAL_TITLE_EPISODE_ORDINAL_RE.search(text)
+    if match is None:
+        return None
+    remainder = _OFFICIAL_TITLE_EPISODE_ORDINAL_RE.sub("", text, count=1)
+    if not re.sub(r"[\s:_－\-–—·.。:：()（）\[\]【】「」『』]+", "", remainder):
+        return None
+    number = int(match.group(1) or match.group(2))
+    if 0 < number <= 999:
+        return number
+    return None
+
+
+def _official_numbered_title_special_run(
+    official_title_variants: Mapping[int, Sequence[str]],
+    *,
+    run_length: int,
+) -> tuple[int, ...] | None:
+    """Align a reset-numbered source run with title-embedded official ordinals.
+
+    Every official special row must agree on exactly one embedded ordinal
+    across its multilingual variants; the ordinals 1..run_length must then be
+    complete.  The result is the official episode numbers carrying those
+    ordinals, so a source ``01..N`` run maps onto the first N episodes of the
+    officially numbered special mini-series even when other Season 00 rows
+    (collab specials, thank-you shows) interleave without ordinals.
+    """
+    if run_length < 2:
+        return None
+    ordinal_to_episode: dict[int, int] = {}
+    for number, variants in official_title_variants.items():
+        ordinals = {
+            ordinal
+            for ordinal in (
+                _official_special_title_ordinal(str(variant))
+                for variant in variants
+            )
+            if ordinal is not None
+        }
+        if len(ordinals) != 1:
+            continue
+        ordinal = next(iter(ordinals))
+        if ordinal in ordinal_to_episode:
+            return None
+        ordinal_to_episode[ordinal] = int(number)
+    if not set(range(1, run_length + 1)).issubset(ordinal_to_episode):
+        return None
+    return tuple(
+        ordinal_to_episode[ordinal] for ordinal in range(1, run_length + 1)
+    )
+
+
 def _map_explicit_special_release_runs(
     items: list[dict[str, Any]],
     official_title_variants: Mapping[int, Sequence[str]],
@@ -5532,6 +5601,19 @@ def _map_explicit_special_release_runs(
                     "子目录名称与多语言官方特别篇标题的唯一连续匹配、"
                     "多语言官方标题"
                 )
+        # A mini-series whose official titles embed their own episode ordinals
+        # (``第1话``/``Episode 1``) can be aligned by that official numbering
+        # alone: the source 01..N run maps onto the official rows carrying
+        # ordinals 1..N even when unnumbered rows (collab specials, thank-you
+        # programmes) interleave between them.
+        if candidate_run is None:
+            ordinal_run = _official_numbered_title_special_run(
+                official_title_variants,
+                run_length=len(video_source_numbers),
+            )
+            if ordinal_run is not None:
+                candidate_run = ordinal_run
+                evidence = "官方特别篇标题内嵌的第N话集号"
         if candidate_run is None or evidence is None:
             continue
         mapped_count = 0
