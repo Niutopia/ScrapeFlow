@@ -4360,6 +4360,79 @@ class SimpleEngineRunner:
             atomic_write_json(self._job_path(identifier), job.as_dict(), allow_nan=False)
             return job
 
+    def rebind_container_artifacts(
+        self,
+        job_id: str,
+        *,
+        poster_path: str | None = None,
+        backdrop_path: str | None = None,
+        representative_tmdb_id: int | None = None,
+    ) -> EngineJob:
+        """Re-point one persisted container carrier at new artwork provenance.
+
+        Only the deterministic container-artifact carrier may be rebound: its
+        plan has no media rows, so this updates provenance metadata and the
+        mirrored request/summary observability fields while leaving the
+        deterministic job id (and therefore the single writer) untouched.
+        Any other job id is rejected so a media-bearing plan can never have
+        its identity swapped in place.
+        """
+        identifier = _safe_job_id(job_id)
+        for label, value in (
+            ("poster_path", poster_path),
+            ("backdrop_path", backdrop_path),
+        ):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise EngineRequestError(f"{label} 必须是非空字符串或省略")
+        if (
+            representative_tmdb_id is not None
+            and (
+                isinstance(representative_tmdb_id, bool)
+                or not isinstance(representative_tmdb_id, int)
+                or representative_tmdb_id <= 0
+            )
+        ):
+            raise EngineRequestError("representative_tmdb_id 必须是正整数或省略")
+        with self.worker_lock():
+            job = self._read(identifier)
+            if job.summary.get("container_artifacts") is not True:
+                raise EngineJobConflictError("只有容器元数据 carrier 才能重绑代表来源")
+            plan = dict(job.plan) if isinstance(job.plan, Mapping) else {}
+            if plan.get("mode") != "container":
+                raise EngineJobConflictError("只有容器元数据 carrier 才能重绑代表来源")
+            raw_metadata = plan.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+            if poster_path is not None:
+                metadata["container_poster_path"] = poster_path.strip()
+            else:
+                metadata.pop("container_poster_path", None)
+            if backdrop_path is not None:
+                metadata["container_backdrop_path"] = backdrop_path.strip()
+            else:
+                metadata.pop("container_backdrop_path", None)
+            if representative_tmdb_id is not None:
+                metadata["representative_tmdb_id"] = representative_tmdb_id
+            else:
+                metadata.pop("representative_tmdb_id", None)
+            plan["metadata"] = metadata
+            request = dict(job.request)
+            if representative_tmdb_id is not None:
+                request["tmdb_id"] = representative_tmdb_id
+            summary = dict(job.summary)
+            summary["container_poster_path"] = metadata.get("container_poster_path")
+            summary["container_backdrop_path"] = metadata.get("container_backdrop_path")
+            updated = replace(
+                job,
+                updated_at=_now(),
+                request=request,
+                plan=plan,
+                summary=summary,
+            )
+            atomic_write_json(
+                self._job_path(identifier), updated.as_dict(), allow_nan=False,
+            )
+            return updated
+
     def mark_internal_child(self, job_id: str, *, root_job_id: str) -> EngineJob:
         """Associate one provider-created child with its visible root job.
 

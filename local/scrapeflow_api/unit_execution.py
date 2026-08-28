@@ -1499,8 +1499,32 @@ def ensure_container_artifacts(
                 for record in records
             )
         ):
-            raise ContainerMetadataAttention(
-                f"容器元数据代表单元已失效: tmdb/{representative}"
+            # The provenance child is gone, so the choice reopens: rebind the
+            # same deterministic carrier to a currently proved sibling.  A
+            # rebind never overwrites library artwork — the repair replay
+            # below still treats existing files as authoritative — it only
+            # un-parks the root and repairs future projections.  With no
+            # proved sibling left there is no safe identity to borrow, so
+            # the attention still fails closed.
+            fresh = _container_artifact_inputs(runner, records, container_parent)
+            if fresh is None:
+                raise ContainerMetadataAttention(
+                    f"容器元数据代表单元已失效: tmdb/{representative}"
+                )
+            existing = runner.rebind_container_artifacts(
+                existing.id,
+                poster_path=str(fresh["poster_path"]),
+                backdrop_path=(
+                    str(fresh["backdrop_path"])
+                    if fresh.get("backdrop_path") is not None
+                    else None
+                ),
+                representative_tmdb_id=(
+                    fresh.get("representative_tmdb_id")
+                    if isinstance(fresh.get("representative_tmdb_id"), int)
+                    and not isinstance(fresh.get("representative_tmdb_id"), bool)
+                    else None
+                ),
             )
     else:
         inputs = _container_artifact_inputs(runner, records, container_parent)
