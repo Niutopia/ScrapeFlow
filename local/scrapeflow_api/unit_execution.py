@@ -938,10 +938,22 @@ def _special_parent_record(
     record: WorkUnitRecord,
     records: Sequence[WorkUnitRecord],
 ) -> tuple[WorkUnitRecord | None, bool]:
-    """Return ``(unique_parent, ambiguous)`` for one special unit."""
+    """Return ``(unique_parent, ambiguous)`` for one special unit.
+
+    A special whose confirmed TV identity equals a regular sibling's identity
+    is the same work's Season 00 release: that sibling is the unique parent,
+    stronger than any title containment.  Otherwise the parent must be proved
+    by formal TMDB title/alias evidence alone.
+    """
     identity = record.identity if isinstance(record.identity, Mapping) else {}
+    own_tmdb_id = identity.get("tmdb_id")
+    same_identity_parent: WorkUnitRecord | None = None
     candidates: dict[int, WorkUnitRecord] = {}
     for candidate in records:
+        if candidate.work_unit_id == record.work_unit_id:
+            # A unit is never its own parent; the old same-id exclusion only
+            # guarded against self-matching, not against a real sibling.
+            continue
         candidate_identity = candidate.identity if isinstance(candidate.identity, Mapping) else {}
         if str(candidate_identity.get("media_type") or "") != "tv":
             continue
@@ -950,11 +962,21 @@ def _special_parent_record(
             isinstance(tmdb_id, bool)
             or not isinstance(tmdb_id, int)
             or tmdb_id <= 0
-            or tmdb_id == identity.get("tmdb_id")
             or _is_physical_special_record(candidate)
         ):
             continue
+        if (
+            str(identity.get("media_type") or "") == "tv"
+            and isinstance(own_tmdb_id, int)
+            and not isinstance(own_tmdb_id, bool)
+            and own_tmdb_id > 0
+            and tmdb_id == own_tmdb_id
+        ):
+            same_identity_parent = same_identity_parent or candidate
+            continue
         candidates.setdefault(tmdb_id, candidate)
+    if same_identity_parent is not None:
+        return same_identity_parent, False
     scored = [
         (score, candidate)
         for candidate in candidates.values()
@@ -1136,7 +1158,11 @@ def _record_proved_positive_seasons(record: WorkUnitRecord) -> set[int]:
         seasons.add(identity_season)
     proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
     tmdb_id = identity.get("tmdb_id")
-    if proof is not None and proof.tmdb_id == tmdb_id:
+    if (
+        proof is not None
+        and proof.tmdb_id == tmdb_id
+        and proof.season > 0
+    ):
         seasons.add(proof.season)
     return seasons
 

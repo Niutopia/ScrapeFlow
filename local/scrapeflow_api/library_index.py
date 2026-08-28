@@ -25,6 +25,9 @@ from engine.scrapeflow.boundary_analysis import (
 from engine.scrapeflow.identity_matching import (
     _clean_boundary_identity_query,
     _normalize_match_title,
+    _official_physical_special_markers,
+    _physical_special_marker_key,
+    _season0_marker_and_ordinal,
     physical_special_candidate_evidence,
 )
 from engine.scrapeflow.media_policy import (
@@ -192,8 +195,19 @@ class SingleSeasonEpisodeProof:
         ):
             return None
         tmdb_id = _positive_season(value.get("tmdb_id"))
-        season = _positive_season(value.get("season"))
         episode_count = _positive_season(value.get("episode_count"))
+        # Season 00 is a legal proof season, but only for the physical-special
+        # grammar: an unqualified ``E01`` run never proves Season 00 ownership.
+        raw_season = value.get("season")
+        if (
+            isinstance(raw_season, int)
+            and not isinstance(raw_season, bool)
+            and raw_season == 0
+            and evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND
+        ):
+            season = 0
+        else:
+            season = _positive_season(raw_season)
         raw_tokens = value.get("episode_tokens")
         if (
             tmdb_id is None
@@ -2074,6 +2088,106 @@ def prove_single_season_episode_evidence(
     )
 
 
+def _season00_physical_special_evidence(
+    official: Mapping[str, object],
+    *,
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    tmdb_id: int,
+    source_markers: tuple[str, ...],
+    source_numbers: tuple[int, ...],
+) -> SingleSeasonEpisodeProof | None:
+    """Prove a complete OVA/OAD run is the parent show's official Season 00.
+
+    This is the parent-identity branch of the shared physical-special grammar:
+    the confirmed identity is a regular multi-season show whose published
+    Season 00 holds its specials.  Two bounded official evidence classes may
+    map the release ordinals to ``S00E01..S00EN``:
+
+    * every source ordinal is named by the official Season 00 episode title
+      of that number (``OVA2 PINTO`` for source ordinal 2);
+    * the source run covers the *complete* published Season 00 and the
+      official Season 00 text (season name or episode titles) carries the
+      same physical marker family.
+
+    Anything looser stays ``None``: a partial run without per-ordinal title
+    proof can never be positioned by release ordinals alone.
+    """
+    if not isinstance(official, Mapping) or not callable(episode_catalog):
+        return None
+    if official.get("special_detail_checked") is not True:
+        return None
+    requested_markers = {
+        key
+        for value in source_markers
+        if (key := _physical_special_marker_key(value)) is not None
+    }
+    if not requested_markers or not source_numbers:
+        return None
+    count = len(source_numbers)
+    expected_numbers = tuple(range(1, count + 1))
+    if source_numbers != expected_numbers:
+        return None
+    official_numbers_raw = official.get("official_season0_numbers")
+    official_titles_raw = official.get("official_season0_titles")
+    if (
+        not isinstance(official_numbers_raw, Sequence)
+        or isinstance(official_numbers_raw, (str, bytes, bytearray))
+        or not official_numbers_raw
+        or not isinstance(official_titles_raw, Sequence)
+        or isinstance(official_titles_raw, (str, bytes, bytearray))
+        or len(official_titles_raw) != len(official_numbers_raw)
+    ):
+        return None
+    official_numbers = tuple(official_numbers_raw)
+    official_titles = tuple(official_titles_raw)
+    # The published catalog is the authoritative coordinate source; the show
+    # detail only proves the Season 00 shape exists.
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping) or 0 not in payload:
+        return None
+    rows = payload.get(0)
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        return None
+    published: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("season_number") != 0:
+            return None
+        number = _positive_season(row.get("episode_number"))
+        if number is None:
+            return None
+        published[number] = str(row.get("name") or "")
+    if not published:
+        return None
+    # Evidence class 1: each source ordinal is named by the official Season 00
+    # title of that number under the shared marker grammar.
+    ordinal_named = True
+    for number in source_numbers:
+        title = published.get(number)
+        marker, ordinal = _season0_marker_and_ordinal(title)
+        if marker not in requested_markers or ordinal != number:
+            ordinal_named = False
+            break
+    # Evidence class 2: the run covers the complete published Season 00 and
+    # the official Season 00 text names the physical marker family.
+    count_match = False
+    if sorted(published) == list(range(1, len(published) + 1)) and len(published) == count:
+        count_match = bool(
+            _official_physical_special_markers(official_titles) & requested_markers
+        )
+    if not ordinal_named and not count_match:
+        return None
+    return SingleSeasonEpisodeProof(
+        tmdb_id=tmdb_id,
+        season=0,
+        episode_count=count,
+        episode_tokens=tuple(f"S00E{number:02d}" for number in expected_numbers),
+        evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+    )
+
+
 def prove_physical_special_single_season_evidence(
     alist: object,
     state_root: Any,
@@ -2083,13 +2197,21 @@ def prove_physical_special_single_season_evidence(
     episode_catalog: Callable[[Mapping[str, object]], object] | None,
     tmdb_client: object | None,
 ) -> SingleSeasonEpisodeProof | None:
-    """Prove a separately catalogued OAD/OVA/OAV work without guessing S00.
+    """Prove a physical OAD/OVA run without guessing its target season.
 
-    The source must be a complete single-family physical-special run.  TMDB
-    must then prove that the *selected work itself* has exactly one positive
-    season of the same size and an official matching physical marker.  The
-    persisted proof turns only those source SP keys into regular coordinates
-    for D/F; it never maps an OAD ordinal to an unrelated parent Season 00.
+    The source must be a complete single-family physical-special run.  Two
+    TMDB shapes then turn the release ordinals into coordinates:
+
+    * a separately catalogued work: the selected identity itself has exactly
+      one positive season of the same size and an official matching physical
+      marker;
+    * the parent show itself (operator override or C): its published Season
+      00 officially holds these specials, proven either by per-ordinal
+      official special titles or by a complete count match with an official
+      marker (``_season00_physical_special_evidence``).
+
+    In both cases only the proved source SP keys become coordinates for D/F;
+    a release ordinal is never silently rewritten to an unrelated Season 00.
     """
     identity = record.identity if isinstance(record.identity, Mapping) else {}
     if record.identity_status != "confirmed" or str(identity.get("media_type")) != "tv":
@@ -2130,7 +2252,13 @@ def prove_physical_special_single_season_evidence(
         and official.get("official_special_count_match") is True
         and official.get("official_special_marker_hits")
     ):
-        return None
+        return _season00_physical_special_evidence(
+            official,
+            episode_catalog=episode_catalog,
+            tmdb_id=tmdb_id,
+            source_markers=markers,
+            source_numbers=numbers,
+        )
     season = _positive_season(official.get("official_special_season"))
     if season is None or not callable(episode_catalog):
         return None

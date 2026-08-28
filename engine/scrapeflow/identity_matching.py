@@ -1792,6 +1792,29 @@ def _official_physical_special_markers(values: Collection[object]) -> set[str]:
     return output
 
 
+def _season0_marker_and_ordinal(
+    value: object,
+) -> tuple[str | None, int | None]:
+    """Return ``(marker_key, ordinal)`` from one official Season 00 title.
+
+    Official special titles such as ``OVA1 JACK`` name both the physical
+    release family and the release ordinal.  This reuses the source-side
+    marker grammar so official and release ordinals are compared under one
+    bounded vocabulary instead of ad-hoc substring checks.
+    """
+    match = re.search(
+        r"(?<![A-Za-z])(?P<marker>OVA|OAV|OAD)(?![A-Za-z])"
+        r"[\s._\-]*[\[(]?\s*0*(?P<number>\d{1,3})\s*[\])]?(?!\d)",
+        unicodedata.normalize("NFKC", str(value or "")).upper(),
+    )
+    if match is None:
+        return None, None
+    number = int(match.group("number"))
+    if 1900 <= number <= 2099:
+        return _physical_special_marker_key(match.group("marker")), None
+    return _physical_special_marker_key(match.group("marker")), number
+
+
 def _tmdb_physical_special_candidate_evidence(
     client: object,
     *,
@@ -1817,6 +1840,13 @@ def _tmdb_physical_special_candidate_evidence(
         "official_special_marker_hits": (),
         "official_special_count_match": False,
         "official_special_season": None,
+        # Official Season 00 structure of a regular parent show.  Season 00 is
+        # TMDB's canonical home for specials, so a complete physical-special
+        # run of the parent identity may map there; the count/ordinal fields
+        # below are the bounded official evidence D checks before doing so.
+        "official_season0_episode_count": None,
+        "official_season0_numbers": (),
+        "official_season0_titles": (),
     }
     if not requested_markers or not source_episode_count:
         return result
@@ -1838,6 +1868,7 @@ def _tmdb_physical_special_candidate_evidence(
         detail.get("original_name"),
     ]
     positives: list[tuple[int, int, str]] = []
+    season0_episode_count: int | None = None
     raw_seasons = detail.get("seasons")
     if not isinstance(raw_seasons, list):
         return result
@@ -1858,13 +1889,50 @@ def _tmdb_physical_special_candidate_evidence(
         if number > 0 and count > 0:
             positives.append((number, count, str(season.get("name") or "")))
             official_texts.append(season.get("name"))
-    # A separate short work must itself have exactly one published positive
-    # season.  A multi-season parent which happens to have an N-episode season
-    # is not sufficient proof for a physical OAD/OVA child.
+        elif number == 0 and count > 0:
+            season0_episode_count = count
     if len(positives) != 1 or positives[0][1] != source_episode_count:
         result["official_special_marker_hits"] = tuple(sorted(
             _official_physical_special_markers(official_texts) & requested_markers
         ))
+        # A regular parent show keeps its specials in Season 00.  Record that
+        # official structure (one bounded request) so D can prove a complete
+        # physical-special run of the parent identity belongs there.  Only a
+        # show with at least one positive season qualifies: an entry without
+        # regular episodes is not a parent whose Season 00 could adopt this
+        # release.
+        if season0_episode_count is not None and positives:
+            try:
+                season0_payload = getter(f"/tv/{tmdb_id}/season/0")
+            except ApiError:
+                season0_payload = None
+            except Exception:
+                season0_payload = None
+            if isinstance(season0_payload, Mapping):
+                episodes0 = season0_payload.get("episodes")
+                if isinstance(episodes0, list):
+                    numbers: list[int] = []
+                    titles: list[object] = []
+                    for episode in episodes0:
+                        if not isinstance(episode, Mapping):
+                            numbers, titles = [], []
+                            break
+                        episode_number = episode.get("episode_number")
+                        if (
+                            isinstance(episode_number, bool)
+                            or not isinstance(episode_number, int)
+                            or episode_number <= 0
+                        ):
+                            numbers, titles = [], []
+                            break
+                        numbers.append(episode_number)
+                        titles.append(episode.get("name"))
+                    if numbers:
+                        result.update({
+                            "official_season0_episode_count": season0_episode_count,
+                            "official_season0_numbers": tuple(numbers),
+                            "official_season0_titles": tuple(titles),
+                        })
         return result
     season_number = positives[0][0]
     marker_hits = _official_physical_special_markers(official_texts)
