@@ -18,7 +18,10 @@ from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.serialization import atomic_write_json
-from engine.scrapeflow.unit_identity import apply_work_unit_override
+from engine.scrapeflow.unit_identity import (
+    apply_work_unit_override,
+    resolve_work_unit_identities,
+)
 from engine.scrapeflow.work_units import load_work_unit_records, save_work_unit_records
 
 from local.scrapeflow_api.library_index import reconcile_root_work_units
@@ -2579,7 +2582,127 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
             {"SP01": "S00E08", "SP02": "S00E09"},
         )
 
-    def test_single_season_block_keeps_the_ordinary_path(self) -> None:
+    def test_titled_single_ova_maps_onto_official_season00_episode(self) -> None:
+        """An unnumbered single OVA positions by its arc title alone.
+
+        ``X 4k 示例剧/示例剧 和猫老师的初次跑腿/[Ygm] … OVA ….mkv`` carries no
+        release ordinal at all, so no run grammar can position it.  C confirms
+        the parent show (its cleaned parent query leads), and D must prove the
+        concrete arc title — minus the parent show's own title — against the
+        published Season 00 titles whose ``OVA1：``-style ordinal prefixes are
+        stripped, tolerating the one-character release-label drift.  F then
+        inherits season 0 without an explicit episode-map bridge.
+        """
+        class TitledSingleOvaTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **params: object) -> dict[str, object]:
+                if path == "/search/tv":
+                    if str(params.get("query", "")) == "示例剧":
+                        return {
+                            "results": [
+                                {
+                                    "id": self.tmdb_id,
+                                    "name": "示例剧",
+                                    "first_air_date": "2008-07-01",
+                                    "genre_ids": [16],
+                                },
+                            ],
+                        }
+                    return {"results": []}
+                if path == "/search/movie":
+                    return {"results": []}
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "first_air_date": "2008-07-01",
+                        "number_of_seasons": 2,
+                        "number_of_episodes": 27,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 14, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 13, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    names = {
+                        1: "3D猫咪剧场 1", 2: "3D猫咪剧场 2", 3: "3D猫咪剧场 3",
+                        4: "3D猫咪剧场 4", 5: "3D猫咪剧场 5",
+                        6: "OVA1：和猫咪老师的初次跑腿",
+                        7: "OVA2：曾几何时下雪之日",
+                        8: "第五季OVA1：一夜酒杯", 9: "第五季OVA2：游戏之宴",
+                        10: "第六季OVA1：铃响的残株", 11: "第六季OVA2：梦幻的碎片",
+                        12: "一番赏 示例剧 猫咪老师和花卉图鉴",
+                        13: "示例剧×熊本县《人吉・球磨的温柔时光》",
+                        14: "第七季OVA：伸手可及的地方",
+                    }
+                    air = {6: "2013-12-15", 7: "2014-02-05"}
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": air.get(number, "2009-04-22"),
+                                "name": names[number],
+                            }
+                            for number in range(1, 15)
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2008-07-01",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 14)
+                        ]
+                    }
+                return {}
+
+        source = "/incoming/X 4k 示例剧"
+        files = {
+            f"{source}/示例剧 和猫老师的初次跑腿/[Ygm] Example OVA [Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+            f"{source}/示例剧 曾几何时下雪日/[Ygm] Example OVA [Ma10p_2160p].mkv": FAKE_VIDEO_BYTES,
+        }
+        tmdb = TitledSingleOvaTMDB(99102)
+        state_root, alist, runner = self._setup(files, tmdb)
+        root_task_id = "root-titled-single-ova"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = resolve_work_unit_identities(
+            tmdb, state_root, root_task_id, prefer_animation=True,
+        )
+        by_label = {record.display_label: record for record in records}
+        self.assertEqual(len(records), 2)
+        for label in ("示例剧 和猫老师的初次跑腿", "示例剧 曾几何时下雪日"):
+            self.assertEqual(by_label[label].identity_status, "confirmed")
+            self.assertEqual(by_label[label].identity["tmdb_id"], 99102)
+            self.assertEqual(by_label[label].identity["title"], "示例剧")
+        reconciled = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )
+        by_label = {record.display_label: record for record in reconciled}
+        self.assertEqual(
+            by_label["示例剧 和猫老师的初次跑腿"].reconciliation_evidence["episode_tokens"],
+            ["S00E06"],
+        )
+        self.assertEqual(
+            by_label["示例剧 曾几何时下雪日"].reconciliation_evidence["episode_tokens"],
+            ["S00E07"],
+        )
+        request = _request_for_unit(
+            runner, by_label["示例剧 和猫老师的初次跑腿"], root_task_id, state_root,
+        )
+        self.assertEqual(request.season, 0)
+        self.assertIsNone(request.episode_map_path)
+
+
         files = {
             f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES
             for i in range(1, 25)

@@ -2411,6 +2411,146 @@ def _named_arc_season00_run(
     return ranked[0][1]
 
 
+def _published_season0_episodes(
+    episode_catalog: Callable[[Mapping[str, object]], object],
+    tmdb_id: int,
+) -> tuple[dict[int, str], dict[int, int]] | None:
+    """Load the parent show's published Season 00 from the episode catalog.
+
+    The published catalog is the authoritative coordinate source; the show
+    detail only proves the Season 00 shape exists.  An episode without a
+    parsable air date simply carries no year.
+    """
+    try:
+        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping) or 0 not in payload:
+        return None
+    rows = payload.get(0)
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        return None
+    published: dict[int, str] = {}
+    published_years: dict[int, int] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("season_number") != 0:
+            return None
+        number = _positive_season(row.get("episode_number"))
+        if number is None:
+            return None
+        published[number] = str(row.get("name") or "")
+        air_date = str(row.get("air_date") or "")
+        air_year_match = re.match(r"(\d{4})-", air_date)
+        if air_year_match:
+            published_years[number] = int(air_year_match.group(1))
+    if not published:
+        return None
+    return published, published_years
+
+
+_TITLED_SPECIAL_OFFICIAL_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:第\s*[0-9一二三四五六七八九十]+\s*季\s*)?(?:OVA|OAV|OAD|SP|SPECIAL)"
+    r"\s*0*\d{0,3}"
+    r"|第\s*[0-9一二三四五六七八九十]+\s*季"
+    r")[\s：:．.・\-—－]*",
+    re.IGNORECASE,
+)
+
+
+def _titled_single_season00_episode(
+    published: Mapping[int, str],
+    published_years: Mapping[int, int],
+    *,
+    boundary_label: str,
+    parent_title: str,
+    source_years: Sequence[int] = (),
+) -> int | None:
+    """Return the one published Season 00 episode titled as the source label.
+
+    The boundary label minus its physical marker words and the parent show's
+    own title must be a concrete arc name (at least four identity characters),
+    and must match exactly one published Season 00 episode title — whose own
+    ``OVA1：``-style ordinal prefixes are stripped before comparison — at the
+    global high-confidence threshold, beating the runner-up by the global
+    ambiguity margin.  A known official air year outside the source release
+    years disqualifies the candidate.
+    """
+    label_text = _ARC_LABEL_SPECIAL_MARKER_RE.sub(
+        " ", str(boundary_label or "")
+    )
+    label_key = _special_arc_title_key(label_text)
+    parent_key = _special_arc_title_key(str(parent_title or ""))
+    if parent_key:
+        label_key = label_key.replace(parent_key, "")
+    if len(label_key) < 4:
+        return None
+    episode_scores: dict[int, float] = {}
+    for number, title in published.items():
+        title_key = _special_arc_title_key(
+            _TITLED_SPECIAL_OFFICIAL_PREFIX_RE.sub("", str(title or ""))
+        )
+        if len(title_key) < 4:
+            continue
+        score = _title_similarity(label_key, title_key)
+        if label_key in title_key or title_key in label_key:
+            score = max(score, 0.95)
+        if score < 0.90:
+            continue
+        if source_years:
+            year = published_years.get(number)
+            if year is not None and min(
+                abs(int(year) - int(source)) for source in source_years
+            ) > 1:
+                continue
+        episode_scores[number] = score
+    ranked = sorted(episode_scores.items(), key=lambda row: (-row[1], row[0]))
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < AUTO_MATCH_MIN_MARGIN:
+        return None
+    return ranked[0][0]
+
+
+def _titled_single_season00_evidence(
+    episode_catalog: Callable[[Mapping[str, object]], object] | None,
+    *,
+    tmdb_id: int,
+    boundary_label: str,
+    parent_title: str,
+    source_years: Sequence[int] = (),
+) -> SingleSeasonEpisodeProof | None:
+    """Prove a single unnumbered titled special as the parent's Season 00.
+
+    This is the ordinal-free branch of the shared physical-special grammar:
+    the confirmed identity is a regular show whose published Season 00 holds
+    the special, and the boundary label's concrete arc title — not a release
+    ordinal, which does not exist — is the only coordinate evidence.
+    """
+    if not callable(episode_catalog):
+        return None
+    loaded = _published_season0_episodes(episode_catalog, tmdb_id)
+    if loaded is None:
+        return None
+    published, published_years = loaded
+    number = _titled_single_season00_episode(
+        published,
+        published_years,
+        boundary_label=boundary_label,
+        parent_title=parent_title,
+        source_years=source_years,
+    )
+    if number is None:
+        return None
+    return SingleSeasonEpisodeProof(
+        tmdb_id=tmdb_id,
+        season=0,
+        episode_count=1,
+        episode_tokens=(f"S00E{number:02d}",),
+        evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+    )
+
+
 def _season00_physical_special_evidence(
     official: Mapping[str, object],
     *,
@@ -2475,30 +2615,10 @@ def _season00_physical_special_evidence(
     official_titles = tuple(official_titles_raw)
     # The published catalog is the authoritative coordinate source; the show
     # detail only proves the Season 00 shape exists.
-    try:
-        payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
-    except Exception:
+    loaded = _published_season0_episodes(episode_catalog, tmdb_id)
+    if loaded is None:
         return None
-    if not isinstance(payload, Mapping) or 0 not in payload:
-        return None
-    rows = payload.get(0)
-    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
-        return None
-    published: dict[int, str] = {}
-    published_years: dict[int, int] = {}
-    for row in rows:
-        if not isinstance(row, Mapping) or row.get("season_number") != 0:
-            return None
-        number = _positive_season(row.get("episode_number"))
-        if number is None:
-            return None
-        published[number] = str(row.get("name") or "")
-        air_date = str(row.get("air_date") or "")
-        air_year_match = re.match(r"(\d{4})-", air_date)
-        if air_year_match:
-            published_years[number] = int(air_year_match.group(1))
-    if not published:
-        return None
+    published, published_years = loaded
     # Evidence class 1: each source ordinal is named by the official Season 00
     # title of that number under the shared marker grammar.
     ordinal_named = True
@@ -2571,7 +2691,13 @@ def prove_physical_special_single_season_evidence(
       official special titles or by a complete count match with an official
       marker (``_season00_physical_special_evidence``).
 
-    In both cases only the proved source SP keys become coordinates for D/F;
+    A third source shape carries no ordinals at all: exactly one unnumbered
+    marker-bearing video whose boundary label is a concrete arc title
+    (``夏目友人帐 和猫老师的第一次跑腿``).  Only the parent-identity Season 00
+    branch can prove it, and only through that arc title matching exactly one
+    published Season 00 episode (``_titled_single_season00_evidence``).
+
+    In all cases only the proved source SP keys become coordinates for D/F;
     a release ordinal is never silently rewritten to an unrelated Season 00.
     """
     identity = record.identity if isinstance(record.identity, Mapping) else {}
@@ -2600,8 +2726,6 @@ def prove_physical_special_single_season_evidence(
     except (KeyError, TypeError, ValueError):
         return None
     markers, numbers, count, complete = physical_special_marker_evidence(scoped)
-    if not complete or count is None or not markers or not numbers:
-        return None
     # The named-arc Season 00 proof is anchored to the release label and the
     # explicit release years, never to a bare ordinal guess.
     source_year_tokens = set(
@@ -2613,6 +2737,27 @@ def prove_physical_special_single_season_evidence(
                 re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", file.name)
             )
     source_years = tuple(sorted(int(y) for y in source_year_tokens))
+    if not (complete and count is not None and markers and numbers):
+        # A single unnumbered marker-bearing video (``夏目友人帐
+        # 和猫老师的第一次跑腿`` around one OVA file) carries no release
+        # ordinal at all, so no run grammar can position it.  Its only
+        # bounded coordinate proof is the concrete arc title itself matching
+        # exactly one published Season 00 episode of the parent show.
+        if markers and not numbers:
+            videos = [
+                file
+                for file in collect_all_files(scoped)
+                if file.object_type == "video"
+            ]
+            if len(videos) == 1:
+                return _titled_single_season00_evidence(
+                    episode_catalog,
+                    tmdb_id=tmdb_id,
+                    boundary_label=record.display_label,
+                    parent_title=str(identity.get("title") or ""),
+                    source_years=source_years,
+                )
+        return None
     official = physical_special_candidate_evidence(
         tmdb_client,
         tmdb_id=tmdb_id,
