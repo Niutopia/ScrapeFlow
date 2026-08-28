@@ -1236,6 +1236,109 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
             self.assertIn("缺少可证明的季集坐标", record.attention or "")
+
+    def test_separated_season_token_videos_prove_the_declared_season(self) -> None:
+        """``S2 [01]`` release names still corroborate their declared season.
+
+        A release run may split the season token from the bracketed episode
+        ordinal.  D's unit tokens already read those coordinates through the
+        shared coverage parser; the root-scope season proof must not narrow
+        to the contiguous ``SxxEyy`` grammar and lose the directory-to-season
+        linkage, or a fully covered season would stay uncertain instead of
+        reporting its gap.
+        """
+
+        class SeparatedSeasonTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "seasons": [
+                            {"season_number": 1, "episode_count": 10, "name": "第 1 季"},
+                            {"season_number": 2, "episode_count": 12, "name": "第 2 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2019-01-11",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 11)
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/2":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2021-01-08",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 13)
+                        ]
+                    }
+                return {}
+
+        def library_files() -> dict[str, bytes]:
+            files: dict[str, bytes] = {
+                "/library/番剧/示例剧/tvshow.nfo": _nfo_tv(99057, "示例剧", "2019"),
+            }
+            for episode in range(1, 11):
+                files[
+                    f"/library/番剧/示例剧/Season 01/S01E{episode:02d}.mkv"
+                ] = b"v"
+            return files
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-separated-season-token"
+            tmdb = SeparatedSeasonTMDB(99057)
+            source = {
+                (
+                    "/incoming/W 4k 某剧/第一季/"
+                    f"[Grp] 某剧 S1 [{episode:02d}][Ma10p_2160p].mkv"
+                ): b"v"
+                for episode in range(1, 11)
+            }
+            source.update({
+                (
+                    "/incoming/W 4k 某剧/第二季/"
+                    f"[Grp] 某剧 S2 [{episode:02d}][Ma10p_2160p].mkv"
+                ): b"v"
+                for episode in range(1, 13)
+            })
+            alist = IndexAList(library_files() | source)
+            analyze_root_boundaries(
+                alist, "/incoming/W 4k 某剧",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = next(
+                unit
+                for unit in load_work_unit_records(state_root, root_task_id)
+                if unit.claimed_seasons == (2,)
+            )
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id, season=2,
+            )
+            records = {
+                unit.work_unit_id: unit
+                for unit in reconcile_root_work_units(
+                    alist, "/library", state_root, root_task_id,
+                    episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+                )
+            }
+            record = records[record.work_unit_id]
+            self.assertEqual(record.reconciliation_outcome, "merge_existing")
+            self.assertEqual(record.matched_work_root, "/library/番剧/示例剧")
+            self.assertIsNone(record.attention)
         """TMDB's zero-episode announced season has no coordinate to infer."""
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)

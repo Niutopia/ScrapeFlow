@@ -815,6 +815,24 @@ def _video_coordinates_match_declared_season(node: SourceNode, season: int) -> b
     return observed == {season}
 
 
+def _scope_videos_corroborate_season(node: SourceNode, season: int) -> bool:
+    """Require a scope's videos to corroborate one declared season.
+
+    Unlike the child-directory rule above, this reads coordinates through
+    the shared coverage parser, so a release grammar that splits the season
+    token from the bracketed episode ordinal (``S2 [01]``) still carries its
+    explicit season.  Only files that state a season count; tokenless videos
+    neither corroborate nor contradict.
+    """
+    observed: set[int] = set()
+    for file in collect_all_files(node):
+        if file.object_type != "video":
+            continue
+        for file_season, _episode in audit_episode_tokens(file.path):
+            observed.add(file_season)
+    return observed == {season}
+
+
 def _declared_empty_seasons_in_root_scope(
     root: SourceNode,
     claimed: tuple[int, ...],
@@ -894,6 +912,19 @@ def _declared_empty_seasons(
         root = nodes_by_path.get(root_path)
         if root is None:
             return None
+        # A unit whose whole scope is one explicitly marked season
+        # directory is season-scoped, not root-scoped: its own directory
+        # marker is the directory-to-season linkage.  The videos must still
+        # corroborate that season through the shared coverage parser, which
+        # also reads release grammars that split the token from the ordinal
+        # (``S2 [01]``).  Nothing claimed can be empty in that shape.
+        scope_season = _scope_season_number(root_path)
+        if scope_season is not None:
+            if claimed != (scope_season,) or not _scope_videos_corroborate_season(
+                root, scope_season
+            ):
+                return None
+            return ()
         return _declared_empty_seasons_in_root_scope(root, claimed)
 
     season_scopes: dict[int, str] = {}
