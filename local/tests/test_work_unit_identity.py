@@ -728,6 +728,55 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         }
         self.assertNotIn("第二季", dispatched)
 
+    def test_season_leaf_unit_matches_via_cleaned_parent_label(self) -> None:
+        """A shelf-prefixed intake root must contribute a cleaned query.
+
+        The intake container (``Y 4k 元气少女缘结神``) is the parent of the
+        ``第二季`` work unit.  TMDB returns nothing for the raw label, so the
+        cleaned form (``元气少女缘结神``) has to be dispatched — otherwise a
+        well-named season folder cannot confirm its show automatically.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "元气少女缘结神": [
+                    {
+                        "id": 62741,
+                        "name": "元气少女缘结神",
+                        "first_air_date": "2012-10-01",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-kamisama-s2",
+            boundary_label="第二季",
+            parent_labels=("Y 4k 元气少女缘结神",),
+            representative_names=("第二季", "Kamisama Hajimemashita S2"),
+            normalized_titles=("第二季",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, prefer_animation=True,
+        )
+        self.assertEqual(best.tmdb_id, 62741)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/tv")
+        ]
+        self.assertIn("元气少女缘结神", dispatched)
+        self.assertNotIn("第二季", dispatched)
+        # The cleaned parent leads the budget ahead of its raw shelf form.
+        self.assertLess(
+            dispatched.index("元气少女缘结神"),
+            dispatched.index("Y 4k 元气少女缘结神"),
+        )
+
     def test_disambiguates_same_title_by_year(self) -> None:
         # Two TMDB results with exact same title but different years
         client = FakeTMDBClient(

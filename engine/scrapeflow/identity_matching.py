@@ -2027,6 +2027,25 @@ def physical_special_candidate_evidence(
     )
 
 
+def _parent_identity_query_variants(parent: str) -> list[str]:
+    """Return a parent label's cleaned release query ahead of its raw form.
+
+    The parent of a work unit is usually the user-owned intake container
+    (``Y 4k 元气少女缘结神``) whose shelf/quality prefix makes TMDB return
+    nothing for the raw label.  The boundary label already gets
+    :func:`_clean_boundary_identity_query`; a parent label deserves the same
+    bounded cleaning, with the cleaned form first because it is the variant
+    that can hit the official title exactly.
+    """
+    raw = str(parent or "").strip()
+    if not raw:
+        return []
+    cleaned = _clean_boundary_identity_query(raw).strip()
+    if cleaned and cleaned != raw:
+        return [cleaned, raw]
+    return [raw]
+
+
 def auto_match_from_evidence(
     client: TMDBClient,
     evidence: IdentityEvidence,
@@ -2092,14 +2111,13 @@ def auto_match_from_evidence(
         # that structural leaf, otherwise the six-query cap can make TMDB
         # confidently select an unrelated show named "第二季".  These remain
         # normal TMDB search queries and ordinary scoring/ambiguity checks;
-        # the parent never injects an identity.
+        # the parent never injects an identity.  Each parent contributes its
+        # cleaned and raw forms, cleaned first, but the standalone forms stay
+        # ahead of the combined ones so representative titles keep budget
+        # slots.
         for parent in evidence.parent_labels:
-            p_clean = parent.strip()
-            if not p_clean:
-                continue
-            candidate_queries.append(p_clean)
-            candidate_queries.append(f"{p_clean} {boundary_label}")
-            candidate_queries.append(f"{p_clean}/{boundary_label}")
+            for p_variant in _parent_identity_query_variants(parent):
+                candidate_queries.append(p_variant)
         for representative in evidence.representative_names:
             if _is_generic_season_identity_label(representative):
                 continue
@@ -2110,14 +2128,18 @@ def auto_match_from_evidence(
                 candidate_queries.append(title_query)
             elif _is_non_structural_identity_evidence(representative):
                 candidate_queries.append(representative)
+        for parent in evidence.parent_labels:
+            for p_variant in _parent_identity_query_variants(parent):
+                candidate_queries.append(f"{p_variant} {boundary_label}")
+                candidate_queries.append(f"{p_variant}/{boundary_label}")
 
     # Combined parent + boundary queries are useful ordinary evidence, but
     # must not crowd out the strict bare-number proof above.
     for parent in evidence.parent_labels:
-        p_clean = parent.strip()
-        if p_clean and boundary_label:
-            candidate_queries.append(f"{p_clean} {boundary_label}")
-            candidate_queries.append(f"{p_clean}/{boundary_label}")
+        for p_variant in _parent_identity_query_variants(parent):
+            if p_variant and boundary_label:
+                candidate_queries.append(f"{p_variant} {boundary_label}")
+                candidate_queries.append(f"{p_variant}/{boundary_label}")
 
     # A generic season label (``第一季``/``第二季``/``Season 02``) is source
     # layout, not a work title.  It must never be dispatched as a standalone
