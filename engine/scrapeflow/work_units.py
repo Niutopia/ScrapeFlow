@@ -48,6 +48,19 @@ _SEASON_EPISODE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# A filename with an explicit season >= 2 coordinate describes that later
+# season's air date, never the work's first-air year.  Treating such a year
+# as work-year evidence would wrongly reject the canonical entry, which first
+# aired years before the continuation season.
+_CONTINUATION_SEASON_RE = re.compile(
+    r"""
+    (?:^|[^A-Za-z0-9])
+    S\s*0*([2-9]\d{0,2})\s*E\s*0*\d{1,4}
+    (?:$|[^0-9])
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _STANDALONE_EPISODE_RE = re.compile(
     r"""
     (?:^|[^A-Za-z0-9])
@@ -676,8 +689,9 @@ def extract_identity_evidence(
                 and strict_naked_numeric_video_run
             )
             for f in _select_representative_video_files(video_files):
-                for y_str in _YEAR_RE.findall(f.name):
-                    years.add(int(y_str))
+                if _CONTINUATION_SEASON_RE.search(f.name) is None:
+                    for y_str in _YEAR_RE.findall(f.name):
+                        years.add(int(y_str))
                 # A naked ordinal is structural evidence only.  Adding it to
                 # ``representative_names`` would later let ``01`` be sent to
                 # TMDB as a movie title if the meaningful boundary query did

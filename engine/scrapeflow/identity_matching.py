@@ -1324,6 +1324,36 @@ class AutoMatchAmbiguityError(PlanError):
         self.candidates = bounded_auto_match_candidate_rows(candidates)
 
 
+def _tv_season_fragment_entry(client: Any, tmdb_id: int) -> bool | None:
+    """Whether a TMDB TV entry's seasons start at a number >= 2.
+
+    TMDB split-season duplicate entries expose only a ``Season 2`` (or
+    later) row while the canonical parent show carries Season 1.  Such a
+    fragment is a season representation, never the identity of a whole
+    source work, so it may not win automatic selection while the canonical
+    parent is also a candidate.  Returns ``None`` when the detail cannot be
+    read; the rule then simply does not apply.
+    """
+    try:
+        details = client.get(f"/tv/{tmdb_id}")
+    except ApiError:
+        return None
+    seasons = details.get("seasons")
+    if not isinstance(seasons, list) or not seasons:
+        return None
+    numbers: list[int] = []
+    for season in seasons:
+        if not isinstance(season, Mapping):
+            continue
+        number = season.get("season_number")
+        if isinstance(number, bool) or not isinstance(number, int):
+            continue
+        numbers.append(number)
+    if not numbers:
+        return None
+    return min(numbers) >= 2
+
+
 def _score_identity_candidate(
     raw: Mapping[str, Any],
     *,
@@ -1440,8 +1470,16 @@ def _score_identity_candidate(
             + episode_structure_score,
         ),
     )
-    confidence = max(0.0, min(1.0, confidence + special_marker_score))
+    season_fragment_score = 0.0
+    if raw.get("season_fragment_entry") is True:
+        season_fragment_score = -0.30
+    confidence = max(
+        0.0,
+        min(1.0, confidence + special_marker_score + season_fragment_score),
+    )
     blockers: list[str] = []
+    if raw.get("season_fragment_entry") is True:
+        blockers.append("season_fragment_entry")
     if wrong_year:
         blockers.append("year_conflict")
     if raw["cross_script"] and alias_score < 0.88:
@@ -1487,6 +1525,7 @@ def _score_identity_candidate(
         "media_type_score": round(media_type_score, 6),
         "episode_structure_score": round(episode_structure_score, 6),
         "special_marker_score": round(special_marker_score, 6),
+        "season_fragment_score": round(season_fragment_score, 6),
         "context_score": round(context_score, 6),
         "final_score": round(confidence, 6),
     }
@@ -1699,6 +1738,9 @@ def auto_match_tmdb(
             genre_ids = item.get("genre_ids") or []
             is_animation = 16 in genre_ids if isinstance(genre_ids, list) and genre_ids else None
             actual_episode_count: int | None = None
+            season_fragment_entry: bool | None = None
+            if candidate_type == "tv" and index < 5:
+                season_fragment_entry = _tv_season_fragment_entry(client, tmdb_id)
             if expected_episode_count and candidate_type == "tv" and index < 5:
                 try:
                     details = client.get(f"/tv/{tmdb_id}")
@@ -1720,6 +1762,7 @@ def auto_match_tmdb(
                 "matched_query": matched_query,
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
+                "season_fragment_entry": season_fragment_entry,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
@@ -2342,6 +2385,9 @@ def auto_match_from_evidence(
             genre_ids = item.get("genre_ids") or []
             is_animation = 16 in genre_ids if isinstance(genre_ids, list) and genre_ids else None
             actual_episode_count: int | None = None
+            season_fragment_entry: bool | None = None
+            if candidate_type == "tv" and index < 5:
+                season_fragment_entry = _tv_season_fragment_entry(client, tmdb_id)
             if expected_episode_count and candidate_type == "tv" and index < 5:
                 try:
                     details = client.get(f"/tv/{tmdb_id}")
@@ -2376,6 +2422,7 @@ def auto_match_from_evidence(
                 "matched_query": matched_query,
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
+                "season_fragment_entry": season_fragment_entry,
                 "strict_naked_numeric_video_run": strict_naked_numeric_guard,
                 "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
                 "naked_numeric_clean_boundary_query_sent": bool(

@@ -585,6 +585,105 @@ class TestWorkUnitRecordPersistence(unittest.TestCase):
 class TestAutoMatchFromEvidence(unittest.TestCase):
     """Tests for TMDB auto-matching using IdentityEvidence."""
 
+    def test_continuation_season_year_is_not_work_year_evidence(self) -> None:
+        """A filename's S02 coordinate makes its year a season-air year.
+
+        ``Sousou.no.Frieren.S02E01.2026.1080p...`` first airs in 2026, but the
+        canonical work first aired in 2023.  The year inside a season >= 2
+        filename must not become ``IdentityEvidence.years`` — otherwise the
+        canonical entry is scored as a year conflict and a split-season
+        duplicate entry without a first-air date wins instead.
+        """
+        candidate = WorkCandidate(
+            work_unit_id="wu-frieren-continuation",
+            boundary_key="/incoming/葬送的芙莉莲",
+            source_paths=("/incoming/葬送的芙莉莲",),
+            display_label="Z 4k 葬送的芙莉莲",
+            proposed_media_context="tv",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.SINGLE_WORK,
+                confidence=0.9,
+                reasons=("tv-shaped container",),
+                competing_roles=(),
+            ),
+        )
+        node = SourceNode(
+            path="/incoming/葬送的芙莉莲",
+            name="葬送的芙莉莲",
+            children=(),
+            files=(
+                SourceFile(
+                    path="/incoming/葬送的芙莉莲/Sousou.no.Frieren.S02E01.2026.1080p.CR.WEB-DL.x264.AAC.mkv",
+                    name="Sousou.no.Frieren.S02E01.2026.1080p.CR.WEB-DL.x264.AAC.mkv",
+                    object_type="video",
+                    size=1,
+                    modified="",
+                ),
+            ),
+            depth=0,
+        )
+        evidence = extract_identity_evidence(candidate, node)
+        self.assertNotIn(2026, evidence.years)
+
+    def test_season_fragment_entry_cannot_win_auto_match(self) -> None:
+        """A TMDB split-season duplicate may not outrank the canonical show.
+
+        TMDB sometimes hosts a duplicate entry whose seasons list contains
+        only ``Season 2`` while the canonical parent carries Season 1.  That
+        fragment is a season representation, not a work identity: it is
+        penalized and blocked, so the canonical entry wins automatic
+        selection even when the fragment lacks a first-air date.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "葬送的芙莉莲": [
+                    {
+                        "id": 327813,
+                        "name": "葬送的芙莉莲",
+                        "first_air_date": "",
+                        "genre_ids": [16],
+                    },
+                    {
+                        "id": 209867,
+                        "name": "葬送的芙莉莲",
+                        "first_air_date": "2023-09-29",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+            details={
+                "/tv/327813": {
+                    "seasons": [{"season_number": 2, "name": "第二季"}],
+                },
+                "/tv/209867": {
+                    "seasons": [
+                        {"season_number": 0, "name": "特别篇"},
+                        {"season_number": 1, "name": "第 1 季"},
+                    ],
+                },
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-frieren",
+            boundary_label="葬送的芙莉莲",
+            parent_labels=(),
+            representative_names=("葬送的芙莉莲",),
+            normalized_titles=("葬送的芙莉莲",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 209867)
+        self.assertEqual(best.status, "confirmed")
+        fragment = next(c for c in candidates if c.tmdb_id == 327813)
+        self.assertEqual(fragment.status, "rejected")
+        self.assertIn(
+            "season_fragment_entry",
+            fragment.decision_trace.get("blockers", []),
+        )
+
     def test_disambiguates_same_title_by_year(self) -> None:
         # Two TMDB results with exact same title but different years
         client = FakeTMDBClient(
@@ -1082,7 +1181,13 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             if path == "/search/tv"
         ]
         self.assertIn("Known.Show", search_queries)
-        self.assertNotIn("/tv/1399", [path for path, _ in client.call_log])
+        # The only permitted detail fetch is the season-fragment check; the
+        # episode-count detail fetch must still be skipped (no expected count).
+        detail_paths = [
+            path for path, _ in client.call_log
+            if path == "/tv/1399"
+        ]
+        self.assertEqual(detail_paths, ["/tv/1399"])
 
     def test_bare_episode_marker_title_derivation_requires_a_title_prefix(self) -> None:
         for source_name in (
