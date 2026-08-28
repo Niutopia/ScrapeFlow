@@ -1037,9 +1037,25 @@ def _path_below_any_scope(path: str, scopes: Sequence[str]) -> bool:
 
 def _fresh_scope_is_directory(alist: object, scope: str) -> bool:
     """Prove an empty source scope still exists as the exact directory."""
+    return _fresh_scope_row(alist, scope, require_directory=True) is not None
+
+
+def _fresh_scope_row(
+    alist: object,
+    scope: str,
+    *,
+    require_directory: bool = False,
+) -> Mapping[str, object] | None:
+    """Return the live provider row for one exact scope path, if present.
+
+    Directory scopes (whole-folder boundaries) and file scopes (flat-split
+    boundaries that own exact media files) are both legitimate WorkUnit
+    scopes.  The caller states which shape it needs; a vanished or
+    shape-shifted object returns ``None`` so the proof fails closed.
+    """
     listing = getattr(alist, "list", None)
     if not callable(listing):
-        return False
+        return None
     parent = posixpath.dirname(scope.rstrip("/")) or "/"
     name = posixpath.basename(scope.rstrip("/"))
     try:
@@ -1048,17 +1064,18 @@ def _fresh_scope_is_directory(alist: object, scope: str) -> bool:
         try:
             rows = listing(parent)
         except Exception:
-            return False
+            return None
     except Exception:
-        return False
+        return None
     if not isinstance(rows, list):
-        return False
-    return any(
-        isinstance(row, Mapping)
-        and row.get("name") == name
-        and row.get("is_dir") is True
-        for row in rows
-    )
+        return None
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("name") != name:
+            continue
+        if require_directory and row.get("is_dir") is not True:
+            continue
+        return row
+    return None
 
 
 def _fresh_scopes_match_snapshot(
@@ -1072,24 +1089,39 @@ def _fresh_scopes_match_snapshot(
     B/W actually classified.  A source object may have appeared, vanished, or
     changed while C queried TMDB, so F must never inherit this proof without a
     fresh directory existence check and the same path/type/size/version tuple.
+    A scope may be a whole directory (folder boundary) or an exact file
+    (flat-split boundary); file scopes are proven from their parent listing.
     """
     scopes = tuple(path.rstrip("/") for path in record.source_paths)
-    if not scopes or any(not _fresh_scope_is_directory(alist, scope) for scope in scopes):
+    if not scopes:
         return False
     raw_snapshot_rows = snapshot.get("rows")
     if not isinstance(raw_snapshot_rows, list):
         return False
-    expected = [
-        row for row in raw_snapshot_rows
-        if isinstance(row, Mapping)
-        and _path_below_any_scope(str(row.get("full_path") or "").rstrip("/"), scopes)
-    ]
     fresh: list[Mapping[str, object]] = []
     try:
         for scope in scopes:
-            fresh.extend(walk_source_rows(alist, scope))
+            directory_row = _fresh_scope_row(alist, scope, require_directory=True)
+            if directory_row is not None:
+                fresh.extend(walk_source_rows(alist, scope))
+                continue
+            # A flat-split boundary owns exact files, not a directory.  The
+            # snapshot's own rows decide the expected shape: a scope whose
+            # snapshot row is a file must still exist as that exact file.
+            scope_row = _fresh_scope_row(alist, scope)
+            if scope_row is None or scope_row.get("is_dir") is True:
+                return False
+            fresh.append(dict(scope_row, full_path=scope))
     except Exception:
         return False
+    expected = [
+        row for row in raw_snapshot_rows
+        if isinstance(row, Mapping)
+        and (
+            _path_below_any_scope(str(row.get("full_path") or "").rstrip("/"), scopes)
+            or str(row.get("full_path") or "").rstrip("/") in scopes
+        )
+    ]
     return _scope_row_fingerprint(expected) == _scope_row_fingerprint(fresh)
 
 
@@ -1123,8 +1155,23 @@ def _movie_shaped_child_paths(node: SourceNode) -> set[str]:
     stack = list(node.children)
     while stack:
         child = stack.pop()
+        # A flat-split multi-file scope aggregates virtual one-FILE nodes as
+        # children.  Every such node trivially holds "exactly one large
+        # video", but it is an owned episode member, not an independent
+        # film; a movie-shaped DIRECTORY owns its video strictly inside it.
+        child_is_directory = child.children or (
+            all(
+                video.path.rstrip("/").startswith(str(child.path).rstrip("/") + "/")
+                for video in collect_all_files(child)
+                if video.object_type == "video"
+            )
+        )
         videos = [f for f in collect_all_files(child) if f.object_type == "video"]
-        if len(videos) == 1 and videos[0].size >= _MOVIE_SHAPED_MIN_BYTES:
+        if (
+            child_is_directory
+            and len(videos) == 1
+            and videos[0].size >= _MOVIE_SHAPED_MIN_BYTES
+        ):
             paths.add(str(child.path).rstrip("/"))
             continue
         stack.extend(child.children)

@@ -1340,6 +1340,90 @@ class LibraryIndexTests(unittest.TestCase):
                 record.reconciliation_evidence,
             )
 
+    def test_bracketed_run_of_flat_split_file_scopes_gets_season_proof(self) -> None:
+        """A flat-split bracket run owns exact FILE scopes; D must prove it.
+
+        The mixed feature-plus-bracket-run B/W split emits one movie unit and
+        one tv unit whose source_paths are the exact media files, not a
+        directory.  The single-season proof used to accept directory scopes
+        only, so such a run parked as "纯方括号集号未能证明为完整唯一的
+        TMDB 正季" even when the run and the catalog matched exactly.
+        """
+
+        class RowsAList:
+            """Sized listing double: one flat folder of large video files."""
+
+            def __init__(self, entries: dict[str, list[dict[str, object]]]) -> None:
+                self.entries = {
+                    str(path).rstrip("/"): rows for path, rows in entries.items()
+                }
+
+            def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return [dict(row) for row in self.entries.get(path.rstrip("/"), [])]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            big = 2 * 1024 ** 3
+            folder = "/incoming/Mixed Bundle"
+            run_one = f"{folder}/Northwind ~The Semi-Final~ [01] 2160p.mkv"
+            run_two = f"{folder}/Northwind ~The Semi-Final~ [02] 2160p.mkv"
+            alist = RowsAList({
+                folder: [
+                    {
+                        "name": "Northwind ~The Final~ 2160p.mkv",
+                        "is_dir": False,
+                        "size": 13 * 1024 ** 3,
+                    },
+                    {"name": run_one.rsplit("/", 1)[-1], "is_dir": False, "size": big},
+                    {"name": run_two.rsplit("/", 1)[-1], "is_dir": False, "size": big},
+                ],
+            })
+            analyze_root_boundaries(
+                alist,
+                folder,
+                root_task_id="root-flat-bracket",
+                state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, "root-flat-bracket")
+            self.assertEqual(len(records), 2)
+            series = next(
+                record for record in records if record.media_context == "tv"
+            )
+            self.assertEqual(series.source_paths, (run_one, run_two))
+            apply_work_unit_override(
+                state_root,
+                "root-flat-bracket",
+                series.work_unit_id,
+                media_type="tv",
+                tmdb_id=99031,
+            )
+            tmdb = StrictBareEpisodeTMDB(99031, {1: 2})
+            reconciled = reconcile_root_work_units(
+                alist,
+                "/library",
+                state_root,
+                "root-flat-bracket",
+                episode_catalog=TmdbEpisodeCatalog(tmdb),
+                tmdb_client=tmdb,
+            )
+            updated = next(
+                record
+                for record in reconciled
+                if record.work_unit_id == series.work_unit_id
+            )
+            self.assertEqual(updated.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                updated.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_bracketed_episodes",
+                    "tmdb_id": 99031,
+                    "season": 1,
+                    "episode_count": 2,
+                    "episode_tokens": ["S01E01", "S01E02"],
+                },
+            )
+
     def test_bracketed_proof_accepts_auxiliary_specials_and_ncop_nced(self) -> None:
         """Published S00 plus explicit NCOP/NCED do not change S01 proof."""
         with tempfile.TemporaryDirectory() as directory:
