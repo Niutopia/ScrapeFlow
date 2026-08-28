@@ -2213,11 +2213,21 @@ def auto_match_from_evidence(
     # title and its combined variants identify the work.
     if not generic_season_boundary:
         candidate_queries.append(boundary_label)
+    # A release-package boundary can be a decorated FILENAME in any script
+    # (``[Ygm] Gintama ~The Final~ [Ma10p_2160p]…``).  The cleaned standalone
+    # variant is dispatched for CJK labels unconditionally (historical
+    # behaviour) and for any other script when it still carries title
+    # substance: a cleaned form that collapsed the label to a year or bare
+    # technical tokens (``[REC] 2007`` -> ``2007``) stays out of the bounded
+    # budget, while the raw label query above remains the fallback.
     if (
-        clean_boundary_is_cjk
-        and clean_boundary_query
+        clean_boundary_query
         and clean_boundary_query != boundary_label
         and not generic_season_boundary
+        and (
+            clean_boundary_is_cjk
+            or _usable_release_title_query(clean_boundary_query)
+        )
     ):
         candidate_queries.append(clean_boundary_query)
 

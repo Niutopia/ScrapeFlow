@@ -684,6 +684,81 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             fragment.decision_trace.get("blockers", []),
         )
 
+    def test_decorated_latin_filename_boundary_dispatches_cleaned_query(self) -> None:
+        """A release-decorated Latin filename must keep its cleaned title query.
+
+        A flat-split movie boundary is the raw media filename
+        (``[Ygm] Gintama ~The Final~ [Ma10p_2160p]…``).  Parent-combination
+        variants used to consume the whole six-query budget while the
+        standalone cleaned title was CJK-gated and never dispatched, so TMDB
+        returned no candidates at all.  The cleaned variant must stay in the
+        budget whenever it still carries title substance.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Gintama ~The Final~": [
+                    {
+                        "id": 732203,
+                        "title": "銀魂 THE FINAL",
+                        "release_date": "2021-01-08",
+                        "genre_ids": [28],
+                    },
+                ],
+            },
+            alternative_titles={
+                "732203": [
+                    {"iso_3166_1": "US", "title": "Gintama: The Very Final", "type": ""},
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-final",
+            boundary_label=(
+                "[Ygm] Gintama ~The Final~ [Ma10p_2160p][x265_flac_DTS5.1_ass]"
+            ),
+            parent_labels=("银魂 剧场版 The Final",),
+            representative_names=(
+                "[Ygm] Gintama ~The Final~ [Ma10p_2160p][x265_flac_DTS5.1_ass]",
+            ),
+            normalized_titles=("Gintama ~The Final~",),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 732203)
+        self.assertEqual(best.status, "confirmed")
+        self.assertTrue(candidates)
+        sent = [params.get("query") for _path, params in client.call_log]
+        self.assertIn("Gintama ~The Final~", sent)
+
+    def test_cleaned_latin_query_without_title_substance_stays_undispatched(self) -> None:
+        """A cleaner that collapses the label to noise must not waste budget.
+
+        ``[Ma10p] 2024`` has no title words; its cleaned form ``2024`` is a
+        year husk.  Extending the cleaned-variant dispatch beyond CJK must
+        still refuse such garbage: only variants with title substance get a
+        budget slot, and the raw label query remains the fallback.
+        """
+        client = FakeTMDBClient()
+        evidence = IdentityEvidence(
+            work_unit_id="wu-husk",
+            boundary_label="[Ma10p] 2024",
+            parent_labels=(),
+            representative_names=(),
+            normalized_titles=(),
+            years=(2024,),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        with self.assertRaises(PlanError):
+            auto_match_from_evidence(client, evidence)
+        sent = [params.get("query") for _path, params in client.call_log]
+        self.assertIn("[Ma10p] 2024", sent)
+        self.assertNotIn("2024", sent)
+
     def test_bare_season_label_is_never_dispatched_standalone(self) -> None:
         """A generic season leaf must not leak back in as its own query.
 
