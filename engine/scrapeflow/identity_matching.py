@@ -2198,19 +2198,18 @@ def auto_match_from_evidence(
                 candidate_queries.append(f"{p_variant} {boundary_label}")
                 candidate_queries.append(f"{p_variant}/{boundary_label}")
 
-    # Combined parent + boundary queries are useful ordinary evidence, but
-    # must not crowd out the strict bare-number proof above.
-    for parent in evidence.parent_labels:
-        for p_variant in _parent_identity_query_variants(parent):
-            if p_variant and boundary_label:
-                candidate_queries.append(f"{p_variant} {boundary_label}")
-                candidate_queries.append(f"{p_variant}/{boundary_label}")
-
     # A generic season label (``第一季``/``第二季``/``Season 02``) is source
     # layout, not a work title.  It must never be dispatched as a standalone
     # query: TMDB would otherwise confidently select an unrelated show whose
     # title merely contains that label (``中国 第二季``).  Only the parent
     # title and its combined variants identify the work.
+    #
+    # The unit's own boundary queries come BEFORE the parent combinations
+    # below: two nested parent labels already produce six or more combined
+    # variants, which once exhausted the whole bounded budget and left a
+    # title-bearing boundary (``[Ygm] Gintama ~The Final~ [Ma10p]…``) with
+    # no query of its own.  A combination is auxiliary evidence; the
+    # boundary label is primary.
     if not generic_season_boundary:
         candidate_queries.append(boundary_label)
     # A release-package boundary can be a decorated FILENAME in any script
@@ -2230,6 +2229,15 @@ def auto_match_from_evidence(
         )
     ):
         candidate_queries.append(clean_boundary_query)
+
+    # Combined parent + boundary queries are useful ordinary evidence, but
+    # must not crowd out the unit's own boundary queries above or the strict
+    # bare-number proof before those.
+    for parent in evidence.parent_labels:
+        for p_variant in _parent_identity_query_variants(parent):
+            if p_variant and boundary_label:
+                candidate_queries.append(f"{p_variant} {boundary_label}")
+                candidate_queries.append(f"{p_variant}/{boundary_label}")
 
     # 3. A representative filename with an explicit ``SxxExx`` marker may
     # carry a clean title even when the boundary is a release-package label.

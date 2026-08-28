@@ -733,6 +733,51 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         sent = [params.get("query") for _path, params in client.call_log]
         self.assertIn("Gintama ~The Final~", sent)
 
+    def test_nested_parent_combos_cannot_crowd_out_boundary_queries(self) -> None:
+        """Two nested parent labels must not exhaust the query budget.
+
+        A unit inside ``Y 4k 银魂/银魂 剧场版 The Final/`` has two parent
+        labels whose combined variants alone exceed the six-query budget.
+        The unit's own boundary label and its cleaned variant must be
+        dispatched ahead of those combinations — a combination is auxiliary
+        evidence, the boundary label is primary.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Gintama ~The Final~": [
+                    {
+                        "id": 732203,
+                        "title": "銀魂 THE FINAL",
+                        "release_date": "2021-01-08",
+                        "genre_ids": [28],
+                    },
+                ],
+            },
+            alternative_titles={
+                "732203": [
+                    {"iso_3166_1": "US", "title": "Gintama: The Very Final", "type": ""},
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-final-nested",
+            boundary_label=(
+                "[Ygm] Gintama ~The Final~ [Ma10p_2160p][x265_flac_DTS5.1_ass]"
+            ),
+            parent_labels=("Y 4k 银魂", "银魂 剧场版 The Final"),
+            representative_names=(
+                "[Ygm] Gintama ~The Final~ [Ma10p_2160p][x265_flac_DTS5.1_ass]",
+            ),
+            normalized_titles=("Gintama ~The Final~",),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 732203)
+        self.assertEqual(best.status, "confirmed")
+
     def test_cleaned_latin_query_without_title_substance_stays_undispatched(self) -> None:
         """A cleaner that collapses the label to noise must not waste budget.
 
