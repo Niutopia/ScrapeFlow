@@ -945,6 +945,93 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             dispatched.index("Y 4k 元气少女缘结神"),
         )
 
+    def test_bonus_directory_unit_matches_via_parent_label(self) -> None:
+        """A pure bonus-directory boundary is layout, like a bare season leaf.
+
+        ``NCOP&ED`` is a dedicated bonus-directory name shared by B/W, D and
+        F: every video inside is withheld non-story content, so the label can
+        never match TMDB.  The unit must resolve through the user-owned
+        parent container instead, and the bonus label itself must never be
+        dispatched as a standalone query.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "夏目友人帐": [
+                    {
+                        "id": 69500,
+                        "name": "夏目友人帐",
+                        "first_air_date": "2008-07-07",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-natsume-ncop",
+            boundary_label="NCOP&ED",
+            parent_labels=("夏目友人帐",),
+            representative_names=("NCOP&ED",),
+            normalized_titles=("NCOP&ED",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, prefer_animation=True,
+        )
+        self.assertEqual(best.tmdb_id, 69500)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/tv")
+        ]
+        self.assertIn("夏目友人帐", dispatched)
+        self.assertNotIn("NCOP&ED", dispatched)
+
+    def test_bonus_directory_without_parent_evidence_is_rejected(self) -> None:
+        """A bonus label alone is not title evidence for the guard either.
+
+        ``Extras`` passes the release-title usability check, so before the
+        shared vocabulary was respected it satisfied the structural-boundary
+        guard and could be dispatched as a standalone query — TMDB has real
+        works merely titled ``Extras``.  A unit whose every clue is a bonus
+        directory name must park with the missing-evidence error instead.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Extras": [
+                    {
+                        "id": 12345,
+                        "name": "Extras",
+                        "first_air_date": "2005-07-21",
+                        "genre_ids": [35],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-extras-only",
+            boundary_label="Extras",
+            parent_labels=(),
+            representative_names=("Extras",),
+            normalized_titles=("Extras",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        with self.assertRaises(PlanError) as ctx:
+            auto_match_from_evidence(client, evidence)
+        self.assertIn("缺少父容器或代表媒体标题证据", str(ctx.exception))
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/")
+        ]
+        self.assertNotIn("Extras", dispatched)
+
     def test_disambiguates_same_title_by_year(self) -> None:
         # Two TMDB results with exact same title but different years
         client = FakeTMDBClient(

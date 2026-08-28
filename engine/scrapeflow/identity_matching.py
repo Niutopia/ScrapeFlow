@@ -76,12 +76,27 @@ def _is_generic_season_identity_label(value: object) -> bool:
     )
 
 
+def _is_bonus_directory_identity_label(value: object) -> bool:
+    """Whether a boundary label is exactly a dedicated bonus-directory name.
+
+    The vocabulary is the one B/W, D, and F already share
+    (``NCOP&ED``, ``特典映像``, ``Extras``, …): a directory named exactly that
+    holds withheld non-story content, so the label is source layout with no
+    title substance of its own.
+    """
+    from .residual_policy import BONUS_DIRECTORY_SEGMENT_RE
+
+    text = str(value or "").strip()
+    return bool(text) and bool(BONUS_DIRECTORY_SEGMENT_RE.fullmatch(text))
+
+
 def _is_non_structural_identity_evidence(value: object) -> bool:
     """Whether a C/U label contains a usable work-title clue, not a coordinate."""
     query = _REPRESENTATIVE_MEDIA_SUFFIX_RE.sub("", str(value or "")).strip()
     return bool(
         query
         and not _is_generic_season_identity_label(query)
+        and not _is_bonus_directory_identity_label(query)
         and not _COORDINATE_ONLY_IDENTITY_LABEL_RE.fullmatch(query)
         and _usable_release_title_query(query)
     )
@@ -2141,7 +2156,14 @@ def auto_match_from_evidence(
         evidence.naked_numeric_cjk_release_eligible
     )
     generic_season_boundary = _is_generic_season_identity_label(boundary_label)
-    if generic_season_boundary and not any(
+    # A boundary whose label is exactly a bonus-directory name (``NCOP&ED``,
+    # ``特典映像``, ``Extras``) is source layout, not a work title: every video
+    # inside it is withheld non-story content, so the label itself can never
+    # match TMDB.  The same structural treatment as a bare season leaf
+    # applies — the user-owned parent container carries the identity.
+    bonus_directory_boundary = _is_bonus_directory_identity_label(boundary_label)
+    structural_boundary = generic_season_boundary or bonus_directory_boundary
+    if structural_boundary and not any(
         _is_non_structural_identity_evidence(value)
         for value in (
             *evidence.parent_labels,
@@ -2150,7 +2172,7 @@ def auto_match_from_evidence(
             *evidence.aliases,
         )
     ):
-        raise PlanError("纯季目录缺少父容器或代表媒体标题证据")
+        raise PlanError("纯季目录或特典目录缺少父容器或代表媒体标题证据")
     # A complete numbered physical OVA/OAV/OAD run is released as part of a
     # parent show, and its own arc label frequently matches no TV search at
     # all (an arc query can return only the split movie halves of the same
@@ -2187,10 +2209,10 @@ def auto_match_from_evidence(
     ):
         candidate_queries.append(clean_boundary_query)
 
-    if generic_season_boundary:
-        # ``第一季``/``Season 02`` is only the source layout.  Give the
-        # user-owned container and a title-bearing media sample priority over
-        # that structural leaf, otherwise the six-query cap can make TMDB
+    if structural_boundary:
+        # ``第一季``/``Season 02``/``NCOP&ED`` is only the source layout.  Give
+        # the user-owned container and a title-bearing media sample priority
+        # over that structural leaf, otherwise the six-query cap can make TMDB
         # confidently select an unrelated show named "第二季".  These remain
         # normal TMDB search queries and ordinary scoring/ambiguity checks;
         # the parent never injects an identity.  Each parent contributes its
@@ -2215,11 +2237,12 @@ def auto_match_from_evidence(
                 candidate_queries.append(f"{p_variant} {boundary_label}")
                 candidate_queries.append(f"{p_variant}/{boundary_label}")
 
-    # A generic season label (``第一季``/``第二季``/``Season 02``) is source
-    # layout, not a work title.  It must never be dispatched as a standalone
-    # query: TMDB would otherwise confidently select an unrelated show whose
-    # title merely contains that label (``中国 第二季``).  Only the parent
-    # title and its combined variants identify the work.
+    # A generic season label (``第一季``/``第二季``/``Season 02``) or a pure
+    # bonus-directory name (``NCOP&ED``) is source layout, not a work title.
+    # It must never be dispatched as a standalone query: TMDB would otherwise
+    # confidently select an unrelated show whose title merely contains that
+    # label (``中国 第二季``).  Only the parent title and its combined
+    # variants identify the work.
     #
     # The unit's own boundary queries come BEFORE the parent combinations
     # below: two nested parent labels already produce six or more combined
@@ -2227,7 +2250,7 @@ def auto_match_from_evidence(
     # title-bearing boundary (``[Ygm] Gintama ~The Final~ [Ma10p]…``) with
     # no query of its own.  A combination is auxiliary evidence; the
     # boundary label is primary.
-    if not generic_season_boundary:
+    if not structural_boundary:
         candidate_queries.append(boundary_label)
     # A release-package boundary can be a decorated FILENAME in any script
     # (``[Ygm] Gintama ~The Final~ [Ma10p_2160p]…``).  The cleaned standalone
@@ -2239,7 +2262,7 @@ def auto_match_from_evidence(
     if (
         clean_boundary_query
         and clean_boundary_query != boundary_label
-        and not generic_season_boundary
+        and not structural_boundary
         and (
             clean_boundary_is_cjk
             or _usable_release_title_query(clean_boundary_query)
@@ -2297,6 +2320,8 @@ def auto_match_from_evidence(
         if not norm_q or norm_q in seen_q:
             continue
         if _is_generic_season_identity_label(norm_q):
+            continue
+        if _is_bonus_directory_identity_label(norm_q):
             continue
         seen_q.add(norm_q)
         search_queries.append(norm_q)
