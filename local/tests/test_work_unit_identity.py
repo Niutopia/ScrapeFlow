@@ -399,6 +399,141 @@ class TestIdentityEvidence(unittest.TestCase):
                 self.assertFalse(evidence.naked_numeric_cjk_release_eligible)
                 self.assertNotIn("01", evidence.representative_names)
 
+    def test_owned_season_directory_years_anchor_naked_numeric_fallback(self) -> None:
+        """A yearless boundary can be anchored by its own season folders.
+
+        The boundary label keeps only the title and a season span; each owned
+        season subdirectory carries its own year (``第一季（2020）全24集``).
+        Those years describe this unit's own packaging, so they are boundary
+        evidence, unlike a parent container year or a release-file date.
+        """
+        label = "05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P"
+        season_files: list[SourceFile] = []
+        for episode in range(1, 25):
+            season_files.append(
+                SourceFile(
+                    f"/待刮削/H 犬夜叉/{label}/第一季（2020）全24集/"
+                    f"1080P 内嵌简中字幕（风车字幕组）/（01-24）/{episode:02d}.mp4",
+                    f"{episode:02d}.mp4",
+                    1000,
+                    "video",
+                    "",
+                )
+            )
+        for episode in range(25, 49):
+            season_files.append(
+                SourceFile(
+                    f"/待刮削/H 犬夜叉/{label}/第二季（2021）全24集/"
+                    f"1080P 外挂简中字幕/（25-48）/{episode:02d}.mp4",
+                    f"{episode:02d}.mp4",
+                    1000,
+                    "video",
+                    "",
+                )
+            )
+
+        def video_node(name: str, depth: int, files: list[SourceFile]) -> SourceNode:
+            leaf = SourceNode(
+                path=f"/待刮削/H 犬夜叉/{label}/{name}/内层",
+                name="内层",
+                files=tuple(files),
+                children=(),
+                depth=depth + 1,
+            )
+            return SourceNode(
+                path=f"/待刮削/H 犬夜叉/{label}/{name}",
+                name=name,
+                files=(),
+                children=(leaf,),
+                depth=depth,
+            )
+
+        candidate = WorkCandidate(
+            work_unit_id="unit-owned-season-years",
+            boundary_key=f"/待刮削/H 犬夜叉/{label}",
+            source_paths=(f"/待刮削/H 犬夜叉/{label}",),
+            display_label=label,
+            proposed_media_context="tv",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.SINGLE_WORK,
+                confidence=0.75,
+                reasons=(),
+                competing_roles=(),
+            ),
+        )
+        node = SourceNode(
+            path=f"/待刮削/H 犬夜叉/{label}",
+            name=label,
+            files=(),
+            children=(
+                video_node("第一季（2020）全24集", 1, season_files[:24]),
+                video_node("第二季（2021）全24集", 1, season_files[24:]),
+            ),
+            depth=0,
+        )
+
+        evidence = extract_identity_evidence(candidate, node)
+
+        self.assertTrue(evidence.strict_naked_numeric_video_run)
+        self.assertTrue(evidence.naked_numeric_cjk_release_eligible)
+        self.assertEqual(evidence.naked_numeric_owned_season_years, (2020, 2021))
+        # The season years are packaging anchors, never work-year evidence:
+        # a continuation-season year must not poison ordinary year scoring.
+        self.assertNotIn(2021, evidence.years)
+
+    def test_yearless_naked_numeric_boundary_without_season_years_stays_ineligible(self) -> None:
+        """No year anywhere in the unit's own structure keeps the guard closed."""
+        label = "05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P"
+        candidate = WorkCandidate(
+            work_unit_id="unit-owned-season-years-absent",
+            boundary_key=f"/待刮削/{label}",
+            source_paths=(f"/待刮削/{label}",),
+            display_label=label,
+            proposed_media_context="tv",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.SINGLE_WORK,
+                confidence=0.75,
+                reasons=(),
+                competing_roles=(),
+            ),
+        )
+        leaf = SourceNode(
+            path=f"/待刮削/{label}/第一季/内层",
+            name="内层",
+            files=tuple(
+                SourceFile(
+                    f"/待刮削/{label}/第一季/内层/{episode:02d}.mp4",
+                    f"{episode:02d}.mp4",
+                    1000,
+                    "video",
+                    "",
+                )
+                for episode in range(1, 13)
+            ),
+            children=(),
+            depth=2,
+        )
+        season = SourceNode(
+            path=f"/待刮削/{label}/第一季",
+            name="第一季",
+            files=(),
+            children=(leaf,),
+            depth=1,
+        )
+        node = SourceNode(
+            path=f"/待刮削/{label}",
+            name=label,
+            files=(),
+            children=(season,),
+            depth=0,
+        )
+
+        evidence = extract_identity_evidence(candidate, node)
+
+        self.assertTrue(evidence.strict_naked_numeric_video_run)
+        self.assertFalse(evidence.naked_numeric_cjk_release_eligible)
+        self.assertEqual(evidence.naked_numeric_owned_season_years, ())
+
     def test_boundary_clean_query_keeps_raw_label_and_only_strips_release_tails(self) -> None:
         raw = "B 有意义中文剧名（2024）全12集 1080P"
         self.assertEqual(
@@ -1821,6 +1956,82 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             aliases=(),
             strict_naked_numeric_video_run=True,
             naked_numeric_cjk_release_eligible=True,
+        )
+
+        with self.assertRaises(AutoMatchAmbiguityError):
+            auto_match_from_evidence(client, evidence, prefer_animation=True)
+
+    def test_naked_numeric_owned_season_years_anchor_exact_year_gate(self) -> None:
+        """A yearless boundary is anchored by its own season-folder years.
+
+        ``05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P`` keeps its years on the
+        owned season directories (``第一季（2020）``/``第二季（2021）``), not on
+        the boundary label.  Those packaging years are boundary-anchored
+        evidence: an exact same-script title match whose year agrees with one
+        owned season year may confirm, while a conflicting year stays
+        rejected.
+        """
+        label = "05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P"
+        client = FakeTMDBClient(
+            search_results={
+                "半妖的夜叉姬": [{
+                    "id": 12060,
+                    "name": "半妖的夜叉姬",
+                    "first_air_date": "2020-10-03",
+                    "genre_ids": [16],
+                }],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-naked-numeric-owned-season-years",
+            boundary_label=label,
+            parent_labels=("H 犬夜叉",),
+            representative_names=(label, "01", "02", "03", "04", "05"),
+            normalized_titles=(label,),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+            strict_naked_numeric_video_run=True,
+            naked_numeric_cjk_release_eligible=True,
+            naked_numeric_owned_season_years=(2020, 2021),
+        )
+
+        best, _ = auto_match_from_evidence(client, evidence, prefer_animation=True)
+
+        self.assertEqual(best.tmdb_id, 12060)
+        self.assertEqual(best.status, "confirmed")
+        self.assertTrue(
+            best.decision_trace["naked_numeric_same_script_exact_title_or_alias"]
+        )
+        self.assertTrue(best.decision_trace["naked_numeric_exact_year"])
+
+    def test_naked_numeric_owned_season_years_reject_conflicting_year(self) -> None:
+        """The owned-season anchor is a real gate: a wrong year still rejects."""
+        label = "05 半妖的夜叉姬 1-2季 外挂+内嵌字幕 1080P"
+        client = FakeTMDBClient(
+            search_results={
+                "半妖的夜叉姬": [{
+                    "id": 12061,
+                    "name": "半妖的夜叉姬",
+                    "first_air_date": "2008-10-03",
+                    "genre_ids": [16],
+                }],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-naked-numeric-owned-season-years-conflict",
+            boundary_label=label,
+            parent_labels=("H 犬夜叉",),
+            representative_names=(label, "01", "02", "03", "04", "05"),
+            normalized_titles=(label,),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+            strict_naked_numeric_video_run=True,
+            naked_numeric_cjk_release_eligible=True,
+            naked_numeric_owned_season_years=(2020, 2021),
         )
 
         with self.assertRaises(AutoMatchAmbiguityError):

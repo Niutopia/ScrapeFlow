@@ -24,7 +24,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from engine.scrapeflow.boundary_analysis import WorkCandidate
+from engine.scrapeflow.boundary_analysis import (
+    WorkCandidate,
+    _season_number_from_directory_name,
+)
 from engine.scrapeflow.media_policy import DISC_IMAGE_INSPECTION_REQUIRED
 from engine.scrapeflow.source_inventory import (
     SourceFile,
@@ -279,6 +282,12 @@ class IdentityEvidence:
     # The only narrow release-label fallback: B/W called it TV-shaped and its
     # boundary is a meaningful CJK title carrying an explicit year.
     naked_numeric_cjk_release_eligible: bool = False
+    # Years observed on this unit's OWN season-labeled subdirectories
+    # (``第一季（2020）全24集``).  They anchor the naked-numeric year gate the
+    # same way a boundary-label year does, but they are packaging metadata,
+    # never ordinary work-year evidence: a continuation-season year must not
+    # poison the aggregate ``years`` used by ordinary scoring.
+    naked_numeric_owned_season_years: tuple[int, ...] = ()
     # Explicit physical special context observed in owned video names/paths.
     # These fields never assert a TMDB season.  ``special_episode_count`` is
     # populated only for a complete, unique, contiguous 1..N run where every
@@ -301,6 +310,9 @@ class IdentityEvidence:
             "aliases": list(self.aliases),
             "strict_naked_numeric_video_run": self.strict_naked_numeric_video_run,
             "naked_numeric_cjk_release_eligible": self.naked_numeric_cjk_release_eligible,
+            "naked_numeric_owned_season_years": list(
+                self.naked_numeric_owned_season_years
+            ),
             "special_markers": list(self.special_markers),
             "special_episode_numbers": list(self.special_episode_numbers),
             "special_episode_count": self.special_episode_count,
@@ -331,6 +343,11 @@ class IdentityEvidence:
             ),
             naked_numeric_cjk_release_eligible=bool(
                 raw.get("naked_numeric_cjk_release_eligible", False)
+            ),
+            naked_numeric_owned_season_years=tuple(
+                int(x)
+                for x in raw.get("naked_numeric_owned_season_years") or ()
+                if isinstance(x, int) and not isinstance(x, bool)
             ),
             special_markers=tuple(
                 str(x).upper() for x in raw.get("special_markers") or ()
@@ -645,6 +662,26 @@ def _select_representative_video_files(
     return selected
 
 
+def _owned_season_directory_years(node: SourceNode) -> tuple[int, ...]:
+    """Collect years from this unit's own season-labeled subdirectories.
+
+    A multi-season release frequently keeps its year evidence on the season
+    folders (``第一季（2020）全24集``) while the boundary label itself carries
+    only the title and a season span.  Only a direct child whose label asserts
+    an explicit season ordinal contributes: the year then describes one owned
+    season of this very unit, never a neighbouring container or a file date.
+    The years stay packaging anchors — they are deliberately NOT folded into
+    the aggregate ``years``, because a continuation-season year describes a
+    later air date, not the work's first-air year.
+    """
+    years: set[int] = set()
+    for child in node.children:
+        if _season_number_from_directory_name(child.name) is None:
+            continue
+        years.update(int(y) for y in _YEAR_RE.findall(child.name))
+    return tuple(sorted(years))
+
+
 def extract_identity_evidence(
     candidate: WorkCandidate,
     node: SourceNode | None = None,
@@ -674,11 +711,13 @@ def extract_identity_evidence(
     episode_pattern: EpisodePattern | None = None
     strict_naked_numeric_video_run = False
     naked_numeric_cjk_release_eligible = False
+    owned_season_years: tuple[int, ...] = ()
     special_markers: tuple[str, ...] = ()
     special_episode_numbers: tuple[int, ...] = ()
     special_episode_count: int | None = None
     special_numbered_run_complete = False
     if node is not None:
+        owned_season_years = _owned_season_directory_years(node)
         video_files = [f for f in collect_all_files(node) if f.object_type == "video"]
         if video_files:
             episode_pattern = extract_episode_pattern(video_files)
@@ -706,7 +745,10 @@ def extract_identity_evidence(
             naked_numeric_cjk_release_eligible = (
                 candidate.proposed_media_context == "tv"
                 and _meaningful_cjk_boundary_label(candidate.display_label)
-                and bool(_YEAR_RE.search(candidate.display_label))
+                and (
+                    bool(_YEAR_RE.search(candidate.display_label))
+                    or bool(owned_season_years)
+                )
                 and strict_naked_numeric_video_run
             )
             for f in _select_representative_video_files(video_files):
@@ -747,6 +789,7 @@ def extract_identity_evidence(
         aliases=tuple(sorted(set(aliases))),
         strict_naked_numeric_video_run=strict_naked_numeric_video_run,
         naked_numeric_cjk_release_eligible=naked_numeric_cjk_release_eligible,
+        naked_numeric_owned_season_years=owned_season_years,
         special_markers=special_markers,
         special_episode_numbers=special_episode_numbers,
         special_episode_count=special_episode_count,

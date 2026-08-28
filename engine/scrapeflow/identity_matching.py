@@ -2557,10 +2557,13 @@ def auto_match_from_evidence(
     # filename years for ordinary matching.  A bare numeric run is much more
     # fragile: its exact-year gate must be anchored to the work boundary
     # itself, never accidentally satisfied by a container or release-file
-    # date.
+    # date.  A year on the unit's OWN season-labeled subdirectory
+    # (``第一季（2020）全24集``) is equally boundary-owned packaging: the year
+    # describes one season of this very unit, so it anchors the same gate
+    # without entering the aggregate year collection.
     boundary_years = set(
         re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", evidence.boundary_label)
-    )
+    ) | set(str(y) for y in evidence.naked_numeric_owned_season_years)
     clean_boundary_key = (
         _normalize_match_title(clean_boundary_query)
         if clean_boundary_is_cjk
