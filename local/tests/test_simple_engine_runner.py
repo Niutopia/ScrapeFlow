@@ -47,6 +47,7 @@ from engine.scrapeflow.serialization import atomic_write_json
 from local.scrapeflow_api.simple_engine_runner import (
     AutomaticIdentity,
     EngineExecutionError,
+    EngineJob,
     EngineJobConflictError,
     EnginePauseRequested,
     EngineRequest,
@@ -55,6 +56,11 @@ from local.scrapeflow_api.simple_engine_runner import (
     SimpleEngineRunner,
     SimplePlanExecutor,
 )
+from local.scrapeflow_api.unit_execution import (
+    ContainerMetadataAttention,
+    ensure_container_artifacts,
+)
+from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 from engine.tools._replenishment_local_adapter_impl import (
     ReplenishmentCandidateError,
     _verify_video_payload,
@@ -594,6 +600,102 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         repaired = runner.repair_automatic_artifacts(carrier.id)
         self.assertEqual(repaired.phase, "executed")
         self.assertEqual(self.alist.moves, [])
+        self.assertEqual(self.alist.uploads, uploads_before)
+
+    @staticmethod
+    def _persist_unit_carrier(
+        runner: SimpleEngineRunner,
+        *,
+        job_id: str,
+        root_job_id: str,
+        target_root: str,
+        metadata: dict[str, object],
+    ) -> None:
+        job = EngineJob(
+            id=job_id,
+            phase="executed",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+            request={},
+            plan={"target_root": target_root, "metadata": metadata},
+            summary={"root_job_id": root_job_id, "internal_child": True},
+            target_shelf="anime",
+            target_root=target_root,
+            selected_at="2026-01-01T00:00:00Z",
+        )
+        atomic_write_json(
+            runner.jobs_root / f"{job_id}.json",
+            job.as_dict(),
+            allow_nan=False,
+        )
+
+    def test_container_pass_yields_to_a_written_work_at_the_container_path(self) -> None:
+        """A work carrier owning the container path preempts the marker pass.
+
+        A layout re-derivation can demote a root from the dominant-TV form to
+        the pure container form after a late sibling executes, while the
+        already written main unit keeps the container path as its own target
+        root.  The directory-only marker must not compete with that real
+        identity NFO, and a stale artifact carrier must not raise drift.
+        """
+        source = "/library/待刮削/Container"
+        self.alist.files[f"{source}/child.mkv"] = FAKE_VIDEO_BYTES
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=RecordingTMDB(),
+            library_root="/library",
+        )
+        root = runner.create_pending_job(source, job_id="engine-root-owned")
+        root = runner.start_automatic_job(root.id, target_shelf="anime")
+        stale = runner.plan_container_artifacts(
+            root_job_id=root.id,
+            source_path=source,
+            target_root="/library/番剧/Container",
+            target_shelf="anime",
+            container_title="Container",
+            poster_path="/old.jpg",
+            backdrop_path=None,
+            representative_tmdb_id=8,
+            job_id="container-artifacts-engine-root-owned",
+        )
+        runner.execute_job(stale.id)
+        # The main work's own executed carrier now owns the container path
+        # exactly; a late sibling demoted the root to the container form.
+        self._persist_unit_carrier(
+            runner,
+            job_id="unit-main-carrier",
+            root_job_id=root.id,
+            target_root="/library/番剧/Container",
+            metadata={"poster_path": "/main.jpg", "tmdb_id": 7},
+        )
+        save_work_unit_records(self.root, root.id, [
+            WorkUnitRecord(
+                work_unit_id="unit-a",
+                root_task_id=root.id,
+                boundary_key=f"{source}/A",
+                source_paths=(f"{source}/A",),
+                source_revision=1,
+                role="single_work",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 7, "title": "A"},
+                claimed_seasons=(1,),
+                writer_job_id="unit-main-carrier",
+            ),
+            WorkUnitRecord(
+                work_unit_id="unit-b",
+                root_task_id=root.id,
+                boundary_key=f"{source}/B",
+                source_paths=(f"{source}/B",),
+                source_revision=1,
+                role="single_work",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 9, "title": "B"},
+                claimed_seasons=(1,),
+            ),
+        ])
+        uploads_before = list(self.alist.uploads)
+        self.assertIsNone(ensure_container_artifacts(runner, self.root, root.id))
         self.assertEqual(self.alist.uploads, uploads_before)
 
     def test_public_request_cannot_nominate_internal_workunit_target_scope(self) -> None:

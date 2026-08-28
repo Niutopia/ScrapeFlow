@@ -1427,6 +1427,24 @@ def ensure_container_artifacts(
     )
     if container_parent is None or main_tmdb is not None:
         return None
+    # The pure-container path and a real work's own root can name the same
+    # directory when the intake basename equals that work's title (银魂): a
+    # layout re-derivation after a late sibling demoted the root from the
+    # dominant-TV form still keeps the already-written main unit at the
+    # container path.  A work-unit carrier targeting exactly the container
+    # root proves the directory already owns a real identity NFO and
+    # artwork; layering the directory-only marker on top would compete with
+    # that identity (and its later writes would collide with the marker).
+    for record in records:
+        if not record.writer_job_id:
+            continue
+        try:
+            carrier = runner.get_job(record.writer_job_id)
+        except Exception:
+            continue
+        raw_plan = carrier.plan if isinstance(carrier.plan, Mapping) else {}
+        if raw_plan.get("target_root") == container_parent:
+            return None
     inputs = _container_artifact_inputs(runner, records, container_parent)
     if inputs is None:
         # No accepted child means there is no safe image identity to borrow;
