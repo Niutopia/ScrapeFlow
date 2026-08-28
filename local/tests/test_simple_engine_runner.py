@@ -1513,6 +1513,114 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertTrue(all(item["action"] == "preserve_at_source" for item in residuals))
         self.assertTrue(all(item["reason"] == "no_write_source_residual" for item in residuals))
 
+    def test_sole_season_bare_run_merges_via_official_alternative_title(self) -> None:
+        """A romaji bare run merges through the official alias list.
+
+        A release titled only with an official alternative title (romaji
+        transliteration) matches neither the zh-CN ``name`` nor the ja-JP
+        ``original_name``.  Without the alias the bare run stays unknown,
+        the long season loses its base season group, and a reset-numbered
+        second release folder can no longer map onto the post-gap segment.
+        """
+
+        class AliasAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class AliasTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/211":
+                    return {
+                        "name": "北风物语",
+                        "original_name": "北風物語",
+                        "first_air_date": "2020-01-01",
+                        "seasons": [{"season_number": 1, "episode_count": 6}],
+                    }
+                if path == "/tv/211/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "name": f"第{number}话",
+                                "air_date": (
+                                    f"2020-01-{1 + 2 * number:02d}"
+                                    if number <= 3
+                                    else f"2021-01-{2 * number:02d}"
+                                ),
+                                "runtime": 24,
+                            }
+                            for number in range(1, 7)
+                        ],
+                    }
+                if path == "/tv/211/season/0":
+                    return {"episodes": []}
+                if path == "/tv/211/alternative_titles":
+                    return {"results": [{"title": "Kita Kaze Monogatari"}]}
+                if path.startswith("/search/"):
+                    return {"results": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/quark/影视/待刮削/KitaKaze"
+        source_files = [
+            *(
+                {
+                    "name": f"[Grp] Kita Kaze Monogatari [{number:02d}].mkv",
+                    "full_path": source_root
+                    + f"/[Grp] Kita Kaze Monogatari [{number:02d}].mkv",
+                    "size": FAKE_VIDEO_SIZE,
+                    "is_dir": False,
+                }
+                for number in (1, 2, 3)
+            ),
+            *(
+                {
+                    "name": f"[Grp] Kita Kaze Monogatari 2nd Season - {number:02d}.mkv",
+                    "full_path": source_root
+                    + f"/第二季/[Grp] Kita Kaze Monogatari 2nd Season - {number:02d}.mkv",
+                    "size": FAKE_VIDEO_SIZE,
+                    "is_dir": False,
+                }
+                for number in (1, 2, 3)
+            ),
+        ]
+        plan = build_tv_plan_smart(
+            auto_episode_mode=True,
+            alist=AliasAList(),
+            tmdb_client=AliasTMDB(),
+            src_path=source_root,
+            parent_path="/quark/影视/番剧",
+            tmdb_id=211,
+            season=1,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            ignore_orphan_temp=False,
+            source_files=source_files,
+            source_declared_seasons=(1, 2),
+            media_root="/quark/影视",
+        )
+        self.assertEqual(
+            sorted(item.episode_key for item in plan.files),
+            ["E01", "E02", "E03", "E04", "E05", "E06"],
+        )
+        season_two_sources = {
+            item.source_path
+            for item in plan.files
+            if "/第二季/" in item.source_path
+        }
+        self.assertEqual(len(season_two_sources), 3)
+        self.assertTrue(
+            all(
+                item.episode_key in {"E04", "E05", "E06"}
+                for item in plan.files
+                if "/第二季/" in item.source_path
+            )
+        )
+
     def test_residual_policy_retains_user_attachments_and_allows_only_os_litter(self) -> None:
         cases = {
             "/incoming/movie/guide.pdf": "document_or_comic",

@@ -1252,6 +1252,21 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 for field in ("name", "original_name")
             }
             show_title_keys.discard("")
+            # A romaji release title (``Sousou no Frieren``) often matches
+            # neither the zh-CN ``name`` nor the ja-JP ``original_name`` but
+            # only the official alternative-title list.  Without those aliases
+            # the whole bare run stays unknown and the long-season merge
+            # machinery below loses its base season group.
+            try:
+                show_title_keys.update(
+                    _normalize_match_title(alias)
+                    for alias in _alternative_tmdb_titles(
+                        kwargs["tmdb_client"], "tv", int(tmdb_id)
+                    )
+                )
+            except (ApiError, KeyError, TypeError, ValueError):
+                pass
+            show_title_keys.discard("")
             proven_bare_items: list[dict[str, Any]] = []
             remaining_unknown: list[dict[str, Any]] = []
             for item in unknown_media:
