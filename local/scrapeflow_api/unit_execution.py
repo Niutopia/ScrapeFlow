@@ -960,6 +960,21 @@ def _is_physical_special_record(record: WorkUnitRecord) -> bool:
         if isinstance(season, int) and not isinstance(season, bool) and season > 0
     ) >= 2:
         return False
+    # A D-proved single positive season carries the same structural weight as
+    # a claimed season: a split-season release (``某科学的超电磁炮`` S /
+    # ``某科学的超电磁炮 T`` directories, each with a complete proved
+    # bracketed run of one official season) is a regular season of the parent
+    # work, not an auxiliary release.  Demoting every part would leave no
+    # main-TV candidate and chain the seasons under each other's work roots.
+    # (Read the proof directly: the proved-seasons helper gates on
+    # main-TV eligibility, which itself asks this very question.)
+    proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
+    if (
+        proof is not None
+        and proof.tmdb_id == identity.get("tmdb_id")
+        and proof.season > 0
+    ):
+        return False
     trace = identity.get("decision_trace")
     if isinstance(trace, Mapping):
         for key in ("physical_special_markers", "official_special_marker_hits"):
@@ -3513,7 +3528,7 @@ def execute_new_work_units(
                         )
                     if (
                         str(identity.get("media_type") or "") == "tv"
-                        and isinstance(identity.get("tmdb_id"), int)
+                                                and isinstance(identity.get("tmdb_id"), int)
                         and not isinstance(identity.get("tmdb_id"), bool)
                     ):
                         executed_tv_roots[int(identity["tmdb_id"])] = str(
@@ -3568,7 +3583,7 @@ def execute_new_work_units(
                     )
                 if (
                     str(identity.get("media_type") or "") == "tv"
-                    and isinstance(identity.get("tmdb_id"), int)
+                                        and isinstance(identity.get("tmdb_id"), int)
                     and not isinstance(identity.get("tmdb_id"), bool)
                 ):
                     executed_tv_roots[int(identity["tmdb_id"])] = str(
@@ -3654,7 +3669,7 @@ def execute_new_work_units(
                 )
             if (
                 str(identity.get("media_type") or "") == "tv"
-                and isinstance(identity.get("tmdb_id"), int)
+                                and isinstance(identity.get("tmdb_id"), int)
                 and not isinstance(identity.get("tmdb_id"), bool)
             ):
                 executed_tv_roots[int(identity["tmdb_id"])] = str(

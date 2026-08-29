@@ -20,7 +20,10 @@ from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import apply_work_unit_override
 from engine.scrapeflow.work_units import load_work_unit_records, save_work_unit_records
 
-from local.scrapeflow_api.library_index import reconcile_root_work_units
+from local.scrapeflow_api.library_index import (
+    SingleSeasonEpisodeProof,
+    reconcile_root_work_units,
+)
 from local.scrapeflow_api.simple_engine_runner import EngineJob, SimpleEngineRunner
 from local.scrapeflow_api.unit_execution import (
     _clean_container_name,
@@ -31,7 +34,7 @@ from local.scrapeflow_api.unit_execution import (
     load_work_acceptance,
 )
 
-from local.tests.test_library_index import IndexAList
+from local.tests.test_library_index import IndexAList, StrictBareEpisodeTMDB
 from local.tests.test_simple_engine_runner import (
     FAKE_VIDEO_BYTES,
     FAKE_VIDEO_SIZE,
@@ -68,7 +71,7 @@ def _recording_planner(events: list[dict[str, Any]]):
 
 
 class ContainerNestingTests(unittest.TestCase):
-    def _setup(self, files: dict[str, bytes]):
+    def _setup(self, files: dict[str, bytes], tmdb: object | None = None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         state_root = Path(temp.name)
@@ -86,7 +89,7 @@ class ContainerNestingTests(unittest.TestCase):
         runner = SimpleEngineRunner(
             state_root,
             alist=alist,
-            tmdb=object(),
+            tmdb=tmdb if tmdb is not None else object(),
             planner=_recording_planner(events),
             validate=False,
             library_root="/library",
@@ -584,6 +587,103 @@ class ContainerNestingTests(unittest.TestCase):
         self.assertNotIn(
             "示例剧 爆焰",
             str(layout[main.work_unit_id]["target_root"]),
+        )
+
+    def test_proved_split_season_parts_stay_main_tv_despite_special_markers(self) -> None:
+        """D-proved split-season parts are regular seasons, not auxiliaries.
+
+        A split-season release ships one directory per official season of the
+        same TMDB identity, and those directories may still bundle OVA files
+        (``physical_special_markers``).  When every part carries a durable
+        single-season episode proof, the parts must stay main-TV candidates
+        that collectively own the shelf-root family: demoting the marked parts
+        would leave no main-TV candidate at all and chain each season under
+        the previous sibling's work root instead of one shared show dir.
+        """
+        source = "/incoming/某科学的超电磁炮"
+        files = {
+            f"{source}/某科学的超电磁炮/[Group] Railgun [01].mkv": FAKE_VIDEO_BYTES,
+        }
+        for season, leaf in ((2, "某科学的超电磁炮 S"), (3, "某科学的超电磁炮 T")):
+            for episode in range(1, season + 1):
+                files[f"{source}/{leaf}/[Group] Railgun [{episode:02d}].mkv"] = (
+                    FAKE_VIDEO_BYTES
+                )
+        tmdb = StrictBareEpisodeTMDB(30977, {1: 1, 2: 2, 3: 3})
+        state_root, alist, runner, events = self._setup(files, tmdb=tmdb)
+        root_id = self._root(runner, source)
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(records), 3)
+
+        season_by_leaf = {
+            "某科学的超电磁炮": 1,
+            "某科学的超电磁炮 S": 2,
+            "某科学的超电磁炮 T": 3,
+        }
+
+        def proof_for(season: int) -> dict[str, object]:
+            return SingleSeasonEpisodeProof(
+                tmdb_id=30977,
+                season=season,
+                episode_count=season,
+                episode_tokens=tuple(
+                    f"S{season:02d}E{episode:02d}"
+                    for episode in range(1, season + 1)
+                ),
+                evidence_kind="tmdb_single_positive_season_bracketed_episodes",
+            ).as_dict()
+
+        current = []
+        for record in records:
+            leaf = record.source_paths[0].rstrip("/").rsplit("/", 1)[-1]
+            markers = ["OVA"] if leaf in {"某科学的超电磁炮 S", "某科学的超电磁炮 T"} else []
+            current.append(replace(
+                record,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 30977,
+                    "title": "某科学的超电磁炮",
+                    "decision_trace": {
+                        "physical_special_markers": markers,
+                        "official_titles": ["某科学的超电磁炮"],
+                    },
+                },
+                reconciliation_outcome="new_work",
+                reconciliation_evidence=proof_for(season_by_leaf[leaf]),
+            ))
+        save_work_unit_records(state_root, root_id, current)
+
+        # The D proof defeats the physical-special demotion for every part…
+        for record in current:
+            self.assertFalse(_is_physical_special_record(record))
+        # …while a marker-bearing record without the proof stays demotable.
+        self.assertTrue(
+            _is_physical_special_record(
+                replace(current[1], reconciliation_evidence=None)
+            )
+        )
+
+        _ordered, container_parent, main_tmdb = _container_plan(
+            runner, runner.get_job(root_id), current,
+        )
+        layout = _container_layout_targets(runner, runner.get_job(root_id), current)
+        self.assertEqual(main_tmdb, 30977)
+        self.assertIsNone(container_parent)
+        for record in current:
+            self.assertEqual(layout[record.work_unit_id]["relation"], "main_tv")
+            self.assertEqual(
+                layout[record.work_unit_id]["parent_path"], "/library/番剧",
+            )
+
+        execute_new_work_units(runner, state_root, root_id)
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(
+            {event["parent_path"] for event in events}, {"/library/番剧"},
         )
 
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
