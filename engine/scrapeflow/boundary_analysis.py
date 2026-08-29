@@ -879,6 +879,23 @@ def _split_flat_movie_files(
     return candidates
 
 
+def _plain_film_folder_title(label: str) -> bool:
+    """A plain film folder must still name its film once positions drop.
+
+    ``来自深渊 启程之拂晓`` is a concrete subtitle (any release position
+    around it is stripped before the substantiality check); ``剧场版 01`` is
+    only a theatrical-form marker plus a bare position, which could as easily
+    be one part of a bundled work, so it delegates to the marker-aware rule
+    and stays unproven when no concrete title remains.
+    """
+    text = str(label or "")
+    if _FEATURE_FILM_FORM_LABEL_RE.search(text):
+        return _feature_film_form_label_with_substantial_title(text)
+    stripped = re.sub(r"^[\s._\-]*0*\d{1,3}[\s._\-、]+", "", text)
+    stripped = re.sub(r"[\s._\-]+0*\d{1,3}[\s._\-]*$", "", stripped)
+    return _direct_movie_title_is_substantial(stripped)
+
+
 def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
     """Return one-video, independently dated feature children of a bundle.
 
@@ -888,9 +905,14 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
     work, and one WorkUnit cannot own several different works.  The split is
     proven only when the bundle holds no direct video and every video-bearing
     child is independently titled, dated (a release year on the folder or its
-    files) or explicitly theatrical-form labelled (``剧场版 排球少年
+    files), explicitly theatrical-form labelled (``剧场版 排球少年
     垃圾场决战`` — the bounded CJK marker plus a substantial title is its own
-    feature evidence where a year is absent), free of season/episode
+    feature evidence where a year is absent), or covered by the bundle's own
+    terminal film-collection role label (``来自深渊 剧场版合集`` — the
+    normalized name ends with a generic collection label, so a plain
+    substantial per-film title needs no year or marker of its own; a label
+    buried in release noise mid-name is decoration, never a role, and a
+    marker-plus-bare-position folder still fails), free of season/episode
     coordinates, and carries exactly one feature-sized video whose filename
     holds a substantial standalone title.  Anything else fails closed to the
     historical whole-child boundary.
@@ -902,6 +924,11 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
     ]
     if len(video_children) < 2:
         return ()
+    normalized_bundle_label = _normalized_role_label(node.name)
+    bundle_declares_film_collection = any(
+        normalized_bundle_label.endswith(label)
+        for label in _FILM_COLLECTION_GROUP_LABELS
+    )
     for child in video_children:
         if _season_number_from_directory_name(child.name) is not None:
             return ()
@@ -912,6 +939,10 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
         if not (
             _has_explicit_year_evidence(child)
             or _feature_film_form_label_with_substantial_title(child.name)
+            or (
+                bundle_declares_film_collection
+                and _plain_film_folder_title(child.name)
+            )
         ):
             return ()
         if _EPISODE_COUNTER_DIRECTORY_RE.search(child.name):
@@ -941,8 +972,8 @@ def _titled_child_split(
     nested_films = _nested_dated_feature_children(child)
     if nested_films:
         reason = (
-            f"目录 '{child.name}' 含 {len(nested_films)} 个独立标题、"
-            f"独立年份、单视频的电影子目录",
+            f"目录 '{child.name}' 含 {len(nested_films)} 个独立标题、单视频的"
+            f"电影子目录（年份/剧场版形态/合集标签证据成立）",
         )
         return [
             WorkCandidate(

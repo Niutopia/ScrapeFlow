@@ -1404,6 +1404,140 @@ class TestSyntheticCases(unittest.TestCase):
         ]
         self.assertEqual(len(bundle_units), 1, msg=[c.display_label for c in candidates])
 
+    def test_terminal_collection_label_bundle_splits_plain_film_dirs(self) -> None:
+        """``来自深渊 剧场版合集`` splits even when film dirs carry no marker.
+
+        A bundle whose normalized name ends with a generic film-collection
+        role label (``剧场版合集``) declares the one-folder-per-film form
+        itself.  The per-film titles are plain franchise subtitles with no
+        year and no theatrical marker of their own (``来自深渊 启程之拂晓``),
+        so the terminal bundle label substitutes for the per-child evidence
+        while every other movie-shape proof still applies.  Residual
+        NCOP/NCED-only season folders beside it stay whole-child units.
+        """
+        root = "/quark/影视/待刮削/L 4k 来自深渊"
+        def film_dir(label: str, movie: str) -> dict:
+            return {
+                "name": label,
+                "is_dir": True,
+                "children": [
+                    {"name": movie, "is_dir": False, "size": 8_000_000_000},
+                ],
+            }
+
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "来自深渊",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "[TUDO&Ygm] Made in Abyss [NCED01][Ma10p_2160p][x265_flac].mkv", "is_dir": False, "size": 162_337_851},
+                        {"name": "[TUDO&Ygm] Made in Abyss [NCOP01][Ma10p_2160p][x265_flac].mkv", "is_dir": False, "size": 228_342_112},
+                        {"name": "备份字幕", "is_dir": True, "children": []},
+                    ],
+                },
+                {
+                    "name": "来自深渊 剧场版合集",
+                    "is_dir": True,
+                    "children": [
+                        film_dir(
+                            "来自深渊 启程之拂晓",
+                            "[TUDO&Ygm] Made in Abyss Movie 1 Tabidachi no Yoake [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                        film_dir(
+                            "来自深渊 漂泊之黄昏",
+                            "[TUDO&Ygm] Made in Abyss Movie 2 Hourou Suru Tasogare [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                        film_dir(
+                            "来自深渊 深魂之黎明",
+                            "[TUDO&Ygm] Made in Abyss Movie 3 Fukaki Tamashii no Reimei [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                    ],
+                },
+                {
+                    "name": "来自深渊 烈日的黄金乡",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "[TUDO&Ygm] Made in Abyss Retsujitsu no Ougonkyou [NCED][Ma10p_2160p][x265_flac].mkv", "is_dir": False, "size": 235_288_798},
+                        {"name": "备份字幕", "is_dir": True, "children": []},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 5, msg=[c.display_label for c in candidates])
+        bundle_prefix = f"{root}/来自深渊 剧场版合集/"
+        movie_units = [
+            c for c in candidates
+            if all(path.startswith(bundle_prefix) for path in c.source_paths)
+        ]
+        self.assertEqual(
+            {c.display_label for c in movie_units},
+            {"来自深渊 启程之拂晓", "来自深渊 漂泊之黄昏", "来自深渊 深魂之黎明"},
+        )
+        self.assertTrue(all(c.proposed_media_context == "movie" for c in movie_units))
+        for unit in movie_units:
+            self.assertEqual(len(unit.source_paths), 1)
+        # The NCOP/NCED-only season folders remain whole-child boundaries and
+        # never absorb the film scopes.
+        self.assertEqual(
+            {
+                c.display_label for c in candidates
+                if not all(path.startswith(bundle_prefix) for path in c.source_paths)
+            },
+            {"来自深渊", "来自深渊 烈日的黄金乡"},
+        )
+
+    def test_non_terminal_collection_word_bundle_stays_whole_child(self) -> None:
+        """A collection word that is not a terminal role label is decoration.
+
+        ``来自深渊 蓝光合集`` ends with ``合集``, which is not one of the
+        generic film-collection role labels, and ``蓝光`` mid-name is release
+        noise rather than a collection declaration.  Plain undated film dirs
+        inside it stay one whole-child boundary, exactly like the mid-name
+        ``02 剧场版 日英双语 …`` bundle rule.
+        """
+        root = "/quark/影视/待刮削/L 4k 来自深渊"
+        def film_dir(label: str, movie: str) -> dict:
+            return {
+                "name": label,
+                "is_dir": True,
+                "children": [
+                    {"name": movie, "is_dir": False, "size": 8_000_000_000},
+                ],
+            }
+
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "来自深渊 蓝光合集",
+                    "is_dir": True,
+                    "children": [
+                        film_dir(
+                            "来自深渊 启程之拂晓",
+                            "[TUDO&Ygm] Made in Abyss Movie 1 Tabidachi no Yoake [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                        film_dir(
+                            "来自深渊 漂泊之黄昏",
+                            "[TUDO&Ygm] Made in Abyss Movie 2 Hourou Suru Tasogare [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                    ],
+                },
+                {
+                    "name": "来自深渊 烈日的黄金乡",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "[TUDO&Ygm] Made in Abyss Retsujitsu no Ougonkyou [NCED][Ma10p_2160p][x265_flac].mkv", "is_dir": False, "size": 235_288_798},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 2, msg=[c.display_label for c in candidates])
+        self.assertIn("来自深渊 蓝光合集", {c.display_label for c in candidates})
+
     def test_flat_marker_ordinal_feature_files_stay_one_special_run(self) -> None:
         """``OVA 01 - Title`` feature files are one special run, not films.
 
