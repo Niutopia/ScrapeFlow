@@ -212,14 +212,16 @@ class SingleSeasonEpisodeProof:
             return None
         tmdb_id = _positive_season(value.get("tmdb_id"))
         episode_count = _positive_season(value.get("episode_count"))
-        # Season 00 is a legal proof season, but only for the physical-special
-        # grammar: an unqualified ``E01`` run never proves Season 00 ownership.
+        # Season 00 is a legal proof season: the physical-special grammar
+        # proves marked OVA/OAD runs onto it, and the franchise-arc grammar
+        # proves a marker-less sub-work onto the parent's published arc
+        # window.  from_dict is only the receipt parser — which grammar may
+        # own Season 00 is decided by the live re-proof, not here.
         raw_season = value.get("season")
         if (
             isinstance(raw_season, int)
             and not isinstance(raw_season, bool)
             and raw_season == 0
-            and evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND
         ):
             season = 0
         else:
@@ -264,33 +266,52 @@ class SingleSeasonEpisodeProof:
                 for season_number, count in boundaries
                 for episode in range(1, count + 1)
             )
-        elif evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND:
-            # A named-arc Season 00 run proves the release ordinals map onto
-            # an official window that may start anywhere (``S00E08``/``E09``),
-            # so only the token grammar and count are checked here.  The
-            # persisted receipt is re-proved against the live catalog before
-            # F uses it, which is what actually pins the window.
-            expected = None
-        else:
-            expected = tuple(
-                f"S{season:02d}E{episode:02d}"
-                for episode in range(1, episode_count + 1)
-            )
-        if expected is not None and tokens != expected:
-            return None
-        if expected is None:
-            prefix = f"S{season:02d}E"
-            ordinals: set[int] = set()
-            for token in tokens:
-                suffix = token[len(prefix):]
-                if not token.startswith(prefix) or not suffix.isdigit():
-                    return None
-                ordinal = int(suffix)
-                if ordinal <= 0 or ordinal in ordinals:
-                    return None
-                ordinals.add(ordinal)
-            if len(ordinals) != episode_count:
+            if tokens != expected:
                 return None
+        else:
+            # The receipt carries one of three token shapes: a complete
+            # regular season ``S{season}E01…E{N}``; an overflow run whose
+            # tail lands in Season 00 (``S01E01…E23`` + ``S00E01``); or a
+            # Season 00 window that starts wherever the parent catalogued
+            # the arc (``S00E08``/``E09``, ``S00E02…E05``).  All are
+            # non-interleaved per-season blocks of consecutive ascending
+            # episodes, and only a Season 00 block may start past E01.
+            # The receipt is re-proved against the live source and catalog
+            # before F uses it, which is what actually pins the window.
+            block_seasons: list[int] = []
+            block_episodes: list[list[int]] = []
+            for token in tokens:
+                token_match = re.fullmatch(
+                    r"S0*(\d{1,3})E0*(\d{1,4})", token
+                )
+                if token_match is None:
+                    return None
+                token_season = int(token_match.group(1))
+                token_episode = int(token_match.group(2))
+                if token_season not in {season, 0} or token_episode <= 0:
+                    return None
+                if not block_seasons or block_seasons[-1] != token_season:
+                    if token_season in block_seasons:
+                        return None
+                    block_seasons.append(token_season)
+                    block_episodes.append([])
+                block_episodes[-1].append(token_episode)
+            if not block_seasons:
+                return None
+            if block_seasons != sorted(
+                block_seasons, key=lambda value: (value != season, value)
+            ):
+                return None
+            if len(tokens) != episode_count:
+                return None
+            for index, token_season in enumerate(block_seasons):
+                episodes = block_episodes[index]
+                if token_season != 0 and episodes[0] != 1:
+                    return None
+                if episodes != list(
+                    range(episodes[0], episodes[0] + len(episodes))
+                ):
+                    return None
         return cls(
             tmdb_id,
             season,

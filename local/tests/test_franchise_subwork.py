@@ -25,6 +25,7 @@ from engine.scrapeflow.work_units import load_work_unit_records
 
 from engine.scrapeflow.source_inventory import SourceFile
 from local.scrapeflow_api.library_index import (
+    SingleSeasonEpisodeProof,
     _franchise_arc_anchor_labels,
     _is_known_non_story_theme_video,
     _is_letter_variant_episode_video,
@@ -71,6 +72,65 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             _is_letter_variant_episode_video(
                 _video("/incoming/Show/[G] Show S02E04 [1080p].mkv")
             )
+        )
+
+
+class ProofReceiptShapeTests(unittest.TestCase):
+    """``SingleSeasonEpisodeProof`` receipts round-trip the proved shapes."""
+
+    def test_season00_arc_window_receipt_round_trips(self) -> None:
+        proof = SingleSeasonEpisodeProof(
+            tmdb_id=42509,
+            season=0,
+            episode_count=4,
+            episode_tokens=("S00E02", "S00E03", "S00E04", "S00E05"),
+            evidence_kind="tmdb_single_positive_season_bracketed_episodes",
+        )
+        restored = SingleSeasonEpisodeProof.from_dict(proof.as_dict())
+        self.assertEqual(restored, proof)
+
+    def test_overflow_receipt_round_trips(self) -> None:
+        proof = SingleSeasonEpisodeProof(
+            tmdb_id=78102,
+            season=1,
+            episode_count=24,
+            episode_tokens=(
+                *(f"S01E{episode:02d}" for episode in range(1, 24)),
+                "S00E01",
+            ),
+            evidence_kind="tmdb_single_positive_season_bracketed_episodes",
+        )
+        restored = SingleSeasonEpisodeProof.from_dict(proof.as_dict())
+        self.assertEqual(restored, proof)
+
+    def test_malformed_receipts_fail_closed(self) -> None:
+        base = {
+            "kind": "tmdb_single_positive_season_bracketed_episodes",
+            "tmdb_id": 42509,
+            "season": 1,
+            "episode_count": 3,
+        }
+        # Interleaved seasons are not one of the proved shapes.
+        self.assertIsNone(
+            SingleSeasonEpisodeProof.from_dict({
+                **base,
+                "episode_tokens": ["S01E01", "S00E01", "S01E02"],
+            })
+        )
+        # A regular block must start at E01.
+        self.assertIsNone(
+            SingleSeasonEpisodeProof.from_dict({
+                **base,
+                "episode_tokens": ["S01E02", "S01E03", "S01E04"],
+            })
+        )
+        # A non-consecutive Season 00 window is not a run.
+        self.assertIsNone(
+            SingleSeasonEpisodeProof.from_dict({
+                **base,
+                "season": 0,
+                "episode_tokens": ["S00E02", "S00E04", "S00E05"],
+            })
         )
 
 
