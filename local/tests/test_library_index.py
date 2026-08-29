@@ -585,6 +585,58 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIn("裸 E", record.attention or "")
 
+    def test_quoted_ordinal_disc_rip_run_gets_single_season_proof(self) -> None:
+        """``01「…」``…``26「…」`` disc rips prove their TMDB season.
+
+        Japanese disc rips lead with the episode ordinal and quote the episode
+        title (犬夜叉完结篇 26 files against a 167-episode first season).  The
+        run length identifies the second season uniquely; D must persist the
+        same revalidatable receipt the other unqualified grammars produce.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99060, {1: 167, 2: 26})
+            names = [
+                f"{episode:02d}「第{episode}話」.mkv" for episode in range(1, 27)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-quoted-ordinal-complete",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_quoted_ordinal",
+                    "tmdb_id": 99060,
+                    "season": 2,
+                    "episode_count": 26,
+                    "episode_tokens": [
+                        f"S02E{episode:02d}" for episode in range(1, 27)
+                    ],
+                },
+            )
+
+    def test_quoted_ordinal_run_mixed_with_bracket_ordinal_stays_uncertain(self) -> None:
+        """One bracket ordinal mixed into a quoted run is two grammars."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99061, {1: 26})
+            names = [
+                f"{episode:02d}「第{episode}話」.mkv"
+                for episode in range(1, 26)
+            ] + ["Example Show [26].mkv"]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-quoted-ordinal-mixed",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIn("混合了不同的无季号集号格式", record.attention or "")
+
     def test_complete_naked_numeric_source_gets_a_revalidatable_single_season_proof(self) -> None:
         """A clean ``01.mp4`` … ``N.mp4`` run is proven only by D/TMDB.
 

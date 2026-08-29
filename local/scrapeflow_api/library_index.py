@@ -48,6 +48,7 @@ from engine.scrapeflow.replenishment_matching import (
     bare_regular_episode_context_is_safe,
     bare_regular_episode_number,
     bracketed_regular_episode_number,
+    quoted_ordinal_regular_episode,
     release_dash_regular_episode,
     release_title_ordinal_regular_episode,
 )
@@ -104,6 +105,9 @@ _RELEASE_DASH_EPISODE_EVIDENCE_KIND = (
 _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND = (
     "tmdb_single_positive_season_title_ordinal_episodes"
 )
+_QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND = (
+    "tmdb_single_positive_season_quoted_ordinal"
+)
 _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND = (
     "tmdb_single_positive_season_physical_special"
 )
@@ -113,6 +117,7 @@ _SINGLE_SEASON_EPISODE_EVIDENCE_KINDS = frozenset({
     _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND,
     _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
     _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND,
+    _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND,
     _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
 })
 
@@ -127,6 +132,8 @@ def single_season_episode_evidence_label(evidence_kind: str) -> str:
         return "发行组短横线集号"
     if evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND:
         return "同标题裸序号集号"
+    if evidence_kind == _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND:
+        return "引号集名序号集号"
     if evidence_kind == _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND:
         return "完整 OAD/OVA/OAV 集号"
     return "裸 E"
@@ -1658,6 +1665,74 @@ def _contains_release_title_ordinal_episode(node: SourceNode | None) -> bool:
     )
 
 
+def _strict_quoted_ordinal_episode_number_for_file(file: SourceFile) -> int | None:
+    """Read one strict ``01「Title」`` release member."""
+    path = str(file.path or "").rstrip("/")
+    if not path or not bare_regular_episode_context_is_safe(path):
+        return None
+    return quoted_ordinal_regular_episode(posixpath.basename(path))
+
+
+def _strict_quoted_ordinal_episode_members(
+    node: SourceNode | None,
+) -> tuple[tuple[str, int], ...] | None:
+    """Return one homogeneous, contiguous ``01「Title」`` source run.
+
+    Japanese disc rips lead with the episode ordinal and quote the episode
+    title (``01「奈落の心臓」.mkv``).  Like the release-title-ordinal grammar
+    this excludes no video: a trailer, special, duplicate or foreign-format
+    filename invalidates the complete proof.
+    """
+    if node is None:
+        return None
+    videos = [
+        file for file in collect_all_files(node) if file.object_type == "video"
+    ]
+    if not videos:
+        return None
+    members: list[tuple[str, int]] = []
+    for file in videos:
+        number = _strict_quoted_ordinal_episode_number_for_file(file)
+        if number is None:
+            return None
+        members.append((str(file.path).rstrip("/"), int(number)))
+    numbers = [number for _path, number in members]
+    if len(set(numbers)) != len(numbers):
+        return None
+    ordered = tuple(sorted(numbers))
+    if ordered != tuple(range(1, len(numbers) + 1)):
+        return None
+    if len({path for path, _number in members}) != len(members):
+        return None
+    return tuple(sorted(members))
+
+
+def _strict_quoted_ordinal_episode_numbers(
+    node: SourceNode | None,
+) -> tuple[int, ...] | None:
+    members = _strict_quoted_ordinal_episode_members(node)
+    if members is None:
+        return None
+    return tuple(sorted(number for _path, number in members))
+
+
+def quoted_ordinal_episode_source_ordinals(
+    node: SourceNode | None,
+) -> dict[str, int] | None:
+    """Expose the exact D/F source-key proof for ``01「Title」`` runs."""
+    members = _strict_quoted_ordinal_episode_members(node)
+    return dict(members) if members is not None else None
+
+
+def _contains_quoted_ordinal_episode(node: SourceNode | None) -> bool:
+    if node is None:
+        return False
+    return any(
+        _strict_quoted_ordinal_episode_number_for_file(file) is not None
+        for file in _unqualified_episode_videos(node)
+    )
+
+
 _KNOWN_NON_STORY_THEME_MARKER_RE = re.compile(
     r"\[\s*(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]",
     re.IGNORECASE,
@@ -1891,6 +1966,8 @@ def _single_season_episode_numbers(
         return _strict_release_dash_episode_numbers(node)
     if evidence_kind == _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND:
         return _strict_release_title_ordinal_episode_numbers(node)
+    if evidence_kind == _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND:
+        return _strict_quoted_ordinal_episode_numbers(node)
     return None
 
 
@@ -3133,6 +3210,7 @@ def reconcile_root_work_units(
             has_release_title_ordinal_episode = _contains_release_title_ordinal_episode(
                 scoped_node
             )
+            has_quoted_ordinal_episode = _contains_quoted_ordinal_episode(scoped_node)
             if physical_special_proof is not None:
                 season_proof = physical_special_proof
                 unit_tokens = frozenset(season_proof.episode_tokens)
@@ -3147,6 +3225,7 @@ def reconcile_root_work_units(
                     or has_naked_numeric_episode
                     or has_release_dash_episode
                     or has_release_title_ordinal_episode
+                    or has_quoted_ordinal_episode
                 )
             ):
                 # A mixed root (bare E01 beside [02], S01E03/SP/unknown
@@ -3163,6 +3242,7 @@ def reconcile_root_work_units(
                         has_naked_numeric_episode,
                         has_release_dash_episode,
                         has_release_title_ordinal_episode,
+                        has_quoted_ordinal_episode,
                     )
                 )
                 if grammar_count != 1:
@@ -3182,6 +3262,8 @@ def reconcile_root_work_units(
                         evidence_kind = _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND
                     elif has_release_title_ordinal_episode:
                         evidence_kind = _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND
+                    elif has_quoted_ordinal_episode:
+                        evidence_kind = _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND
                     else:
                         evidence_kind = _RELEASE_DASH_EPISODE_EVIDENCE_KIND
                     season_proof = prove_single_season_episode_evidence(

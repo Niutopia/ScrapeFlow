@@ -13,6 +13,7 @@ from engine.scrapeflow.replenishment_matching import (
     episode_ranges,
     expanded_episode_ids,
     fractional_episode_tokens,
+    quoted_ordinal_regular_episode,
     release_dash_regular_episode,
     season_markers,
 )
@@ -210,6 +211,43 @@ class EpisodeMatchingConvergenceTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertIsNone(release_dash_regular_episode(value))
+
+    def test_quoted_ordinal_is_a_df_primitive_not_generic_coverage(self) -> None:
+        """``01「奈落の心臓」`` is a D/F proof primitive, not generic coverage.
+
+        Japanese disc rips lead with the episode ordinal and quote the episode
+        title in CJK brackets.  The D/F single-season proof may use the leading
+        ordinal only when it opens the name; a sequel digit inside a title
+        (``White Album 2「新章」``) must not manufacture a season coordinate.
+        """
+        self.assertEqual(
+            quoted_ordinal_regular_episode("01「奈落の心臓」.mkv"), 1
+        )
+        self.assertEqual(
+            quoted_ordinal_regular_episode("26「明日へ(最終話)」.mkv"), 26
+        )
+        self.assertEqual(
+            quoted_ordinal_regular_episode("/incoming/Show/26 『最終回』.mkv"), 26
+        )
+        self.assertEqual(
+            quoted_ordinal_regular_episode("15「正统なる継承者」.ass"), 15
+        )
+        for value in (
+            "White Album 2「新章」.mkv",
+            "Example 01「新章」.mkv",
+            "S01E01「新章」.mkv",
+            "E01「新章」.mkv",
+            "01.5「新章」.mkv",
+            "01「新章」E02.mkv",
+            "01「新章」[02].mkv",
+            "01「新章」 02「新章」.mkv",
+            "OVA 01「新章」.mkv",
+            "01「新章」[OVA].mkv",
+            "01-02「新章」.mkv",
+            "/incoming/OVA/01「新章」.mkv",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(quoted_ordinal_regular_episode(value))
 
     def test_resolution_suffix_does_not_turn_an_integer_episode_into_a_fraction(self) -> None:
         self.assert_converged_integer_coordinate(

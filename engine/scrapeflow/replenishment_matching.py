@@ -618,6 +618,78 @@ def release_title_ordinal_regular_episode(value: Any) -> tuple[str, int] | None:
     return (prefix, number) if 0 < number <= 999 else None
 
 
+# A Japanese disc rip leads with the episode ordinal and quotes the episode
+# title in CJK brackets (``01「奈落の心臓」.mkv``).  The quote opening right
+# after the digits is the release's ordinal separator, which the bare-E,
+# bracket and title-ordinal grammars cannot see.  Only a leading ordinal
+# counts; the digits must sit at the very start of the stem.
+_QUOTED_ORDINAL_HEAD_RE = re.compile(r"^0*(?P<episode>[1-9]\d{0,2})\s*[「『《]")
+_QUOTED_ORDINAL_CLOSERS = {"「": "」", "『": "』", "《": "》"}
+# After the closing quote only bracketed/parenthesized release tags may
+# follow; a bare trailing token (``E02``, a second quoted title, loose text)
+# is competing coordinate evidence and fails closed.
+_QUOTED_ORDINAL_TAIL_RE = re.compile(
+    r"^(?:\s*(?:\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）))*\s*$"
+)
+
+
+def quoted_ordinal_regular_episode(value: Any) -> int | None:
+    """Return the ordinal of one strict ``01「Title」`` disc-rip member.
+
+    This is a D/F-only primitive mirroring the Engine parser's leading
+    quoted-ordinal rule: the digits must open the stem and be immediately
+    followed (ignoring whitespace) by a CJK quote, and the quote must close
+    before any bracketed release tags.  Special labels, explicit
+    season/episode forms, ranges, fractional values, a competing bracket
+    ordinal and a second quoted segment all stay outside this grammar.
+    """
+    text = str(value or "")
+    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+        return None
+    if _RELEASE_DASH_COMPACT_SPECIAL_RE.search(text):
+        return None
+    if episode_ranges(text) or season_markers(text):
+        return None
+    name = re.split(r"[/\\]", text.rstrip("/"))[-1]
+    stem, dot, _suffix = name.rpartition(".")
+    if not dot:
+        stem = name
+    stem = stem.strip()
+    if not stem:
+        return None
+    if FRACTIONAL_EPISODE_RE.search(stem):
+        return None
+    match = _QUOTED_ORDINAL_HEAD_RE.match(stem)
+    if match is None:
+        return None
+    rest = stem[match.end():]
+    opener = stem[match.end() - 1]
+    closer = _QUOTED_ORDINAL_CLOSERS[opener]
+    close_index = rest.find(closer)
+    if close_index < 0:
+        # An unterminated quote is not a title; the stem is a different shape.
+        return None
+    tail = rest[close_index + 1:]
+    if not _QUOTED_ORDINAL_TAIL_RE.match(tail):
+        return None
+    for group in re.findall(
+        r"\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）", tail,
+    ):
+        inner = unicodedata.normalize("NFKC", group[1:-1]).strip()
+        if _RELEASE_TITLE_ORDINAL_PURE_NUMBER_TAG_RE.fullmatch(inner):
+            return None
+        if re.search(r"(?<![A-Za-z0-9])E(?:P)?\s*0*[1-9]\d{0,3}", inner, re.IGNORECASE):
+            return None
+        if re.search(
+            r"(?<![A-Za-z0-9])(?:CM|OP(?:ED)?|ED|MENU|OVA|OAV|OAD|MV|PV|TRAILER|TEASER|PROMO)(?:\s*0*\d{0,3})?(?![A-Za-z0-9])",
+            inner,
+            re.IGNORECASE,
+        ):
+            return None
+    number = int(match.group("episode"))
+    return number if 0 < number <= 999 else None
+
+
 def bare_regular_episode_context_is_safe(value: Any) -> bool:
     """Return whether path context can safely accompany a bare ``E##``.
 

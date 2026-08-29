@@ -67,11 +67,13 @@ from .library_index import (
     SingleSeasonEpisodeProof,
     _BRACKETED_EPISODE_EVIDENCE_KIND,
     _PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+    _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND,
     _RELEASE_DASH_EPISODE_EVIDENCE_KIND,
     _RELEASE_TITLE_ORDINAL_EPISODE_EVIDENCE_KIND,
     bracketed_episode_source_ordinals,
     prove_physical_special_single_season_evidence,
     prove_single_season_episode_evidence,
+    quoted_ordinal_episode_source_ordinals,
     release_dash_episode_source_ordinals,
     release_title_ordinal_episode_source_ordinals,
     single_season_episode_evidence_label,
@@ -2128,6 +2130,55 @@ def _release_title_ordinal_episode_map_path(
     return str(path)
 
 
+def _quoted_ordinal_episode_map_path(
+    state_root: Path,
+    root_task_id: str,
+    record: WorkUnitRecord,
+    proof: SingleSeasonEpisodeProof | None,
+) -> str | None:
+    """Build the F-only ``01「Title」`` source-key map after D revalidation.
+
+    A Japanese disc-rip run quotes the episode title right after the leading
+    ordinal.  The Engine parser already reads that ordinal natively (the
+    leading quoted-ordinal rule), so F needs no parser gate — only the explicit
+    episode map that pins each proved source ordinal to its official season
+    coordinate, keeping a movie-keyword or title-digit detour from hijacking
+    the run.
+    """
+    if proof is None or proof.evidence_kind != _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND:
+        return None
+    snapshot = load_source_snapshot(state_root, root_task_id)
+    if snapshot is None:
+        return None
+    try:
+        scoped = build_scoped_source_node(
+            build_source_inventory(snapshot["rows"], snapshot["root"]),
+            record.source_paths,
+            boundary_key=record.boundary_key,
+            display_label=record.display_label,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    source_ordinals = quoted_ordinal_episode_source_ordinals(scoped)
+    if source_ordinals is None:
+        return None
+    numbers = tuple(sorted(source_ordinals.values()))
+    expected = tuple(range(1, proof.episode_count + 1))
+    if numbers != expected or tuple(proof.episode_tokens) != tuple(
+        f"S{proof.season:02d}E{number:02d}" for number in expected
+    ):
+        return None
+    mapping = {
+        str(number): f"S{proof.season:02d}E{number:02d}"
+        for number in numbers
+    }
+    if len(mapping) != proof.episode_count:
+        return None
+    path = state_root / f"episode_map_{record.work_unit_id}.json"
+    atomic_write_json(path, mapping, allow_nan=False)
+    return str(path)
+
+
 def _revalidated_reconciliation_season(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -2463,6 +2514,10 @@ def _request_for_unit(
         proof is not None
         and proof.evidence_kind == _BRACKETED_EPISODE_EVIDENCE_KIND
     )
+    is_quoted_ordinal_proof = (
+        proof is not None
+        and proof.evidence_kind == _QUOTED_ORDINAL_EPISODE_EVIDENCE_KIND
+    )
     if proof_season is not None:
         if (
             isinstance(season, int)
@@ -2550,6 +2605,7 @@ def _request_for_unit(
         or is_release_dash_proof
         or is_release_title_ordinal_proof
         or is_bracketed_proof
+        or is_quoted_ordinal_proof
     ):
         fresh_scopes, manifest = _fresh_scoped_source_files(
             runner,
@@ -2561,6 +2617,7 @@ def _request_for_unit(
                 is_release_dash_proof
                 or is_release_title_ordinal_proof
                 or is_bracketed_proof
+                or is_quoted_ordinal_proof
             ),
         )
     if fresh_scopes is not None and manifest is not None:
@@ -2608,6 +2665,16 @@ def _request_for_unit(
         if proof_season is None or map_path is None:
             raise ValueError(
                 "D 纯方括号集号证据无法重建 F 显式映射；"
+                "请保持暂停并重建边界/对账"
+            )
+    if map_path is None:
+        map_path = _quoted_ordinal_episode_map_path(
+            state_root, root_task_id, record, proof,
+        )
+    if is_quoted_ordinal_proof:
+        if proof_season is None or map_path is None:
+            raise ValueError(
+                "D 引号集名序号集号证据无法重建 F 显式映射；"
                 "请保持暂停并重建边界/对账"
             )
     if map_path is None:
