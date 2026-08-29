@@ -1583,10 +1583,14 @@ def _score_identity_candidate(
     # makes that parent shape a legal target; the release-local ordinals are
     # later positioned by D's named-arc proof, so the count need not match
     # here.  It is weaker than a standalone proof (no marker/count match of
-    # the short work itself), hence the smaller bonus.
+    # the short work itself), hence the smaller bonus.  A marker-bearing
+    # release without a counted run (a metadata-named OVA single) proves the
+    # same parent shape through the same official S00 catalog.
+    physical_special_source_shape = bool(
+        set(special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
+    )
     parent_special_run_shape = bool(
-        special_episode_count
-        and set(special_markers) & _PHYSICAL_SPECIAL_IDENTITY_MARKERS
+        physical_special_source_shape
         and raw.get("official_season0_episode_count") is not None
         and raw.get("official_season0_numbers")
     )
@@ -1686,7 +1690,7 @@ def _score_identity_candidate(
     # here.  It is weaker than a standalone proof (no marker/count match of
     # the short work itself), hence the smaller bonus.
     parent_special_run_shape = bool(
-        special_evidence_required
+        physical_special_source_shape
         and raw.get("official_season0_episode_count") is not None
         and raw.get("official_season0_numbers")
     )
@@ -2153,7 +2157,7 @@ def _tmdb_physical_special_candidate_evidence(
         "official_season0_numbers": (),
         "official_season0_titles": (),
     }
-    if not requested_markers or not source_episode_count:
+    if not requested_markers:
         return result
     getter = getattr(client, "get", None)
     if not callable(getter):
@@ -2196,7 +2200,17 @@ def _tmdb_physical_special_candidate_evidence(
             official_texts.append(season.get("name"))
         elif number == 0 and count > 0:
             season0_episode_count = count
-    if len(positives) != 1 or positives[0][1] != source_episode_count:
+    if (
+        source_episode_count is None
+        or len(positives) != 1
+        or positives[0][1] != source_episode_count
+    ):
+        # An uncounted release (``source_episode_count is None``, a
+        # metadata-named OVA single without release ordinals) can never prove
+        # the standalone season shape below — it has no count to match.  It
+        # still takes this parent-shape branch: the marker hits and the
+        # official Season 00 structure are exactly what the parent-absorption
+        # scoring needs.
         result["official_special_marker_hits"] = tuple(sorted(
             _official_physical_special_markers(official_texts) & requested_markers
         ))
@@ -2766,7 +2780,7 @@ def auto_match_from_evidence(
                     actual_episode_count = actual_count
             physical_special_evidence: Mapping[str, object] = {}
             if (
-                physical_special_episode_count
+                (physical_special_episode_count or physical_special_markers)
                 and candidate_type == "tv"
                 and index < 5
             ):

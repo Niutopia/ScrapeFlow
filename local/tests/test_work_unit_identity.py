@@ -2790,6 +2790,116 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         for candidate in movies:
             self.assertEqual(candidate.status, "rejected")
 
+    def test_unnumbered_ova_with_year_evidence_resolves_to_parent_show(self) -> None:
+        """A dated, unnumbered OVA single confirms its parent via Season 00.
+
+        ``03 OVA：黑色的铁碎牙（2008）内封+外挂字幕 1080P`` is a metadata-named
+        OVA release: it carries the physical OVA marker and a release year,
+        but no numbered run, so ``special_episode_count`` is None.  The
+        parent's official Season 00 catalog (one episode airing in the source
+        year) still proves the parent-attached shape, and the later release
+        year is the expected shape for a special, not a conflict.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "示例剧": [
+                    {"id": 69500, "name": "示例剧", "first_air_date": "2000-10-16", "genre_ids": [16]},
+                ],
+            },
+            details={
+                "/tv/69500": {
+                    "name": "示例剧",
+                    "original_name": "示例剧",
+                    "seasons": [
+                        {"season_number": 0, "episode_count": 1, "name": "特别篇"},
+                        {"season_number": 1, "episode_count": 167, "name": "第 1 季"},
+                    ],
+                },
+                "/tv/69500/season/0": {
+                    "episodes": [
+                        {"episode_number": 1, "air_date": "2008-07-30", "name": "示例剧 黑色铁剑"},
+                    ],
+                },
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-ova-year-single",
+            boundary_label="03 OVA：黑色铁剑（2008）内封+外挂字幕 1080P",
+            parent_labels=("示例剧",),
+            representative_names=("03 OVA：黑色铁剑（2008）内封+外挂字幕 1080P",),
+            normalized_titles=("03 OVA：黑色铁剑（2008）内封+外挂字幕",),
+            years=(2008,),
+            episode_pattern=None,
+            media_shape="unknown",
+            aliases=("黑色铁剑",),
+            special_markers=("OVA",),
+            special_episode_numbers=(3,),
+            special_episode_count=None,
+            special_numbered_run_complete=False,
+        )
+        best, candidates = auto_match_from_evidence(
+            client, evidence, prefer_animation=True,
+        )
+        self.assertEqual(best.media_type, "tv")
+        self.assertEqual(best.tmdb_id, 69500)
+        self.assertEqual(best.status, "confirmed")
+        self.assertTrue(best.decision_trace["parent_special_run_shape"])
+        self.assertNotIn("year_conflict", best.decision_trace["blockers"])
+        self.assertIn("/tv/69500/season/0", [path for path, _ in client.call_log])
+
+    def test_unnumbered_ova_year_before_parent_premiere_stays_conflict(self) -> None:
+        """The Season 00 exemption only forgives later years, never earlier.
+
+        A physical special is released after its parent premiered: a source
+        year that predates the parent's first air is impossible even when the
+        official Season 00 catalog exists.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "示例剧": [
+                    {"id": 69500, "name": "示例剧", "first_air_date": "2000-10-16", "genre_ids": [16]},
+                ],
+            },
+            details={
+                "/tv/69500": {
+                    "name": "示例剧",
+                    "seasons": [
+                        {"season_number": 0, "episode_count": 1, "name": "特别篇"},
+                        {"season_number": 1, "episode_count": 167, "name": "第 1 季"},
+                    ],
+                },
+                "/tv/69500/season/0": {
+                    "episodes": [
+                        {"episode_number": 1, "air_date": "1998-07-30", "name": "示例剧 黑色铁剑"},
+                    ],
+                },
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-ova-early-year",
+            boundary_label="03 OVA：黑色铁剑（1998）内封+外挂字幕 1080P",
+            parent_labels=("示例剧",),
+            representative_names=("03 OVA：黑色铁剑（1998）内封+外挂字幕 1080P",),
+            normalized_titles=("03 OVA：黑色铁剑（1998）内封+外挂字幕",),
+            years=(1998,),
+            episode_pattern=None,
+            media_shape="unknown",
+            aliases=("黑色铁剑",),
+            special_markers=("OVA",),
+            special_episode_numbers=(3,),
+            special_episode_count=None,
+            special_numbered_run_complete=False,
+        )
+        with self.assertRaises(AutoMatchAmbiguityError) as ctx:
+            auto_match_from_evidence(client, evidence, prefer_animation=True)
+        first = ctx.exception.candidates[0]
+        self.assertEqual(first["tmdb_id"], 69500)
+        self.assertEqual(first["status"], "rejected")
+        # The S00 catalog exists, so the parent-shape probe ran and only the
+        # year gate can be the rejecting difference against the confirming
+        # twin test above: a source year before the premiere stays fatal.
+        self.assertIn("/tv/69500/season/0", [path for path, _ in client.call_log])
+
     def test_single_unnumbered_ova_resolves_to_parent_show(self) -> None:
         """An unnumbered single OVA directory confirms its parent show.
 
