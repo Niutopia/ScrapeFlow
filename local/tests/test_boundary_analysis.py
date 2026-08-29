@@ -1271,6 +1271,139 @@ class TestSyntheticCases(unittest.TestCase):
 
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_theatrical_marked_one_video_folders_split_without_years(self) -> None:
+        """A ``剧场版 X`` bundle splits per film even without year evidence.
+
+        ``排球少年 剧场版合集`` wraps five separately released theatrical
+        films, one folder per film, each folder named with the bounded
+        theatrical-form marker (``剧场版``) plus a concrete film title and
+        each holding exactly one feature-sized video.  The undated shape
+        cannot use the year-corroborated nested-collection rule, but the
+        explicit theatrical form marker plus a substantial standalone title
+        is its own bounded evidence: one WorkUnit cannot own five different
+        films, and the bundle label itself matches no TMDB work.
+        """
+        root = "/quark/影视/待刮削/P 4k 排球少年"
+        def film_dir(label: str, movie: str) -> dict:
+            return {
+                "name": label,
+                "is_dir": True,
+                "children": [
+                    {"name": "简中.ass", "is_dir": False, "size": 110_000},
+                    {"name": movie, "is_dir": False, "size": 20_000_000_000},
+                ],
+            }
+
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "排球少年 剧场版合集",
+                    "is_dir": True,
+                    "children": [
+                        film_dir(
+                            "剧场版 排球少年 垃圾场决战",
+                            "[Ygm] Haikyuu!! Gomisuteba no Kessen [Ma10p_2160p][x265_TrueHD_ass].mkv",
+                        ),
+                        film_dir(
+                            "剧场版 排球少年 才能与感觉",
+                            "[Ygm] Haikyuu!! Sainou to Sense [Ma10p_2160p][x265_flac_ass].mkv",
+                        ),
+                        film_dir(
+                            "剧场版 排球少年 结束与开始",
+                            "[Ygm] Haikyuu!! Owari to Hajimari [Ma10p_2160p][x265_flac_ass].mkv",
+                        ),
+                        film_dir(
+                            "剧场版 排球少年 胜者与败者",
+                            "[Ygm] Haikyuu!! Shousha to Haisha [Ma10p_2160p][x265_flac_ass].mkv",
+                        ),
+                        film_dir(
+                            "剧场版 排球少年 观念之战",
+                            "[Ygm] Haikyuu!! Concept no Tatakai [Ma10p_2160p][x265_flac_ass].mkv",
+                        ),
+                    ],
+                },
+                {
+                    "name": "排球少年第二季",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "[Ygm] Haikyuu!! 2nd Season [01][Ma10p_2160p][x265_flac_ass].mkv",
+                            "is_dir": False,
+                            "size": 3_000_000_000,
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(
+            len(candidates), 6, msg=[c.display_label for c in candidates]
+        )
+        self.assertTrue(all(c.proposed_media_context == "movie" for c in candidates[:5]))
+        self.assertEqual(
+            {c.display_label for c in candidates},
+            {
+                "剧场版 排球少年 垃圾场决战",
+                "剧场版 排球少年 才能与感觉",
+                "剧场版 排球少年 结束与开始",
+                "剧场版 排球少年 胜者与败者",
+                "剧场版 排球少年 观念之战",
+                "排球少年第二季",
+            },
+        )
+        for unit in candidates[:5]:
+            self.assertEqual(len(unit.source_paths), 1)
+            self.assertTrue(
+                unit.source_paths[0].startswith(f"{root}/排球少年 剧场版合集/")
+            )
+
+    def test_theatrical_marker_alone_does_not_split_titled_children(self) -> None:
+        """``剧场版`` prefix without a concrete film title fails closed.
+
+        A bundle whose children share one theatrical marker but carry no
+        distinct substantial titles (bare ordinals, generic labels) is not
+        proven to be one-film-per-folder; the whole-child boundary stays.
+        """
+        root = "/quark/影视/待刮削/Example Bundle"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "剧场版合集",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "剧场版 01",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Film 01.mkv", "is_dir": False, "size": 20_000_000_000},
+                            ],
+                        },
+                        {
+                            "name": "剧场版 02",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Film 02.mkv", "is_dir": False, "size": 20_000_000_000},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "name": "正片第一季",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Show [01].mkv", "is_dir": False, "size": 3_000_000_000},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        bundle_units = [
+            c for c in candidates if "剧场版" in c.display_label
+        ]
+        self.assertEqual(len(bundle_units), 1, msg=[c.display_label for c in candidates])
+
     def test_flat_marker_ordinal_feature_files_stay_one_special_run(self) -> None:
         """``OVA 01 - Title`` feature files are one special run, not films.
 

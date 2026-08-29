@@ -618,6 +618,30 @@ _DIRECT_RUN_PHYSICAL_SPECIAL_RE = re.compile(
 _DIRECT_LEADING_ORDINAL_RE = re.compile(
     r"^\s*0*\d{1,3}\s*[.、,，\-_）)\]]?\s*\S",
 )
+# A bounded theatrical-form marker (``剧场版 排球少年 垃圾场决战``) on a
+# one-video folder is its own evidence that the folder is one feature film:
+# the CJK vocabulary never appears inside ordinary episode titles, so it can
+# corroborate an undated nested film collection where a year cannot.
+_FEATURE_FILM_FORM_LABEL_RE = re.compile(r"剧场版|劇場版|电影|電影|映画")
+# Release ordinals and separators left behind after the form marker drops
+# (``剧场版 01`` → ``01``): a bare position is not a film title.
+_BARE_FORM_ORDINAL_RE = re.compile(r"[\s._\-—－：:、，0-9]+")
+
+
+def _feature_film_form_label_with_substantial_title(label: str) -> bool:
+    """A theatrical-form label must still name its film concretely.
+
+    ``剧场版 排球少年 垃圾场决战`` keeps a substantial standalone title once
+    the form marker drops; ``剧场版 01`` keeps only a bare release position,
+    which could as easily be one episode of a bundled work, so it is not
+    feature evidence on its own.
+    """
+    text = str(label or "")
+    if not _FEATURE_FILM_FORM_LABEL_RE.search(text):
+        return False
+    remainder = _FEATURE_FILM_FORM_LABEL_RE.sub("", text)
+    remainder = _BARE_FORM_ORDINAL_RE.sub("", remainder)
+    return _direct_movie_title_is_substantial(remainder)
 # A per-episode directory name (``第01话「起点」``) is episodic evidence for
 # the nested-collection splitter: the enclosing bundle is a TV shape, not a
 # package of separately released feature films.
@@ -864,9 +888,12 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
     work, and one WorkUnit cannot own several different works.  The split is
     proven only when the bundle holds no direct video and every video-bearing
     child is independently titled, dated (a release year on the folder or its
-    files), free of season/episode coordinates, and carries exactly one
-    feature-sized video whose filename holds a substantial standalone title.
-    Anything else fails closed to the historical whole-child boundary.
+    files) or explicitly theatrical-form labelled (``剧场版 排球少年
+    垃圾场决战`` — the bounded CJK marker plus a substantial title is its own
+    feature evidence where a year is absent), free of season/episode
+    coordinates, and carries exactly one feature-sized video whose filename
+    holds a substantial standalone title.  Anything else fails closed to the
+    historical whole-child boundary.
     """
     if direct_video_file_count(node) != 0:
         return ()
@@ -882,7 +909,10 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
             return ()
         if not _single_large_video(child):
             return ()
-        if not _has_explicit_year_evidence(child):
+        if not (
+            _has_explicit_year_evidence(child)
+            or _feature_film_form_label_with_substantial_title(child.name)
+        ):
             return ()
         if _EPISODE_COUNTER_DIRECTORY_RE.search(child.name):
             return ()
