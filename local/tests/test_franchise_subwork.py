@@ -23,6 +23,7 @@ from engine.scrapeflow.unit_identity import (
 )
 from engine.scrapeflow.work_units import load_work_unit_records
 
+from engine.scrapeflow.core import _has_special_context
 from engine.scrapeflow.source_inventory import SourceFile
 from local.scrapeflow_api.library_index import (
     SingleSeasonEpisodeProof,
@@ -46,6 +47,10 @@ def _video(path: str, size: int = 100) -> SourceFile:
         object_type="video",
         modified="",
     )
+
+
+def _special_context(name: str) -> bool:
+    return _has_special_context({"name": name, "full_path": "/quark/x/" + name})
 
 
 class LetterVariantBracketOrdinalTests(unittest.TestCase):
@@ -81,6 +86,27 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
                 ),
                 tag,
             )
+
+    def test_letter_variant_and_theme_assets_are_special_context(self) -> None:
+        """Non-story assets stay at source instead of blocking the plan."""
+        for name in (
+            "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv",
+            "[TUDO&Ygm]Steins;Gate[NCOP][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm]Steins;Gate[NCED][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate 0 [NCOP01][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate 0 [NCED02][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate 0 [Game OP][Ma10p_2160p][x265_flac].mkv",
+        ):
+            self.assertTrue(_special_context(name), name)
+        # A story episode, a revision, and a quality tag stay regular.
+        for name in (
+            "[TUDO&Ygm] Steins;Gate [23][Ma10p_2160p][x265_flac_ass].mkv",
+            "[G] Show [02v2].mkv",
+            "Show [720p].mkv",
+            "Show [1080i].mkv",
+            "[G] Show [Ma10p_2160p].mkv",
+        ):
+            self.assertFalse(_special_context(name), name)
 
 
 class ProofReceiptShapeTests(unittest.TestCase):

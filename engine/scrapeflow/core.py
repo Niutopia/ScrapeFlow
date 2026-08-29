@@ -192,6 +192,20 @@ EPISODE_THEME_VARIANT_RE = re.compile(
     r"(?:^|[\s._\-\[\]()])(?:OP|ED)[ ._-]*EP[ ._-]*0*(\d{1,4})(?:$|[\s._\-\[\]()])",
     re.IGNORECASE,
 )
+# A structurally non-story asset: an OP/ED theme marker with an optional
+# bounded qualifier word (``[NCOP01]``/``[Game OP]``/``[Creditless ED 2]``)
+# or a letter-suffixed alternate cut of an episode (``[23B]``/``[23β]`` —
+# 23β is a distinct special beside the plain episode 23).  ``v2``-style
+# revisions re-release the same ordinal so they stay excluded; the
+# ``p``/``i``/``k`` scan tags (``[720p]``/``1080i``/``ma10p``) are release
+# quality labels, not cut letters, and are dropped explicitly.  These assets
+# never carry a story coordinate, so they count as special context — left
+# at source — instead of blocking the plan for the episodes around them.
+_NON_STORY_ASSET_RE = re.compile(
+    r"\[\s*(?:\w{1,12}\s+)?(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]"
+    r"|\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]",
+    re.IGNORECASE,
+)
 BONUS_DIRECTORY_RE = re.compile(
     r"(?:^|/)(?:SPs?|Extras?|Bonus|Tokuten|特典|映像特典)(?:/|$)",
     re.IGNORECASE,
@@ -5135,6 +5149,15 @@ def _has_special_context(item: Mapping[str, Any]) -> bool:
     )
     key = extract_episode_key(str(item.get("name", "")))
     if key is not None and key.kind == "special":
+        return True
+    # A non-story asset is special context too: it is deliberately left at
+    # source instead of blocking the plan for the episodes around it.  Two
+    # release shapes are structurally never story episodes — an OP/ED theme
+    # marker with an optional bounded qualifier (``[NCOP01]``/``[Game OP]``)
+    # and a letter-suffixed alternate cut of an episode (``[23B]``/``[23β]``,
+    # where ``[720p]``-style resolution tags are deliberately excluded by
+    # dropping the ``p`` suffix letter).
+    if _NON_STORY_ASSET_RE.search(str(item.get("name", ""))):
         return True
     # Generic special markers stay inline; concrete release spellings come
     # from the release lexicon (data, not business logic).
