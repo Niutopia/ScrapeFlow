@@ -320,6 +320,30 @@ def _pending_physical_special_recheck(
     )
 
 
+def _automatic_identity_needs_junk_movie_recheck(record: WorkUnitRecord) -> bool:
+    """Whether a retry must re-resolve an automatic undated-movie identity.
+
+    The matcher now refuses movie rows TMDB never dated or timed (search row
+    without a date AND detail with neither release year nor runtime).  An
+    older automatic confirmation whose accepted identity is exactly that
+    shape — an ``unknown year`` movie — was accepted from junk catalogue
+    data, so an explicit retry must re-resolve it under the current guards.
+    An operator's confirmation is durable, and the writer carrier is kept:
+    once C re-resolves, G retires the superseded carrier through the
+    identity-mismatch rule.  This is provenance repair on the accepted
+    evidence shape, not a title or TMDB-ID rule.
+    """
+    identity = record.identity if isinstance(record.identity, dict) else {}
+    if (
+        record.identity_status != "confirmed"
+        or identity.get("source") == "operator_override"
+        or str(identity.get("media_type")) != "movie"
+        or str(identity.get("year") or "") != "未知年份"
+    ):
+        return False
+    return True
+
+
 def resolve_work_unit_identities(
     tmdb_client: object,
     state_root: Path,
@@ -577,6 +601,30 @@ def requeue_uncertain_work_units(
             changed = True
             continue
         if _pending_physical_special_recheck(state_root, root_task_id, record):
+            updated.append(replace(
+                record,
+                identity_status="pending",
+                identity=None,
+                candidate_identities=(),
+                reconciliation_outcome=None,
+                matched_work_root=None,
+                reconciliation_evidence=None,
+                uncovered_tokens=(),
+                lane_status=None,
+                lane_detail=None,
+                gap_status=None,
+                gap_detail=None,
+                attention=None,
+                updated_at=_now(),
+            ))
+            changed = True
+            continue
+        if _automatic_identity_needs_junk_movie_recheck(record):
+            # A pre-guard automatic match accepted a movie row TMDB never
+            # dated or timed.  Re-run C under the current release-evidence
+            # guards; the writer carrier is deliberately preserved so G can
+            # retire it through the identity-mismatch rule after the
+            # re-resolution.
             updated.append(replace(
                 record,
                 identity_status="pending",

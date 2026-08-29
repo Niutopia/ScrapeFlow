@@ -529,6 +529,76 @@ class WorkUnitIdentityTests(unittest.TestCase):
             self.assertIsNone(reopened[0].gap_detail)
             self.assertIsNone(reopened[0].attention)
 
+    def test_retry_reopens_automatic_undated_movie_confirmation(self) -> None:
+        """A pre-guard automatic junk-movie confirmation re-runs C on retry.
+
+        The matcher now refuses movie rows TMDB never dated or timed.  An
+        older automatic confirmation whose accepted identity is an undated
+        movie was accepted from exactly that junk shape, so an explicit
+        retry must re-resolve it.  The writer carrier is deliberately kept:
+        once C re-resolves, G retires the superseded carrier through the
+        identity-mismatch rule.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-junk-movie-retry"
+            _build_snapshot("fate_container", root_task_id, state_root)
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertGreaterEqual(len(records), 3)
+            records[0] = replace(
+                records[0],
+                identity_status="confirmed",
+                identity={
+                    "media_type": "movie",
+                    "tmdb_id": 1587181,
+                    "title": "某剧:完结篇",
+                    "year": "未知年份",
+                    "confidence": 0.98,
+                    "decision_trace": {"query": "完结篇"},
+                },
+                reconciliation_outcome="new_work",
+                writer_job_id="writer-junk-movie",
+            )
+            dated = replace(
+                records[1],
+                identity_status="confirmed",
+                identity={
+                    "media_type": "movie",
+                    "tmdb_id": 447,
+                    "title": "A Real Film",
+                    "year": "2009",
+                    "confidence": 0.95,
+                },
+                reconciliation_outcome="new_work",
+                writer_job_id="writer-dated",
+            )
+            records[1] = dated
+            override = replace(
+                records[2],
+                identity_status="confirmed",
+                identity={
+                    "media_type": "movie",
+                    "tmdb_id": 997,
+                    "title": None,
+                    "year": "未知年份",
+                    "source": "operator_override",
+                },
+                reconciliation_outcome="new_work",
+                writer_job_id="writer-override",
+            )
+            records[2] = override
+            save_work_unit_records(state_root, root_task_id, records)
+
+            reopened = requeue_uncertain_work_units(state_root, root_task_id)
+
+            self.assertEqual(reopened[0].identity_status, "pending")
+            self.assertIsNone(reopened[0].identity)
+            self.assertIsNone(reopened[0].reconciliation_outcome)
+            self.assertEqual(reopened[0].writer_job_id, "writer-junk-movie")
+            # A dated movie and an operator's explicit override stay durable.
+            self.assertEqual(reopened[1], dated)
+            self.assertEqual(reopened[2], override)
+
 
 if __name__ == "__main__":
     unittest.main()
