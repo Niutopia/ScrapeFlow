@@ -2214,7 +2214,11 @@ def _single_positive_tmdb_season(
     if total_episodes is not None and (
         isinstance(total_episodes, bool)
         or not isinstance(total_episodes, int)
-        or total_episodes < episode_count
+        # ``number_of_episodes`` counts regular episodes only (tv/78102
+        # reports 23 while its S00 OVA adds one more), so an overflow run
+        # may legitimately exceed it by the specials bucket.  The run may
+        # never exceed everything the show has published.
+        or total_episodes + (specials_count or 0) < episode_count
     ):
         return None
     return _TmdbSingleRegularSeasonEvidence(

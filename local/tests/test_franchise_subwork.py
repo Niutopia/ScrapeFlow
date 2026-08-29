@@ -30,6 +30,7 @@ from local.scrapeflow_api.library_index import (
     _is_letter_variant_episode_video,
     _named_arc_franchise_subwork_evidence,
     _named_arc_season00_run,
+    _single_positive_tmdb_season,
     reconcile_root_work_units,
 )
 from local.scrapeflow_api.tmdb_episode_catalog import TmdbEpisodeCatalog
@@ -113,6 +114,50 @@ class QualifierThemeMarkerTests(unittest.TestCase):
         self.assertFalse(
             _is_known_non_story_theme_video(
                 _video("/incoming/Show/[G] Show [Opening Theme Full Song].mkv")
+            )
+        )
+
+
+class RegularTotalExcludesSpecialsTests(unittest.TestCase):
+    """An overflow run may exceed ``number_of_episodes`` by the specials."""
+
+    def test_regular_only_total_still_proves_the_overflow_run(self) -> None:
+        # tv/78102 shape: 23 regular + 1 special, run 1..24.  The detail
+        # total counts regular episodes only, so the old strict bound
+        # (23 < 24) rejected exactly the run the overflow rule exists for.
+        class RegularOnlyTMDB:
+            def get(self, path: str, **_kwargs: object) -> dict[str, object]:
+                if path == "/tv/78102":
+                    return {
+                        "number_of_seasons": 1,
+                        "number_of_episodes": 23,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 1},
+                            {"season_number": 1, "episode_count": 23},
+                        ],
+                    }
+                return {}
+
+        evidence = _single_positive_tmdb_season(
+            RegularOnlyTMDB(), tmdb_id=78102, episode_count=24,
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.season, 1)
+        self.assertEqual(evidence.regular_episode_count, 23)
+        self.assertEqual(evidence.overflow_episode_count, 1)
+        # A run longer than everything the show published still fails.
+        class TooLongTMDB(RegularOnlyTMDB):
+            def get(self, path: str, **kwargs: object) -> dict[str, object]:
+                payload = super().get(path, **kwargs)
+                if path == "/tv/78102":
+                    payload = dict(payload)
+                    payload["number_of_episodes"] = 20
+                return payload
+
+        self.assertIsNone(
+            _single_positive_tmdb_season(
+                TooLongTMDB(), tmdb_id=78102, episode_count=24,
             )
         )
 
