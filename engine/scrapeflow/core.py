@@ -2192,6 +2192,12 @@ def parse_ep_files(
             )
             if (
                 not parent_is_release_range
+                # A non-story asset (``[NCOP01]``/``[Game OP]``/``[23B]``) has
+                # no ordinal of its own; the only number its parent carries is
+                # then the title's sequel digit (``命运石之门 0``), never an
+                # episode ordinal.  Leave the asset unparsed so the
+                # special-context path keeps it at source.
+                and not _NON_STORY_ASSET_RE.search(name)
                 and not re.fullmatch(
                     r"(?:season|s)\s*0*\d{1,3}", parent_name, re.IGNORECASE
                 )

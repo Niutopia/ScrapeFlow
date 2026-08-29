@@ -23,7 +23,11 @@ from engine.scrapeflow.unit_identity import (
 )
 from engine.scrapeflow.work_units import load_work_unit_records
 
-from engine.scrapeflow.core import _has_special_context, extract_episode_key
+from engine.scrapeflow.core import (
+    _has_special_context,
+    extract_episode_key,
+    parse_ep_files,
+)
 from engine.scrapeflow.source_inventory import SourceFile
 from local.scrapeflow_api.library_index import (
     SingleSeasonEpisodeProof,
@@ -134,6 +138,44 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             key = extract_episode_key(name)
             self.assertIsNotNone(key, name)
             self.assertEqual(key.display, expected, name)
+
+    def test_non_story_assets_do_not_inherit_a_parent_ordinal(self) -> None:
+        """A sequel digit in the parent title is not an asset's episode.
+
+        When a theme asset's own name parses to no key, parse_ep_files falls
+        back to the parent directory name — which for a sequel-titled folder
+        (``命运石之门 0``) yields the fake ``E00`` again, one layer later.
+        The asset marker must suppress the parent fallback too, while a
+        directory that genuinely carries the ordinal keeps working.
+        """
+        groups = parse_ep_files([
+            {
+                "name": "[TUDO&Ygm] Steins;Gate 0 [NCOP01][Ma10p_2160p][x265_flac].mkv",
+                "full_path": "/src/命运石之门 0/[TUDO&Ygm] Steins;Gate 0 [NCOP01][Ma10p_2160p][x265_flac].mkv",
+                "is_dir": False,
+            },
+            {
+                "name": "[TUDO&Ygm] Steins;Gate 0 [01][Ma10p_2160p][x265_flac_ass].mkv",
+                "full_path": "/src/命运石之门 0/[TUDO&Ygm] Steins;Gate 0 [01][Ma10p_2160p][x265_flac_ass].mkv",
+                "is_dir": False,
+            },
+            {
+                "name": "ep.mkv",
+                "full_path": "/src/某番剧 第02话/ep.mkv",
+                "is_dir": False,
+            },
+        ])
+        self.assertEqual(
+            sorted(key.display for key in groups), ["E01", "E02"]
+        )
+        # The theme asset stayed unparsed — left at source by special context.
+        unparsed = [
+            item["name"]
+            for key, items in groups.items()
+            for item in items
+            if "NCOP" in item["name"]
+        ]
+        self.assertEqual(unparsed, [])
 
 
 class ProofReceiptShapeTests(unittest.TestCase):
