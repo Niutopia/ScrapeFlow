@@ -2071,13 +2071,48 @@ def _bracketed_episode_map_path(
         return None
     numbers = tuple(sorted(source_ordinals.values()))
     expected = tuple(range(1, proof.episode_count + 1))
-    if numbers != expected or tuple(proof.episode_tokens) != tuple(
-        f"S{proof.season:02d}E{number:02d}" for number in expected
+    if numbers != expected:
+        return None
+    proof_tokens = tuple(str(token).upper() for token in proof.episode_tokens)
+    if len(proof_tokens) != len(numbers):
+        return None
+    # The proved token shapes are exactly three: a local run
+    # ``S{season}E01…E{N}``; an overflow run whose tail lands in Season 00
+    # (日在校园 1..14 = 12 regular + 2 OVA); and a named-arc Season 00
+    # window that starts wherever the parent catalogued the arc
+    # (命运石之门 聪明睿智的认知计算 [01]…[04] → S00E02…E05).  All three are
+    # non-interleaved per-season blocks of consecutive ascending episodes
+    # over the proved seasons; any other shape fails closed instead of
+    # guessing a split.
+    block_seasons: list[int] = []
+    block_episodes: list[list[int]] = []
+    for token in proof_tokens:
+        match = re.fullmatch(r"S0*(\d{1,3})E0*(\d{1,4})", token)
+        if match is None:
+            return None
+        token_season = int(match.group(1))
+        token_episode = int(match.group(2))
+        if token_season not in {proof.season, 0}:
+            return None
+        if not block_seasons or block_seasons[-1] != token_season:
+            if token_season in block_seasons:
+                return None
+            block_seasons.append(token_season)
+            block_episodes.append([])
+        block_episodes[-1].append(token_episode)
+    if not block_seasons:
+        return None
+    if block_seasons != sorted(
+        block_seasons, key=lambda season: (season != proof.season, season)
+    ):
+        return None
+    if any(
+        episodes != list(range(episodes[0], episodes[0] + len(episodes)))
+        for episodes in block_episodes
     ):
         return None
     mapping = {
-        str(number): f"S{proof.season:02d}E{number:02d}"
-        for number in numbers
+        str(number): token for number, token in zip(numbers, proof_tokens)
     }
     if len(mapping) != proof.episode_count:
         return None

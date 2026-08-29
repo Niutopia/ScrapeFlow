@@ -1,7 +1,8 @@
-"""Regression coverage: a letter-suffixed bracket ordinal.
+"""Regression coverage: bracket-ordinal and theme-marker classification.
 
 ``[23B]`` is an alternate cut with its own release coordinate, omitted from
-the strict ``1..N`` run like a fractional episode.
+the strict ``1..N`` run like a fractional episode; a qualifier word before
+OP/ED (``[Game OP]``) is still a non-story theme asset.
 """
 
 from __future__ import annotations
@@ -9,7 +10,10 @@ from __future__ import annotations
 import unittest
 
 from engine.scrapeflow.source_inventory import SourceFile
-from local.scrapeflow_api.library_index import _is_letter_variant_episode_video
+from local.scrapeflow_api.library_index import (
+    _is_known_non_story_theme_video,
+    _is_letter_variant_episode_video,
+)
 
 
 def _video(path: str, size: int = 100) -> SourceFile:
@@ -48,6 +52,49 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             )
         )
 
+
+class QualifierThemeMarkerTests(unittest.TestCase):
+    """``[Game OP]`` names the game-version opening, not a story episode."""
+
+    def test_qualifier_prefix_still_classifies_as_theme_video(self) -> None:
+        self.assertTrue(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [Game OP].mkv")
+            )
+        )
+        self.assertTrue(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [Creditless OP 2].mkv")
+            )
+        )
+        # The historical shapes keep their classification.
+        self.assertTrue(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [NCOP01].mkv")
+            )
+        )
+        self.assertTrue(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [EDv2].mkv")
+            )
+        )
+        # An episode bracket or an unrelated tag stays a regular video.
+        self.assertFalse(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [01].mkv")
+            )
+        )
+        self.assertFalse(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [Ma10p_2160p].mkv")
+            )
+        )
+        # One bounded qualifier word only: a long phrase is unknown shape.
+        self.assertFalse(
+            _is_known_non_story_theme_video(
+                _video("/incoming/Show/[G] Show [Opening Theme Full Song].mkv")
+            )
+        )
 
 if __name__ == "__main__":
     unittest.main()

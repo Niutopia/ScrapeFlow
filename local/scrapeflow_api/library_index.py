@@ -1734,7 +1734,7 @@ def _contains_quoted_ordinal_episode(node: SourceNode | None) -> bool:
 
 
 _KNOWN_NON_STORY_THEME_MARKER_RE = re.compile(
-    r"\[\s*(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]",
+    r"\[\s*(?:\w{1,12}\s+)?(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]",
     re.IGNORECASE,
 )
 
@@ -1793,8 +1793,11 @@ def _is_known_non_story_theme_video(file: SourceFile) -> bool:
 
     ``[OP]``/``[ED]`` (with or without ``NC`` and an optional number) are
     opening/ending theme markers, so they are omitted from the regular-episode
-    proof.  An ``MV``/``PV`` label is not a reliable media role, so it keeps
-    the proof fail-closed until B/W can place it independently.
+    proof.  One bounded qualifier word before the core is still the same
+    asset: ``[Game OP]``/``[Creditless OP]`` name the game-version or
+    creditless opening, not a story episode.  An ``MV``/``PV`` label is not a
+    reliable media role, so it keeps the proof fail-closed until B/W can
+    place it independently.
     """
     basename = posixpath.basename(str(file.path or "").rstrip("/"))
     return bool(_KNOWN_NON_STORY_THEME_MARKER_RE.search(basename))
