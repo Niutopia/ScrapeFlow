@@ -2793,6 +2793,42 @@ def auto_match_from_evidence(
             )
             ingest(response)
 
+        # A leaf boundary whose every dispatched query returned nothing is a
+        # candidate franchise sub-work: its own label (``Steins;Gate Soumei
+        # Eichi no Cognitive Computing``) is frequently not a TMDB search
+        # title at all, while the user-owned parent container (``M 4k 命运
+        # 石之门``) carries the franchise.  Escalate to the parents'
+        # standalone cleaned queries — the same dispatch the physical-special
+        # grammar already uses for marked sub-works, now for unmarked ones
+        # after a total miss.  It stays a strict second round: a boundary
+        # found by its own queries never reaches this code, the escalation
+        # stops at the first parent variant that yields candidates, and the
+        # ordinary scoring/ambiguity gates still arbitrate the pool — the
+        # parent never injects an identity.
+        if not search_items:
+            for parent in evidence.parent_labels:
+                for p_variant in _parent_identity_query_variants(parent):
+                    cleaned = _clean_boundary_identity_query(p_variant).strip()
+                    if (
+                        not cleaned
+                        or cleaned in seen_sent_queries
+                        or _is_generic_season_identity_label(cleaned)
+                        or _is_bonus_directory_identity_label(cleaned)
+                        or _is_pure_movie_form_label(cleaned)
+                    ):
+                        continue
+                    record_sent_query(cleaned, from_clean_boundary=False)
+                    response = client.get(
+                        f"/search/{candidate_type}",
+                        query=cleaned,
+                        language=_search_language(cleaned),
+                    )
+                    ingest(response)
+                    if search_items:
+                        break
+                if search_items:
+                    break
+
         sent_query_keys = [
             _normalize_match_title(query)
             for query in sent_queries

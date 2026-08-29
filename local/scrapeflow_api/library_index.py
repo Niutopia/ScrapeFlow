@@ -2350,6 +2350,137 @@ def _partial_season_prefix_evidence(
     return (season, total)
 
 
+def _official_tv_title(tmdb_client: object, tmdb_id: int) -> str:
+    """The official show name for an identity that carries no title.
+
+    An operator override confirms ``media_type + tmdb_id`` only, so the
+    confirmed identity can hold a null title.  The franchise-arc grammar
+    still needs the franchise title to strip it from the arc label; the
+    show detail the same client already serves is the authoritative name,
+    and a fetch failure simply leaves the grammar unproved.
+    """
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return ""
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+    except Exception:
+        return ""
+    if not isinstance(show, Mapping):
+        return ""
+    return str(show.get("name") or "").strip()
+
+
+def _franchise_arc_anchor_labels(
+    source_paths: Sequence[str],
+    root_path: str,
+    identity_title: str,
+) -> tuple[str, ...]:
+    """Return enclosing directory labels that extend the franchise title.
+
+    A marker-less franchise sub-work (``命运石之门 聪明睿智的认知计算``)
+    names its arc in an enclosing directory label instead of a physical
+    OVA/OAD marker: the confirmed identity title is a strict prefix of the
+    label and the residual still carries at least four identity characters,
+    so the label is franchise title + concrete arc — never a bare season or
+    quality variant of the franchise itself.  Labels are returned nearest to
+    the source files first.
+    """
+    title_key = _special_arc_title_key(str(identity_title or ""))
+    if len(title_key) < 2:
+        return ()
+    root = str(root_path or "").rstrip("/")
+    if not root:
+        return ()
+    anchors: list[str] = []
+    for raw_path in source_paths:
+        text = str(raw_path or "").rstrip("/")
+        if not text.startswith(root + "/"):
+            continue
+        relative = text[len(root) + 1:]
+        segments = relative.split("/")
+        # A file's own name is not an enclosing label; a directory's own
+        # name is.  Both shapes appear in unit scopes, so drop the final
+        # segment only when it carries a media extension.
+        if is_video_filename(segments[-1]):
+            segments = segments[:-1]
+        for segment in segments:
+            segment_key = _special_arc_title_key(segment)
+            if (
+                len(segment_key) > len(title_key)
+                and segment_key.startswith(title_key)
+                and len(segment_key) - len(title_key) >= 4
+                and segment not in anchors
+            ):
+                anchors.append(segment)
+    # Nearest directory first: the label closest to the files names the
+    # sub-work itself, outer containers name the franchise shelf.
+    anchors.sort(key=lambda label: -label.count("/"))
+    return tuple(anchors)
+
+
+def _named_arc_franchise_subwork_evidence(
+    episode_catalog: Callable[[Mapping[str, object], object]] | None,
+    *,
+    tmdb_id: int,
+    run_length: int,
+    source_paths: Sequence[str],
+    root_path: str,
+    display_label: str,
+    source_years: Sequence[int],
+    identity_title: str,
+    evidence_kind: str,
+) -> SingleSeasonEpisodeProof | None:
+    """Prove a marker-less franchise sub-work run as the parent's S00 arc.
+
+    The source carries no OVA/OAD marker, so the shared physical-special
+    grammar never applies.  Its own label may still identify the sub-work
+    through an enclosing directory label (``命运石之门 聪明睿智的认知计算``
+    = franchise + arc): exactly one consecutive published Season 00 window
+    of the run length, every episode officially titled with that arc, proves
+    the release-local ordinals onto the window.  The proof keeps the calling
+    grammar's evidence kind so D/F revalidation stays symmetric; season 0 is
+    the only possible target for a specials window.
+    """
+    if not callable(episode_catalog) or run_length < 2:
+        return None
+    anchors = _franchise_arc_anchor_labels(
+        source_paths, root_path, identity_title
+    )
+    candidates = [*anchors]
+    if display_label and display_label not in candidates:
+        candidates.append(str(display_label))
+    if not candidates:
+        return None
+    loaded = _published_season0_episodes(episode_catalog, tmdb_id)
+    if loaded is None:
+        return None
+    published, published_years, _published_dates = loaded
+    proved: list[tuple[int, ...]] = []
+    for label in candidates:
+        named_run = _named_arc_season00_run(
+            published,
+            published_years=published_years,
+            run_length=run_length,
+            boundary_label=label,
+            source_years=source_years,
+            parent_title=identity_title,
+        )
+        if named_run is not None:
+            proved.append(named_run)
+    if not proved:
+        return None
+    if any(run != proved[0] for run in proved[1:]):
+        return None
+    return SingleSeasonEpisodeProof(
+        tmdb_id=tmdb_id,
+        season=0,
+        episode_count=run_length,
+        episode_tokens=tuple(f"S00E{number:02d}" for number in proved[0]),
+        evidence_kind=evidence_kind,
+    )
+
+
 def prove_single_season_episode_evidence(
     alist: object,
     state_root: Any,
@@ -2439,6 +2570,49 @@ def prove_single_season_episode_evidence(
                 or is_physical_special_video_file(file)
                 for file in collect_all_files(scoped)
                 if file.object_type == "video"
+            ):
+                return None
+            # A marker-less franchise sub-work names a concrete arc, not a
+            # season prefix: its own directory label is the franchise title
+            # plus the arc (``命运石之门 聪明睿智的认知计算``).  When that
+            # label shape is present, the run is either proved onto the
+            # parent's published Season 00 arc window or left unproven —
+            # never read as the parent's first-N regular episodes, which
+            # would collide with the real season start elsewhere in the
+            # release.
+            identity_title = str(identity.get("title") or "").strip()
+            if not identity_title:
+                identity_title = _official_tv_title(tmdb_client, tmdb_id)
+            source_year_tokens = set(
+                re.findall(
+                    r"(?<!\d)(?:19|20)\d{2}(?!\d)",
+                    str(record.display_label or " "),
+                )
+            )
+            for file in collect_all_files(scoped):
+                if file.object_type == "video":
+                    source_year_tokens.update(
+                        re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", file.name)
+                    )
+            arc_proof = _named_arc_franchise_subwork_evidence(
+                episode_catalog,
+                tmdb_id=tmdb_id,
+                run_length=len(episode_numbers),
+                source_paths=record.source_paths,
+                root_path=str(snapshot["root"] or ""),
+                display_label=str(record.display_label or ""),
+                source_years=tuple(
+                    sorted(int(year) for year in source_year_tokens)
+                ),
+                identity_title=identity_title,
+                evidence_kind=evidence_kind,
+            )
+            if arc_proof is not None:
+                return arc_proof
+            if _franchise_arc_anchor_labels(
+                record.source_paths,
+                str(snapshot["root"] or ""),
+                identity_title,
             ):
                 return None
             prefix = _partial_season_prefix_evidence(
@@ -2570,6 +2744,7 @@ def _named_arc_season00_run(
     run_length: int,
     boundary_label: str,
     source_years: Sequence[int],
+    parent_title: str = "",
 ) -> tuple[int, ...] | None:
     """Return the one official Season 00 window titled as the source arc.
 
@@ -2581,25 +2756,51 @@ def _named_arc_season00_run(
     the official air years must sit inside the source release-year window.
     Exactly one such window may exist, or the best must beat the runner-up by
     the global ambiguity margin.
+
+    A marker-less franchise sub-work (``命运石之门 聪明睿智的认知计算`` under
+    the confirmed parent ``命运石之门``) names the arc in an enclosing
+    directory label instead of the release's own label, and often carries no
+    year at all.  ``parent_title`` supplies the franchise prefix: the label
+    minus that prefix is a second arc key, so the official part-titled
+    episodes (``聪明睿智的认知计算：料理篇``) match either the whole label or
+    the bare arc.  An empty ``source_years`` simply skips the year
+    confirmation — the title containment, the unique window, and the margin
+    remain the proof.
     """
-    if run_length < 2 or not source_years:
+    if run_length < 2:
         return None
     label_text = _ARC_LABEL_SPECIAL_MARKER_RE.sub(
         " ", str(boundary_label or "")
     )
     label_key = _special_arc_title_key(label_text)
-    if len(label_key) < 4:
+    arc_keys: list[str] = []
+    if len(label_key) >= 4:
+        arc_keys.append(label_key)
+    parent_key = _special_arc_title_key(str(parent_title or ""))
+    if (
+        parent_key
+        and len(parent_key) >= 2
+        and len(label_key) > len(parent_key)
+        and label_key.startswith(parent_key)
+    ):
+        residual = label_key[len(parent_key):]
+        if len(residual) >= 4 and residual not in arc_keys:
+            arc_keys.append(residual)
+    if not arc_keys:
         return None
     episode_scores: dict[int, float] = {}
     for number, title in published.items():
         title_key = _special_arc_title_key(title)
         if not title_key:
             continue
-        score = _title_similarity(label_key, title_key)
-        if label_key in title_key:
-            score = max(score, 0.95)
-        elif len(title_key) >= 4 and title_key in label_key:
-            score = max(score, 0.95)
+        score = 0.0
+        for arc_key in arc_keys:
+            key_score = _title_similarity(arc_key, title_key)
+            if arc_key in title_key:
+                key_score = max(key_score, 0.95)
+            elif len(title_key) >= 4 and title_key in arc_key:
+                key_score = max(key_score, 0.95)
+            score = max(score, key_score)
         if score >= 0.90:
             episode_scores[number] = score
     ranked: list[tuple[float, tuple[int, ...]]] = []
@@ -2610,7 +2811,7 @@ def _named_arc_season00_run(
         years = [published_years.get(number) for number in window]
         if any(year is None for year in years):
             continue
-        if any(
+        if source_years and any(
             min(abs(int(year) - int(source)) for source in source_years) > 1
             for year in years
             if year is not None
