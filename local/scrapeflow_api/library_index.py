@@ -2183,14 +2183,19 @@ def _partial_season_prefix_evidence(
     tmdb_id: int,
     episode_count: int,
 ) -> tuple[int, int] | None:
-    """Prove a contiguous ``1..N`` run is the prefix of the sole positive
-    season when ``N < season episode_count``.
+    """Prove a contiguous ``1..N`` run is the prefix of the first positive
+    season when ``N < that season's episode_count``.
 
     A not-yet-finished release legitimately has fewer source episodes than the
-    published season total.  The proof only accepts the unique positive season
-    (a multi-season show stays ambiguous) and returns ``(season, total)``; the
-    uncovered tail ``E(N+1)..E(total)`` is left for the ordinary J gap
-    discovery against the TMDB episode catalog, never treated as complete.
+    published season total.  The prefix reading is provable when exactly one
+    positive season is long enough to host the run AND that season is the
+    first positive season: a later-season host would mean the run crossed an
+    earlier season's boundary, where an absolute-ordered batch (earlier
+    season complete plus more) is an equally valid reading and the run stays
+    ambiguous.  A season declaring exactly ``N`` episodes is a competing
+    complete-season reading and also keeps the proof closed.  The uncovered
+    tail ``E(N+1)..E(total)`` is left for the ordinary J gap discovery against
+    the TMDB episode catalog, never treated as complete.
     """
     getter = getattr(tmdb_client, "get", None)
     if not callable(getter):
@@ -2221,10 +2226,21 @@ def _partial_season_prefix_evidence(
             return None
         if raw_season > 0 and raw_count > 0:
             positives.append((raw_season, raw_count))
-    if len(positives) != 1:
+    if not positives:
         return None
-    season, total = positives[0]
-    if total <= episode_count:
+    positives.sort()
+    # A season declaring exactly the run length is a complete-season reading;
+    # if that proof failed for other reasons the run is ambiguous, not a
+    # prefix.
+    if any(count == episode_count for _season, count in positives):
+        return None
+    hosts = [
+        (season, count) for season, count in positives if count > episode_count
+    ]
+    if len(hosts) != 1:
+        return None
+    season, total = hosts[0]
+    if season != positives[0][0]:
         return None
     return (season, total)
 

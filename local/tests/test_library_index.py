@@ -531,6 +531,60 @@ class LibraryIndexTests(unittest.TestCase):
                 },
             )
 
+    def test_partial_prefix_of_first_season_survives_a_shorter_later_season(self) -> None:
+        """A ``1..N`` run is the first season's prefix when it is the only
+        season long enough to host it (犬夜叉 001-100 of 167 with a 26-episode
+        sequel season)."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99007, {1: 8, 2: 4})
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                [f"One.Season.Show.E{episode:02d}.mkv" for episode in range(1, 7)],
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bare-partial-multiseason",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_bare_episodes",
+                    "tmdb_id": 99007,
+                    "season": 1,
+                    "episode_count": 6,
+                    "episode_tokens": [f"S01E{episode:02d}" for episode in range(1, 7)],
+                },
+            )
+
+    def test_partial_prefix_stays_uncertain_when_two_seasons_could_host_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99008, {1: 8, 2: 9})
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                [f"One.Season.Show.E{episode:02d}.mkv" for episode in range(1, 7)],
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bare-partial-ambiguous",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIn("裸 E", record.attention or "")
+
+    def test_partial_prefix_never_lands_on_a_later_season(self) -> None:
+        """A run that crossed the first season in absolute order could be an
+        absolute batch (first season complete plus more), so a later-season
+        prefix reading stays unproven."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99009, {1: 4, 2: 9})
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                [f"One.Season.Show.E{episode:02d}.mkv" for episode in range(1, 7)],
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bare-partial-later-season",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIn("裸 E", record.attention or "")
+
     def test_complete_naked_numeric_source_gets_a_revalidatable_single_season_proof(self) -> None:
         """A clean ``01.mp4`` … ``N.mp4`` run is proven only by D/TMDB.
 
