@@ -5828,11 +5828,26 @@ def _propagate_explicit_video_episode_overrides(
     return changed
 
 
+_EXPLICIT_BETA_ALTERNATE_RE = re.compile(
+    r"\[\s*(?P<ordinal>\d{1,3})\s*(?:B|β)\s*\]",
+    re.IGNORECASE,
+)
+
+
 def _map_explicit_beta_alternate(
     items: Iterable[dict[str, Any]],
     official_title_variants: Mapping[int, Sequence[str]],
 ) -> int:
-    """Map an explicit ``23B/23β`` release to one official beta special."""
+    """Map an explicit ``[23B]``/``[12β]`` release to one official beta special.
+
+    A letter-suffixed bracket ordinal names the beta-route alternate cut of
+    that episode — its own release coordinate beside the plain run, never a
+    second member of the integer run.  The marker alone is not identity
+    evidence: the multilingual official titles must name exactly one beta
+    special (``β``/``BETA``/``Missing Link`` wording), and each marked file
+    then inherits that special's Season 00 coordinate while keeping its own
+    ordinal as the edition tag.
+    """
     beta_title = re.compile(
         r"(?:β|BETA|MISSING[ ._-]*LINK|ミッシングリンク|缺失之环|缺失之環)",
         re.IGNORECASE,
@@ -5845,14 +5860,14 @@ def _map_explicit_beta_alternate(
     if len(candidates) != 1:
         return 0
     target = next(iter(candidates))
-    marker = re.compile(r"\[\s*23\s*(?:B|β)\s*\]", re.IGNORECASE)
     changed = 0
     for item in items:
-        if not marker.search(str(item.get("name", ""))):
+        match = _EXPLICIT_BETA_ALTERNATE_RE.search(str(item.get("name", "")))
+        if match is None:
             continue
         item["_episode_kind_override"] = "special"
         item["_episode_key_override"] = target
-        item["_edition_override"] = "23β"
+        item["_edition_override"] = f"{int(match.group('ordinal'))}β"
         changed += 1
     return changed
 
