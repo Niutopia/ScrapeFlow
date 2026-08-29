@@ -3343,6 +3343,11 @@ def execute_new_work_units(
             or not isinstance(candidate_tmdb, int)
             or candidate_tmdb <= 0
             or candidate_tmdb not in needed_parent_tmdbs
+            # A nested special's own root sits below its parent's work root;
+            # seeding it as the family root would chain later same-identity
+            # siblings under that special instead of under the parent show.
+            or layout_targets.get(candidate.work_unit_id, {}).get("relation")
+            == "nested_special"
         ):
             continue
         root: str | None = None
@@ -3528,7 +3533,8 @@ def execute_new_work_units(
                         )
                     if (
                         str(identity.get("media_type") or "") == "tv"
-                                                and isinstance(identity.get("tmdb_id"), int)
+                        and layout.get("relation") != "nested_special"
+                        and isinstance(identity.get("tmdb_id"), int)
                         and not isinstance(identity.get("tmdb_id"), bool)
                     ):
                         executed_tv_roots[int(identity["tmdb_id"])] = str(
@@ -3583,7 +3589,8 @@ def execute_new_work_units(
                     )
                 if (
                     str(identity.get("media_type") or "") == "tv"
-                                        and isinstance(identity.get("tmdb_id"), int)
+                    and layout.get("relation") != "nested_special"
+                    and isinstance(identity.get("tmdb_id"), int)
                     and not isinstance(identity.get("tmdb_id"), bool)
                 ):
                     executed_tv_roots[int(identity["tmdb_id"])] = str(
@@ -3669,7 +3676,8 @@ def execute_new_work_units(
                 )
             if (
                 str(identity.get("media_type") or "") == "tv"
-                                and isinstance(identity.get("tmdb_id"), int)
+                and layout.get("relation") != "nested_special"
+                and isinstance(identity.get("tmdb_id"), int)
                 and not isinstance(identity.get("tmdb_id"), bool)
             ):
                 executed_tv_roots[int(identity["tmdb_id"])] = str(

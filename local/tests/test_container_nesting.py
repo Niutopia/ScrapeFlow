@@ -686,6 +686,72 @@ class ContainerNestingTests(unittest.TestCase):
             {event["parent_path"] for event in events}, {"/library/番剧"},
         )
 
+    def test_same_identity_specials_all_nest_under_the_main_sibling_root(self) -> None:
+        """Two same-identity specials must not chain under each other.
+
+        A special unit shares its parent's TMDB identity, and the family root
+        map is keyed by that identity.  Without excluding nested specials from
+        registering their own (deeper) roots, the second special would plan
+        below the first special's directory instead of below the regular
+        sibling's show root.
+        """
+        files = {
+            "/incoming/Same Family/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Same Family/Main OVA/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/Same Family/Main SP/S01E01.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, events = self._setup(files)
+        root_id = self._root(runner, "/incoming/Same Family")
+        analyze_root_boundaries(
+            alist, "/incoming/Same Family",
+            root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(records), 3)
+        current = []
+        for record in records:
+            leaf = record.source_paths[0].rstrip("/").rsplit("/", 1)[-1]
+            markers = ["OVA"] if leaf == "Main OVA" else (["SP"] if leaf == "Main SP" else [])
+            current.append(replace(
+                record,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 500,
+                    "title": "Main",
+                    "decision_trace": {
+                        "physical_special_markers": markers,
+                        "official_titles": ["Main"],
+                    },
+                },
+                reconciliation_outcome="new_work",
+            ))
+        save_work_unit_records(state_root, root_id, current)
+
+        layout = _container_layout_targets(runner, runner.get_job(root_id), current)
+        main = self._record_for_source_leaf(current, "Main")
+        self.assertEqual(layout[main.work_unit_id]["relation"], "direct_tv")
+        for leaf in ("Main OVA", "Main SP"):
+            special = self._record_for_source_leaf(current, leaf)
+            self.assertEqual(
+                layout[special.work_unit_id]["relation"], "nested_special",
+            )
+            self.assertEqual(layout[special.work_unit_id]["parent_tmdb_id"], 500)
+
+        execute_new_work_units(runner, state_root, root_id)
+
+        self.assertEqual(len(events), 3)
+        family_root = "/library/番剧/Same Family/Work (500)"
+        for event in events:
+            self.assertIn(event["parent_path"], {"/library/番剧/Same Family", family_root})
+        special_events = [
+            event for event in events
+            if event["parent_path"] != "/library/番剧/Same Family"
+        ]
+        self.assertEqual(len(special_events), 2)
+        for event in special_events:
+            self.assertEqual(event["parent_path"], family_root)
+
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
         files = {
             "/incoming/Collection/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
