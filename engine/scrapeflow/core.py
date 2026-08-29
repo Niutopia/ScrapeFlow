@@ -202,7 +202,8 @@ EPISODE_THEME_VARIANT_RE = re.compile(
 # never carry a story coordinate, so they count as special context — left
 # at source — instead of blocking the plan for the episodes around them.
 _NON_STORY_ASSET_RE = re.compile(
-    r"\[\s*(?:\w{1,12}\s+)?(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?)\s*\]"
+    r"\[\s*(?:\w{1,12}\s+)?(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?"
+    r"(?:[\s_]*EP\s*\d+)?)\s*\]"
     r"|\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]",
     re.IGNORECASE,
 )
@@ -2068,11 +2069,17 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
         r"(?:^|[^A-Za-z0-9])(?:EP?|E)\s*0*(\d{1,4})(?:$|[\s._\-\[\]()])",
         r"第\s*0*(\d{1,4})\s*(?:话|話|集)",
     ]
-    for pattern in regular_patterns:
-        match = re.search(pattern, clean, re.IGNORECASE)
-        if match:
-            return EpisodeKey("regular", int(match.group(1)))
+    # A structurally non-story asset name (``[NCOP03_EP58]`` — a creditless
+    # opening *used from* episode 58, where the EP annotation is a usage
+    # range, not the asset's own ordinal) must not read ANY ordinal from the
+    # weak regular patterns below.  Stronger tokens above — an explicit
+    # SxxExx coordinate or a pure numeric bracket — still win, so a genuine
+    # episode that merely carries a theme bracket keeps its ordinal.
     if not _NON_STORY_ASSET_RE.search(clean):
+        for pattern in regular_patterns:
+            match = re.search(pattern, clean, re.IGNORECASE)
+            if match:
+                return EpisodeKey("regular", int(match.group(1)))
         # A bare number immediately followed by a roman-numeral sequel
         # marker is the show-title composite (``Mob Psycho 100 II`` — the
         # 100 belongs to the title, the II to the season), never an episode

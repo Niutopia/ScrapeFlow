@@ -169,6 +169,24 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             self.assertIsNotNone(key, name)
             self.assertEqual(key.display, expected, name)
 
+    def test_theme_asset_with_ep_usage_annotation_is_unparsed(self) -> None:
+        """``[NCOP03_EP58]`` is a creditless opening used FROM episode 58.
+
+        The ``EP`` annotation marks the usage range of a theme asset, not the
+        asset's own ordinal.  The asset vocabulary must recognize the
+        annotated bracket, and the weak regular patterns (bare ``EP?\d+``
+        tokens above all) must stay suppressed for the whole asset name —
+        otherwise the asset parses as E58, an ordinal the catalog may not
+        carry, and one such file aborts the entire season plan.  Stronger
+        tokens still win (``Show [23][NCOP]`` keeps E23).
+        """
+        for name in (
+            "[TUDO&Ygm] Tensei Shitara Slime Datta Ken 3rd Season [NCOP03_EP58][Ma10p_2160p][x265_flac].mkv",
+            "[Ygm] Mob Psycho 100 III [NCED_EP01][Ma10p_2160p][x265_flac].mkv",
+            "[Ygm] Show [ED_EP12][Ma10p_2160p].mkv",
+        ):
+            self.assertIsNone(extract_episode_key(name), name)
+
     def test_non_story_assets_do_not_inherit_a_parent_ordinal(self) -> None:
         """A sequel digit in the parent title is not an asset's episode.
 
