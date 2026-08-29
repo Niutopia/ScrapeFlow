@@ -1544,6 +1544,30 @@ def _tv_season_fragment_entry(client: Any, tmdb_id: int) -> bool | None:
     return min(numbers) >= 2
 
 
+def _movie_release_evidence_missing(client: Any, tmdb_id: int) -> bool:
+    """Whether a movie row has no release evidence anywhere in TMDB.
+
+    A search row without a date can still belong to a real film, so only a
+    detail probe that finds NEITHER a release date NOR a positive runtime
+    marks the entry as catalogue junk — TMDB itself never dated or timed
+    it.  Caller bounds the probe to the first few candidates.
+    """
+    try:
+        details = client.get(f"/movie/{tmdb_id}")
+    except ApiError:
+        return False
+    runtime = details.get("runtime")
+    has_runtime = (
+        isinstance(runtime, int)
+        and not isinstance(runtime, bool)
+        and runtime > 0
+    )
+    has_release_year = bool(
+        re.search(r"(?:19|20)\d{2}", str(details.get("release_date") or ""))
+    )
+    return not has_release_year and not has_runtime
+
+
 def _score_identity_candidate(
     raw: Mapping[str, Any],
     *,
@@ -1724,13 +1748,22 @@ def _score_identity_candidate(
     season_fragment_score = 0.0
     if raw.get("season_fragment_entry") is True:
         season_fragment_score = -0.30
+    release_evidence_score = 0.0
+    if raw.get("movie_release_evidence_missing") is True:
+        release_evidence_score = -0.30
     confidence = max(
         0.0,
-        min(1.0, confidence + special_marker_score + season_fragment_score),
+        min(
+            1.0,
+            confidence + special_marker_score + season_fragment_score
+            + release_evidence_score,
+        ),
     )
     blockers: list[str] = []
     if raw.get("season_fragment_entry") is True:
         blockers.append("season_fragment_entry")
+    if raw.get("movie_release_evidence_missing") is True:
+        blockers.append("movie_release_evidence_missing")
     if wrong_year:
         blockers.append("year_conflict")
     if raw["cross_script"] and alias_score < 0.88:
@@ -1778,6 +1811,7 @@ def _score_identity_candidate(
         "movie_form_alignment_score": round(movie_form_alignment_score, 6),
         "special_marker_score": round(special_marker_score, 6),
         "season_fragment_score": round(season_fragment_score, 6),
+        "release_evidence_score": round(release_evidence_score, 6),
         "context_score": round(context_score, 6),
         "final_score": round(confidence, 6),
     }
@@ -1996,6 +2030,19 @@ def auto_match_tmdb(
             season_fragment_entry: bool | None = None
             if candidate_type == "tv" and index < 5:
                 season_fragment_entry = _tv_season_fragment_entry(client, tmdb_id)
+            movie_release_evidence: Mapping[str, object] = {}
+            if (
+                candidate_type == "movie"
+                and index < 5
+                and year == "未知年份"
+            ):
+                # A search row without a date can still be a real film; only
+                # a detail probe with neither date nor runtime marks junk.
+                movie_release_evidence = {
+                    "movie_release_evidence_missing": _movie_release_evidence_missing(
+                        client, tmdb_id
+                    ),
+                }
             if expected_episode_count and candidate_type == "tv" and index < 5:
                 try:
                     details = client.get(f"/tv/{tmdb_id}")
@@ -2022,6 +2069,7 @@ def auto_match_tmdb(
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
+                **movie_release_evidence,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
@@ -2791,6 +2839,19 @@ def auto_match_from_evidence(
                     source_markers=physical_special_markers,
                     source_episode_count=physical_special_episode_count,
                 )
+            movie_release_evidence: Mapping[str, object] = {}
+            if (
+                candidate_type == "movie"
+                and index < 5
+                and year == "未知年份"
+            ):
+                # A search row without a date can still be a real film; only
+                # a detail probe with neither date nor runtime marks junk.
+                movie_release_evidence = {
+                    "movie_release_evidence_missing": _movie_release_evidence_missing(
+                        client, tmdb_id
+                    ),
+                }
             raw_candidates.append({
                 "media_type": candidate_type,
                 "tmdb_id": tmdb_id,
@@ -2809,6 +2870,8 @@ def auto_match_from_evidence(
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
+                **movie_release_evidence,
+                **physical_special_evidence,
                 "strict_naked_numeric_video_run": strict_naked_numeric_guard,
                 "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
                 "naked_numeric_clean_boundary_query_sent": bool(
@@ -2824,7 +2887,6 @@ def auto_match_from_evidence(
                     bool(boundary_years) and year in boundary_years
                 ),
                 "naked_numeric_boundary_years": tuple(sorted(boundary_years)),
-                **physical_special_evidence,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
