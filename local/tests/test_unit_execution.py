@@ -43,7 +43,11 @@ from local.scrapeflow_api.unit_execution import (
     rereview_executed_unit_gaps,
 )
 
-from local.tests.test_library_index import IndexAList, _nfo_tv
+from local.tests.test_library_index import (
+    IndexAList,
+    StrictBareEpisodeTMDB,
+    _nfo_tv,
+)
 from local.tests.test_simple_engine_runner import (
     FAKE_VIDEO_BYTES,
     FAKE_VIDEO_SIZE,
@@ -3599,6 +3603,133 @@ class ConsumedSourceContinuationTests(unittest.TestCase):
         self.assertEqual(third[0].outcome, "accepted")
         self.assertIn("/library/番剧/Work (101)/S01E01.mkv", alist.files)
         self.assertNotIn("/incoming/one/S01E01.mkv", alist.files)
+
+    def test_continuation_keeps_the_stored_proof_season(self) -> None:
+        """A consumed-source continuation replans the D-proven season.
+
+        The interrupted write moved a season-2 bracketed run.  The fresh D
+        revalidator cannot recompute that verdict from the consumed source,
+        so the continuation used to fall back to EngineRequest's historical
+        implicit Season 01 default and replan a different season than the
+        one the interrupted write had already partly written — every
+        already-moved target then read back as a missing conflict.
+        """
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        tmdb = StrictBareEpisodeTMDB(101, {2: 2})
+        episodes = [
+            (
+                f"[Ygm] Show [{episode:02d}][Ma10p_2160p].mkv",
+                episode,
+            )
+            for episode in range(1, 3)
+        ]
+        alist = IndexAList(
+            {
+                f"/incoming/one/{name}": FAKE_VIDEO_BYTES
+                for name, _ in episodes
+            }
+        )
+        plan_calls: list[dict] = []
+        fail_once = {"remaining": 1}
+
+        def planner(request, _alist, _tmdb) -> Plan:
+            plan_calls.append({
+                "source_path": request.source_path,
+                "season": request.season,
+            })
+            target = f"{request.parent_path.rstrip('/')}/Work ({request.tmdb_id})"
+            return Plan(
+                mode="tv",
+                source_root=request.source_path,
+                target_root=target,
+                files=[
+                    PlannedFile(
+                        source_path=f"{request.source_path}/{name}",
+                        source_dir=request.source_path,
+                        original_name=name,
+                        final_name=f"S{request.season:02d}E{episode:02d}.mkv",
+                        target_dir=target,
+                        media_kind="video",
+                        source_size=FAKE_VIDEO_SIZE,
+                    )
+                    for name, episode in episodes
+                ],
+                warnings=[],
+                metadata={
+                    "tmdb_id": request.tmdb_id,
+                    "title": "Work",
+                    "year": "2020",
+                    "poster_path": None,
+                    "backdrop_path": None,
+                },
+            )
+
+        def executor(plan):
+            for item in plan.files:
+                source = f"{item.source_dir.rstrip('/')}/{item.original_name}"
+                target = f"{item.target_dir.rstrip('/')}/{item.final_name}"
+                if source in alist.files:
+                    # The write shape under test moves AND renames, like the
+                    # real executor's move-then-rename ladder.
+                    alist.move(item.source_dir, item.target_dir, [item.original_name])
+                    landed = f"{item.target_dir.rstrip('/')}/{item.original_name}"
+                    if landed != target:
+                        payload = alist.files.pop(landed)
+                        alist.files[target] = payload
+                else:
+                    payload = alist.files.get(target)
+                    if payload is None:
+                        raise RuntimeError(f"continuation target missing: {target}")
+                    if item.source_size is not None and len(payload) != item.source_size:
+                        raise RuntimeError(f"continuation target size drift: {target}")
+            if fail_once["remaining"] > 0:
+                fail_once["remaining"] -= 1
+                raise RuntimeError("injected artifact failure after moves")
+            return {"ok": True, "files": [], "file_count": 0, "artifacts": [], "artifact_count": 0, "cleanup": [], "cleanup_count": 0}
+
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=tmdb, planner=planner,
+            validate=False, library_root="/library", executor=executor,
+        )
+        pending = runner.create_pending_job("/incoming/one", job_id="root-season-cont")
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, "/incoming/one", root_task_id="root-season-cont",
+            state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, "root-season-cont")
+        apply_work_unit_override(
+            state_root, "root-season-cont", records[0].work_unit_id,
+            media_type="tv", tmdb_id=101,
+        )
+        record = reconcile_root_work_units(
+            alist, "/library", state_root, "root-season-cont",
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )[0]
+        self.assertEqual(record.reconciliation_outcome, "new_work")
+        self.assertEqual(
+            (record.reconciliation_evidence or {}).get("kind"),
+            "tmdb_single_positive_season_bracketed_episodes",
+        )
+        self.assertEqual((record.reconciliation_evidence or {}).get("season"), 2)
+
+        # First attempt: the writer moves the season-2 media and fails
+        # during artifacts, leaving a receipt-bearing failed record.
+        first = execute_new_work_units(runner, state_root, "root-season-cont")
+        self.assertEqual(first[0].outcome, "failed")
+        self.assertEqual(plan_calls[0]["season"], 2)
+        self.assertIn("/library/番剧/Work (101)/S02E01.mkv", alist.files)
+        self.assertIn("/library/番剧/Work (101)/S02E02.mkv", alist.files)
+
+        # The continuation must replan the same season: the stored D proof,
+        # not the implicit Season 01 default, carries the request's season.
+        second = execute_new_work_units(runner, state_root, "root-season-cont")
+        self.assertEqual(second[0].outcome, "accepted")
+        self.assertEqual(plan_calls[1]["season"], 2)
+        self.assertIn("/library/番剧/Work (101)/S02E01.mkv", alist.files)
+        self.assertIn("/library/番剧/Work (101)/S02E02.mkv", alist.files)
 
 
 class SupersededExecutedCarrierTests(unittest.TestCase):

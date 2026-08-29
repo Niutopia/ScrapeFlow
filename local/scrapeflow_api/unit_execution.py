@@ -2536,6 +2536,7 @@ def _request_for_unit(
     # gate below: the D proof revalidator and the exact manifest both read
     # the (now consumed) provider source and would fail before the planner
     # could rebuild the continuation plan.
+    proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
     if continuation_manifest is None:
         try:
             proof_season = _revalidated_reconciliation_season(
@@ -2553,7 +2554,22 @@ def _request_for_unit(
             proof_season = None
     else:
         proof_season = None
-    proof = SingleSeasonEpisodeProof.from_dict(record.reconciliation_evidence)
+    if continuation_manifest is not None and proof_season is None:
+        # The interrupted write's receipt was planned from the stored D
+        # verdict, and the fresh revalidator cannot recompute that verdict
+        # from the consumed source.  Keep the durable stored season so the
+        # rebuilt plan targets the same episodes: without it the request
+        # would fall to the historical implicit Season 01 default and plan
+        # a different season than the one the interrupted write partly
+        # wrote.  The tmdb identity guard mirrors the equality check the
+        # fresh revalidator performs between record and recomputed proof.
+        proof_season = (
+            proof.season
+            if proof is not None
+            and proof.tmdb_id == tmdb_id
+            and proof.season > 0
+            else None
+        )
     is_release_dash_proof = (
         proof is not None
         and proof.evidence_kind == _RELEASE_DASH_EPISODE_EVIDENCE_KIND
