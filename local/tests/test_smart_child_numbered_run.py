@@ -192,3 +192,121 @@ class SmartChildNumberedRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MisplacedForeignSeasonSubtitleTests(unittest.TestCase):
+    def test_misplaced_foreign_season_subtitles_do_not_abort_sibling_seasons(self) -> None:
+        """A foreign season's sidecars under another season never kill the plan.
+
+        ``第二季/备份字幕/`` can carry Season 3 external subtitles the
+        uploader misplaced.  They group as an undeclared Season 3 bucket with
+        zero videos; executing that bucket as a TV sub-plan raises the generic
+        "no video" failure and aborts the whole otherwise-valid Season 2 plan.
+        The subtitle-only bucket must be preserved in the source with a
+        warning instead, exactly like a declared subtitle-only season.
+        """
+
+        class SubtitleAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class ThreeSeasonTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/tv/650":
+                    return {
+                        "name": "Psychic Show",
+                        "original_name": "Psychic Show",
+                        "first_air_date": "2016-07-12",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 9},
+                            {"season_number": 1, "episode_count": 12},
+                            {"season_number": 2, "episode_count": 13},
+                            {"season_number": 3, "episode_count": 12},
+                        ],
+                    }
+                if path.startswith("/tv/650/season/"):
+                    season = int(path.rsplit("/", 1)[1])
+                    counts = {0: 9, 1: 12, 2: 13, 3: 12}
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "name": f"Episode {number}",
+                                "air_date": f"2016-07-{number:02d}",
+                                "runtime": 24,
+                            }
+                            for number in range(1, counts.get(season, 0) + 1)
+                        ],
+                    }
+                if path == "/tv/650/alternative_titles":
+                    return {"results": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        season_root = "/quark/影视/待刮削/L 4k Psychic Show/第二季"
+        source_files = [
+            {
+                "name": f"[Ygm] Psychic Show II [{number:02d}][Ma10p_2160p].mkv",
+                "full_path": (
+                    season_root
+                    + f"/[Ygm] Psychic Show II [{number:02d}][Ma10p_2160p].mkv"
+                ),
+                "size": FAKE_VIDEO_SIZE + number * 1024,
+                "is_dir": False,
+            }
+            for number in range(1, 14)
+        ]
+        source_files.extend(
+            {
+                "name": f"[Ygm] Psychic Show III [{number:02d}][Ma10p_2160p].ass",
+                "full_path": (
+                    season_root
+                    + "/备份字幕/"
+                    + f"[Ygm] Psychic Show III [{number:02d}][Ma10p_2160p].ass"
+                ),
+                "size": 40_000,
+                "is_dir": False,
+            }
+            for number in range(1, 13)
+        )
+        plan = build_tv_plan_smart(
+            auto_episode_mode=True,
+            alist=SubtitleAList(),
+            tmdb_client=ThreeSeasonTMDB(),
+            src_path=season_root,
+            parent_path="/quark/影视/番剧",
+            tmdb_id=650,
+            season=2,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            ignore_orphan_temp=False,
+            source_files=source_files,
+            source_declared_seasons=(2,),
+            media_root="/quark/影视",
+        )
+
+        planned = {item.source_path for item in plan.files}
+        self.assertEqual(len(planned), 13)
+        self.assertFalse(
+            any("备份字幕" in path for path in planned),
+            "misplaced foreign-season subtitles must not be written",
+        )
+        self.assertFalse(
+            any(
+                "备份字幕" in str(item.source_path)
+                for item in [*plan.cleanup_files, *plan.problem_files]
+            ),
+        )
+        deferred = plan.scan_report.get("deferred_subtitle_only_seasons") or []
+        self.assertTrue(
+            any(entry.get("season") == 3 for entry in deferred),
+            msg=deferred,
+        )
+        self.assertTrue(
+            any("Season 03" in warning for warning in plan.warnings),
+            msg=plan.warnings,
+        )

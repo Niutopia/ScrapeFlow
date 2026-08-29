@@ -2776,12 +2776,16 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(plan.problem_files, [])
 
     def test_declared_subtitle_only_season_is_retained_without_blocking_tv_plan(self) -> None:
-        """B/W-proven empty seasons are gaps, never subtitle-only writes.
+        """Subtitle-only seasons are gaps, never writes, declared or not.
 
-        This exercises the real smart multi-season split.  Without the B/W
-        declaration it must preserve the existing fail-closed no-video error;
-        with the declaration it plans only the two playable seasons and leaves
-        the Season 02 SUP file outside files, cleanup, and problem rows.
+        This exercises the real smart multi-season split.  A subtitle-only
+        season group is preserved in the source with a plan warning even
+        without the B/W declaration: misplaced foreign-season sidecars
+        (Season 3 subtitles stored under Season 2's 备份字幕) group as an
+        undeclared season, and aborting there would kill the sibling
+        seasons' valid plans.  The plan writes only the two playable seasons
+        and leaves the Season 02 SUP file outside files, cleanup, and
+        problem rows.
         """
         class PlannerAList:
             def try_list(self, _path: str, refresh: bool = False) -> list[dict[str, object]]:
@@ -2854,8 +2858,14 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             "media_root": "/quark/影视",
         }
 
-        with self.assertRaisesRegex(PlanError, "未找到剧集视频文件"):
-            build_tv_plan_smart(**kwargs)
+        undeclared_plan = build_tv_plan_smart(**kwargs)
+        self.assertEqual(
+            {item.source_path for item in undeclared_plan.files},
+            {
+                source_root + "/S01/Northwind.Show.S01E01.mkv",
+                source_root + "/S03/Northwind.Show.S03E01.mkv",
+            },
+        )
 
         plan = build_tv_plan_smart(
             **kwargs,

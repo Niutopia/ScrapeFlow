@@ -2735,10 +2735,15 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         # turns the whole otherwise-valid multi-season work into the generic
         # "no video" failure.  Keep the sidecars in their source directory,
         # surface that decision in the persisted plan, and let the final
-        # official-season audit create the corresponding media gap.  This is
-        # deliberately narrow: an unplayable group containing anything other
-        # than subtitles remains a planning error, and a source with no
-        # executable season at all still fails closed below.
+        # official-season audit create the corresponding media gap.  A
+        # subtitle-only group is preserved for ANY season number: a batch of
+        # misplaced foreign-season sidecars (Season 3 subtitles stored under
+        # Season 2's 备份字幕) groups as an undeclared season whose execution
+        # would abort the sibling seasons' valid plans the same way.  This is
+        # deliberately narrow about group content: an unplayable group
+        # containing anything other than subtitles remains a planning error,
+        # and a source with no executable season at all still fails closed
+        # below.
         preserved_subtitle_only_seasons: dict[int, list[dict[str, Any]]] = {}
         if season_groups and any(
             any(
@@ -2757,8 +2762,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     executable_season_groups[season_number] = group
                     continue
                 if (
-                    season_number in source_declared_seasons
-                    and group
+                    group
                     and all(
                     Path(str(item.get("name", ""))).suffix.lower() in SUBTITLE_EXTS
                     for item in group
