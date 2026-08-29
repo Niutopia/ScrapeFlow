@@ -2254,14 +2254,23 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 if not videos:
                     continue
                 try:
-                    child_queries = list(dict.fromkeys([
-                        _query_from_source(join_remote(source_root, segment)),
-                        *(
-                            query
-                            for item in videos[:3]
-                            for query in _movie_queries_from_item(item)
-                        ),
-                    ]))
+                    # Bare ordinals are release-local season numbering, not
+                    # work identity.  A TMDB junk movie titled ``#002`` (2019)
+                    # answers the naked numeric query exactly, so a numbered
+                    # folder such as ``001-100`` must never dispatch ``002``
+                    # as a title query in either namespace.
+                    child_queries = list(dict.fromkeys(
+                        query
+                        for query in [
+                            _query_from_source(join_remote(source_root, segment)),
+                            *(
+                                query
+                                for item in videos[:3]
+                                for query in _movie_queries_from_item(item)
+                            ),
+                        ]
+                        if _usable_release_title_query(query)
+                    ))
                     child_episode_count = len({
                         key.number
                         for item in videos
@@ -2366,6 +2375,21 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                             f"无法识别子作品目录: {segment}"
                         )
                     if child_match.media_type == "movie":
+                        segment_episode_numbers = {
+                            key.number
+                            for item in videos
+                            if (key := extract_episode_key(str(item.get("name", "")))) is not None
+                            and key.kind == "regular"
+                            and not key.end_number
+                        }
+                        if len(segment_episode_numbers) >= 3:
+                            # Mirror of the franchise-member guard: a child
+                            # segment holding a multi-episode numbered run is
+                            # release-local season packaging, never one film's
+                            # file set.  Refuse the swallow and leave the run
+                            # to the ordinary season evidence passes instead
+                            # of registering its siblings as residue.
+                            continue
                         movie_groups[child_match.tmdb_id].extend(group_items)
                         consumed.update(str(item["full_path"]) for item in group_items)
                         continue
