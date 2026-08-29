@@ -2046,13 +2046,25 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
     if quoted_ordinal:
         return EpisodeKey("regular", int(quoted_ordinal.group(1)))
 
+    # The bare-number fallback is the weakest ordinal signal: in a non-story
+    # asset name it can only be the title's sequel digit (``Steins;Gate 0
+    # [NCOP01]`` → fake ``E00``, which no catalog carries and which would
+    # block the plan).  When the name is structurally a non-story asset, that
+    # digit belongs to the title: leave the asset unparsed so the
+    # special-context path keeps it at source.  Every stronger token above —
+    # an explicit SxxExx or a pure numeric bracket — still wins over the
+    # asset marker, so a numbered episode that merely carries a theme bracket
+    # (``Show [23][NCOP]``) keeps its ordinal.
     regular_patterns = [
         r"(?:^|[^A-Za-z0-9])S\d{1,2}\s*E\s*0*(\d{1,4})(?:$|[^0-9])",
         SEASON_DASH_EPISODE_RE.pattern,
         r"(?:^|[^A-Za-z0-9])(?:EP?|E)\s*0*(\d{1,4})(?:$|[\s._\-\[\]()])",
         r"第\s*0*(\d{1,4})\s*(?:话|話|集)",
-        r"(?:^|[\s_\-.(])0*(\d{1,3})(?:[\s_\-.()]|$)",
     ]
+    if not _NON_STORY_ASSET_RE.search(clean):
+        regular_patterns.append(
+            r"(?:^|[\s_\-.(])0*(\d{1,3})(?:[\s_\-.()]|$)",
+        )
     for pattern in regular_patterns:
         match = re.search(pattern, clean, re.IGNORECASE)
         if match:

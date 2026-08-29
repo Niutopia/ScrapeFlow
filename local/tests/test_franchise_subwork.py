@@ -23,7 +23,7 @@ from engine.scrapeflow.unit_identity import (
 )
 from engine.scrapeflow.work_units import load_work_unit_records
 
-from engine.scrapeflow.core import _has_special_context
+from engine.scrapeflow.core import _has_special_context, extract_episode_key
 from engine.scrapeflow.source_inventory import SourceFile
 from local.scrapeflow_api.library_index import (
     SingleSeasonEpisodeProof,
@@ -107,6 +107,33 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             "[G] Show [Ma10p_2160p].mkv",
         ):
             self.assertFalse(_special_context(name), name)
+
+    def test_non_story_assets_leave_the_bare_number_fallback(self) -> None:
+        """A sequel title digit on a non-story asset is not an episode.
+
+        ``Steins;Gate 0 [NCOP01]`` has no numeric episode bracket, so the
+        bare-number fallback used to read the sequel ``0`` as ``E00`` — a
+        coordinate no catalog carries, which blocked the plan instead of
+        staying at source.  Stronger tokens still win over the asset marker.
+        """
+        for name in (
+            "[TUDO&Ygm] Steins;Gate 0 [NCOP01][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate 0 [NCED02][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate 0 [Game OP][Ma10p_2160p][x265_flac].mkv",
+            "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv",
+        ):
+            self.assertIsNone(extract_episode_key(name), name)
+        # A pure numeric bracket, an explicit token, and a revision keep
+        # their ordinal even beside a theme bracket or a sequel digit.
+        for name, expected in (
+            ("[TUDO&Ygm] Steins;Gate 0 [01][Ma10p_2160p][x265_flac_ass].mkv", "E01"),
+            ("[TUDO&Ygm] Steins;Gate 0 [24][Ma10p_2160p][x265_flac_ass].mkv", "E24"),
+            ("Show S01E05 [NCOP].mkv", "E05"),
+            ("Show [23][NCOP].mkv", "E23"),
+        ):
+            key = extract_episode_key(name)
+            self.assertIsNotNone(key, name)
+            self.assertEqual(key.display, expected, name)
 
 
 class ProofReceiptShapeTests(unittest.TestCase):
