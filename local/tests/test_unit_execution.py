@@ -525,6 +525,98 @@ class UnitExecutionTests(unittest.TestCase):
 
         self.assertEqual(request.season, 1)
 
+    def test_named_season_window_reaches_planner_request(self) -> None:
+        """C's officially proved named-season window becomes the F season.
+
+        A continuation arc ships as its own release package years after the
+        parent premiered (``某剧完结篇`` = the parent's Season 2 airing in
+        the boundary year).  C records the officially named season window in
+        the identity's decision trace; without carrying it into the request,
+        F would fall back to EngineRequest's Season 01 default and map the
+        release-local ordinals onto the wrong season.
+        """
+        source = "/incoming/某剧完结篇（2009）全26集"
+        files = {
+            f"{source}/01「第一话」.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/02「第二话」.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiSeasonTMDB(91004, {1: 12, 2: 2}),
+        )
+        root_task_id = "root-named-season-window"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        records[0] = replace(
+            records[0],
+            identity_status="confirmed",
+            identity={
+                "media_type": "tv",
+                "tmdb_id": 91004,
+                "title": "某剧",
+                "year": "2000",
+                "confidence": 1.0,
+                "decision_trace": {
+                    "season_window_season": 2,
+                    "season_window_year": "2009",
+                    "season_window_name": "某剧:完结篇",
+                },
+            },
+            reconciliation_outcome="new_work",
+        )
+        save_work_unit_records(state_root, root_task_id, records)
+
+        request = _request_for_unit(runner, records[0], root_task_id, state_root)
+
+        self.assertEqual(request.season, 2)
+        self.assertEqual(request.source_path, source)
+
+    def test_named_season_window_conflicts_with_scope_season_visibly(self) -> None:
+        """A directory season marker disagreeing with the window is an error."""
+        source = "/incoming/某剧第二季"
+        files = {
+            f"{source}/01「第一话」.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/02「第二话」.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, _planner_events, _executor_events = self._setup(
+            files,
+            tmdb=MultiSeasonTMDB(91005, {1: 12, 2: 2, 3: 2}),
+        )
+        root_task_id = "root-window-scope-conflict"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        records[0] = replace(
+            records[0],
+            identity_status="confirmed",
+            identity={
+                "media_type": "tv",
+                "tmdb_id": 91005,
+                "title": "某剧",
+                "year": "2000",
+                "confidence": 1.0,
+                "decision_trace": {
+                    "season_window_season": 3,
+                    "season_window_year": "2009",
+                    "season_window_name": "某剧:完结篇",
+                },
+            },
+            reconciliation_outcome="new_work",
+        )
+        save_work_unit_records(state_root, root_task_id, records)
+
+        with self.assertRaisesRegex(ValueError, "来源目录显式季号与身份命名季窗口冲突"):
+            _request_for_unit(runner, records[0], root_task_id, state_root)
+
+        self.assertEqual(alist.move_calls, [])
+
     def test_root_scope_pause_after_plan_blocks_unit_formal_writer(self) -> None:
         """F/G/H must pass the root predicate into the child executor."""
         files = {"/incoming/one/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}

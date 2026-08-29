@@ -2411,6 +2411,21 @@ def _request_for_unit(
         "tmdb_id": tmdb_id,
     }
     season = identity.get("season")
+    # A named-season window (``犬夜叉完结篇`` = the parent's Season 2 that
+    # officially aired inside the boundary years) is a C-proven identity
+    # fact recorded in the decision trace.  It carries the same authority as
+    # an identity season: the smart planner cannot infer it from the
+    # release-local ordinals alone.
+    window_season = None
+    decision_trace = identity.get("decision_trace")
+    if isinstance(decision_trace, dict):
+        window_candidate = decision_trace.get("season_window_season")
+        if (
+            isinstance(window_candidate, int)
+            and not isinstance(window_candidate, bool)
+            and window_candidate >= 0
+        ):
+            window_season = window_candidate
     scope_season = _explicit_single_scope_season(
         state_root, root_task_id, record, scopes,
     )
@@ -2456,15 +2471,23 @@ def _request_for_unit(
             and season != proof_season
         ):
             raise ValueError("D 无季号集号证据季号与身份季号冲突")
+        if window_season is not None and window_season != proof_season:
+            raise ValueError("D 季集证据与身份命名季窗口冲突")
         if scope_season is not None and scope_season != proof_season:
             raise ValueError("D 季集证据与来源目录显式季号冲突")
         # This is an explicit, freshly revalidated F request field—not
         # EngineRequest's historical implicit Season 01 default.
         payload["season"] = proof_season
     elif isinstance(season, int) and not isinstance(season, bool) and season > 0:
+        if window_season is not None and window_season != season:
+            raise ValueError("身份季号与身份命名季窗口冲突")
         if scope_season is not None and scope_season != season:
             raise ValueError("身份季号与来源目录显式季号冲突")
         payload["season"] = season
+    elif window_season is not None:
+        if scope_season is not None and scope_season != window_season:
+            raise ValueError("来源目录显式季号与身份命名季窗口冲突")
+        payload["season"] = window_season
     elif scope_season is not None:
         payload["season"] = scope_season
     elif (
