@@ -757,6 +757,18 @@ def _split_flat_movie_files(
         for file in direct_videos
     ):
         return None
+    # A directory whose every direct video carries a physical-special marker
+    # (``OVA 01 - Riku vs. Kuu`` / ``OVA 02 - Bouru no 'Michi'``) is one
+    # special run, not a package of independently titled feature films.  The
+    # release ordinals only mean anything as a run, and the whole-directory
+    # boundary owns that physical-special evidence for the D/F grammar;
+    # shredding it per file would leave every shard an unpositionable single
+    # special.
+    if all(
+        _DIRECT_RUN_PHYSICAL_SPECIAL_RE.search(file.name)
+        for file in direct_videos
+    ):
+        return None
     # A numbered same-franchise sequence (``01. 俯瞰风景.mkv`` …) is one
     # collection, never a package of independently titled features.
     if any(

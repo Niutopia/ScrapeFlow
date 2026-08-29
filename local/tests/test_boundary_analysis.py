@@ -1271,6 +1271,36 @@ class TestSyntheticCases(unittest.TestCase):
 
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_flat_marker_ordinal_feature_files_stay_one_special_run(self) -> None:
+        """``OVA 01 - Title`` feature files are one special run, not films.
+
+        A physical OVA directory (``OVA 排球少年 陆 VS 空``) ships its
+        extras as marker-ordinal feature files.  Each file is large and
+        independently titled, but the ``OVA NN -`` release-ordinal prefix is
+        episodic evidence of one run owned by the parent show: the flat
+        movie splitter must fail closed and leave the whole directory as
+        one unit for the physical-special grammar.
+        """
+        root = "/quark/影视/待刮削/P 4k 排球少年/OVA 排球少年 陆 VS 空"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "[Ygm] Haikyuu!! OVA 01 - Riku vs. Kuu [Ma10p_2160p][x265_flac_ass].mkv",
+                    "is_dir": False,
+                    "size": 8_000_000_000,
+                },
+                {
+                    "name": "[Ygm] Haikyuu!! OVA 02 - Bouru no 'Michi' [Ma10p_2160p][x265_flac_ass].mkv",
+                    "is_dir": False,
+                    "size": 8_000_000_000,
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1, msg=[c.display_label for c in candidates])
+        self.assertEqual(candidates[0].source_paths, (root,))
+
 
 if __name__ == "__main__":
     unittest.main()
