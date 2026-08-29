@@ -2702,6 +2702,174 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
         self.assertEqual(request.season, 0)
         self.assertIsNone(request.episode_map_path)
 
+    def test_dual_encoded_unnumbered_ova_maps_onto_single_proved_special(self) -> None:
+        """A dual-encoded unnumbered OVA scope still proves one S00 episode.
+
+        ``03 OVA：黑色的铁碎牙（2008）内封+外挂字幕 1080P`` holds two encodes of
+        one special: a hardsub mp4 named only by release packaging and a
+        softsub mkv named by the arc title.  The boundary's sibling-position
+        prefix ``03 OVA`` feeds the scope-level ordinal parse through the
+        ancestor path, and the boundary label itself is too polluted for arc
+        matching — the proof must ignore ancestor-fed ordinals, anchor the
+        arc title on the video stems, and let every anchor agree on exactly
+        one published Season 00 episode.
+        """
+        class DualEncodedOvaTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **params: object) -> dict[str, object]:
+                if path == "/search/tv":
+                    return {"results": []}
+                if path == "/search/movie":
+                    return {"results": []}
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "first_air_date": "2000-10-16",
+                        "number_of_seasons": 2,
+                        "number_of_episodes": 14,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 1, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 13, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": 1,
+                                "air_date": "2008-07-30",
+                                "name": "黑色铁碎牙",
+                            },
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2000-10-16",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 14)
+                        ]
+                    }
+                return {}
+
+        source = "/incoming/X 4k 示例剧"
+        unit = f"{source}/03 OVA：黑色的铁碎牙（2008）内封+外挂字幕 1080P"
+        files = {
+            f"{unit}/1080P 内嵌简中字幕.mp4": FAKE_VIDEO_BYTES,
+            f"{unit}/1080P 外挂简中字幕/OVA：黑色的铁碎牙 1080P.mkv": FAKE_VIDEO_BYTES,
+            f"{unit}/1080P 外挂简中字幕/简中.ass": b"[Script Info]\n",
+        }
+        tmdb = DualEncodedOvaTMDB(99104)
+        state_root, alist, runner = self._setup(files, tmdb)
+        root_task_id = "root-dual-encoded-ova"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 1)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=99104,
+        )
+        record = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )[0]
+        self.assertEqual(
+            record.reconciliation_evidence and record.reconciliation_evidence["episode_tokens"],
+            ["S00E01"],
+        )
+        request = _request_for_unit(runner, record, root_task_id, state_root)
+        self.assertEqual(request.season, 0)
+        self.assertIsNone(request.episode_map_path)
+
+    def test_two_distinct_unnumbered_ova_stems_stay_unproven(self) -> None:
+        """Two arc-titled stems that win different episodes stay unproven.
+
+        The same ordinal-free admission must not collapse two distinct
+        specials onto one episode: when the video stems match two different
+        published Season 00 episodes, the proof fails closed instead of
+        silently rewriting one arc onto the other's coordinate.
+        """
+        class TwoArcOvaTMDB:
+            def __init__(self, tmdb_id: int) -> None:
+                self.tmdb_id = tmdb_id
+
+            def get(self, path: str, **params: object) -> dict[str, object]:
+                if path == f"/tv/{self.tmdb_id}":
+                    return {
+                        "name": "示例剧",
+                        "original_name": "示例剧",
+                        "first_air_date": "2000-10-16",
+                        "number_of_seasons": 2,
+                        "number_of_episodes": 15,
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 2, "name": "特别篇"},
+                            {"season_number": 1, "episode_count": 13, "name": "第 1 季"},
+                        ],
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/0":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": 1,
+                                "air_date": "2008-07-30",
+                                "name": "黑色铁碎牙",
+                            },
+                            {
+                                "episode_number": 2,
+                                "air_date": "2008-07-31",
+                                "name": "银色铁碎牙",
+                            },
+                        ]
+                    }
+                if path == f"/tv/{self.tmdb_id}/season/1":
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "air_date": "2000-10-16",
+                                "name": f"第{number}集",
+                            }
+                            for number in range(1, 14)
+                        ]
+                    }
+                return {}
+
+        source = "/incoming/X 4k 示例剧"
+        unit = f"{source}/03 OVA（2008）内封+外挂字幕 1080P"
+        files = {
+            f"{unit}/1080P 外挂简中字幕/OVA：黑色的铁碎牙 1080P.mkv": FAKE_VIDEO_BYTES,
+            f"{unit}/1080P 内嵌简中字幕/OVA：银色铁碎牙 1080P.mp4": FAKE_VIDEO_BYTES,
+        }
+        tmdb = TwoArcOvaTMDB(99105)
+        state_root, alist, runner = self._setup(files, tmdb)
+        root_task_id = "root-two-arc-ova"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(len(records), 1)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=99105,
+        )
+        record = reconcile_root_work_units(
+            alist, "/library", state_root, root_task_id,
+            episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+        )[0]
+        self.assertIsNone(record.reconciliation_evidence)
+
 
         files = {
             f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES

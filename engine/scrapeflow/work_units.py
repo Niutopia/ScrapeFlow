@@ -582,6 +582,39 @@ def physical_special_marker_evidence(
     return _physical_special_marker_evidence(videos)
 
 
+def physical_special_stem_ordinal(name: str) -> int | None:
+    """Return the release ordinal one video's own stem carries alone.
+
+    The shared scope grammar parses ``path + name``, so a sibling-position
+    prefix in an ancestor directory (``03 OVA：…`` inside a numbered bundle)
+    feeds the same reverse marker pattern as a real per-file ordinal.  This
+    stem-only view answers the disambiguating question: does the file itself
+    name a release coordinate?  It applies the same bounded grammar to the
+    stem alone — marker-attached ordinals, reversed ``13 OAV`` forms, and the
+    single standalone delimited ordinal of a marker-bearing stem — and never
+    borrows marker context from ancestor directories.
+    """
+    stem = unicodedata.normalize("NFKC", Path(name).stem)
+    if not stem:
+        return None
+    direct = list(_PHYSICAL_SPECIAL_MARKER_RE.finditer(stem))
+    reverse = list(_REVERSE_PHYSICAL_SPECIAL_MARKER_RE.finditer(stem))
+    matches = direct or reverse
+    for match in matches:
+        value = int(match.group("number"))
+        if not 1900 <= value <= 2099:
+            return value
+    if _PHYSICAL_SPECIAL_TOKEN_RE.search(stem):
+        standalone = {
+            int(match.group(1))
+            for match in _STANDALONE_SPECIAL_NUMBER_RE.finditer(stem)
+            if 0 < int(match.group(1)) <= 999
+        }
+        if len(standalone) == 1:
+            return next(iter(standalone))
+    return None
+
+
 def is_physical_special_video_file(file: SourceFile) -> bool:
     """Whether one video file carries a physical-special marker with an ordinal.
 
@@ -1043,6 +1076,7 @@ __all__ = [
     "EpisodePattern",
     "extract_episode_pattern",
     "physical_special_marker_evidence",
+    "physical_special_stem_ordinal",
     "IdentityEvidence",
     "extract_identity_evidence",
     "WorkUnitRecord",

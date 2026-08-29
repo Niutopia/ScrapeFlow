@@ -66,6 +66,7 @@ from engine.scrapeflow.work_units import (
     is_physical_special_video_file,
     load_work_unit_records,
     physical_special_marker_evidence,
+    physical_special_stem_ordinal,
     save_work_unit_records,
 )
 
@@ -2619,13 +2620,20 @@ def _titled_single_season00_evidence(
     boundary_label: str,
     parent_title: str,
     source_years: Sequence[int] = (),
+    video_names: Sequence[str] = (),
 ) -> SingleSeasonEpisodeProof | None:
     """Prove a single unnumbered titled special as the parent's Season 00.
 
     This is the ordinal-free branch of the shared physical-special grammar:
     the confirmed identity is a regular show whose published Season 00 holds
-    the special, and the boundary label's concrete arc title — not a release
-    ordinal, which does not exist — is the only coordinate evidence.
+    the special, and a concrete arc title — not a release ordinal, which does
+    not exist — is the only coordinate evidence.  The boundary label is the
+    primary anchor; every video stem in scope is a further anchor, because a
+    release bundle whose directory name mixes sibling positions and packaging
+    metadata (``03 OVA：黑色的铁碎牙（2008）内封+外挂字幕 1080P``) can leave
+    the arc title readable only in the file names.  All anchors must agree on
+    exactly one published Season 00 episode: two different winning episodes,
+    or none, stay unproven.
     """
     if not callable(episode_catalog):
         return None
@@ -2633,15 +2641,22 @@ def _titled_single_season00_evidence(
     if loaded is None:
         return None
     published, published_years = loaded
-    number = _titled_single_season00_episode(
-        published,
-        published_years,
-        boundary_label=boundary_label,
-        parent_title=parent_title,
-        source_years=source_years,
-    )
-    if number is None:
+    labels = [str(boundary_label or "")]
+    labels.extend(str(name or "") for name in video_names if name)
+    matched: dict[int, None] = {}
+    for label in labels:
+        number = _titled_single_season00_episode(
+            published,
+            published_years,
+            boundary_label=label,
+            parent_title=parent_title,
+            source_years=source_years,
+        )
+        if number is not None:
+            matched.setdefault(number, None)
+    if len(matched) != 1:
         return None
+    number = next(iter(matched))
     return SingleSeasonEpisodeProof(
         tmdb_id=tmdb_id,
         season=0,
@@ -2843,19 +2858,32 @@ def prove_physical_special_single_season_evidence(
         # ordinal at all, so no run grammar can position it.  Its only
         # bounded coordinate proof is the concrete arc title itself matching
         # exactly one published Season 00 episode of the parent show.
-        if markers and not numbers:
+        # The same holds when the scope-level ordinal parse is fed only by an
+        # ancestor directory name (``03 OVA：…`` sibling positions inside a
+        # numbered bundle) and every video's own stem is ordinal-free, and
+        # when several ordinal-free stems are alternate encodes of one
+        # release (hardsub mp4 beside a softsub mkv): the stems share every
+        # arc anchor, so they can only prove that one episode together or
+        # not at all.
+        if markers:
             videos = [
                 file
                 for file in collect_all_files(scoped)
                 if file.object_type == "video"
             ]
-            if len(videos) == 1:
+            stem_ordinals = [
+                physical_special_stem_ordinal(file.name) for file in videos
+            ]
+            if all(value is None for value in stem_ordinals):
                 return _titled_single_season00_evidence(
                     episode_catalog,
                     tmdb_id=tmdb_id,
                     boundary_label=record.display_label,
                     parent_title=str(identity.get("title") or ""),
                     source_years=source_years,
+                    video_names=tuple(
+                        posixpath.splitext(file.name)[0] for file in videos
+                    ),
                 )
         return None
     official = physical_special_candidate_evidence(
