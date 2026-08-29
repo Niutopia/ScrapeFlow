@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,
+    _is_season_dir,
     _season_number_from_directory_name,
 )
 from engine.scrapeflow.media_policy import (
@@ -975,6 +976,17 @@ def _is_physical_special_record(record: WorkUnitRecord) -> bool:
         and proof.season > 0
     ):
         return False
+    # A boundary whose whole directory name is a structural season marker
+    # (``第一季``/``Season 02``) is B/W's proof of a regular season part.
+    # One bundled OVA/SP file inside such a season (``第二季/[14(OVA)]``)
+    # must not demote the whole unit to an auxiliary release: that would
+    # drop the split-season cohort's only main-TV candidate and re-plan the
+    # regular seasons under an unrelated container root.  A decorated label
+    # (``第二季 OVA``, where the marker word belongs to the release's own
+    # title) still fails this full-match test and keeps the demotion.
+    for scope in record.source_paths:
+        if _is_season_dir(posixpath.basename(str(scope).rstrip("/"))):
+            return False
     trace = identity.get("decision_trace")
     if isinstance(trace, Mapping):
         for key in ("physical_special_markers", "official_special_marker_hits"):

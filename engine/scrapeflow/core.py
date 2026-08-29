@@ -6905,7 +6905,17 @@ def _map_unnumbered_specials(
 def _align_subtitles_to_video_sequence(
     groups: dict[EpisodeKey, list[dict[str, Any]]],
 ) -> bool:
-    """Align a complete subtitle track by order when release numbering has safe gaps."""
+    """Align a complete subtitle track by order when release numbering has safe gaps.
+
+    Order alignment is a pure offset claim: it is safe only when BOTH the
+    video keys and the subtitle keys form their own contiguous runs (for
+    example videos ``[01]..[13]`` beside subtitles ``[02]..[14]``).  A
+    subtitle set with a hole (``[01]..[11]`` + ``[13]`` + ``[14]`` — the
+    uploader lost one sidecar) is not an offset run: aligning it by order
+    would relabel every subtitle after the hole to the wrong episode, so it
+    keeps its own ordinal mapping and the hole stays a plain missing
+    subtitle.
+    """
     video_keys = sorted(
         key
         for key, items in groups.items()
@@ -6926,6 +6936,8 @@ def _align_subtitles_to_video_sequence(
         or video_keys == subtitle_keys
         or [key.number for key in video_keys]
         != list(range(video_keys[0].number, video_keys[0].number + len(video_keys)))
+        or [key.number for key in subtitle_keys]
+        != list(range(subtitle_keys[0].number, subtitle_keys[0].number + len(subtitle_keys)))
     ):
         return False
     subtitle_items = {
