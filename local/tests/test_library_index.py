@@ -179,6 +179,67 @@ class StrictBareEpisodeTMDB:
                 }
         return {}
 
+
+class SameDayBlockTMDB:
+    """TMDB double whose Season 00 holds a same-day multi-episode block."""
+
+    def __init__(self, tmdb_id: int, third_air: str) -> None:
+        self.tmdb_id = tmdb_id
+        self.third_air = third_air
+
+    def get(self, path: str, **_params: object) -> dict[str, object]:
+        if path == f"/tv/{self.tmdb_id}":
+            return {
+                "name": "示例剧",
+                "original_name": "示例剧",
+                "number_of_seasons": 2,
+                "number_of_episodes": 60,
+                "seasons": [
+                    {"season_number": 0, "episode_count": 6, "name": "特别篇"},
+                    {"season_number": 1, "episode_count": 60, "name": "第 1 季"},
+                ],
+            }
+        if path == f"/tv/{self.tmdb_id}/season/0":
+            names = {
+                1: "短篇 1",
+                2: "VS 不及格",
+                3: "特集",
+                4: "示例剧：陆 VS 空",
+                5: "球之“道”",
+                6: "第一季OAD",
+            }
+            air = {
+                1: "2015-03-04",
+                2: "2016-05-02",
+                3: "2017-08-04",
+                4: "2020-01-22",
+                5: "2020-01-22",
+                6: self.third_air,
+            }
+            return {
+                "episodes": [
+                    {
+                        "episode_number": number,
+                        "air_date": air[number],
+                        "name": names[number],
+                    }
+                    for number in range(1, 7)
+                ]
+            }
+        if path == f"/tv/{self.tmdb_id}/season/1":
+            return {
+                "episodes": [
+                    {
+                        "episode_number": number,
+                        "air_date": "2014-04-06",
+                        "name": f"第{number}集",
+                    }
+                    for number in range(1, 61)
+                ]
+            }
+        return {}
+
+
 def _sample_library() -> dict[str, bytes]:
     files: dict[str, bytes] = {}
     files["/library/番剧/Fate Zero/tvshow.nfo"] = _nfo_tv(35507, "Fate/Zero", "2011")
@@ -1195,7 +1256,80 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
 
-    def test_season_scoped_ova_run_derives_its_window_coordinates(self) -> None:
+    def test_titled_release_run_maps_onto_same_day_season00_block(self) -> None:
+        """A titled multi-part special run maps onto its same-day S00 block.
+
+        ``OVA 示例剧 陆 VS 空`` ships as ``OVA 01``/``OVA 02`` while the parent
+        show's Season 00 holds the arc as consecutive episodes that all aired
+        on the same day (``E04 陆 VS 空``/``E05 球之"道"``), with only the
+        block's head carrying the arc title.  D must anchor the label onto the
+        head episode and let the exact same-day block size position the run.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-same-day-block"
+            tmdb = SameDayBlockTMDB(99054, "2014-09-25")
+            files = {
+                "/incoming/OVA 示例剧 陆 VS 空/示例剧 OVA 01.mkv": b"v",
+                "/incoming/OVA 示例剧 陆 VS 空/示例剧 OVA 02.mkv": b"v",
+            }
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, "/incoming/OVA 示例剧 陆 VS 空",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence,
+                {
+                    "kind": "tmdb_single_positive_season_physical_special",
+                    "tmdb_id": 99054,
+                    "season": 0,
+                    "episode_count": 2,
+                    "episode_tokens": ["S00E04", "S00E05"],
+                },
+            )
+
+    def test_titled_release_run_rejects_oversized_same_day_block(self) -> None:
+        """A same-day block larger than the source run stays unproven.
+
+        ``OVA 01``/``OVA 02`` against a same-day official block of three
+        episodes is a subset guess, not a proof: which two of the three the
+        release covers cannot be decided from release ordinals alone.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-same-day-block-oversized"
+            tmdb = SameDayBlockTMDB(99055, "2020-01-22")
+            files = {
+                "/incoming/OVA 示例剧 陆 VS 空/示例剧 OVA 01.mkv": b"v",
+                "/incoming/OVA 示例剧 陆 VS 空/示例剧 OVA 02.mkv": b"v",
+            }
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, "/incoming/OVA 示例剧 陆 VS 空",
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
         """A season-confirmed same-marker OVA run proves its S00 coordinates.
 
         ``W 4k 某剧 第三季OVA`` holds ``[12(OVA)]``/``[13(OVA)]`` with no

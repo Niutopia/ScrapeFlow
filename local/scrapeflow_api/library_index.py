@@ -2608,12 +2608,12 @@ def _named_arc_season00_run(
 def _published_season0_episodes(
     episode_catalog: Callable[[Mapping[str, object]], object],
     tmdb_id: int,
-) -> tuple[dict[int, str], dict[int, int]] | None:
+) -> tuple[dict[int, str], dict[int, int], dict[int, str]] | None:
     """Load the parent show's published Season 00 from the episode catalog.
 
     The published catalog is the authoritative coordinate source; the show
     detail only proves the Season 00 shape exists.  An episode without a
-    parsable air date simply carries no year.
+    parsable air date simply carries no year and no date.
     """
     try:
         payload = episode_catalog({"media_type": "tv", "tmdb_id": tmdb_id})
@@ -2626,6 +2626,7 @@ def _published_season0_episodes(
         return None
     published: dict[int, str] = {}
     published_years: dict[int, int] = {}
+    published_dates: dict[int, str] = {}
     for row in rows:
         if not isinstance(row, Mapping) or row.get("season_number") != 0:
             return None
@@ -2637,9 +2638,11 @@ def _published_season0_episodes(
         air_year_match = re.match(r"(\d{4})-", air_date)
         if air_year_match:
             published_years[number] = int(air_year_match.group(1))
+        if air_date:
+            published_dates[number] = air_date
     if not published:
         return None
-    return published, published_years
+    return published, published_years, published_dates
 
 
 _TITLED_SPECIAL_OFFICIAL_PREFIX_RE = re.compile(
@@ -2733,7 +2736,7 @@ def _titled_single_season00_evidence(
     loaded = _published_season0_episodes(episode_catalog, tmdb_id)
     if loaded is None:
         return None
-    published, published_years = loaded
+    published, published_years, _published_dates = loaded
     labels = [str(boundary_label or "")]
     labels.extend(str(name or "") for name in video_names if name)
     matched: dict[int, None] = {}
@@ -2768,13 +2771,14 @@ def _season00_physical_special_evidence(
     source_numbers: tuple[int, ...],
     boundary_label: str = "",
     source_years: tuple[int, ...] = (),
+    parent_title: str = "",
 ) -> SingleSeasonEpisodeProof | None:
     """Prove a complete OVA/OAD run is the parent show's official Season 00.
 
     This is the parent-identity branch of the shared physical-special grammar:
     the confirmed identity is a regular multi-season show whose published
-    Season 00 holds its specials.  Three bounded official evidence classes may
-    map the release ordinals to ``S00E01..S00EN``:
+    Season 00 holds its specials.  Four bounded official evidence classes may
+    map the release ordinals onto published Season 00 coordinates:
 
     * every source ordinal is named by the official Season 00 episode title
       of that number (``OVA2 PINTO`` for source ordinal 2);
@@ -2788,7 +2792,15 @@ def _season00_physical_special_evidence(
       with air years inside the source release-year window.  The release-local
       ordinals then map onto that official window, which may start anywhere
       in Season 00 (``S00E08``/``S00E09``), and must beat the runner-up window
-      by the global ambiguity margin.
+      by the global ambiguity margin;
+    * a titled release whose official window is one same-day block: the
+      boundary label anchors exactly one published Season 00 episode
+      (``OVA 排球少年 陆 VS 空`` → ``E04 陆 VS 空``), and the anchored episode
+      heads a maximal consecutive block of episodes sharing its air date
+      whose size is exactly the source run length — a multi-part special
+      released together is catalogued as consecutive episodes that aired
+      together (``E04``/``E05`` both 2020-01-22).  A block of any other size
+      is a subset guess and stays unproven.
 
     Anything looser stays ``None``: a partial run without per-ordinal title
     proof can never be positioned by release ordinals alone.
@@ -2826,7 +2838,7 @@ def _season00_physical_special_evidence(
     loaded = _published_season0_episodes(episode_catalog, tmdb_id)
     if loaded is None:
         return None
-    published, published_years = loaded
+    published, published_years, published_dates = loaded
     # Evidence class 1: each source ordinal is named by the official Season 00
     # title of that number under the shared marker grammar.
     ordinal_named = True
@@ -2857,14 +2869,52 @@ def _season00_physical_special_evidence(
             boundary_label=boundary_label,
             source_years=source_years,
         )
-        if named_run is None:
+        if named_run is not None:
+            return SingleSeasonEpisodeProof(
+                tmdb_id=tmdb_id,
+                season=0,
+                episode_count=count,
+                episode_tokens=tuple(
+                    f"S00E{number:02d}" for number in named_run
+                ),
+                evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
+            )
+        # Evidence class 4: a titled release whose official window is one
+        # same-day block.  A multi-part special released together
+        # (``OVA 排球少年 陆 VS 空``) is catalogued as consecutive Season 00
+        # episodes that aired together, yet only the block's head carries the
+        # arc title — the companions are positioned by the shared air date,
+        # not by their own titles.  The label anchors the head episode, and
+        # the maximal same-day block it heads must be exactly the source run
+        # length; any other size is a subset guess and fails closed.
+        anchored = _titled_single_season00_episode(
+            published,
+            published_years,
+            boundary_label=boundary_label,
+            parent_title=parent_title,
+            source_years=source_years,
+        )
+        if anchored is None:
+            return None
+        anchor_air = published_dates.get(anchored)
+        if not anchor_air:
+            return None
+        if published_dates.get(anchored - 1) == anchor_air:
+            # The anchored episode does not head its own same-day block: the
+            # block starts earlier, so the release ordinals cannot start here.
+            return None
+        block_end = anchored
+        while published_dates.get(block_end + 1) == anchor_air:
+            block_end += 1
+        if block_end - anchored + 1 != count:
             return None
         return SingleSeasonEpisodeProof(
             tmdb_id=tmdb_id,
             season=0,
             episode_count=count,
             episode_tokens=tuple(
-                f"S00E{number:02d}" for number in named_run
+                f"S00E{number:02d}"
+                for number in range(anchored, anchored + count)
             ),
             evidence_kind=_PHYSICAL_SPECIAL_EPISODE_EVIDENCE_KIND,
         )
@@ -2895,9 +2945,11 @@ def prove_physical_special_single_season_evidence(
       one positive season of the same size and an official matching physical
       marker;
     * the parent show itself (operator override or C): its published Season
-      00 officially holds these specials, proven either by per-ordinal
-      official special titles or by a complete count match with an official
-      marker (``_season00_physical_special_evidence``).
+      00 officially holds these specials, proven by one of the four bounded
+      evidence classes of ``_season00_physical_special_evidence`` (per-ordinal
+      official special titles, a complete count match with an official
+      marker, a named-arc window, or a titled release anchoring a same-day
+      block).
 
     A third source shape carries no ordinals at all: exactly one unnumbered
     marker-bearing video whose boundary label is a concrete arc title
@@ -2998,6 +3050,7 @@ def prove_physical_special_single_season_evidence(
             source_numbers=numbers,
             boundary_label=record.display_label,
             source_years=source_years,
+            parent_title=str(identity.get("title") or ""),
         )
     season = _positive_season(official.get("official_special_season"))
     if season is None or not callable(episode_catalog):
