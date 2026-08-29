@@ -2018,6 +2018,20 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
     if cut_bracket:
         return EpisodeKey("regular", int(cut_bracket.group(1)))
 
+    # Japanese disc rips lead with the episode ordinal and quote the episode
+    # title in CJK brackets (``01「奈落の心臓」.mkv``).  The quote opening
+    # directly after the digits is itself the release's ordinal separator,
+    # which the generic bare-number pattern cannot see (it requires an ASCII
+    # boundary).  Only a leading ordinal counts — the digits must sit at the
+    # very start of the name — so a sequel digit inside a title
+    # (``White Album 2「新章」``) is not an episode number.
+    quoted_ordinal = re.match(
+        r"\s*0*(\d{1,3})(?=[「『《])",
+        clean,
+    )
+    if quoted_ordinal:
+        return EpisodeKey("regular", int(quoted_ordinal.group(1)))
+
     regular_patterns = [
         r"(?:^|[^A-Za-z0-9])S\d{1,2}\s*E\s*0*(\d{1,4})(?:$|[^0-9])",
         SEASON_DASH_EPISODE_RE.pattern,

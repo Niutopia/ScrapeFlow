@@ -223,6 +223,31 @@ class EpisodeMatchingConvergenceTests(unittest.TestCase):
             set(),
         )
 
+    def test_leading_ordinal_before_quoted_episode_title_is_regular(self) -> None:
+        """``01「奈落の心臓」.mkv`` is episode 1, not an unparsable file.
+
+        Japanese disc rips lead with the episode ordinal and quote the
+        episode title in CJK brackets.  The ordinal must read as a regular
+        episode number while a mid-title sequel digit before the quote
+        (``White Album 2「…」``) must not.
+        """
+        self.assertEqual(
+            extract_episode_key("01「奈落の心臓」.mkv"),
+            __import__("engine.scrapeflow.core", fromlist=["EpisodeKey"]).EpisodeKey(
+                "regular", 1
+            ),
+        )
+        self.assertEqual(
+            extract_episode_key("15「正统なる継承者」.ass").number, 15
+        )
+        self.assertEqual(
+            extract_episode_key("26 『最終回』.mkv").number, 26
+        )
+        # A sequel digit inside the title is not a leading release ordinal.
+        self.assertIsNone(
+            extract_episode_key("White Album 2「新章」.mkv")
+        )
+
     def test_request_normalization_uses_the_same_dual_ordinal_coordinate(self) -> None:
         request = build_replenishment_request(
             {
