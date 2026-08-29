@@ -109,6 +109,21 @@ _BARE_REGULAR_EPISODE_SPECIAL_RE = re.compile(
 # The caller additionally requires exactly one such bracket per primary video
 # and a complete TMDB-backed run before it can invent a season.
 _PURE_BRACKETED_NUMERIC_RE = re.compile(r"\[\s*(\d{1,6})\s*\]")
+# A qualified bracket ordinal is the same episode coordinate carrying its own
+# release edition or finale marker: ``[25(Director' Cut)]``,
+# ``[25 Director's Cut]``/``[25 cut]`` and ``[12 END]``.  These mirror the
+# titled/cut/finale bracket grammars of the generic episode parser
+# (``extract_episode_key``) so a re-released cut stays one ``N`` with its own
+# source file instead of an unparsable run member.
+_TITLED_BRACKETED_NUMERIC_RE = re.compile(r"\[\s*(\d{1,6})\s*\([^]\r\n]+\)\s*\]")
+_CUT_BRACKETED_NUMERIC_RE = re.compile(
+    r"\[\s*(\d{1,6})\s+(?:director(?:'?s)?[ ._-]*)?cut\s*\]",
+    re.IGNORECASE,
+)
+_FINALE_BRACKETED_NUMERIC_RE = re.compile(
+    r"\[\s*(\d{1,6})\s*(?:END|FIN(?:AL)?)\s*\]",
+    re.IGNORECASE,
+)
 # A release-style member often carries no ``E``/season marker at all:
 # ``[Group] Title - 01 [WebRip].mkv``.  It is not an ordinary coverage
 # coordinate because the leading title can itself contain numbers or dashes.
@@ -441,16 +456,19 @@ def bare_regular_episode_number(value: Any) -> int | None:
     return number if number > 0 else None
 
 
-def bracketed_regular_episode_number(value: Any) -> int | None:
-    """Return one unqualified pure-bracket ordinal, or ``None``.
+def bracketed_regular_episode_member(value: Any) -> tuple[int, bool, str] | None:
+    """Return ``(ordinal, edition_qualified, bracket_token)`` or ``None``.
 
-    ``[01]`` is widespread in anime releases but is much weaker than an
-    explicit ``SxxEyy`` coordinate.  It is admitted only as one member of a
-    separately proved, complete single-season sequence.  The primitive itself
-    rejects special labels, explicit season/episode forms, ranges and every
-    basename with zero or multiple pure numeric brackets.  Four-digit values
-    such as ``[1080]`` are deliberately not possible episode ordinals here;
-    treating a resolution-only bracket as an episode would be unsafe.
+    The bracket-ordinal grammar is shared with the generic episode parser: a
+    pure ``[01]`` and its qualified re-release forms — the parenthesised
+    edition ``[25(Director' Cut)]``, the ``cut``-suffixed edition
+    ``[25 Director's Cut]``/``[25 cut]`` and the finale marker ``[12 END]`` —
+    all name exactly one episode coordinate.  The primitive itself rejects
+    special labels, explicit season/episode forms, ranges and every basename
+    with zero or multiple bracket ordinals; four-digit values such as
+    ``[1080]`` are deliberately not episode ordinals here.  ``qualified``
+    tells the caller the token is an edition spelling, so one ordinal may
+    legitimately arrive on more than one source file.
     """
     text = str(value or "")
     if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
@@ -462,14 +480,40 @@ def bracketed_regular_episode_number(value: Any) -> int | None:
     # the numeric values happen to agree.
     if bare_regular_episode_number(text) is not None:
         return None
-    matches = list(_PURE_BRACKETED_NUMERIC_RE.finditer(text))
-    if len(matches) != 1:
+    tokens = [
+        (match, False)
+        for match in _PURE_BRACKETED_NUMERIC_RE.finditer(text)
+    ] + [
+        (match, True)
+        for pattern in (
+            _TITLED_BRACKETED_NUMERIC_RE,
+            _CUT_BRACKETED_NUMERIC_RE,
+            _FINALE_BRACKETED_NUMERIC_RE,
+        )
+        for match in pattern.finditer(text)
+    ]
+    if len(tokens) != 1:
         return None
-    number = int(matches[0].group(1))
+    match, qualified = tokens[0]
+    number = int(match.group(1))
     # A regular TV episode is bounded to the same three-digit range used by
     # the shared anime parser.  This makes a bare ``[1080]`` fail closed even
     # when it is the only numeric bracket in the name.
-    return number if 0 < number <= 999 else None
+    if not 0 < number <= 999:
+        return None
+    return (number, qualified, match.group(0))
+
+
+def bracketed_regular_episode_number(value: Any) -> int | None:
+    """Return one unqualified pure-bracket ordinal, or ``None``.
+
+    ``[01]`` is widespread in anime releases but is much weaker than an
+    explicit ``SxxEyy`` coordinate.  It is admitted only as one member of a
+    separately proved, complete single-season sequence.  See
+    :func:`bracketed_regular_episode_member` for the full shared grammar.
+    """
+    member = bracketed_regular_episode_member(value)
+    return member[0] if member is not None else None
 
 
 def release_dash_regular_episode(value: Any) -> tuple[str, int] | None:

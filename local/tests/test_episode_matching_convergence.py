@@ -8,6 +8,7 @@ from engine.scrapeflow.replenishment_matching import (
     audit_episode_tokens,
     bare_regular_episode_context_is_safe,
     bare_regular_episode_number,
+    bracketed_regular_episode_member,
     bracketed_regular_episode_number,
     coverage_tokens,
     episode_ranges,
@@ -186,6 +187,44 @@ class EpisodeMatchingConvergenceTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertIsNone(bracketed_regular_episode_number(value))
+
+    def test_bracketed_ordinal_edition_spellings_share_the_parser_grammar(self) -> None:
+        """Qualified bracket ordinals are one episode coordinate, edition-tagged.
+
+        ``extract_episode_key`` already reads ``[25(Director' Cut)]``,
+        ``[25 Director's Cut]``/``[25 cut]`` and ``[12 END]`` as episode 25/12.
+        The strict D/F bracket member must agree — same ordinal, flagged as an
+        edition spelling — or a finale's re-release silently invalidates the
+        whole single-season bracket run.
+        """
+        cases = {
+            "Show [25(Director' Cut)][Ma10p_2160p].mkv": (25, True),
+            "Show [25 Director's Cut][Ma10p_2160p].mkv": (25, True),
+            "Show [25 cut][Ma10p_2160p].mkv": (25, True),
+            "Show [12 END][Ma10p_2160p].mkv": (12, True),
+            "Show [12][Ma10p_2160p].mkv": (12, False),
+        }
+        for value, (number, qualified) in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(extract_episode_key(value).number, number)
+                member = bracketed_regular_episode_member(value)
+                self.assertIsNotNone(member)
+                assert member is not None
+                self.assertEqual(member[0], number)
+                self.assertIs(member[1], qualified)
+                if not qualified:
+                    self.assertEqual(
+                        bracketed_regular_episode_number(value), number
+                    )
+        for value in (
+            # A qualified bracket beside another numeric bracket is ambiguous.
+            "Show [25(Director' Cut)][26].mkv",
+            # A range inside the bracket is not an edition spelling.
+            "Show [25-26].mkv",
+            "Show [01v2].mkv",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(bracketed_regular_episode_member(value))
 
     def test_release_dash_ordinal_keeps_a_stable_title_prefix(self) -> None:
         """``Title - 01`` is a D/F proof primitive, not generic coverage."""

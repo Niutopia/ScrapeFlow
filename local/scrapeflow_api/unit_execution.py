@@ -2069,7 +2069,9 @@ def _bracketed_episode_map_path(
     source_ordinals = bracketed_episode_source_ordinals(scoped)
     if source_ordinals is None:
         return None
-    numbers = tuple(sorted(source_ordinals.values()))
+    # An edition cut repeats one ordinal on its own source file, so the proved
+    # run is the set of ordinals while the map still carries every file.
+    numbers = tuple(sorted(set(source_ordinals.values())))
     expected = tuple(range(1, proof.episode_count + 1))
     if numbers != expected:
         return None

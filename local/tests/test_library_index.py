@@ -2196,6 +2196,57 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_evidence["season"], 1)
             self.assertEqual(record.reconciliation_evidence["episode_count"], 12)
 
+    def test_bracketed_proof_admits_edition_cut_of_one_ordinal(self) -> None:
+        """A finale re-released as a distinct cut repeats one ordinal.
+
+        ``[25]`` beside ``[25(Director' Cut)]`` is the same episode coordinate
+        on two source files, exactly as the generic episode parser reads it.
+        The strict run proves the ordinal set ``1..25`` while keeping both
+        member files for F's episode map; a second plain ``[25]`` encode is
+        still an ambiguous duplicate and fails closed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99102, {1: 25})
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 25)
+            ] + [
+                "[Ygm] Example Show [25][Ma10p_2160p].mkv",
+                "[Ygm] Example Show [25(Director' Cut)][Ma10p_2160p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bracketed-edition-cut",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            evidence = record.reconciliation_evidence
+            self.assertEqual(evidence["season"], 1)
+            self.assertEqual(evidence["episode_count"], 25)
+            self.assertEqual(len(evidence["episode_tokens"]), 25)
+
+    def test_bracketed_proof_rejects_duplicate_plain_ordinal_encode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99103, {1: 25})
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 25)
+            ] + [
+                "1080p/[Ygm] Example Show [25][Ma10p_2160p].mkv",
+                "2160p/[Ygm] Example Show [25][Ma10p_2160p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bracketed-duplicate-encode",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
     def test_bracketed_proof_excludes_fractional_special_video(self) -> None:
         """A ``[11.5]`` fractional special is a separate coordinate.
 

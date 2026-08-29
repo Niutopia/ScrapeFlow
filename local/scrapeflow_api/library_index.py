@@ -47,6 +47,7 @@ from engine.scrapeflow.replenishment_matching import (
     audit_episode_tokens,
     bare_regular_episode_context_is_safe,
     bare_regular_episode_number,
+    bracketed_regular_episode_member,
     bracketed_regular_episode_number,
     quoted_ordinal_regular_episode,
     release_dash_regular_episode,
@@ -2044,21 +2045,26 @@ def _is_commercial_video(file: SourceFile) -> bool:
     return bool(_COMMERCIAL_MARKER_RE.search(basename))
 
 
-def _strict_bracketed_episode_number_for_file(file: SourceFile) -> int | None:
-    """Read one pure ``[01]`` ordinal without erasing hierarchy evidence.
+def _strict_bracketed_episode_member_for_file(
+    file: SourceFile,
+) -> tuple[int, bool, str] | None:
+    """Read one ``[01]``/``[01(…)]``/``[01 END]`` member token, or ``None``.
 
     ``[00]`` is a special coordinate (S00), never a member of the integer
     ``1..N`` regular run; it is rejected here so a single prologue file
-    cannot invalidate an otherwise complete bracket run.
+    cannot invalidate an otherwise complete bracket run.  The bracket grammar
+    (including the edition-qualified spellings) is the shared D/F primitive.
     """
-    if not bare_regular_episode_context_is_safe(file.path):
+    path = str(file.path or "").rstrip("/")
+    if not path or not bare_regular_episode_context_is_safe(path):
         return None
-    number = bracketed_regular_episode_number(
-        posixpath.basename(file.path.rstrip("/"))
-    )
-    if number is not None and number <= 0:
-        return None
-    return number
+    return bracketed_regular_episode_member(posixpath.basename(path))
+
+
+def _strict_bracketed_episode_number_for_file(file: SourceFile) -> int | None:
+    """Read one pure ``[01]`` ordinal without erasing hierarchy evidence."""
+    member = _strict_bracketed_episode_member_for_file(file)
+    return member[0] if member is not None else None
 
 
 def _strict_bracketed_episode_members(
@@ -2069,22 +2075,29 @@ def _strict_bracketed_episode_members(
     This is the member-level view of :func:`_strict_bracketed_episode_numbers`
     used by the D/F proof chain: F turns the same strict members into an
     explicit episode map, so every planner override stays tied to one
-    revalidated source file instead of a bare ordinal.
+    revalidated source file instead of a bare ordinal.  One ordinal may
+    arrive on several source files when the release re-issued that episode
+    as a distinct edition cut (``[25]`` beside ``[25(Director' Cut)]``);
+    the bracket token itself must differ per file, so a plain duplicate
+    encode still fails closed.
     """
     videos = _regular_episode_primary_videos(node)
     if not videos:
         return None
     members: list[tuple[str, int]] = []
+    tokens: dict[int, set[str]] = {}
     for file in videos:
-        number = _strict_bracketed_episode_number_for_file(file)
-        if number is None:
+        member = _strict_bracketed_episode_member_for_file(file)
+        if member is None:
             return None
+        number, _qualified, token = member
+        bucket = tokens.setdefault(number, set())
+        if token in bucket:
+            return None
+        bucket.add(token)
         members.append((str(file.path).rstrip("/"), int(number)))
-    numbers = [number for _path, number in members]
-    if len(set(numbers)) != len(numbers):
-        return None
-    ordered = tuple(sorted(numbers))
-    if ordered != tuple(range(1, len(numbers) + 1)):
+    ordinals = sorted({number for _path, number in members})
+    if ordinals != list(range(1, len(ordinals) + 1)):
         return None
     if len({path for path, _number in members}) != len(members):
         return None
@@ -2099,12 +2112,13 @@ def _strict_bracketed_episode_numbers(
     NCOP/NCED/fractional and a complete OAD/OVA/OAV/SP family are omitted from
     the integer run.  A lone OVA, special, trailer, duplicate encode, or a file
     with ambiguous brackets still invalidates the entire proof rather than
-    being ignored.
+    being ignored.  Edition cuts repeat one ordinal, so the proved run is the
+    set of ordinals; the members keep every source file for F's episode map.
     """
     members = _strict_bracketed_episode_members(node)
     if members is None:
         return None
-    return tuple(sorted(number for _path, number in members))
+    return tuple(sorted({number for _path, number in members}))
 
 
 def bracketed_episode_source_ordinals(

@@ -1662,6 +1662,77 @@ class UnitExecutionTests(unittest.TestCase):
             self.assertIn(injected_path, alist.files)
             self.assertEqual(alist.move_calls, [])
 
+    def test_bracketed_proof_carries_edition_cut_files_through_f(self) -> None:
+        """F's episode map keeps the edition cut file of a repeated ordinal.
+
+        ``[02]`` beside ``[02(Director' Cut)]`` proves one two-episode run;
+        the map carries both source files onto the same coordinate and the
+        planner keeps the edition file as a distinct cut of that episode.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb_id = 99151
+            tmdb = BareEpisodePlanningTMDB(tmdb_id, 2)
+            source = "/quark/影视/待刮削/Bracket Run Edition"
+            run_dir = f"{source}/剧场版 Show The Final"
+            names = [
+                f"[Ygm] Show ~Semi-Final~ [{episode:02d}]"
+                "[Ma10p_2160p][x265_flac_ass].mkv"
+                for episode in range(1, 3)
+            ] + [
+                "[Ygm] Show ~Semi-Final~ [02(Director' Cut)]"
+                "[Ma10p_2160p][x265_flac_ass].mkv",
+            ]
+            alist = BareEpisodePlanningAList(
+                {f"{run_dir}/{name}": FAKE_VIDEO_BYTES for name in names}
+            )
+            runner = SimpleEngineRunner(
+                state_root,
+                alist=alist,
+                tmdb=tmdb,
+                validate=False,
+                library_root="/quark/影视",
+            )
+            root_task_id = "root-bracketed-edition-f"
+            pending = runner.create_pending_job(source, job_id=root_task_id)
+            runner.start_automatic_job(pending.id, target_shelf="anime")
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertEqual(len(records), 1)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/quark/影视", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                (record.reconciliation_evidence or {}).get("episode_count"), 2
+            )
+            request = _request_for_unit(runner, record, root_task_id, state_root)
+            self.assertEqual(request.season, 1)
+            mapping = json.loads(Path(str(request.episode_map_path)).read_text())
+            self.assertEqual(mapping, {"1": "S01E01", "2": "S01E02"})
+            plan = runner._build_plan(request)  # noqa: SLF001 - F planner seam
+            videos = [item for item in plan.files if item.media_kind == "video"]
+            self.assertEqual(
+                [item.episode_key for item in videos], ["E01", "E02", "E02"]
+            )
+            self.assertEqual(
+                {
+                    token
+                    for item in videos
+                    for season, episode in audit_episode_tokens(item.final_name)
+                    for token in (f"S{season:02d}E{episode:02d}",)
+                },
+                {"S01E01", "S01E02"},
+            )
+            self.assertEqual(len({item.final_name for item in videos}), 3)
+
     def test_complete_bracketed_proof_is_revalidated_for_f_and_read_by_j(self) -> None:
         """The strict ``[01]..[12]`` D proof is fresh again at F.
 
