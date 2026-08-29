@@ -2430,6 +2430,19 @@ def physical_special_candidate_evidence(
     )
 
 
+# A trailing season marker on a release title (``Show 2nd Season``, ``Show
+# 第2季``, ``Show S2``) is structural information about which season the
+# files belong to, never part of the work's identity title.
+_TRAILING_SEASON_MARKER_RE = re.compile(
+    r"[\s_\-]*"
+    r"(?:第\s*\d{1,2}\s*季"
+    r"|第\s*[一二三四五六七八九十]{1,3}\s*季"
+    r"|(?:season|s)\s*\d{1,2}"
+    r"|\d{1,2}(?:st|nd|rd|th)\s*season)",
+    re.IGNORECASE,
+)
+
+
 def _parent_identity_query_variants(parent: str) -> list[str]:
     """Return a parent label's cleaned release query ahead of its raw form.
 
@@ -2636,6 +2649,15 @@ def auto_match_from_evidence(
     for r in evidence.representative_names:
         if _usable_representative_identity_query(r):
             candidate_queries.append(r)
+            # A release filename titles the season it belongs to
+            # (``Tensei Shitara Slime Datta Ken 2nd Season [24.9]``): the
+            # trailing season marker is structural, not identity, and TMDB
+            # search returns nothing for the suffixed form.  The
+            # marker-stripped stem is the work's own title and is dispatched
+            # right behind the raw form.
+            stripped = _TRAILING_SEASON_MARKER_RE.sub("", r).strip()
+            if stripped and stripped != r and _usable_release_title_query(stripped):
+                candidate_queries.append(stripped)
 
     # Combined parent + boundary queries are useful ordinary evidence, but
     # must not crowd out the unit's own boundary queries above or the strict

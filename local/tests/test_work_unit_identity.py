@@ -3022,6 +3022,57 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             auto_match_from_evidence(client, evidence_valid, min_confidence=1.5)
         self.assertIn("最低置信度必须在 0 到 1 之间", str(ctx2.exception))
 
+    def test_representative_title_with_trailing_season_marker_strips_it(self) -> None:
+        """``Show 2nd Season [24.9]`` queries the show title without the season.
+
+        A release filename titles the season it belongs to (``Tensei Shitara
+        Slime Datta Ken 2nd Season``); TMDB search returns nothing for the
+        suffixed form, and a supplement intake whose boundary label does not
+        match the title either (``关于我转生变成史莱姆这档事SP补扫``) then has
+        no candidate pool at all.  The marker-stripped stem is dispatched
+        right behind the raw representative form.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Tensei Shitara Slime Datta Ken 2nd Season": [],
+                "Tensei Shitara Slime Datta Ken": [
+                    {
+                        "id": 82684,
+                        "name": "关于我转生变成史莱姆这档事",
+                        "first_air_date": "2018-10-01",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+            alternative_titles={
+                "82684": [
+                    {"iso_3166_1": "JP", "title": "Tensei Shitara Slime Datta Ken", "type": ""},
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-slime-sp",
+            boundary_label="关于我转生变成史莱姆这档事SP补扫",
+            parent_labels=(),
+            representative_names=(
+                "关于我转生变成史莱姆这档事SP补扫",
+                "Tensei Shitara Slime Datta Ken 2nd Season",
+            ),
+            normalized_titles=("关于我转生变成史莱姆这档事SP补扫",),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 82684)
+        dispatched = {
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/")
+        }
+        self.assertIn("Tensei Shitara Slime Datta Ken", dispatched)
+
     def test_sibling_films_split_by_representative_filename_query(self) -> None:
         """Representative filename queries precede parent combinations.
 
