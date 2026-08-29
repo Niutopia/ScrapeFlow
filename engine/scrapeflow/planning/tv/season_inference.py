@@ -184,7 +184,26 @@ def _normalize_cumulative_season_episode_numbers(
             and set(unique_keys) == legal_keys
         )
 
-    if not simple_cumulative and not mixed_numbering and not local_run_offset:
+    # An absolute-numbered partial run that starts mid-window is the same
+    # whole-series convention seen from a source that only carries the
+    # season's tail (``[79]..[83]`` for Season 4 of a 24+24+24 show whose
+    # first six episodes already live in the library): every key sits inside
+    # the season's absolute window and none uses the relative convention, so
+    # the offset is mechanical.  A non-consecutive or out-of-window run
+    # keeps the fail-closed verdict.
+    in_window_partial = (
+        not simple_cumulative
+        and bool(unique_keys)
+        and unique_keys[0] > prior_count
+        and unique_keys == list(range(unique_keys[0], unique_keys[-1] + 1))
+        and unique_keys[-1] <= prior_count + current_count
+    )
+    if (
+        not simple_cumulative
+        and not mixed_numbering
+        and not local_run_offset
+        and not in_window_partial
+    ):
         return [dict(item) for item in source_files], None
     if not local_run_offset and (
         not unique_keys

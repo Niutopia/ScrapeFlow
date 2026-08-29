@@ -310,3 +310,124 @@ class MisplacedForeignSeasonSubtitleTests(unittest.TestCase):
             any("Season 03" in warning for warning in plan.warnings),
             msg=plan.warnings,
         )
+
+
+class InWindowPartialAbsoluteRunTests(unittest.TestCase):
+    def test_mid_window_absolute_tail_run_normalizes_to_season_relative(self) -> None:
+        """``[79]..[83]`` under ``第四季`` is Season 4 E07-E11, not E79-E83.
+
+        A 24+24+24 show whose Season 4 absolute window is 73-96 can arrive
+        as a multi-season cohort whose Season 4 folder carries only the
+        season's tail (the first six episodes already live in the formal
+        library).  The per-season sub-plan's run starts mid-window, so
+        neither the season-boundary anchor nor the full-count local offset
+        applied, and the whole cohort plan failed with unmapped E79-E83
+        before the absolute fallback could rescue a single-season request.
+        Every key inside the season's absolute window, all keys absolute,
+        and a consecutive run prove the offset mechanically.
+        """
+
+        class TailAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class TailTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/tv/82684":
+                    return {
+                        "name": "Slime Show",
+                        "original_name": "Slime Show",
+                        "first_air_date": "2018-10-01",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 16},
+                            {"season_number": 1, "episode_count": 24},
+                            {"season_number": 2, "episode_count": 24},
+                            {"season_number": 3, "episode_count": 24},
+                            {"season_number": 4, "episode_count": 24},
+                        ],
+                    }
+                if path.startswith("/tv/82684/season/"):
+                    season = int(path.rsplit("/", 1)[1])
+                    counts = {0: 16, 1: 24, 2: 24, 3: 24, 4: 24}
+                    return {
+                        "episodes": [
+                            {
+                                "episode_number": number,
+                                "name": f"Episode {number}",
+                                "air_date": f"2018-10-{number:02d}",
+                                "runtime": 24,
+                            }
+                            for number in range(1, counts.get(season, 0) + 1)
+                        ],
+                    }
+                if path == "/tv/82684/alternative_titles":
+                    return {"results": []}
+                if path in ("/search/tv", "/search/movie"):
+                    return {"results": []}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/quark/影视/待刮削/G 4k Slime Show"
+        source_files = [
+            # Season 1 head (a couple of episodes are enough for the cohort).
+            *(
+                {
+                    "name": f"[Ygm] Slime Show [{number}][Ma10p_2160p][x265_flac_ass].mkv",
+                    "full_path": (
+                        source_root
+                        + f"/关于我转生变成史莱姆这档事 第一季/[Ygm] Slime Show [{number}][Ma10p_2160p][x265_flac_ass].mkv"
+                    ),
+                    "size": FAKE_VIDEO_SIZE + number * 1024,
+                    "is_dir": False,
+                }
+                for number in range(1, 3)
+            ),
+            # Season 4 absolute tail inside the season-4 directory.
+            *(
+                {
+                    "name": f"[Ygm] Slime Show 4rd Season [{number}][Ma10p_2160p][x265_aac_ass].mkv",
+                    "full_path": (
+                        source_root
+                        + f"/关于我转生变成史莱姆这档事 第四季/[Ygm] Slime Show 4rd Season [{number}][Ma10p_2160p][x265_aac_ass].mkv"
+                    ),
+                    "size": FAKE_VIDEO_SIZE + number * 1024,
+                    "is_dir": False,
+                }
+                for number in range(79, 84)
+            ),
+        ]
+        plan = build_tv_plan_smart(
+            auto_episode_mode=True,
+            alist=TailAList(),
+            tmdb_client=TailTMDB(),
+            src_path=source_root,
+            parent_path="/quark/影视/番剧",
+            tmdb_id=82684,
+            season=1,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            ignore_orphan_temp=False,
+            source_files=source_files,
+            source_declared_seasons=(1, 2, 3, 4),
+            media_root="/quark/影视",
+        )
+
+        season4_targets = sorted(
+            item.final_name
+            for item in plan.files
+            if item.media_kind == "video" and "S04" in item.final_name
+        )
+        self.assertEqual(len(season4_targets), 5, msg=season4_targets)
+        for expected in ("S04E07", "S04E08", "S04E09", "S04E10", "S04E11"):
+            self.assertTrue(
+                any(expected in name for name in season4_targets),
+                msg=season4_targets,
+            )
+        self.assertFalse(
+            any("E79" in name or "E83" in name for name in season4_targets),
+            msg=season4_targets,
+        )
