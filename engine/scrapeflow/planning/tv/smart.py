@@ -122,6 +122,15 @@ _THEME_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A letter-suffixed bracket ordinal (``[23B]``) is its own release coordinate
+# beside the plain integer run.  The beta-alternate evidence mapper decides
+# whether the official titles prove one beta special for it; the broader
+# scan-tag letters (``p``/``i``) are not cut letters and stay out of the
+# class, exactly like the non-story asset vocabulary in the core parser.
+_LETTER_VARIANT_BRACKET_RE = re.compile(
+    r"\[\s*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]",
+)
+
 
 def _preclassify_theme_residuals(
     files: Sequence[Mapping[str, Any]],
@@ -273,11 +282,13 @@ def _plan_with_explicit_episode_map(
     unparsed episode.  Route movie-context videos through the same movie
     matcher the smart grouping uses, then combine the TV (map-driven) plan
     with each independent movie plan exactly like the ordinary split path.
-    Unnumbered specials (``[OVA].mkv``) are resolved through the same
-    subtitle-title matcher the smart grouping uses: the companion subtitle's
-    bounded content names the official TMDB S00 episode, and the special
-    video inherits that coordinate.  A special with no unique official title
-    stays at source as a visible problem row.
+    A letter-suffixed alternate cut (``[23B]``) is resolved here through the
+    beta-alternate evidence mapper, the same call the smart grouping makes
+    before its season split.  Unnumbered specials (``[SP]``/``[OVA].mkv``)
+    are handed to the lower planner with ``auto_special_title_match`` so the
+    subtitle-title matcher resolves them with the real regular-episode
+    count; a special with no unique official title stays at source as a
+    visible problem row.
     """
     prefer_animation = _media_context_from_source_and_target(
         str(kwargs["src_path"]), str(kwargs["parent_path"]),
@@ -313,109 +324,86 @@ def _plan_with_explicit_episode_map(
                 continue
         remaining.append(dict(item))
 
-    # Resolve unnumbered specials through the subtitle-title matcher before
-    # handing the remaining files to the mapped planner.  This is the exact
-    # same call the smart grouping makes; it reads the companion subtitle's
-    # bounded content and names the official TMDB S00 episode.
-    if remaining:
-        special_candidates = [
-            item for item in remaining
-            if Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
-            and (key := extract_episode_key(str(item.get("name", "")))) is not None
-            and key.kind == "special"
-            and key.number == 0
-        ]
-        if special_candidates:
-            pre_groups = parse_ep_files(
-                remaining,
-                prefer_simplified=False,
-                defer_unnumbered_specials=True,
+    # The explicit-map path skips the smart grouping, so the release-evidence
+    # mappers that run before that split never see these files.  The one that
+    # matters here is the beta-alternate mapper: a ``[23B]`` cut beside a
+    # mapped bracket run is its own release coordinate, and only the
+    # multilingual official titles can prove which beta special it is.  An
+    # unnumbered special (``[SP]``) is NOT resolved here — the lower planner
+    # re-runs the subtitle-title matcher with the real regular-episode count.
+    beta_candidates = [
+        item for item in remaining
+        if Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
+        and _LETTER_VARIANT_BRACKET_RE.search(str(item.get("name", "")))
+    ]
+    beta_warnings: list[str] = []
+    if beta_candidates:
+        official_special_title_variants: dict[int, list[str]] = defaultdict(list)
+        tmdb_id_value = kwargs.get("tmdb_id")
+        tmdb_get = getattr(kwargs.get("tmdb_client"), "get", None)
+        if (
+            isinstance(tmdb_id_value, int)
+            and not isinstance(tmdb_id_value, bool)
+            and callable(tmdb_get)
+        ):
+            try:
+                special_payload = tmdb_get(
+                    f"/tv/{tmdb_id_value}/season/0"
+                )
+            except ScraperError:
+                special_payload = None
+            if isinstance(special_payload, Mapping):
+                for row in special_payload.get("episodes") or []:
+                    if not isinstance(row, Mapping):
+                        continue
+                    number = row.get("episode_number")
+                    title = row.get("name")
+                    if (
+                        isinstance(number, int)
+                        and not isinstance(number, bool)
+                        and isinstance(title, str)
+                        and title
+                    ):
+                        official_special_title_variants[number].append(title)
+            # Multi-language variants strengthen the title matching.
+            primary_language = str(
+                getattr(kwargs.get("tmdb_client"), "language", "") or ""
             )
-            official_special_titles: dict[int, str] = {}
-            official_special_title_variants: dict[int, list[str]] = defaultdict(list)
-            tmdb_id_value = kwargs.get("tmdb_id")
-            tmdb_get = getattr(kwargs.get("tmdb_client"), "get", None)
-            if (
-                isinstance(tmdb_id_value, int)
-                and not isinstance(tmdb_id_value, bool)
-                and callable(tmdb_get)
-            ):
+            for language in ("zh-CN", "zh-TW", "ja-JP", "en-US"):
+                if language == primary_language:
+                    continue
                 try:
-                    special_payload = tmdb_get(
-                        f"/tv/{tmdb_id_value}/season/0"
+                    translated = tmdb_get(
+                        f"/tv/{tmdb_id_value}/season/0",
+                        language=language,
                     )
                 except ScraperError:
-                    special_payload = None
-                if isinstance(special_payload, Mapping):
-                    for row in special_payload.get("episodes") or []:
-                        if not isinstance(row, Mapping):
-                            continue
-                        number = row.get("episode_number")
-                        title = row.get("name")
-                        if (
-                            isinstance(number, int)
-                            and not isinstance(number, bool)
-                            and isinstance(title, str)
-                            and title
-                        ):
-                            official_special_titles[number] = title
-                            official_special_title_variants[number].append(title)
-                # Multi-language variants strengthen the title matching.
-                primary_language = str(
-                    getattr(kwargs.get("tmdb_client"), "language", "") or ""
-                )
-                for language in ("zh-CN", "zh-TW", "ja-JP", "en-US"):
-                    if language == primary_language:
+                    continue
+                if not isinstance(translated, Mapping):
+                    continue
+                for row in translated.get("episodes") or []:
+                    if not isinstance(row, Mapping):
                         continue
-                    try:
-                        translated = tmdb_get(
-                            f"/tv/{tmdb_id_value}/season/0",
-                            language=language,
-                        )
-                    except ScraperError:
-                        continue
-                    if not isinstance(translated, Mapping):
-                        continue
-                    for row in translated.get("episodes") or []:
-                        if not isinstance(row, Mapping):
-                            continue
-                        number = row.get("episode_number")
-                        title = row.get("name")
-                        if (
-                            isinstance(number, int)
-                            and not isinstance(number, bool)
-                            and isinstance(title, str)
-                            and title
-                            and title not in official_special_title_variants[number]
-                        ):
-                            official_special_title_variants[number].append(title)
-            if official_special_titles:
-                show_detail = None
-                if callable(tmdb_get) and isinstance(tmdb_id_value, int):
-                    try:
-                        show_detail = tmdb_get(f"/tv/{tmdb_id_value}")
-                    except ScraperError:
-                        show_detail = None
-                show_titles = []
-                if isinstance(show_detail, Mapping):
-                    for field in ("name", "original_name"):
-                        value = show_detail.get(field)
-                        if isinstance(value, str) and value.strip():
-                            show_titles.append(value.strip())
-                _map_unnumbered_special_from_subtitle_title(
-                    kwargs["alist"],
-                    special_candidates,
-                    pre_groups,
-                    {
-                        EpisodeKey("special", number): title
-                        for number, title in official_special_titles.items()
-                    },
-                    series_titles=show_titles,
-                    regular_episode_count=0,
-                    tmdb_client=kwargs["tmdb_client"],
-                    tmdb_id=int(tmdb_id_value),
-                    season=None,
-                )
+                    number = row.get("episode_number")
+                    title = row.get("name")
+                    if (
+                        isinstance(number, int)
+                        and not isinstance(number, bool)
+                        and isinstance(title, str)
+                        and title
+                        and title not in official_special_title_variants[number]
+                    ):
+                        official_special_title_variants[number].append(title)
+        # An empty title table safely leaves every letter variant unmapped.
+        beta_alternate_count = _map_explicit_beta_alternate(
+            beta_candidates,
+            official_special_title_variants,
+        )
+        if beta_alternate_count:
+            beta_warnings.append(
+                f"{beta_alternate_count} 个明确字母变体（β）版本已根据"
+                "多语言官方β/Missing Link 特别篇标题映射到 Season 00"
+            )
 
     map_kwargs = dict(smart_kwargs)
     map_kwargs["source_files"] = remaining
@@ -425,6 +413,8 @@ def _plan_with_explicit_episode_map(
     # specials so the lower planner can resolve them into Season 00.
     map_kwargs["auto_special_title_match"] = True
     plan = build_tv_plan(**map_kwargs)
+    if beta_warnings:
+        plan.warnings.extend(beta_warnings)
     if not movie_groups:
         if preserved_theme_residuals:
             plan.scan_report.setdefault("preserved_source_residuals", []).extend(
@@ -759,7 +749,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         )
         if beta_alternate_count:
             special_release_warnings.append(
-                f"{beta_alternate_count} 个明确 23B/23β 版本已根据多语言官方"
+                f"{beta_alternate_count} 个明确字母变体（β）版本已根据多语言官方"
                 "β/Missing Link 特别篇标题映射到 Season 00"
             )
         release_edition_count = _map_release_label_editions(

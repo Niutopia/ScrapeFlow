@@ -3863,5 +3863,279 @@ class SimpleEngineRunnerTests(unittest.TestCase):
             all(item["action"] == "preserve_at_source" for item in residuals)
         )
 
+    def _steins_gate_shape_source_files(self) -> list[dict[str, object]]:
+        source_root = "/incoming/Steins;Gate"
+        files: list[dict[str, object]] = []
+        for number in range(1, 25):
+            for template in (
+                "[TUDO&Ygm] Steins;Gate [{number:02d}][Ma10p_2160p][x265_flac_ass].mkv",
+                "[TUDO&Ygm] Steins;Gate [{number:02d}][Ma10p_2160p][x265_flac_ass].ass",
+            ):
+                name = template.format(number=number)
+                files.append({
+                    "name": name,
+                    "full_path": f"{source_root}/{name}",
+                    "size": 1_100_000_000,
+                    "is_dir": False,
+                })
+        for tag, size in (
+            ("SP", 1_168_972_819),
+            ("23B", 1_160_950_615),
+            ("NCOP", 233_001_311),
+            ("NCED", 91_197_846),
+        ):
+            name = f"[TUDO&Ygm] Steins;Gate [{tag}][Ma10p_2160p][x265_flac_ass].mkv"
+            files.append({
+                "name": name,
+                "full_path": f"{source_root}/{name}",
+                "size": size,
+                "is_dir": False,
+            })
+        subtitle_name = "[Ygm]Steins;Gate[SP][Ma10p_2160p][x265_flac_ass].ass"
+        files.append({
+            "name": subtitle_name,
+            "full_path": f"{source_root}/备份字幕/{subtitle_name}",
+            "size": 60_456,
+            "is_dir": False,
+        })
+        return files
+
+    def test_explicit_map_resolves_beta_cut_and_script_info_special(self) -> None:
+        """A bracket run's ``[SP]``/``[23B]`` neighbours both get written.
+
+        The explicit-map path must resolve the letter-variant beta cut from
+        the sole beta-titled official special, and that resolution unblocks
+        the subtitle-title matcher: with only the ``[SP]`` video left
+        pending, the ASS Script Info ordinal (25 = 24 regular + 1) and the
+        unique post-finale equal-runtime special both point at S00E01
+        (命运石之门 shape).
+        """
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def read_file_bytes(self, path: str, max_bytes: int = 0) -> bytes:
+                del max_bytes
+                assert path.endswith("[SP][Ma10p_2160p][x265_flac_ass].ass"), path
+                return (
+                    "[Script Info]\n"
+                    "Title: Steins;Gate 25 gb\n"
+                    "ScriptType: v4.00+\n"
+                    "\n"
+                    "[V4+ Styles]\n"
+                ).encode("utf-8")
+
+        class PlannerTMDB:
+            language = "zh-CN"
+
+            def get(self, path: str, **kwargs: object) -> dict[str, object]:
+                language = str(kwargs.get("language") or "zh-CN")
+                if path == "/tv/42509":
+                    return {
+                        "name": "命运石之门",
+                        "original_name": "Steins;Gate",
+                        "first_air_date": "2011-04-06",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 6},
+                            {"season_number": 1, "episode_count": 24},
+                        ],
+                    }
+                if path == "/tv/42509/season/1":
+                    return {"episodes": [{
+                        "episode_number": number,
+                        "name": f"第{number}话",
+                        "air_date": "2011-04-06",
+                        "runtime": 24,
+                    } for number in range(1, 25)]}
+                if path == "/tv/42509/season/0":
+                    episodes = [{
+                        "episode_number": 1,
+                        "name": "横行跋扈的浪荡之徒",
+                        "air_date": "2012-02-22",
+                        "runtime": 24,
+                    }]
+                    episodes.extend({
+                        "episode_number": number,
+                        "name": f"聪明睿智的认知计算 {number - 1}",
+                        "air_date": "2014-04-15",
+                        "runtime": 4,
+                    } for number in (2, 3, 4, 5))
+                    final_title = (
+                        "Missing Link of the Decisive Battle"
+                        if language == "en-US"
+                        else "境界面上的缺失之环（β线）"
+                    )
+                    episodes.append({
+                        "episode_number": 6,
+                        "name": final_title,
+                        "air_date": "2015-12-03",
+                        "runtime": 24,
+                    })
+                    return {"episodes": episodes}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_files = self._steins_gate_shape_source_files()
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "beta-map.json"
+            mapping_path.write_text(
+                json.dumps({
+                    f"{number:02d}": f"S01E{number:02d}"
+                    for number in range(1, 25)
+                }),
+                encoding="utf-8",
+            )
+            plan = build_tv_plan_smart(
+                auto_episode_mode=True,
+                alist=PlannerAList(), tmdb_client=PlannerTMDB(),
+                src_path="/incoming/Steins;Gate", parent_path="/library/番剧",
+                tmdb_id=42509, season=1, absolute=False,
+                prefer_simplified=True, allow_unmapped=False,
+                episode_map_path=mapping_path, source_files=source_files,
+            )
+        by_source_suffix = {
+            str(item.source_path).rsplit("/", 1)[-1]: item
+            for item in plan.files
+        }
+        sp_video = by_source_suffix[
+            "[TUDO&Ygm] Steins;Gate [SP][Ma10p_2160p][x265_flac_ass].mkv"
+        ]
+        self.assertEqual(sp_video.episode_key, "SP01")
+        self.assertEqual(
+            sp_video.final_name,
+            "命运石之门 - S00E01 - 横行跋扈的浪荡之徒.mkv",
+        )
+        sp_subtitle = by_source_suffix[
+            "[Ygm]Steins;Gate[SP][Ma10p_2160p][x265_flac_ass].ass"
+        ]
+        self.assertEqual(sp_subtitle.episode_key, "SP01")
+        beta_cut = by_source_suffix[
+            "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv"
+        ]
+        self.assertEqual(beta_cut.episode_key, "SP06")
+        self.assertEqual(
+            beta_cut.final_name,
+            "命运石之门 - S00E06 - 境界面上的缺失之环（β线） {edition-23β}.mkv",
+        )
+        # The theme residuals stay at source, and the two mapped specials
+        # must not leave any problem rows behind.
+        self.assertEqual(plan.problem_files, [])
+        residuals = {
+            str(item.get("source_path")).rsplit("/", 1)[-1]
+            for item in plan.scan_report.get("preserved_source_residuals") or []
+        }
+        self.assertIn("[TUDO&Ygm] Steins;Gate [NCOP][Ma10p_2160p][x265_flac_ass].mkv", residuals)
+        self.assertIn("[TUDO&Ygm] Steins;Gate [NCED][Ma10p_2160p][x265_flac_ass].mkv", residuals)
+        self.assertTrue(any(
+            "字母变体" in warning for warning in plan.warnings
+        ))
+        self.assertTrue(any(
+            "Script Info" in warning for warning in plan.warnings
+        ))
+
+    def test_explicit_map_beta_cut_fails_closed_on_two_beta_specials(self) -> None:
+        """Two beta-titled officials leave every ``[Nβ]`` cut unmapped.
+
+        The beta-alternate mapper is evidence-driven: when the multilingual
+        Season 00 titles name more than one beta special, the letter-variant
+        cut has no unique target.  Both the ``[23B]`` video and — because the
+        pending pool then holds two videos — the ``[SP]`` pair must stay at
+        source instead of being guessed.
+        """
+        class PlannerAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def read_file_bytes(self, path: str, max_bytes: int = 0) -> bytes:
+                del max_bytes
+                assert path.endswith("[SP][Ma10p_2160p][x265_flac_ass].ass"), path
+                return (
+                    "[Script Info]\n"
+                    "Title: Steins;Gate 25 gb\n"
+                    "ScriptType: v4.00+\n"
+                    "\n"
+                    "[V4+ Styles]\n"
+                ).encode("utf-8")
+
+        class PlannerTMDB:
+            language = "zh-CN"
+
+            def get(self, path: str, **kwargs: object) -> dict[str, object]:
+                del kwargs
+                if path == "/tv/42509":
+                    return {
+                        "name": "命运石之门",
+                        "original_name": "Steins;Gate",
+                        "first_air_date": "2011-04-06",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 6},
+                            {"season_number": 1, "episode_count": 24},
+                        ],
+                    }
+                if path == "/tv/42509/season/1":
+                    return {"episodes": [{
+                        "episode_number": number,
+                        "name": f"第{number}话",
+                        "air_date": "2011-04-06",
+                        "runtime": 24,
+                    } for number in range(1, 25)]}
+                if path == "/tv/42509/season/0":
+                    return {"episodes": [
+                        {
+                            "episode_number": 1,
+                            "name": "横行跋扈的浪荡之徒",
+                            "air_date": "2012-02-22",
+                            "runtime": 24,
+                        },
+                        {
+                            "episode_number": 6,
+                            "name": "境界面上的缺失之环（β线）",
+                            "air_date": "2015-12-03",
+                            "runtime": 24,
+                        },
+                        {
+                            "episode_number": 7,
+                            "name": "另一条β线的特别篇",
+                            "air_date": "2016-03-03",
+                            "runtime": 24,
+                        },
+                    ]}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_files = self._steins_gate_shape_source_files()
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "beta-map.json"
+            mapping_path.write_text(
+                json.dumps({
+                    f"{number:02d}": f"S01E{number:02d}"
+                    for number in range(1, 25)
+                }),
+                encoding="utf-8",
+            )
+            plan = build_tv_plan_smart(
+                auto_episode_mode=True,
+                alist=PlannerAList(), tmdb_client=PlannerTMDB(),
+                src_path="/incoming/Steins;Gate", parent_path="/library/番剧",
+                tmdb_id=42509, season=1, absolute=False,
+                prefer_simplified=True, allow_unmapped=False,
+                episode_map_path=mapping_path, source_files=source_files,
+            )
+        planned_sources = {
+            str(item.source_path).rsplit("/", 1)[-1] for item in plan.files
+        }
+        self.assertNotIn(
+            "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv",
+            planned_sources,
+        )
+        self.assertNotIn(
+            "[TUDO&Ygm] Steins;Gate [SP][Ma10p_2160p][x265_flac_ass].mkv",
+            planned_sources,
+        )
+        self.assertEqual(len(planned_sources), 48)  # 24 videos + 24 subtitles
+        self.assertFalse(any(
+            "字母变体" in warning for warning in plan.warnings
+        ))
+
 if __name__ == "__main__":
     unittest.main()
