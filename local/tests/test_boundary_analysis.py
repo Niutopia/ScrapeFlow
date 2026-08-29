@@ -1538,6 +1538,84 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(len(candidates), 2, msg=[c.display_label for c in candidates])
         self.assertIn("来自深渊 蓝光合集", {c.display_label for c in candidates})
 
+    def test_sole_video_child_bundle_splits_before_whole_root_fallback(self) -> None:
+        """A consumed intake whose only video child is a bundle still splits.
+
+        After the TV units of ``L 4k 来自深渊`` were consumed, the intake
+        held one video-bearing child: the terminal-collection film bundle.
+        The whole-root single-work fallback must not swallow it — the
+        conservative per-film splitter decides, so each film gets its own
+        unit instead of one unmatchable mixed root.
+        """
+        root = "/quark/影视/待刮削/L 4k 来自深渊"
+        def film_dir(label: str, movie: str) -> dict:
+            return {
+                "name": label,
+                "is_dir": True,
+                "children": [
+                    {"name": movie, "is_dir": False, "size": 8_000_000_000},
+                ],
+            }
+
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "海量4K高清资源文档合集.jpg", "is_dir": False, "size": 86_916},
+                {"name": "防失联永久链接.jpg", "is_dir": False, "size": 85_918},
+                {
+                    "name": "来自深渊 剧场版合集",
+                    "is_dir": True,
+                    "children": [
+                        film_dir(
+                            "来自深渊 启程之拂晓",
+                            "[TUDO&Ygm] Made in Abyss Movie 1 Tabidachi no Yoake [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                        film_dir(
+                            "来自深渊 漂泊之黄昏",
+                            "[TUDO&Ygm] Made in Abyss Movie 2 Hourou Suru Tasogare [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                        film_dir(
+                            "来自深渊 深魂之黎明",
+                            "[TUDO&Ygm] Made in Abyss Movie 3 Fukaki Tamashii no Reimei [Ma10p_2160p][x265_flac7.1_ass].mkv",
+                        ),
+                    ],
+                },
+                {"name": "玛露露库的日常", "is_dir": True, "children": []},
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(
+            {c.display_label for c in candidates},
+            {"来自深渊 启程之拂晓", "来自深渊 漂泊之黄昏", "来自深渊 深魂之黎明"},
+            msg=[c.display_label for c in candidates],
+        )
+        self.assertTrue(all(c.proposed_media_context == "movie" for c in candidates))
+
+    def test_sole_ordinary_video_child_stays_whole_root(self) -> None:
+        """One ordinary titled child is a single work, bundle split never fires.
+
+        ``Some Movie Pack/Some Movie (2020)/`` has exactly one video-bearing
+        child, but the conservative splitter finds no multi-film proof, so
+        the whole-root single-work boundary must survive unchanged.
+        """
+        root = "/quark/影视/待刮削/Some Movie Pack"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "Some Movie (2020)",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Some Movie (2020).mkv", "is_dir": False, "size": 20_000_000_000},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1, msg=[c.display_label for c in candidates])
+        self.assertEqual(candidates[0].display_label, root.split("/")[-1])
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
+
     def test_flat_marker_ordinal_feature_files_stay_one_special_run(self) -> None:
         """``OVA 01 - Title`` feature files are one special run, not films.
 

@@ -1649,6 +1649,26 @@ def analyze_boundaries(
     # (multi-season single TV show).
     total_videos = count_video_files(node)
     if total_videos > 0 or season_children:
+        # The whole-root fallback treats the one video-bearing child as a
+        # single work.  When that sole child is itself a proven multi-film
+        # bundle (terminal collection label, dated one-folder-per-film
+        # children, or flat feature files), the conservative splitter owns
+        # every video in the tree and the root keeps only residual files:
+        # prefer those exact per-film units over the whole-root claim.
+        video_children = [
+            child for child in node.children if _child_has_video(child)
+        ]
+        if (
+            root_videos == 0
+            and len(titled_children) == 1
+            and len(video_children) == 1
+            and video_children[0].path == titled_children[0].path
+        ):
+            child_split = _titled_child_split(
+                titled_children[0], root_task_id=root_task_id
+            )
+            if child_split:
+                return child_split
         reasons: list[str] = []
         if root_videos > 0:
             reasons.append(f"根目录直接含 {root_videos} 个视频文件")
