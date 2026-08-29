@@ -234,6 +234,33 @@ def bind_root_task(
     return new_catalog, updated
 
 
+def retire_root_task_binding(
+    catalog: list[IntakeSource],
+    source_id: str,
+) -> tuple[list[IntakeSource], IntakeSource | None]:
+    """Detach a RootJob id from an IntakeSource after terminal cleanup.
+
+    ``bind_root_task`` attaches the lifecycle pointer; this releases it once
+    the root's terminal cleanup has archived the binding's identity evidence
+    in a tombstone.  The catalog row itself (history, presence, counts) is
+    preserved so the source stays observable.  Idempotent; returns ``None``
+    as the second element when the source_id is not found or was already
+    unbound.
+    """
+    updated: IntakeSource | None = None
+    new_catalog: list[IntakeSource] = []
+    for src in catalog:
+        if src.source_id == source_id:
+            if src.root_task_id is None:
+                new_catalog.append(src)
+                continue
+            updated = replace(src, root_task_id=None)
+            new_catalog.append(updated)
+        else:
+            new_catalog.append(src)
+    return new_catalog, updated
+
+
 def find_by_source_id(
     catalog: list[IntakeSource],
     source_id: str,

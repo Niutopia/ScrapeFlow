@@ -132,6 +132,15 @@ class TerminalCleanupTests(unittest.TestCase):
         self.assertTrue(marker.exists())
         self.assertEqual(Path(result["identity_tombstone"]).resolve(), marker.resolve())
         self.assertEqual(marker.read_text(encoding="utf-8").count(root.id), 1)
+        # The tombstone now carries the identity evidence, so the catalog's
+        # lifecycle pointer must be released: a lingering binding whose job
+        # record is gone fail-closes every later create/retry path for the
+        # source ("IntakeSource 仍绑定已不存在的 RootJob") and strands it.
+        from engine.scrapeflow.intake_source import load_intake_catalog
+
+        remaining = load_intake_catalog(self.root)
+        self.assertEqual(len(remaining), 1)
+        self.assertIsNone(remaining[0].root_task_id)
 
 
 if __name__ == "__main__":

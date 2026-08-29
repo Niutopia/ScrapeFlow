@@ -3081,7 +3081,9 @@ class SimpleEngineRunner:
         The method intentionally does not accept paths and never calls AList:
             only the root/owned-child JSON files, ``gaps/<root>``,
             ``staging/<root>`` and archive preprocessing staging under this
-            runner's state root are in scope.  A
+            runner's state root are in scope, plus the IntakeSource binding
+            (released after its identity evidence is archived in a local
+            tombstone).  A
         formal media-library path cannot enter this operation.
         """
         safe_id = _safe_job_id(job_id)
@@ -3105,10 +3107,11 @@ class SimpleEngineRunner:
 
             # An IntakeSource binding is the durable identity of a RootJob.
             # Keep a small, local tombstone before removing its JSON record so
-            # cleanup can never leave an unauditable dangling binding again.
-            # The tombstone is identity evidence only: reopening still has to
-            # prove paused/quiescent state and the absence of every F+ side
-            # effect before rebuilding a fresh B/W generation.
+            # cleanup can never leave an unauditable dangling binding again,
+            # then release the catalog's lifecycle pointer (the tombstone is
+            # now the identity evidence).  Reopening still has to prove
+            # paused/quiescent state and the absence of every F+ side effect
+            # before rebuilding a fresh B/W generation.
             tombstone_path: Path | None = None
             try:
                 from engine.scrapeflow.intake_source import load_intake_catalog
@@ -3148,6 +3151,29 @@ class SimpleEngineRunner:
                     },
                     allow_nan=False,
                 )
+                # The tombstone above is now the auditable identity evidence
+                # for this root, so releasing the catalog's lifecycle pointer
+                # is safe.  Leaving the binding in place would strand the
+                # source forever: the job record below is removed, and the
+                # create path fail-closes on a binding whose RootJob no
+                # longer exists.  The source row itself stays observable.
+                try:
+                    from engine.scrapeflow.intake_source import (
+                        retire_root_task_binding,
+                        save_intake_catalog,
+                    )
+
+                    retired_catalog, _retired = retire_root_task_binding(
+                        load_intake_catalog(self.state_root),
+                        binding.source_id,
+                    )
+                    save_intake_catalog(self.state_root, retired_catalog)
+                except EngineExecutionError:
+                    raise
+                except Exception as exc:
+                    raise EngineExecutionError(
+                        "IntakeSource 绑定无法释放，拒绝清理根任务"
+                    ) from exc
 
             gaps_root = self.state_root / "gaps"
             staging_root = self.state_root / "staging"
