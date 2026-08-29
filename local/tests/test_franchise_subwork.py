@@ -139,6 +139,36 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             self.assertIsNotNone(key, name)
             self.assertEqual(key.display, expected, name)
 
+
+    def test_title_composite_number_and_roman_sequel_is_not_an_ordinal(self) -> None:
+        """``Mob Psycho 100 II`` — the 100 is the title, the II the season.
+
+        A corrupted bracket run (``[1[Ma10p_…]``) used to knock the filename
+        out of the bracket grammar, and the bare-number fallback then read
+        the show title's own ``100`` as episode 100, an ordinal no catalog
+        carries that aborted the whole season plan.  A bare number directly
+        followed by a roman-numeral sequel marker is the show-title
+        composite; a trailing ``(N)`` copy counter is likewise scrubbed, so
+        the mangled sidecar stays unparsed and is left at source.
+        """
+        for name in (
+            "[Ygm] Mob Psycho 100 II [1[Ma10p_2160p][x265_flac_ass] (2).ass",
+            "[Ygm] Mob Psycho 100 II.mkv",
+            "[Ygm] Mob Psycho 100 III [NCED].mkv",
+        ):
+            self.assertIsNone(extract_episode_key(name), name)
+        # A number that merely sits before a roman sequel in the TITLE keeps
+        # other ordinals working, and a plain copy-counter suffix never
+        # swallows a real bracket ordinal.
+        for name, expected in (
+            ("Mob Psycho 100 II 05.mkv", "E05"),
+            ("[Ygm] Mob Psycho 100 II [01][Ma10p_2160p][x265_flac_ass].mkv", "E01"),
+            ("Some Show [01] (2).mkv", "E01"),
+        ):
+            key = extract_episode_key(name)
+            self.assertIsNotNone(key, name)
+            self.assertEqual(key.display, expected, name)
+
     def test_non_story_assets_do_not_inherit_a_parent_ordinal(self) -> None:
         """A sequel digit in the parent title is not an asset's episode.
 

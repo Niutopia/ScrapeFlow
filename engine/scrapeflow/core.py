@@ -270,6 +270,12 @@ EPISODE_NOISE_RE = re.compile(
 )
 DATE_NOISE_RE = re.compile(r"\b(?:19|20)\d{2}[-._]\d{1,2}[-._]\d{1,2}\b")
 
+# A trailing ``(N)`` directly before the extension is the filesystem's
+# collision copy counter (``name (2).ass``), never episode evidence: a
+# release that numbers its episodes in parentheses at the end of the stem
+# does not exist.  Scrub it before any ordinal grammar can read it.
+TRAILING_COPY_COUNTER_RE = re.compile(r"\s*\(\s*\d{1,4}\s*\)(?=\.[^.]*$|\s*$)")
+
 # A bare four-digit year (``2021``) is release metadata, never an episode
 # number.  ``S01.2021`` therefore reads as ``Season 1, year 2021``, not
 # ``Season 1, episode 2021``.
@@ -1916,6 +1922,7 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
     clean = DATE_NOISE_RE.sub(" ", text)
     clean = EPISODE_NOISE_RE.sub(" ", clean)
     clean = BARE_YEAR_NOISE_RE.sub(" ", clean)
+    clean = TRAILING_COPY_COUNTER_RE.sub(" ", clean)
     for roman, arabic in ROMAN_MAP.items():
         clean = clean.replace(roman, f" {arabic} ")
 
@@ -2061,14 +2068,29 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
         r"(?:^|[^A-Za-z0-9])(?:EP?|E)\s*0*(\d{1,4})(?:$|[\s._\-\[\]()])",
         r"第\s*0*(\d{1,4})\s*(?:话|話|集)",
     ]
-    if not _NON_STORY_ASSET_RE.search(clean):
-        regular_patterns.append(
-            r"(?:^|[\s_\-.(])0*(\d{1,3})(?:[\s_\-.()]|$)",
-        )
     for pattern in regular_patterns:
         match = re.search(pattern, clean, re.IGNORECASE)
         if match:
             return EpisodeKey("regular", int(match.group(1)))
+    if not _NON_STORY_ASSET_RE.search(clean):
+        # A bare number immediately followed by a roman-numeral sequel
+        # marker is the show-title composite (``Mob Psycho 100 II`` — the
+        # 100 belongs to the title, the II to the season), never an episode
+        # ordinal.  Skip that number and keep scanning: a later standalone
+        # number is still ordinary bare-number evidence.
+        for bare_match in re.finditer(
+            r"(?:^|[\s_\-.(])0*(\d{1,3})(?:[\s_\-.()]|$)",
+            clean,
+            re.IGNORECASE,
+        ):
+            remainder = clean[bare_match.end():]
+            if re.match(
+                r"\s*(?:II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)(?![A-Za-z0-9])",
+                remainder,
+                re.IGNORECASE,
+            ):
+                continue
+            return EpisodeKey("regular", int(bare_match.group(1)))
     return None
 
 
