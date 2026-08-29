@@ -123,6 +123,54 @@ class FractionalSpecialMappingTests(unittest.TestCase):
         )
         self.assertEqual([(item[0], item[1]) for item in candidates], [(0, 3)])
 
+    def test_non_half_decimal_maps_when_official_title_carries_same_label(self) -> None:
+        """``24.9`` maps when TMDB's special title literally says 第24.9话.
+
+        The evidence gate was reserved for the conventional N.5 half-episode
+        form, so the Tensura ``[24.9]`` sidecar failed closed even though
+        TMDB's Season 00 E07 title is ``第24.9话 闲话：日向·坂口`` — the same
+        explicit-label evidence class the N.5 path scores highest.  A non-N.5
+        decimal now passes only with that verbatim official label; without it
+        the fail-closed verdict stands.
+        """
+        specials = [
+            {"episode_number": 7, "name": "第24.9话 闲话：日向·坂口",
+             "air_date": "2021-01-05", "runtime": 24},
+            {"episode_number": 8, "name": "第36.5话 闲话：维鲁多拉日记2",
+             "air_date": "2021-06-29", "runtime": 24},
+        ]
+        titles = {
+            (0, 7): ["第24.9话 闲话：日向·坂口"],
+            (0, 8): ["第36.5话 闲话：维鲁多拉日记2"],
+        }
+        candidates, reason = _fractional_recap_evidence_candidates(
+            FakeTMDB({1: SAO_S1}, specials), 82684, 1,
+            EpisodeKey(kind="fractional", number=24, fractional_digits="9"),
+            titles,
+            [{"name": "[Ygm] Show 2nd Season [24.9][Ma10p].mkv",
+              "full_path": "/x/[24.9].mkv"}],
+        )
+        self.assertTrue(candidates, reason)
+        best = max(candidates, key=lambda row: row[4] if len(row) > 4 else 0)
+        targets = {row[1] for row in candidates if isinstance(row[1], int)}
+        self.assertIn(7, targets)
+
+    def test_non_half_decimal_without_official_label_stays_closed(self) -> None:
+        """No official title carrying ``24.9`` keeps the non-N.5 gate shut."""
+        specials = [
+            {"episode_number": 1, "name": "Totally unrelated special",
+             "air_date": "2021-01-05", "runtime": 24},
+        ]
+        candidates, reason = _fractional_recap_evidence_candidates(
+            FakeTMDB({1: SAO_S1}, specials), 82684, 1,
+            EpisodeKey(kind="fractional", number=24, fractional_digits="9"),
+            {(0, 1): ["Totally unrelated special"]},
+            [{"name": "[Ygm] Show 2nd Season [24.9][Ma10p].mkv",
+              "full_path": "/x/[24.9].mkv"}],
+        )
+        self.assertEqual(candidates, [])
+        self.assertTrue(reason)
+
     def test_unknown_fractional_still_fails_closed(self) -> None:
         tmdb = FakeTMDB({1: SAO_S1}, [])
         candidates, reason = _fractional_recap_evidence_candidates(

@@ -3822,7 +3822,19 @@ def _fractional_recap_evidence_candidates(
 ]:
     """Resolve N.5 using scored independent evidence and conflict vetoes."""
     if source_key.fractional_digits != "5":
-        return [], "没有找到可用于非 N.5 小数集的高置信半集识别证据"
+        # A non-N.5 decimal (``24.9``) is only safe when an official special
+        # title carries the same decimal label verbatim (``第24.9话 闲话：
+        # 日向·坂口``) — that explicit label is the same top evidence class
+        # the N.5 path scores highest.  Without it the softer recap/interlude
+        # heuristics stay reserved for the conventional half-episode form.
+        explicit_label = any(
+            (source_key.number, source_key.fractional_digits)
+            in _fractional_signatures(title)
+            for localized_titles in titles.values()
+            for title in localized_titles
+        )
+        if not explicit_label:
+            return [], "没有找到可用于非 N.5 小数集的高置信半集识别证据"
 
     recap_re = re.compile(
         r"(?:总集篇|總集篇|総集編|総集篇|recap|digest|compilation|summary|回顾|回顧)",
