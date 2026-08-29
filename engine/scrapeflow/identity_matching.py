@@ -2618,6 +2618,25 @@ def auto_match_from_evidence(
     ):
         candidate_queries.append(clean_boundary_query)
 
+    # A representative media filename carries the work's own release title
+    # (``[TUDO&Ygm] Made in Abyss Movie 1 Tabidachi no Yoake [Ma10p]…``), and
+    # its official romaji alias is frequently the only evidence separating
+    # same-franchise sibling films whose localized titles all share the
+    # franchise prefix.  Those file-level title queries are the unit's own
+    # primary evidence, so they must take budget slots ahead of the parent
+    # combinations below — otherwise two nested parents' combined variants
+    # exhaust the six-query budget, the boundary label's localized miss
+    # (``启程之拂晓`` vs the official ``启程的拂晓``) leaves the pool empty, and
+    # the parent escalation floods it with every franchise sibling tied at
+    # the prefix-containment floor.
+    for representative in evidence.representative_names:
+        title_query = _title_from_representative_episode_filename(representative)
+        if title_query:
+            candidate_queries.append(title_query)
+    for r in evidence.representative_names:
+        if _usable_representative_identity_query(r):
+            candidate_queries.append(r)
+
     # Combined parent + boundary queries are useful ordinary evidence, but
     # must not crowd out the unit's own boundary queries above or the strict
     # bare-number proof before those.
@@ -2627,15 +2646,6 @@ def auto_match_from_evidence(
                 candidate_queries.append(f"{p_variant} {boundary_label}")
                 candidate_queries.append(f"{p_variant}/{boundary_label}")
 
-    # 3. A representative filename with an explicit ``SxxExx`` marker may
-    # carry a clean title even when the boundary is a release-package label.
-    # Put that derived query ahead of further noisy variants so it remains
-    # inside the bounded search budget.
-    for representative in evidence.representative_names:
-        title_query = _title_from_representative_episode_filename(representative)
-        if title_query:
-            candidate_queries.append(title_query)
-
     # 4. Normalized titles and combined with parent
     for t in evidence.normalized_titles:
         for parent in evidence.parent_labels:
@@ -2643,15 +2653,12 @@ def auto_match_from_evidence(
                 candidate_queries.append(f"{parent.strip()} {t.strip()}")
         candidate_queries.append(t)
 
-    # 5. Aliases and raw representative names
+    # 5. Aliases and combined with parent
     for a in evidence.aliases:
         for parent in evidence.parent_labels:
             if parent.strip() and a.strip():
                 candidate_queries.append(f"{parent.strip()} {a.strip()}")
         candidate_queries.append(a)
-    for r in evidence.representative_names:
-        if _usable_representative_identity_query(r):
-            candidate_queries.append(r)
 
     # Deduplicate while preserving order.  A bare season label
     # (``第一季``/``Season 02``) or a pure movie-form label (``剧场版``)

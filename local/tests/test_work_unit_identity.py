@@ -3022,6 +3022,87 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             auto_match_from_evidence(client, evidence_valid, min_confidence=1.5)
         self.assertIn("最低置信度必须在 0 到 1 之间", str(ctx2.exception))
 
+    def test_sibling_films_split_by_representative_filename_query(self) -> None:
+        """Representative filename queries precede parent combinations.
+
+        ``来自深渊 剧场版合集/来自深渊 启程之拂晓/``: the boundary label
+        misses TMDB's localized title by one character (``之拂晓`` vs ``的拂晓``),
+        and the parent escalation alone floods the pool with every franchise
+        sibling tied at the prefix-containment floor.  The representative
+        release filename (``[TUDO&Ygm] Made in Abyss Movie 1 Tabidachi no
+        Yoake …``) is the unit's own title evidence: dispatched ahead of the
+        parent combinations, its exact official romaji alias separates the
+        siblings and confirms the right film.
+        """
+        franchise_pool = [
+            {"id": 526426, "title": "来自深渊：启程的拂晓", "release_date": "2019-01-04", "genre_ids": [16]},
+            {"id": 526429, "title": "来自深渊：流浪的黄昏", "release_date": "2019-01-18", "genre_ids": [16]},
+            {"id": 573730, "title": "来自深渊：深魂的黎明", "release_date": "2020-01-17", "genre_ids": [16]},
+        ]
+        client = FakeTMDBClient(
+            search_results={
+                # The franchise-wide parent escalation query.
+                "来自深渊": franchise_pool,
+                # The representative filename (raw and TMDB-returned form).
+                "Made in Abyss Movie 1 Tabidachi no Yoake": [
+                    {"id": 526426, "title": "来自深渊：启程的拂晓", "release_date": "2019-01-04", "genre_ids": [16]},
+                ],
+            },
+            alternative_titles={
+                "526426": [
+                    {"iso_3166_1": "US", "title": "Made in Abyss Movie 1: Tabidachi no Yoake", "type": ""},
+                    {"iso_3166_1": "US", "title": "Made in Abyss Movie 1: Journey's Dawn", "type": ""},
+                ],
+                "526429": [
+                    {"iso_3166_1": "US", "title": "Made in Abyss Movie 2: Hourou Suru Tasogare", "type": ""},
+                ],
+                "573730": [
+                    {"iso_3166_1": "US", "title": "Made in Abyss Movie 3: Fukaki Tamashii no Reimei", "type": ""},
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-abyss-movie1",
+            boundary_label="来自深渊 启程之拂晓",
+            parent_labels=("L 4k 来自深渊", "来自深渊 剧场版合集"),
+            representative_names=(
+                "来自深渊 启程之拂晓",
+                "Made in Abyss Movie 1 Tabidachi no Yoake",
+            ),
+            normalized_titles=("来自深渊 启程之拂晓",),
+            years=(),
+            episode_pattern=None,
+            media_shape="movie",
+            aliases=(),
+        )
+        best, candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 526426)
+        self.assertEqual(best.status, "confirmed")
+        self.assertGreaterEqual(best.confidence, 0.999999)
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/")
+        ]
+        filename_query = next(
+            (q for q in dispatched if "Tabidachi" in q), None,
+        )
+        parent_combo = next(
+            (
+                q for q in dispatched
+                if q != "来自深渊 启程之拂晓"
+                and q.endswith("来自深渊 启程之拂晓")
+            ),
+            None,
+        )
+        self.assertIsNotNone(filename_query)
+        if parent_combo is not None:
+            self.assertLess(
+                dispatched.index(filename_query),
+                dispatched.index(parent_combo),
+                "representative filename query must precede parent combinations",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
