@@ -2277,11 +2277,38 @@ def _same_sized_specials_resolved_by_runtimes(
     ) and all(value is not None and value >= 18 for value in regular_runtimes)
 
 
+def _season_disambiguated_by_name(
+    matching: Sequence[tuple[int, int, str]],
+    *,
+    unit_label: str,
+) -> tuple[int, int] | None:
+    """Pick one count-matching season whose official name is the unit label.
+
+    Franchise releases title each season directory exactly as TMDB titles the
+    season (``某科学的超电磁炮 S`` ↔ season ``某科学的超电磁炮S``).  When the
+    episode count alone matches several seasons, the normalized season name
+    must equal the normalized unit label for exactly one candidate; anything
+    else stays ambiguous and the caller keeps failing closed.
+    """
+    label_key = _normalize_match_title(str(unit_label or ""))
+    if not label_key:
+        return None
+    named = [
+        (season, count)
+        for season, count, name in matching
+        if _normalize_match_title(str(name or "")) == label_key
+    ]
+    if len(named) != 1:
+        return None
+    return named[0]
+
+
 def _single_positive_tmdb_season(
     tmdb_client: object | None,
     *,
     tmdb_id: int,
     episode_count: int,
+    unit_label: str = "",
 ) -> _TmdbSingleRegularSeasonEvidence | None:
     """Read show detail that proves one regular season.
 
@@ -2305,7 +2332,7 @@ def _single_positive_tmdb_season(
     raw_seasons = show.get("seasons")
     if not isinstance(raw_seasons, list) or not raw_seasons:
         return None
-    positives: list[tuple[int, int]] = []
+    positives: list[tuple[int, int, str]] = []
     specials_count: int | None = None
     for row in raw_seasons:
         if not isinstance(row, Mapping):
@@ -2333,10 +2360,13 @@ def _single_positive_tmdb_season(
             # Future/announced season placeholder; the episode catalog will
             # independently confirm all currently published coordinates.
             continue
-        positives.append((raw_season, raw_count))
+        raw_name = row.get("name")
+        positives.append(
+            (raw_season, raw_count, raw_name if isinstance(raw_name, str) else "")
+        )
     matching = [
-        (season, count)
-        for season, count in positives
+        (season, count, name)
+        for season, count, name in positives
         if count == episode_count
     ]
     # A complete ``1..N`` run proves one published season when exactly one
@@ -2344,24 +2374,31 @@ def _single_positive_tmdb_season(
     # container child owns only that season).  A run equal to the sum of
     # several seasons is handled by the merged-season evidence instead.
     if len(matching) == 1:
-        season, declared_count = matching[0]
+        season, declared_count = matching[0][:2]
         overflow_count = 0
     else:
-        # A ``1..N`` run whose tail (N - declared) exactly equals the published
-        # specials bucket proves the regular season plus an overflow tail that
-        # lands in Season 00 (日在校园 1..14 = 12 regular + 2 OVA).  Only a
-        # unique such season is accepted.
-        overflow = [
-            (season, count)
-            for season, count in positives
-            if count < episode_count
-            and specials_count is not None
-            and episode_count - count == specials_count
-        ]
-        if len(overflow) != 1:
-            return None
-        season, declared_count = overflow[0]
-        overflow_count = episode_count - declared_count
+        # Same-sized seasons are still distinguishable when the unit's own
+        # label is exactly one candidate season's official name.
+        named = _season_disambiguated_by_name(matching, unit_label=unit_label)
+        if named is not None:
+            season, declared_count = named
+            overflow_count = 0
+        else:
+            # A ``1..N`` run whose tail (N - declared) exactly equals the
+            # published specials bucket proves the regular season plus an
+            # overflow tail that lands in Season 00 (日在校园 1..14 = 12
+            # regular + 2 OVA).  Only a unique such season is accepted.
+            overflow = [
+                (season, count)
+                for season, count, _name in positives
+                if count < episode_count
+                and specials_count is not None
+                and episode_count - count == specials_count
+            ]
+            if len(overflow) != 1:
+                return None
+            season, declared_count = overflow[0]
+            overflow_count = episode_count - declared_count
     if specials_count == episode_count and not _same_sized_specials_resolved_by_runtimes(
         tmdb_client,
         tmdb_id=tmdb_id,
@@ -2723,6 +2760,7 @@ def prove_single_season_episode_evidence(
         tmdb_client,
         tmdb_id=tmdb_id,
         episode_count=len(episode_numbers),
+        unit_label=str(record.display_label or ""),
     )
     if season_evidence is None:
         merged = _merged_multi_season_evidence(

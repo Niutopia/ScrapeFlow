@@ -137,11 +137,13 @@ class StrictBareEpisodeTMDB:
         *,
         payload_counts: dict[int, int] | None = None,
         episode_runtimes: dict[int, list[int | None]] | None = None,
+        season_names: dict[int, str] | None = None,
     ) -> None:
         self.tmdb_id = tmdb_id
         self.seasons = dict(seasons)
         self.payload_counts = dict(payload_counts or seasons)
         self.episode_runtimes = dict(episode_runtimes or {})
+        self.season_names = dict(season_names or {})
 
     def get(self, path: str, **_params: object) -> dict[str, object]:
         if path == f"/tv/{self.tmdb_id}":
@@ -156,10 +158,18 @@ class StrictBareEpisodeTMDB:
                 "number_of_seasons": len(positive),
                 "number_of_episodes": sum(positive.values()),
                 "seasons": [
-                    {
-                        "season_number": season,
-                        "episode_count": count,
-                    }
+                    (
+                        {
+                            "season_number": season,
+                            "episode_count": count,
+                            "name": self.season_names[season],
+                        }
+                        if season in self.season_names
+                        else {
+                            "season_number": season,
+                            "episode_count": count,
+                        }
+                    )
                     for season, count in sorted(self.seasons.items())
                 ],
             }
@@ -2243,6 +2253,94 @@ class LibraryIndexTests(unittest.TestCase):
                 tmdb,
                 state_root=state_root,
                 root_task_id="root-bracketed-duplicate-encode",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
+    def test_same_sized_seasons_disambiguated_by_official_season_name(self) -> None:
+        """A unit label equal to one season's official name picks that season.
+
+        Franchise releases title each season directory exactly as TMDB titles
+        the season (``某科学的超电磁炮 S`` ↔ ``某科学的超电磁炮S``).  When both
+        S1 and S2 declare 24 episodes, the count alone is ambiguous; the
+        normalized unit label must match exactly one candidate season's
+        normalized official name, otherwise the proof stays fail-closed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99104,
+                {0: 1, 1: 24, 2: 24},
+                season_names={1: "某科学的超电磁炮", 2: "某科学的超电磁炮S"},
+            )
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 25)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-season-name-s",
+            )
+            # The default helper label is "One Season Show"; no candidate
+            # season carries that name, so the count ambiguity stays closed.
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99104,
+                {0: 1, 1: 24, 2: 24},
+                season_names={1: "One Season Show S", 2: "One Season Show T"},
+            )
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 25)
+            ]
+            files = {
+                f"/incoming/One Season Show S/{name}": b"v"
+                for name in names
+            }
+            alist = IndexAList(files)
+            root_task_id = "root-season-name-s2"
+            analyze_root_boundaries(
+                alist,
+                "/incoming/One Season Show S",
+                root_task_id=root_task_id,
+                state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(record.reconciliation_evidence["season"], 1)
+
+    def test_same_sized_seasons_without_name_match_stay_ambiguous(self) -> None:
+        """Two candidate names matching the unit label keep the proof closed."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99105,
+                {1: 24, 2: 24},
+                season_names={1: "One Season Show", 2: "One Season Show"},
+            )
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 25)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-season-name-ambiguous",
             )
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
