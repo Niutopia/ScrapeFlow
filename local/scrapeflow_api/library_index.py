@@ -1775,6 +1775,18 @@ _UNNUMBERED_SPECIAL_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A letter-suffixed bracket ordinal (``[23B]``/``[23β]``) is an alternate cut
+# of that episode with its own release coordinate — 23β is a distinct special
+# beside the plain episode 23, not a second member of the integer run.  A
+# ``v2``-style revision suffix (``[02v2]``) is deliberately NOT a letter
+# variant: a revision re-releases the same ordinal, so it keeps its existing
+# parsing.  The variant is omitted from the strict run exactly like a
+# fractional episode; when the plain ordinals alone no longer form one
+# contiguous ``1..N`` run the proof fails closed instead of guessing.
+_LETTER_VARIANT_EPISODE_RE = re.compile(
+    r"\[\s*0*\d{1,3}\s*(?:[A-Za-z]|β)\s*\]",
+)
+
 
 def _is_known_non_story_theme_video(file: SourceFile) -> bool:
     """Whether a video is one explicitly identified non-story OP/ED asset.
@@ -1803,6 +1815,7 @@ def _is_non_regular_episode_video(file: SourceFile) -> bool:
     return (
         _is_known_non_story_theme_video(file)
         or _is_fractional_episode_video(file)
+        or _is_letter_variant_episode_video(file)
         or _is_bonus_directory_video(file)
         or _is_unnumbered_special_video(file)
         or _is_menu_video(file)
@@ -1849,6 +1862,18 @@ def _is_unnumbered_special_video(file: SourceFile) -> bool:
     """
     basename = posixpath.basename(str(file.path or "").rstrip("/"))
     return bool(_UNNUMBERED_SPECIAL_MARKER_RE.search(basename))
+
+
+def _is_letter_variant_episode_video(file: SourceFile) -> bool:
+    """Whether a video carries a letter-suffixed bracket ordinal (``[23B]``).
+
+    ``23B``/``23β`` names an alternate cut of episode 23 — its own release
+    coordinate, not a member of the integer ``1..N`` run.  Like a fractional
+    episode it is omitted from the regular proof instead of invalidating it,
+    and its own coordinate stays unmapped unless a later layer proves one.
+    """
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_LETTER_VARIANT_EPISODE_RE.search(basename))
 
 
 def _is_menu_video(file: SourceFile) -> bool:
