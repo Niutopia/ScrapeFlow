@@ -1843,12 +1843,21 @@ class SimpleApplication:
             from local.scrapeflow_api.library_index import (
                 reconcile_root_work_units,
             )
+            from local.scrapeflow_api.tmdb_episode_catalog import (
+                TmdbEpisodeCatalog,
+            )
             from local.scrapeflow_api.unit_e_lanes import compute_known_gap_tokens
             reconcile_root_work_units(
                 runner.alist, runner.library_root, self.state_root, job_id,
                 known_gap_tokens_by_identity=compute_known_gap_tokens(
                     self.state_root
                 ),
+                # Mirror the pipeline's own D pass: without the catalog and
+                # client the planner dry-run evidence source stays dark and a
+                # specials-only confirmed unit parks as "缺少可证明的季集坐标"
+                # even though F could prove its coordinates.
+                episode_catalog=TmdbEpisodeCatalog(runner.tmdb),
+                tmdb_client=runner.tmdb,
             )
         except Exception:
             pass  # Read-only refinement; the durable override already stands.
