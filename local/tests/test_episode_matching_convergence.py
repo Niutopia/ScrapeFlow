@@ -179,6 +179,10 @@ class EpisodeMatchingConvergenceTests(unittest.TestCase):
             "Example Show E01 [01].mkv",
             "Example Show S01E01 [01].mkv",
             "/incoming/OVA/Example Show [01].mkv",
+            # The compound OVA-bonus-special token is a special-release label;
+            # the bracket ordinal beside it must not become a regular member.
+            "Example Show [OVBSP] [01].mkv",
+            "/incoming/OVBSP/Example Show [01].mkv",
         ):
             with self.subTest(value=value):
                 self.assertIsNone(bracketed_regular_episode_number(value))

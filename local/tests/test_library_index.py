@@ -2168,6 +2168,34 @@ class LibraryIndexTests(unittest.TestCase):
                 1,
             )
 
+    def test_bracketed_proof_accepts_compound_ovbsp_release_token(self) -> None:
+        """``[OVBSP]`` is one more unnumbered special-release spelling.
+
+        The planner's special-context classifier already treats the compound
+        OVA-bonus-special token as special context, so D's unnumbered-marker
+        vocabulary must agree; otherwise the file silently stays inside the
+        bracket run and invalidates an otherwise complete single-season proof.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99101, {0: 3, 1: 12})
+            names = [
+                f"[Ygm] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 13)
+            ] + [
+                "[Ygm] Example Show [OVBSP][Ma10p_1154p].mkv",
+                "[Ygm] Example Show [OVA][Ma10p_2160p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-bracketed-ovbsp-token",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(record.reconciliation_evidence["season"], 1)
+            self.assertEqual(record.reconciliation_evidence["episode_count"], 12)
+
     def test_bracketed_proof_excludes_fractional_special_video(self) -> None:
         """A ``[11.5]`` fractional special is a separate coordinate.
 

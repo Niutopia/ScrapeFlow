@@ -1915,11 +1915,14 @@ _NON_STORY_THEME_DIRECTORY_RE = BONUS_DIRECTORY_SEGMENT_RE
 # Kept consistent with ``boundary_analysis._MOVIE_MIN_BYTES``.
 _MOVIE_SHAPED_MIN_BYTES = 200 * 1024 * 1024
 
-# An unnumbered physical-special marker (``[OAD]``/``[OVA]``/``[OAV]``/``[SP]``)
-# is a named special, not a member of the integer ``1..N`` regular run.  It is
-# omitted from the regular single-season proof exactly like NCOP/NCED are.
+# An unnumbered physical-special marker (``[OAD]``/``[OVA]``/``[OAV]``/``[SP]``/
+# ``[OVBSP]``) is a named special, not a member of the integer ``1..N`` regular
+# run.  It is omitted from the regular single-season proof exactly like
+# NCOP/NCED are.  ``OVBSP`` is the compound OVA-bonus-special release token the
+# planner's special-context classifier already recognizes; D must agree or the
+# file silently stays inside the bracket run and invalidates the whole proof.
 _UNNUMBERED_SPECIAL_MARKER_RE = re.compile(
-    r"(?<![A-Za-z])(?:OVA|OAV|OAD|SP)(?![A-Za-z])",
+    r"(?<![A-Za-z])(?:OVBSP|OVA|OAV|OAD|SP)(?![A-Za-z])",
     re.IGNORECASE,
 )
 

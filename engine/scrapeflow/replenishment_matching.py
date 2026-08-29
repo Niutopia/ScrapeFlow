@@ -92,9 +92,12 @@ CHINESE_EPISODE_ONLY_RE = re.compile(
 # coordinate, not a fragment of an explicit SxxEyy label or a special-release
 # marker.  D/F use this narrow primitive when a one-season TMDB catalog is the
 # *only* possible season proof.  Keeping it here means source reconciliation
-# and later writer validation share the same episode grammar.
+# and later writer validation share the same episode grammar.  ``ovbsp`` is
+# one compound release spelling of OVA-bonus-special; the planner's
+# special-context classifier already knows it, so this vocabulary must too.
 _BARE_REGULAR_EPISODE_SPECIAL_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
+    r"ovbsp|"
     r"sp(?:ecial)?|ova|oav|oad|extra(?:s)?|bonus|"
     r"特别篇|特辑|花絮|映像特典"
     r")(?![A-Za-z0-9])",
