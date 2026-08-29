@@ -792,6 +792,133 @@ def _scope_season_number(path: str) -> int | None:
     return _season_number_from_directory_name(posixpath.basename(path))
 
 
+_PLANNED_EPISODE_TOKEN_RE = re.compile(r"(?<!\d)S(\d{2,})E(\d{2,})(?!\d)")
+
+
+def _planned_special_tokens(
+    alist: object,
+    scoped_node: SourceNode,
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    media_root: str,
+    record: WorkUnitRecord,
+) -> frozenset[str]:
+    """Derive Season 00 coordinates by dry-running the F planner itself.
+
+    A specials-only TV source (a letter-variant cut beside an unnumbered
+    ``[SP]`` pair) carries no episode grammar at all, so no inline D proof
+    can name its coordinates.  The planner that will write the files can:
+    its beta-alternate and subtitle-title mappers resolve every video
+    against official Season 00 rows before any write.  Re-run that same
+    smart plan here and accept exactly the Season 00 coordinates it proves
+    — every planned video must land in Season 00 with no problem rows — so
+    D and F can never disagree about which coordinates are being
+    reconciled.  Any planner error or unresolved mapping leaves the set
+    empty and the unit keeps its manual-confirmation surface.
+    """
+    if tmdb_client is None:
+        return frozenset()
+    # Mirror the season F will put on its request for this unit (identity
+    # season → named-arc window → one claimed season → the historical
+    # Season 01 default).  Official Season 00 rows are season-independent,
+    # but the Script-Info timeline evidence reads the anchor season's
+    # finale, so the dry run must anchor exactly where F will.
+    identity = record.identity or {}
+    season_value: int | None = None
+    raw_season = identity.get("season")
+    if (
+        isinstance(raw_season, int)
+        and not isinstance(raw_season, bool)
+        and raw_season > 0
+    ):
+        season_value = int(raw_season)
+    if season_value is None:
+        decision_trace = identity.get("decision_trace")
+        window = (
+            decision_trace.get("season_window_season")
+            if isinstance(decision_trace, Mapping)
+            else None
+        )
+        if (
+            isinstance(window, int)
+            and not isinstance(window, bool)
+            and window >= 0
+        ):
+            season_value = int(window)
+    declared_seasons = tuple(
+        value
+        for value in record.claimed_seasons
+        if isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+    if season_value is None and len(declared_seasons) == 1:
+        season_value = declared_seasons[0]
+    if season_value is None:
+        season_value = 1
+    src_path = scoped_node.path
+    if is_video_filename(posixpath.basename(src_path)):
+        # One-file scope: the planner's public root stays the file's parent,
+        # exactly as the F request builder keeps it.
+        src_path = posixpath.dirname(src_path) or "/"
+    files = [
+        {
+            "name": file.name,
+            "full_path": file.path,
+            "size": int(file.size),
+            "is_dir": False,
+        }
+        for file in collect_all_files(scoped_node)
+    ]
+    try:
+        from engine.scraper import build_tv_plan_smart
+
+        plan = build_tv_plan_smart(
+            auto_episode_mode=True,
+            alist=alist,
+            tmdb_client=tmdb_client,
+            src_path=src_path,
+            parent_path=f"{str(media_root).rstrip('/')}/番剧",
+            tmdb_id=tmdb_id,
+            season=season_value,
+            absolute=False,
+            prefer_simplified=True,
+            allow_unmapped=False,
+            ignore_orphan_temp=False,
+            episode_map_path=None,
+            source_files=files,
+            media_root=str(media_root),
+            **(
+                {"source_declared_seasons": declared_seasons}
+                if declared_seasons
+                else {}
+            ),
+        )
+    except Exception:
+        # The planner is evidence here, not an authority: any failure means
+        # the coordinates stay unproven and the unit keeps parking.
+        return frozenset()
+    if list(getattr(plan, "problem_files", None) or []):
+        return frozenset()
+    tokens: set[str] = set()
+    for item in getattr(plan, "files", None) or []:
+        source_path = str(getattr(item, "source_path", "") or "")
+        if not is_video_filename(posixpath.basename(source_path)):
+            continue
+        match = _PLANNED_EPISODE_TOKEN_RE.search(
+            str(getattr(item, "final_name", "") or "")
+        )
+        if match is None:
+            return frozenset()
+        if int(match.group(1)) != 0:
+            # This evidence path only reconciles specials-only sources; a
+            # regular-season coordinate belongs to an ordinary D proof.
+            return frozenset()
+        tokens.add(f"S00E{int(match.group(2)):02d}")
+    return frozenset(tokens)
+
+
 def _subtitle_coordinates_for_season(node: SourceNode, season: int) -> frozenset[int] | None:
     """Return exact subtitle coordinates for one declared no-video season.
 
@@ -3653,6 +3780,20 @@ def reconcile_root_work_units(
                         tmdb_id=tmdb_id,
                         season=default_season,
                     )
+                    if not special_run_tokens:
+                        # A specials-only source has no grammar at all — not
+                        # even a same-marker OVA run.  Its coordinates are
+                        # provable only by the planner that will write the
+                        # files (letter-variant and Script-Info mappers), so
+                        # a dry run of that same plan supplies them here.
+                        special_run_tokens = _planned_special_tokens(
+                            alist,
+                            scoped_node,
+                            tmdb_client,
+                            tmdb_id=tmdb_id,
+                            media_root=media_root,
+                            record=record,
+                        )
                     if special_run_tokens:
                         decision = decide_reconciliation(
                             index,

@@ -100,6 +100,10 @@ class IndexAList:
             return value[:max_bytes]
         return value
 
+    def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        return self.list(path)
+
     def ensure_directory(self, path: str) -> bool:
         self.dirs.add(path.rstrip("/") or "/")
         return True
@@ -1468,6 +1472,225 @@ class LibraryIndexTests(unittest.TestCase):
             apply_work_unit_override(
                 state_root, root_task_id, record.work_unit_id,
                 media_type="tv", tmdb_id=tmdb.tmdb_id, season=1,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+            self.assertIn("缺少可证明的季集坐标", record.attention or "")
+
+    def test_specials_only_source_reconciles_via_planner_evidence(self) -> None:
+        """D derives a specials-only unit's S00 coordinates from F's own plan.
+
+        A source holding only a letter-variant cut and an unnumbered ``[SP]``
+        pair has no episode grammar for any inline D proof.  The planner that
+        will write the files resolves both against official Season 00 rows
+        (the β-titled special, the ASS Script Info ordinal), so D dry-runs
+        that same smart plan and reconciles exactly the coordinates it
+        proves — here S00E01/S00E06 beside an existing S01 run.
+        """
+
+        class SteinsGateTMDB:
+            language = "zh-CN"
+            tmdb_id = 42509
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/tv/42509":
+                    return {
+                        "name": "命运石之门",
+                        "original_name": "Steins;Gate",
+                        "first_air_date": "2011-04-06",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 6},
+                            {"season_number": 1, "episode_count": 24},
+                        ],
+                    }
+                if path == "/tv/42509/season/1":
+                    return {"episodes": [
+                        {
+                            "episode_number": number,
+                            "name": f"第{number}话",
+                            "air_date": "2011-04-06",
+                            "runtime": 24,
+                        }
+                        for number in range(1, 25)
+                    ]}
+                if path == "/tv/42509/season/0":
+                    return {"episodes": [
+                        {
+                            "episode_number": 1,
+                            "name": "横行跋扈的浪荡之徒",
+                            "air_date": "2012-02-22",
+                            "runtime": 24,
+                        },
+                        *[
+                            {
+                                "episode_number": number,
+                                "name": f"聪明睿智的认知计算 第{number - 1}话",
+                                "air_date": f"2014-0{number}-01",
+                                "runtime": 4,
+                            }
+                            for number in range(2, 6)
+                        ],
+                        {
+                            "episode_number": 6,
+                            "name": "境界面上的缺失之环（β线）",
+                            "air_date": "2015-12-03",
+                            "runtime": 24,
+                        },
+                    ]}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/library/待刮削/命运石之门SP补扫"
+        library: dict[str, bytes] = {
+            "/library/番剧/命运石之门/tvshow.nfo": _nfo_tv(42509, "命运石之门", "2011"),
+        }
+        for episode in range(1, 25):
+            library[
+                f"/library/番剧/命运石之门/Season 01/S01E{episode:02d}.mkv"
+            ] = b"v"
+        for episode in range(2, 6):
+            library[
+                f"/library/番剧/命运石之门/Season 00/S00E{episode:02d}.mkv"
+            ] = b"v"
+        subtitle_name = "[Ygm]Steins;Gate[SP][Ma10p_2160p][x265_flac_ass].ass"
+        files = dict(library)
+        files.update({
+            (
+                f"{source_root}/"
+                "[TUDO&Ygm] Steins;Gate [SP][Ma10p_2160p][x265_flac_ass].mkv"
+            ): b"v" * 2_000_000,
+            (
+                f"{source_root}/"
+                "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv"
+            ): b"v" * 2_000_000,
+            f"{source_root}/备份字幕/{subtitle_name}": (
+                "[Script Info]\n"
+                "Title: Steins;Gate 25 gb\n"
+                "ScriptType: v4.00+\n"
+                "\n"
+                "[V4+ Styles]\n"
+            ).encode("utf-8"),
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-specials-only"
+            tmdb = SteinsGateTMDB()
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, source_root,
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertEqual(len(records), 1)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "merge_existing")
+            self.assertEqual(
+                record.matched_work_root, "/library/番剧/命运石之门"
+            )
+            self.assertIsNone(record.reconciliation_evidence)
+            self.assertEqual(record.attention, None)
+
+    def test_specials_only_planner_evidence_fails_closed_on_two_betas(self) -> None:
+        """Two β-titled officials keep the specials-only unit parked.
+
+        The dry-run planner is the evidence, and the beta-alternate mapper
+        fails closed when the multilingual Season 00 titles name more than
+        one β special: ``[23B]`` stays unmapped, the plan reports a problem
+        row, and D must not reconcile coordinates the planner cannot prove.
+        """
+
+        class TwoBetaTMDB:
+            language = "zh-CN"
+            tmdb_id = 42509
+
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/tv/42509":
+                    return {
+                        "name": "命运石之门",
+                        "original_name": "Steins;Gate",
+                        "first_air_date": "2011-04-06",
+                        "seasons": [
+                            {"season_number": 0, "episode_count": 7},
+                            {"season_number": 1, "episode_count": 24},
+                        ],
+                    }
+                if path == "/tv/42509/season/1":
+                    return {"episodes": [
+                        {
+                            "episode_number": number,
+                            "name": f"第{number}话",
+                            "air_date": "2011-04-06",
+                            "runtime": 24,
+                        }
+                        for number in range(1, 25)
+                    ]}
+                if path == "/tv/42509/season/0":
+                    return {"episodes": [
+                        {
+                            "episode_number": 1,
+                            "name": "横行跋扈的浪荡之徒",
+                            "air_date": "2012-02-22",
+                            "runtime": 24,
+                        },
+                        {
+                            "episode_number": 6,
+                            "name": "境界面上的缺失之环（β线）",
+                            "air_date": "2015-12-03",
+                            "runtime": 24,
+                        },
+                        {
+                            "episode_number": 7,
+                            "name": "另一条β线的特别篇",
+                            "air_date": "2016-03-03",
+                            "runtime": 24,
+                        },
+                    ]}
+                raise AssertionError(f"unexpected TMDB path: {path}")
+
+        source_root = "/library/待刮削/命运石之门SP补扫"
+        subtitle_name = "[Ygm]Steins;Gate[SP][Ma10p_2160p][x265_flac_ass].ass"
+        files: dict[str, bytes] = {
+            "/library/番剧/命运石之门/tvshow.nfo": _nfo_tv(42509, "命运石之门", "2011"),
+            (
+                f"{source_root}/"
+                "[TUDO&Ygm] Steins;Gate [SP][Ma10p_2160p][x265_flac_ass].mkv"
+            ): b"v" * 2_000_000,
+            (
+                f"{source_root}/"
+                "[TUDO&Ygm] Steins;Gate [23B][Ma10p_2160p][x265_flac_ass].mkv"
+            ): b"v" * 2_000_000,
+            f"{source_root}/备份字幕/{subtitle_name}": (
+                "[Script Info]\n"
+                "Title: Steins;Gate 25 gb\n"
+                "ScriptType: v4.00+\n"
+                "\n"
+                "[V4+ Styles]\n"
+            ).encode("utf-8"),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-specials-only-two-betas"
+            tmdb = TwoBetaTMDB()
+            alist = IndexAList(files)
+            analyze_root_boundaries(
+                alist, source_root,
+                root_task_id=root_task_id, state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            self.assertEqual(len(records), 1)
+            apply_work_unit_override(
+                state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
             )
             record = reconcile_root_work_units(
                 alist, "/library", state_root, root_task_id,
