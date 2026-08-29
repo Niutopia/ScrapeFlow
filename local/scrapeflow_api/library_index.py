@@ -1801,11 +1801,13 @@ _UNNUMBERED_SPECIAL_MARKER_RE = re.compile(
 # beside the plain episode 23, not a second member of the integer run.  A
 # ``v2``-style revision suffix (``[02v2]``) is deliberately NOT a letter
 # variant: a revision re-releases the same ordinal, so it keeps its existing
-# parsing.  The variant is omitted from the strict run exactly like a
-# fractional episode; when the plain ordinals alone no longer form one
-# contiguous ``1..N`` run the proof fails closed instead of guessing.
+# parsing.  The scan tags (``[720p]``/``[1080i]``/``[Ma10p]``) are release
+# quality labels, not cut letters, so the suffix class drops ``p``/``i``.
+# The variant is omitted from the strict run exactly like a fractional
+# episode; when the plain ordinals alone no longer form one contiguous
+# ``1..N`` run the proof fails closed instead of guessing.
 _LETTER_VARIANT_EPISODE_RE = re.compile(
-    r"\[\s*0*\d{1,3}\s*(?:[A-Za-z]|β)\s*\]",
+    r"\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]",
 )
 
 

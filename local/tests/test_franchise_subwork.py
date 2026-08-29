@@ -73,6 +73,14 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
                 _video("/incoming/Show/[G] Show S02E04 [1080p].mkv")
             )
         )
+        # Scan tags are release quality labels, not cut letters.
+        for tag in ("720p", "1080i", "360p", "576p", "Ma10p_2160p"):
+            self.assertFalse(
+                _is_letter_variant_episode_video(
+                    _video(f"/incoming/Show/[G] Show [{tag}].mkv")
+                ),
+                tag,
+            )
 
 
 class ProofReceiptShapeTests(unittest.TestCase):
