@@ -1,4 +1,4 @@
-"""C-layer regression for releaseless junk movie rows."""
+"""C-layer regressions for named-season windows and releaseless movie rows."""
 
 from __future__ import annotations
 
@@ -73,6 +73,28 @@ class _NamedSeasonTMDB:
 
 
 class NamedSeasonWindowTests(unittest.TestCase):
+    def test_query_with_continuation_year_resolves_parent_show(self) -> None:
+        """``北风完结篇`` + 2009 anchors the named Season 2, not a junk film.
+
+        The exact-title junk movie row has neither a release date nor a
+        runtime; the real parent show aired 2000, so its first-air year
+        conflicts with the boundary year until the official season window
+        is probed.
+        """
+        tmdb = _NamedSeasonTMDB()
+        match, _ = auto_match_tmdb(
+            tmdb,
+            "北风完结篇 (2009)",
+            media_type=None,
+            min_confidence=0.88,
+        )
+        self.assertEqual(match.status, "confirmed")
+        self.assertEqual((match.media_type, match.tmdb_id), ("tv", 210))
+        self.assertEqual(
+            match.decision_trace.get("season_window_year"),
+            "2009",
+        )
+
     def test_releaseless_movie_row_is_never_confirmed(self) -> None:
         """A movie with neither release date nor runtime cannot win."""
 
@@ -102,6 +124,44 @@ class NamedSeasonWindowTests(unittest.TestCase):
             str(caught.exception).startswith(("自动匹配", "TMDB")),
             msg=str(caught.exception),
         )
+
+    def test_boundary_evidence_resolves_the_parent_show(self) -> None:
+        """B→C on the continuation-season folder shape confirms the parent."""
+        root = "/incoming/04 北风完结篇（2009）全26集 1080P"
+        alist = DictAList({
+            root: [
+                *[
+                    {
+                        "name": f"{number:02d}「第{number}话」.mkv",
+                        "is_dir": False,
+                        "size": 300 * 1024 * 1024,
+                    }
+                    for number in range(1, 27)
+                ],
+                {"name": "01「第1话」.ass", "is_dir": False, "size": 10240},
+            ],
+        })
+        tmdb = _NamedSeasonTMDB()
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            analyze_root_boundaries(
+                alist,
+                root,
+                root_task_id="root-named-season-window",
+                state_root=state_root,
+            )
+            resolved = resolve_work_unit_identities(
+                tmdb,
+                state_root,
+                "root-named-season-window",
+                prefer_animation=True,
+            )
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].identity_status, "confirmed")
+        identity = resolved[0].identity or {}
+        self.assertEqual((identity.get("media_type"), identity.get("tmdb_id")), ("tv", 210))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1568,6 +1568,53 @@ def _movie_release_evidence_missing(client: Any, tmdb_id: int) -> bool:
     return not has_release_year and not has_runtime
 
 
+def _tv_named_season_window(
+    client: Any,
+    tmdb_id: int,
+    reference_keys: Collection[str],
+    query_years: Collection[str],
+) -> dict[str, Any]:
+    """Locate an officially named season airing inside the query years.
+
+    A continuation arc often ships as its own release package years after
+    the parent show premiered (the ``完结篇`` season of a 2000 show airing
+    in 2009).  When TMDB officially names that season after the matched
+    query/title/alias and its air year agrees with the boundary year, the
+    parent's earlier first-air year is the expected continuation shape,
+    not a conflict.  Returns an empty dict when no such season exists.
+    """
+    if not query_years:
+        return {}
+    try:
+        details = client.get(f"/tv/{tmdb_id}")
+    except ApiError:
+        return {}
+    seasons = details.get("seasons")
+    if not isinstance(seasons, list):
+        return {}
+    keys = [str(key) for key in reference_keys if str(key or "").strip()]
+    for season in seasons:
+        if not isinstance(season, Mapping):
+            continue
+        name = str(season.get("name") or "").strip()
+        air_year = _extract_year(season.get("air_date"))
+        if not name or not air_year or air_year not in query_years:
+            continue
+        season_key = _normalize_match_title(name)
+        if not season_key:
+            continue
+        if any(
+            season_key == reference or _title_similarity(reference, season_key) >= 0.98
+            for reference in keys
+        ):
+            return {
+                "season_window_season": season.get("season_number"),
+                "season_window_year": air_year,
+                "season_window_name": name,
+            }
+    return {}
+
+
 def _score_identity_candidate(
     raw: Mapping[str, Any],
     *,
@@ -1640,6 +1687,15 @@ def _score_identity_candidate(
                         for year in query_years
                     )
                     year_score = -0.30 if wrong_year else 0.0
+                elif (
+                    raw["media_type"] == "tv"
+                    and str(raw.get("season_window_year") or "") in query_years
+                ):
+                    # An officially named continuation season airing inside
+                    # the boundary years makes the parent's earlier first-air
+                    # year the expected shape — the mirror of the S00
+                    # physical-special exemption above.
+                    year_score = 0.0
                 else:
                     deltas = [
                         abs(candidate_year_int - int(year))
@@ -1828,6 +1884,15 @@ def _score_identity_candidate(
             "official_titles": list(raw["titles"]),
             "aliases_checked": list(raw["aliases"]),
             "blockers": blockers,
+            **{
+                key: raw[key]
+                for key in (
+                    "season_window_season",
+                    "season_window_year",
+                    "season_window_name",
+                )
+                if key in raw
+            },
             "expected_episode_count": expected_episode_count,
             "actual_episode_count": actual_count,
             "physical_special_markers": sorted(str(x) for x in special_markers),
@@ -2043,6 +2108,19 @@ def auto_match_tmdb(
                         client, tmdb_id
                     ),
                 }
+            named_season_window: Mapping[str, object] = {}
+            if candidate_type == "tv" and index < 5 and query_year:
+                named_season_window = _tv_named_season_window(
+                    client,
+                    tmdb_id,
+                    reference_keys=[
+                        query_key,
+                        *(_normalize_match_title(variant) for variant in _search_query_variants(query)),
+                        *titles,
+                        *aliases,
+                    ],
+                    query_years={query_year},
+                )
             if expected_episode_count and candidate_type == "tv" and index < 5:
                 try:
                     details = client.get(f"/tv/{tmdb_id}")
@@ -2070,6 +2148,7 @@ def auto_match_tmdb(
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
                 **movie_release_evidence,
+                **named_season_window,
             })
 
     def score(raw: Mapping[str, Any]) -> AutoMatch:
@@ -2852,6 +2931,14 @@ def auto_match_from_evidence(
                         client, tmdb_id
                     ),
                 }
+            named_season_window: Mapping[str, object] = {}
+            if candidate_type == "tv" and index < 5 and query_years:
+                named_season_window = _tv_named_season_window(
+                    client,
+                    tmdb_id,
+                    reference_keys=[*sent_query_keys, *titles, *aliases],
+                    query_years=query_years,
+                )
             raw_candidates.append({
                 "media_type": candidate_type,
                 "tmdb_id": tmdb_id,
@@ -2871,6 +2958,7 @@ def auto_match_from_evidence(
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
                 **movie_release_evidence,
+                **named_season_window,
                 **physical_special_evidence,
                 "strict_naked_numeric_video_run": strict_naked_numeric_guard,
                 "naked_numeric_cjk_release_eligible": naked_numeric_cjk_release_eligible,
