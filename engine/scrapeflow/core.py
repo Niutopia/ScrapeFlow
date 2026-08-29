@@ -5180,9 +5180,16 @@ def _numbered_physical_special_markers(
     excluded (``OAD 2016`` keeps its dated-run evidence path), and a marker
     followed by an ordinal word (``OVA 2nd Season``) is a season label, not a
     release ordinal.
+
+    A reversed ``13 OAV`` form counts only inside the file's own stem.  The
+    same pattern in an ancestor directory name is usually a sibling-position
+    bundle prefix (``03 OVA：…`` inside a numbered bundle), so it can never
+    supply this file's release ordinal; marker-first forms (``OVA 2/``) stay
+    valid in ancestors because the directory then numbers the release itself.
     """
     markers: set[str] = set()
     for item in items:
+        name = unicodedata.normalize("NFKC", str(item.get("name", "")))
         text = unicodedata.normalize(
             "NFKC",
             f"{item.get('name', '')} {item.get('full_path', '')}",
@@ -5196,7 +5203,7 @@ def _numbered_physical_special_markers(
                 markers.add(f"{marker}{int(number)}")
         for number, marker in re.findall(
             r"(?<![A-Za-z0-9])0*(\d{1,3})[\s._-]*(OVA|OAV|OAD)(?!\d)",
-            text,
+            name.upper(),
         ):
             if 0 < int(number) <= 999:
                 markers.add(f"{marker}{int(number)}")

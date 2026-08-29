@@ -9,6 +9,7 @@ from engine.scrapeflow.core import (
     EpisodeKey,
     _map_explicit_special_release_runs,
     _map_unnumbered_specials,
+    _numbered_physical_special_markers,
     _official_numbered_title_special_run,
     _official_special_title_ordinal,
 )
@@ -106,6 +107,48 @@ class OfficialNumberedTitleSpecialRunTests(unittest.TestCase):
             [],
         )
         self.assertNotIn("_episode_key_override", plain[0])
+
+
+class NumberedPhysicalSpecialMarkerScopeTests(unittest.TestCase):
+    """A reversed ``NN OVA`` match is a release ordinal only in a file's own stem."""
+
+    def test_ancestor_bundle_position_prefix_is_not_a_release_ordinal(self) -> None:
+        # ``03 OVA：黑色的铁碎牙（2008）…`` names the third unit of a numbered
+        # bundle, not OVA release #3.  When the marker-bearing videos inside
+        # carry no per-file ordinals, the numbered-marker guard must not fire
+        # and nullify a proved explicit override map.
+        unnumbered = {
+            "name": "OVA：黑色的铁碎牙 1080P.mkv",
+            "full_path": (
+                "/incoming/犬夜叉/03 OVA：黑色的铁碎牙（2008）内封+外挂字幕 1080P"
+                "/1080P 外挂简中字幕/OVA：黑色的铁碎牙 1080P.mkv"
+            ),
+        }
+        self.assertEqual(_numbered_physical_special_markers([unnumbered]), set())
+
+    def test_own_stem_reversed_ordinal_still_counts(self) -> None:
+        real = {
+            "name": "[13 OAV].mkv",
+            "full_path": "/incoming/Show/[13 OAV].mkv",
+        }
+        self.assertEqual(_numbered_physical_special_markers([real]), {"OAV13"})
+        own_stem = {
+            "name": "13 OAV.mkv",
+            "full_path": "/incoming/Show/13 OAV.mkv",
+        }
+        self.assertEqual(_numbered_physical_special_markers([own_stem]), {"OAV13"})
+
+    def test_ancestor_reversed_ordinal_directory_does_not_count(self) -> None:
+        # A ``NN OVA`` ancestor directory is a sibling-position bundle label
+        # (``03 OVA：…``) just as often as a release ordinal; the file's own
+        # stem is the only disambiguator, so the guard never derives an
+        # ordinal from an ancestor's reversed form.  An unnumbered stem
+        # cannot form an SP-group anyway, so this cannot weaken the guard.
+        under_dir = {
+            "name": "title.mkv",
+            "full_path": "/incoming/Show/13 OAV/title.mkv",
+        }
+        self.assertEqual(_numbered_physical_special_markers([under_dir]), set())
 
 
 class SameMarkerOvaRunTimelineTests(unittest.TestCase):
