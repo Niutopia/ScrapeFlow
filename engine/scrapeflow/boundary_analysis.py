@@ -618,6 +618,12 @@ _DIRECT_RUN_PHYSICAL_SPECIAL_RE = re.compile(
 _DIRECT_LEADING_ORDINAL_RE = re.compile(
     r"^\s*0*\d{1,3}\s*[.、,，\-_）)\]]?\s*\S",
 )
+# A per-episode directory name (``第01话「起点」``) is episodic evidence for
+# the nested-collection splitter: the enclosing bundle is a TV shape, not a
+# package of separately released feature films.
+_EPISODE_COUNTER_DIRECTORY_RE = re.compile(
+    r"第\s*0*\d{1,4}\s*[话話回集]",
+)
 
 
 def _direct_movie_title_text(file_name: str) -> str | None:
@@ -837,6 +843,46 @@ def _split_flat_movie_files(
     return candidates
 
 
+def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
+    """Return one-video, independently dated feature children of a bundle.
+
+    A release package (``02 剧场版4部（2001-2004）日英双语 …``) can wrap
+    several separately released feature films, one folder per film.  That
+    shape is a nested film collection: the bundle label itself matches no
+    work, and one WorkUnit cannot own several different works.  The split is
+    proven only when the bundle holds no direct video and every video-bearing
+    child is independently titled, dated (a release year on the folder or its
+    files), free of season/episode coordinates, and carries exactly one
+    feature-sized video whose filename holds a substantial standalone title.
+    Anything else fails closed to the historical whole-child boundary.
+    """
+    if direct_video_file_count(node) != 0:
+        return ()
+    video_children = [
+        child for child in node.children if _child_has_video(child)
+    ]
+    if len(video_children) < 2:
+        return ()
+    for child in video_children:
+        if _season_number_from_directory_name(child.name) is not None:
+            return ()
+        if not _is_titled_child(child):
+            return ()
+        if not _single_large_video(child):
+            return ()
+        if not _has_explicit_year_evidence(child):
+            return ()
+        if _EPISODE_COUNTER_DIRECTORY_RE.search(child.name):
+            return ()
+        videos = [
+            file for file in collect_all_files(child)
+            if file.object_type == "video"
+        ]
+        if len(videos) != 1 or _direct_movie_title_key(videos[0].name) is None:
+            return ()
+    return tuple(video_children)
+
+
 def _titled_child_split(
     child: SourceNode,
     *,
@@ -846,9 +892,32 @@ def _titled_child_split(
 
     A titled child normally stays one whole WorkUnit, but a release folder
     can pack several independently titled feature files — a theatrical
-    feature beside a bracket-numbered mini-series.  The conservative flat
-    splitter decides; ``None`` keeps the ordinary whole-child boundary.
+    feature beside a bracket-numbered mini-series — or wrap a dated
+    one-folder-per-film collection.  The conservative splitters decide;
+    ``None`` keeps the ordinary whole-child boundary.
     """
+    nested_films = _nested_dated_feature_children(child)
+    if nested_films:
+        reason = (
+            f"目录 '{child.name}' 含 {len(nested_films)} 个独立标题、"
+            f"独立年份、单视频的电影子目录",
+        )
+        return [
+            WorkCandidate(
+                work_unit_id=_work_unit_id(root_task_id, film.path),
+                boundary_key=film.path,
+                source_paths=(film.path,),
+                display_label=film.name,
+                proposed_media_context="movie",
+                boundary_evidence=BoundaryEvidence(
+                    role=DirectoryRole.MOVIE_COLLECTION,
+                    confidence=0.86,
+                    reasons=reason,
+                    competing_roles=(DirectoryRole.SINGLE_WORK.value,),
+                ),
+            )
+            for film in nested_films
+        ]
     return _split_flat_movie_files(
         child,
         root_task_id=root_task_id,

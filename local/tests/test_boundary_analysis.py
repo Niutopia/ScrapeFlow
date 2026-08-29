@@ -477,6 +477,173 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_titled_movie_bundle_splits_into_dated_feature_units(self) -> None:
+        """A titled bundle of dated one-video feature folders is a collection.
+
+        ``02 剧场版4部（2001-2004）日英双语 内封+外挂字幕 1080P`` is a release
+        package around four independently titled, independently dated feature
+        films.  One WorkUnit cannot hold four different works, and the bundle
+        label itself matches no TMDB title, so each dated feature folder must
+        become its own movie-shaped unit.
+        """
+        root = "/quark/影视/待刮削/Example Franchise"
+        def feature_dir(name: str, movie: str) -> dict:
+            return {
+                "name": name,
+                "is_dir": True,
+                "children": [
+                    {"name": "简中.ass", "is_dir": False, "size": 110_000},
+                    {"name": movie, "is_dir": False, "size": 20_000_000_000},
+                ],
+            }
+
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "01 正片（2000）全24集 日中双语 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "1080P 日中双语",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "01.mp4", "is_dir": False, "size": 1_073_741_824},
+                                {"name": "02.mp4", "is_dir": False, "size": 1_073_741_824},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "name": "02 剧场版4部（2001-2004）日英双语 内封+外挂字幕 1080P",
+                    "is_dir": True,
+                    "children": [
+                        feature_dir(
+                            "01 穿越时空的思念（2001）日英双语 内封+外挂字幕 1080P",
+                            "Example：穿越时空的思念.mkv",
+                        ),
+                        feature_dir(
+                            "02 镜中的梦幻城（2002）日英双语 内封+外挂字幕 1080P",
+                            "Example：镜中的梦幻城.mkv",
+                        ),
+                        feature_dir(
+                            "03 天下霸道之剑（2003）日英双语 内封+外挂字幕 1080P",
+                            "Example：天下霸道之剑.mkv",
+                        ),
+                        feature_dir(
+                            "04 红莲之蓬莱岛（2004）日英双语 内封+外挂字幕 1080P",
+                            "Example：红莲之蓬莱岛.mkv",
+                        ),
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 5, msg=[c.display_label for c in candidates])
+        movie_units = [c for c in candidates if c.proposed_media_context == "movie"]
+        self.assertEqual(len(movie_units), 4)
+        self.assertEqual(
+            {c.display_label for c in movie_units},
+            {
+                "01 穿越时空的思念（2001）日英双语 内封+外挂字幕 1080P",
+                "02 镜中的梦幻城（2002）日英双语 内封+外挂字幕 1080P",
+                "03 天下霸道之剑（2003）日英双语 内封+外挂字幕 1080P",
+                "04 红莲之蓬莱岛（2004）日英双语 内封+外挂字幕 1080P",
+            },
+        )
+        # Every feature unit owns exactly its own directory scope, carrying the
+        # external subtitle alongside the film.
+        for unit in movie_units:
+            self.assertEqual(len(unit.source_paths), 1)
+            self.assertTrue(unit.source_paths[0].startswith(f"{root}/02 剧场版4部"))
+        tv_units = [c for c in candidates if c.proposed_media_context != "movie"]
+        self.assertEqual(len(tv_units), 1)
+        self.assertEqual(tv_units[0].display_label, "01 正片（2000）全24集 日中双语 1080P")
+
+    def test_movie_bundle_without_year_evidence_stays_one_unit(self) -> None:
+        """Undated one-video folders could be episodes; fail closed."""
+        root = "/quark/影视/待刮削/Example Franchise"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "01 正片（2000）全24集 日中双语 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "01.mp4", "is_dir": False, "size": 1_073_741_824},
+                    ],
+                },
+                {
+                    "name": "02 剧场版 日英双语 内封+外挂字幕 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "穿越时空的思念",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Example：穿越时空的思念.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                        {
+                            "name": "镜中的梦幻城",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Example：镜中的梦幻城.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 2, msg=[c.display_label for c in candidates])
+
+    def test_episode_coordinate_subdirs_never_split_as_features(self) -> None:
+        """A per-episode folder layout is a TV shape even when episodes are big.
+
+        Episode coordinates (``第01话``/``E01``/part tokens) and same-year
+        folders are series evidence: the bundle must stay one unit and let
+        C/D resolve it on the container's own title.
+        """
+        root = "/quark/影视/待刮削/Example Series"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "01 正片（2000）全26集",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "E01.mkv", "is_dir": False, "size": 1_073_741_824},
+                        {"name": "E02.mkv", "is_dir": False, "size": 1_073_741_824},
+                    ],
+                },
+                {
+                    "name": "02 完结篇（2009）",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "第01话「起点」（2009）",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "01.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                        {
+                            "name": "第02话「终章」（2009）",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "02.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 2, msg=[c.display_label for c in candidates])
+        labels = {c.display_label for c in candidates}
+        self.assertIn("02 完结篇（2009）", labels)
+
     def test_multiseason_root_splits_generic_nested_film_collection(self) -> None:
         """Season folders and a generic film group own disjoint WorkUnits.
 
