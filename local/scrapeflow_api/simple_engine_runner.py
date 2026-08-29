@@ -1258,11 +1258,52 @@ class SimplePlanExecutor:
         mkdir = getattr(self.alist, "mkdir", None)
         if not callable(mkdir):
             raise EngineExecutionError("AList 客户端缺少目录创建接口")
-        current = "/"
-        for segment in path.strip("/").split("/"):
-            current = posixpath.join(current, segment)
-            _cancellation_checkpoint()
-            mkdir(current)
+        # Some AList-backed providers (observed on Quark after a burst of
+        # writes) acknowledge ``fs/mkdir`` with success while the directory
+        # never appears.  A move into that phantom destination then fails with
+        # ``failed to get dst dir`` for the whole bounded move ladder, because
+        # replaying the move cannot repair a missing destination.  Only a
+        # directory the provider's own listing proves counts as created; an
+        # invisible one is re-announced with the same bounded cooldown the
+        # move/rename ladders already use.  A client that cannot report
+        # directory existence keeps the plain announce walk.
+        visible = self._listed_dir(path)
+        if visible:
+            # Already observable: skip a redundant announce walk (mkdir on an
+            # existing directory is provider load with no effect).
+            return
+        for attempt in range(6):
+            current = "/"
+            for segment in path.strip("/").split("/"):
+                current = posixpath.join(current, segment)
+                _cancellation_checkpoint()
+                mkdir(current)
+            if visible is None:
+                return
+            if self._listed_dir(path):
+                return
+            time.sleep(min(1.5 * (2 ** attempt), 12.0))
+        raise EngineExecutionError(f"AList mkdir 后目录仍不可见: {path}")
+
+    def _listed_dir(self, path: str) -> bool | None:
+        """True/False when the provider listing proves/disproves the directory.
+
+        ``None`` means this client cannot report directory existence at all;
+        callers then keep the legacy announce-walk-only guarantee.
+        """
+        try_list = getattr(self.alist, "try_list", None)
+        if not callable(try_list):
+            return None
+        try:
+            rows = try_list(path, refresh=True)
+        except TypeError:
+            try:
+                rows = try_list(path)
+            except Exception:
+                return False
+        except Exception:
+            return False
+        return rows is not None
 
     def _check_size(self, path: str, expected: int | None) -> Mapping[str, object]:
         observed = self._exact_with_visibility_retry(path, expected_size=expected)

@@ -192,6 +192,42 @@ class DelayedMoveAList(FakeAList):
         super().move(source_dir, target_dir, names)
 
 
+class SilentMkdirAList(FakeAList):
+    """A provider that acknowledges ``fs/mkdir`` without creating anything.
+
+    Quark was observed (sustained-write burst) to answer every mkdir call in
+    one announce walk with success while the directory never appeared, so
+    each move into the phantom destination failed with ``failed to get dst
+    dir: object not found`` for the whole bounded move ladder.  A second
+    announce walk creates the directory; only the provider's listing can
+    tell the two apart.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mkdir_calls = 0
+
+    # The executor must take its mkdir ladder, not the ensured-directory
+    # shortcut.
+    ensure_directory = None
+
+    def mkdir(self, path: str) -> None:
+        self.mkdir_calls += 1
+        # The first announce walk is silently swallowed.
+        if self.mkdir_calls > 2:
+            self.directories.add(path.rstrip("/"))
+
+    def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]] | None:
+        if path.rstrip("/") in self.directories:
+            return self.list(path, refresh=refresh)
+        return None
+
+    def move(self, source_dir: str, target_dir: str, names: list[str]) -> None:
+        if target_dir.rstrip("/") not in self.directories:
+            raise RuntimeError("failed to get dst dir: object not found")
+        super().move(source_dir, target_dir, names)
+
+
 class ArchiveLifecycleAList(FakeAList):
     def __init__(self) -> None:
         super().__init__()
@@ -3106,6 +3142,18 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         result = SimplePlanExecutor(alist).execute(fake_plan(self.request, alist, object()))
         self.assertEqual(result["file_count"], 1)
         self.assertEqual(alist.move_attempts, 2)
+        self.assertIn("/library/Movie (2020)/Movie (2020).mkv", alist.files)
+
+    def test_default_executor_reannounces_a_silent_mkdir_noop(self) -> None:
+        """A phantom mkdir announcement must not strand the move ladder."""
+        alist = SilentMkdirAList()
+        alist.files["/incoming/movie/source.mkv"] = FAKE_VIDEO_BYTES
+        with patch("local.scrapeflow_api.simple_engine_runner.time.sleep"):
+            result = SimplePlanExecutor(alist).execute(fake_plan(self.request, alist, object()))
+        self.assertEqual(result["file_count"], 1)
+        # First announce walk is swallowed (2 mkdir calls), the reconciling
+        # second walk creates both ancestors (2 more).
+        self.assertEqual(alist.mkdir_calls, 4)
         self.assertIn("/library/Movie (2020)/Movie (2020).mkv", alist.files)
 
     def test_default_executor_refreshes_parent_listing_for_delayed_move_visibility(self) -> None:
