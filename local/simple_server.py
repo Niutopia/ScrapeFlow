@@ -1837,7 +1837,9 @@ class SimpleApplication:
             # the official title/year from TMDB the same way the automatic
             # matcher's identity projection would have.
             try:
-                detail = runner.tmdb.get(f"/{media_type}/{tmdb_id}")
+                detail = self._get_engine_runner().tmdb.get(
+                    f"/{media_type}/{tmdb_id}"
+                )
                 if isinstance(detail, dict):
                     title = detail.get("name" if media_type == "tv" else "title")
                     date_value = detail.get(
