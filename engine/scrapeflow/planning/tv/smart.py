@@ -429,6 +429,36 @@ def _plan_with_explicit_episode_map(
         _partition_movie_groups_with_video(movie_groups)
     )
     movie_parent = split_remote(plan.target_root)[0]
+    # Sub-series containment (operator tree 2026-08-30): a movie whose zh-CN
+    # title contains the TV work's own title (命运／奇异赝品 黎明低语 contains
+    # 命运／奇异赝品; 万华描绘者 魔法少女☆伊莉雅剧场版 contains 魔法少女☆伊莉雅)
+    # nests INSIDE the TV work root — never as a sibling beside it.  This
+    # also keeps the mixed plan's combined target_root at the TV work root
+    # (commonpath of a root and its own descendants), so a container-level
+    # unit never projects the franchise container itself as its target.
+    tv_title = str(plan.metadata.get("title") or "").strip()
+    contained_movie_groups: dict[int, list[Mapping[str, Any]]] = {}
+    sibling_movie_groups: dict[int, list[Mapping[str, Any]]] = {}
+    for movie_tmdb_id, movie_files in executable_movie_groups.items():
+        # Compare official zh-CN identities, never the Latin release query:
+        # 命运／奇异赝品 黎明低语's files are named "Fate.strange.Fake...",
+        # so only the TMDB title proves the containment.
+        movie_title = ""
+        try:
+            detail = kwargs["tmdb_client"].get(f"/movie/{movie_tmdb_id}")
+            if isinstance(detail, Mapping):
+                movie_title = str(detail.get("title") or "").strip()
+        except Exception:
+            movie_title = ""
+        if (
+            tv_title
+            and len(tv_title) >= 4
+            and movie_title
+            and tv_title in movie_title
+        ):
+            contained_movie_groups[movie_tmdb_id] = movie_files
+        else:
+            sibling_movie_groups[movie_tmdb_id] = movie_files
     try:
         placement_for(
             str(kwargs["src_path"]),
@@ -437,21 +467,30 @@ def _plan_with_explicit_episode_map(
         )
     except ValueError:
         movie_parent = plan.target_root
-    movie_plans = [
-        build_movie_plan(
-            kwargs["alist"],
-            kwargs["tmdb_client"],
-            src_path=str(kwargs["src_path"]),
-            # Independent movies nest under the TV work root as siblings of
-            # its episodes, never loose beside its ``tvshow.nfo``.
-            parent_path=movie_parent,
-            tmdb_id=movie_tmdb_id,
-            ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
-            source_files=movie_files,
-            defer_validation=True,
+    movie_plans = []
+    for movie_tmdb_id, movie_files in sorted(executable_movie_groups.items()):
+        # Containment-owned movies use the TV work root; siblings keep the
+        # placement-validated parent above.
+        parent_for_movie = (
+            plan.target_root
+            if movie_tmdb_id in contained_movie_groups
+            else movie_parent
         )
-        for movie_tmdb_id, movie_files in sorted(executable_movie_groups.items())
-    ]
+        movie_plans.append(
+            build_movie_plan(
+                kwargs["alist"],
+                kwargs["tmdb_client"],
+                src_path=str(kwargs["src_path"]),
+                # Independent movies nest under the TV work root as siblings of
+                # its episodes, never loose beside its ``tvshow.nfo``; a
+                # containment-owned movie nests one level deeper, inside it.
+                parent_path=parent_for_movie,
+                tmdb_id=movie_tmdb_id,
+                ignore_orphan_temp=bool(kwargs.get("ignore_orphan_temp")),
+                source_files=movie_files,
+                defer_validation=True,
+            )
+        )
     metadata = dict(plan.metadata)
     metadata["series_root"] = plan.target_root
     metadata["member_posters"] = {
