@@ -1832,6 +1832,44 @@ class SimpleApplication:
                 self.state_root, job_id, work_unit_id,
                 media_type=media_type, tmdb_id=tmdb_id, season=season,
             )
+            # The override writes the minimal identity (title=None), but the
+            # layout layer's sub-series grouping reads the zh-CN title.  Fill
+            # the official title/year from TMDB the same way the automatic
+            # matcher's identity projection would have.
+            try:
+                detail = runner.tmdb.get(f"/{media_type}/{tmdb_id}")
+                if isinstance(detail, dict):
+                    title = detail.get("name" if media_type == "tv" else "title")
+                    date_value = detail.get(
+                        "first_air_date" if media_type == "tv" else "release_date"
+                    )
+                    year = str(date_value or "")[:4] or None
+                    if title:
+                        from engine.scrapeflow.work_units import (
+                            load_work_unit_records,
+                            save_work_unit_records,
+                        )
+                        from dataclasses import replace as _replace
+                        records_now = load_work_unit_records(
+                            self.state_root, job_id,
+                        )
+                        for _index, item in enumerate(records_now):
+                            if item.work_unit_id != work_unit_id:
+                                continue
+                            identity_now = dict(item.identity or {})
+                            identity_now["title"] = str(title)
+                            if year:
+                                identity_now["year"] = year
+                            records_now[_index] = _replace(
+                                item, identity=identity_now,
+                            )
+                            unit = records_now[_index]
+                            break
+                        save_work_unit_records(
+                            self.state_root, job_id, records_now,
+                        )
+            except Exception:
+                pass  # The durable override stands; the title is enrichments.
         except KeyError as exc:
             raise EngineJobNotFoundError(f"work unit 不存在: {work_unit_id}") from exc
         except ValueError as exc:
