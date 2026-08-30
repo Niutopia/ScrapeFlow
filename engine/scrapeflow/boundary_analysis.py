@@ -39,7 +39,11 @@ from engine.scrapeflow.source_inventory import (
     has_only_subtitles,
 )
 from engine.scrapeflow.media_policy import DISC_IMAGE_INSPECTION_REQUIRED
-from engine.scrapeflow.replenishment_matching import audit_episode_tokens
+from engine.scrapeflow.replenishment_matching import (
+    audit_episode_tokens,
+    normalized_text,
+    release_dash_regular_episode,
+)
 from engine.scrapeflow.residual_policy import _THEME_VIDEO_RE
 
 
@@ -882,6 +886,49 @@ def _split_flat_movie_files(
     # layout.  Leave it intact for the season/container rules below.
     if any(_child_has_video(child) for child in node.children):
         return None
+    # A homogeneous release-dash episode run (``[Kamigami] Mushishi - 01
+    # [BD …]`` … ``- 26 [BD …]``) is one TV season's episode batch, never a
+    # package of independently titled feature films.  The dash ordinals fold
+    # into each file's movie title key (mushishi01, mushishi02, …) so the
+    # per-key grouping below would shred the run into one unpositionable
+    # movie shard per episode.  Recognize the shape the D/F release-dash
+    # grammar already owns — every video shares one normalized title prefix
+    # and the ordinals form one complete contiguous 1..N run — and keep it
+    # as a single tv-shaped exact-file-scope candidate like the bracketed
+    # mini-series rule below.
+    dash_members = [
+        release_dash_regular_episode(file.name) for file in direct_videos
+    ]
+    if len(dash_members) >= 2 and all(
+        member is not None for member in dash_members
+    ):
+        prefixes = {
+            normalized_text(prefix) for prefix, _ordinal in dash_members
+        }
+        ordinals = sorted(ordinal for _prefix, ordinal in dash_members)
+        if (
+            len(prefixes) == 1
+            and len(set(ordinals)) == len(ordinals)
+            and ordinals == list(range(1, len(ordinals) + 1))
+        ):
+            label = _direct_movie_title_text(dash_members[0][0]) or (
+                dash_members[0][0].strip()
+            )
+            return [WorkCandidate(
+                work_unit_id=_work_unit_id(root_task_id, f"{node.path}/@dash-run"),
+                boundary_key=f"{node.path}/@dash-run",
+                source_paths=tuple(file.path for file in direct_videos),
+                display_label=label or node.name,
+                proposed_media_context="tv",
+                boundary_evidence=BoundaryEvidence(
+                    role=DirectoryRole.SINGLE_WORK,
+                    confidence=0.9,
+                    reasons=(
+                        f"{len(direct_videos)} 个同标题短横线集号文件构成完整 1..{len(direct_videos)} 连续集",
+                    ),
+                    competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
+                ),
+            )]
     texts = [_direct_movie_title_text(file.name) for file in direct_videos]
     keys = [_direct_movie_title_key(file.name) for file in direct_videos]
     if any(key is None for key in keys):
