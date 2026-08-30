@@ -73,7 +73,15 @@ class ProviderSafeBasenameTests(unittest.TestCase):
             ),
             "Seraph of the End：Vampire Reign[01].mkv",
         )
-        for name in (".", "..", "a/b", "a\\b", "a／b"):
+        # A full-width slash is title punctuation (``Fate／Grand Order``),
+        # not a path segment for this engine: reads and source-side moves
+        # keep the literal spelling and only the formal rename applies the
+        # strict target policy.
+        self.assertEqual(
+            _validate_remote_source_basename("Fate／Grand Order [01].mkv"),
+            "Fate／Grand Order [01].mkv",
+        )
+        for name in (".", "..", "a/b", "a\\b"):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
                     _validate_remote_source_basename(name)
@@ -99,7 +107,7 @@ class ProviderSafeBasenameTests(unittest.TestCase):
                     "names": ["Seraph of the End：Vampire Reign[01].mkv"],
                 },
             )
-        for name in ("a／b", "a\\b", ".."):
+        for name in ("a/b", "a\\b", ".."):
             with self.subTest(name=name), patch.object(client, "call") as call:
                 with self.assertRaises(ValueError):
                     client.move("/source", "/destination", [name])

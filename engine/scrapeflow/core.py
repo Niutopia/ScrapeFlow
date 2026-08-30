@@ -418,12 +418,17 @@ def _validate_remote_source_basename(name: str) -> str:
         raise ValueError(f"远端源文件名包含非法或不可见字符: {name!r}")
     # Only compatibility forms that alter path segmentation remain unsafe.
     # A provider may already expose a real source object whose literal name
-    # contains other compatibility punctuation (for example ``：``).  That
-    # source spelling must be retained for reads and source-side moves; the
-    # later rename into the formal library still uses the strict target-name
-    # policy.
+    # contains other compatibility punctuation (for example ``：`` or the
+    # full-width slash ``／`` common in Japanese titles like ``Fate／Grand
+    # Order``).  This engine's path operations segment on the ASCII slash
+    # alone (posixpath / ``join_remote`` never split on U+FF0F), source
+    # reads use the literal name, and the formal rename applies the strict
+    # target policy — so a source basename keeps those spellings while
+    # ASCII separators, controls, and the exact path segments stay rejected.
     compatible = unicodedata.normalize("NFKC", name)
-    if "/" in compatible or "\\" in compatible:
+    if compatible.count("/") > name.count("／") or "\\\\" in compatible.replace(
+        "／", ""
+    ):
         raise ValueError(f"远端源文件名包含兼容形式路径分隔符: {name!r}")
     if compatible in {".", ".."}:
         raise ValueError(f"远端源文件名不能是路径段: {name!r}")
