@@ -132,6 +132,18 @@ _LETTER_VARIANT_BRACKET_RE = re.compile(
 )
 
 
+def _identity_title_key(value: str) -> str:
+    """One title as a containment-comparison key.
+
+    ``plan.metadata['title']`` is already provider-safe (／ becomes -), while
+    a fresh TMDB detail keeps the original punctuation.  Normalize both with
+    the same projection so 命运-奇异赝品 matches 命运／奇异赝品.
+    """
+    from ..remote_paths import provider_safe_basename
+
+    return provider_safe_basename(str(value or "")).casefold()
+
+
 def _preclassify_theme_residuals(
     files: Sequence[Mapping[str, Any]],
 ) -> tuple[
@@ -454,7 +466,7 @@ def _plan_with_explicit_episode_map(
             tv_title
             and len(tv_title) >= 4
             and movie_title
-            and tv_title in movie_title
+            and _identity_title_key(tv_title) in _identity_title_key(movie_title)
         ):
             contained_movie_groups[movie_tmdb_id] = movie_files
         else:
