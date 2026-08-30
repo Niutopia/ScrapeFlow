@@ -1489,6 +1489,41 @@ class TestSyntheticCases(unittest.TestCase):
             {"来自深渊", "来自深渊 烈日的黄金乡"},
         )
 
+    def test_season_marked_filenames_never_split_as_flat_movies(self) -> None:
+        """``…第四季 - 01`` files are one season's episodes, not N films.
+
+        A WEB-DL season batch names each file with the show title, its own
+        season marker, and a release ordinal (``[ANi] Re：從零開始的異世界
+        生活 第四季 - 01 [1080P][Baha][WEB-DL]…``).  The flat movie splitter
+        used to shred it into one movie unit per file — twelve unmatchable
+        shards.  A filename carrying a season marker is TV evidence; the
+        splitter fails closed and the ordinary TV boundary owns the batch.
+        """
+        root = "/quark/影视/待刮削/Re：從零開始的異世界生活"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "07. 第四季",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": f"[ANi] Re：從零開始的異世界生活 第四季 - {number:02d} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+                            "is_dir": False,
+                            "size": 400_000_000 + number * 1024,
+                        }
+                        for number in range(1, 13)
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1, msg=[c.display_label for c in candidates])
+        self.assertNotEqual(
+            candidates[0].proposed_media_context, "movie",
+            "season-marked batch must not be split into movie units",
+        )
+
     def test_non_terminal_collection_word_bundle_stays_whole_child(self) -> None:
         """A collection word that is not a terminal role label is decoration.
 

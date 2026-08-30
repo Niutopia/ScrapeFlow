@@ -793,6 +793,16 @@ def _split_flat_movie_files(
         for file in direct_videos
     ):
         return None
+    # A filename that names its own season (``…第四季 - 01`` / ``… S4 - 01``)
+    # is TV evidence: the ordinal is that season's episode, never a feature
+    # film's own identity.  A same-titled run carrying season markers is one
+    # season directory's episode batch, so the flat movie splitter must fail
+    # closed and leave the files to the ordinary TV boundary.
+    if any(
+        _GENERIC_SEASON_MARKER_RE.search(file.name)
+        for file in direct_videos
+    ):
+        return None
     # A numbered same-franchise sequence (``01. 俯瞰风景.mkv`` …) is one
     # collection, never a package of independently titled features.
     if any(
