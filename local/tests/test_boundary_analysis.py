@@ -1489,6 +1489,99 @@ class TestSyntheticCases(unittest.TestCase):
             {"来自深渊", "来自深渊 烈日的黄金乡"},
         )
 
+    def test_nested_multi_work_container_recurses_per_work(self) -> None:
+        """A franchise grab-bag child splits into its independent works.
+
+        ``其它`` beside the numbered seasons holds 卫宫家 (a 13-video pack),
+        a dated one-video feature, and a ten-film 空之境界 bundle — three
+        independent works, none of them one unmatchable whole-child unit.
+        The recursion is gated: every video-bearing child must be
+        independently work-shaped (multi-video, or dated/theatrical with no
+        episode coordinates), so undated one-video bundles and per-episode
+        directories keep their fail-closed verdicts.
+        """
+        root = "/quark/影视/待刮削/Fate"
+        def video_dir(label, count=1, dated=True):
+            return {
+                "name": label,
+                "is_dir": True,
+                "children": [
+                    {"name": f"{number:02d}.mkv", "is_dir": False, "size": 800_000_000}
+                    for number in range(1, count + 1)
+                ],
+            }
+        fixture = {
+            "root": root,
+            "children": [
+                video_dir("01 命运之夜（2006）全24集", count=24),
+                {
+                    "name": "其它",
+                    "is_dir": True,
+                    "children": [
+                        video_dir("卫宫家今天的饭（2017）全13集", count=13),
+                        video_dir("命运 奇异赝品 黎明低语（2023）", count=1),
+                        {
+                            "name": "空之境界 1-10部 4K",
+                            "is_dir": True,
+                            "children": [
+                                video_dir(f"0{index} 第{index}章 俯瞰风景（2007）", count=1)
+                                for index in range(1, 10)
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        labels = [c.display_label for c in candidates]
+        self.assertIn("卫宫家今天的饭（2017）全13集", labels, msg=labels)
+        self.assertIn("命运 奇异赝品 黎明低语（2023）", labels, msg=labels)
+        # The 空之境界 bundle is itself a movie collection of dated films.
+        self.assertTrue(
+            any("俯瞰风景" in label for label in labels), msg=labels,
+        )
+        self.assertNotIn("其它", labels, msg=labels)
+
+    def test_undated_nested_bundle_stays_whole_child(self) -> None:
+        """The recursion respects the undated one-video fail-closed rule."""
+        root = "/quark/影视/待刮削/Example Franchise"
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "01 正片（2000）全24集 日中双语 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "01.mp4", "is_dir": False, "size": 1_073_741_824},
+                    ],
+                },
+                {
+                    "name": "02 剧场版 日英双语 内封+外挂字幕 1080P",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "穿越时空的思念",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Example：穿越时空的思念.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                        {
+                            "name": "镜中的梦幻城",
+                            "is_dir": True,
+                            "children": [
+                                {"name": "Example：镜中的梦幻城.mkv", "is_dir": False, "size": 2_147_483_648},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        labels = [c.display_label for c in candidates]
+        self.assertEqual(len(candidates), 2, msg=labels)
+        self.assertIn("02 剧场版 日英双语 内封+外挂字幕 1080P", labels)
+
     def test_season_marked_filenames_never_split_as_flat_movies(self) -> None:
         """``…第四季 - 01`` files are one season's episodes, not N films.
 

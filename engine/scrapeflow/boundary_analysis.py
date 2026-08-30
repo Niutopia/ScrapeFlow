@@ -966,6 +966,58 @@ def _nested_dated_feature_children(node: SourceNode) -> tuple[SourceNode, ...]:
     return tuple(video_children)
 
 
+def _independently_shaped_work_child(node: SourceNode) -> bool:
+    """Whether one child of a nested container is a work-shaped boundary.
+
+    A multi-video child (a season or series pack) is independently shaped
+    outright.  A single-video child must pass the same strict feature
+    evidence the dated-feature splitter uses — dated or theatrical-form
+    titled, no episode coordinates, feature-sized — so undated one-video
+    folders and per-episode directories keep their fail-closed verdicts.
+    """
+    videos = [f for f in collect_all_files(node) if f.object_type == "video"]
+    if len(videos) >= 2:
+        return True
+    if len(videos) != 1 or videos[0].size < _MOVIE_MIN_BYTES:
+        return False
+    if _EPISODE_COUNTER_DIRECTORY_RE.search(node.name):
+        return False
+    if _season_number_from_directory_name(node.name) is not None:
+        return False
+    return _has_explicit_year_evidence(node) or (
+        _feature_film_form_label_with_substantial_title(node.name)
+    )
+
+
+def _nested_multi_work_candidates(
+    child: SourceNode,
+    *,
+    root_task_id: str,
+) -> list[WorkCandidate] | None:
+    """Recurse into a titled child that is itself a multi-work container.
+
+    The child holds no direct videos and at least two of its own titled
+    children carry videos, each independently work-shaped (a franchise
+    grab-bag folder like ``其它`` or a dated three-film ``天之杯`` bundle).
+    Such a child is a layout container, never one work; running the ordinary
+    boundary analysis on it yields one candidate per real work.  ``None``
+    keeps the historical whole-child boundary — including every single-work
+    child, every shape the caller's earlier splitters already handled, and
+    every bundle whose members are not independently provable works.
+    """
+    if direct_video_file_count(child) != 0:
+        return None
+    titled = [c for c in child.children if _is_titled_child(c)]
+    if len(titled) < 2:
+        return None
+    if not all(_independently_shaped_work_child(c) for c in titled):
+        return None
+    sub = analyze_boundaries(child, root_task_id=root_task_id)
+    if len(sub) <= 1:
+        return None
+    return sub
+
+
 def _titled_child_split(
     child: SourceNode,
     *,
@@ -1602,6 +1654,16 @@ def analyze_boundaries(
             child_split = _titled_child_split(child, root_task_id=root_task_id)
             if child_split is not None:
                 candidates.extend(child_split)
+                continue
+            # A titled child that is itself a multi-work container (no direct
+            # videos, two or more titled video-bearing children of its own —
+            # a franchise's ``其它`` grab bag or a three-film ``天之杯``
+            # bundle) is recursed instead of collapsing into one unmatchable
+            # whole-child unit.  Only a split result replaces the whole child;
+            # a single-candidate analysis keeps the ordinary boundary.
+            nested = _nested_multi_work_candidates(child, root_task_id=root_task_id)
+            if nested is not None:
+                candidates.extend(nested)
                 continue
             child_context = _propose_media_context(child)
             # A titled child whose own name carries a season marker (``不死者
