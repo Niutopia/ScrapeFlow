@@ -169,17 +169,32 @@ def _move_with_readback(
     source_kind = runner._remote_entry_kind(source)
     if source_kind == "unknown":
         raise EngineExecutionError(f"{field} source 回读不可确认")
+    def _ensure_lane_root(path: str) -> None:
+        """Create the lane directory and prove it through a fresh listing.
+
+        Some AList-backed providers (observed on Quark after a burst of
+        writes) acknowledge ``fs/mkdir`` with success while the directory
+        never appears — the same phantom-directory failure the plan
+        executor's _ensure_dir already handles.  Re-announce with a bounded
+        cooldown until the provider's own listing proves the directory.
+        """
+        for attempt in range(3):
+            if runner._remote_entry_kind(path) == "directory":
+                return
+            _pause_checkpoint(pause_requested)
+            ensure(path)
+            time.sleep(3.0)
+        if runner._remote_entry_kind(path) != "directory":
+            raise EngineExecutionError(f"{field} 归档根创建后回读失败")
+
     target_kind = runner._remote_entry_kind(target)
     if target_kind == "unknown":
         # On the real AList client, listing a not-yet-created lane root can
         # surface as an error instead of an empty listing.  Create the lane
         # root first, then re-probe the exact target.
         root_kind = runner._remote_entry_kind(target_root)
-        if root_kind in {"file", "ambiguous", "unknown"}:
-            _pause_checkpoint(pause_requested)
-            ensure(target_root)
-            if runner._remote_entry_kind(target_root) != "directory":
-                raise EngineExecutionError(f"{field} 归档根创建后回读失败")
+        if root_kind != "directory":
+            _ensure_lane_root(target_root)
         target_kind = runner._remote_entry_kind(target)
         if target_kind == "unknown":
             raise EngineExecutionError(f"{field} 目标回读不可确认")
@@ -195,14 +210,15 @@ def _move_with_readback(
     if target_kind != "missing":
         raise EngineExecutionError(f"{field} 目标已被占用")
     root_kind = runner._remote_entry_kind(target_root)
-    if root_kind in {"file", "ambiguous", "unknown"}:
+    if root_kind != "directory":
+        # missing/unknown both need creation (with the phantom-mkdir
+        # re-announce); file/ambiguous are occupied and fail closed inside.
+        _ensure_lane_root(target_root)
+    if runner._remote_entry_kind(target_root) != "directory":
         raise EngineExecutionError(f"{field} 归档根不是可用目录")
     _pause_checkpoint(pause_requested)
-    if runner._consume_cancel_request(runner._read(root_job.id)) is not None:  # noqa: SLF001
+    if runner._consume_cancel_request(runner._read(root_job.id)) is not None:  # noqa: SLF001 - lane composition
         raise EngineExecutionError(f"{field} 已取消")
-    ensure(target_root)
-    if runner._remote_entry_kind(target_root) != "directory":
-        raise EngineExecutionError(f"{field} 归档根创建后回读失败")
     if runner._remote_entry_kind(target) != "missing":
         raise EngineExecutionError(f"{field} 目标已被占用")
     _pause_checkpoint(pause_requested)
