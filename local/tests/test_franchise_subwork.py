@@ -268,11 +268,23 @@ class ProofReceiptShapeTests(unittest.TestCase):
                 "episode_tokens": ["S01E01", "S00E01", "S01E02"],
             })
         )
-        # A regular block must start at E01.
+        # A whole-series suffix slice onto one season is the receipt's sole
+        # positive block (命运之夜 前传's bare 24/25 tail = S02E11/S02E12),
+        # so a lone block starting past E01 parses and re-proves live.
+        self.assertIsNotNone(
+            SingleSeasonEpisodeProof.from_dict({
+                **base,
+                "season": 2,
+                "episode_count": 2,
+                "episode_tokens": ["S02E11", "S02E12"],
+            })
+        )
+        # A positive-season block past E01 beside any other block is not the
+        # suffix shape and stays malformed.
         self.assertIsNone(
             SingleSeasonEpisodeProof.from_dict({
                 **base,
-                "episode_tokens": ["S01E02", "S01E03", "S01E04"],
+                "episode_tokens": ["S01E02", "S00E01", "S00E02"],
             })
         )
         # A non-consecutive Season 00 window is not a run.

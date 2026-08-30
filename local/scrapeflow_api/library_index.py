@@ -270,14 +270,17 @@ class SingleSeasonEpisodeProof:
             if tokens != expected:
                 return None
         else:
-            # The receipt carries one of three token shapes: a complete
+            # The receipt carries one of four token shapes: a complete
             # regular season ``S{season}E01…E{N}``; an overflow run whose
-            # tail lands in Season 00 (``S01E01…E23`` + ``S00E01``); or a
+            # tail lands in Season 00 (``S01E01…E23`` + ``S00E01``); a
             # Season 00 window that starts wherever the parent catalogued
-            # the arc (``S00E08``/``E09``, ``S00E02…E05``).  All are
-            # non-interleaved per-season blocks of consecutive ascending
-            # episodes, and only a Season 00 block may start past E01.
-            # The receipt is re-proved against the live source and catalog
+            # the arc (``S00E08``/``E09``, ``S00E02…E05``); or a
+            # whole-series suffix slice onto a positive season
+            # (``S02E11``/``S02E12``, the cumulative tail after an earlier
+            # root wrote the prefix).  All are non-interleaved per-season
+            # blocks of consecutive ascending episodes; a positive-season
+            # block may start past E01 only when it is the sole block, and
+            # the receipt is re-proved against the live source and catalog
             # before F uses it, which is what actually pins the window.
             block_seasons: list[int] = []
             block_episodes: list[list[int]] = []
@@ -307,7 +310,13 @@ class SingleSeasonEpisodeProof:
                 return None
             for index, token_season in enumerate(block_seasons):
                 episodes = block_episodes[index]
-                if token_season != 0 and episodes[0] != 1:
+                if (
+                    token_season != 0
+                    and episodes[0] != 1
+                    and block_seasons != [season]
+                ):
+                    # A positive-season slice past E01 is legal only as the
+                    # receipt's sole block — the whole-series suffix shape.
                     return None
                 if episodes != list(
                     range(episodes[0], episodes[0] + len(episodes))

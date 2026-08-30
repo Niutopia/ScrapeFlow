@@ -1200,32 +1200,58 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     and Path(str(item.get("name", ""))).suffix.lower() in VIDEO_EXTS
                     and source_episode_key is None
                 ):
+                    # TMDB double-catalogues a franchise short both as a
+                    # standalone movie and as a named episode of this show's
+                    # Season 00 (Fate／Prototype is movie/415547 and 幻想
+                    # 嘉年华 S00E04 alike).  A video whose own label matches
+                    # exactly one published special title of the very series
+                    # it ships with is that episode: the episode mapping wins
+                    # over an independent sibling movie beside the show.
+                    episode_label_key = _normalize_match_title(
+                        re.sub(
+                            r"\d+$", "",
+                            _normalize_match_title(
+                                Path(str(item.get("name", ""))).stem
+                            ),
+                        )
+                    )
+                    labelled_specials = {
+                        number
+                        for number, titles in official_special_title_variants.items()
+                        if any(
+                            episode_label_key
+                            and episode_label_key
+                            == _normalize_match_title(str(title))
+                            for title in titles
+                        )
+                    }
                     named_ova_movie: AutoMatch | None = None
-                    for movie_query in _movie_queries_from_item(item):
-                        if not _usable_release_title_query(movie_query):
-                            continue
-                        try:
-                            candidate, _ = auto_match_tmdb(
-                                kwargs["tmdb_client"],
-                                movie_query,
-                                media_type="movie",
-                                min_confidence=0.88,
-                                prefer_animation=_media_context_from_source_and_target(
-                                    source_root,
-                                    str(kwargs["parent_path"]),
-                                )[1],
-                            )
-                        except ScraperError:
-                            continue
-                        if (
-                            candidate.status == "confirmed"
-                            and candidate.media_type == "movie"
-                            and _specific_movie_query_agrees_with_match(
-                                movie_query, candidate
-                            )
-                        ):
-                            named_ova_movie = candidate
-                            break
+                    if len(labelled_specials) != 1:
+                        for movie_query in _movie_queries_from_item(item):
+                            if not _usable_release_title_query(movie_query):
+                                continue
+                            try:
+                                candidate, _ = auto_match_tmdb(
+                                    kwargs["tmdb_client"],
+                                    movie_query,
+                                    media_type="movie",
+                                    min_confidence=0.88,
+                                    prefer_animation=_media_context_from_source_and_target(
+                                        source_root,
+                                        str(kwargs["parent_path"]),
+                                    )[1],
+                                )
+                            except ScraperError:
+                                continue
+                            if (
+                                candidate.status == "confirmed"
+                                and candidate.media_type == "movie"
+                                and _specific_movie_query_agrees_with_match(
+                                    movie_query, candidate
+                                )
+                            ):
+                                named_ova_movie = candidate
+                                break
                     if named_ova_movie is not None:
                         movie_groups[named_ova_movie.tmdb_id].append(item)
                         continue
