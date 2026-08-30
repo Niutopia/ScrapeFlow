@@ -44,6 +44,74 @@ def _work_roots(runner: Any, state_root: Path, root_task_id: str) -> dict[str, s
     return roots
 
 
+def _unit_identity(
+    state_root: Path,
+    root_task_id: str,
+) -> dict[str, tuple[str, int]]:
+    """Map each unit id to its confirmed (media_type, tmdb_id) identity."""
+    identity: dict[str, tuple[str, int]] = {}
+    for record in load_work_unit_records(state_root, root_task_id):
+        raw = record.identity if isinstance(record.identity, Mapping) else {}
+        media_type = str(raw.get("media_type") or "")
+        tmdb_id = raw.get("tmdb_id")
+        if (
+            media_type in {"movie", "tv"}
+            and isinstance(tmdb_id, int)
+            and not isinstance(tmdb_id, bool)
+            and tmdb_id > 0
+        ):
+            identity[record.work_unit_id] = (media_type, tmdb_id)
+    return identity
+
+
+def _resolve_stale_roots(
+    runner: Any,
+    roots: dict[str, str],
+    identity: dict[str, tuple[str, int]],
+) -> None:
+    """Re-point units whose recorded library root no longer lists.
+
+    A manual consolidation (or an earlier mis-placed write) can move the
+    work's files to a different library path after D recorded its
+    ``matched_work_root``.  The recorded path then lists empty or missing
+    and every gap under it stays open forever even though the library holds
+    the coordinates.  For exactly those units, fall back to the library
+    index: the NFO-confirmed root of the unit's own confirmed identity.
+    """
+    stale: dict[str, str] = {}
+    for unit_id, root in roots.items():
+        try:
+            rows = runner.alist.list(root, refresh=True)
+        except Exception:
+            rows = None
+        if rows is None or not any(
+            isinstance(item, Mapping) for item in rows
+        ):
+            stale[unit_id] = root
+    if not stale:
+        return
+    wanted = {
+        identity[unit_id] for unit_id in stale if unit_id in identity
+    }
+    if not wanted:
+        return
+    try:
+        from .library_index import build_library_index
+
+        index = build_library_index(runner.alist, runner.library_root)
+    except Exception:
+        return
+    resolved: dict[tuple[str, int], str] = {}
+    for work in index.works:
+        key = (work.media_type, work.tmdb_id)
+        if key in wanted and key not in resolved:
+            resolved[key] = work.work_root
+    for unit_id in stale:
+        unit_identity = identity.get(unit_id)
+        if unit_identity is not None and unit_identity in resolved:
+            roots[unit_id] = resolved[unit_identity]
+
+
 def _actual_coordinates(runner: Any, root: str) -> set[tuple[int, int]]:
     """Fresh-listing walk of one library root collecting SxxEyy coordinates."""
     listing = getattr(runner.alist, "list", None)
@@ -99,6 +167,7 @@ def reaudit_open_gaps(
     """
     state_root = Path(state_root)
     roots = _work_roots(runner, state_root, root_task_id)
+    _resolve_stale_roots(runner, roots, _unit_identity(state_root, root_task_id))
     actual_by_unit: dict[str, set[tuple[int, int]]] = {}
     errors: list[str] = []
     for unit_id, root in roots.items():
