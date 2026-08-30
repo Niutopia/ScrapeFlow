@@ -183,12 +183,15 @@ def _move_with_readback(
         target_kind = runner._remote_entry_kind(target)
         if target_kind == "unknown":
             raise EngineExecutionError(f"{field} 目标回读不可确认")
-    if source_kind == "missing" and target_kind == "directory":
+    if source_kind == "missing" and target_kind in {"directory", "file"}:
         return  # The move already committed; idempotent success.
     if source_kind == "missing":
         raise EngineExecutionError(f"{field} source/目标均无法回读")
-    if source_kind != "directory":
-        raise EngineExecutionError(f"{field} 来源不是唯一目录")
+    # A duplicate unit's exact ownership may be one directory (a whole
+    # variant folder) or one flat feature file (a movie-package shard).
+    # Both are legal consumed sources; anything else fails closed.
+    if source_kind not in {"directory", "file"}:
+        raise EngineExecutionError(f"{field} 来源不是唯一目录或文件")
     if target_kind != "missing":
         raise EngineExecutionError(f"{field} 目标已被占用")
     root_kind = runner._remote_entry_kind(target_root)
@@ -205,12 +208,13 @@ def _move_with_readback(
     _pause_checkpoint(pause_requested)
     parent = posixpath.dirname(source)
     move(parent, target_root, [name])
+    expected_kind = "directory" if source_kind == "directory" else "file"
     verified = False
     for _ in range(4):
         time.sleep(3.0)
         if (
             _stable_kind(runner, source) == "missing"
-            and _stable_kind(runner, target) == "directory"
+            and _stable_kind(runner, target) == expected_kind
         ):
             verified = True
             break
