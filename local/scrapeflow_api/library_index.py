@@ -803,6 +803,9 @@ def _scope_season_number(path: str) -> int | None:
 
 
 _PLANNED_EPISODE_TOKEN_RE = re.compile(r"(?<!\d)S(\d{2,})E(\d{2,})(?!\d)")
+_PLANNED_EPISODE_SPAN_END_RE = re.compile(
+    r"(?<!\d)S\d{2,}E\d{2,}-E(\d{2,})(?!\d)"
+)
 
 
 def _planned_special_tokens(
@@ -911,6 +914,21 @@ def _planned_special_tokens(
         return frozenset()
     if list(getattr(plan, "problem_files", None) or []):
         return frozenset()
+    plan_metadata = getattr(plan, "metadata", None)
+    packed_ova_seasons: dict[int, int] = {}
+    if isinstance(plan_metadata, Mapping):
+        raw_packed = plan_metadata.get("packed_ova_seasons")
+        if isinstance(raw_packed, Mapping):
+            for raw_season, raw_count in raw_packed.items():
+                if (
+                    isinstance(raw_season, int)
+                    and not isinstance(raw_season, bool)
+                    and isinstance(raw_count, int)
+                    and not isinstance(raw_count, bool)
+                    and raw_season > 0
+                    and raw_count > 0
+                ):
+                    packed_ova_seasons[int(raw_season)] = int(raw_count)
     tokens: set[str] = set()
     for item in getattr(plan, "files", None) or []:
         source_path = str(getattr(item, "source_path", "") or "")
@@ -921,10 +939,34 @@ def _planned_special_tokens(
         )
         if match is None:
             return frozenset()
-        if int(match.group(1)) != 0:
-            # This evidence path only reconciles specials-only sources; a
-            # regular-season coordinate belongs to an ordinary D proof.
-            return frozenset()
+        season_number = int(match.group(1))
+        if season_number != 0:
+            # This evidence path reconciles specials-only sources and
+            # planner-proved packed OVA volumes.  A regular-season coordinate
+            # is acceptable only when the planner itself proved the
+            # volume↔season packing — the volume carries no episode grammar,
+            # so the packing proof is the only coordinate evidence — and
+            # only when the span covers the whole published season.
+            if season_number not in packed_ova_seasons:
+                return frozenset()
+            end_match = _PLANNED_EPISODE_SPAN_END_RE.search(
+                str(getattr(item, "final_name", "") or "")
+            )
+            span_end = (
+                int(end_match.group(1))
+                if end_match is not None
+                else int(match.group(2))
+            )
+            if (
+                int(match.group(2)) != 1
+                or span_end != packed_ova_seasons[season_number]
+            ):
+                return frozenset()
+            tokens.update(
+                f"S{season_number:02d}E{episode:02d}"
+                for episode in range(1, span_end + 1)
+            )
+            continue
         tokens.add(f"S00E{int(match.group(2)):02d}")
     return frozenset(tokens)
 

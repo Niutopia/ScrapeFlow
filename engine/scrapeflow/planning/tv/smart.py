@@ -3023,6 +3023,11 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
             metadata = dict(first.metadata)
             if movie_plans:
                 metadata["series_root"] = first.target_root
+            if packed_ova_seasons:
+                # D's planner dry-run reads this to accept the volume↔season
+                # packing as coordinate evidence: the volumes carry no episode
+                # grammar, so the packing proof is the only coordinate source.
+                metadata["packed_ova_seasons"] = dict(packed_ova_seasons)
                 metadata["member_posters"] = {
                     movie_plan.target_root: movie_plan.metadata["poster_path"]
                     for movie_plan in movie_plans
