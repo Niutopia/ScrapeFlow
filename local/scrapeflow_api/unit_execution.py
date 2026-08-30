@@ -54,6 +54,8 @@ from engine.scrapeflow.gap_ledger import (
 )
 from engine.scrapeflow.identity_matching import _clean_franchise_root_label
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
+from collections import defaultdict
+
 from engine.scrapeflow.remote_paths import provider_safe_basename
 from engine.scrapeflow.target_shelf import target_root_for_shelf
 from engine.scrapeflow.work_units import (
@@ -1158,16 +1160,19 @@ def _container_layout_targets(
             tmdb_id = identity.get("tmdb_id")
             by_tmdb.setdefault(tmdb_id, record)
 
-    # Sub-series grouping (operator ruling 2026-08-30: series movies nest in
-    # a named collection directory, always, and the directory carries the
-    # official collection poster).  Inside a pure franchise container, movie
-    # units whose TMDB identity belongs to one collection with at least two
-    # members present nest under a directory named after the collection, so
-    # a trilogy like 命运之夜——天之杯 or a ten-film 空之境界 run stays one
-    # visible series instead of N loose siblings.  A name collision with a
-    # regular work child keeps the movies flat (fail closed).
+    # Sub-series grouping (operator ruling 2026-08-30, tree confirmed
+    # 2026-08-30): inside a pure franchise container, works sharing a zh-CN
+    # title prefix (命运之夜, 命运／冠位指定, 魔法少女☆伊莉雅) nest under a
+    # named sub-series directory, and TMDB collections nest one level deeper
+    # inside their sub-series.  A group needs at least two member works; a
+    # lone work stays flat.  A sub-series label colliding with another work
+    # child name fails closed to flat layout.
     collection_parent_by_unit: dict[str, tuple[str, int, str]] = {}
+    sub_series_parent_by_unit: dict[str, str] = {}
     if container_parent is not None:
+        sub_series_parent_by_unit = _sub_series_parents(
+            container_parent, records,
+        )
         collection_members: dict[int, list[WorkUnitRecord]] = {}
         collection_names: dict[int, str] = {}
         for record in records:
@@ -1203,7 +1208,24 @@ def _container_layout_targets(
             label = _collection_directory_label(collection_names[collection_id])
             if not label or label in work_child_names:
                 continue
-            collection_dir = posixpath.join(container_parent, label)
+            # A collection whose members all share one sub-series prefix
+            # nests inside that sub-series directory (天之杯 inside
+            # 命运之夜); a cross-series collection stays at the container.
+            # A collection whose label equals the sub-series' own name (空之
+            # 境界) IS that sub-series: the anchor directory itself, never a
+            # same-named nested duplicate.
+            member_parents = {
+                sub_series_parent_by_unit.get(member.work_unit_id)
+                for member in members
+            }
+            anchor = next(iter(member_parents)) if len(member_parents) == 1 else None
+            base_dir = anchor if anchor else container_parent
+            if anchor is not None and posixpath.basename(
+                anchor.rstrip("/")
+            ) == label:
+                collection_dir = anchor
+            else:
+                collection_dir = posixpath.join(base_dir, label)
             for member in members:
                 collection_parent_by_unit[member.work_unit_id] = (
                     collection_dir, collection_id, label,
@@ -1222,6 +1244,9 @@ def _container_layout_targets(
         expected_root: str | None = None
         if container_parent is not None:
             parent_path = container_parent
+            sub_series_dir = sub_series_parent_by_unit.get(record.work_unit_id)
+            if sub_series_dir is not None:
+                parent_path = sub_series_dir
             collection_target = collection_parent_by_unit.get(record.work_unit_id)
             if collection_target is not None:
                 parent_path = collection_target[0]
@@ -1421,6 +1446,199 @@ def _main_tv_identity(records: Sequence[WorkUnitRecord]) -> int | None:
     if main is None:
         return None
     return int((main.identity or {})["tmdb_id"])
+
+
+def _normalized_title_key(value: str) -> str:
+    """One work title as a bounded comparison key for prefix grouping."""
+    from engine.scrapeflow.remote_paths import provider_safe_basename
+
+    cleaned = provider_safe_basename(
+        re.sub(r"[（(]\s*\d{4}(-\d{4})?\s*[)）]", "", str(value or "").strip())
+    )
+    return str(cleaned or "").strip()
+
+
+def _sub_series_parents(
+    container_parent: str,
+    records: Sequence[WorkUnitRecord],
+) -> dict[str, str]:
+    """Nest same-family works under sub-series directories (operator tree).
+
+    Operator-confirmed tree (2026-08-30) for a pure franchise container:
+
+    1. Containment: a movie whose zh-CN title contains a TV work's title as
+       a bounded substring (魔法少女☆伊莉雅剧场版 contains 魔法少女☆伊莉雅,
+       命运／奇异赝品 黎明低语 contains 命运／奇异赝品) belongs to that TV's
+       family root — the TV's own directory, or the TV's prefix-group label
+       directory when the TV itself groups with sibling TV works.
+    2. Prefix groups: the remaining works whose cleaned titles share a
+       separator-bounded common prefix (命运之夜, 命运-冠位指定, 空之境界)
+       nest under a label directory named with the prefix; a group needs at
+       least two distinct works and the prefix must end at a separator in
+       every member's own original title (命运-冠位嘉年华 never folds into
+       the 命运-冠位指定 stem).
+    3. Everything else stays a direct container child.
+
+    Collections are anchored by their members' shared family root (the
+    collection pass runs after this function and reads its result).
+    Returns ``{work_unit_id: family directory}``; the family-directory owner
+    itself (a TV whose own dir IS the family root) is absent from the map.
+    """
+    identities: dict[tuple[str, int], str] = {}
+    representative: dict[tuple[str, int], WorkUnitRecord] = {}
+    for record in records:
+        identity = record.identity if isinstance(record.identity, Mapping) else {}
+        media_type = str(identity.get("media_type") or "")
+        tmdb_id = identity.get("tmdb_id")
+        title = str(identity.get("title") or "").strip()
+        if media_type not in {"tv", "movie"} or not isinstance(tmdb_id, int):
+            continue
+        if not title:
+            continue
+        # A physical special keeps the nested_special family path — prefix
+        # grouping must not steal it into a label directory.
+        if _is_physical_special_record(record):
+            continue
+        key = (media_type, tmdb_id)
+        identities.setdefault(key, title)
+        representative.setdefault(key, record)
+    if len(identities) < 2:
+        return {}
+
+    keys = {value: _normalized_title_key(value) for value in identities.values()}
+    separators = {" ", "　", "-", "—", "–", "／", "/", "·", "：", ":", "！", "!", "？", "?", "）", "(", ")", "（", "]", "[", "「", "」"}
+
+    # --- Rule 1: containment --------------------------------------------
+    tv_keys = [key for key in identities if key[0] == "tv"]
+    containment_owner: dict[tuple[str, int], tuple[str, int]] = {}
+    for key in identities:
+        if key[0] != "movie":
+            continue
+        raw = str(identities[key])
+        theatrical_markers = ("剧场版", "劇場版", "电影", "電影", "Theatrical")
+
+        def _after_ok(text: str, position: int) -> bool:
+            if position >= len(text):
+                return True
+            if text[position] in separators:
+                return True
+            return any(
+                text[position : position + len(marker)] == marker
+                for marker in theatrical_markers
+            )
+
+        best: tuple[str, int] | None = None
+        best_len = 0
+        for tv_key in tv_keys:
+            tv_title = str(identities[tv_key])
+            if len(keys[tv_title]) < 4 or keys[tv_title] == keys[raw]:
+                continue
+            index = raw.find(tv_title)
+            while index != -1:
+                after = index + len(tv_title)
+                before_ok = index == 0 or raw[index - 1] in separators
+                if before_ok and _after_ok(raw, after) and len(tv_title) > best_len:
+                    best = tv_key
+                    best_len = len(tv_title)
+                index = raw.find(tv_title, index + 1)
+        if best is not None:
+            containment_owner[key] = best
+
+    # --- Rule 2: prefix groups over non-contained works -----------------
+    group_members: dict[tuple[str, int], str] = {}
+    uncontained = [
+        key for key in identities if key not in containment_owner
+    ]
+    groups: dict[str, set[tuple[str, int]]] = defaultdict(set)
+
+    def _key_bounded(key: str, prefix_len: int) -> bool:
+        """The prefix ends at a separator inside this normalized key.
+
+        命运-冠位指定 绝对魔兽战线巴比伦尼亚 has a boundary after 命运-冠位
+        指定 (the next normalized character is a space); 命运-冠位嘉年华
+        continues the glued word with 嘉, so the shorter stem is not a
+        boundary in ITS OWN key and the pair never groups.
+        """
+        if prefix_len >= len(key):
+            return False
+        return key[prefix_len] in separators
+
+    for index_a, key_a in enumerate(uncontained):
+        title_a = identities[key_a]
+        key_a_norm = keys[title_a]
+        if len(key_a_norm) < 4:
+            continue
+        for key_b in uncontained[index_a + 1:]:
+            title_b = identities[key_b]
+            key_b_norm = keys[title_b]
+            if len(key_b_norm) < 4 or key_a_norm == key_b_norm:
+                continue
+            shared = min(len(key_a_norm), len(key_b_norm))
+            prefix_len = 0
+            for index in range(shared):
+                if key_a_norm[index] != key_b_norm[index]:
+                    break
+                prefix_len = index + 1
+            while prefix_len > 0 and key_a_norm[prefix_len - 1] in separators:
+                prefix_len -= 1
+            if prefix_len < 4:
+                continue
+            # An anchor-exact member (its whole normalized key IS the
+            # prefix, 命运之夜 the TV) joins its own group; otherwise the
+            # prefix must be strictly shorter than both keys and end at a
+            # separator in both.
+            a_exact = prefix_len == len(key_a_norm)
+            b_exact = prefix_len == len(key_b_norm)
+            if a_exact and b_exact:
+                continue
+            if not (
+                (a_exact or _key_bounded(key_a_norm, prefix_len))
+                and (b_exact or _key_bounded(key_b_norm, prefix_len))
+            ):
+                continue
+            prefix = key_a_norm[:prefix_len]
+            groups[prefix].add(key_a)
+            groups[prefix].add(key_b)
+
+    # Widest-group-first assignment: a member belonging to both a broad
+    # family stem (命运-冠位指定) and a narrow pair prefix (命运-冠位指定
+    # -神圣圆桌领域卡美洛) joins the broad family — the narrow pairing is a
+    # TMDB collection, and the collection pass nests it inside the family.
+    for prefix in sorted(groups, key=len):
+        if len(groups[prefix]) < 2:
+            continue
+        for key in groups[prefix]:
+            group_members.setdefault(key, prefix)
+
+    # --- Family roots ----------------------------------------------------
+    family_dir: dict[tuple[str, int], str] = {}
+    for key, prefix in group_members.items():
+        family_dir[key] = posixpath.join(container_parent, prefix)
+    # A containment-anchor TV that belongs to no prefix group keeps its own
+    # directory as the family root (伊莉雅: movies nest inside the TV root).
+    # An anchor TV inside a prefix group moves into the group's label
+    # directory like every other member (命运之夜 2006 nests under
+    # Fate/命运之夜/命运之夜/, the 来自深渊 double-nesting form).
+    anchored_self: set[tuple[str, int]] = set()
+    for key, tv_key in containment_owner.items():
+        anchor = family_dir.get(tv_key)
+        if anchor is None:
+            anchor = _canonical_target_child(container_parent, representative[tv_key])
+            anchored_self.add(tv_key)
+        family_dir[key] = anchor
+    result: dict[str, str] = {}
+    for record in records:
+        identity = record.identity if isinstance(record.identity, Mapping) else {}
+        media_type = str(identity.get("media_type") or "")
+        tmdb_id = identity.get("tmdb_id")
+        key = (media_type, tmdb_id)
+        if key in anchored_self:
+            continue
+        target = family_dir.get(key)
+        if target is None:
+            continue
+        result[record.work_unit_id] = target
+    return result
 
 
 def _collection_directory_label(name: str) -> str | None:

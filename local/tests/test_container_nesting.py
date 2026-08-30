@@ -752,6 +752,60 @@ class ContainerNestingTests(unittest.TestCase):
         for event in special_events:
             self.assertEqual(event["parent_path"], family_root)
 
+    def test_fate_sub_series_prefix_grouping_tree(self) -> None:
+        """The operator-confirmed 2026-08-30 franchise sub-series tree.
+
+        命运之夜 family (2006 TV double-nested under its own label dir),
+        命运-冠位指定 family, 空之境界 collection-as-subseries, 伊莉雅 movies
+        inside the TV's own root, 黎明低语 inside 奇异赝品, seven single
+        works flat. 冠位嘉年华 never folds into the FGO stem.
+        """
+        from local.scrapeflow_api.unit_execution import _sub_series_parents
+
+        def rec(uid, mt, tid, title):
+            return WorkUnitRecord(
+                work_unit_id=uid, boundary_key=f"/x/{uid}",
+                source_paths=(f"/x/{uid}",), display_label=title,
+                role="series_container", media_context="tv",
+                identity={"media_type": mt, "tmdb_id": tid, "title": title},
+                claimed_seasons=(), root_task_id="r", source_revision=1,
+            )
+
+        records = [
+            rec("a", "tv", 37858, "命运之夜"),
+            rec("b", "tv", 45845, "命运之夜 前传"),
+            rec("c", "tv", 61415, "命运之夜 无限剑制"),
+            rec("d", "movie", 46304, "命运之夜-无限剑制 剧场版"),
+            rec("e", "movie", 283984, "命运之夜——天之杯Ⅰ：恶兆之花"),
+            rec("f", "movie", 428142, "命运／冠位指定 -序章-"),
+            rec("g", "tv", 90677, "命运／冠位指定 绝对魔兽战线巴比伦尼亚"),
+            rec("h", "movie", 637202, "命运／冠位指定 -神圣圆桌领域卡美洛- 前篇 漂泊的银之臂"),
+            rec("i", "movie", 23150, "空之境界 第一章 俯瞰风景"),
+            rec("j", "movie", 47747, "空之境界 终章"),
+            rec("k", "tv", 63576, "魔法少女☆伊莉雅"),
+            rec("l", "movie", 461083, "命运／万华描绘者 魔法少女☆伊莉雅剧场版 雪下的誓言"),
+            rec("m", "tv", 229858, "命运／奇异赝品"),
+            rec("n", "movie", 1145612, "命运／奇异赝品 黎明低语"),
+            rec("o", "tv", 132848, "命运-冠位嘉年华"),
+            rec("p", "tv", 76047, "卫宫家今天的饭"),
+        ]
+        out = _sub_series_parents("/番剧/Fate", records)
+        byid = {r.work_unit_id: (r.identity or {}).get("title") for r in records}
+        self.assertEqual(out["a"], "/番剧/Fate/命运之夜")
+        self.assertEqual(out["b"], "/番剧/Fate/命运之夜")
+        self.assertEqual(out["d"], "/番剧/Fate/命运之夜")
+        self.assertEqual(out["f"], "/番剧/Fate/命运-冠位指定")
+        self.assertEqual(out["g"], "/番剧/Fate/命运-冠位指定")
+        self.assertEqual(out["h"], "/番剧/Fate/命运-冠位指定")
+        self.assertEqual(out["i"], "/番剧/Fate/空之境界")
+        self.assertEqual(out["j"], "/番剧/Fate/空之境界")
+        self.assertEqual(out["l"], "/番剧/Fate/魔法少女☆伊莉雅")
+        self.assertNotIn("k", out)  # TV root is its own family anchor
+        self.assertEqual(out["n"], "/番剧/Fate/命运-奇异赝品")
+        self.assertNotIn("m", out)
+        for flat in ("o", "p"):
+            self.assertNotIn(flat, out, byid[flat])
+
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
         files = {
             "/incoming/Collection/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
