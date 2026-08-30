@@ -3148,16 +3148,25 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 # the container root, so it must not be re-nested under a
                 # same-named directory-only container; passing the TV identity
                 # keeps its root stable while each film stays a child leaf.
-                # A franchise-root sibling keeps the old sibling layout.
+                # A franchise-root sibling keeps the old sibling layout.  A
+                # containment-owned movie (黎明低语 inside 奇异赝品) is already
+                # a child of the TV work root, so its canonical tree also
+                # anchors there — anchoring at the franchise root would
+                # re-nest it back beside the TV work.
                 root_identity = (
                     WorkIdentity("tmdb.tv", int(first.metadata["tmdb_id"]))
                     if movie_parent == first.target_root
                     else None
                 )
+                movie_tree_anchor = (
+                    first.target_root
+                    if contained_movie_groups
+                    else movie_parent
+                )
                 _movie_root, movie_tree_warnings, _movie_tree_posters = (
                     _plan_canonical_batch_tree(
                         [plan],
-                        outer_root=movie_parent,
+                        outer_root=movie_tree_anchor,
                         root_identity=root_identity,
                         allow_family_boundaries=False,
                     )
