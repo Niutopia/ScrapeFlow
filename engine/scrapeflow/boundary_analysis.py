@@ -1010,7 +1010,8 @@ def _nested_multi_work_candidates(
     titled = [c for c in child.children if _is_titled_child(c)]
     if len(titled) < 2:
         return None
-    if not all(_independently_shaped_work_child(c) for c in titled):
+    provable = [c for c in titled if _independently_shaped_work_child(c)]
+    if len(provable) < 2:
         return None
     sub = analyze_boundaries(child, root_task_id=root_task_id)
     if len(sub) <= 1:
