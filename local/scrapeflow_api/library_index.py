@@ -2235,13 +2235,16 @@ def _is_proven_non_story_residual_video(file: SourceFile) -> bool:
 
     This is the D-side subset of the non-story vocabulary whose members the
     planner never writes as story media: theme videos, disc menus,
-    commercials and bonus-directory residents.  Fractional and
-    unnumbered-special videos are excluded — they are story coordinates with
-    their own mapping paths, so consuming them without a write would lose
-    media.
+    commercials and bonus-directory residents.  A theme-usage annotation
+    asset (``NCED_Ep16``, ``[EP.16 Ending Song … Special PV]``) is the same
+    class — a creditless theme or a music PV named by its usage range, never
+    a story episode.  Fractional and unnumbered-special videos are excluded —
+    they are story coordinates with their own mapping paths, so consuming
+    them without a write would lose media.
     """
     return (
         _is_known_non_story_theme_video(file)
+        or _is_theme_usage_annotation_video(file)
         or _is_bonus_directory_video(file)
         or _is_menu_video(file)
         or _is_commercial_video(file)
