@@ -139,7 +139,7 @@ def _identity_title_key(value: str) -> str:
     a fresh TMDB detail keeps the original punctuation.  Normalize both with
     the same projection so 命运-奇异赝品 matches 命运／奇异赝品.
     """
-    from ..remote_paths import provider_safe_basename
+    from ...remote_paths import provider_safe_basename
 
     return provider_safe_basename(str(value or "")).casefold()
 
