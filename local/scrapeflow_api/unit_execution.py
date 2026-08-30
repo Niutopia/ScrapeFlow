@@ -1170,8 +1170,25 @@ def _container_layout_targets(
     collection_parent_by_unit: dict[str, tuple[str, int, str]] = {}
     sub_series_parent_by_unit: dict[str, str] = {}
     if container_parent is not None:
+        # Directories an earlier root already created under the container are
+        # family evidence for a later root's lone works (巴比伦尼亚 joining
+        # 命运-冠位指定/ built by 序章/月光/所罗门).  A listing failure keeps
+        # the current-root-only behaviour — the anchor is an optimization of
+        # placement, never a correctness gate.
+        existing_children: list[str] = []
+        try:
+            rows = runner.alist.list(container_parent, refresh=True)
+        except Exception:
+            rows = None
+        if isinstance(rows, list):
+            existing_children = [
+                str(row.get("name") or "")
+                for row in rows
+                if isinstance(row, Mapping) and row.get("is_dir") is True
+            ]
         sub_series_parent_by_unit = _sub_series_parents(
             container_parent, records,
+            existing_children=existing_children,
         )
         collection_members: dict[int, list[WorkUnitRecord]] = {}
         collection_names: dict[int, str] = {}
@@ -1461,6 +1478,8 @@ def _normalized_title_key(value: str) -> str:
 def _sub_series_parents(
     container_parent: str,
     records: Sequence[WorkUnitRecord],
+    *,
+    existing_children: Collection[str] = (),
 ) -> dict[str, str]:
     """Nest same-family works under sub-series directories (operator tree).
 
@@ -1477,7 +1496,15 @@ def _sub_series_parents(
        least two distinct works and the prefix must end at a separator in
        every member's own original title (命运-冠位嘉年华 never folds into
        the 命运-冠位指定 stem).
-    3. Everything else stays a direct container child.
+    3. Library-anchored grouping: a lone work from a *later* root joins a
+       prefix family that an *earlier* root already created in the library
+       (巴比伦尼亚 arriving after 序章/月光/所罗门 built 命运-冠位指定/).
+       The anchor must be a directory that already exists under the
+       container and whose normalized name is a separator-bounded strict
+       prefix of the work's normalized title.  Nothing new is ever created
+       from library evidence alone — without the existing directory the
+       work keeps rule 2's fail-flat behaviour.
+    4. Everything else stays a direct container child.
 
     Collections are anchored by their members' shared family root (the
     collection pass runs after this function and reads its result).
@@ -1610,10 +1637,48 @@ def _sub_series_parents(
         for key in groups[prefix]:
             group_members.setdefault(key, prefix)
 
+    # --- Rule 3: library-anchored grouping --------------------------------
+    # A lone later-root work joins a family directory an earlier root already
+    # created in the library.  Only an existing directory anchors: the match
+    # is its normalized name as a separator-bounded strict prefix of the
+    # work's normalized title, the longest anchor wins, and without any
+    # anchor the work keeps its flat behaviour.  The work's own canonical
+    # directory name never anchors (equal names are the merge path, not a
+    # family relation).
+    anchored_prefixes: dict[tuple[str, int], str] = {}
+    if existing_children:
+        existing_by_key: list[tuple[str, str]] = []
+        for name in existing_children:
+            label = str(name or "").strip()
+            if not label:
+                continue
+            existing_by_key.append((_normalized_title_key(label), label))
+        for key in uncontained:
+            if key in group_members:
+                continue
+            title_key = keys[identities[key]]
+            if len(title_key) < 4:
+                continue
+            best: tuple[int, str] | None = None
+            for existing_key, label in existing_by_key:
+                if (
+                    len(existing_key) < 4
+                    or len(existing_key) >= len(title_key)
+                    or not title_key.startswith(existing_key)
+                    or not _key_bounded(title_key, len(existing_key))
+                ):
+                    continue
+                if best is None or len(existing_key) > best[0]:
+                    best = (len(existing_key), label)
+            if best is not None:
+                anchored_prefixes[key] = best[1]
+
     # --- Family roots ----------------------------------------------------
     family_dir: dict[tuple[str, int], str] = {}
     for key, prefix in group_members.items():
         family_dir[key] = posixpath.join(container_parent, prefix)
+    for key, label in anchored_prefixes.items():
+        family_dir[key] = posixpath.join(container_parent, label)
     # A containment-anchor TV that belongs to no prefix group keeps its own
     # directory as the family root (伊莉雅: movies nest inside the TV root).
     # An anchor TV inside a prefix group moves into the group's label

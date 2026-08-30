@@ -806,6 +806,67 @@ class ContainerNestingTests(unittest.TestCase):
         for flat in ("o", "p"):
             self.assertNotIn(flat, out, byid[flat])
 
+    def test_library_anchor_nests_a_lone_later_root_work(self) -> None:
+        """A lone work joins a family directory the library already holds.
+
+        巴比伦尼亚's shape: an earlier root built 命运-冠位指定/ (序章, 月光,
+        所罗门, 卡美洛), and a later root carries only the Babylonia TV.  The
+        current-root-only rule left it flat on the container; an existing
+        library directory whose normalized name is a separator-bounded strict
+        prefix of the work's title anchors it into the family.
+        """
+        from local.scrapeflow_api.unit_execution import _sub_series_parents
+
+        def rec(uid, mt, tid, title):
+            return WorkUnitRecord(
+                work_unit_id=uid, boundary_key=f"/x/{uid}",
+                source_paths=(f"/x/{uid}",), display_label=title,
+                role="series_container", media_context="tv",
+                identity={"media_type": mt, "tmdb_id": tid, "title": title},
+                claimed_seasons=(), root_task_id="r", source_revision=1,
+            )
+
+        records = [
+            rec("b", "tv", 90677, "命运-冠位指定 绝对魔兽战线巴比伦尼亚"),
+            rec("c", "tv", 76047, "卫宫家今天的饭"),
+        ]
+        existing = [
+            "命运-冠位指定",
+            "命运-冠位指定-序章 (2016)",
+            "命运-冠位指定 -月光-失落之室- (2017)",
+            "卫宫家今天的饭",
+            "poster.jpg",
+        ]
+        out = _sub_series_parents("/番剧/Fate", records, existing_children=existing)
+        self.assertEqual(out["b"], "/番剧/Fate/命运-冠位指定")
+        # An existing directory equal to the work's own root is the merge
+        # path, never a family anchor.
+        self.assertNotIn("c", out)
+
+    def test_library_anchor_requires_an_existing_directory(self) -> None:
+        """Without the existing family directory the work stays flat.
+
+        Library evidence never invents a new top-level group: the anchor is
+        an optimization of placement into what an earlier root built, so a
+        family that does not exist yet keeps the fail-flat behaviour.
+        """
+        from local.scrapeflow_api.unit_execution import _sub_series_parents
+
+        def rec(uid, mt, tid, title):
+            return WorkUnitRecord(
+                work_unit_id=uid, boundary_key=f"/x/{uid}",
+                source_paths=(f"/x/{uid}",), display_label=title,
+                role="series_container", media_context="tv",
+                identity={"media_type": mt, "tmdb_id": tid, "title": title},
+                claimed_seasons=(), root_task_id="r", source_revision=1,
+            )
+
+        records = [
+            rec("b", "tv", 90677, "命运-冠位指定 绝对魔兽战线巴比伦尼亚"),
+        ]
+        out = _sub_series_parents("/番剧/Fate", records, existing_children=["卫宫家今天的饭"])
+        self.assertNotIn("b", out)
+
     def test_oad_nests_under_unique_tmdb_alias_parent(self) -> None:
         files = {
             "/incoming/Collection/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
