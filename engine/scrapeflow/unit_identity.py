@@ -140,14 +140,18 @@ def _automatic_identity_needs_parent_context_recheck(
     root_task_id: str,
     record: WorkUnitRecord,
 ) -> bool:
-    """Detect a pre-context automatic match made from a bare season label.
+    """Detect an automatic match earned from parent-side evidence alone.
 
-    Older C/U records can be ``confirmed`` solely because TMDB returned a
-    plausible result for ``第一季``/``Season 02``.  That is not a durable
-    identity proof when the exact B snapshot shows the source is really a
-    child of a titled intake container.  Re-evaluate only on an explicit
-    retry, only before a writer exists, and never replace an operator's
-    confirmation.  This is provenance repair, not a title or TMDB-ID rule.
+    Two shapes qualify.  Older C/U records can be ``confirmed`` solely
+    because TMDB returned a plausible result for ``第一季``/``Season 02``;
+    that is not a durable identity proof when the exact B snapshot shows the
+    source is really a child of a titled intake container.  Newer records
+    also mark when the earning query was the total-miss parent escalation —
+    a recovery round whose ancestor label (a franchise-bundle root
+    collapsing to a bare prefix) can select the wrong franchise sibling.
+    Re-evaluate only on an explicit retry, only before a writer exists, and
+    never replace an operator's confirmation.  This is provenance repair,
+    not a title or TMDB-ID rule.
     """
     identity = record.identity if isinstance(record.identity, dict) else {}
     if (
@@ -169,6 +173,12 @@ def _automatic_identity_needs_parent_context_recheck(
         if isinstance(matched_variant, str) and matched_variant.strip()
         else _is_generic_season_label(trace.get("query"))
     )
+    # A total-miss parent escalation is a recovery round: the earning query
+    # was not the boundary's own evidence but an ancestor container label,
+    # which a generic franchise-bundle root collapses into a bare prefix
+    # that can select the wrong franchise sibling.  Such a confirmation is
+    # not durable against matcher fixes — an explicit retry must re-run C.
+    stale_query = stale_query or bool(trace.get("matched_query_via_parent_escalation"))
     if not stale_query:
         return False
     snapshot = load_source_snapshot(state_root, root_task_id)

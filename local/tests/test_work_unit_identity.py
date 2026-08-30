@@ -1718,6 +1718,11 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         # The escalation stopped at the nearest container: the franchise
         # root's collapsed single word was never dispatched.
         self.assertNotIn("Fate", dispatched)
+        # The confirmation carries its recovery-grade provenance so an
+        # explicit retry re-opens C instead of trusting the ancestor label.
+        trace = best.decision_trace or {}
+        self.assertTrue(trace.get("matched_query_via_parent_escalation"))
+        self.assertEqual(trace.get("matched_query_variant"), "魔法少女☆伊莉雅")
 
     def test_bonus_directory_unit_matches_via_parent_label(self) -> None:
         """A pure bonus-directory boundary is layout, like a bare season leaf.

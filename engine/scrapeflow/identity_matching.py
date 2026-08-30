@@ -2750,6 +2750,12 @@ def auto_match_from_evidence(
     # catalogue; the bare parent query only floods the pool with the whole
     # franchise.
     arc_query_hits: dict[str, set[int]] = {}
+    # Queries dispatched by the total-miss parent escalation below.  An
+    # identity whose earning query came from that recovery round is
+    # recovery-grade evidence: a generic franchise-bundle ancestor can flood
+    # the pool and let a bare prefix select the wrong sibling, so the record
+    # must stay re-openable on an explicit retry after a matcher fix.
+    escalation_sent_queries: set[str] = set()
     special_marker_gate = tuple(
         marker for marker in evidence.special_markers if str(marker or "").strip()
     )
@@ -2861,6 +2867,7 @@ def auto_match_from_evidence(
                     ):
                         continue
                     record_sent_query(cleaned, from_clean_boundary=False)
+                    escalation_sent_queries.add(cleaned)
                     response = client.get(
                         f"/search/{candidate_type}",
                         query=cleaned,
@@ -3079,6 +3086,9 @@ def auto_match_from_evidence(
                 "query": evidence.boundary_label,
                 "matched_query_variant": raw.get(
                     "matched_query", evidence.boundary_label
+                ),
+                "matched_query_via_parent_escalation": bool(
+                    raw.get("matched_query") in escalation_sent_queries
                 ),
                 "query_years": sorted(query_years),
                 "work_unit_id": evidence.work_unit_id,

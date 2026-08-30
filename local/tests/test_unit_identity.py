@@ -291,6 +291,90 @@ class WorkUnitIdentityTests(unittest.TestCase):
             self.assertEqual(stable.identity_status, "confirmed")
             self.assertEqual(stable.identity["tmdb_id"], 61945)
 
+    def test_retry_rechecks_unwritten_auto_match_from_parent_escalation(self) -> None:
+        """Retry must re-open an ancestor-escalated confirmation.
+
+        A total-miss parent escalation can auto-confirm from a
+        franchise-bundle ancestor label alone (``Fate系列`` -> ``Fate`` ->
+        Fate/Apocrypha for a Prisma☆Illya movie leaf).  The decision trace
+        marks that provenance with ``matched_query_via_parent_escalation``;
+        an explicit retry must re-run C under the current matcher instead of
+        trusting recovery-grade ancestor evidence.  A confirmation whose
+        earning query was the unit's own boundary label is not reopened.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-fate-escalation"
+            _build_snapshot("fate_container", root_task_id, state_root)
+            initial = load_work_unit_records(state_root, root_task_id)
+            escalated_unit = next(
+                record for record in initial if record.display_label == "Fate Zero"
+            )
+            boundary_unit = next(
+                record for record in initial if record.display_label == "空之境界"
+            )
+            escalated = replace(
+                escalated_unit,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "tv",
+                    "tmdb_id": 72304,
+                    "title": "命运／外典",
+                    "year": "2017",
+                    "confidence": 0.96,
+                    "decision_trace": {
+                        "query": escalated_unit.display_label,
+                        "matched_query_variant": "Fate",
+                        "matched_query_via_parent_escalation": True,
+                    },
+                },
+                candidate_identities=((
+                    {"media_type": "tv", "tmdb_id": 72304, "status": "confirmed"}
+                ),),
+                reconciliation_outcome=None,
+                attention=None,
+            )
+            boundary_confirmed = replace(
+                boundary_unit,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "movie",
+                    "tmdb_id": 40981,
+                    "title": "空之境界",
+                    "year": "2007",
+                    "confidence": 0.9,
+                    "decision_trace": {
+                        "query": boundary_unit.display_label,
+                        "matched_query_variant": "空之境界",
+                    },
+                },
+                candidate_identities=((
+                    {"media_type": "movie", "tmdb_id": 40981, "status": "confirmed"}
+                ),),
+                reconciliation_outcome=None,
+                attention=None,
+            )
+            save_work_unit_records(state_root, root_task_id, [
+                escalated if record.work_unit_id == escalated_unit.work_unit_id
+                else boundary_confirmed if record.work_unit_id == boundary_unit.work_unit_id
+                else record
+                for record in initial
+            ])
+
+            requeued = requeue_uncertain_work_units(state_root, root_task_id)
+            reopened = next(
+                record for record in requeued
+                if record.work_unit_id == escalated_unit.work_unit_id
+            )
+            self.assertEqual(reopened.identity_status, "pending")
+            self.assertIsNone(reopened.identity)
+            stable = next(
+                record for record in requeued
+                if record.work_unit_id == boundary_unit.work_unit_id
+            )
+            self.assertEqual(stable.identity_status, "confirmed")
+            self.assertEqual(stable.identity["tmdb_id"], 40981)
+
     def test_bare_season_without_parent_or_title_evidence_stays_uncertain(self) -> None:
         """A season coordinate alone cannot become a TMDB identity query."""
         root = "/incoming/Season 02"
