@@ -1596,11 +1596,25 @@ def _strict_naked_numeric_episode_number(file: SourceFile) -> int | None:
 def _strict_naked_numeric_episode_numbers(
     node: SourceNode | None,
 ) -> tuple[int, ...] | None:
-    """Return exactly numeric ``01`` … ``N`` primary videos, or ``None``."""
+    """Return exactly numeric ``01`` … ``N`` primary videos, or ``None``.
+
+    A naked ``00.mkv`` prologue carries the Season-00 coordinate, never a
+    member of the integer ``1..N`` run — the same treatment the bracket
+    grammar gives ``[00]``.  It is omitted from the run instead of poisoning
+    the proof (巴比伦尼亚's ``00.mkv`` beside ``01..21.mkv`` is one
+    complete 21-episode season plus a prologue special).
+    """
     videos = _regular_episode_primary_videos(node)
     if not videos:
         return None
-    numbers = [_strict_naked_numeric_episode_number(file) for file in videos]
+    primary = [
+        file
+        for file in videos
+        if _naked_zero_prologue_stem(file) is False
+    ]
+    if not primary:
+        return None
+    numbers = [_strict_naked_numeric_episode_number(file) for file in primary]
     if any(number is None for number in numbers):
         return None
     concrete = [int(number) for number in numbers if number is not None]
@@ -1610,6 +1624,15 @@ def _strict_naked_numeric_episode_numbers(
     if ordered != tuple(range(1, len(concrete) + 1)):
         return None
     return ordered
+
+
+def _naked_zero_prologue_stem(file: SourceFile) -> bool | None:
+    """Whether a video stem is exactly ``00`` (the S00 prologue ordinal)."""
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    stem, dot, _suffix = basename.rpartition(".")
+    if not dot:
+        return None
+    return bool(re.fullmatch(r"0+", stem.strip()))
 
 
 def _strict_release_dash_episode_signature_for_file(
