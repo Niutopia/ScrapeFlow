@@ -3153,15 +3153,14 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 # a child of the TV work root, so its canonical tree also
                 # anchors there — anchoring at the franchise root would
                 # re-nest it back beside the TV work.
+                contained_tree = bool(contained_movie_groups)
                 root_identity = (
                     WorkIdentity("tmdb.tv", int(first.metadata["tmdb_id"]))
-                    if movie_parent == first.target_root
+                    if movie_parent == first.target_root or contained_tree
                     else None
                 )
                 movie_tree_anchor = (
-                    first.target_root
-                    if contained_movie_groups
-                    else movie_parent
+                    first.target_root if contained_tree else movie_parent
                 )
                 _movie_root, movie_tree_warnings, _movie_tree_posters = (
                     _plan_canonical_batch_tree(
