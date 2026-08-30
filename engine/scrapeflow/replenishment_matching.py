@@ -385,6 +385,43 @@ def season_markers(value: str) -> set[int]:
         number = parse_chinese_number(match.group(1))
         if isinstance(number, int) and number > 0:
             output.add(number)
+    # A clearly delimited season DIRECTORY in the path is the authoritative
+    # season context for every file below it — the same privilege the bare
+    # ordinal branch already grants ``Season 2/01.mkv``.  Scattered markers
+    # elsewhere include a collection-span label on the intake root
+    # (``魔法禁书目录 S01-S03合集/魔法禁书目录 I …/[01].mkv`` whose span
+    # floods the marker set); the season directory the file actually lives
+    # in wins, and a marker set that does not contain the directory season
+    # at all is a genuine disagreement kept ambiguous.
+    directory_seasons = _season_directory_markers(value)
+    if len(directory_seasons) == 1:
+        directory_season = next(iter(directory_seasons))
+        if not output or directory_season in output:
+            return {directory_season}
+    return output
+
+
+def _season_directory_markers(value: str) -> set[int]:
+    """Season numbers read from path segments that are season directories.
+
+    Uses the shared B/W season-directory parser so the audit, the boundary
+    analysis, and every D/F proof agree on which directory is a season
+    directory (``Season 02``, ``第二季``, decorated ``魔法禁书目录 II``,
+    Roman ``Overlord IV``).  Non-path strings are returned unchanged as no
+    markers; only real ``/``-delimited segments are candidates.
+    """
+    from engine.scrapeflow.boundary_analysis import (
+        _season_number_from_directory_name,
+    )
+
+    output: set[int] = set()
+    for segment in re.split(r"[/\\]", str(value or "")):
+        segment = segment.strip()
+        if not segment:
+            continue
+        season = _season_number_from_directory_name(segment)
+        if season is not None:
+            output.add(season)
     return output
 
 
