@@ -1609,6 +1609,25 @@ def _strict_naked_numeric_episode_numbers(
     the proof (巴比伦尼亚's ``00.mkv`` beside ``01..21.mkv`` is one
     complete 21-episode season plus a prologue special).
     """
+    partition = _naked_numeric_run_partition(node)
+    if partition is None:
+        return None
+    return partition[0]
+
+
+def _naked_numeric_run_partition(
+    node: SourceNode | None,
+) -> tuple[tuple[int, ...], tuple[SourceFile, ...]] | None:
+    """Split primary videos into a numeric ``1..N`` run and its leftovers.
+
+    The numeric members must still form one complete, duplicate-free
+    ``1..N`` run.  The leftover members are non-numeric primary videos
+    beside that run — a special-form asset the naming vocabulary does not
+    know (``EX Season 01``, ``Fate／Prototype``, ``[Special]``).  They are
+    returned separately so the proof can admit them only when the numeric
+    run already proves one complete published season (their own coordinates
+    stay with the special mappers), and stay poisoning otherwise.
+    """
     videos = _regular_episode_primary_videos(node)
     if not videos:
         return None
@@ -1619,16 +1638,130 @@ def _strict_naked_numeric_episode_numbers(
     ]
     if not primary:
         return None
-    numbers = [_strict_naked_numeric_episode_number(file) for file in primary]
-    if any(number is None for number in numbers):
+    numbered: list[tuple[int, SourceFile]] = []
+    leftovers: list[SourceFile] = []
+    for file in primary:
+        number = _strict_naked_numeric_episode_number(file)
+        if number is None:
+            leftovers.append(file)
+        else:
+            numbered.append((int(number), file))
+    if not numbered:
         return None
-    concrete = [int(number) for number in numbers if number is not None]
+    concrete = [number for number, _file in numbered]
     if len(set(concrete)) != len(concrete):
         return None
     ordered = tuple(sorted(concrete))
     if ordered != tuple(range(1, len(concrete) + 1)):
         return None
-    return ordered
+    return ordered, tuple(leftovers)
+
+
+def _naked_numeric_suffix_run(
+    node: SourceNode | None,
+) -> tuple[tuple[int, ...], tuple[SourceFile, ...]] | None:
+    """Return a contiguous numeric tail run (``24``, ``25``) and leftovers.
+
+    A cumulative-numbered release whose earlier episodes were already
+    written by a previous root legitimately surfaces as a bare tail
+    (命运之夜 前传's ``24.mkv``/``25.mkv`` after 1..23 landed in the
+    library).  The tail is a contiguous numeric run that does not start at
+    1; its season alignment is proved separately against the cumulative
+    season boundaries, so this helper only guarantees the run's own shape.
+    """
+    videos = _regular_episode_primary_videos(node)
+    if not videos:
+        return None
+    primary = [
+        file
+        for file in videos
+        if _naked_zero_prologue_stem(file) is False
+    ]
+    if not primary:
+        return None
+    numbered: list[tuple[int, SourceFile]] = []
+    leftovers: list[SourceFile] = []
+    for file in primary:
+        number = _strict_naked_numeric_episode_number(file)
+        if number is None:
+            leftovers.append(file)
+        else:
+            numbered.append((int(number), file))
+    if not numbered:
+        return None
+    concrete = [number for number, _file in numbered]
+    if len(set(concrete)) != len(concrete):
+        return None
+    ordered = tuple(sorted(concrete))
+    if ordered[0] < 2:
+        # A run starting at 1 is the ordinary complete-run shape; whether it
+        # is complete is the partition helper's decision, never this one's.
+        return None
+    if ordered != tuple(range(ordered[0], ordered[0] + len(ordered))):
+        return None
+    return ordered, tuple(leftovers)
+
+
+def _partial_season_suffix_evidence(
+    tmdb_client: object | None,
+    *,
+    tmdb_id: int,
+    run_numbers: tuple[int, ...],
+) -> tuple[int, tuple[int, ...]] | None:
+    """Prove a contiguous whole-series suffix run onto its ending season.
+
+    A cumulative-numbered show counts one number per episode across seasons
+    (命运之夜 前传: 1..13 season 1, 14..25 season 2).  A bare tail
+    (``24.mkv``, ``25.mkv``) is provable exactly when it is contiguous,
+    every member lands inside one published season under the cumulative
+    boundaries, and its last member is the series' last published episode —
+    the series end anchors the alignment exactly the way ``1..N`` anchors a
+    full run, and any other alignment would overshoot the published total.
+    """
+    getter = getattr(tmdb_client, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        show = getter(f"/tv/{tmdb_id}")
+    except Exception:
+        return None
+    if not isinstance(show, Mapping):
+        return None
+    raw_seasons = show.get("seasons")
+    if not isinstance(raw_seasons, list) or not raw_seasons:
+        return None
+    boundaries: list[tuple[int, int]] = []
+    for row in raw_seasons:
+        if not isinstance(row, Mapping):
+            return None
+        raw_season = row.get("season_number")
+        raw_count = row.get("episode_count")
+        if (
+            isinstance(raw_season, bool)
+            or not isinstance(raw_season, int)
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_season <= 0
+            or raw_count <= 0
+        ):
+            # Season 00 carries no cumulative position and empty placeholders
+            # no coordinates; neither participates in the alignment.
+            continue
+        boundaries.append((raw_season, raw_count))
+    if not boundaries:
+        return None
+    total = sum(count for _season, count in boundaries)
+    if not run_numbers or run_numbers[0] < 2 or run_numbers[-1] != total:
+        return None
+    cumulative = 0
+    for season, count in boundaries:
+        if cumulative < run_numbers[0] <= cumulative + count:
+            season_episodes = tuple(number - cumulative for number in run_numbers)
+            if season_episodes[-1] > count or season_episodes[0] < 1:
+                return None
+            return season, season_episodes
+        cumulative += count
+    return None
 
 
 def _naked_zero_prologue_stem(file: SourceFile) -> bool | None:
@@ -1643,7 +1776,9 @@ def _naked_zero_prologue_stem(file: SourceFile) -> bool | None:
 _THEME_EP_USAGE_ANNOTATION_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:NC)?(?:OP|ED)(?:\d+)?(?:_\s*-?\s*)?EP\d+"
     r"|(?:NC)?(?:OP|ED)(?:_\s*-?\s*EP\d+)"
-    r"|\[\s*EP\s*[._]?\s*\d+\s+(?:Ending|Fin(?:al)?)\s*\]",
+    r"|\[\s*EP\s*[._]?\s*\d+\s+(?:Ending|Fin(?:al)?)\s*\]"
+    r"|\[\s*EP\s*[._]?\s*\d+\s+(?:Ending|Fin(?:al)?)[^\]]*"
+    r"(?:PV|Song|Video)[^\]]*\]",
     re.IGNORECASE,
 )
 
@@ -1653,8 +1788,11 @@ def _is_theme_usage_annotation_video(file: SourceFile) -> bool:
 
     ``NCED_Ep16`` and ``[EP.16 Ending]`` beside NCOP/NCED siblings both say
     "this theme was used from episode 16": the EP tail is a usage range,
-    never the file's own episode coordinate.  A bare ``EP16`` with no theme
-    context remains ordinary episode evidence.
+    never the file's own episode coordinate.  The bracket form may carry the
+    asset's own description after the form word (``[EP.16 Ending Song Tell
+    Me Special PV]`` — a PV of episode 16's ending), so the bracket matches
+    through to its close.  A bare ``EP16`` with no theme context remains
+    ordinary episode evidence.
     """
     basename = posixpath.basename(str(file.path or "").rstrip("/"))
     return bool(_THEME_EP_USAGE_ANNOTATION_RE.search(basename))
@@ -2314,13 +2452,13 @@ def _same_sized_specials_resolved_by_runtimes(
 
     When TMDB's specials bucket declares exactly as many episodes as the
     source run, the counts alone cannot tell a regular season from the
-    specials.  The two buckets' published runtime profiles can: a uniformly
-    short specials bucket (every episode under the contract's 18-minute
-    episode threshold) against a uniformly full-length regular season
-    (every episode at or above it) cannot be the same content (轮回七次
-    shape: 12 one-minute Picture Dramas beside twelve 24-minute episodes).
-    Missing, partial, or overlapping runtime data keeps the fail-closed
-    verdict.
+    specials.  The two buckets' published runtime profiles can: two
+    uniformly separated profiles — every special strictly shorter than
+    every regular episode — cannot be the same content (轮回七次 shape:
+    twelve one-minute Picture Dramas beside twelve 24-minute episodes; 卫宫
+    家 shape: 13 three-to-five-minute recipe shorts beside thirteen
+    13-minute episodes, a legitimately short-form regular season).  Missing,
+    partial, or overlapping runtime data keeps the fail-closed verdict.
     """
     special_runtimes = _season_runtime_profile(tmdb_client, tmdb_id, 0)
     regular_runtimes = _season_runtime_profile(tmdb_client, tmdb_id, season)
@@ -2334,8 +2472,8 @@ def _same_sized_specials_resolved_by_runtimes(
     ):
         return False
     return all(
-        value is not None and value < 18 for value in special_runtimes
-    ) and all(value is not None and value >= 18 for value in regular_runtimes)
+        value is not None for value in (*special_runtimes, *regular_runtimes)
+    ) and max(special_runtimes) < min(regular_runtimes)
 
 
 def _season_disambiguated_by_name(
@@ -2350,15 +2488,26 @@ def _season_disambiguated_by_name(
     episode count alone matches several seasons, the normalized season name
     must equal the normalized unit label for exactly one candidate; anything
     else stays ambiguous and the caller keeps failing closed.
+
+    A release-directory label rarely equals the season name verbatim: it
+    carries packaging (``01 魔法少女☆伊莉雅（2013）全10集 内封简繁字幕
+    4K（Ma10p…）`` around the season ``魔法少女☆伊莉雅``).  The same
+    bounded boundary cleaning C already uses strips that packaging, so the
+    comparison runs on the cleaned label ahead of the raw one; the raw form
+    stays first so a verbatim season title keeps its exact behaviour.
     """
-    label_key = _normalize_match_title(str(unit_label or ""))
-    if not label_key:
+    label = str(unit_label or "")
+    label_keys = [key for key in (
+        _normalize_match_title(label),
+        _normalize_match_title(_clean_boundary_identity_query(label)),
+    ) if key]
+    if not label_keys:
         return None
-    named = [
-        (season, count)
-        for season, count, name in matching
-        if _normalize_match_title(str(name or "")) == label_key
-    ]
+    named: list[tuple[int, int]] = []
+    for season, count, name in matching:
+        name_key = _normalize_match_title(str(name or ""))
+        if name_key and name_key in label_keys and (season, count) not in named:
+            named.append((season, count))
     if len(named) != 1:
         return None
     return named[0]
@@ -2811,19 +2960,79 @@ def prove_single_season_episode_evidence(
             first_prefix, record,
         ):
             return None
-    episode_numbers = _single_season_episode_numbers(
-        scoped,
-        evidence_kind=evidence_kind,
-    )
+    leftovers: tuple[SourceFile, ...] = ()
+    suffix_run: tuple[int, ...] | None = None
+    if evidence_kind == _NAKED_NUMERIC_EPISODE_EVIDENCE_KIND:
+        # The naked grammar partitions its primary videos: the numeric
+        # ``1..N`` run plus non-numeric leftovers, or a bare cumulative
+        # tail after an earlier root wrote the prefix.
+        partition = _naked_numeric_run_partition(scoped)
+        if partition is not None:
+            episode_numbers, leftovers = partition
+        else:
+            suffix = _naked_numeric_suffix_run(scoped)
+            if suffix is None:
+                return None
+            suffix_run, leftovers = suffix
+            episode_numbers = suffix_run
+    else:
+        episode_numbers = _single_season_episode_numbers(
+            scoped,
+            evidence_kind=evidence_kind,
+        )
     if episode_numbers is None:
         return None
+    if suffix_run is not None:
+        # A proved suffix is its own complete coordinate set: the cumulative
+        # boundaries place every member.  Like the partial-season prefix, a
+        # suffix is only sound for a pure regular run: any leftover,
+        # fractional or physical-special video beside the tail means the
+        # source carries ambiguous coordinates, so fail closed instead of
+        # reading the tail as a season slice.
+        if leftovers or any(
+            _is_fractional_episode_video(file)
+            or _is_unnumbered_special_video(file)
+            or is_physical_special_video_file(file)
+            for file in collect_all_files(scoped)
+            if file.object_type == "video"
+        ):
+            return None
+        suffix_evidence = _partial_season_suffix_evidence(
+            tmdb_client,
+            tmdb_id=tmdb_id,
+            run_numbers=suffix_run,
+        )
+        if suffix_evidence is None:
+            return None
+        suffix_season, season_episode_numbers = suffix_evidence
+        return SingleSeasonEpisodeProof(
+            tmdb_id=tmdb_id,
+            season=suffix_season,
+            episode_count=len(season_episode_numbers),
+            episode_tokens=tuple(
+                f"S{suffix_season:02d}E{episode:02d}"
+                for episode in season_episode_numbers
+            ),
+            evidence_kind=evidence_kind,
+        )
     season_evidence = _single_positive_tmdb_season(
         tmdb_client,
         tmdb_id=tmdb_id,
         episode_count=len(episode_numbers),
         unit_label=str(record.display_label or ""),
     )
+    if season_evidence is not None and leftovers:
+        # Non-numeric leftovers beside a complete numeric run are
+        # special-form assets the naming vocabulary does not know (``EX
+        # Season 01``, ``Fate／Prototype``, ``[Special]``).  They may not
+        # weaken the season proof: only a unique complete published season
+        # (no overflow tail, no prefix/merged/arc fallback) may carry them,
+        # and their own coordinates stay with the special mappers.
+        if season_evidence.overflow_episode_count != 0:
+            return None
     if season_evidence is None:
+        if leftovers:
+            return None
         merged = _merged_multi_season_evidence(
             tmdb_client,
             tmdb_id=tmdb_id,

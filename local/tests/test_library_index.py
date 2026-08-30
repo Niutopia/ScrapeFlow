@@ -1859,6 +1859,104 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
 
+    def test_naked_numeric_run_tolerates_non_numeric_leftovers(self) -> None:
+        """Non-numeric special-form leftovers must not poison a complete run.
+
+        幻想嘉年华 shape: a complete ``01..12`` naked run beside ``EX Season
+        01``/``EX Season 02``/``Fate／Prototype``/``Special Season`` —
+        special-form assets the naming vocabulary does not know.  The run
+        itself still proves one complete published season; the leftovers'
+        own coordinates stay with the special mappers.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99049, {0: 6, 1: 12})
+            names = (
+                [f"{episode:02d}.mkv" for episode in range(1, 13)]
+                + ["EX Season 01.mkv", "EX Season 02.mkv"]
+                + ["Fate／Prototype.mkv", "Special Season.mkv"]
+            )
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-naked-leftovers",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(record.reconciliation_evidence["season"], 1)
+            self.assertEqual(
+                record.reconciliation_evidence["episode_count"], 12,
+            )
+
+    def test_naked_numeric_leftovers_keep_a_prefix_run_closed(self) -> None:
+        """Leftovers beside an incomplete run still fail closed.
+
+        The leftover tolerance applies only when the numeric run already
+        proves one complete published season; a short run beside leftovers
+        is a partial-season reading, which stays ambiguous by the existing
+        prefix rule.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99050, {0: 6, 1: 12})
+            names = [f"{episode:02d}.mkv" for episode in range(1, 7)] + [
+                "EX Season 01.mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-naked-leftovers-partial",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
+    def test_naked_numeric_suffix_run_proves_the_ending_season_tail(self) -> None:
+        """A bare cumulative tail proves onto the series' ending season.
+
+        命运之夜 前传 shape: cumulative numbering (1..13 season 1, 14..25
+        season 2) with an earlier root having written 1..23.  The bare
+        ``24.mkv``/``25.mkv`` tail is provable because its last member is
+        the series' last published episode: only the S02 tail alignment
+        fits.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99051, {0: 8, 1: 13, 2: 12})
+            names = ["24.mkv", "25.mkv"]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-naked-suffix",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(record.reconciliation_evidence["season"], 2)
+            self.assertEqual(
+                record.reconciliation_evidence["episode_tokens"],
+                ["S02E11", "S02E12"],
+            )
+
+    def test_naked_numeric_suffix_not_ending_the_series_stays_closed(self) -> None:
+        """A tail that stops short of the series end is ambiguous.
+
+        ``14.mkv``/``15.mkv`` (S02E01/E02) could equally be an early-week
+        partial upload of the season's start; without the series-end anchor
+        the alignment stays unproven.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99052, {0: 8, 1: 13, 2: 12})
+            names = ["14.mkv", "15.mkv"]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-naked-suffix-mid",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+            self.assertIsNone(record.reconciliation_evidence)
+
     def test_naked_numeric_source_rejects_a_gap_or_release_suffix(self) -> None:
         """A missing number or ``01.1080p`` must remain uncertain."""
         cases = (
@@ -2314,6 +2412,54 @@ class LibraryIndexTests(unittest.TestCase):
             records = load_work_unit_records(state_root, root_task_id)
             apply_work_unit_override(
                 state_root, root_task_id, records[0].work_unit_id,
+                media_type="tv", tmdb_id=tmdb.tmdb_id,
+            )
+            record = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=TmdbEpisodeCatalog(tmdb), tmdb_client=tmdb,
+            )[0]
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(record.reconciliation_evidence["season"], 1)
+
+    def test_same_sized_seasons_disambiguated_by_cleaned_release_label(self) -> None:
+        """A decorated release label names the season after bounded cleaning.
+
+        魔法少女☆伊莉雅 shape: three same-sized seasons (S1/S2/S3 each 10
+        episodes) and a release directory labelled ``01 魔法少女☆伊莉雅
+        （2013）全10集 内封简繁字幕 4K（Ma10p x265 flac ass）`` around the
+        first season.  The raw label can never equal a season name; the same
+        bounded boundary cleaning C already uses strips the packaging, and
+        the cleaned residue must pick exactly one candidate season.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99105,
+                {0: 23, 1: 10, 2: 10, 3: 10},
+                season_names={
+                    1: "魔法少女☆伊莉雅",
+                    2: "魔法少女☆伊莉雅 2wei!",
+                    3: "魔法少女☆伊莉雅 2wei Herz!",
+                },
+            )
+            names = [f"{episode:02d}.mkv" for episode in range(1, 11)]
+            intake_root = (
+                "/incoming/01 魔法少女☆伊莉雅（2013）全10集 "
+                "内封简繁字幕 4K（Ma10p x265 flac ass）"
+            )
+            files = {f"{intake_root}/{name}": b"v" for name in names}
+            alist = IndexAList(files)
+            root_task_id = "root-season-name-cleaned"
+            analyze_root_boundaries(
+                alist,
+                intake_root,
+                root_task_id=root_task_id,
+                state_root=state_root,
+            )
+            records = load_work_unit_records(state_root, root_task_id)
+            target = records[0]
+            apply_work_unit_override(
+                state_root, root_task_id, target.work_unit_id,
                 media_type="tv", tmdb_id=tmdb.tmdb_id,
             )
             record = reconcile_root_work_units(
@@ -3132,8 +3278,80 @@ class SameSizedSpecialsRuntimeTests(LibraryIndexTests):
             )
             self.assertNotEqual(record.reconciliation_outcome, "new_work")
 
+    def test_same_sized_specials_resolved_by_short_form_regular_season(self) -> None:
+        """A short-form regular season must not read as the specials bucket.
+
+        卫宫家 shape: TMDB declares 13 three-to-five-minute recipe shorts in
+        Season 00 beside thirteen 13-minute regular episodes.  The old fixed
+        18-minute threshold called the 13-minute season "specials" and failed
+        closed; the separation test is between the two profiles, so a
+        uniformly shorter specials bucket resolves the run.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            resolved = StrictBareEpisodeTMDB(
+                99048, {0: 13, 1: 13},
+                episode_runtimes={
+                    0: [4, 3, 4, 4, 5, 5, 4, 3, 4, 5, 4, 4, 5],
+                    1: [13] * 13,
+                },
+            )
+            names = [f"{episode:02d}.mp4" for episode in range(1, 14)]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                resolved,
+                state_root=state_root,
+                root_task_id="root-runtime-short-form",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence and record.reconciliation_evidence["season"],
+                1,
+            )
+
 
 class SharedBonusDirectoryVocabularyTests(unittest.TestCase):
+    def test_theme_usage_annotation_bracket_admits_asset_descriptions(self) -> None:
+        """``[EP.16 Ending …]`` stays a usage note through its bracket.
+
+        巴比伦尼亚 shape: ``[MAI] Fate／Grand Order … [EP.16 Ending Song
+        Tell Me Special PV]`` is a PV of episode 16's ending — the EP tail
+        is a usage range, never the file's own episode coordinate.  The
+        bracket form may carry the asset's description after the form word,
+        but an ordinary episode descriptor (``[EP.16 Final Battle]``)
+        remains ordinary episode evidence.
+        """
+        from engine.scrapeflow.source_inventory import SourceFile
+        from local.scrapeflow_api.library_index import (
+            _is_theme_usage_annotation_video,
+        )
+
+        def video(name: str) -> SourceFile:
+            return SourceFile(
+                f"/incoming/Example/{name}", name, 1, "video", "",
+            )
+
+        self.assertTrue(
+            _is_theme_usage_annotation_video(video("[MAI] Show [EP.16 Ending].mkv"))
+        )
+        self.assertTrue(_is_theme_usage_annotation_video(
+            video(
+                "[MAI] Fate／Grand Order Zettai Majuu Sensen Babylonia "
+                "[EP.16 Ending Song Tell Me Special PV][Ma10p_2160p].mkv"
+            )
+        ))
+        self.assertTrue(
+            _is_theme_usage_annotation_video(video("Show NCED_Ep16.mkv"))
+        )
+        # A real episode descriptor inside the same bracket shape keeps its
+        # ordinary episode evidence.
+        self.assertFalse(
+            _is_theme_usage_annotation_video(video("Show [EP.16 Final Battle].mkv"))
+        )
+        self.assertFalse(
+            _is_theme_usage_annotation_video(video("Show EP16.mkv"))
+        )
+
     def test_f_preclassification_uses_the_shared_bonus_directory_vocabulary(self) -> None:
         """F removes bonus-directory videos by directory context alone.
 
