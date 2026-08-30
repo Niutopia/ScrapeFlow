@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -43,6 +44,7 @@ from engine.scrapeflow.replenishment_matching import (
     audit_episode_tokens,
     normalized_text,
     release_dash_regular_episode,
+    release_title_ordinal_regular_episode,
 )
 from engine.scrapeflow.residual_policy import _THEME_VIDEO_RE
 
@@ -886,49 +888,75 @@ def _split_flat_movie_files(
     # layout.  Leave it intact for the season/container rules below.
     if any(_child_has_video(child) for child in node.children):
         return None
-    # A homogeneous release-dash episode run (``[Kamigami] Mushishi - 01
-    # [BD …]`` … ``- 26 [BD …]``) is one TV season's episode batch, never a
-    # package of independently titled feature films.  The dash ordinals fold
-    # into each file's movie title key (mushishi01, mushishi02, …) so the
-    # per-key grouping below would shred the run into one unpositionable
-    # movie shard per episode.  Recognize the shape the D/F release-dash
-    # grammar already owns — every video shares one normalized title prefix
-    # and the ordinals form one complete contiguous 1..N run — and keep it
-    # as a single tv-shaped exact-file-scope candidate like the bracketed
-    # mini-series rule below.
-    dash_members = [
-        release_dash_regular_episode(file.name) for file in direct_videos
-    ]
-    if len(dash_members) >= 2 and all(
-        member is not None for member in dash_members
-    ):
-        prefixes = {
-            normalized_text(prefix) for prefix, _ordinal in dash_members
-        }
-        ordinals = sorted(ordinal for _prefix, ordinal in dash_members)
+    # Homogeneous release-episode runs (``[Kamigami] Mushishi - 01 [BD …]``
+    # … ``- 26``, ``High School DxD 01 [BD …]`` … ``12``) are TV seasons'
+    # episode batches, never packages of independently titled feature
+    # films.  The ordinals fold into each file's movie title key
+    # (mushishi01, …) so the per-key grouping below would shred every run
+    # into one unpositionable movie shard per episode.  Recognize the shapes
+    # the D/F release-dash and title-ordinal grammars already own — parse
+    # every video, group by normalized title prefix, keep each group whose
+    # ordinals form one complete contiguous 1..N run as a single tv-shaped
+    # exact-file-scope candidate (mirroring the bracketed mini-series rule),
+    # and let the remaining files (an OVA beside its season's run) keep the
+    # per-key movie path below.
+    run_by_prefix: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for index, file in enumerate(direct_videos):
+        member = release_dash_regular_episode(file.name)
+        if member is None:
+            member = release_title_ordinal_regular_episode(file.name)
+        if member is None:
+            continue
+        prefix, ordinal = member
+        run_by_prefix[normalized_text(prefix)].append(
+            (ordinal, index, prefix)
+        )
+    tv_run_candidates: list[WorkCandidate] = []
+    run_file_indexes: set[int] = set()
+    for prefix_key, members in run_by_prefix.items():
+        ordinals = sorted(ordinal for ordinal, _index, _prefix in members)
         if (
-            len(prefixes) == 1
-            and len(set(ordinals)) == len(ordinals)
-            and ordinals == list(range(1, len(ordinals) + 1))
+            len(members) < 2
+            or len(set(ordinals)) != len(ordinals)
+            or ordinals != list(range(1, len(ordinals) + 1))
         ):
-            label = _direct_movie_title_text(dash_members[0][0]) or (
-                dash_members[0][0].strip()
-            )
-            return [WorkCandidate(
-                work_unit_id=_work_unit_id(root_task_id, f"{node.path}/@dash-run"),
-                boundary_key=f"{node.path}/@dash-run",
-                source_paths=tuple(file.path for file in direct_videos),
-                display_label=label or node.name,
-                proposed_media_context="tv",
-                boundary_evidence=BoundaryEvidence(
-                    role=DirectoryRole.SINGLE_WORK,
-                    confidence=0.9,
-                    reasons=(
-                        f"{len(direct_videos)} 个同标题短横线集号文件构成完整 1..{len(direct_videos)} 连续集",
-                    ),
-                    competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
+            continue
+        for _ordinal, index, _prefix in members:
+            run_file_indexes.add(index)
+        first_prefix = next(
+            prefix for _ordinal, _index, prefix in sorted(members)
+        )
+        label = _direct_movie_title_text(first_prefix) or first_prefix.strip()
+        tv_run_candidates.append(WorkCandidate(
+            work_unit_id=_work_unit_id(root_task_id, f"{node.path}/@dash-run/{prefix_key}"),
+            boundary_key=f"{node.path}/@dash-run/{prefix_key}",
+            source_paths=tuple(
+                direct_videos[index].path
+                for _ordinal, index, _prefix in sorted(members)
+            ),
+            display_label=label or node.name,
+            proposed_media_context="tv",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.SINGLE_WORK,
+                confidence=0.9,
+                reasons=(
+                    f"{len(members)} 个同标题集号文件构成完整 1..{len(members)} 连续集",
                 ),
-            )]
+                competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
+            ),
+        ))
+    if tv_run_candidates:
+        leftover_videos = [
+            file
+            for index, file in enumerate(direct_videos)
+            if index not in run_file_indexes
+        ]
+        if not leftover_videos:
+            return tv_run_candidates
+        # The leftover files continue through the independently-titled
+        # feature path below; every run file is already owned above.
+        direct_videos = leftover_videos
+        root_videos = len(direct_videos)
     texts = [_direct_movie_title_text(file.name) for file in direct_videos]
     keys = [_direct_movie_title_key(file.name) for file in direct_videos]
     if any(key is None for key in keys):
@@ -999,7 +1027,7 @@ def _split_flat_movie_files(
                 competing_roles=(DirectoryRole.MOVIE_COLLECTION.value,),
             ),
         ))
-    return candidates
+    return tv_run_candidates + candidates
 
 
 def _plain_film_folder_title(label: str) -> bool:
