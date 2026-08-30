@@ -1408,6 +1408,10 @@ def _strict_bare_episode_number_for_file(file: SourceFile) -> int | None:
     """
     if not bare_regular_episode_context_is_safe(file.path):
         return None
+    # A theme/menu/bonus video is never a story coordinate: its ``Ep16`` tail
+    # is a usage annotation (``NCED_Ep16``), not an episode number.
+    if _is_non_regular_episode_video(file):
+        return None
     # Source paths are POSIX provider paths.  Parsing the basename, rather
     # than the whole path, intentionally confines bare ranges and packed
     # episode markers to the media member itself.
@@ -1544,6 +1548,7 @@ def _regular_episode_primary_videos(
         for file in videos
         if file.path not in special_paths
         and not _is_non_regular_episode_video(file)
+        and not _is_theme_usage_annotation_video(file)
         and not _season_qualified_video(file)
         and not _bracket_zero_prologue_video(file)
         and not any(
@@ -1633,6 +1638,26 @@ def _naked_zero_prologue_stem(file: SourceFile) -> bool | None:
     if not dot:
         return None
     return bool(re.fullmatch(r"0+", stem.strip()))
+
+
+_THEME_EP_USAGE_ANNOTATION_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:NC)?(?:OP|ED)(?:\d+)?(?:_\s*-?\s*)?EP\d+"
+    r"|(?:NC)?(?:OP|ED)(?:_\s*-?\s*EP\d+)"
+    r"|\[\s*EP\s*[._]?\s*\d+\s+(?:Ending|Fin(?:al)?)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _is_theme_usage_annotation_video(file: SourceFile) -> bool:
+    """Whether a video basename attaches an EP-usage note to a theme marker.
+
+    ``NCED_Ep16`` and ``[EP.16 Ending]`` beside NCOP/NCED siblings both say
+    "this theme was used from episode 16": the EP tail is a usage range,
+    never the file's own episode coordinate.  A bare ``EP16`` with no theme
+    context remains ordinary episode evidence.
+    """
+    basename = posixpath.basename(str(file.path or "").rstrip("/"))
+    return bool(_THEME_EP_USAGE_ANNOTATION_RE.search(basename))
 
 
 def _strict_release_dash_episode_signature_for_file(
@@ -1965,6 +1990,13 @@ _LETTER_VARIANT_EPISODE_RE = re.compile(
 )
 
 
+_THEME_EP_ANNOTATION_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:NC)?(?:OP|ED)(?:\d+)?_?EP\d+"
+    r"|(?:NC)?(?:OP|ED)(?:_?EP\d+)",
+    re.IGNORECASE,
+)
+
+
 def _is_known_non_story_theme_video(file: SourceFile) -> bool:
     """Whether a video is one explicitly identified non-story OP/ED asset.
 
@@ -1972,12 +2004,18 @@ def _is_known_non_story_theme_video(file: SourceFile) -> bool:
     opening/ending theme markers, so they are omitted from the regular-episode
     proof.  One bounded qualifier word before the core is still the same
     asset: ``[Game OP]``/``[Creditless OP]`` name the game-version or
-    creditless opening, not a story episode.  An ``MV``/``PV`` label is not a
-    reliable media role, so it keeps the proof fail-closed until B/W can
-    place it independently.
+    creditless opening, not a story episode.  The underscore-attached usage
+    annotation (``NCED_Ep16`` — the ending used from episode 16) is the same
+    theme asset as the bracketed ``[NCED01]``, so its ``EP16`` tail can never
+    surface as a bare episode coordinate in the strict single-season proof.
+    An ``MV``/``PV`` label is not a reliable media role, so it keeps the
+    proof fail-closed until B/W can place it independently.
     """
     basename = posixpath.basename(str(file.path or "").rstrip("/"))
-    return bool(_KNOWN_NON_STORY_THEME_MARKER_RE.search(basename))
+    return bool(
+        _KNOWN_NON_STORY_THEME_MARKER_RE.search(basename)
+        or _THEME_EP_ANNOTATION_RE.search(basename)
+    )
 
 
 def _is_bonus_directory_video(file: SourceFile) -> bool:
