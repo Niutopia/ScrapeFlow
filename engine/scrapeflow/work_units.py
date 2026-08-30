@@ -110,6 +110,20 @@ _PHYSICAL_SPECIAL_TOKEN_RE = re.compile(
     r"(?<![A-Za-z])(?P<marker>OVA|OAV|OAD|SP|SPECIAL)(?![A-Za-z])",
     re.IGNORECASE,
 )
+# A parent supplies special-container context only when one whole path
+# segment is dominated by the marker (``OAD/01.mkv``, ``OVA 02/03.mkv``).
+# A release folder that merely MENTIONS the marker inside its packaging
+# (``01 寒蝉鸣泣之时（2006）全26集+OVA 内嵌简中字幕 1080P…``) is an
+# ordinary season folder: the mention belongs to the advertising text, and
+# honouring it turned every bare episode ordinal under the folder into a
+# physical-special candidate, breaking the regular naked-numeric proof.
+_SPECIAL_DOMINANT_SEGMENT_RE = re.compile(
+    r"^[\s._\-\[\]()]*"
+    r"(?:ova|oav|oad|sp|special)s?"
+    r"[\s._\-]*0*\d{0,3}"
+    r"[\s._\-\[\]()]*$",
+    re.IGNORECASE,
+)
 _STANDALONE_SPECIAL_NUMBER_RE = re.compile(
     r"(?:^|[\s._\-\[\](){}])0*(\d{1,3})(?=$|[\s._\-\[\](){}])"
 )
@@ -629,8 +643,10 @@ def is_physical_special_video_file(file: SourceFile) -> bool:
         return True
     if _REVERSE_PHYSICAL_SPECIAL_MARKER_RE.search(text):
         return True
-    marker_in_parent = "/" in text and bool(
-        _PHYSICAL_SPECIAL_TOKEN_RE.search(text.rsplit("/", 1)[0])
+    marker_in_parent = "/" in text and any(
+        _SPECIAL_DOMINANT_SEGMENT_RE.fullmatch(segment)
+        for segment in text.rsplit("/", 1)[0].split("/")
+        if segment
     )
     if marker_in_parent:
         basename = Path(file.name).stem
