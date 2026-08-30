@@ -1803,6 +1803,23 @@ def _partial_season_suffix_evidence(
         return None
     total = sum(count for _season, count in boundaries)
     if not run_numbers or run_numbers[0] < 2 or run_numbers[-1] != total:
+        # A run ending exactly at a season boundary anchors the same way
+        # (寒蝉鸣泣之时·业's bare 11..24 tail ends at Season 1's last
+        # episode): the whole run must sit inside that one season, and the
+        # season end pins the alignment.
+        cumulative = 0
+        for season, count in boundaries:
+            season_end = cumulative + count
+            if (
+                run_numbers
+                and run_numbers[-1] == season_end
+                and cumulative < run_numbers[0] <= season_end
+            ):
+                season_episodes = tuple(
+                    number - cumulative for number in run_numbers
+                )
+                return season, season_episodes
+            cumulative = season_end
         return None
     cumulative = 0
     for season, count in boundaries:
