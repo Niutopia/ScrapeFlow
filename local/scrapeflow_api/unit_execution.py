@@ -3943,6 +3943,12 @@ def execute_new_work_units(
                 )
                 if parent_override is None:
                     raise ValueError("特别篇父剧尚未完成安全目标根证明")
+            elif layout.get("parent_path"):
+                # The layout's family decision (sub-series directory,
+                # collection directory, or container root) is the planner's
+                # parent — a sub-series movie plans inside its family
+                # directory, never flattened onto the container root.
+                parent_override = str(layout["parent_path"])
             elif container_parent:
                 parent_override = container_parent
             elif main_tmdb is not None:
