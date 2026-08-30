@@ -883,6 +883,23 @@ def coverage_tokens(
                     episode = int(match.group(1))
                     if 0 < episode <= 999:
                         output.add(f"S{season:02d}E{episode:02d}")
+            # A ``Title 01 [tags]`` terminal ordinal is the same unmarked
+            # episode form the dash/bracket patterns above cover, and the
+            # strict D/F title-ordinal grammar owns.  It emits a coordinate
+            # only through this block's already-resolved single season —
+            # the season directory in the path (or one caller default), the
+            # same authority every other emission here uses — so a bare
+            # ``Title 01`` with no season context stays coordinate-less.
+            # The grammar is fed the basename: its own season-marker fuse
+            # would reject the whole path precisely because the season
+            # directory that legitimizes this emission is in it.
+            title_ordinal_member = release_title_ordinal_regular_episode(
+                re.split(r"[/\\]", item.rstrip("/"))[-1]
+            )
+            if title_ordinal_member is not None:
+                _prefix, title_ordinal = title_ordinal_member
+                if 0 < title_ordinal <= 999:
+                    output.add(f"S{season:02d}E{title_ordinal:02d}")
         if allow_bare_numeric and not explicit_episode_ids and not has_marked_episode:
             # A bare ordinal is accepted only with an explicit season context:
             # either one season directory in the path or one caller-supplied
