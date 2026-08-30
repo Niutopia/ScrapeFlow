@@ -103,6 +103,31 @@ _BARE_REGULAR_EPISODE_SPECIAL_RE = re.compile(
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# A whole path segment dominated by a special marker (``OAD/01.mkv``,
+# ``OVA 02/03.mkv``).  A release folder that merely MENTIONS the marker in
+# its packaging (``01 寒蝉鸣泣之时（2006）全26集+OVA 内嵌简中字幕…``) is an
+# ordinary season folder: the mention is advertising text, not a special
+# container, and honouring it closed every strict bare-ordinal lane under
+# the folder.
+_SPECIAL_DOMINANT_SEGMENT_RE = re.compile(
+    r"^[\s._\-\[\]()]*"
+    r"(?:ova|oav|oad|sp|special)s?"
+    r"[\s._\-]*0*\d{0,3}"
+    r"[\s._\-\[\]()]*$",
+    re.IGNORECASE,
+)
+
+
+def special_dominant_parent(path: str) -> bool:
+    """Whether any directory segment of ``path`` is special-marker-dominated."""
+    text = str(path or "")
+    if "/" not in text:
+        return False
+    return any(
+        _SPECIAL_DOMINANT_SEGMENT_RE.fullmatch(segment)
+        for segment in text.rsplit("/", 1)[0].split("/")
+        if segment
+    )
 # A bracketed ordinal is only useful as a single-season fallback when the
 # bracket itself contains digits and nothing else.  This intentionally does
 # not accept ``[01v2]``, ``[01-02]`` or ``[1080p]`` as an episode coordinate.
@@ -780,16 +805,31 @@ def bare_regular_episode_context_is_safe(value: Any) -> bool:
     The naked-E coordinate itself must be parsed from the media basename: a
     release-container directory such as ``E01-E06`` describes the collection,
     not each member.  Path context is still meaningful negative evidence,
-    though.  A parent season/qualified coordinate or special/OVA marker means
-    the file belongs to a stronger hierarchy and must not enter the strict
-    single-season naked-E proof.
+    though.  A special/OVA marker in the media basename or in a
+    special-dominant parent segment (``OAD/01.mkv``) means the file belongs
+    to a stronger hierarchy and must not enter the strict single-season
+    naked-E proof.  A marker that a titled release folder merely mentions
+    inside its packaging (``01 寒蝉鸣泣之时（2006）全26集+OVA 内嵌简中字
+    幕 1080P…``) is advertising text, not a hierarchy, and stays safe.
 
     Bare ranges and adjacent bare markers are intentionally *not* inspected
     here.  Those are basename-only coordinate checks in
     :func:`bare_regular_episode_number`.
     """
     text = str(value or "")
-    if not text or _BARE_REGULAR_EPISODE_SPECIAL_RE.search(text):
+    if not text:
+        return False
+    basename = re.split(r"[/\\]", text.rstrip("/"))[-1]
+    if _BARE_REGULAR_EPISODE_SPECIAL_RE.search(basename) or (
+        special_dominant_parent(text)
+        and _BARE_REGULAR_EPISODE_SPECIAL_RE.search(
+            "/".join(
+                segment
+                for segment in text.split("/")
+                if _SPECIAL_DOMINANT_SEGMENT_RE.fullmatch(segment)
+            )
+        )
+    ):
         return False
     # ``episode_ranges`` covers explicit SxxEyy/x-style/Chinese coordinates
     # in a parent directory, while ``season_markers`` also catches a plain
