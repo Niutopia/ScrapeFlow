@@ -649,6 +649,26 @@ _EPISODE_COUNTER_DIRECTORY_RE = re.compile(
     r"第\s*0*\d{1,4}\s*[话話回集]",
 )
 
+# A physical-volume directory label: the release calls each TMDB season one
+# named OVA/BD volume (``OVA 01（2021.8）…``, ``OVA 2nd Season``, ``VOL.2``).
+# Such a directory is a packaging layer of ONE work, never an independent
+# work child.  Keep this narrower than the planner's `_ova_volume_ordinal`:
+# only a leading marker+ordinal (or the 上/下卷 pair) is volume packaging.
+_OVA_VOLUME_DIRECTORY_LABEL_RE = re.compile(
+    r"(?:^|[\s._\-\[(（])"
+    r"(?:OVA|OAV|OAD|VOL(?:UME)?\.?|BD(?:-?BOX)?)"
+    r"[\s._-]*"
+    r"(?:"
+    r"0*\d{1,3}"
+    r"|[1-9]\d{0,2}(?:st|nd|rd|th)\s*(?:Season|Series)"
+    r"|2nd\s*Season"
+    r"|上卷|下卷|前篇|后篇"
+    r"|(?:19|20)\d{2}[\s._-]*[\[(]\s*0*\d{1,3}\s*[\])]"
+    r")"
+    r"(?=$|[\s._\-\])）.（(])",
+    re.IGNORECASE,
+)
+
 
 def _direct_movie_title_text(file_name: str) -> str | None:
     """Return the lexical title text of one flat video filename.
@@ -974,8 +994,17 @@ def _independently_shaped_work_child(node: SourceNode) -> bool:
     evidence the dated-feature splitter uses — dated or theatrical-form
     titled, no episode coordinates, feature-sized — so undated one-video
     folders and per-episode directories keep their fail-closed verdicts.
+
+    An OVA/physical-volume labelled child is never an independent work: a
+    release that ships one named volume per TMDB season (命运／冠位嘉年华's
+    ``OVA 01``/``OVA 02`` folders) is one work whose planner needs every
+    volume in scope to prove the volume↔season packing.  Splitting the
+    volumes into separate units starves that proof and fail-closes every
+    part.
     """
     videos = [f for f in collect_all_files(node) if f.object_type == "video"]
+    if _OVA_VOLUME_DIRECTORY_LABEL_RE.search(node.name):
+        return False
     if len(videos) >= 2:
         return True
     if len(videos) != 1 or videos[0].size < _MOVIE_MIN_BYTES:
