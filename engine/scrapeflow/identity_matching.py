@@ -2839,7 +2839,17 @@ def auto_match_from_evidence(
         # ordinary scoring/ambiguity gates still arbitrate the pool — the
         # parent never injects an identity.
         if not search_items:
-            for parent in evidence.parent_labels:
+            # ``parent_labels`` runs from the intake root to the unit's
+            # direct container because the combined-query slots ahead of this
+            # round want the franchise root first.  This fallback is the
+            # opposite task: recover a leaf whose own queries missed.  The
+            # nearest container is the specific work-group label
+            # (``魔法少女☆伊莉雅``); the intake root is the most generic
+            # franchise bundle (``Fate全系列`` -> ``Fate``), which floods the
+            # pool with every franchise sibling and lets a bare prefix
+            # confidently select the wrong sibling (``Fate`` -> Fate/Apocrypha
+            # for a Prisma☆Illya movie).  Escalate nearest-first.
+            for parent in reversed(evidence.parent_labels):
                 for p_variant in _parent_identity_query_variants(parent):
                     cleaned = _clean_boundary_identity_query(p_variant).strip()
                     if (

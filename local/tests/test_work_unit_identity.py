@@ -1644,6 +1644,81 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
             dispatched.index("Y 4k 元气少女缘结神"),
         )
 
+    def test_total_miss_escalation_starts_at_the_nearest_parent(self) -> None:
+        """A total-miss escalation must walk parents nearest-first.
+
+        ``parent_labels`` runs from the intake root to the unit's direct
+        container because the combined-query budget wants the franchise root
+        first.  The total-miss escalation fallback used to walk the same
+        order: the intake root (``Fate全系列 硬字幕+软字幕 4K+1080P`` ->
+        ``Fate``) is the most generic franchise bundle, so it flooded the
+        pool with every franchise sibling and a bare ``Fate`` prefix then
+        auto-confirmed Fate/Apocrypha for a Prisma☆Illya movie leaf whose
+        own queries all missed.  The escalation must start at the direct
+        container (``魔法少女☆伊莉雅``) and stop there, never reaching the
+        collapsed franchise word.
+        """
+
+        class ExactMatchClient(FakeTMDBClient):
+            """Only exact-key searches hit: no fuzzy containment."""
+
+            def get(self, path: str, **params: Any) -> dict[str, Any]:
+                self.call_log.append((path, params))
+                if path.startswith("/search/"):
+                    q = str(params.get("query", ""))
+                    return {"results": self.search_results.get(q, [])}
+                return super().get(path, **params)
+
+        client = ExactMatchClient(
+            search_results={
+                "Fate": [
+                    {
+                        "id": 72304,
+                        "name": "命运／外典",
+                        "original_name": "Fate/Apocrypha",
+                        "first_air_date": "2017-07-02",
+                        "genre_ids": [16],
+                    },
+                ],
+                "魔法少女☆伊莉雅": [
+                    {
+                        "id": 63576,
+                        "name": "魔法少女☆伊莉雅",
+                        "original_name": "Fate/kaleid liner Prisma☆Illya",
+                        "first_air_date": "2013-07-06",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-illya-movie-leaf",
+            boundary_label="05 剧场版：雪下的誓言（2017）内封&外挂简中字幕 4K",
+            parent_labels=(
+                "Fate全系列 硬字幕+软字幕 4K+1080P",
+                "其它",
+                "魔法少女☆伊莉雅 内封+外挂字幕 4K",
+            ),
+            representative_names=(),
+            normalized_titles=(),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(client, evidence)
+        self.assertEqual(best.tmdb_id, 63576)
+        self.assertEqual(best.status, "confirmed")
+        dispatched = [
+            str(params.get("query", ""))
+            for path, params in client.call_log
+            if path.startswith("/search/tv")
+        ]
+        self.assertIn("魔法少女☆伊莉雅", dispatched)
+        # The escalation stopped at the nearest container: the franchise
+        # root's collapsed single word was never dispatched.
+        self.assertNotIn("Fate", dispatched)
+
     def test_bonus_directory_unit_matches_via_parent_label(self) -> None:
         """A pure bonus-directory boundary is layout, like a bare season leaf.
 
