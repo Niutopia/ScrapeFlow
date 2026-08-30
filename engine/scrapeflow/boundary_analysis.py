@@ -39,6 +39,8 @@ from engine.scrapeflow.source_inventory import (
     has_only_subtitles,
 )
 from engine.scrapeflow.media_policy import DISC_IMAGE_INSPECTION_REQUIRED
+from engine.scrapeflow.replenishment_matching import audit_episode_tokens
+from engine.scrapeflow.residual_policy import _THEME_VIDEO_RE
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +71,19 @@ _ASCII_BARE_SEASON_DIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A season span declares a multi-season collection, not one season directory
+# (``魔法禁书目录 S01-S03合集``, ``S1-S4``, ``第1-3季``).  Matching the single
+# season marker inside a span made the whole intake look like Season 01 and
+# short-circuited every season-cohort split below.
+_SEASON_SPAN_LABEL_RE = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9])S\s*0*\d{1,3}\s*[-~至]\s*S?\s*0*\d{1,3}(?![A-Za-z0-9])"
+    r"|第\s*0*\d{1,3}\s*[-~至]\s*0*\d{1,3}\s*季"
+    r"|第\s*[一二三四五六七八九十百零〇两]{1,5}\s*[-~至]\s*[一二三四五六七八九十百零〇两]{1,5}\s*季"
+    r")",
+    re.IGNORECASE,
+)
+
 # A release folder can carry its season marker together with the show and
 # release name, for example ``Northwind.Show.S02.1080p``.  This is deliberately
 # stricter than a free substring search: an ASCII title glued to ``S01``
@@ -82,10 +97,31 @@ _DECORATED_SEASON_RE = re.compile(
         (?!\s*e\s*\d)(?![A-Za-z0-9])
       | 第\s*(\d{1,3}|[一二三四五六七八九十百零〇两]{1,5})\s*季
         (?!\s*(?:(?:s\s*0*\d{1,3}\s*)?e\s*0*\d{1,4}|第\s*0*\d{1,4}\s*[集话]))
+      | (?<![A-Za-z0-9])(?<!EP\s)(?<!Vol\s)(?<!Vol\.\s)
+        (II|III|IV|VI{1,3}|IX|XI{1,3}|XIV|XV|XVI{0,3}|XIX|XX)
+        (?![A-Za-z0-9])
+      | (?<=[㐀-鿿]\s)(I)(?![A-Za-z0-9])
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# The decorated Roman alternative above resolves through this table.  Bare
+# ``I`` is accepted only directly after a CJK title and a space (魔法禁书目录
+# I); bare ``V`` and ``X`` are deliberately absent: single Latin letters are
+# ordinary title letters far too often (``Gundam X``), while multi-letter
+# Roman numerals as standalone separator-bounded tokens are season markers
+# in the overwhelming majority of release names (``魔法禁书目录 II/III``,
+# ``Overlord IV``).  Downstream proofs still revalidate every claimed season.
+_ROMAN_SEASON_VALUES: dict[str, int] = {
+    "I": 1,
+    "II": 2, "III": 3, "IV": 4,
+    "VI": 6, "VII": 7, "VIII": 8,
+    "IX": 9,
+    "XI": 11, "XII": 12, "XIII": 13,
+    "XIV": 14, "XV": 15, "XVI": 16, "XVII": 17, "XVIII": 18,
+    "XIX": 19, "XX": 20,
+}
 _SEASON_EPISODE_RE = re.compile(
     r"(?:^|[^A-Za-z0-9])S\s*0*(\d{1,3})\s*E\s*0*(\d{1,4})(?:$|[^0-9])",
     re.IGNORECASE,
@@ -228,16 +264,20 @@ _CJK_SEASON_DIGITS = {
 
 
 def _parse_season_number(value: str) -> int | None:
-    """Parse one bounded Arabic or Chinese season ordinal.
+    """Parse one bounded Arabic, Chinese or Roman season ordinal.
 
     Chinese numerals are accepted only as a complete 1–99 cardinal token (for
-    example 一、十一、二十一).  Mixed/unknown characters fail closed rather
-    than being interpreted as a title or an approximate number.
+    example 一、十一、二十一).  Roman numerals arrive only from the decorated
+    season alternative's bounded vocabulary.  Mixed/unknown characters fail
+    closed rather than being interpreted as a title or an approximate number.
     """
     token = str(value or "").strip()
     if token.isdecimal():
         number = int(token)
         return number if number > 0 else None
+    roman = _ROMAN_SEASON_VALUES.get(token.upper())
+    if roman is not None:
+        return roman
     if not token or any(
         character not in _CJK_SEASON_DIGITS and character != "十"
         for character in token
@@ -273,9 +313,15 @@ def _season_number_from_directory_name(name: str) -> int | None:
 
     Bare season folders use the long-standing full-match pattern.  Decorated
     release folders use the bounded pattern above, but an episode filename or
-    an arbitrary ``MS01``-style token never qualifies.
+    an arbitrary ``MS01``-style token never qualifies.  A season *span* label
+    (``S01-S03合集``) declares several seasons at once — it is a collection
+    label, never one season directory, so it fails closed here and the
+    ordinary season-cohort/split rules below the single-season shortcut own
+    the layout.
     """
     stripped = name.strip()
+    if _SEASON_SPAN_LABEL_RE.search(stripped):
+        return None
     bare = _SEASON_DIR_RE.fullmatch(stripped)
     if bare is not None:
         value = next((part for part in bare.groups() if part is not None), None)
