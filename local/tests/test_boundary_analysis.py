@@ -1777,3 +1777,137 @@ class TestSyntheticCases(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CollectionSeriesGroupingTests(unittest.TestCase):
+    """Layout + artwork for the operator's 2026-08-30 series-grouping ruling."""
+
+    def test_collection_label_strips_series_suffix_and_keeps_safe_chars(self) -> None:
+        from engine.scrapeflow.media_naming import collection_directory_label
+
+        self.assertEqual(
+            collection_directory_label("命运之夜——天之杯（系列）"),
+            "命运之夜——天之杯",
+        )
+        self.assertEqual(collection_directory_label("空之境界（系列）"), "空之境界")
+        self.assertEqual(
+            collection_directory_label("命运／万华描绘者 魔法少女☆伊莉雅剧场版（系列）"),
+            "命运-万华描绘者 魔法少女☆伊莉雅剧场版",
+        )
+        self.assertIsNone(collection_directory_label("（系列）"))
+        self.assertIsNone(collection_directory_label(""))
+
+    def test_movie_plan_carries_collection_artwork_when_parent_is_collection_dir(self) -> None:
+        """A movie inside its own collection directory paints that directory.
+
+        ``build_movie_plan`` receives the layout-decided parent path; when
+        that directory is named after the movie's TMDB collection, the plan
+        carries the collection root and official artwork paths so the single
+        writer uploads poster/folder/fanart for the sub-series directory —
+        idempotently across the collection's members.
+        """
+        import engine.scraper  # binds the planner runtime
+        from engine.scrapeflow.planning.movie import build_movie_plan
+
+        class CollectionAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class CollectionTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/movie/283984":
+                    return {
+                        "title": "命运之夜——天之杯Ⅰ-恶兆之花",
+                        "release_date": "2017-10-14",
+                        "poster_path": "/movie-poster.jpg",
+                        "backdrop_path": "/movie-backdrop.jpg",
+                        "belongs_to_collection": {
+                            "id": 390636,
+                            "name": "命运之夜——天之杯（系列）",
+                            "poster_path": "/collection-poster.jpg",
+                            "backdrop_path": "/collection-backdrop.jpg",
+                        },
+                    }
+                raise AssertionError(path)
+
+        plan = build_movie_plan(
+            CollectionAList(),
+            CollectionTMDB(),
+            src_path="/incoming/天之杯Ⅰ",
+            parent_path="/library/Fate/命运之夜——天之杯",
+            tmdb_id=283984,
+            source_files=[
+                {
+                    "name": "Sakura no Uta.mkv",
+                    "full_path": "/incoming/天之杯Ⅰ/Sakura no Uta.mkv",
+                    "size": 20_000_000_000,
+                    "is_dir": False,
+                }
+            ],
+            defer_validation=True,
+        )
+        self.assertEqual(
+            plan.metadata.get("collection_root"),
+            "/library/Fate/命运之夜——天之杯",
+        )
+        self.assertEqual(
+            plan.metadata.get("collection_poster_path"),
+            "/collection-poster.jpg",
+        )
+        from engine.scraper import planned_artwork
+
+        artwork = planned_artwork(plan)
+        targets = {target for target, _image, _role in artwork}
+        self.assertIn("/library/Fate/命运之夜——天之杯/poster.jpg", targets)
+        self.assertIn("/library/Fate/命运之夜——天之杯/folder.jpg", targets)
+        self.assertIn("/library/Fate/命运之夜——天之杯/fanart.jpg", targets)
+
+    def test_movie_plan_outside_collection_dir_has_no_collection_metadata(self) -> None:
+        """A flat movie keeps its ordinary layout: no phantom parent artwork."""
+        import engine.scraper  # binds the planner runtime
+        from engine.scrapeflow.planning.movie import build_movie_plan
+
+        class FlatAList:
+            def try_list(self, _path: str, refresh: bool = True) -> list[dict[str, object]]:
+                del refresh
+                return []
+
+            def walk(self, _path: str, **_kwargs: object) -> list[dict[str, object]]:
+                return []
+
+        class FlatTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/movie/900497":
+                    return {
+                        "title": "命运-冠位指定 -月光-失落之室-",
+                        "release_date": "2017-12-31",
+                        "poster_path": "/movie-poster.jpg",
+                        "belongs_to_collection": {
+                            "id": 390636,
+                            "name": "命运之夜——天之杯（系列）",
+                            "poster_path": "/collection-poster.jpg",
+                        },
+                    }
+                raise AssertionError(path)
+
+        plan = build_movie_plan(
+            FlatAList(),
+            FlatTMDB(),
+            src_path="/incoming/月光",
+            parent_path="/library/Fate",
+            tmdb_id=900497,
+            source_files=[
+                {
+                    "name": "Moonlight.mp4",
+                    "full_path": "/incoming/月光/Moonlight.mp4",
+                    "size": 20_000_000_000,
+                    "is_dir": False,
+                }
+            ],
+            defer_validation=True,
+        )
+        self.assertIsNone(plan.metadata.get("collection_root"))

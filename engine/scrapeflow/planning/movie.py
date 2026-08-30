@@ -6,6 +6,7 @@ can be tested independently while preserving deterministic plan output.
 
 from __future__ import annotations
 
+import posixpath
 from collections import defaultdict
 from pathlib import Path
 from types import ModuleType
@@ -384,6 +385,30 @@ def build_movie_plan(
             f"已按 part1-part{candidate_part_numbers[-1]} 命名"
         )
 
+    # Sub-series grouping (operator ruling 2026-08-30): when the layout put
+    # this movie inside a directory named after its own TMDB collection, the
+    # collection directory is a visible shelf item and carries the official
+    # collection artwork.  The metadata is idempotent across the collection's
+    # members — the writer's preserve-or-upload keeps an already-present
+    # poster authoritative — so any member can supply it.
+    collection = movie.get("belongs_to_collection") or {}
+    collection_metadata: dict[str, Any] = {}
+    if isinstance(collection, Mapping):
+        from ..media_naming import collection_directory_label
+
+        collection_label = collection_directory_label(
+            str(collection.get("name") or "")
+        )
+        parent_label = posixpath.basename(
+            str(parent_path).rstrip("/")
+        )
+        if collection_label and collection_label == parent_label:
+            collection_metadata = {
+                "collection_root": str(parent_path).rstrip("/"),
+                "collection_poster_path": collection.get("poster_path"),
+                "collection_backdrop_path": collection.get("backdrop_path"),
+            }
+
     plan = Plan(
         mode="movie",
         source_root=normalize_remote_path(src_path),
@@ -396,6 +421,7 @@ def build_movie_plan(
             "year": year,
             "poster_path": movie.get("poster_path"),
             "backdrop_path": movie.get("backdrop_path"),
+            **collection_metadata,
         },
         cleanup_files=cleanup_files,
         problem_files=[

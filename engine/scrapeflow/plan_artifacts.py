@@ -90,6 +90,25 @@ def _planned_artwork_impl(
             requests.append(
                 (join_remote_fn(container_root, "fanart.jpg"), container_backdrop, "container-fanart")
             )
+    # A sub-series collection directory (operator ruling 2026-08-30: series
+    # movies always nest in a named collection directory that carries the
+    # official collection artwork).  Same shape as the container block: the
+    # paths arrive already-approved from the accepted plan metadata.
+    collection_root = metadata.get("collection_root")
+    if isinstance(collection_root, str) and collection_root:
+        collection_poster = metadata.get("collection_poster_path")
+        collection_backdrop = metadata.get("collection_backdrop_path")
+        if isinstance(collection_poster, str) and collection_poster:
+            requests.extend(
+                [
+                    (join_remote_fn(collection_root, "folder.jpg"), collection_poster, "collection-folder"),
+                    (join_remote_fn(collection_root, "poster.jpg"), collection_poster, "collection-poster"),
+                ]
+            )
+        if isinstance(collection_backdrop, str) and collection_backdrop:
+            requests.append(
+                (join_remote_fn(collection_root, "fanart.jpg"), collection_backdrop, "collection-fanart")
+            )
     primary_root = (
         str(plan.metadata.get("series_root"))
         if plan.mode == "mixed" and plan.metadata.get("series_root")

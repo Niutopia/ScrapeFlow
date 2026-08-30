@@ -1158,6 +1158,57 @@ def _container_layout_targets(
             tmdb_id = identity.get("tmdb_id")
             by_tmdb.setdefault(tmdb_id, record)
 
+    # Sub-series grouping (operator ruling 2026-08-30: series movies nest in
+    # a named collection directory, always, and the directory carries the
+    # official collection poster).  Inside a pure franchise container, movie
+    # units whose TMDB identity belongs to one collection with at least two
+    # members present nest under a directory named after the collection, so
+    # a trilogy like 命运之夜——天之杯 or a ten-film 空之境界 run stays one
+    # visible series instead of N loose siblings.  A name collision with a
+    # regular work child keeps the movies flat (fail closed).
+    collection_parent_by_unit: dict[str, tuple[str, int, str]] = {}
+    if container_parent is not None:
+        collection_members: dict[int, list[WorkUnitRecord]] = {}
+        collection_names: dict[int, str] = {}
+        for record in records:
+            identity = record.identity if isinstance(record.identity, Mapping) else {}
+            if str(identity.get("media_type") or "") != "movie":
+                continue
+            tmdb_id = identity.get("tmdb_id")
+            if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool):
+                continue
+            try:
+                detail = runner.tmdb.get(f"/movie/{tmdb_id}")
+            except Exception:
+                continue
+            collection = (
+                detail.get("belongs_to_collection")
+                if isinstance(detail, Mapping)
+                else None
+            ) or {}
+            collection_id = collection.get("id")
+            collection_name = str(collection.get("name") or "").strip()
+            if not isinstance(collection_id, int) or not collection_name:
+                continue
+            collection_members.setdefault(collection_id, []).append(record)
+            collection_names.setdefault(collection_id, collection_name)
+        work_child_names = {
+            posixpath.basename(_canonical_target_child(container_parent, record))
+            for record in records
+            if str((record.identity or {}).get("media_type") or "") == "tv"
+        }
+        for collection_id, members in collection_members.items():
+            if len(members) < 2:
+                continue
+            label = _collection_directory_label(collection_names[collection_id])
+            if not label or label in work_child_names:
+                continue
+            collection_dir = posixpath.join(container_parent, label)
+            for member in members:
+                collection_parent_by_unit[member.work_unit_id] = (
+                    collection_dir, collection_id, label,
+                )
+
     targets: dict[str, dict[str, object]] = {}
     for record in records:
         identity = record.identity if isinstance(record.identity, Mapping) else {}
@@ -1171,6 +1222,9 @@ def _container_layout_targets(
         expected_root: str | None = None
         if container_parent is not None:
             parent_path = container_parent
+            collection_target = collection_parent_by_unit.get(record.work_unit_id)
+            if collection_target is not None:
+                parent_path = collection_target[0]
             if _is_physical_special_record(record) and len(by_tmdb) > 0:
                 parent, _ambiguous = _special_parent_record(record, records)
                 if parent is not None:
@@ -1206,6 +1260,7 @@ def _container_layout_targets(
                 if parent_path is not None
                 else None
             )
+        collection_target = collection_parent_by_unit.get(record.work_unit_id)
         targets[record.work_unit_id] = {
             "parent_path": parent_path,
             "target_root": expected_root,
@@ -1213,6 +1268,14 @@ def _container_layout_targets(
             "parent_work_unit_id": parent_unit_id,
             "parent_tmdb_id": parent_tmdb_id,
             "uncertain": uncertain,
+            **(
+                {
+                    "collection_id": collection_target[1],
+                    "collection_name": collection_target[2],
+                }
+                if collection_target is not None
+                else {}
+            ),
         }
     # Preserve deterministic insertion order for callers that iterate the map.
     return {record.work_unit_id: targets[record.work_unit_id] for record in ordered if record.work_unit_id in targets}
@@ -1358,6 +1421,13 @@ def _main_tv_identity(records: Sequence[WorkUnitRecord]) -> int | None:
     if main is None:
         return None
     return int((main.identity or {})["tmdb_id"])
+
+
+def _collection_directory_label(name: str) -> str | None:
+    """Delegate to the engine's shared collection-label policy."""
+    from engine.scrapeflow.media_naming import collection_directory_label
+
+    return collection_directory_label(name)
 
 
 def _container_plan(

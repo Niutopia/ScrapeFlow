@@ -38,6 +38,25 @@ BONUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("scene", re.compile(r"(?:^|[ ._\-])scene(?:$|[ ._\-])|片段", re.IGNORECASE)),
     ("short", re.compile(r"(?:^|[ ._\-])short(?:$|[ ._\-])|短片", re.IGNORECASE)),
 )
+_COLLECTION_SERIES_SUFFIX_RE = re.compile(r"[（(]\s*系列\s*[)）]\s*$")
+
+
+def collection_directory_label(name: str) -> str | None:
+    """One TMDB collection name as a bounded sub-series directory label.
+
+    The trailing ``（系列）`` marker is catalogue grammar, not the label the
+    operator wants on the shelf; drop it, then keep only provider-safe
+    characters so ``命运／万华描绘者`` becomes a legal single directory name.
+    """
+    from .remote_paths import provider_safe_basename
+
+    label = _COLLECTION_SERIES_SUFFIX_RE.sub("", str(name or "").strip()).strip()
+    if not label:
+        return None
+    cleaned = provider_safe_basename(label)
+    return cleaned or None
+
+
 PLANNED_BONUS_SUFFIX_RE = re.compile(
     rf"-(?:{'|'.join(re.escape(label) for label, _ in BONUS_PATTERNS)})(?:\d+)?$",
     re.IGNORECASE,
