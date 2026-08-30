@@ -534,6 +534,20 @@ class TestIdentityEvidence(unittest.TestCase):
         self.assertFalse(evidence.naked_numeric_cjk_release_eligible)
         self.assertEqual(evidence.naked_numeric_owned_season_years, ())
 
+    def test_boundary_clean_query_strips_trailing_collection_word(self) -> None:
+        """``暗杀教室 全系列`` queries the bare franchise title.
+
+        A trailing 全系列/全季/合集 is packaging vocabulary (the boundary
+        lexicon already treats it as noise); the user-owned container names
+        the franchise and TMDB must receive the bare title, otherwise a
+        bare-ordinal season release (``01 第1季（2015）全22集 …`` whose own
+        label cleans to nothing) has no working query at all.
+        """
+        self.assertEqual(
+            _clean_boundary_identity_query("暗杀教室 全系列"), "暗杀教室"
+        )
+        self.assertEqual(_clean_boundary_identity_query("暗杀教室"), "暗杀教室")
+
     def test_boundary_clean_query_keeps_raw_label_and_only_strips_release_tails(self) -> None:
         raw = "B 有意义中文剧名（2024）全12集 1080P"
         self.assertEqual(

@@ -503,6 +503,10 @@ def _clean_boundary_identity_query(value: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"(?:全|共)\s*\d{1,4}\s*(?:集|话|話|期)", " ", text)
+    # A trailing collection word (``暗杀教室 全系列``) is packaging vocabulary
+    # the boundary lexicon already treats as noise: the user-owned container
+    # names the franchise, and TMDB must receive the bare title.
+    text = re.sub(r"\s*(?:全系列|全季|合集)\s*$", " ", text)
     text = re.sub(r"\+\s*(?:OVA|OAV|OAD|SP)(?:\s*\+)?", " ", text, flags=re.IGNORECASE)
     # A language label can also be a reversed or multi-script track list
     # (``日中双语``/``日英台三语``) — track metadata, not title words.  The
