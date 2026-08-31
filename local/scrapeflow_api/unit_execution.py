@@ -1345,7 +1345,7 @@ def _record_is_single_video_scope(record: WorkUnitRecord) -> bool:
     paths = tuple(record.source_paths or ())
     if len(paths) != 1:
         return False
-    from engine.scrapeflow.source_inventory import is_video_filename
+    from engine.scrapeflow.media_policy import is_video_filename
 
     return is_video_filename(posixpath.basename(paths[0].rstrip("/")))
 
