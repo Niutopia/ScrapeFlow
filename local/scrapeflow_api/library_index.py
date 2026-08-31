@@ -23,6 +23,7 @@ from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,
     _season_number_from_directory_name,
 )
+from engine.scrapeflow.core import extract_episode_key
 from engine.scrapeflow.core import (
     _pending_special_release_ordinal,
     _special_arc_title_key,
@@ -1266,6 +1267,10 @@ def _residual_only_reconciliation(
     media_type: str,
     tmdb_id: int,
     known_gap_tokens: frozenset[str],
+    alist: object = None,
+    tmdb_client: object = None,
+    media_root: str = "",
+    record: WorkUnitRecord | None = None,
 ) -> ReconciliationDecision | None:
     """Classify an extras-only confirmed TV unit whose work already exists.
 
@@ -1295,6 +1300,36 @@ def _residual_only_reconciliation(
         return None
     if not index.entries_for(media_type, tmdb_id):
         return None
+    # A numbered special run inside a bonus directory (よくわかる魔法科！
+    # 第01話..第07話 under ``SP/``) is story media with real catalog slots
+    # (S00E01..E07), not residual junk.  The bonus-directory context made
+    # every resident "never-written residual", and a duplicate_complete
+    # verdict then deleted genuinely unwritten media.  Consuming a
+    # residual-only source is safe only when NO video carries a numbered
+    # episode coordinate the official Season 00 catalog can host: the
+    # planner's special dry-run proves exactly that, so require it to map
+    # nothing before declaring the source a pure duplicate.
+    special_run_tokens = _planned_special_tokens(
+        alist,
+        node,
+        tmdb_client,
+        tmdb_id=tmdb_id,
+        media_root=f"{str(media_root).rstrip('/')}" if media_root else "/",
+        record=record,
+    )
+    if special_run_tokens:
+        return None
+    # The dry run is evidence, not a guarantee: a mapper miss would leave
+    # the tokens empty while the videos still hold real ordinals.  Any
+    # regular episode coordinate on a supposed residual (``第01話``, a bare
+    # ``01`` stem, an ``E01`` marker) means story-shaped media — fail
+    # closed to uncertain and let the operator decide, never consume.
+    for file in videos:
+        key = extract_episode_key(str(file.name))
+        if key is not None and key.kind == "regular":
+            return None
+        if _strict_bare_episode_number_for_file(file) is not None:
+            return None
     owned_gap_tokens = _owned_season_catalog_gap_tokens(
         episode_catalog,
         index,
@@ -4180,6 +4215,10 @@ def reconcile_root_work_units(
                             str(token)
                             for token in known.get((media_type, tmdb_id), ())
                         ),
+                        alist=alist,
+                        tmdb_client=tmdb_client,
+                        media_root=media_root,
+                        record=record,
                     )
                 if decision is None:
                     # A season-scoped same-marker OVA run carries no episode
