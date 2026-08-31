@@ -844,11 +844,22 @@ class AListClient:
 
     def mkdir(self, path: str) -> None:
         normalized = normalize_remote_path(path)
+        # The visibility probe must never let a transient listing failure
+        # escape this recovery path: ``try_list`` re-raises provider errors
+        # that are not missing-markers (quark's ``file is doloading`` while
+        # the directory is still syncing), and a raise from inside the
+        # ``except`` handler below would bypass the bounded retry entirely.
+        def _probe_visible() -> bool | None:
+            try:
+                return self.try_list(normalized, refresh=True) is not None
+            except ApiError:
+                return None
+
         try:
             self.call("mkdir", {"path": normalized})
         except ApiError as original_exc:
             # 部分 AList 存储对已存在目录返回错误。只有目录确实可列出时才视为成功。
-            if self.try_list(normalized, refresh=True) is not None:
+            if _probe_visible():
                 return
             # Quark may return the misleading logical error ``illegal text``
             # after a burst of otherwise valid directory creations, and the
@@ -871,7 +882,7 @@ class AListClient:
                     self.call("mkdir", {"path": normalized})
                     return
                 except ApiError as retry_exc:
-                    if self.try_list(normalized, refresh=True) is not None:
+                    if _probe_visible():
                         return
                     original_exc = retry_exc
                     if not _transient(retry_exc):
