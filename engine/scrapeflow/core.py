@@ -851,11 +851,19 @@ class AListClient:
             if self.try_list(normalized, refresh=True) is not None:
                 return
             # Quark may return the misleading logical error ``illegal text``
-            # after a burst of otherwise valid directory creations.  Retry
-            # only that proven transient response, reconciling visibility on
-            # every attempt; genuinely invalid names still fail closed after
-            # the bounded cooldown.
-            if "illegal text" not in str(original_exc).casefold():
+            # after a burst of otherwise valid directory creations, and the
+            # equally transient ``file is doloading[同名冲突]`` while a
+            # freshly created directory is still syncing.  Retry only those
+            # two proven transients, reconciling visibility on every
+            # attempt; genuinely invalid names still fail closed after the
+            # bounded cooldown.
+            def _transient(exc: ApiError) -> bool:
+                text = str(exc).casefold()
+                return "illegal text" in text or (
+                    "doloading" in text and "同名冲突" in str(exc)
+                )
+
+            if not _transient(original_exc):
                 raise
             for attempt in range(6):
                 time.sleep(min(1.5 * (2**attempt), 12.0))
@@ -866,7 +874,7 @@ class AListClient:
                     if self.try_list(normalized, refresh=True) is not None:
                         return
                     original_exc = retry_exc
-                    if "illegal text" not in str(retry_exc).casefold():
+                    if not _transient(retry_exc):
                         raise
             raise original_exc
 
