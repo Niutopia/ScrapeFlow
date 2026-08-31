@@ -4111,26 +4111,45 @@ def reconcile_root_work_units(
                         evidence_label = single_season_episode_evidence_label(
                             evidence_kind
                         )
-                        decision = (
-                            _resumable_consumed_source_decision(
-                                alist,
-                                snapshot,
-                                state_root,
-                                root_task_id,
-                                record,
-                                index,
-                                media_type=media_type,
-                                tmdb_id=tmdb_id,
-                                label=f"{evidence_label}证据",
-                            )
-                            or ReconciliationDecision(
-                                "uncertain", None, None,
-                                (
-                                    f"TV {evidence_label}未能证明为完整唯一的 "
-                                    "TMDB 正季；不能安全判定重复",
-                                ),
-                            )
+                        # A bare-ordinal run that fails the regular-season
+                        # proof may still be a named OVA arc window (寒蝉
+                        # 鸣泣之时·礼: bare 01..05 = S00E02..06 of the
+                        # parent show).  The planner's special mappers can
+                        # prove those coordinates; their tokens then flow
+                        # through the ordinary token path below exactly as
+                        # the E lane will later write them.
+                        special_run_tokens = _planned_special_tokens(
+                            alist,
+                            scoped_node,
+                            tmdb_client,
+                            tmdb_id=tmdb_id,
+                            media_root=media_root,
+                            record=record,
                         )
+                        if special_run_tokens:
+                            unit_tokens = special_run_tokens
+                            decision = None
+                        else:
+                            decision = (
+                                _resumable_consumed_source_decision(
+                                    alist,
+                                    snapshot,
+                                    state_root,
+                                    root_task_id,
+                                    record,
+                                    index,
+                                    media_type=media_type,
+                                    tmdb_id=tmdb_id,
+                                    label=f"{evidence_label}证据",
+                                )
+                                or ReconciliationDecision(
+                                    "uncertain", None, None,
+                                    (
+                                        f"TV {evidence_label}未能证明为完整唯一的 "
+                                        "TMDB 正季；不能安全判定重复",
+                                    ),
+                                )
+                            )
                     else:
                         unit_tokens = frozenset(season_proof.episode_tokens)
                         decision = None

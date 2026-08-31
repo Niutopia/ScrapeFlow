@@ -1334,6 +1334,22 @@ _NON_MAIN_TV_ROLES = frozenset({
 })
 
 
+def _record_is_single_video_scope(record: WorkUnitRecord) -> bool:
+    """Whether a unit's whole source scope is exactly one video file.
+
+    Used only as the special-pending signal in the main-TV season-split
+    check: a single-video unit without season facts claims no season scope
+    at all (a special awaiting its lane), so it cannot contest the seasons
+    its sibling season units proved.
+    """
+    paths = tuple(record.source_paths or ())
+    if len(paths) != 1:
+        return False
+    from engine.scrapeflow.source_inventory import is_video_filename
+
+    return is_video_filename(posixpath.basename(paths[0].rstrip("/")))
+
+
 def _eligible_main_tv_record(record: WorkUnitRecord) -> bool:
     """Whether a persisted unit may provide main-TV hierarchy evidence."""
     identity = record.identity if isinstance(record.identity, Mapping) else {}
@@ -1403,16 +1419,29 @@ def _main_tv_record(records: Sequence[WorkUnitRecord]) -> WorkUnitRecord | None:
         # Split season records are safe only when B/W gave every physical
         # record a non-empty, disjoint positive-season scope.  Empty/stale
         # siblings (including historical version backups) remain ambiguous.
+        # A single-video record with no season facts claims no season at
+        # all — it is a special-pending unit (High School DxD Hero 00)
+        # owned by the nested-special lane, not a contested season scope.
         seen_seasons: set[int] = set()
         for item in items:
             seasons = _record_proved_positive_seasons(item)
-            if not seasons or seen_seasons.intersection(seasons):
+            if not seasons:
+                if _record_is_single_video_scope(item):
+                    continue
+                return None
+            if seen_seasons.intersection(seasons):
                 return None
             seen_seasons.update(seasons)
 
     # A second row carrying the same identity but excluded above (for example
-    # VERSION_GROUP, OVA, or stale uncertain state) is an ownership collision,
-    # not evidence that may be silently folded into the regular unit.
+    # VERSION_GROUP or a stale uncertain state) is an ownership collision,
+    # not evidence that may be silently folded into the regular unit.  A
+    # same-identity physical special (OVA/OAD/SP of this very show — same
+    # TMDB id) is NOT a collision: it is the work's own special, the
+    # nested-special lane owns it, and treating it as contested ownership
+    # demoted the whole single-work root to a named container wrapper
+    # (恶魔高校D×D nested under the intake container beside its own
+    # specials).
     for tmdb_id in by_tmdb:
         same_identity = [
             record
@@ -1423,9 +1452,14 @@ def _main_tv_record(records: Sequence[WorkUnitRecord]) -> WorkUnitRecord | None:
                 and record.identity.get("tmdb_id") == tmdb_id
             )
         ]
+        colliding = [
+            record
+            for record in same_identity
+            if not _is_physical_special_record(record)
+        ]
         if (
-            len(same_identity) != len(by_tmdb[tmdb_id])
-            or any(not _eligible_main_tv_record(item) for item in same_identity)
+            len(colliding) != len(by_tmdb[tmdb_id])
+            or any(not _eligible_main_tv_record(item) for item in colliding)
         ):
             return None
 
@@ -3914,7 +3948,7 @@ def execute_new_work_units(
                         )
                     if (
                         str(identity.get("media_type") or "") == "tv"
-                        and layout.get("relation") != "nested_special"
+                        and layout.get("relation") not in {"nested_special", "nested_under_main"}
                         and isinstance(identity.get("tmdb_id"), int)
                         and not isinstance(identity.get("tmdb_id"), bool)
                     ):
@@ -3970,7 +4004,7 @@ def execute_new_work_units(
                     )
                 if (
                     str(identity.get("media_type") or "") == "tv"
-                    and layout.get("relation") != "nested_special"
+                    and layout.get("relation") not in {"nested_special", "nested_under_main"}
                     and isinstance(identity.get("tmdb_id"), int)
                     and not isinstance(identity.get("tmdb_id"), bool)
                 ):
@@ -3994,7 +4028,11 @@ def execute_new_work_units(
         planned: EngineJob | None = None
         main_failed = False
         try:
-            if is_main_tv:
+            if is_main_tv and layout.get("relation") != "nested_under_main":
+                # A same-identity physical special shares the main's TMDB id,
+                # so the identity test above is true for it too — its layout
+                # relation distinguishes it, and it must take the nested
+                # path below instead of planning its own root at the shelf.
                 parent_override = None
             elif layout.get("relation") == "nested_special":
                 parent_tmdb = layout.get("parent_tmdb_id")
@@ -4008,6 +4046,17 @@ def execute_new_work_units(
                 )
                 if parent_override is None:
                     raise ValueError("特别篇父剧尚未完成安全目标根证明")
+            elif layout.get("relation") == "nested_under_main":
+                # The main unit's freshly executed target root is the family
+                # anchor: prefer the identity-keyed map (registered by every
+                # executed TV unit), then the validated main root.
+                parent_override = (
+                    executed_tv_roots.get(main_tmdb)
+                    if isinstance(main_tmdb, int)
+                    else None
+                ) or main_target_root
+                if parent_override is None:
+                    raise ValueError("主剧尚未完成安全目标根证明")
             elif layout.get("parent_path"):
                 # The layout's family decision (sub-series directory,
                 # collection directory, or container root) is the planner's
@@ -4063,7 +4112,7 @@ def execute_new_work_units(
                 )
             if (
                 str(identity.get("media_type") or "") == "tv"
-                and layout.get("relation") != "nested_special"
+                and layout.get("relation") not in {"nested_special", "nested_under_main"}
                 and isinstance(identity.get("tmdb_id"), int)
                 and not isinstance(identity.get("tmdb_id"), bool)
             ):

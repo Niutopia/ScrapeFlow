@@ -699,6 +699,9 @@ class ContainerNestingTests(unittest.TestCase):
             "/incoming/Same Family/Main/S01E01.mkv": FAKE_VIDEO_BYTES,
             "/incoming/Same Family/Main OVA/S01E01.mkv": FAKE_VIDEO_BYTES,
             "/incoming/Same Family/Main SP/S01E01.mkv": FAKE_VIDEO_BYTES,
+            # The main unit's planned work root must exist on the remote
+            # before the nested specials can anchor to it.
+            "/library/番剧/Work (500)/tvshow.nfo": b"<tvshow/>",
         }
         state_root, alist, runner, events = self._setup(files)
         root_id = self._root(runner, "/incoming/Same Family")
@@ -730,27 +733,31 @@ class ContainerNestingTests(unittest.TestCase):
 
         layout = _container_layout_targets(runner, runner.get_job(root_id), current)
         main = self._record_for_source_leaf(current, "Main")
-        self.assertEqual(layout[main.work_unit_id]["relation"], "direct_tv")
+        # The same-identity specials are the main work's own nested specials,
+        # not contested ownership: the main TV owns the container root (the
+        # 刀剑神域 single-work shape), so a same-identity OVA beside its
+        # regular season never demotes the root to a container wrapper.
+        self.assertEqual(layout[main.work_unit_id]["relation"], "main_tv")
         for leaf in ("Main OVA", "Main SP"):
             special = self._record_for_source_leaf(current, leaf)
             self.assertEqual(
-                layout[special.work_unit_id]["relation"], "nested_special",
+                layout[special.work_unit_id]["relation"], "nested_under_main",
             )
-            self.assertEqual(layout[special.work_unit_id]["parent_tmdb_id"], 500)
+            # The parent resolves at execution time from the main unit's
+            # executed target root; the events below prove both specials
+            # land inside the same family root as the main unit.
 
         execute_new_work_units(runner, state_root, root_id)
 
         self.assertEqual(len(events), 3)
-        family_root = "/library/番剧/Same Family/Work (500)"
+        family_root = "/library/番剧/Work (500)"
         for event in events:
-            self.assertIn(event["parent_path"], {"/library/番剧/Same Family", family_root})
+            self.assertIn(event["parent_path"], {"/library/番剧", family_root})
         special_events = [
             event for event in events
-            if event["parent_path"] != "/library/番剧/Same Family"
+            if event["parent_path"] == family_root
         ]
         self.assertEqual(len(special_events), 2)
-        for event in special_events:
-            self.assertEqual(event["parent_path"], family_root)
 
     def test_fate_sub_series_prefix_grouping_tree(self) -> None:
         """The operator-confirmed 2026-08-30 franchise sub-series tree.
