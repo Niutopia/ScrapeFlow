@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2275,6 +2276,51 @@ class LibraryIndexTests(unittest.TestCase):
                 record.reconciliation_evidence and record.reconciliation_evidence["season"],
                 1,
             )
+
+    def test_alternate_cut_scope_shares_its_base_season_in_the_linkage(self) -> None:
+        """A re-edit scope must not break the season-to-directory linkage.
+
+        The coalesced `Re：從零開始的異世界生活` unit owns five scopes for four
+        seasons — 第一季 plus its 新编集版.  Counting the cut positionally made
+        `_declared_empty_seasons` return `None` and parked the whole broadcast
+        run as "声明季与来源目录无法一一核对".
+        """
+        from engine.scrapeflow.source_inventory import SourceFile, SourceNode
+        from engine.scrapeflow.work_units import WorkUnitRecord
+        from local.scrapeflow_api.library_index import _declared_empty_seasons
+
+        root = "/incoming/Re Zero"
+        labels = ["第一季", "第一季 新编集版", "第二季", "第三季"]
+        nodes = {}
+        for label in labels:
+            path = f"{root}/{label}"
+            nodes[path] = SourceNode(
+                path=path, name=label, depth=1, children=(),
+                files=tuple(
+                    SourceFile(path=f"{path}/[X] Re Zero [{n:02d}].mkv",
+                               name=f"[X] Re Zero [{n:02d}].mkv",
+                               size=2_000_000_000, object_type="video", modified="")
+                    for n in (1, 2)
+                ),
+            )
+        record = WorkUnitRecord(
+            work_unit_id="unit-rz", root_task_id="root",
+            boundary_key=f"{root}/@season-root",
+            source_paths=tuple(f"{root}/{label}" for label in labels),
+            source_revision=1, role="single_work", media_context="tv",
+            claimed_seasons=(1, 2, 3),
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 65942},
+        )
+        self.assertEqual(_declared_empty_seasons(record, nodes), ())
+
+        # 剪辑对应的基准季不在本单元时 fail-closed
+        orphan = replace(
+            record,
+            source_paths=(f"{root}/第一季 新编集版", f"{root}/第二季", f"{root}/第三季"),
+            claimed_seasons=(2, 3),
+        )
+        self.assertIsNone(_declared_empty_seasons(orphan, nodes))
 
     def test_arc_release_maps_onto_a_unique_contiguous_season_window(self) -> None:
         """A cumulative arc counter may span seasons other than S01 onward.

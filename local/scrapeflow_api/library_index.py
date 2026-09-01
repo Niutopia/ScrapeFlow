@@ -24,6 +24,7 @@ from engine.scrapeflow.boundary_analysis import (
     _season_number_from_directory_name,
 )
 from engine.scrapeflow.core import extract_episode_key
+from engine.scrapeflow.media_naming import edition_tag
 from engine.scrapeflow.core import (
     _pending_special_release_ordinal,
     _special_arc_title_key,
@@ -1137,13 +1138,24 @@ def _declared_empty_seasons(
         return _declared_empty_seasons_in_root_scope(root, claimed)
 
     season_scopes: dict[int, str] = {}
+    edition_scopes: dict[int, list[str]] = {}
     for source_path in record.source_paths:
         season = _scope_season_number(source_path)
         if season is None:
             continue
+        if edition_tag(posixpath.basename(source_path.rstrip("/"))) is not None:
+            # An alternate cut (``第一季 新编集版``) is a second physical scope for
+            # a season the unit already owns, not a competing season assertion.
+            # Counting it positionally made the linkage fail and parked a whole
+            # broadcast run as "声明季与来源目录无法一一核对".
+            edition_scopes.setdefault(season, []).append(source_path)
+            continue
         if season in season_scopes:
             return None
         season_scopes[season] = source_path
+    if any(season not in season_scopes for season in edition_scopes):
+        # A cut of a season this unit does not otherwise own proves nothing.
+        return None
     if tuple(sorted(season_scopes)) != claimed:
         return None
     empty: list[int] = []
