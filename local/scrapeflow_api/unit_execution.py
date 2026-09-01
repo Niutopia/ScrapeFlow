@@ -2576,6 +2576,14 @@ def _bracketed_episode_map_path(
     # non-interleaved per-season blocks of consecutive ascending episodes
     # over the proved seasons; any other shape fails closed instead of
     # guessing a split.
+    # A cumulative arc run spans the seasons D proved, not only ``proof.season``:
+    # ``爱丽丝篇`` is S03E01…E24 followed by S04E01…E23.  The boundaries are the
+    # proof's own output, so admitting them here adds no new inference — without
+    # them the S04 block failed closed and the merge lane raised
+    # "D 纯方括号集号证据无法重建 F 显式映射".
+    allowed_seasons = {proof.season, 0} | {
+        season for season, _count in (proof.season_boundaries or ())
+    }
     block_seasons: list[int] = []
     block_episodes: list[list[int]] = []
     for token in proof_tokens:
@@ -2584,7 +2592,7 @@ def _bracketed_episode_map_path(
             return None
         token_season = int(match.group(1))
         token_episode = int(match.group(2))
-        if token_season not in {proof.season, 0}:
+        if token_season not in allowed_seasons:
             return None
         if not block_seasons or block_seasons[-1] != token_season:
             if token_season in block_seasons:

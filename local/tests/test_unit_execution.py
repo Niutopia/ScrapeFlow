@@ -3869,3 +3869,93 @@ class SupersededExecutedCarrierTests(unittest.TestCase):
         self.assertEqual(len(plan_calls), plans_before)
         records = load_work_unit_records(state_root, "root-reuse")
         self.assertEqual(records[0].writer_job_id, carrier.id)
+
+
+class ArcEpisodeMapTests(unittest.TestCase):
+    """A cumulative arc proof must produce a multi-season F episode map."""
+
+    def test_bracket_map_accepts_the_proved_season_boundaries(self) -> None:
+        from engine.scrapeflow.serialization import atomic_write_json
+        from engine.scrapeflow.work_units import WorkUnitRecord
+        from local.scrapeflow_api.library_index import (
+            SingleSeasonEpisodeProof,
+            _BRACKETED_EPISODE_EVIDENCE_KIND,
+        )
+        from local.scrapeflow_api.unit_execution import _bracketed_episode_map_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-arc"
+            source = "/incoming/爱丽丝篇"
+            rows = [{"name": "爱丽丝篇", "is_dir": True, "full_path": source}]
+            for episode in range(1, 25):
+                name = f"[TUDO] Alicization [{episode:02d}][Ma10p_2160p].mkv"
+                rows.append({"name": name, "is_dir": False, "size": 2_000_000_000,
+                             "full_path": f"{source}/{name}"})
+            for episode in range(25, 48):
+                name = f"[TUDO] Alicization War of Underworld [{episode:02d}][Ma10p_2160p].mkv"
+                rows.append({"name": name, "is_dir": False, "size": 2_000_000_000,
+                             "full_path": f"{source}/{name}"})
+            atomic_write_json(
+                state_root / f"work_snapshot_{root_task_id}.json",
+                {"root": source, "rows": rows},
+                allow_nan=False,
+            )
+            record = WorkUnitRecord(
+                work_unit_id="unit-arc", root_task_id=root_task_id,
+                boundary_key=source, source_paths=(source,), source_revision=1,
+                role="single_work", display_label="爱丽丝篇", media_context="tv",
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 45782},
+            )
+            tokens = tuple(f"S03E{n:02d}" for n in range(1, 25)) + tuple(
+                f"S04E{n:02d}" for n in range(1, 24)
+            )
+            proof = SingleSeasonEpisodeProof(
+                tmdb_id=45782, season=3, episode_count=47,
+                episode_tokens=tokens,
+                evidence_kind=_BRACKETED_EPISODE_EVIDENCE_KIND,
+                season_boundaries=((3, 24), (4, 23)),
+            )
+            path = _bracketed_episode_map_path(
+                state_root, root_task_id, record, proof,
+            )
+            self.assertIsNotNone(path)
+            assert path is not None
+            mapping = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(len(mapping), 47)
+            self.assertEqual(mapping["1"], "S03E01")
+            self.assertEqual(mapping["24"], "S03E24")
+            self.assertEqual(mapping["25"], "S04E01")
+            self.assertEqual(mapping["47"], "S04E23")
+
+        # 未被证明的季号仍然 fail-closed
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            atomic_write_json(
+                state_root / "work_snapshot_root-bad.json",
+                {"root": "/incoming/x", "rows": [
+                    {"name": "x", "is_dir": True, "full_path": "/incoming/x"},
+                    {"name": "[T] Show [01].mkv", "is_dir": False, "size": 2_000_000_000,
+                     "full_path": "/incoming/x/[T] Show [01].mkv"},
+                    {"name": "[T] Show [02].mkv", "is_dir": False, "size": 2_000_000_000,
+                     "full_path": "/incoming/x/[T] Show [02].mkv"},
+                ]},
+                allow_nan=False,
+            )
+            record = WorkUnitRecord(
+                work_unit_id="unit-bad", root_task_id="root-bad",
+                boundary_key="/incoming/x", source_paths=("/incoming/x",),
+                source_revision=1, role="single_work", display_label="x",
+                media_context="tv", identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 1},
+            )
+            proof = SingleSeasonEpisodeProof(
+                tmdb_id=1, season=1, episode_count=2,
+                episode_tokens=("S01E01", "S07E01"),
+                evidence_kind=_BRACKETED_EPISODE_EVIDENCE_KIND,
+            )
+            self.assertIsNone(
+                _bracketed_episode_map_path(state_root, "root-bad", record, proof)
+            )
+
