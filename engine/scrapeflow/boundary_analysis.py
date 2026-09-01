@@ -953,10 +953,19 @@ def _split_flat_movie_files(
     run_file_indexes: set[int] = set()
     for prefix_key, members in run_by_prefix.items():
         ordinals = sorted(ordinal for ordinal, _index, _prefix in members)
+        # A release may number from zero (``High School DxD Hero 00`` is TMDB
+        # S04E01), so a contiguous run may start at 0 or 1.  Keeping ``00``
+        # inside its own run is the conservative reading: the alternative was
+        # for it to fall through to the per-file movie path below and become a
+        # lone "independently titled feature film", which is how a whole
+        # 13-episode season ended up written one slot early.  D still has to
+        # prove the run against a published season before any coordinate.
+        start = ordinals[0] if ordinals else 1
         if (
             len(members) < 2
             or len(set(ordinals)) != len(ordinals)
-            or ordinals != list(range(1, len(ordinals) + 1))
+            or start not in (0, 1)
+            or ordinals != list(range(start, start + len(ordinals)))
         ):
             continue
         for _ordinal, index, _prefix in members:

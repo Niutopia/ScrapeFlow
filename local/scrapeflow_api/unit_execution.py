@@ -2641,13 +2641,19 @@ def _release_title_ordinal_episode_map_path(
     if source_ordinals is None:
         return None
     numbers = tuple(sorted(source_ordinals.values()))
-    expected = tuple(range(1, proof.episode_count + 1))
+    if not numbers or numbers[0] not in (0, 1):
+        return None
+    # A zero-based release run (``High School DxD Hero 00`` = S04E01) keeps its
+    # own source ordinals as the map keys and carries the proven +1 offset into
+    # the official coordinates, so F renames from the same evidence D proved.
+    offset = 1 if numbers[0] == 0 else 0
+    expected = tuple(range(numbers[0], numbers[0] + proof.episode_count))
     if numbers != expected or tuple(proof.episode_tokens) != tuple(
-        f"S{proof.season:02d}E{number:02d}" for number in expected
+        f"S{proof.season:02d}E{number + offset:02d}" for number in expected
     ):
         return None
     mapping = {
-        str(number): f"S{proof.season:02d}E{number:02d}"
+        str(number): f"S{proof.season:02d}E{number + offset:02d}"
         for number in numbers
     }
     if len(mapping) != proof.episode_count:

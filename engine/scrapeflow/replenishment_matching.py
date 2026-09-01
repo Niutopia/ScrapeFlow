@@ -202,8 +202,14 @@ _RELEASE_DASH_TAIL_EXPLICIT_EPISODE_RE = re.compile(
 # optional bracketed release tags after the ordinal.  It is intentionally a
 # separate grammar from ``Title - 01``: the title prefix must be digit-free,
 # so ordinary planning never has to guess which number is the episode.
+# A release may number its episodes from zero (``High School DxD Hero 00`` is
+# TMDB S04E01).  The ordinal itself is therefore allowed to be ``0``; only the
+# whole-run + official-season proof downstream may decide whether a zero-based
+# run is regular episodes.  Keeping ``00`` inside its own run is the
+# conservative direction: the alternative was for it to fall through to the
+# flat splitter as a lone "independently titled feature film".
 _RELEASE_TITLE_ORDINAL_EPISODE_RE = re.compile(
-    r"^(?P<prefix>.+?)\s+0*(?P<episode>[1-9]\d{0,2})"
+    r"^(?P<prefix>.+?)\s+(?P<episode>0{1,3}|0*[1-9]\d{0,2})"
     r"(?P<tail>(?:\s*(?:\[[^\[\]]+\]|【[^【】]+】|\([^()]+\)|（[^（）]+）))*?)\s*$",
     re.IGNORECASE,
 )
@@ -724,7 +730,7 @@ def release_title_ordinal_regular_episode(value: Any) -> tuple[str, int] | None:
         ):
             return None
     number = int(match.group("episode"))
-    return (prefix, number) if 0 < number <= 999 else None
+    return (prefix, number) if 0 <= number <= 999 else None
 
 
 # A Japanese disc rip leads with the episode ordinal and quotes the episode

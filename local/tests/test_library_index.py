@@ -2276,6 +2276,60 @@ class LibraryIndexTests(unittest.TestCase):
                 1,
             )
 
+    def test_zero_based_release_run_maps_onto_the_whole_season(self) -> None:
+        """``Title 00..N`` is a zero-based run: ``00`` is E01.
+
+        ``High School DxD Hero 00..12`` is 13 files and TMDB S04 has exactly 13
+        episodes.  Rejecting ordinal ``0`` made B/W split ``Hero 00`` off as a
+        lone feature film and left a 12-member ``01..12`` run, which D then
+        proved as a 12-episode *prefix* of the 13-episode season — the whole
+        season landed one slot early with E13 empty.
+
+        A 1-based release never contains a ``0``, so the presence of ordinal 0
+        proves the scheme; the exact length match against one published season
+        proves the window.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99301, {0: 4, 1: 13})
+            names = [
+                f"Example Hero {episode:02d} [BD 1920x1080 HEVC x265 10bit].mkv"
+                for episode in range(0, 13)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-zero-based-run",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            evidence = record.reconciliation_evidence or {}
+            self.assertEqual(evidence.get("season"), 1)
+            self.assertEqual(evidence.get("episode_count"), 13)
+            self.assertEqual(
+                tuple(evidence.get("episode_tokens") or ())[:3],
+                ("S01E01", "S01E02", "S01E03"),
+            )
+            self.assertIn("S01E13", tuple(evidence.get("episode_tokens") or ()))
+            self.assertNotIn("S01E00", tuple(evidence.get("episode_tokens") or ()))
+
+    def test_zero_based_run_longer_than_the_season_fails_closed(self) -> None:
+        """A zero-based run that does not fill one season proves nothing."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(99302, {0: 4, 1: 12})
+            names = [
+                f"Example Hero {episode:02d} [BD 1920x1080 HEVC x265 10bit].mkv"
+                for episode in range(0, 14)
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-zero-based-overflow",
+            )
+            self.assertEqual(record.reconciliation_outcome, "uncertain")
+
     def test_unaired_specials_metadata_never_invalidates_the_season_proof(self) -> None:
         """A declared S00 total larger than the published one is bookkeeping.
 

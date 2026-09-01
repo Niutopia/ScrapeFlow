@@ -2010,7 +2010,13 @@ def _strict_release_title_ordinal_episode_members(
     if len(set(numbers)) != len(numbers):
         return None
     ordered = tuple(sorted(numbers))
-    if ordered != tuple(range(1, len(ordered) + 1)):
+    # A release may number from zero: ``High School DxD Hero 00`` is TMDB
+    # S04E01, and the run ``00..12`` fills that 13-episode season exactly.
+    # Only 0 or 1 may start a run; the caller still proves the length against
+    # one published season and shifts a zero-based run by one.
+    if not ordered or ordered[0] not in (0, 1):
+        return None
+    if ordered != tuple(range(ordered[0], ordered[0] + len(ordered))):
         return None
     members = tuple(sorted(
         (str(file.path).rstrip("/"), number)
@@ -3306,8 +3312,12 @@ def prove_single_season_episode_evidence(
             return None
         if not set(range(1, overflow_count + 1)) <= set(special_numbers):
             return None
+    # A zero-based source run is one-based on TMDB: ``Hero 00`` is E01.  The
+    # length already matched exactly one published season, so the offset is
+    # proven, not guessed.
+    ordinal_offset = 1 if episode_numbers and episode_numbers[0] == 0 else 0
     tokens = tuple(
-        f"S{season:02d}E{episode:02d}"
+        f"S{season:02d}E{episode + ordinal_offset:02d}"
         for episode in episode_numbers[:regular_count]
     ) + tuple(
         f"S00E{index:02d}"
