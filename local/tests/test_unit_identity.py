@@ -8,13 +8,21 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from types import SimpleNamespace
+
+from engine.scrapeflow.boundary_analysis import DirectoryRole
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import (
+    _boundary_media_form_conflict,
     apply_work_unit_override,
     requeue_uncertain_work_units,
     resolve_work_unit_identities,
 )
-from engine.scrapeflow.work_units import load_work_unit_records, save_work_unit_records
+from engine.scrapeflow.work_units import (
+    WorkUnitRecord,
+    load_work_unit_records,
+    save_work_unit_records,
+)
 
 from local.tests.test_root_boundaries import DictAList, _entries_from_fixture
 
@@ -460,6 +468,88 @@ class WorkUnitIdentityTests(unittest.TestCase):
             if path == "/search/tv"
         ]
         self.assertIn("Northwind.Show", search_queries)
+
+    def test_proven_film_boundary_refuses_a_tv_auto_confirmation(self) -> None:
+        """A film unit must not inherit its parent show's TV identity.
+
+        ``钢之炼金术师 FA …/剧场版/[AI-Raws] … the Movie The Sacred Star of
+        Milos ….mkv`` scored 1.0 against the parent series on title text plus a
+        parent bonus while the movie-form alignment score stayed 0.  Confirming
+        that would hand a 22 GB feature to the TV work's planner, so a proven
+        ``movie_collection`` boundary parks instead of confirming a ``tv`` hit —
+        and the sibling episode body must keep resolving on its own.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-fma"
+            source = "/quark/影视/待刮削/钢之炼金术师"
+            body = f"{source}/钢之炼金术师 FA（2009）4K 全02集"
+            alist = DictAList({
+                source: [{"name": "钢之炼金术师 FA（2009）4K 全02集", "is_dir": True, "size": 0}],
+                body: [
+                    {"name": "[MAI] Fullmetal Alchemist Brotherhood [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                    {"name": "[MAI] Fullmetal Alchemist Brotherhood [02].mkv", "is_dir": False, "size": 1_400_000_000},
+                    {"name": "剧场版", "is_dir": True, "size": 0},
+                ],
+                f"{body}/剧场版": [
+                    {
+                        "name": "[AI-Raws] Fullmetal Alchemist the Movie The Sacred Star of Milos [2160p].mkv",
+                        "is_dir": False,
+                        "size": 22_087_828_467,
+                    },
+                ],
+            })
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            # 只有剧集身份可被搜到，正片只能靠祖先名命中——正是要拒绝的情形
+            tmdb = FakeTMDB({
+                "fullmetalalchemistbrotherhood": [
+                    {"id": 31911, "name": "Fullmetal Alchemist: Brotherhood",
+                     "first_air_date": "2009-04-05", "genre_ids": [16]},
+                ],
+                "钢之炼金术师fullmetalalchemistthemoviethesacredstarofmilos2160p": [
+                    {"id": 31911, "name": "Fullmetal Alchemist: Brotherhood",
+                     "first_air_date": "2009-04-05", "genre_ids": [16]},
+                ],
+            })
+            records = resolve_work_unit_identities(tmdb, state_root, root_task_id)
+            by_context = {record.media_context: record for record in records}
+            self.assertEqual(set(by_context), {"tv", "movie"}, msg=[r.role for r in records])
+            film = by_context["movie"]
+            self.assertEqual(film.role, DirectoryRole.MOVIE_COLLECTION.value)
+            # 无论评分层因何拒绝，正片单元都绝不能带着剧集身份被确认
+            self.assertNotEqual(
+                (film.identity or {}).get("media_type"), "tv", msg=film.identity,
+            )
+            self.assertEqual(film.identity_status, "uncertain")
+
+    def test_media_form_conflict_guard_blocks_only_a_proven_film_boundary(self) -> None:
+        """The guard fires on a proven film boundary meeting a TV winner only."""
+        record = WorkUnitRecord(
+            work_unit_id="unit-film",
+            root_task_id="root",
+            boundary_key="/quark/影视/待刮削/Show/剧场版/Feature.mkv",
+            source_paths=("/quark/影视/待刮削/Show/剧场版/Feature.mkv",),
+            source_revision=1,
+            role=DirectoryRole.MOVIE_COLLECTION.value,
+            media_context="movie",
+        )
+        tv_best = SimpleNamespace(media_type="tv", tmdb_id=31911, title="钢之炼金术师 FA")
+        movie_best = SimpleNamespace(media_type="movie", tmdb_id=80518, title="叹息之丘的圣星")
+        message = _boundary_media_form_conflict(record, tv_best)
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertIn("电影合集内的独立正片边界", message)
+        self.assertIn("tv/31911", message)
+        # 同一单元遇到电影身份不拦；非电影边界的单元一律不拦
+        self.assertIsNone(_boundary_media_form_conflict(record, movie_best))
+        self.assertIsNone(_boundary_media_form_conflict(
+            replace(record, role=DirectoryRole.SINGLE_WORK.value), tv_best,
+        ))
+        self.assertIsNone(_boundary_media_form_conflict(
+            replace(record, role=DirectoryRole.SEASON.value), tv_best,
+        ))
 
     def test_override_validates_the_confirmation_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

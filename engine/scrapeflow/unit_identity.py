@@ -460,6 +460,19 @@ def resolve_work_unit_identities(
                 updated_at=_now(),
             ))
             continue
+        form_conflict = _boundary_media_form_conflict(record, best)
+        if form_conflict is not None:
+            updated.append(replace(
+                record,
+                identity_status="uncertain",
+                identity=None,
+                candidate_identities=tuple(
+                    bounded_auto_match_candidate_rows(candidates)
+                ),
+                attention=form_conflict,
+                updated_at=_now(),
+            ))
+            continue
         updated.append(replace(
             record,
             identity_status="confirmed",
@@ -470,6 +483,40 @@ def resolve_work_unit_identities(
         ))
     save_work_unit_records(state_root, root_task_id, updated)
     return updated
+
+
+def _boundary_media_form_conflict(
+    record: WorkUnitRecord,
+    best: object,
+) -> str | None:
+    """Refuse an auto-confirm that contradicts a *structurally proven* form.
+
+    ``DirectoryRole.MOVIE_COLLECTION`` is never a heuristic guess: only the
+    conservative film splitters emit it, and each one demands a generic
+    film-collection role label plus a substantial standalone per-film title
+    (and, where a label cannot carry that proof, an explicit year or
+    theatrical-form marker).  A unit carrying that role therefore *is* a
+    feature boundary, so a winning ``tv`` candidate means the query was
+    answered by an ancestor's series name rather than by this film.
+
+    ``[AI-Raws] Fullmetal Alchemist the Movie The Sacred Star of Milos …``
+    inside ``剧场版`` scored 1.0 against the parent show ``tv/31911`` on title
+    text plus a parent bonus, with a zero movie-form alignment score.  Letting
+    that confirm would hand a 22 GB feature to the TV work's planner.  Parking
+    it keeps the sibling episode body moving and asks a human for the one fact
+    the evidence cannot supply.
+    """
+    if record.role != DirectoryRole.MOVIE_COLLECTION.value:
+        return None
+    media_type = getattr(best, "media_type", None)
+    if media_type != "tv":
+        return None
+    tmdb_id = getattr(best, "tmdb_id", None)
+    title = getattr(best, "title", None) or ""
+    return (
+        "B/W 已证明这是电影合集内的独立正片边界，但自动匹配给出的是剧集身份"
+        f" tv/{tmdb_id} {title}；拒绝自动确认，需人工确认电影身份"
+    )
 
 
 def apply_work_unit_override(
