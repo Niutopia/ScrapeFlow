@@ -1744,6 +1744,65 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(candidates[0].display_label, root.split("/")[-1])
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_opaque_container_parks_only_its_own_branch(self) -> None:
+        """A light-novel ``.exe`` must not park a seven-work container.
+
+        ``刀剑神域/系列小说/刀剑神域 小说.exe`` is a publication bundle: it will
+        never be an episode, yet the whole-root opaque park blocked all 214
+        objects of the container.  Contract rule 3 — one uncertain child never
+        blocks its siblings.
+        """
+        root = "/quark/影视/待刮削/刀剑神域"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "1.刀剑神域 第一季", "is_dir": True, "children": [
+                    {"name": "SAO S01E01.mkv", "is_dir": False, "size": 2_000_000_000},
+                    {"name": "SAO S01E02.mkv", "is_dir": False, "size": 2_000_000_000},
+                ]},
+                {"name": "3.刀剑神域：序列之争", "is_dir": True, "children": [
+                    {"name": "Ordinal Scale (2017).mkv", "is_dir": False, "size": 9_000_000_000},
+                ]},
+                {"name": "系列小说", "is_dir": True, "children": [
+                    {"name": "刀剑神域 小说.exe", "is_dir": False, "size": 484_655_989},
+                ]},
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        by_label = {c.display_label: c for c in candidates}
+        self.assertEqual(len(candidates), 3, msg=list(by_label))
+        novels = by_label["系列小说"]
+        self.assertEqual(novels.boundary_evidence.role, DirectoryRole.UNCERTAIN)
+        self.assertTrue(novels.requires_content_expansion)
+        self.assertEqual(novels.source_paths, (f"{root}/系列小说",))
+        # 兄弟作品照常拆分，且绝不带上内容展开标记
+        for label in ("1.刀剑神域 第一季", "3.刀剑神域：序列之争"):
+            self.assertFalse(by_label[label].requires_content_expansion)
+            self.assertNotEqual(
+                by_label[label].boundary_evidence.role, DirectoryRole.UNCERTAIN,
+            )
+
+    def test_opaque_container_beside_the_root_files_still_parks_everything(self) -> None:
+        """An opaque container directly under the root keeps the whole-root park."""
+        root = "/quark/影视/待刮削/Mixed"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "Season 01", "is_dir": True, "children": [
+                    {"name": "S01E01.mkv", "is_dir": False, "size": 2_000_000_000},
+                ]},
+            ],
+            "files": [],
+        }
+        fixture["children"].append(
+            {"name": "disc.iso", "is_dir": False, "size": 45_000_000_000}
+        )
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.UNCERTAIN)
+        self.assertTrue(candidates[0].requires_content_expansion)
+        self.assertEqual(candidates[0].source_paths, (root,))
+
     def test_episode_body_splits_from_bare_theatrical_group(self) -> None:
         """A TV body plus a generic ``剧场版`` group is two works, not one.
 

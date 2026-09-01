@@ -25,7 +25,7 @@ import re
 import unicodedata
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Sequence
@@ -1594,6 +1594,71 @@ def _split_tv_body_with_film_collection(
     return candidates
 
 
+def _opaque_container_count(node: SourceNode) -> int:
+    """Disc images plus masquerade executables anywhere under ``node``."""
+    return count_disc_image_files(node) + count_executable_files(node)
+
+
+def _scoped_opaque_container_split(
+    node: SourceNode,
+    *,
+    root_task_id: str,
+) -> list[WorkCandidate] | None:
+    """Park only the branches that actually hold an opaque container.
+
+    The whole-root park exists because a disc image or masquerade ``.exe`` may
+    hide any media shape, so no boundary can be proven around it.  That is true
+    of the *branch* holding it — not of its siblings.  A light-novel bundle
+    (``系列小说/刀剑神域 小说.exe``) blocked a seven-work container's 214 objects
+    with a park that could never be resolved by inspecting the novels.
+
+    Fail closed unless the split is unambiguous: no opaque container directly
+    under ``node``, at least one direct child free of them, and at least one of
+    those free children carrying video.  Each opaque child becomes its own
+    visible ``requires_content_expansion`` unit; the remainder is analysed
+    normally, so this only ever narrows a park, never widens a claim.
+    """
+    if any(
+        file.object_type in ("disc_image", "executable") for file in node.files
+    ):
+        return None
+    opaque = tuple(child for child in node.children if _opaque_container_count(child))
+    if not opaque:
+        return None
+    remaining = tuple(child for child in node.children if child not in opaque)
+    if not remaining or not any(_child_has_video(child) for child in remaining):
+        return None
+    inner = replace(node, children=remaining)
+    candidates = list(analyze_boundaries(inner, root_task_id=root_task_id))
+    if not candidates:
+        return None
+    for child in opaque:
+        discs = count_disc_image_files(child)
+        executables = count_executable_files(child)
+        reasons = []
+        if discs:
+            reasons.append(f"发现 {discs} 个光盘镜像容器；{DISC_IMAGE_INSPECTION_REQUIRED}")
+        if executables:
+            reasons.append(
+                f"发现 {executables} 个伪装视频 .exe，真实媒体类型尚未只读识别"
+            )
+        candidates.append(WorkCandidate(
+            work_unit_id=_work_unit_id(root_task_id, child.path),
+            boundary_key=child.path,
+            source_paths=(child.path,),
+            display_label=child.name,
+            proposed_media_context="unknown",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.UNCERTAIN,
+                confidence=1.0,
+                reasons=tuple(reasons),
+                competing_roles=(),
+            ),
+            requires_content_expansion=True,
+        ))
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Main analyser
 # ---------------------------------------------------------------------------
@@ -1617,6 +1682,15 @@ def analyze_boundaries(
     # one visible uncertain unit instead of silently dropping image files or
     # guessing an overlapping sibling split.  A future read-only image
     # expander must create a concrete inventory and re-run B/W.
+    # An opaque container confined to a strict subset of the direct children
+    # must park only that branch.  ``刀剑神域/系列小说/刀剑神域 小说.exe`` is a
+    # light-novel publication bundle: it will never be an episode, yet the
+    # whole-root park blocked all 214 objects of a seven-work container.
+    # Contract rule 3 — one uncertain child never blocks its siblings.
+    scoped_park = _scoped_opaque_container_split(node, root_task_id=root_task_id)
+    if scoped_park is not None:
+        return scoped_park
+
     disc_image_count = count_disc_image_files(node)
     if disc_image_count:
         evidence = BoundaryEvidence(
