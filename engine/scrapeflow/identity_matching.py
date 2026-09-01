@@ -1929,6 +1929,7 @@ def _select_auto_match(
     *,
     query_label: str,
     year_label: str,
+    source_years: Collection[str] = (),
 ) -> tuple[AutoMatch, list[AutoMatch]]:
     """Apply the shared final-selection policy (margin + exact-title rules)."""
     ordered = sorted(
@@ -1960,13 +1961,30 @@ def _select_auto_match(
     # escalated with its intake root scored an exact 1.0 against both the 2003
     # original (tv/37863) and the 2009 remake (tv/31911); only the year told
     # them apart, and the margin check could not see it.
-    def _year_blocked(item: AutoMatch) -> bool:
-        return "year_conflict" in (item.decision_trace.get("blockers") or [])
+    known_years = {
+        value for value in (str(year) for year in source_years) if value.isdigit()
+    }
 
-    runner_up = next(
-        (item for item in ordered[1:] if not _year_blocked(item)),
-        None,
-    ) if not _year_blocked(best) else (ordered[1] if len(ordered) > 1 else None)
+    def _year_blocked(item: AutoMatch) -> bool:
+        if "year_conflict" in (item.decision_trace.get("blockers") or []):
+            return True
+        # The blocker is only set on the branch that scored the candidate.  A
+        # parent-escalated query round can reach the same candidate without it,
+        # so re-apply the same two-year threshold against the source's own year
+        # evidence here.  Anything without a usable year stays eligible.
+        if not known_years or not str(item.year or "").isdigit():
+            return False
+        return all(
+            abs(int(item.year) - int(year)) >= 2 for year in known_years
+        )
+
+    if _year_blocked(best):
+        runner_up = ordered[1] if len(ordered) > 1 else None
+    else:
+        runner_up = next(
+            (item for item in ordered[1:] if not _year_blocked(item)),
+            None,
+        )
     best_exact = max(
         float(best.score_components.get("title_score", 0.0)),
         float(best.score_components.get("alias_score", 0.0)),
@@ -2219,6 +2237,7 @@ def auto_match_tmdb(
         candidates,
         query_label=query,
         year_label=f"query_year={query_year}",
+        source_years=(query_year,) if query_year else (),
     )
 
 
@@ -3220,6 +3239,7 @@ def auto_match_from_evidence(
         candidates,
         query_label=evidence.boundary_label,
         year_label=f"query_years={sorted(query_years)}",
+        source_years=query_years,
     )
 
 

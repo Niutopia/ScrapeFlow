@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from engine.scrapeflow.boundary_analysis import DirectoryRole
+from engine.scrapeflow.identity_matching import AutoMatchAmbiguityError
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import (
     _boundary_media_form_conflict,
@@ -590,6 +591,39 @@ class WorkUnitIdentityTests(unittest.TestCase):
             if "year_conflict" in (item.decision_trace.get("blockers") or [])
         ]
         self.assertEqual([item.tmdb_id for item in blocked], [37863])
+
+    def test_select_auto_match_skips_a_year_contradicting_runner_up(self) -> None:
+        """The shared selector re-applies the two-year rule without the blocker.
+
+        A parent-escalated query round can reach a candidate without the
+        scoring branch that sets ``year_conflict``, which is how the 2003 show
+        kept tying with the 2009 remake at an exact 1.0 each.
+        """
+        from engine.scrapeflow.identity_matching import AutoMatch, _select_auto_match
+
+        def match(tmdb_id: int, title: str, year: str) -> AutoMatch:
+            return AutoMatch(
+                media_type="tv", tmdb_id=tmdb_id, title=title, year=year,
+                confidence=1.0, status="confirmed",
+                score_components={"title_score": 1.0, "alias_score": 1.0},
+                decision_trace={"blockers": []},
+            )
+
+        candidates = [match(31911, "钢之炼金术师 FA", "2009"), match(37863, "钢之炼金术师", "2003")]
+        best, ordered = _select_auto_match(
+            candidates, query_label="钢之炼金术师", year_label="", source_years={"2009"},
+        )
+        self.assertEqual(best.tmdb_id, 31911)
+        self.assertEqual(len(ordered), 2)
+        # 没有年份证据时保持原来的 fail-closed 行为
+        with self.assertRaises(AutoMatchAmbiguityError):
+            _select_auto_match(candidates, query_label="钢之炼金术师", year_label="")
+        # 两个候选年份都贴着来源年份时，年份帮不上忙，仍然拒绝自动选择
+        near = [match(1, "甲", "2009"), match(2, "乙", "2010")]
+        with self.assertRaises(AutoMatchAmbiguityError):
+            _select_auto_match(
+                near, query_label="甲", year_label="", source_years={"2009"},
+            )
 
     def test_self_named_film_boundary_drops_ancestor_labels(self) -> None:
         """A film that names itself must not be queried through its parent show."""
