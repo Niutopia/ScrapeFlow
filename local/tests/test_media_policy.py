@@ -1,6 +1,11 @@
 import unittest
 
-from engine.scrapeflow.core import MEDIA_EXTS, SUBTITLE_EXTS, VIDEO_EXTS
+from engine.scrapeflow.core import (
+    MEDIA_EXTS,
+    SUBTITLE_EXTS,
+    VIDEO_EXTS,
+    make_unique_media_names,
+)
 from engine.scrapeflow.media_policy import (
     ARCHIVE_EXTENSIONS,
     AUDIO_EXTENSIONS,
@@ -152,3 +157,41 @@ class MediaPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LanguagelessSubtitleSidecarNameTests(unittest.TestCase):
+    """A language-less external subtitle takes the plain sidecar name."""
+
+    BASE = "银魂 - S06E10 - 激光这个词能让所有人为之心动"
+
+    def test_single_languageless_sidecar_has_no_marker(self) -> None:
+        # ``.subtitle`` was never a language tag: players showed "subtitle" as
+        # the track name, and the reviewed layout wants the plain sidecar.
+        self.assertEqual(
+            make_unique_media_names(self.BASE, [
+                {"name": "ep.mkv", "size": 1},
+                {"name": "[Ygm] Gintama'  [61][Ma10p_2160p][x265_flac_ass].ass", "size": 2},
+            ]),
+            [f"{self.BASE}.mkv", f"{self.BASE}.ass"],
+        )
+
+    def test_second_languageless_sidecar_still_disambiguates(self) -> None:
+        self.assertEqual(
+            make_unique_media_names(self.BASE, [
+                {"name": "ep.mkv", "size": 1},
+                {"name": "a.ass", "size": 2},
+                {"name": "b.ass", "size": 3},
+            ]),
+            [f"{self.BASE}.mkv", f"{self.BASE}.ass", f"{self.BASE}.subtitle2.ass"],
+        )
+
+    def test_detected_language_still_wins(self) -> None:
+        self.assertEqual(
+            make_unique_media_names(self.BASE, [
+                {"name": "ep.mkv", "size": 1},
+                {"name": "release.chs.ass", "size": 2},
+            ]),
+            [f"{self.BASE}.mkv", f"{self.BASE}.zh-CN.ass"],
+        )
+
+

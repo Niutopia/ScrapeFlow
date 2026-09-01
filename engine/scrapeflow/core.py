@@ -1150,6 +1150,68 @@ class AListClient:
         if effective_port not in {80, 443}:
             raise ApiError("AList 外部文件下载地址使用了不允许的端口")
 
+    def read_file_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        expected_size: int | None = None,
+        refresh: bool = True,
+    ) -> bytes:
+        """Read one exact range without exposing provider URLs or headers."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset 必须是非负整数")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError("length 必须是正整数")
+        if expected_size is not None:
+            if (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or expected_size <= 0
+            ):
+                raise ValueError("expected_size 必须是正整数")
+            if offset + length > expected_size:
+                raise ValueError("请求 Range 超出 expected_size")
+
+        raw_url, headers = self.file_link(path, refresh=refresh)
+        return self.http.request_exact_range(
+            raw_url,
+            offset=offset,
+            length=length,
+            headers=headers,
+            expected_total=expected_size,
+            url_validator=self._validate_download_url,
+        )
+
+    @contextlib.contextmanager
+    def open_file_range_reader(
+        self,
+        path: str,
+        *,
+        expected_size: int,
+        refresh: bool = True,
+    ):
+        """Open a reusable exact-Range reader without exposing link details."""
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or expected_size <= 0
+        ):
+            raise ValueError("expected_size 必须是正整数")
+        raw_url, headers = self.file_link(path, refresh=refresh)
+
+        def read_range(offset: int, length: int) -> bytes:
+            return self.http.request_exact_range(
+                raw_url,
+                offset=offset,
+                length=length,
+                headers=headers,
+                expected_total=expected_size,
+                url_validator=self._validate_download_url,
+            )
+
+        yield read_range
+
     def read_file_prefix(self, path: str, *, max_bytes: int = 1024 * 1024) -> bytes:
         """Read only the beginning of a remote file; used for signature checks.
 
@@ -1328,6 +1390,121 @@ class AListClient:
                 if matches:
                     break
             raise ApiError(f"AList 流式上传失败: {target_path}; {exc}") from exc
+        finally:
+            connection.close()
+
+    def upload_stream(
+        self,
+        target_path: str,
+        chunks: Iterable[bytes],
+        *,
+        size: int,
+        md5: str,
+        sha1: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        """Upload a proven-size stream without caching the whole object locally.
+
+        AList accepts ``X-File-Md5`` and ``X-File-Sha1`` on ``fs/put``.  Its
+        Quark driver otherwise has to spool the complete request into a local
+        temporary file before it can calculate those two hashes.  Supplying
+        both proven hashes lets the driver consume this iterable directly in
+        provider-sized parts while preserving create-only semantics.
+
+        ``chunks`` is deliberately one-shot.  A transport failure is never
+        replayed because the remote multipart upload may already have
+        committed; the exact target is reconciled by path and size instead.
+        """
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError("size 必须是正整数")
+        clean_md5 = str(md5).strip().casefold()
+        clean_sha1 = str(sha1).strip().casefold()
+        if re.fullmatch(r"[0-9a-f]{32}", clean_md5) is None:
+            raise ValueError("md5 必须是 32 位十六进制摘要")
+        if re.fullmatch(r"[0-9a-f]{40}", clean_sha1) is None:
+            raise ValueError("sha1 必须是 40 位十六进制摘要")
+        if not isinstance(content_type, str) or not content_type.strip():
+            raise ValueError("content_type 不能为空")
+
+        parsed = urllib.parse.urlsplit(self.base_url)
+        connection_type = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        response_timeout = max(
+            120,
+            min(3600, 300 + int(size / (4 * 1024 * 1024))),
+        )
+        connection = connection_type(
+            parsed.hostname,
+            parsed.port,
+            timeout=response_timeout,
+        )
+        endpoint = (parsed.path.rstrip("/") if parsed.path else "") + "/api/fs/put"
+        sent = 0
+        try:
+            connection.putrequest("PUT", endpoint)
+            for key, value in {
+                **self._headers(),
+                "File-Path": urllib.parse.quote(normalize_remote_path(target_path)),
+                "Overwrite": "false",
+                "Content-Type": content_type,
+                "Content-Length": str(size),
+                "X-File-Md5": clean_md5,
+                "X-File-Sha1": clean_sha1,
+            }.items():
+                connection.putheader(key, value)
+            connection.endheaders()
+            for chunk in chunks:
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise ApiError("AList 流式上传收到非字节数据")
+                if not chunk:
+                    continue
+                chunk_size = len(chunk)
+                if sent + chunk_size > size:
+                    raise ApiError(
+                        f"AList 流式上传超过计划大小: "
+                        f"expected={size}, attempted={sent + chunk_size}"
+                    )
+                connection.send(chunk)
+                sent += chunk_size
+            if sent != size:
+                raise ApiError(
+                    f"AList 流式上传大小不足: expected={size}, actual={sent}"
+                )
+
+            response = connection.getresponse()
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise ApiError("AList 上传响应过大")
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ApiError(f"AList 上传响应无效: HTTP {response.status}") from exc
+            if not isinstance(payload, Mapping):
+                raise ApiError("AList 上传响应格式异常")
+            self._require_success(payload, "AList 零落盘流式上传")
+        except (OSError, http.client.HTTPException) as exc:
+            target_dir, target_name = split_remote(target_path)
+            for delay in (0, 1, 2, 4, 8):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    matches = [
+                        item
+                        for item in (self.try_list(target_dir, refresh=True) or [])
+                        if not item.get("is_dir")
+                        and _collision_key(str(item.get("name") or ""))
+                        == _collision_key(target_name)
+                    ]
+                except ApiError:
+                    continue
+                if len(matches) == 1 and _entry_size_value(matches[0]) == size:
+                    return
+                if matches:
+                    break
+            raise ApiError(f"AList 零落盘流式上传失败: {target_path}; {exc}") from exc
         finally:
             connection.close()
 
@@ -2821,10 +2998,15 @@ def make_unique_media_names(
                 )
                 pair_suffixes[pair_key] = suffix
             else:
+                # A language-less external subtitle takes the plain sidecar
+                # name.  The old ``.subtitle`` marker was not a language tag,
+                # so players displayed "subtitle" as the track name; only a
+                # second language-less sidecar for the same episode needs a
+                # disambiguating ordinal.
                 unknown_sub_counts[edition_suffix] += 1
                 unknown_sub_index = unknown_sub_counts[edition_suffix]
                 suffix = (
-                    f"{edition_suffix}.subtitle"
+                    edition_suffix
                     if unknown_sub_index == 1
                     else f"{edition_suffix}.subtitle{unknown_sub_index}"
                 )
