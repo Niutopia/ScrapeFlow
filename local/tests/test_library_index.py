@@ -2276,6 +2276,47 @@ class LibraryIndexTests(unittest.TestCase):
                 1,
             )
 
+    def test_unaired_specials_metadata_never_invalidates_the_season_proof(self) -> None:
+        """A declared S00 total larger than the published one is bookkeeping.
+
+        ``钢之炼金术师 FA`` declares 20 specials in ``seasons[].episode_count``
+        while only 4 have aired and reached the episode catalog.  The S00 gate
+        compared those two different numbers and threw away a complete,
+        gapless, unambiguous 64-episode Season 01 run over Season 00
+        bookkeeping the proof never touches.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            tmdb = StrictBareEpisodeTMDB(
+                99201, {0: 20, 1: 12}, payload_counts={0: 4, 1: 12},
+            )
+            names = [
+                f"[MAI] Example Show [{episode:02d}][Ma10p_2160p].mkv"
+                for episode in range(1, 13)
+            ] + [
+                "[MAI] Example Show [NCOP01][Ma10p_2160p].mkv",
+                "[MAI] Example Show [NCED01][Ma10p_2160p].mkv",
+                "[MAI] Example Show [OVA01][Ma10p_2160p].mkv",
+                "[MAI] Example Show [OVA02][Ma10p_2160p].mkv",
+            ]
+            _alist, _state_root, record = self._reconcile_bare_episode_source(
+                names,
+                tmdb,
+                state_root=state_root,
+                root_task_id="root-unaired-specials",
+            )
+            self.assertEqual(record.reconciliation_outcome, "new_work")
+            self.assertEqual(
+                record.reconciliation_evidence
+                and record.reconciliation_evidence["season"],
+                1,
+            )
+            self.assertEqual(
+                record.reconciliation_evidence
+                and record.reconciliation_evidence["episode_count"],
+                12,
+            )
+
     def test_bracketed_proof_accepts_compound_ovbsp_release_token(self) -> None:
         """``[OVBSP]`` is one more unnumbered special-release spelling.
 

@@ -3275,14 +3275,21 @@ def prove_single_season_episode_evidence(
     expected_numbers = tuple(range(1, regular_count + 1))
     if tuple(sorted(catalog_numbers)) != expected_numbers or len(set(catalog_numbers)) != len(catalog_numbers):
         return None
-    if 0 in payload:
+    if overflow_count and 0 in payload:
+        # Only validate Season 00 when this proof actually assigns S00 tokens.
+        # The gate used to compare the catalog's *published* specials against
+        # TMDB's ``seasons[].episode_count`` metadata, which is a different
+        # number: 钢之炼金术师 FA declares 20 specials while only 4 have aired
+        # and reached the catalog, so a complete and unambiguous 64-episode
+        # Season 01 run lost its proof over Season 00 bookkeeping it never
+        # touched.  When the proof does emit ``S00E01..N`` those N coordinates
+        # must exist and be contiguous in the catalog; the declared total is
+        # not the authority.
         special_rows = payload.get(0)
-        special_count = season_evidence.specials_episode_count
         if (
-            special_count is None
-            or not isinstance(special_rows, Sequence)
+            not isinstance(special_rows, Sequence)
             or isinstance(special_rows, (str, bytes, bytearray))
-            or len(special_rows) != special_count
+            or len(special_rows) < overflow_count
         ):
             return None
         special_numbers: list[int] = []
@@ -3295,10 +3302,9 @@ def prove_single_season_episode_evidence(
             if number is None:
                 return None
             special_numbers.append(number)
-        if (
-            tuple(sorted(special_numbers)) != tuple(range(1, special_count + 1))
-            or len(set(special_numbers)) != len(special_numbers)
-        ):
+        if len(set(special_numbers)) != len(special_numbers):
+            return None
+        if not set(range(1, overflow_count + 1)) <= set(special_numbers):
             return None
     tokens = tuple(
         f"S{season:02d}E{episode:02d}"
