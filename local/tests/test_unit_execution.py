@@ -3959,3 +3959,66 @@ class ArcEpisodeMapTests(unittest.TestCase):
                 _bracketed_episode_map_path(state_root, "root-bad", record, proof)
             )
 
+
+class BroadcastSeasonCoalescingTests(unittest.TestCase):
+    """An alternate cut must not block a broadcast-season group from merging."""
+
+    SOURCE = "/incoming/Re Zero"
+
+    def _snapshot(self, labels):
+        rows = [{"name": "Re Zero", "is_dir": True, "full_path": self.SOURCE}]
+        for label in labels:
+            path = f"{self.SOURCE}/{label}"
+            rows.append({"name": label, "is_dir": True, "full_path": path})
+            for episode in (1, 2):
+                name = f"[X] Re Zero [{episode:02d}].mkv"
+                rows.append({"name": name, "is_dir": False, "size": 2_000_000_000,
+                             "full_path": f"{path}/{name}"})
+        return {"root": self.SOURCE, "rows": rows}
+
+    def _records(self, labels):
+        from engine.scrapeflow.work_units import WorkUnitRecord
+        out = []
+        for index, label in enumerate(labels):
+            path = f"{self.SOURCE}/{label}"
+            out.append(WorkUnitRecord(
+                work_unit_id=f"unit-{index}", root_task_id="root", boundary_key=path,
+                source_paths=(path,), source_revision=1, role="season",
+                display_label=label, media_context="tv", identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 65942},
+            ))
+        return out
+
+    def test_alternate_cut_joins_its_base_season_group(self) -> None:
+        from engine.scrapeflow.work_unit_coalescing import (
+            coalesce_confirmed_tv_season_work_units,
+        )
+        labels = ["第一季", "第一季 新编集版", "第二季", "第三季", "第四季"]
+        merged = coalesce_confirmed_tv_season_work_units(
+            self._records(labels), self._snapshot(labels),
+        )
+        self.assertEqual(len(merged), 1, msg=[r.display_label for r in merged])
+        unit = merged[0]
+        self.assertEqual(len(unit.source_paths), 5)
+        # 备用剪辑与它的基准季共享季号，合并后的季声明必须去重
+        self.assertEqual(unit.claimed_seasons, (1, 2, 3, 4))
+        self.assertNotIn("season", unit.identity or {})
+
+    def test_alternate_cut_alone_keeps_per_unit_boundaries(self) -> None:
+        from engine.scrapeflow.work_unit_coalescing import (
+            coalesce_confirmed_tv_season_work_units,
+        )
+        labels = ["第一季", "第一季 新编集版"]
+        records = self._records(labels)
+        merged = coalesce_confirmed_tv_season_work_units(records, self._snapshot(labels))
+        self.assertEqual(len(merged), 2)
+
+    def test_alternate_cut_of_an_unowned_season_fails_closed(self) -> None:
+        from engine.scrapeflow.work_unit_coalescing import (
+            coalesce_confirmed_tv_season_work_units,
+        )
+        labels = ["第一季", "第二季", "第五季 新编集版"]
+        records = self._records(labels)
+        merged = coalesce_confirmed_tv_season_work_units(records, self._snapshot(labels))
+        self.assertEqual(len(merged), 3, msg=[r.display_label for r in merged])
+

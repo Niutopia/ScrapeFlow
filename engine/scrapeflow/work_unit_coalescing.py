@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Mapping, Sequence
 
 from .boundary_analysis import _SEASON_EPISODE_RE, _season_number_from_directory_name
+from .media_naming import edition_tag
 from .source_inventory import (
     SourceNode,
     build_source_inventory,
@@ -44,6 +45,11 @@ class _SeasonSibling:
     parent_path: str
     source_path: str
     season: int
+    # An explicit edition tag on the folder label (``… 第一季 新编集版``) marks an
+    # alternate cut of that season, not a competing season sibling.  The smart
+    # planner already understands ``{edition-New Edit}``; it just needs the cut
+    # to arrive inside the same WorkUnit as the season it re-cuts.
+    edition: str | None = None
 
 
 def _confirmed_tv_tmdb_id(record: WorkUnitRecord) -> int | None:
@@ -136,6 +142,7 @@ def _season_sibling(
         parent_path=posixpath.dirname(source_path) or "/",
         source_path=source_path,
         season=season,
+        edition=edition_tag(posixpath.basename(source_path)),
     )
 
 
@@ -216,7 +223,12 @@ def _merge_group(group: Sequence[_SeasonSibling]) -> WorkUnitRecord:
         canonical,
         source_paths=tuple(item.source_path for item in ordered),
         role="single_work",
-        claimed_seasons=tuple(item.season for item in ordered),
+        # An alternate cut shares its base season, so the merged claim set is
+        # the ordinary seasons only — a repeated number would read as two
+        # different seasons to every downstream consumer.
+        claimed_seasons=tuple(
+            sorted({item.season for item in ordered if item.edition is None})
+        ),
         media_context="tv",
         identity=identity,
         reconciliation_outcome=None,
@@ -281,7 +293,21 @@ def coalesce_confirmed_tv_season_work_units(
     for group in groups.values():
         if len(group) < 2:
             continue
-        if len({item.season for item in group}) != len(group):
+        base = [item for item in group if item.edition is None]
+        editions = [item for item in group if item.edition is not None]
+        if len(base) < 2:
+            # Without at least two ordinary seasons there is no broadcast run to
+            # coalesce; a lone season plus its alternate cut keeps the historical
+            # per-unit boundaries.
+            continue
+        if len({item.season for item in base}) != len(base):
+            continue
+        base_seasons = {item.season for item in base}
+        if any(item.season not in base_seasons for item in editions):
+            # An alternate cut of a season this group does not own is not proof
+            # of anything; fail closed rather than widen the scope.
+            continue
+        if len({(item.season, item.edition) for item in editions}) != len(editions):
             continue
         if len({item.record.source_revision for item in group}) != 1:
             continue
