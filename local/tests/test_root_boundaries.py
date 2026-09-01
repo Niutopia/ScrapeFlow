@@ -550,6 +550,38 @@ class BoundaryRebuildBeforeWriteTests(unittest.TestCase):
             self.assertEqual(records[0].identity_status, "confirmed")
             self.assertEqual((records[0].identity or {}).get("tmdb_id"), 777)
 
+    def test_automatic_confirmation_is_re_derived_not_carried_over(self) -> None:
+        """A rebuild exists to re-derive C; an auto confirm must not survive it.
+
+        Carrying an automatic verdict across the rebuild would freeze the old
+        conclusion behind the new split — the exact failure that kept a nested
+        feature confirmed as its parent TV series after the boundary was fixed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            rid = "engine-auto"
+            alist = DictAList({
+                self.SOURCE: [
+                    {"name": "Rebuild Show [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                ],
+            })
+            _snapshot, seeded = build_root_boundary_analysis(
+                alist, self.SOURCE, root_task_id=rid,
+            )
+            save_work_unit_records(state_root, rid, [replace(
+                seeded[0],
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 31911, "confidence": 1.0},
+                reconciliation_outcome="uncertain",
+            )])
+            records = rebuild_root_boundary_if_unwritten(
+                alist, self.SOURCE, root_task_id=rid, state_root=state_root,
+            )
+            self.assertIsNotNone(records)
+            assert records is not None
+            self.assertEqual(records[0].identity_status, "pending")
+            self.assertIsNone(records[0].identity)
+
 
 class WalkSourceRowsTests(unittest.TestCase):
     def test_walk_returns_directories_and_files_with_full_paths(self) -> None:

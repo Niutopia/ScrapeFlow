@@ -352,8 +352,9 @@ def rebuild_root_boundary_if_unwritten(
     function then retires the old ledger to a timestamped sidecar (evidence,
     not garbage) and rebuilds from a fresh listing.
 
-    Durable operator identity confirmations survive only on an **identical**
-    unit key.  ``_work_unit_id`` is a deterministic function of the boundary
+    Durable *operator* identity confirmations survive only on an **identical**
+    unit key; an automatic confirmation is always re-derived, because the same
+    engine fix that changed the boundary may change what C should conclude.  ``_work_unit_id`` is a deterministic function of the boundary
     key, so an unchanged source reproduces the same ids and keeps its
     overrides; a unit whose scope actually changed is a different object set
     and returns to C for re-confirmation rather than silently inheriting a
@@ -391,10 +392,16 @@ def rebuild_root_boundary_if_unwritten(
     carried: list[WorkUnitRecord] = []
     for record in records:
         prior = prior_scopes.get(record.work_unit_id)
+        prior_identity = (prior[0].identity or {}) if prior is not None else {}
         if (
             prior is not None
             and prior[0].identity_status == "confirmed"
-            and prior[0].identity is not None
+            # Only a human confirmation is worth preserving.  An *automatic*
+            # confirmation is exactly what a rebuild exists to re-derive: the
+            # engine fix that changed the boundary may equally have changed
+            # what C should conclude, so carrying it over would freeze the old
+            # verdict behind the new split.
+            and prior_identity.get("source") == "operator_override"
             and prior[1] == tuple(record.source_paths)
         ):
             record = replace(
