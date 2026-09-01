@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -27,6 +29,7 @@ from .source_objects import (
 from .work_units import (
     WorkUnitRecord,
     create_work_units_from_candidates,
+    load_work_unit_records,
     save_work_unit_records,
 )
 
@@ -298,6 +301,117 @@ def persist_root_boundary_analysis(
         except FileNotFoundError:
             pass
     save_work_unit_records(state_root, root_task_id, records)
+
+
+def _has_write_side_facts(record: WorkUnitRecord) -> bool:
+    """Whether this unit already produced a durable write-side fact.
+
+    Any of these means the ledger is load-bearing: a writer carrier was
+    created, an E lane finished, D bound the unit to an existing work root,
+    or J recorded a gap outcome.  A rebuild would re-key the unit and orphan
+    those facts, so it must fail closed.
+    """
+    return bool(
+        record.writer_job_id
+        or record.lane_status
+        or record.matched_work_root
+        or record.gap_status
+    )
+
+
+def rebuild_root_boundary_if_unwritten(
+    alist: object,
+    source_path: str,
+    *,
+    root_task_id: str,
+    state_root: Path,
+) -> list[WorkUnitRecord] | None:
+    """Re-derive B/W from the current source when nothing has been written yet.
+
+    A persisted ledger is normally reused so C/D/F never re-key work that is
+    already in flight.  That reuse also pins a *stale boundary*: a root parked
+    in C/U or D keeps whatever split the engine produced when it first ran, so
+    a later generic boundary fix can never reach it and a plain retry repeats
+    the same verdict forever.
+
+    The rebuild therefore fires only for a root that is actually parked (a
+    unit in ``uncertain``/``failed`` identity, an ``uncertain`` reconciliation,
+    or a recorded attention).  A healthy in-flight ledger is left untouched.
+
+    When every unit is free of write-side facts there is nothing to protect:
+    no carrier, no lane, no bound work root, no gap ledger entry.  This
+    function then retires the old ledger to a timestamped sidecar (evidence,
+    not garbage) and rebuilds from a fresh listing.
+
+    Durable operator identity confirmations survive only on an **identical**
+    unit key.  ``_work_unit_id`` is a deterministic function of the boundary
+    key, so an unchanged source reproduces the same ids and keeps its
+    overrides; a unit whose scope actually changed is a different object set
+    and returns to C for re-confirmation rather than silently inheriting a
+    title that was confirmed against a different scope.
+
+    Returns the rebuilt records, or ``None`` when a rebuild is unsafe or the
+    ledger is empty (the caller then follows its ordinary path).
+    """
+    existing = load_work_unit_records(state_root, root_task_id)
+    if not existing:
+        return None
+    if any(_has_write_side_facts(record) for record in existing):
+        return None
+    # Only a *stuck* root is rebuilt.  A healthy in-flight ledger keeps its
+    # exact keys so C-stage coalescing, operator confirmations and D evidence
+    # are never churned; the stale-boundary problem only exists where a unit
+    # is parked and a retry would otherwise repeat the same verdict forever.
+    if not any(
+        record.identity_status in {"uncertain", "failed"}
+        or record.reconciliation_outcome == "uncertain"
+        or record.attention
+        for record in existing
+    ):
+        return None
+
+    snapshot, records = build_root_boundary_analysis(
+        alist,
+        source_path,
+        root_task_id=root_task_id,
+    )
+    prior_scopes = {
+        record.work_unit_id: (record, tuple(record.source_paths))
+        for record in existing
+    }
+    carried: list[WorkUnitRecord] = []
+    for record in records:
+        prior = prior_scopes.get(record.work_unit_id)
+        if (
+            prior is not None
+            and prior[0].identity_status == "confirmed"
+            and prior[0].identity is not None
+            and prior[1] == tuple(record.source_paths)
+        ):
+            record = replace(
+                record,
+                identity_status=prior[0].identity_status,
+                identity=dict(prior[0].identity),
+                candidate_identities=tuple(prior[0].candidate_identities),
+            )
+        carried.append(record)
+
+    retired = _snapshot_path(state_root, root_task_id).with_name(
+        f"work_units_{root_task_id}.retired-"
+        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    atomic_write_json(
+        retired,
+        {
+            "retired_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "root_task_id": root_task_id,
+            "reason": "boundary_rebuild_before_any_write",
+            "records": [record.as_dict() for record in existing],
+        },
+        allow_nan=False,
+    )
+    persist_root_boundary_analysis(state_root, root_task_id, snapshot, carried)
+    return carried
 
 
 def load_source_snapshot(

@@ -34,6 +34,7 @@ from typing import Callable
 from engine.scrapeflow.intake_source import load_intake_catalog
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
+    rebuild_root_boundary_if_unwritten,
     load_source_snapshot,
 )
 from engine.scrapeflow.serialization import atomic_write_json
@@ -430,6 +431,17 @@ def run_root_pipeline(
     # F refuses them before any planner/writer side effect.
     if not load_work_unit_records(state_root, root_task_id):
         analyze_root_boundaries(
+            runner.alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+    else:
+        # A persisted ledger normally wins so nothing in flight is re-keyed.
+        # But a root parked in C/U or D has written nothing, and reusing its
+        # ledger also pins the boundary the engine produced back then — a
+        # later generic B/W fix could never reach it and a retry would repeat
+        # the same verdict forever.  The rebuild is refused as soon as any
+        # unit carries a write-side fact, and durable operator confirmations
+        # survive only on an identical unit key/scope.
+        rebuild_root_boundary_if_unwritten(
             runner.alist, source, root_task_id=root_task_id, state_root=state_root,
         )
     cancelled_job = cancelled()

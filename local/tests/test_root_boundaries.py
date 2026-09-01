@@ -7,13 +7,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dataclasses import replace
+
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
     build_root_boundary_analysis,
     load_source_manifest,
+    rebuild_root_boundary_if_unwritten,
     walk_source_rows,
 )
-from engine.scrapeflow.work_units import load_work_unit_records
+from engine.scrapeflow.work_units import (
+    WorkUnitRecord,
+    load_work_unit_records,
+    save_work_unit_records,
+)
 from engine.scrapeflow.source_inventory import build_scoped_source_node, build_source_inventory
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media_cases"
@@ -405,6 +412,139 @@ class RootBoundaryCompositionTests(unittest.TestCase):
                 (f"{root}/剧场版/Example Reminiscence (2021)",),
             },
         )
+
+
+class BoundaryRebuildBeforeWriteTests(unittest.TestCase):
+    """A parked, unwritten root may re-derive its boundary; anything else may not."""
+
+    SOURCE = "/quark/影视/待刮削/Rebuild Show"
+    BODY = f"{SOURCE}/Rebuild Show 4K 全02集"
+
+    def _alist(self) -> DictAList:
+        return DictAList({
+            self.SOURCE: [
+                {"name": "Rebuild Show 4K 全02集", "is_dir": True, "size": 0},
+            ],
+            self.BODY: [
+                {"name": "Rebuild Show [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                {"name": "Rebuild Show [02].mkv", "is_dir": False, "size": 1_400_000_000},
+                {"name": "剧场版", "is_dir": True, "size": 0},
+            ],
+            f"{self.BODY}/剧场版": [
+                {
+                    "name": "Rebuild Show the Movie Distant Shore [2160p].mkv",
+                    "is_dir": False,
+                    "size": 9_000_000_000,
+                },
+            ],
+        })
+
+    def _seed_stale_ledger(self, state_root: Path, root_task_id: str, **overrides: object):
+        record = WorkUnitRecord(
+            work_unit_id="stale-unit",
+            root_task_id=root_task_id,
+            boundary_key=self.SOURCE,
+            source_paths=(self.SOURCE,),
+            source_revision=1,
+            role="single_work",
+            display_label="Rebuild Show",
+            media_context="tv",
+            identity_status="confirmed",
+            identity={"media_type": "tv", "tmdb_id": 555, "source": "operator_override"},
+            reconciliation_outcome="uncertain",
+            attention="纯方括号集号未能证明完整唯一正季",
+        )
+        record = replace(record, **overrides) if overrides else record
+        save_work_unit_records(state_root, root_task_id, [record])
+        return record
+
+    def test_parked_unwritten_root_rebuilds_and_retires_the_old_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            rid = "engine-rebuild"
+            self._seed_stale_ledger(state_root, rid)
+            records = rebuild_root_boundary_if_unwritten(
+                self._alist(), self.SOURCE, root_task_id=rid, state_root=state_root,
+            )
+            self.assertIsNotNone(records)
+            assert records is not None
+            self.assertEqual(len(records), 2, msg=[r.display_label for r in records])
+            self.assertEqual(
+                {r.media_context for r in records}, {"tv", "movie"},
+            )
+            # 旧账本必须留证退役，而不是被悄悄覆盖
+            retired = list(state_root.glob(f"work_units_{rid}.retired-*.json"))
+            self.assertEqual(len(retired), 1)
+            payload = json.loads(retired[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["reason"], "boundary_rebuild_before_any_write")
+            self.assertEqual(payload["records"][0]["work_unit_id"], "stale-unit")
+            # 作用域已变，人工确认不得被新单元继承
+            self.assertTrue(all(r.identity is None for r in records))
+            self.assertTrue(all(r.identity_status == "pending" for r in records))
+
+    def test_write_side_fact_refuses_the_rebuild(self) -> None:
+        for field, value in (
+            ("writer_job_id", "writer-1"),
+            ("lane_status", "merge_done"),
+            ("matched_work_root", "/quark/影视/番剧/Rebuild Show"),
+            ("gap_status", "registered"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                state_root = Path(tmp)
+                rid = "engine-written"
+                self._seed_stale_ledger(state_root, rid, **{field: value})
+                self.assertIsNone(rebuild_root_boundary_if_unwritten(
+                    self._alist(), self.SOURCE,
+                    root_task_id=rid, state_root=state_root,
+                ))
+                self.assertEqual(
+                    [r.work_unit_id for r in load_work_unit_records(state_root, rid)],
+                    ["stale-unit"],
+                )
+
+    def test_healthy_in_flight_ledger_is_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            rid = "engine-healthy"
+            self._seed_stale_ledger(
+                state_root, rid, reconciliation_outcome=None, attention=None,
+            )
+            self.assertIsNone(rebuild_root_boundary_if_unwritten(
+                self._alist(), self.SOURCE, root_task_id=rid, state_root=state_root,
+            ))
+            self.assertEqual(
+                [r.work_unit_id for r in load_work_unit_records(state_root, rid)],
+                ["stale-unit"],
+            )
+
+    def test_unchanged_boundary_keeps_the_operator_confirmation(self) -> None:
+        """An identical scope reproduces the unit id, so the override survives."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp)
+            rid = "engine-same"
+            alist = DictAList({
+                self.SOURCE: [
+                    {"name": "Rebuild Show [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                ],
+            })
+            _snapshot, seeded = build_root_boundary_analysis(
+                alist, self.SOURCE, root_task_id=rid,
+            )
+            self.assertEqual(len(seeded), 1)
+            save_work_unit_records(state_root, rid, [replace(
+                seeded[0],
+                identity_status="confirmed",
+                identity={"media_type": "tv", "tmdb_id": 777, "source": "operator_override"},
+                reconciliation_outcome="uncertain",
+            )])
+            records = rebuild_root_boundary_if_unwritten(
+                alist, self.SOURCE, root_task_id=rid, state_root=state_root,
+            )
+            self.assertIsNotNone(records)
+            assert records is not None
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].identity_status, "confirmed")
+            self.assertEqual((records[0].identity or {}).get("tmdb_id"), 777)
 
 
 class WalkSourceRowsTests(unittest.TestCase):
