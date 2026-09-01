@@ -486,8 +486,12 @@ class BoundaryRebuildBeforeWriteTests(unittest.TestCase):
         for field, value in (
             ("writer_job_id", "writer-1"),
             ("lane_status", "merge_done"),
+            ("lane_detail", "已归档"),
             ("matched_work_root", "/quark/影视/番剧/Rebuild Show"),
             ("gap_status", "registered"),
+            ("gap_detail", "S01E03 缺"),
+            ("uncovered_tokens", ("S01E03",)),
+            ("reconciliation_outcome", "new_work"),
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 state_root = Path(tmp)

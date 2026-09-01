@@ -308,14 +308,23 @@ def _has_write_side_facts(record: WorkUnitRecord) -> bool:
 
     Any of these means the ledger is load-bearing: a writer carrier was
     created, an E lane finished, D bound the unit to an existing work root,
-    or J recorded a gap outcome.  A rebuild would re-key the unit and orphan
-    those facts, so it must fail closed.
+    J recorded a gap outcome, or D reached a decision other than the parked
+    ``uncertain``.  A rebuild would re-key the unit and orphan those facts, so
+    it must fail closed.  ``uncertain`` is the one D outcome that is not a
+    decision at all — it records insufficient evidence — so it never blocks.
     """
     return bool(
         record.writer_job_id
         or record.lane_status
+        or record.lane_detail
         or record.matched_work_root
         or record.gap_status
+        or record.gap_detail
+        or record.uncovered_tokens
+        or (
+            record.reconciliation_outcome is not None
+            and record.reconciliation_outcome != "uncertain"
+        )
     )
 
 
