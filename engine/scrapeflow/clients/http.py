@@ -18,6 +18,7 @@ from ..errors import ApiError
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_POSTER_BYTES = 32 * 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
+_CONTENT_RANGE_RE = re.compile(r"bytes[ \t]+([0-9]+)-([0-9]+)/([0-9]+|\*)", re.IGNORECASE)
 SENSITIVE_KEYS = {
     "api_key", "api-key", "password", "passwd", "pass", "archive_pass",
     "archive-password", "token", "access_token", "access-token", "authorization",
@@ -271,4 +272,168 @@ class JsonHttpClient:
             time.sleep(min(2**attempt, 8))
         raise ApiError(
             f"下载失败: {redact_url(url)}; {redact_sensitive_text(str(last_error), secret_values)}"
+        )
+
+    def request_exact_range(
+        self,
+        url: str,
+        *,
+        offset: int,
+        length: int,
+        headers: Mapping[str, str] | None = None,
+        expected_total: int | None = None,
+        url_validator: Callable[[str], None] | None = None,
+    ) -> bytes:
+        """Read one exact HTTP byte range and reject any ambiguous response.
+
+        This primitive is intentionally stricter than :meth:`request_bytes`:
+        a bounded body alone cannot prove that a server honored ``Range``.  A
+        successful response must be HTTP 206, carry one matching
+        ``Content-Range`` field, and contain exactly ``length`` bytes.
+        """
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset 必须是非负整数")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError("length 必须是正整数")
+        if expected_total is not None:
+            if (
+                isinstance(expected_total, bool)
+                or not isinstance(expected_total, int)
+                or expected_total <= 0
+            ):
+                raise ValueError("expected_total 必须是正整数")
+            if offset + length > expected_total:
+                raise ValueError("请求 Range 超出 expected_total")
+
+        end = offset + length - 1
+        request_headers = dict(headers or {})
+        for name in list(request_headers):
+            if name.casefold() == "range":
+                del request_headers[name]
+        request_headers["Range"] = f"bytes={offset}-{end}"
+
+        # Provider links and headers may carry opaque signatures under names we
+        # cannot predict.  Treat every query/header value as secret when an
+        # underlying transport exception is projected into an operator error.
+        secret_values = self._secrets(url, request_headers)
+        secret_values.update(
+            str(value) for value in request_headers.values() if str(value)
+        )
+        try:
+            secret_values.update(
+                value
+                for _key, value in urllib.parse.parse_qsl(
+                    urllib.parse.urlsplit(url).query,
+                    keep_blank_values=True,
+                )
+                if value
+            )
+        except ValueError:
+            pass
+
+        if url_validator is not None:
+            url_validator(url)
+        opener = self._build_opener(url_validator)
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                request = urllib.request.Request(url, headers=request_headers)
+                with opener.open(request, timeout=self.timeout) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        getcode = getattr(response, "getcode", None)
+                        status = getcode() if callable(getcode) else None
+                    if status != 206:
+                        raise ApiError(
+                            "下载服务器未严格执行 HTTP Range: "
+                            f"expected_status=206, actual_status={status!r}; "
+                            f"{redact_url(url)}"
+                        )
+
+                    response_headers = getattr(response, "headers", None)
+                    content_range_values: list[str] = []
+                    if response_headers is not None:
+                        get_all = getattr(response_headers, "get_all", None)
+                        if callable(get_all):
+                            content_range_values = [
+                                str(value) for value in (get_all("Content-Range") or [])
+                            ]
+                        else:
+                            get_header = getattr(response_headers, "get", None)
+                            value = get_header("Content-Range") if callable(get_header) else None
+                            if value is not None:
+                                content_range_values = [str(value)]
+                    if not content_range_values:
+                        getheader = getattr(response, "getheader", None)
+                        value = getheader("Content-Range") if callable(getheader) else None
+                        if value is not None:
+                            content_range_values = [str(value)]
+                    if len(content_range_values) != 1:
+                        raise ApiError(
+                            "下载服务器未返回唯一 Content-Range: "
+                            f"{redact_url(url)}"
+                        )
+
+                    match = _CONTENT_RANGE_RE.fullmatch(content_range_values[0])
+                    if match is None:
+                        raise ApiError(
+                            "下载服务器返回了无效 Content-Range: "
+                            f"{redact_url(url)}"
+                        )
+                    actual_start = int(match.group(1))
+                    actual_end = int(match.group(2))
+                    actual_total_text = match.group(3)
+                    if actual_start != offset or actual_end != end:
+                        raise ApiError(
+                            "下载服务器返回的 Content-Range 范围不匹配: "
+                            f"expected={offset}-{end}, actual={actual_start}-{actual_end}; "
+                            f"{redact_url(url)}"
+                        )
+                    if actual_total_text != "*":
+                        actual_total = int(actual_total_text)
+                        if actual_total <= actual_end:
+                            raise ApiError(
+                                "下载服务器返回了无效 Content-Range 总大小: "
+                                f"{redact_url(url)}"
+                            )
+                        if expected_total is not None and actual_total != expected_total:
+                            raise ApiError(
+                                "下载服务器返回的 Content-Range 总大小不匹配: "
+                                f"expected={expected_total}, actual={actual_total}; "
+                                f"{redact_url(url)}"
+                            )
+                    elif expected_total is not None:
+                        raise ApiError(
+                            "下载服务器未返回可验证的 Content-Range 总大小: "
+                            f"expected={expected_total}; {redact_url(url)}"
+                        )
+
+                    data = response.read(length + 1)
+                if len(data) != length:
+                    raise ApiError(
+                        "Range 响应长度不匹配: "
+                        f"expected={length}, actual={len(data)}; {redact_url(url)}"
+                    )
+                return data
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                if not retryable or attempt >= self.retries:
+                    exc.close()
+                    raise ApiError(
+                        f"Range 下载失败，HTTP {exc.code}: {redact_url(url)}",
+                        status_code=exc.code,
+                    ) from exc
+                exc.close()
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                if attempt >= self.retries:
+                    raise ApiError(
+                        f"Range 下载失败: {redact_url(url)}; "
+                        f"{redact_sensitive_text(str(exc), secret_values)}"
+                    ) from exc
+            time.sleep(min(2**attempt, 8))
+        raise ApiError(
+            f"Range 下载失败: {redact_url(url)}; "
+            f"{redact_sensitive_text(str(last_error), secret_values)}"
         )

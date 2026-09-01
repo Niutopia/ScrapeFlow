@@ -13,10 +13,12 @@ to the AList client protocol.
 from __future__ import annotations
 
 import json
+import math
 import posixpath
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from engine.scrapeflow.media_policy import (
     AUDIO_EXTENSIONS,
@@ -101,6 +103,586 @@ class SourceNode:
     files: tuple[SourceFile, ...]          # direct file children
     children: tuple["SourceNode", ...]     # direct directory children
     depth: int                             # 0 = root, 1 = immediate child, …
+
+
+class DiscAnalysisProjectionError(ValueError):
+    """A verified disc inventory cannot be represented safely for B/W."""
+
+
+_DISC_BLOCK_BYTES = 2048
+_DISC_PROJECTION_KIND = "disc_inventory"
+
+
+def _has_unsafe_projection_text(value: str) -> bool:
+    return any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        for character in value
+    )
+
+
+def _normalize_projection_path(
+    value: object,
+    *,
+    field_name: str,
+    allow_root: bool = False,
+) -> str:
+    """Validate one already-normalized absolute POSIX projection path."""
+    if not isinstance(value, str) or not value:
+        raise DiscAnalysisProjectionError(f"{field_name}必须是非空字符串")
+    if not value.startswith("/") or "\\" in value:
+        raise DiscAnalysisProjectionError(f"{field_name}必须是绝对 POSIX 路径")
+    if _has_unsafe_projection_text(value):
+        raise DiscAnalysisProjectionError(f"{field_name}不能包含控制或不可见字符")
+    if value == "/":
+        if allow_root:
+            return value
+        raise DiscAnalysisProjectionError(f"{field_name}不能是根路径")
+    if value.endswith("/") or posixpath.normpath(value) != value:
+        raise DiscAnalysisProjectionError(f"{field_name}未规范化")
+    if any(part in {"", ".", ".."} for part in value.split("/")[1:]):
+        raise DiscAnalysisProjectionError(f"{field_name}包含无效路径段")
+    return value
+
+
+def _projection_collision_key(path: str) -> str:
+    return "/".join(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in path.split("/")
+    )
+
+
+def _projection_descendant(path: str, root: str) -> bool:
+    return root == "/" or path.startswith(root + "/")
+
+
+def _projection_size(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise DiscAnalysisProjectionError(f"{field_name}必须是非负整数")
+    if isinstance(value, int):
+        size = value
+    elif isinstance(value, str) and value.isdigit():
+        size = int(value)
+    else:
+        raise DiscAnalysisProjectionError(f"{field_name}必须是非负整数")
+    if size < 0:
+        raise DiscAnalysisProjectionError(f"{field_name}必须是非负整数")
+    return size
+
+
+def _projection_version(value: object) -> str | int | float:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise DiscAnalysisProjectionError("backing image version 必须是可序列化标量")
+    if isinstance(value, str) and not value.strip():
+        raise DiscAnalysisProjectionError("backing image version 不能为空")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise DiscAnalysisProjectionError("backing image version 必须是有限值")
+    return value
+
+
+def _projection_name(value: object, *, expected: str, field_name: str) -> str:
+    name = expected if value in (None, "") else value
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or _has_unsafe_projection_text(name)
+        or name != expected
+    ):
+        raise DiscAnalysisProjectionError(f"{field_name}与路径不一致或不安全")
+    return name
+
+
+def _disc_projection_provenance(
+    *,
+    image_path: str,
+    image_size: int,
+    image_version: str | int | float,
+    disc_kind: str,
+    disc_structure: str,
+    inner_path: str,
+) -> dict[str, object]:
+    """Return the immutable physical-source proof copied to every virtual row."""
+    return {
+        "is_virtual": True,
+        "content_expansion": _DISC_PROJECTION_KIND,
+        "backing_image_path": image_path,
+        "backing_image_size": image_size,
+        "backing_image_version": image_version,
+        "disc_kind": disc_kind,
+        "disc_structure": disc_structure,
+        "disc_inner_path": inner_path,
+    }
+
+
+def project_disc_inventories_to_analysis_rows(
+    walk_rows: Sequence[object],
+    root_path: str,
+    inventories: Sequence[object],
+    *,
+    backing_provenance: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Project verified optical-disc contents into a pure B/W row snapshot.
+
+    ``walk_rows`` remains the physical provider snapshot and is never mutated.
+    For each verified inventory, its one physical image-file row is replaced
+    *only in the returned analysis view* by a virtual directory at the same
+    path plus the inventory's inner directories/files.  Consequently the
+    original rows — not this return value — remain the sole valid input to a
+    :class:`SourceManifest`; virtual M2TS/VOB/MPLS rows never become source
+    ownership objects.
+
+    ``backing_provenance`` is keyed by ``DiscInventory.image_path`` and must
+    provide exact ``size`` and non-empty ``version`` values observed by the
+    same read-only probe.  Every virtual row carries that path/size/version so
+    a later integration layer can map logical B/W evidence back to the single
+    physical ISO/UDF object without inventing a second source object.
+
+    This helper is intentionally domain-neutral: it performs no title,
+    season, episode, playlist, acquisition, planning, or writer decisions.
+    It only validates and projects an already-proven filesystem inventory.
+    """
+    root = _normalize_projection_path(
+        root_path,
+        field_name="analysis root",
+        allow_root=True,
+    )
+    if not isinstance(backing_provenance, Mapping):
+        raise DiscAnalysisProjectionError("backing provenance 必须是路径映射")
+
+    # Validate/copy the physical listing first.  Projection is fail-closed on
+    # duplicate exact paths and provider-ambiguous case/Unicode spellings.
+    physical_rows: list[dict[str, object]] = []
+    physical_by_path: dict[str, dict[str, object]] = {}
+    physical_collision_paths: dict[str, str] = {}
+    for raw_row in walk_rows:
+        if not isinstance(raw_row, Mapping):
+            raise DiscAnalysisProjectionError("来源 analysis row 必须是映射")
+        row = dict(raw_row)
+        raw_path = row.get("full_path")
+        if raw_path in (None, ""):
+            raw_path = row.get("path")
+        path = _normalize_projection_path(raw_path, field_name="来源路径")
+        if not _projection_descendant(path, root):
+            raise DiscAnalysisProjectionError("来源路径不属于 analysis root")
+        if path in physical_by_path:
+            raise DiscAnalysisProjectionError("来源 rows 包含重复路径")
+        collision_key = _projection_collision_key(path)
+        collision_path = physical_collision_paths.get(collision_key)
+        if collision_path is not None:
+            raise DiscAnalysisProjectionError(
+                "来源 rows 包含大小写或 Unicode 路径碰撞"
+            )
+        expected_name = posixpath.basename(path)
+        row["name"] = _projection_name(
+            row.get("name"),
+            expected=expected_name,
+            field_name="来源名称",
+        )
+        row["full_path"] = path
+        is_directory = row.get("is_dir") is True
+        row["is_dir"] = is_directory
+        if is_directory:
+            row["size"] = _projection_size(
+                row.get("size", 0),
+                field_name="来源目录大小",
+            )
+        else:
+            if "size" not in row or row.get("size") is None:
+                raise DiscAnalysisProjectionError("来源文件缺少大小")
+            row["size"] = _projection_size(
+                row.get("size"),
+                field_name="来源文件大小",
+            )
+        if row.get("version") not in (None, ""):
+            _projection_version(row.get("version"))
+        physical_rows.append(row)
+        physical_by_path[path] = row
+        physical_collision_paths[collision_key] = path
+
+    ordered_physical_paths = sorted(physical_by_path)
+    for index, path in enumerate(ordered_physical_paths[:-1]):
+        row = physical_by_path[path]
+        if row.get("is_dir") is True:
+            continue
+        if ordered_physical_paths[index + 1].startswith(path + "/"):
+            raise DiscAnalysisProjectionError(
+                "来源 rows 把文件同时当作了后代路径的目录"
+            )
+
+    provenance_by_path: dict[str, tuple[int, str | int | float]] = {}
+    provenance_collision_paths: dict[str, str] = {}
+    for raw_path, raw_provenance in backing_provenance.items():
+        path = _normalize_projection_path(raw_path, field_name="backing image path")
+        if not _projection_descendant(path, root):
+            raise DiscAnalysisProjectionError(
+                "backing image path 不属于 analysis root"
+            )
+        if not isinstance(raw_provenance, Mapping):
+            raise DiscAnalysisProjectionError("backing provenance 条目必须是映射")
+        if "size" not in raw_provenance:
+            raise DiscAnalysisProjectionError("backing provenance 缺少 size")
+        if "version" not in raw_provenance:
+            raise DiscAnalysisProjectionError("backing provenance 缺少 version")
+        size = _projection_size(
+            raw_provenance.get("size"),
+            field_name="backing image size",
+        )
+        if size <= 0:
+            raise DiscAnalysisProjectionError("backing image size 必须大于零")
+        version = _projection_version(raw_provenance.get("version"))
+        collision_key = _projection_collision_key(path)
+        collision_path = provenance_collision_paths.get(collision_key)
+        if collision_path is not None:
+            raise DiscAnalysisProjectionError(
+                "backing provenance 包含大小写或 Unicode 路径碰撞"
+            )
+        provenance_by_path[path] = (size, version)
+        provenance_collision_paths[collision_key] = path
+
+    inventory_by_path: dict[str, object] = {}
+    inventory_collision_paths: dict[str, str] = {}
+    for inventory in inventories:
+        image_path = _normalize_projection_path(
+            getattr(inventory, "image_path", None),
+            field_name="DiscInventory.image_path",
+        )
+        if not _projection_descendant(image_path, root):
+            raise DiscAnalysisProjectionError(
+                "DiscInventory.image_path 不属于 analysis root"
+            )
+        if image_path in inventory_by_path:
+            raise DiscAnalysisProjectionError("DiscInventory 路径重复")
+        collision_key = _projection_collision_key(image_path)
+        collision_path = inventory_collision_paths.get(collision_key)
+        if collision_path is not None:
+            raise DiscAnalysisProjectionError(
+                "DiscInventory 包含大小写或 Unicode 路径碰撞"
+            )
+        inventory_by_path[image_path] = inventory
+        inventory_collision_paths[collision_key] = image_path
+
+    if set(inventory_by_path) != set(provenance_by_path):
+        raise DiscAnalysisProjectionError(
+            "DiscInventory 与 backing provenance 路径集合不一致"
+        )
+
+    validated: list[
+        tuple[
+            str,
+            object,
+            int,
+            str | int | float,
+            str,
+            str,
+            tuple[object, ...],
+        ]
+    ] = []
+    for image_path in sorted(inventory_by_path, key=_projection_collision_key):
+        inventory = inventory_by_path[image_path]
+        image_size, image_version = provenance_by_path[image_path]
+        physical_row = physical_by_path.get(image_path)
+        if physical_row is None:
+            raise DiscAnalysisProjectionError(
+                "backing image 不存在于物理来源 rows"
+            )
+        if physical_row.get("is_dir") is True:
+            raise DiscAnalysisProjectionError("backing image 不能是目录")
+        physical_type = physical_row.get("object_type")
+        if not (
+            isinstance(physical_type, str)
+            and physical_type.strip().casefold() == "disc_image"
+        ) and classify_object_type(str(physical_row["name"])) != "disc_image":
+            raise DiscAnalysisProjectionError(
+                "backing image 不是受支持的光盘镜像来源对象"
+            )
+        if physical_row.get("size") != image_size:
+            raise DiscAnalysisProjectionError(
+                "backing image size 与物理来源 row 不一致"
+            )
+        observed_version: object = physical_row.get("version")
+        if observed_version in (None, ""):
+            for key in ("modified", "updated_at", "mtime", "last_modified"):
+                candidate = physical_row.get(key)
+                if candidate not in (None, ""):
+                    observed_version = candidate
+                    break
+        if observed_version not in (None, ""):
+            normalized_observed = _projection_version(observed_version)
+            if str(normalized_observed) != str(image_version):
+                raise DiscAnalysisProjectionError(
+                    "backing image version 与物理来源 row 不一致"
+                )
+
+        disc_kind = getattr(inventory, "kind", None)
+        if disc_kind not in {"udf", "iso9660"}:
+            raise DiscAnalysisProjectionError("DiscInventory.kind 不受支持")
+        disc_structure = getattr(inventory, "structure", None)
+        if disc_structure not in {"bdmv", "video_ts", "flat", "unknown"}:
+            raise DiscAnalysisProjectionError("DiscInventory.structure 不受支持")
+        try:
+            inner_files = tuple(getattr(inventory, "inner_files"))
+        except (AttributeError, TypeError) as exc:
+            raise DiscAnalysisProjectionError(
+                "DiscInventory.inner_files 无效"
+            ) from exc
+        if not inner_files:
+            raise DiscAnalysisProjectionError(
+                "DiscInventory 为空，不能隐藏物理镜像来源对象"
+            )
+        validated.append(
+            (
+                image_path,
+                inventory,
+                image_size,
+                image_version,
+                disc_kind,
+                disc_structure,
+                inner_files,
+            )
+        )
+
+    expanded_paths = set(inventory_by_path)
+    analysis_rows = [
+        row for row in physical_rows
+        if str(row["full_path"]) not in expanded_paths
+    ]
+
+    # Track both exact and provider-ambiguous paths across the final virtual
+    # view.  Reusing an ancestor directory generated by the same image is the
+    # sole allowed duplicate; file/file, file/directory, cross-image, and
+    # physical/virtual collisions all fail closed.
+    path_kinds: dict[str, str] = {}
+    collision_paths: dict[str, str] = {}
+    for row in analysis_rows:
+        path = str(row["full_path"])
+        kind = "directory" if row.get("is_dir") is True else "file"
+        path_kinds[path] = kind
+        collision_paths[_projection_collision_key(path)] = path
+
+    def add_virtual_row(row: dict[str, object], *, kind: str) -> None:
+        path = str(row["full_path"])
+        collision_key = _projection_collision_key(path)
+        collision_path = collision_paths.get(collision_key)
+        if collision_path is not None:
+            if (
+                collision_path == path
+                and path_kinds.get(path) == "directory"
+                and kind == "directory"
+            ):
+                return
+            raise DiscAnalysisProjectionError(
+                "虚拟 disc analysis row 与现有路径碰撞或重复"
+            )
+        path_kinds[path] = kind
+        collision_paths[collision_key] = path
+        analysis_rows.append(row)
+
+    for (
+        image_path,
+        _inventory,
+        image_size,
+        image_version,
+        disc_kind,
+        disc_structure,
+        inner_files,
+    ) in validated:
+        root_provenance = _disc_projection_provenance(
+            image_path=image_path,
+            image_size=image_size,
+            image_version=image_version,
+            disc_kind=disc_kind,
+            disc_structure=disc_structure,
+            inner_path="/",
+        )
+        add_virtual_row(
+            {
+                "name": posixpath.basename(image_path),
+                "is_dir": True,
+                "full_path": image_path,
+                "size": 0,
+                "modified": "",
+                "object_type": "directory",
+                **root_provenance,
+            },
+            kind="directory",
+        )
+
+        ordered_inner_files: list[tuple[str, object]] = []
+        seen_inner_paths: set[str] = set()
+        seen_inner_collision_paths: dict[str, str] = {}
+        for inner_file in inner_files:
+            inner_path = _normalize_projection_path(
+                getattr(inner_file, "inner_path", None),
+                field_name="DiscInventory inner path",
+            )
+            if inner_path in seen_inner_paths:
+                raise DiscAnalysisProjectionError(
+                    "DiscInventory 包含重复 inner path"
+                )
+            collision_key = _projection_collision_key(inner_path)
+            collision_path = seen_inner_collision_paths.get(collision_key)
+            if collision_path is not None:
+                raise DiscAnalysisProjectionError(
+                    "DiscInventory 包含大小写或 Unicode inner path 碰撞"
+                )
+            seen_inner_paths.add(inner_path)
+            seen_inner_collision_paths[collision_key] = inner_path
+            ordered_inner_files.append((inner_path, inner_file))
+
+        for inner_path, inner_file in sorted(
+            ordered_inner_files,
+            key=lambda item: _projection_collision_key(item[0]),
+        ):
+            parts = inner_path.split("/")[1:]
+            for index in range(1, len(parts)):
+                directory_inner_path = "/" + "/".join(parts[:index])
+                virtual_directory_path = image_path + directory_inner_path
+                provenance = _disc_projection_provenance(
+                    image_path=image_path,
+                    image_size=image_size,
+                    image_version=image_version,
+                    disc_kind=disc_kind,
+                    disc_structure=disc_structure,
+                    inner_path=directory_inner_path,
+                )
+                add_virtual_row(
+                    {
+                        "name": parts[index - 1],
+                        "is_dir": True,
+                        "full_path": virtual_directory_path,
+                        "size": 0,
+                        "modified": "",
+                        "object_type": "directory",
+                        **provenance,
+                    },
+                    kind="directory",
+                )
+
+            inner_size = _projection_size(
+                getattr(inner_file, "size", None),
+                field_name="DiscInventory inner file size",
+            )
+            try:
+                raw_extents = tuple(getattr(inner_file, "extents"))
+            except (AttributeError, TypeError) as exc:
+                raise DiscAnalysisProjectionError(
+                    "DiscInventory inner file extents 无效"
+                ) from exc
+            extents: list[tuple[int, int]] = []
+            byte_ranges: list[tuple[int, int]] = []
+            for raw_extent in raw_extents:
+                if (
+                    not isinstance(raw_extent, (tuple, list))
+                    or len(raw_extent) != 2
+                ):
+                    raise DiscAnalysisProjectionError(
+                        "DiscInventory extent 必须是 (lba, block_count)"
+                    )
+                lba, block_count = raw_extent
+                if (
+                    isinstance(lba, bool)
+                    or not isinstance(lba, int)
+                    or lba < 0
+                    or isinstance(block_count, bool)
+                    or not isinstance(block_count, int)
+                    or block_count <= 0
+                ):
+                    raise DiscAnalysisProjectionError(
+                        "DiscInventory extent 坐标无效"
+                    )
+                byte_start = lba * _DISC_BLOCK_BYTES
+                byte_end = (lba + block_count) * _DISC_BLOCK_BYTES
+                if byte_end > image_size:
+                    raise DiscAnalysisProjectionError(
+                        "DiscInventory extent 越过 backing image size"
+                    )
+                if any(
+                    byte_start < existing_end and existing_start < byte_end
+                    for existing_start, existing_end in byte_ranges
+                ):
+                    raise DiscAnalysisProjectionError(
+                        "DiscInventory inner file extent 重叠或重复"
+                    )
+                extents.append((lba, block_count))
+                byte_ranges.append((byte_start, byte_end))
+
+            extent_capacity = sum(
+                block_count * _DISC_BLOCK_BYTES
+                for _, block_count in extents
+            )
+            if inner_size == 0:
+                if extents:
+                    raise DiscAnalysisProjectionError(
+                        "零字节 inner file 不得声明正长度 extent"
+                    )
+            elif (
+                not extents
+                or extent_capacity < inner_size
+                or extent_capacity - inner_size >= _DISC_BLOCK_BYTES
+            ):
+                raise DiscAnalysisProjectionError(
+                    "DiscInventory extent 未精确覆盖 inner file size"
+                )
+
+            virtual_file_path = image_path + inner_path
+            provenance = _disc_projection_provenance(
+                image_path=image_path,
+                image_size=image_size,
+                image_version=image_version,
+                disc_kind=disc_kind,
+                disc_structure=disc_structure,
+                inner_path=inner_path,
+            )
+            name = parts[-1]
+            add_virtual_row(
+                {
+                    "name": name,
+                    "is_dir": False,
+                    "full_path": virtual_file_path,
+                    "size": inner_size,
+                    "modified": "",
+                    "object_type": classify_object_type(name),
+                    "disc_extents": [list(extent) for extent in extents],
+                    **provenance,
+                },
+                kind="file",
+            )
+
+    return sorted(
+        analysis_rows,
+        key=lambda row: (
+            _projection_collision_key(str(row["full_path"])),
+            0 if row.get("is_dir") is True else 1,
+            str(row["full_path"]),
+        ),
+    )
+
+
+def project_disc_inventory_to_analysis_rows(
+    walk_rows: Sequence[object],
+    root_path: str,
+    inventory: object,
+    *,
+    backing_size: int,
+    backing_version: str | int | float,
+) -> list[dict[str, object]]:
+    """Single-image convenience wrapper for the plural projection helper."""
+    image_path = getattr(inventory, "image_path", None)
+    if not isinstance(image_path, str):
+        raise DiscAnalysisProjectionError("DiscInventory.image_path 无效")
+    return project_disc_inventories_to_analysis_rows(
+        walk_rows,
+        root_path,
+        (inventory,),
+        backing_provenance={
+            image_path: {
+                "size": backing_size,
+                "version": backing_version,
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
