@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 import unittest
 
+from engine.scrapeflow.source_inventory import SourceFile
+from engine.scrapeflow.work_units import is_physical_special_video_file
+
 from engine.scrapeflow.core import (
     EpisodeKey,
     _map_explicit_special_release_runs,
@@ -125,6 +128,32 @@ class NumberedPhysicalSpecialMarkerScopeTests(unittest.TestCase):
             ),
         }
         self.assertEqual(_numbered_physical_special_markers([unnumbered]), set())
+
+    def test_creditless_theme_video_is_never_a_physical_special(self) -> None:
+        """A numbered NCOP/NCED disc volume is residual, not a story special.
+
+        ``[Ygm] Kuroshitsuji BD-BOX [SP01] NCOP [01 [ S1 ]]`` carries a volume
+        ``SP01`` token, so eight NCOP/NCED files joined the physical-special run
+        and outvoted the single real OVA beside them — D could then prove no
+        Season 00 coordinate at all for the whole unit.
+        """
+        def video(name: str) -> SourceFile:
+            return SourceFile(
+                path=f"/incoming/黑执事/1.黑执事 第一季/{name}",
+                name=name, size=200_000_000, object_type="video", modified="",
+            )
+
+        for name in (
+            "[Ygm] Kuroshitsuji BD-BOX [SP01] NCOP [01 [ S1 ]][Ma10p_2160p].mkv",
+            "[Ygm] Kuroshitsuji BD-BOX [SP02] NCED [04 [ S2-EP.08 ]][Ma10p_2160p].mkv",
+            "Show [SP03] NCOP.mkv",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(is_physical_special_video_file(video(name)))
+        # 真正的物理特别篇不受影响
+        for name in ("[Ygm] Show OVA [01].mkv", "[Ygm] Show [SP01].mkv", "Show OAD 02.mkv"):
+            with self.subTest(name=name):
+                self.assertTrue(is_physical_special_video_file(video(name)))
 
     def test_own_stem_reversed_ordinal_still_counts(self) -> None:
         real = {

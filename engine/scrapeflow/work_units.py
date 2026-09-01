@@ -29,6 +29,7 @@ from engine.scrapeflow.boundary_analysis import (
     _season_number_from_directory_name,
 )
 from engine.scrapeflow.media_policy import DISC_IMAGE_INSPECTION_REQUIRED
+from engine.scrapeflow.residual_policy import _THEME_VIDEO_RE
 from engine.scrapeflow.source_inventory import (
     SourceFile,
     SourceNode,
@@ -639,6 +640,14 @@ def is_physical_special_video_file(file: SourceFile) -> bool:
     ``physical_special_marker_evidence``, never through this predicate alone.
     """
     text = unicodedata.normalize("NFKC", f"{file.path} {file.name}")
+    # A proven creditless theme video is non-story residual, never a story
+    # special — even when the disc release numbers it like one.  ``[Ygm]
+    # Kuroshitsuji BD-BOX [SP01] NCOP [01 [ S1 ]]`` carries a volume ``SP01``
+    # token, so it used to join the physical-special run and pollute the whole
+    # unit's Season 00 grammar: eight NCOP/NCED files outvoted the single real
+    # OVA beside them and D could prove no coordinate at all.
+    if _THEME_VIDEO_RE.search(file.name):
+        return False
     if _PHYSICAL_SPECIAL_MARKER_RE.search(text):
         return True
     if _REVERSE_PHYSICAL_SPECIAL_MARKER_RE.search(text):
