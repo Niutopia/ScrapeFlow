@@ -253,6 +253,76 @@ class ContainerNestingTests(unittest.TestCase):
         self.assertEqual(events[1]["parent_path"], "/library/番剧/Work (45782)")
         self.assertEqual(events[1]["tmdb_id"], 413594)
 
+    def test_established_library_container_absorbs_a_later_root(self) -> None:
+        """A later root joins the container the library already established.
+
+        An earlier `钢之炼金术师` root wrote the 2003 series plus two films under
+        `/library/番剧/钢之炼金术师/`.  When the FA remake and its own film come
+        back as a new root, the single-TV rule planned the TV at the shelf root
+        and produced the sibling tree `/library/番剧/钢之炼金术师 FA`.  The
+        library's own structure is the evidence: work child directories and no
+        season directory of its own means this is a container to join.
+        """
+        files = {
+            "/incoming/钢之炼金术师/FA 全02集/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/钢之炼金术师/FA 全02集/S01E02.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/钢之炼金术师/剧场版/movie.mkv": FAKE_VIDEO_BYTES,
+            # 早前根建立的容器：两个作品子目录，容器自身没有季目录
+            "/library/番剧/钢之炼金术师/钢之炼金术师/Season 01/old.mkv": FAKE_VIDEO_BYTES,
+            "/library/番剧/钢之炼金术师/钢之炼金术师-香巴拉的征服者 (2005)/old.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, events = self._setup(files)
+        root_id = self._root(runner, "/incoming/钢之炼金术师")
+        analyze_root_boundaries(
+            alist, "/incoming/钢之炼金术师", root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(records), 2, msg=[r.display_label for r in records])
+        apply_work_unit_override(
+            state_root, root_id,
+            self._record_for_source_leaf(records, "FA 全02集").work_unit_id,
+            media_type="tv", tmdb_id=31911,
+        )
+        apply_work_unit_override(
+            state_root, root_id,
+            self._record_for_source_leaf(records, "剧场版").work_unit_id,
+            media_type="movie", tmdb_id=80518,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_id)
+        execute_new_work_units(runner, state_root, root_id)
+
+        parents = {event["parent_path"] for event in events}
+        self.assertEqual(parents, {"/library/番剧/钢之炼金术师"})
+        self.assertNotIn("/library/番剧", parents)
+
+    def test_existing_work_root_with_seasons_is_not_treated_as_a_container(self) -> None:
+        """A plain work root owning its seasons keeps the ordinary layout."""
+        files = {
+            "/incoming/刀剑神域/第一季/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/刀剑神域/序列之争/movie.mkv": FAKE_VIDEO_BYTES,
+            # 已有的是作品根本体（自己带季目录），不是容器
+            "/library/番剧/刀剑神域/Season 01/old.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, events = self._setup(files)
+        root_id = self._root(runner, "/incoming/刀剑神域")
+        analyze_root_boundaries(
+            alist, "/incoming/刀剑神域", root_task_id=root_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_id)
+        apply_work_unit_override(
+            state_root, root_id,
+            self._record_for_source_leaf(records, "第一季").work_unit_id,
+            media_type="tv", tmdb_id=45782,
+        )
+        apply_work_unit_override(
+            state_root, root_id,
+            self._record_for_source_leaf(records, "序列之争").work_unit_id,
+            media_type="movie", tmdb_id=413594,
+        )
+        reconcile_root_work_units(alist, "/library", state_root, root_id)
+        execute_new_work_units(runner, state_root, root_id)
+        self.assertIn("/library/番剧", {event["parent_path"] for event in events})
+
     def test_junk_container_name_falls_back_to_first_tv_boundary(self) -> None:
         files = {
             "/incoming/无！！！32生/Show A/S01E01.mkv": FAKE_VIDEO_BYTES,

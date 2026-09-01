@@ -1747,6 +1747,59 @@ def _collection_directory_label(name: str) -> str | None:
     return collection_directory_label(name)
 
 
+_SEASON_DIRECTORY_RE = re.compile(r"(?:Season\s*\d{1,3}|Specials)", re.IGNORECASE)
+
+
+def _existing_library_container(
+    runner: SimpleEngineRunner,
+    root_job: EngineJob,
+) -> str | None:
+    """Return this intake folder's already-established library container.
+
+    Container continuation must be read off the library, not re-derived from
+    the current root's records: an earlier root can have written one TV work
+    plus its films under ``<shelf>/<cleaned intake name>/``, and this root's
+    own units are then only part of the family.
+
+    The evidence is deliberately structural and bounded to one listing:
+
+    * the directory ``<shelf>/<cleaned intake name>`` exists,
+    * it holds at least one child **directory** (a work child), and
+    * none of its children is a ``Season xx`` directory — a work root owns
+      its seasons directly, so seeing one means this is a work, not a
+      container, and the ordinary merge path must keep handling it.
+
+    Any listing failure returns ``None``: continuation is a placement
+    improvement, never a correctness gate.
+    """
+    shelf_root = target_root_for_shelf(
+        runner.library_root, str(root_job.target_shelf or "anime")
+    )
+    intake_basename = posixpath.basename(
+        str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
+    )
+    container_name = _clean_container_name(intake_basename)
+    if not container_name:
+        return None
+    candidate = f"{shelf_root}/{container_name}"
+    try:
+        rows = runner.alist.list(candidate, refresh=True)
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    child_directories = [
+        str(row.get("name") or "")
+        for row in rows
+        if isinstance(row, Mapping) and row.get("is_dir") is True
+    ]
+    if not child_directories:
+        return None
+    if any(_SEASON_DIRECTORY_RE.fullmatch(name.strip()) for name in child_directories):
+        return None
+    return candidate
+
+
 def _container_plan(
     runner: SimpleEngineRunner,
     root_job: EngineJob,
@@ -1772,6 +1825,29 @@ def _container_plan(
     """
     if len(records) <= 1:
         return list(records), None, None
+    existing = _existing_library_container(runner, root_job)
+    if existing is not None:
+        # The library already decided this intake folder is a container: it
+        # holds work child directories and no season directory of its own.
+        # A later root must join that container instead of planning a sibling
+        # at the shelf root — that is how `/番剧/钢之炼金术师 FA` appeared beside
+        # `/番剧/钢之炼金术师` while the reviewed layout wants
+        # `/番剧/钢之炼金术师/钢之炼金术师 FA`.  Every unit becomes a direct
+        # child, exactly as the pure-container path below already does.
+        ordered = sorted(
+            records,
+            key=lambda record: (
+                0
+                if str((record.identity or {}).get("media_type") or "") == "tv"
+                and not _is_physical_special_record(record)
+                else 1
+                if str((record.identity or {}).get("media_type") or "") == "tv"
+                else 2,
+                str((record.identity or {}).get("tmdb_id") or ""),
+                record.work_unit_id,
+            ),
+        )
+        return ordered, existing, None
     main_tmdb = _main_tv_identity(records)
     if main_tmdb is not None:
         ordered = sorted(records, key=lambda record: (
