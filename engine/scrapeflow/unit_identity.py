@@ -22,12 +22,15 @@ from .boundary_analysis import (
     BoundaryEvidence,
     DirectoryRole,
     WorkCandidate,
+    _direct_movie_title_is_substantial,
+    _direct_movie_title_key,
 )
 from .errors import PlanError
 from .identity_matching import (
     AutoMatchAmbiguityError,
     auto_match_from_evidence,
     bounded_auto_match_candidate_rows,
+    _normalize_match_title,
 )
 from .media_policy import DISC_IMAGE_INSPECTION_REQUIRED
 from .root_boundaries import load_source_snapshot
@@ -98,6 +101,42 @@ def _common_parent_labels(root: SourceNode, units: tuple[SourceNode, ...]) -> tu
             break
         common.append(parts[0])
     return tuple(common)
+
+
+def _useful_parent_labels(
+    record: WorkUnitRecord,
+    own_label: str,
+    labels: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Drop ancestor labels that cannot add title evidence to this unit.
+
+    Ancestor escalation exists to rescue a bare child (``第一季``) whose parent
+    carries the title, and a franchise sub-work still needs its parent's
+    standalone query to be issued — so the filter stays narrow.
+
+    A *proven film boundary that names itself* is the one shape where an
+    ancestor can only mislead: ``剧场版/[AI-Raws] … the Movie The Sacred Star
+    of Milos ….mkv`` escalated with ``钢之炼金术师`` matched the parent
+    **series** ``tv/31911``; on its own label it matches ``movie/80518``
+    correctly.  The ancestor there is a different work, not a missing title.
+
+    Everything else is left untouched.
+    """
+    if not labels:
+        return ()
+    if record.role == DirectoryRole.MOVIE_COLLECTION.value and (
+        _movie_title_names_itself(own_label)
+    ):
+        return ()
+    return labels
+
+
+def _movie_title_names_itself(label: str) -> bool:
+    """Whether a film boundary label carries a substantial standalone title."""
+    return bool(
+        _direct_movie_title_key(label)
+        and _direct_movie_title_is_substantial(label)
+    )
 
 
 def _source_nodes_by_path(root: SourceNode) -> dict[str, SourceNode]:
@@ -431,7 +470,11 @@ def resolve_work_unit_identities(
         evidence: IdentityEvidence = extract_identity_evidence(
             candidate,
             subnode,
-            parent_labels=_common_parent_labels(node, scoped_units),
+            parent_labels=_useful_parent_labels(
+                record,
+                candidate.display_label,
+                _common_parent_labels(node, scoped_units),
+            ),
         )
         try:
             best, candidates = auto_match_from_evidence(

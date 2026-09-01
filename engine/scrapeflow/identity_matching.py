@@ -1954,7 +1954,19 @@ def _select_auto_match(
             f"{best.title} ({best.year})",
             candidates=ordered,
         )
-    runner_up = ordered[1] if len(ordered) > 1 else None
+    # An explicit source year is hard evidence: a candidate whose own year
+    # contradicts it by two or more years cannot be the answer, so it must not
+    # be allowed to block the decision either.  ``钢之炼金术师 FA（2009）…``
+    # escalated with its intake root scored an exact 1.0 against both the 2003
+    # original (tv/37863) and the 2009 remake (tv/31911); only the year told
+    # them apart, and the margin check could not see it.
+    def _year_blocked(item: AutoMatch) -> bool:
+        return "year_conflict" in (item.decision_trace.get("blockers") or [])
+
+    runner_up = next(
+        (item for item in ordered[1:] if not _year_blocked(item)),
+        None,
+    ) if not _year_blocked(best) else (ordered[1] if len(ordered) > 1 else None)
     best_exact = max(
         float(best.score_components.get("title_score", 0.0)),
         float(best.score_components.get("alias_score", 0.0)),

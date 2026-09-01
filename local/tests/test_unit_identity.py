@@ -14,6 +14,7 @@ from engine.scrapeflow.boundary_analysis import DirectoryRole
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
 from engine.scrapeflow.unit_identity import (
     _boundary_media_form_conflict,
+    _useful_parent_labels,
     apply_work_unit_override,
     requeue_uncertain_work_units,
     resolve_work_unit_identities,
@@ -550,6 +551,66 @@ class WorkUnitIdentityTests(unittest.TestCase):
         self.assertIsNone(_boundary_media_form_conflict(
             replace(record, role=DirectoryRole.SEASON.value), tv_best,
         ))
+
+    def test_year_conflicting_runner_up_never_blocks_the_decision(self) -> None:
+        """An explicit source year breaks an otherwise exact two-way tie.
+
+        ``钢之炼金术师 FA（2009）…`` escalated with its intake root matched the
+        2003 original and the 2009 remake at an exact 1.0 each.  The margin
+        check could not see that only one of them can air in 2009, so the whole
+        64-episode root parked forever.
+        """
+        from engine.scrapeflow.identity_matching import auto_match_tmdb
+
+        class TwoEraTMDB:
+            def get(self, path: str, **params: object) -> dict:
+                if path == "/search/tv":
+                    return {"results": [
+                        {"id": 31911, "name": "钢之炼金术师 FA",
+                         "first_air_date": "2009-04-05", "genre_ids": [16]},
+                        {"id": 37863, "name": "钢之炼金术师",
+                         "first_air_date": "2003-10-04", "genre_ids": [16]},
+                    ]}
+                if path in {"/tv/31911", "/tv/37863"}:
+                    return {}
+                if path.endswith("/alternative_titles"):
+                    return {"results": []}
+                return {}
+
+        best, ordered = auto_match_tmdb(
+            TwoEraTMDB(),
+            "钢之炼金术师 FA 2009",
+            media_type="tv",
+            min_confidence=0.70,
+            prefer_animation=True,
+        )
+        self.assertEqual(best.tmdb_id, 31911)
+        blocked = [
+            item for item in ordered
+            if "year_conflict" in (item.decision_trace.get("blockers") or [])
+        ]
+        self.assertEqual([item.tmdb_id for item in blocked], [37863])
+
+    def test_self_named_film_boundary_drops_ancestor_labels(self) -> None:
+        """A film that names itself must not be queried through its parent show."""
+        film = WorkUnitRecord(
+            work_unit_id="unit-film", root_task_id="root",
+            boundary_key="/x/剧场版/Feature.mkv", source_paths=("/x/剧场版/Feature.mkv",),
+            source_revision=1, role=DirectoryRole.MOVIE_COLLECTION.value,
+            media_context="movie",
+        )
+        own = "[AI-Raws] Fullmetal Alchemist the Movie The Sacred Star of Milos [2160p]"
+        self.assertEqual(_useful_parent_labels(film, own, ("钢之炼金术师",)), ())
+        # 裸标签的电影边界仍然需要祖先救援
+        self.assertEqual(
+            _useful_parent_labels(film, "剧场版", ("钢之炼金术师",)), ("钢之炼金术师",),
+        )
+        # 非电影边界一律不动，系列子作品仍能拿到父级独立查询
+        season = replace(film, role=DirectoryRole.SEASON.value)
+        self.assertEqual(
+            _useful_parent_labels(season, "命运石之门 聪明睿智的认知计算", ("命运石之门",)),
+            ("命运石之门",),
+        )
 
     def test_override_validates_the_confirmation_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
