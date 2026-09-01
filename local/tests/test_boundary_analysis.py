@@ -1744,6 +1744,131 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertEqual(candidates[0].display_label, root.split("/")[-1])
         self.assertEqual(candidates[0].boundary_evidence.role, DirectoryRole.SINGLE_WORK)
 
+    def test_episode_body_splits_from_bare_theatrical_group(self) -> None:
+        """A TV body plus a generic ``剧场版`` group is two works, not one.
+
+        ``钢之炼金术师 FA …/`` keeps the whole episode run as direct files and
+        hangs the feature off a bare ``剧场版`` folder.  The folder label names
+        no film, so only the file's own substantial standalone title proves the
+        second work — the episode body must not swallow a 22 GB feature.
+        """
+        root = "/quark/影视/待刮削/钢之炼金术师"
+        episodes = [
+            {
+                "name": f"[MAI] Fullmetal Alchemist: Brotherhood [{index:02d}][Ma10p_2160p][x265_flac_ass].mkv",
+                "is_dir": False,
+                "size": 1_400_000_000,
+            }
+            for index in range(1, 65)
+        ]
+        fixture = {
+            "root": root,
+            "children": [
+                {
+                    "name": "钢之炼金术师 FA（2009）4K超清2160P收藏版 全64集 110.2G",
+                    "is_dir": True,
+                    "children": episodes + [
+                        {
+                            "name": "[MAI&POPGO] Fullmetal Alchemist: Brotherhood [Fonts].exe",
+                            "is_dir": False,
+                            "size": 50_797_113,
+                        },
+                        {
+                            "name": "剧场版",
+                            "is_dir": True,
+                            "children": [
+                                {
+                                    "name": "[AI-Raws] Fullmetal Alchemist the Movie The Sacred Star of Milos [Ma10p_2160p][x265_DTS-HD5.1_ass].mkv",
+                                    "is_dir": False,
+                                    "size": 22_087_828_467,
+                                },
+                                {
+                                    "name": "[Kamigami] Fullmetal Alchemist the Movie The Sacred Star of Milos [Fonts].exe",
+                                    "is_dir": False,
+                                    "size": 7_393_862,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 2, msg=[c.display_label for c in candidates])
+        contexts = {c.proposed_media_context for c in candidates}
+        self.assertEqual(contexts, {"tv", "movie"})
+        tv = next(c for c in candidates if c.proposed_media_context == "tv")
+        movie = next(c for c in candidates if c.proposed_media_context == "movie")
+        self.assertEqual(movie.boundary_evidence.role, DirectoryRole.MOVIE_COLLECTION)
+        self.assertTrue(movie.source_paths[0].endswith("Milos [Ma10p_2160p][x265_DTS-HD5.1_ass].mkv"))
+        # 剧集单元必须精确拿住自己的直接文件，且绝不覆盖电影所在子树
+        self.assertEqual(len(tv.source_paths), 65)
+        self.assertTrue(all("/剧场版/" not in path for path in tv.source_paths))
+        self.assertNotIn(movie.source_paths[0], tv.source_paths)
+
+    def test_episode_body_keeps_whole_boundary_when_group_holds_a_run(self) -> None:
+        """A bracket-numbered run inside ``剧场版`` is not a feature set.
+
+        The group label alone never proves independent films; the members must
+        each name their own title.  A same-title ordinal run fails closed so
+        the historical whole-directory boundary survives.
+        """
+        root = "/quark/影视/待刮削/Some Show"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "Some Show [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                {"name": "Some Show [02].mkv", "is_dir": False, "size": 1_400_000_000},
+                {
+                    "name": "剧场版",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "Some Show Recap [01].mkv", "is_dir": False, "size": 900_000_000},
+                        {"name": "Some Show Recap [02].mkv", "is_dir": False, "size": 900_000_000},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1, msg=[c.display_label for c in candidates])
+        self.assertEqual(candidates[0].source_paths, (root,))
+
+    def test_episode_body_split_fails_closed_on_unclassified_sibling(self) -> None:
+        """An unclassified video-bearing sibling keeps the whole boundary.
+
+        The splitter is all-or-nothing: losing ownership of a branch nobody
+        classified is worse than one over-wide fail-closed unit.
+        """
+        root = "/quark/影视/待刮削/Mixed Show"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "Mixed Show [01].mkv", "is_dir": False, "size": 1_400_000_000},
+                {"name": "Mixed Show [02].mkv", "is_dir": False, "size": 1_400_000_000},
+                {
+                    "name": "剧场版",
+                    "is_dir": True,
+                    "children": [
+                        {
+                            "name": "Mixed Show the Movie Distant Shore [2160p].mkv",
+                            "is_dir": False,
+                            "size": 9_000_000_000,
+                        },
+                    ],
+                },
+                {
+                    "name": "未分类花絮合辑",
+                    "is_dir": True,
+                    "children": [
+                        {"name": "unknown.mkv", "is_dir": False, "size": 3_000_000_000},
+                    ],
+                },
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1, msg=[c.display_label for c in candidates])
+        self.assertEqual(candidates[0].source_paths, (root,))
+
     def test_flat_marker_ordinal_feature_files_stay_one_special_run(self) -> None:
         """``OVA 01 - Title`` feature files are one special run, not films.
 

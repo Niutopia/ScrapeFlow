@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Sequence
 
 from engine.scrapeflow.source_inventory import (
+    SourceFile,
     SourceNode,
     collect_all_files,
     count_disc_image_files,
@@ -617,6 +618,43 @@ def _film_collection_children(node: SourceNode) -> tuple[SourceNode, ...]:
     return video_children
 
 
+def _film_collection_direct_features(node: SourceNode) -> tuple[SourceFile, ...]:
+    """Return the direct feature files of one generic film-collection group.
+
+    ``_film_collection_children`` covers the layout where the group holds one
+    titled directory per film.  A release just as often drops the feature file
+    straight into the group (``剧场版/[AI-Raws] … The Sacred Star of Milos
+    ….mkv``): the group label proves the role, and each file's own substantial
+    standalone title proves the individual work, so the year/label evidence a
+    bare group name cannot supply comes from the filename instead.
+
+    Fail closed unless the group holds no video-bearing subdirectory and every
+    direct video is feature-sized, episode-coordinate free and distinctly
+    titled — otherwise a bundled mini-series or a mixed branch could lose a
+    video by being split away from its siblings.
+    """
+    if _normalized_role_label(node.name) not in _FILM_COLLECTION_GROUP_LABELS:
+        return ()
+    if any(_child_has_video(child) for child in node.children):
+        return ()
+    videos = [file for file in node.files if file.object_type == "video"]
+    if not videos:
+        return ()
+    keys: set[str] = set()
+    for file in videos:
+        if file.size < _MOVIE_MIN_BYTES:
+            return ()
+        if _DIRECT_EPISODE_MARKER_RE.search(file.name):
+            return ()
+        key = _direct_movie_title_key(file.name)
+        if key is None or not _direct_movie_title_is_substantial(file.name):
+            return ()
+        if key in keys:
+            return ()
+        keys.add(key)
+    return tuple(videos)
+
+
 def _single_large_video(node: SourceNode) -> bool:
     """True if the node contains exactly one large video file (movie-shaped)."""
     all_files = collect_all_files(node)
@@ -1182,6 +1220,13 @@ def _titled_child_split(
     one-folder-per-film collection.  The conservative splitters decide;
     ``None`` keeps the ordinary whole-child boundary.
     """
+    body_split = _split_tv_body_with_film_collection(
+        child,
+        root_task_id=root_task_id,
+        root_videos=direct_video_file_count(child),
+    )
+    if body_split is not None:
+        return body_split
     nested_films = _nested_dated_feature_children(child)
     if nested_films:
         reason = (
@@ -1452,6 +1497,94 @@ def _split_mixed_season_root(
     return candidates
 
 
+def _split_tv_body_with_film_collection(
+    node: SourceNode,
+    *,
+    root_task_id: str,
+    root_videos: int,
+) -> list[WorkCandidate] | None:
+    """Split an episode body from a generic film-collection group beside it.
+
+    ``_split_mixed_season_root`` handles the layout where the seasons are their
+    own directories.  A release pack just as often keeps the whole episode run
+    as direct files and hangs the theatrical features off a generic
+    ``剧场版``/``Movies`` group.  One WorkUnit cannot own both a TV identity and
+    a feature identity, so the episode body and every proven feature become
+    separate units.
+
+    All-or-nothing, like the season-root splitter: any other video-bearing
+    child that is not a generic TV auxiliary group returns ``None`` so the
+    caller keeps its fail-closed whole-directory boundary rather than losing
+    ownership of a branch nobody classified.
+    """
+    if root_videos < 2:
+        return None
+    film_units: list[tuple[str, str, str]] = []
+    film_group_paths: set[str] = set()
+    for child in node.children:
+        nested = _film_collection_children(child)
+        if nested:
+            film_group_paths.add(child.path)
+            film_units.extend((film.path, film.name, child.name) for film in nested)
+            continue
+        features = _film_collection_direct_features(child)
+        if features:
+            film_group_paths.add(child.path)
+            film_units.extend(
+                (file.path, Path(file.name).stem, child.name) for file in features
+            )
+    if not film_units:
+        return None
+    tv_children: list[SourceNode] = []
+    for child in node.children:
+        if child.path in film_group_paths:
+            continue
+        if _child_has_video(child) and not _is_tv_auxiliary_group(child):
+            return None
+        if collect_all_files(child):
+            tv_children.append(child)
+    tv_scopes = tuple(file.path for file in node.files) + tuple(
+        child.path for child in tv_children
+    )
+    if not tv_scopes:
+        return None
+    tv_reason = (
+        f"目录 '{node.name}' 直接含 {root_videos} 个剧集视频，且旁边的通用电影"
+        f"合集目录另有 {len(film_units)} 个独立标题的正片，两者文件树不重叠",
+    )
+    candidates = [WorkCandidate(
+        work_unit_id=_work_unit_id(root_task_id, f"{node.path}/@episode-body"),
+        boundary_key=f"{node.path}/@episode-body",
+        source_paths=tv_scopes,
+        display_label=node.name,
+        proposed_media_context="tv",
+        boundary_evidence=BoundaryEvidence(
+            role=DirectoryRole.SINGLE_WORK,
+            confidence=0.9,
+            reasons=tv_reason,
+            competing_roles=(DirectoryRole.SERIES_CONTAINER.value,),
+        ),
+    )]
+    for film_path, film_label, group_label in film_units:
+        candidates.append(WorkCandidate(
+            work_unit_id=_work_unit_id(root_task_id, film_path),
+            boundary_key=film_path,
+            source_paths=(film_path,),
+            display_label=film_label,
+            proposed_media_context="movie",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.MOVIE_COLLECTION,
+                confidence=0.88,
+                reasons=(
+                    f"通用电影合集目录 '{group_label}' 内的独立标题正片，"
+                    "与同级剧集正片分属不同作品",
+                ),
+                competing_roles=(DirectoryRole.SINGLE_WORK.value,),
+            ),
+        ))
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Main analyser
 # ---------------------------------------------------------------------------
@@ -1573,6 +1706,20 @@ def analyze_boundaries(
     )
     if flat_movie_split is not None:
         return flat_movie_split
+
+    # --- Rule 0b: episode body plus a generic film-collection group -------
+    # The intake root itself can be the TV body (direct episode files) with the
+    # theatrical features hanging off a ``剧场版``/``Movies`` group.  Split
+    # before the season/cohort rules so the film never rides along in the TV
+    # unit; the helper is all-or-nothing and returns ``None`` for every other
+    # shape.
+    tv_body_split = _split_tv_body_with_film_collection(
+        node,
+        root_task_id=root_task_id,
+        root_videos=root_videos,
+    )
+    if tv_body_split is not None:
+        return tv_body_split
 
     # --- Rule 1a: season root plus independent film/special collection ---
     # This must happen before decorated-season cohorts and the broad
