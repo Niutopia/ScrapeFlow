@@ -2807,9 +2807,24 @@ def _merged_multi_season_evidence(
     if len(positives) < 2:
         return None
     positives.sort(key=lambda pair: pair[0])
-    if sum(count for _season, count in positives) != episode_count:
-        return None
-    return _TmdbMergedSeasonEvidence(tuple(positives))
+    if sum(count for _season, count in positives) == episode_count:
+        return _TmdbMergedSeasonEvidence(tuple(positives))
+    # An arc release numbers cumulatively across the seasons it covers rather
+    # than across the whole series: ``爱丽丝篇`` holds ``Alicization [01..24]``
+    # plus ``Alicization War of Underworld [25..47]``, which is S03+S04 of
+    # 刀剑神域 (24 + 23), not S01 onward.  A contiguous season window whose
+    # total equals the run is admissible only when it is the *only* such
+    # window; two candidate windows fail closed exactly like a tied season.
+    windows = [
+        positives[start:stop]
+        for start in range(len(positives))
+        for stop in range(start + 2, len(positives) + 1)
+        if sum(count for _season, count in positives[start:stop]) == episode_count
+        and positives[stop - 1][0] - positives[start][0] == stop - start - 1
+    ]
+    if len(windows) == 1:
+        return _TmdbMergedSeasonEvidence(tuple(windows[0]))
+    return None
 
 
 def _partial_season_prefix_evidence(

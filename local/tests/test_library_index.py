@@ -2276,6 +2276,51 @@ class LibraryIndexTests(unittest.TestCase):
                 1,
             )
 
+    def test_arc_release_maps_onto_a_unique_contiguous_season_window(self) -> None:
+        """A cumulative arc counter may span seasons other than S01 onward.
+
+        ``刀剑神域/4.刀剑神域 爱丽丝篇`` holds ``Alicization [01..24]`` plus
+        ``Alicization War of Underworld [25..47]``: 47 episodes numbered
+        cumulatively across S03 (24) and S04 (23), not across the whole series
+        (25+24+24+23 = 96).  The merged reading only accepted "every published
+        season", so a complete arc proved nothing.
+        """
+        from local.scrapeflow_api.library_index import _merged_multi_season_evidence
+
+        class ArcTMDB:
+            def get(self, path: str, **_p: object) -> dict:
+                if path == "/tv/45782":
+                    return {"seasons": [
+                        {"season_number": 0, "episode_count": 25},
+                        {"season_number": 1, "episode_count": 25},
+                        {"season_number": 2, "episode_count": 24},
+                        {"season_number": 3, "episode_count": 24},
+                        {"season_number": 4, "episode_count": 23},
+                    ]}
+                return {}
+
+        evidence = _merged_multi_season_evidence(ArcTMDB(), tmdb_id=45782, episode_count=47)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.boundaries, ((3, 24), (4, 23)))
+        # 覆盖全部正季仍然优先命中原有读法
+        whole = _merged_multi_season_evidence(ArcTMDB(), tmdb_id=45782, episode_count=96)
+        self.assertIsNotNone(whole)
+        assert whole is not None
+        self.assertEqual(whole.boundaries, ((1, 25), (2, 24), (3, 24), (4, 23)))
+        # 两个窗口同时成立时 fail-closed
+        class TiedTMDB:
+            def get(self, path: str, **_p: object) -> dict:
+                return {"seasons": [
+                    {"season_number": 1, "episode_count": 5},
+                    {"season_number": 2, "episode_count": 5},
+                    {"season_number": 3, "episode_count": 5},
+                    {"season_number": 4, "episode_count": 5},
+                ]}
+        self.assertIsNone(
+            _merged_multi_season_evidence(TiedTMDB(), tmdb_id=1, episode_count=10)
+        )
+
     def test_zero_based_release_run_maps_onto_the_whole_season(self) -> None:
         """``Title 00..N`` is a zero-based run: ``00`` is E01.
 
