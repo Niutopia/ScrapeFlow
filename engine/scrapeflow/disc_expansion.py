@@ -833,8 +833,8 @@ class DiscExpansionExecutor:
         local_buffer_dir: str,
         chunk_bytes: int = 16 * 1024 * 1024,
         min_free_buffer_bytes: int = 20 * 1024 * 1024 * 1024,
-        readback_attempts: int = 7,
-        readback_interval_seconds: float = 35.0,
+        readback_attempts: int = 20,
+        readback_interval_seconds: float = 60.0,
         now: Callable[[], str] | None = None,
         sleep: Callable[[float], None] | None = None,
         reader_opener: Callable[..., object] | None = None,
@@ -848,8 +848,10 @@ class DiscExpansionExecutor:
         self.chunk_bytes = chunk_bytes
         self.min_free_buffer_bytes = min_free_buffer_bytes
         # Provider listings lag behind a committed upload by minutes at
-        # multi-GB sizes (empirically ~4 min on quark_uc), so the post-upload
-        # readback tolerates a bounded window before declaring failure.
+        # multi-GB sizes (empirically ~4 min on quark_uc for one file, and
+        # ~12 min when back-to-back multi-GB uploads land in the same
+        # directory), so the post-upload readback tolerates a bounded window
+        # before declaring failure.
         self.readback_attempts = max(1, readback_attempts)
         self.readback_interval_seconds = max(0.0, readback_interval_seconds)
         self._now = now or (lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
