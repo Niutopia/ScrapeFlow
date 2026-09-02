@@ -31,6 +31,10 @@ from engine.scrapeflow.placement import (
     validate_routing,
 )
 from engine.scrapeflow.residual_policy import is_task_owned_staging_root
+from engine.scrapeflow.source_inventory import (
+    build_scoped_source_node,
+    build_source_inventory,
+)
 from engine.scrapeflow.work_units import (
     WorkUnitRecord,
     load_work_unit_records,
@@ -243,6 +247,131 @@ class TestStagingLayout:
         assert not is_task_owned_staging_root(f"{INGRESS}/ScrapeFlow/展开")
         assert not is_task_owned_staging_root(STAGING_ROOT)
         assert not is_task_owned_staging_root(f"{INGRESS}/ScrapeFlow")
+
+
+# ---------------------------------------------------------------- identity
+
+
+class TestScopeIdentityContext:
+    """The bridge's scope identity must see what the C lane would see."""
+
+    def test_season_marked_scope_matches_as_tv_with_container_label(
+        self, monkeypatch,
+    ) -> None:
+        root = "/media/影视/无耻之徒"
+        scope = f"{root}/无耻之徒(美版) 第一季"
+        image = f"{scope}/Shameless.US.S01-DISC1.iso"
+        rows = [
+            {"name": "无耻之徒(美版) 第一季", "is_dir": True, "full_path": scope},
+            {
+                "name": "Shameless.US.S01-DISC1.iso",
+                "is_dir": False,
+                "size": IMAGE_SIZE,
+                "full_path": image,
+            },
+        ]
+        inventory_root = build_source_inventory(rows, root)
+        scoped = build_scoped_source_node(
+            inventory_root,
+            [scope],
+            boundary_key=scope,
+            display_label="无耻之徒(美版) 第一季",
+        )
+        record = WorkUnitRecord(
+            work_unit_id="ctx-1",
+            root_task_id=ROOT_TASK,
+            boundary_key=scope,
+            source_paths=(scope,),
+            source_revision=1,
+            role="single_work",
+            display_label="无耻之徒(美版) 第一季",
+            media_context="unknown",
+            requires_content_expansion=True,
+        )
+        captured: dict[str, object] = {}
+
+        def fake_auto_match(_tmdb, evidence, **kwargs):
+            captured["evidence"] = evidence
+            captured["kwargs"] = kwargs
+            return (
+                SimpleNamespace(media_type="tv", tmdb_id=34307, title="无耻之徒"),
+                [],
+            )
+
+        monkeypatch.setattr(bridge, "auto_match_from_evidence", fake_auto_match)
+        tmdb_id, title = bridge._scope_identity(
+            object(),
+            scoped,
+            record,
+            inventory_root=inventory_root,
+            season=1,
+            prefer_animation=False,
+            min_confidence=0.70,
+        )
+        assert (tmdb_id, title) == (34307, "无耻之徒")
+        evidence = captured["evidence"]
+        # The scope's own season marker is TV evidence: a movie identity
+        # cannot own a season, so the match stays inside the tv type.
+        assert evidence.media_shape == "tv"
+        # The intake container's label reaches the evidence the same way
+        # the C lane's parent-label escalation would deliver it.
+        assert evidence.parent_labels == ("无耻之徒",)
+        # The image name contributes its romanized title query; the disc
+        # ordinals stay out of it.
+        assert "Shameless US" in evidence.representative_names
+
+    def test_unmarked_scope_keeps_the_records_context(self, monkeypatch) -> None:
+        root = "/media/影视/无耻之徒"
+        scope = f"{root}/无耻之徒(美版) 电影盘"
+        image = f"{scope}/Shameless.US.Movie.2014.BluRay.iso"
+        rows = [
+            {"name": "无耻之徒(美版) 电影盘", "is_dir": True, "full_path": scope},
+            {
+                "name": "Shameless.US.Movie.2014.BluRay.iso",
+                "is_dir": False,
+                "size": IMAGE_SIZE,
+                "full_path": image,
+            },
+        ]
+        inventory_root = build_source_inventory(rows, root)
+        scoped = build_scoped_source_node(
+            inventory_root,
+            [scope],
+            boundary_key=scope,
+            display_label="无耻之徒(美版) 电影盘",
+        )
+        record = WorkUnitRecord(
+            work_unit_id="ctx-2",
+            root_task_id=ROOT_TASK,
+            boundary_key=scope,
+            source_paths=(scope,),
+            source_revision=1,
+            role="single_work",
+            display_label="无耻之徒(美版) 电影盘",
+            media_context="unknown",
+            requires_content_expansion=True,
+        )
+        captured: dict[str, object] = {}
+
+        def fake_auto_match(_tmdb, evidence, **kwargs):
+            captured["evidence"] = evidence
+            return (
+                SimpleNamespace(media_type="tv", tmdb_id=34307, title="无耻之徒"),
+                [],
+            )
+
+        monkeypatch.setattr(bridge, "auto_match_from_evidence", fake_auto_match)
+        bridge._scope_identity(
+            object(),
+            scoped,
+            record,
+            inventory_root=inventory_root,
+            season=None,
+            prefer_animation=False,
+            min_confidence=0.70,
+        )
+        # Without a season marker the record's own context decides.
+        assert captured["evidence"].media_shape == "unknown"
 
 
 # ---------------------------------------------------------------- rulings

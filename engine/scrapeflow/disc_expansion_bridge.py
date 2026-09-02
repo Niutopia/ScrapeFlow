@@ -201,22 +201,31 @@ def _scope_identity(
     scoped_node: Any,
     record: WorkUnitRecord,
     *,
+    inventory_root: Any,
+    season: int | None,
     prefer_animation: bool,
     min_confidence: float,
 ) -> tuple[int, str]:
     """Match one parked scope's TMDB identity from its boundary evidence.
 
-    Reuses the C lane's evidence extractor and auto matcher so the bridge
-    can never confirm an identity C itself would not reach.
+    Reuses the C lane's evidence extractor and auto matcher — including its
+    parent-label escalation over the snapshot inventory — so the bridge can
+    never confirm an identity C itself would not reach.  A scope whose own
+    path carries a season marker is TV-shaped by that evidence alone: a
+    movie identity cannot own a season, so the match stays inside the tv
+    type instead of tying against same-named films.
     """
     from .boundary_analysis import BoundaryEvidence, DirectoryRole, WorkCandidate
+    from .unit_identity import _common_parent_labels, _useful_parent_labels
 
     candidate = WorkCandidate(
         work_unit_id=record.work_unit_id,
         boundary_key=record.boundary_key,
         source_paths=record.source_paths,
         display_label=record.display_label or scoped_node.name,
-        proposed_media_context=record.media_context,
+        proposed_media_context=(
+            "tv" if season is not None else record.media_context
+        ),
         boundary_evidence=BoundaryEvidence(
             role=DirectoryRole(record.role),
             confidence=1.0,
@@ -225,7 +234,14 @@ def _scope_identity(
         ),
         requires_content_expansion=True,
     )
-    evidence = extract_identity_evidence(candidate, scoped_node)
+    parent_labels = _useful_parent_labels(
+        record,
+        candidate.display_label,
+        _common_parent_labels(inventory_root, (scoped_node,)),
+    )
+    evidence = extract_identity_evidence(
+        candidate, scoped_node, parent_labels=parent_labels
+    )
     best, _candidates = auto_match_from_evidence(
         tmdb_client,
         evidence,
@@ -410,6 +426,7 @@ def expand_root_disc_images(
                 tmdb_client,
                 record,
                 scoped_node,
+                inventory_root=inventory_node,
                 scope=scope,
                 staging_root=staging_root,
                 rulings=rulings,
@@ -446,6 +463,7 @@ def _expand_one_scope(
     record: WorkUnitRecord,
     scoped_node: Any,
     *,
+    inventory_root: Any,
     scope: str,
     staging_root: str,
     rulings: Mapping[str, ScopeMappingRuling],
@@ -470,6 +488,8 @@ def _expand_one_scope(
         tmdb_client,
         scoped_node,
         record,
+        inventory_root=inventory_root,
+        season=season,
         prefer_animation=prefer_animation,
         min_confidence=min_confidence,
     )
