@@ -122,6 +122,7 @@ def plan_from_dict(raw: Mapping[str, Any]) -> Plan:
             source_path=str(_text(item.get("source_path"), f"problem_files[{index}].source_path")),
             reason=str(_text(item.get("reason"), f"problem_files[{index}].reason")),
             target_path=_text(item.get("target_path"), f"problem_files[{index}].target_path", optional=True),
+            stays_at_source=bool(item.get("stays_at_source", False)),
         ))
 
     notices: list[PlanNotice] = []

@@ -1760,6 +1760,50 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertIn("未闭合问题文件", blocked.error or "")
         self.assertEqual(self.alist.moves, [])
 
+    def test_a_stays_at_source_problem_row_never_blocks_the_write(self) -> None:
+        """The structured flag classifies a row without wording inference."""
+        executed: list[Plan] = []
+
+        def executor(received: Plan) -> object:
+            executed.append(received)
+            return {"ok": True}
+
+        for reason, flag in (
+            # Newly phrased reason carrying no whitelisted wording at all:
+            # only the structured flag can keep the plan writable.
+            ("目标坐标已由其他字节占用，未完成跨库质量校验", True),
+            # Same reason without the flag stays a write-safety blocker.
+            ("目标坐标已由其他字节占用，未完成跨库质量校验", False),
+        ):
+            plan = fake_plan(self.request, self.alist, object())
+            plan.problem_files.append(PlannedProblem(
+                source_path="/incoming/show/runner-up.mp4",
+                reason=reason,
+                target_path="/library/Show/Season 01/Show - S01E01.mp4",
+                stays_at_source=flag,
+            ))
+            runner = SimpleEngineRunner(
+                self.root,
+                alist=self.alist,
+                tmdb=object(),
+                planner=lambda *_args: plan,
+                validate=False,
+                executor=executor,
+            )
+            job = runner.plan_job(
+                self.request,
+                job_id=f"engine-stays-at-source-{'info' if flag else 'block'}",
+            )
+            if flag:
+                runner.execute_job(job.id)
+                self.assertEqual(
+                    [row.source_path for row in executed[-1].problem_files],
+                    ["/incoming/show/runner-up.mp4"],
+                )
+            else:
+                with self.assertRaisesRegex(EngineExecutionError, "未闭合问题文件"):
+                    runner.execute_job(job.id)
+
     def test_runner_redacts_error_fields_at_execute_gate_and_recovery_writes(self) -> None:
         """Durable runner errors never retain a configured runtime secret."""
         secret = "runner-secret-not-for-job-json"

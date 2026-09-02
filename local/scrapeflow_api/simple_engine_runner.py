@@ -437,9 +437,22 @@ _CLEANUP_ACTIVE_PROVIDER_STATUSES = frozenset({
 # the residual simply remains untouched.  These rows must not block the
 # formal write of every correctly mapped file.
 _PRESERVE_AT_SOURCE_PROBLEM_RE = re.compile(
-    r"保留原位|保留于源目录|保留在来源|待人工确认|未闭合",
+    r"保留原位|保留于源目录|保留在来源|保留库内既有版本|留在源目录|待人工确认|未闭合",
     re.IGNORECASE,
 )
+
+
+def _problem_stays_at_source(problem: object) -> bool:
+    """Decide whether one problem row keeps its file at source on purpose.
+
+    The authoritative signal is the structured ``stays_at_source`` flag the
+    planner sets; the reason-wording regex remains only as the fallback for
+    plans persisted before the flag existed, so a freshly phrased reason can
+    never accidentally (de)classify a row again.
+    """
+    if getattr(problem, "stays_at_source", False):
+        return True
+    return bool(_PRESERVE_AT_SOURCE_PROBLEM_RE.search(str(getattr(problem, "reason", "") or "")))
 
 
 def _require_problem_free_plan(plan: object, *, stage: str) -> None:
@@ -461,9 +474,7 @@ def _require_problem_free_plan(plan: object, *, stage: str) -> None:
         return
     blocking = [
         problem for problem in problems
-        if not _PRESERVE_AT_SOURCE_PROBLEM_RE.search(
-            str(getattr(problem, "reason", "") or "")
-        )
+        if not _problem_stays_at_source(problem)
     ]
     if not blocking:
         return

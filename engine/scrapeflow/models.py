@@ -72,6 +72,11 @@ class PlannedProblem:
     source_path: str
     reason: str
     target_path: str | None = None
+    # True when the file deliberately remains at source (an unidentifiable
+    # special, or a duplicate whose coordinate already holds other bytes):
+    # informational, never a write-safety blocker.  Persisted plans from
+    # before this flag rely on the reason-wording fallback instead.
+    stays_at_source: bool = False
 
 
 @dataclass(frozen=True)

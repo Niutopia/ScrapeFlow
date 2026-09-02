@@ -10685,6 +10685,7 @@ def _demote_videos_whose_coordinate_holds_other_bytes(
                     "目标坐标已由其他字节占用，未完成跨库质量校验；"
                     f"保留库内既有版本并留在源目录: {occupied_path}"
                 ),
+                stays_at_source=True,
                 target_path=join_remote(
                     normalize_remote_path(item.target_dir), item.final_name
                 ),
