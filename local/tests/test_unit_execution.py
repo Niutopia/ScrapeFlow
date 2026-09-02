@@ -13,7 +13,7 @@ from unittest.mock import patch
 from engine.scrapeflow.errors import PlanError
 from engine.scrapeflow.core import _tv_season_resource_gaps
 from engine.scrapeflow.current_plan import plan_to_dict
-from engine.scrapeflow.gap_ledger import load_gap_ledger, save_gap_ledger
+from engine.scrapeflow.gap_ledger import Gap, load_gap_ledger, save_gap_ledger
 from engine.scrapeflow.models import Plan, PlannedFile
 from engine.scrapeflow.replenishment_matching import audit_episode_tokens
 from engine.scrapeflow.root_boundaries import analyze_root_boundaries
@@ -785,6 +785,157 @@ class UnitExecutionTests(unittest.TestCase):
             },
             {"S01E02"},
         )
+
+    def test_planner_missing_season_conflict_scopes_to_the_carriers_own_writes(self) -> None:
+        """缺季冲突只对本单元自身写入的季生效。
+
+        The planner's missing-season proof predates the merge target's final
+        state: a sibling unit can merge that same season into the shared root
+        afterwards, and the fresh readback of the whole target then holds
+        episodes this carrier's plan proved absent.  Reading that as a
+        self-contradiction parks the carrier behind an attention forever
+        (黑执事's S2-OVA unit against its sibling's S4).  Only the carrier's
+        OWN writes — plan video rows, else its carried B snapshot rows —
+        prove a real contradiction; sibling coverage must flow through and
+        register just the uncovered remainder.
+        """
+        source = "/incoming/merge-conflict"
+        state_root, alist, runner, _p, _e = self._setup(
+            {f"{source}/Show [01].mkv": FAKE_VIDEO_BYTES},
+            library_files={
+                # This unit's own S02 write plus a sibling's later S04
+                # merge into the same shared work root.
+                "/library/番剧/Example/Season 02/Show - S02E01.mkv":
+                    FAKE_VIDEO_BYTES,
+                "/library/番剧/Example/Season 04/Show - S04E01.mkv":
+                    FAKE_VIDEO_BYTES,
+                "/library/番剧/Example/Season 04/Show - S04E02.mkv":
+                    FAKE_VIDEO_BYTES,
+            },
+            tmdb=MultiSeasonTMDB(101, {2: 1, 4: 2}),
+        )
+        root_task_id = "root-merge-conflict-sibling"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity={"media_type": "tv", "tmdb_id": 101},
+            reconciliation_outcome="merge_existing",
+        )
+        resource_gap = {
+            "kind": "missing_season",
+            "label": "Season 04 Fourth Season",
+            "reason": "planner proved no source or formal-library video",
+            "files": [],
+            "season": 4,
+            "season_name": "Fourth Season",
+            "expected_episode_count": 2,
+        }
+        executed_plan = {
+            "files": [{"final_name": "Show - S02E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {"resource_gaps": [resource_gap]},
+        }
+
+        # Before the fix this raised GapDiscoveryAttention: the sibling's
+        # S04 writes polluted verified_seasons and read as this carrier
+        # contradicting its own missing-season proof.
+        _register_unit_episode_gaps(
+            runner, state_root, root_task_id, record, executed_plan,
+        )
+        # S04E01/E02 are covered by the sibling's merge: nothing registers.
+        self.assertEqual(load_gap_ledger(state_root, root_task_id), [])
+
+        # The carrier's OWN write inside the planner-declared missing season
+        # is a real contradiction and still fails closed.
+        contradictory = {
+            "files": [{"final_name": "Show - S04E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {"resource_gaps": [resource_gap]},
+        }
+        with self.assertRaises(GapDiscoveryAttention):
+            _register_unit_episode_gaps(
+                runner, state_root, root_task_id, record, contradictory,
+            )
+
+    def test_registration_closes_this_units_rows_covered_after_the_write(self) -> None:
+        """J 登记后关闭本单元已被写后事实覆盖的 open 行。
+
+        A merge lane's J re-entry (黑执事's S2-OVA unit) reads a ledger whose
+        earlier registration opened rows for episodes that a later manual
+        placement or sibling write has since covered.  Registration only ever
+        adds missing coordinates; the mirror obligation is closing this
+        unit's covered rows so the terminal aggregate reflects the library,
+        not the stale registration moment.
+        """
+        source = "/incoming/merge-close"
+        state_root, alist, runner, _p, _e = self._setup(
+            {f"{source}/Show [01].mkv": FAKE_VIDEO_BYTES},
+            library_files={
+                "/library/番剧/Example/Season 02/Show - S02E01.mkv":
+                    FAKE_VIDEO_BYTES,
+                # S00E07 is present post-write (the manual placement); S00E08
+                # is not.
+                "/library/番剧/Example/Season 00/Show - S00E07.mkv":
+                    FAKE_VIDEO_BYTES,
+            },
+            tmdb=MultiSeasonTMDB(101, {0: 8, 2: 1}),
+        )
+        root_task_id = "root-merge-close-covered"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity={"media_type": "tv", "tmdb_id": 101},
+            reconciliation_outcome="merge_existing",
+        )
+
+        def open_row(token: str, season: int, episode: int) -> Gap:
+            return Gap(
+                gap_id=f"{record.work_unit_id}::missing_episode::{token}",
+                root_task_id=root_task_id,
+                work_unit_id=record.work_unit_id,
+                kind="missing_episode",
+                media_type="tv",
+                tmdb_id=101,
+                season=season,
+                episodes=(episode,),
+                subtitle_path=None,
+                subtitle_language=None,
+                status="open",
+            )
+
+        # An earlier run of this unit registered both S00 rows as open.
+        save_gap_ledger(state_root, root_task_id, [
+            open_row("S00E07", 0, 7),
+            open_row("S00E08", 0, 8),
+        ])
+        executed_plan = {
+            "files": [{"final_name": "Show - S02E01.mkv", "media_kind": "video"}],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {},
+        }
+
+        _register_unit_episode_gaps(
+            runner, state_root, root_task_id, record, executed_plan,
+        )
+
+        statuses = {
+            gap.gap_id.rsplit("::", 1)[1]: gap.status
+            for gap in load_gap_ledger(state_root, root_task_id)
+        }
+        # Covered by the post-write merge target -> closed.
+        self.assertEqual(statuses["S00E07"], "closed")
+        # Still absent from the library -> stays open.
+        self.assertEqual(statuses["S00E08"], "open")
 
     def test_planner_missing_season_registers_exact_structured_and_legacy_coordinates(self) -> None:
         """J accepts the current field and only the old canonical fallback."""

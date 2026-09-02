@@ -3114,6 +3114,129 @@ class LibraryIndexTests(unittest.TestCase):
                     "季集坐标", unknown[0].attention or "",
                 )
 
+    def test_stale_snapshot_story_video_rewalks_the_live_scope(self) -> None:
+        """B 快照中的故事视频被合法消费后，残件守卫用实时树重走。
+
+        The all-residual guard reads the B-time snapshot, but a story video
+        in that snapshot may have been legitimately consumed since — a manual
+        placement per receipt (黑执事's S1 OVA -> library S00E02).  The stale
+        snapshot must not park the unit uncertain forever: when a live client
+        is available the scope is re-walked and the guard retried on the live
+        tree.  A scope that still holds the story video stays fail-closed,
+        and a lost story episode surfaces through the owned-season catalog
+        gaps instead of a consuming duplicate verdict.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            root_task_id = "root-stale-snapshot-live"
+            source = "/incoming/Stale Show"
+            library = {
+                "/library/番剧/Stale Show/tvshow.nfo": _nfo_tv(
+                    99047, "Stale Show", "2020",
+                ),
+                "/library/番剧/Stale Show/Season 00/S00E01.mkv": b"v",
+                "/library/番剧/Stale Show/Season 00/S00E02.mkv": b"v",
+                "/library/番剧/Stale Show/Season 01/S01E01.mkv": b"v",
+                "/library/番剧/Stale Show/Season 01/S01E02.mkv": b"v",
+            }
+            catalog = {
+                0: [
+                    {"season_number": 0, "episode_number": 1},
+                    {"season_number": 0, "episode_number": 2},
+                ],
+                1: [
+                    {"season_number": 1, "episode_number": 1},
+                    {"season_number": 1, "episode_number": 2},
+                ],
+            }
+            # The B-time source held the story OVA beside the residuals.
+            snapshot_files = {
+                **library,
+                f"{source}/[Group] Stale Show OVA.mkv": b"v",
+                f"{source}/[Group] Stale Show [NCOP][Ma10p].mkv": b"v",
+                f"{source}/[Group] Stale Show [NCED][Ma10p].mkv": b"v",
+            }
+            alist = IndexAList(snapshot_files)
+            analyze_root_boundaries(
+                alist, source, root_task_id=root_task_id, state_root=state_root,
+            )
+            record = load_work_unit_records(state_root, root_task_id)[0]
+            apply_work_unit_override(
+                state_root, root_task_id, record.work_unit_id,
+                media_type="tv", tmdb_id=99047,
+            )
+            # The OVA was legitimately consumed after B (the manual placement
+            # per receipt); the live scope now holds only residuals.
+            del alist.files[f"{source}/[Group] Stale Show OVA.mkv"]
+
+            reconciled = reconcile_root_work_units(
+                alist, "/library", state_root, root_task_id,
+                episode_catalog=lambda _identity: catalog,
+            )
+            self.assertEqual(
+                reconciled[0].reconciliation_outcome, "duplicate_complete",
+            )
+
+            # The same stale snapshot against a scope that still holds the
+            # story video must stay fail-closed: no live-only residual claim
+            # may consume unproven story media.
+            with tempfile.TemporaryDirectory() as kept:
+                kept_root = Path(kept)
+                kept_task = "root-stale-snapshot-kept"
+                kept_alist = IndexAList(snapshot_files)
+                analyze_root_boundaries(
+                    kept_alist, source,
+                    root_task_id=kept_task, state_root=kept_root,
+                )
+                kept_record = load_work_unit_records(kept_root, kept_task)[0]
+                apply_work_unit_override(
+                    kept_root, kept_task, kept_record.work_unit_id,
+                    media_type="tv", tmdb_id=99047,
+                )
+                kept_reconciled = reconcile_root_work_units(
+                    kept_alist, "/library", kept_root, kept_task,
+                    episode_catalog=lambda _identity: catalog,
+                )
+                self.assertEqual(
+                    kept_reconciled[0].reconciliation_outcome, "uncertain",
+                )
+
+            # A story episode that never reached the library surfaces as an
+            # owned-season catalog gap: the verdict becomes existing_gap, so
+            # the residual source is held instead of consumed.
+            with tempfile.TemporaryDirectory() as lost:
+                lost_root = Path(lost)
+                lost_task = "root-stale-snapshot-lost"
+                lost_files = {
+                    key: value for key, value in snapshot_files.items()
+                    if not key.startswith(f"{source}/")
+                }
+                lost_files[f"{source}/[Group] Stale Show [NCOP][Ma10p].mkv"] = b"v"
+                lost_files[f"{source}/[Group] Stale Show [NCED][Ma10p].mkv"] = b"v"
+                # The library is missing S00E02: the OVA's episode was lost,
+                # not placed.
+                del lost_files["/library/番剧/Stale Show/Season 00/S00E02.mkv"]
+                lost_alist = IndexAList(lost_files)
+                analyze_root_boundaries(
+                    lost_alist, source,
+                    root_task_id=lost_task, state_root=lost_root,
+                )
+                lost_record = load_work_unit_records(lost_root, lost_task)[0]
+                apply_work_unit_override(
+                    lost_root, lost_task, lost_record.work_unit_id,
+                    media_type="tv", tmdb_id=99047,
+                )
+                lost_reconciled = reconcile_root_work_units(
+                    lost_alist, "/library", lost_root, lost_task,
+                    episode_catalog=lambda _identity: catalog,
+                )
+                self.assertEqual(
+                    lost_reconciled[0].reconciliation_outcome, "existing_gap",
+                )
+                self.assertEqual(
+                    lost_reconciled[0].uncovered_tokens, ("S00E02",),
+                )
+
     def test_rooted_declared_subtitle_only_season_is_reconciled_as_exact_gap(self) -> None:
         """A rooted multi-season TV need not expose one WorkUnit scope per season.
 

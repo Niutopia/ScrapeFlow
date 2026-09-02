@@ -1271,6 +1271,24 @@ def _owned_season_catalog_gap_tokens(
     return frozenset(output)
 
 
+def _live_scope_node(alist: object, scope_path: str) -> SourceNode | None:
+    """Re-walk one scope live and rebuild its SourceNode, fail closed.
+
+    The B snapshot is durable evidence of what the boundary walk once saw,
+    but a reconciliation guard that decides between "consume" and "hold"
+    must be able to consult the tree as it exists now.  A missing client,
+    a provider error, or an unreadable scope all return ``None`` — the
+    caller then keeps its conservative verdict.
+    """
+    if alist is None:
+        return None
+    try:
+        rows = walk_source_rows(alist, str(scope_path))
+        return build_source_inventory(rows, str(scope_path))
+    except Exception:
+        return None
+
+
 def _residual_only_reconciliation(
     node: SourceNode | None,
     index: LibraryIndex,
@@ -1300,6 +1318,16 @@ def _residual_only_reconciliation(
     consuming them without a write would lose media.  A library without this
     identity also stays uncertain: an extras-only source can never found a
     new work root.
+
+    The all-residual guard is evaluated against the B-time snapshot, but a
+    story video in that snapshot may have been legitimately consumed since
+    (a manual placement per receipt, an earlier lane's write).  When the
+    snapshot guard fails and a live client is available the scope is
+    re-walked and the guard retried on the live tree; any walk failure or
+    surviving non-residual video fails closed to uncertain.  A lost story
+    file still surfaces through ``_owned_season_catalog_gap_tokens``: its
+    episode is missing from a library-owned season, so the verdict becomes
+    ``existing_gap`` instead of a consuming duplicate.
     """
     if node is None or media_type != "tv":
         return None
@@ -1309,7 +1337,21 @@ def _residual_only_reconciliation(
     if not videos:
         return None
     if not all(_is_proven_non_story_residual_video(file) for file in videos):
-        return None
+        live_node = _live_scope_node(alist, node.path)
+        if live_node is None:
+            return None
+        live_videos = [
+            file for file in collect_all_files(live_node)
+            if file.object_type == "video"
+        ]
+        if not live_videos:
+            return None
+        if not all(
+            _is_proven_non_story_residual_video(file) for file in live_videos
+        ):
+            return None
+        node = live_node
+        videos = live_videos
     if not index.entries_for(media_type, tmdb_id):
         return None
     # A numbered special run inside a bonus directory (よくわかる魔法科！

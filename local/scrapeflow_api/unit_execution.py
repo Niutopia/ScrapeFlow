@@ -48,6 +48,7 @@ from engine.scrapeflow.source_inventory import (
 )
 from engine.scrapeflow.serialization import atomic_write_json
 from engine.scrapeflow.gap_ledger import (
+    close_gap,
     discover_episode_gaps,
     load_gap_ledger,
     parse_gap_token,
@@ -3409,7 +3410,12 @@ def _register_unit_episode_gaps(
         if isinstance(item, Mapping)
     ]
     owned: set[int] = set()
-    actual: list[str] = []
+    # ``own_tokens`` are the coordinates this carrier itself carried or wrote:
+    # its plan's video rows, else its B snapshot rows.  Merge-target tokens
+    # collected below are deliberately kept apart — they include every
+    # sibling's writes into the shared root and must never be read as this
+    # carrier's own evidence (see the planner-missing-season conflict test).
+    own_tokens: list[str] = []
     has_video_row = False
     source_has_video = False
     for item in plan_files:
@@ -3417,7 +3423,7 @@ def _register_unit_episode_gaps(
         if item.get("media_kind") == "video":
             has_video_row = True
             tokens = list(audit_episode_tokens(name))
-            actual.extend(f"S{season:02d}E{episode:02d}" for season, episode in tokens)
+            own_tokens.extend(f"S{season:02d}E{episode:02d}" for season, episode in tokens)
             owned.update(season for season, _ in tokens)
             continue
         match = _BARE_SEASON_RE.match(name)
@@ -3436,10 +3442,11 @@ def _register_unit_episode_gaps(
         for row in source_rows:
             name = str(row.get("name") or "")
             for season, episode in audit_episode_tokens(name):
-                actual.append(f"S{season:02d}E{episode:02d}")
+                own_tokens.append(f"S{season:02d}E{episode:02d}")
                 owned.add(season)
     else:
         source_has_video = True
+    actual = list(own_tokens)
     if record.reconciliation_outcome == "merge_existing":
         # E3 has an existing work root whose already-present episode tokens
         # are part of the post-write truth.  Never create gaps from merely
@@ -3513,12 +3520,21 @@ def _register_unit_episode_gaps(
         ]
         if episodes:
             expected_by_season[season] = episodes
-    # The planner has already proven that these positive seasons contain no
-    # source or formal-library video.  Re-read their official catalog now and
-    # materialize only its exact published SxxEyy coordinates in the normal
-    # episode ledger.  Never manufacture a season-level second ledger row.
+    # The planner's missing-season proof predates the merge target's final
+    # state: a sibling unit can have merged that same season after this
+    # carrier's plan was cut, and the shared target's fresh readback then
+    # shows episodes the planner proved absent.  A real contradiction exists
+    # only when the carrier's OWN writes (plan video rows, else its carried
+    # B snapshot rows) landed in a season the plan declared missing; sibling
+    # coverage flows through below and ``discover_episode_gaps`` subtracts
+    # the full post-write ``actual`` so only the true remainder registers.
+    own_written_seasons: set[int] = set()
+    for token in own_tokens:
+        coordinate = parse_gap_token(token)
+        if coordinate is not None:
+            own_written_seasons.add(coordinate[0])
     for season, expected_count in planner_missing_seasons.items():
-        if season in verified_seasons:
+        if season in own_written_seasons:
             raise GapDiscoveryAttention("已执行计划的缺季与已写季集冲突")
         expected_by_season[season] = _strict_catalog_season_episodes(
             expected.get(season),
@@ -3527,7 +3543,7 @@ def _register_unit_episode_gaps(
     if not expected_by_season:
         return []
     try:
-        return discover_episode_gaps(
+        gaps = discover_episode_gaps(
             state_root,
             root_task_id,
             record.work_unit_id,
@@ -3538,6 +3554,44 @@ def _register_unit_episode_gaps(
         )
     except Exception as exc:
         raise GapLedgerPersistenceError("缺口账本登记或写后回读失败") from exc
+    # Registration above only ever adds coordinates the post-write library
+    # still lacks.  The mirror obligation is closure: this unit's own open
+    # rows whose coordinates the post-write truth now covers (a sibling
+    # merge into the shared target, a manual placement between two runs, or
+    # this carrier's write landing after an earlier attention) are no
+    # longer gaps.  Scoped to this unit's own rows — a root-wide reaudit
+    # stays the replenishment lane's job.  Coordinates registered by the
+    # call above are absent from ``actual`` by construction, so closure can
+    # never cancel a fresh registration; a closure failure is a real ledger
+    # fault, not a zero-gap result.
+    present = {
+        coordinate
+        for coordinate in (parse_gap_token(token) for token in actual)
+        if coordinate is not None
+    }
+    for gap in gaps:
+        if gap.status != "open" or gap.kind != "missing_episode":
+            continue
+        if not isinstance(gap.season, int) or isinstance(gap.season, bool):
+            continue
+        episodes = {
+            int(episode)
+            for episode in (gap.episodes or ())
+            if isinstance(episode, int) and not isinstance(episode, bool)
+        }
+        if not episodes:
+            continue
+        covered = {episode for season, episode in present if season == gap.season}
+        if not episodes.issubset(covered):
+            continue
+        try:
+            close_gap(
+                state_root, root_task_id, gap.gap_id,
+                note="写后核对已覆盖，关闭该单元缺口行",
+            )
+        except Exception as exc:
+            raise GapLedgerPersistenceError("缺口账本关闭已覆盖行失败") from exc
+    return gaps
 
 
 def _complete_unit_episode_gap_registration(
