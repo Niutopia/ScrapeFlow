@@ -1803,6 +1803,72 @@ class TestSyntheticCases(unittest.TestCase):
         self.assertTrue(candidates[0].requires_content_expansion)
         self.assertEqual(candidates[0].source_paths, (root,))
 
+    def test_opaque_split_descends_into_single_remaining_sibling(self) -> None:
+        """One clean sibling beside an opaque branch is scoped to itself.
+
+        ``无耻之徒/{季 ISO 目录, 无耻堂 WEB-DL 目录}``: the remainder analysis
+        used to run on the node carrying the intake path, so the work
+        boundary it placed there claimed the parked branch's ISOs a second
+        time and the exact source-object proof failed.  With exactly one
+        remaining child and no loose root files, the node is a grouping
+        shell — the sibling is analysed directly and no claim ever covers
+        the parked branch.
+        """
+        root = "/quark/影视/待刮削/无耻之徒"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "无耻之徒(美版) 第一季", "is_dir": True, "children": [
+                    {"name": "Shameless.US.S01-DISC1.iso", "is_dir": False, "size": 45_000_000_000},
+                ]},
+                {"name": "无耻之徒之无耻堂.E01-E06.2021.1080p.WEB-DL", "is_dir": True, "children": [
+                    {"name": "无耻之徒之无耻堂.E01.mkv", "is_dir": False, "size": 2_000_000_000},
+                    {"name": "无耻之徒之无耻堂.E02.mkv", "is_dir": False, "size": 2_000_000_000},
+                ]},
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        scopes = {path for c in candidates for path in c.source_paths}
+        self.assertIn(f"{root}/无耻之徒(美版) 第一季", scopes)
+        webdl = [
+            c for c in candidates
+            if "无耻之徒之无耻堂" in c.display_label
+        ]
+        self.assertEqual(len(webdl), 1)
+        self.assertEqual(
+            webdl[0].source_paths,
+            (f"{root}/无耻之徒之无耻堂.E01-E06.2021.1080p.WEB-DL",),
+        )
+        self.assertFalse(webdl[0].requires_content_expansion)
+        # No candidate may claim the grouping shell itself.
+        self.assertNotIn(root, scopes)
+
+    def test_opaque_split_fails_closed_over_loose_root_files(self) -> None:
+        """Loose root files keep the whole-root park when a branch is opaque.
+
+        Descending into the single remaining child would leave the root's
+        own files claimed by no unit at all, and a node-level boundary
+        would double-own the parked branch's objects.  Neither is
+        acceptable: the split fails closed and the whole root parks.
+        """
+        root = "/quark/影视/待刮削/Mixed"
+        fixture = {
+            "root": root,
+            "children": [
+                {"name": "Feature.Cut.2020.1080p.mkv", "is_dir": False, "size": 8_000_000_000},
+                {"name": "seasons", "is_dir": True, "children": [
+                    {"name": "Show S01E01.mkv", "is_dir": False, "size": 2_000_000_000},
+                ]},
+                {"name": "extras", "is_dir": True, "children": [
+                    {"name": "Show.SP.iso", "is_dir": False, "size": 40_000_000_000},
+                ]},
+            ],
+        }
+        candidates = analyze_boundaries(self._node(fixture), root_task_id="t")
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].requires_content_expansion)
+        self.assertEqual(candidates[0].source_paths, (root,))
+
     def test_episode_body_splits_from_bare_theatrical_group(self) -> None:
         """A TV body plus a generic ``剧场版`` group is two works, not one.
 

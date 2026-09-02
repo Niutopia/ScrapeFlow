@@ -1629,9 +1629,31 @@ def _scoped_opaque_container_split(
     if not remaining or not any(_child_has_video(child) for child in remaining):
         return None
     inner = replace(node, children=remaining)
+    if len(remaining) == 1 and not node.files:
+        # The remainder node still carries the intake path, so a boundary
+        # the analysis places on the node itself would claim the parked
+        # branches' objects on disk a second time.  With exactly one
+        # remaining child and no loose files of its own, the node is a
+        # pure grouping shell over that child — analyse the child directly
+        # so every claim covers only real remaining objects.  The node
+        # name stays available to C as the parent-label evidence it
+        # derives from the snapshot.
+        inner = remaining[0]
     candidates = list(analyze_boundaries(inner, root_task_id=root_task_id))
     if not candidates:
         return None
+    # Fail closed unless every remainder claim provably avoids the parked
+    # branches: a claim covering a parked branch would double-own its
+    # objects in the exact source-object proof.
+    for candidate in candidates:
+        for scope in candidate.source_paths:
+            scope_path = str(scope).rstrip("/")
+            for branch in opaque:
+                if (
+                    branch.path == scope_path
+                    or branch.path.startswith(scope_path + "/")
+                ):
+                    return None
     for child in opaque:
         discs = count_disc_image_files(child)
         executables = count_executable_files(child)
