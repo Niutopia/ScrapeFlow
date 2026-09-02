@@ -283,6 +283,20 @@ def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
         if getattr(item, "media_kind", None) == "video"
     ]
     if not files:
+        # A TV child whose every primary video already sits in the formal
+        # library legitimately ends as a subtitle-only replenish: the planner
+        # keeps an external subtitle only beside a companion video that
+        # exists, so those rows restate library coordinates instead of new
+        # ownership.  Keep the fail-closed door for any other video-less
+        # shape (an empty plan, or non-subtitle rows with no coordinates).
+        remaining = list(getattr(plan, "files", ()) or ())
+        if remaining and all(
+            getattr(item, "media_kind", None) == "subtitle"
+            and _internal_child_episode_coordinates(
+                str(getattr(item, "final_name", "") or ""))
+            for item in remaining
+        ):
+            return []
         return ["内部 TV child 没有视频"]
     owners: dict[str, list[str]] = {}
     errors: list[str] = []

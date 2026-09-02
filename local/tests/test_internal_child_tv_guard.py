@@ -39,6 +39,18 @@ def _video(source_name: str, final_name: str) -> PlannedFile:
     )
 
 
+def _subtitle(source_name: str, final_name: str) -> PlannedFile:
+    return PlannedFile(
+        source_path=f"/incoming/show/{source_name}",
+        source_dir="/incoming/show",
+        original_name=source_name,
+        final_name=final_name,
+        target_dir="/library/show/Season 01",
+        media_kind="subtitle",
+        source_size=512,
+    )
+
+
 class InternalChildTvGuardTests(unittest.TestCase):
     def test_bracketed_source_with_single_final_coordinate_passes(self) -> None:
         """``[01]`` source carries no SxxEyy; the final S01E01 is authoritative."""
@@ -90,6 +102,47 @@ class InternalChildTvGuardTests(unittest.TestCase):
         )
         errors = _internal_child_tv_primary_video_errors(plan)
         self.assertTrue(any("多个视频" in error for error in errors))
+
+    def test_subtitle_only_child_with_coordinates_passes(self) -> None:
+        """正片已全部在库的 TV child 合法收敛为纯字幕补写。"""
+        plan = _plan(
+            _subtitle("[Ygm] Show [51].CHS.ass", "Show - S01E51 - 标题.zh-CN.ass"),
+            _subtitle("[Ygm] Show [52].CHS.ass", "Show - S01E52 - 标题.zh-CN.ass"),
+        )
+        self.assertEqual(_internal_child_tv_primary_video_errors(plan), [])
+
+    def test_subtitle_only_child_with_a_multi_episode_row_passes(self) -> None:
+        """双集合并字幕（S01E02-E03）也是库坐标的复述，不是所有权主张。"""
+        plan = _plan(
+            _subtitle(
+                "[Ygm] Show [NE 02-03].CHS.ass",
+                "Show - S01E02-E03 - 标题 {edition-New Edit}.zh-CN.ass",
+            ),
+        )
+        self.assertEqual(_internal_child_tv_primary_video_errors(plan), [])
+
+    def test_subtitle_without_coordinates_is_still_rejected(self) -> None:
+        plan = _plan(
+            _subtitle("[Ygm] Show extras.ass", "Show 特典字幕.ass"),
+        )
+        errors = _internal_child_tv_primary_video_errors(plan)
+        self.assertEqual(errors, ["内部 TV child 没有视频"])
+
+    def test_mixed_non_subtitle_video_less_child_is_still_rejected(self) -> None:
+        plan = _plan(
+            _subtitle("[Ygm] Show [51].CHS.ass", "Show - S01E51 - 标题.zh-CN.ass"),
+            PlannedFile(
+                source_path="/incoming/show/menu.jpg",
+                source_dir="/incoming/show",
+                original_name="menu.jpg",
+                final_name="menu.jpg",
+                target_dir="/library/show/Season 01",
+                media_kind="other",
+                source_size=10,
+            ),
+        )
+        errors = _internal_child_tv_primary_video_errors(plan)
+        self.assertEqual(errors, ["内部 TV child 没有视频"])
 
 
 if __name__ == "__main__":

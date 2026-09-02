@@ -10897,6 +10897,26 @@ def _demote_videos_whose_coordinate_holds_other_bytes(
     )
 
 
+_SUBTITLE_TRACK_RANK_FLOOR = 99
+
+
+def _subtitle_language_rank(language: str | None) -> int:
+    """Rank one external-track language exactly like the track selector.
+
+    The order mirrors ``_subtitle_track_rank`` in ``current_plan``: the
+    simplified-Chinese preference chain first, then the other languages, so
+    a candidate is suppressed only when the library track is equal or better
+    under the same single policy.
+    """
+    return {
+        "zh-CN": 0,
+        "zh-TW": 1,
+        "en": 2,
+        "ja": 3,
+        None: 4,
+    }.get(language, 5)
+
+
 def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
     """Keep a subtitle only when its destination has an exact video companion."""
     planned_video_keys = {
@@ -10912,12 +10932,25 @@ def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
         not in planned_video_keys
     }
     existing_video_keys: set[tuple[str, str]] = set()
+    existing_track_ranks: dict[tuple[str, str], int] = {}
     for target_dir in sorted(target_dirs):
         for entry in alist.try_list(target_dir, refresh=True) or []:
             name = str(entry.get("name", ""))
-            if entry.get("is_dir") or Path(name).suffix.lower() not in VIDEO_EXTS:
+            if entry.get("is_dir"):
                 continue
-            existing_video_keys.add(_planned_companion_key(target_dir, name))
+            suffix = Path(name).suffix.lower()
+            if suffix in VIDEO_EXTS:
+                existing_video_keys.add(_planned_companion_key(target_dir, name))
+            elif suffix in SUBTITLE_EXTS:
+                # An external track already migrated into the library is the
+                # standing winner for that companion: remember its language
+                # rank so a same-or-worse candidate re-appearing in a later
+                # source never rewrites or duplicates it.
+                companion = _planned_companion_key(target_dir, name)
+                existing_track_ranks[companion] = min(
+                    existing_track_ranks.get(companion, _SUBTITLE_TRACK_RANK_FLOOR),
+                    _subtitle_language_rank(subtitle_language(name)),
+                )
 
     # Subtitle files are media candidates, never generic cleanup rows.
     plan.cleanup_files = [
@@ -10927,16 +10960,51 @@ def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
 
     retained: list[PlannedFile] = []
     unpaired: list[PlannedFile] = []
+    superseded: list[PlannedFile] = []
     for item in plan.files:
         if item.media_kind != "subtitle":
             retained.append(item)
             continue
         companion = _planned_companion_key(item.target_dir, item.final_name)
-        if companion in planned_video_keys or companion in existing_video_keys:
+        if companion in planned_video_keys:
             retained.append(item)
-        else:
-            unpaired.append(item)
+            continue
+        if companion in existing_video_keys:
+            library_rank = existing_track_ranks.get(companion)
+            if library_rank is not None and (
+                _subtitle_language_rank(subtitle_language(item.final_name))
+                >= library_rank
+            ):
+                # The library already holds an equal-or-preferred track beside
+                # this existing video (e.g. the migrated CHS winner beside a
+                # re-offered CHT), so the candidate loses and stays at source.
+                superseded.append(item)
+            else:
+                retained.append(item)
+            continue
+        unpaired.append(item)
     plan.files = retained
+    if superseded:
+        deferred = plan.scan_report.setdefault("deferred_subtitles", [])
+        if not isinstance(deferred, list):
+            raise PlanError("scan_report.deferred_subtitles 必须是数组")
+        existing_sources = _deferred_subtitle_source_keys(plan)
+        deferred.extend(
+            {
+                "source_path": item.source_path,
+                "planned_target_path": join_remote(
+                    normalize_remote_path(item.target_dir), item.final_name
+                ),
+                "action": "defer_until_exact_video_subtitle_closure",
+                "reason": "library_track_supersedes_candidate",
+            }
+            for item in superseded
+            if _collision_key(item.source_path) not in existing_sources
+        )
+        plan.warnings.append(
+            f"{len(superseded)} 个外挂字幕的伴随视频已在库且库内已有同轨或更优轨道；"
+            "候选保留在源目录"
+        )
     if not unpaired:
         return
 
