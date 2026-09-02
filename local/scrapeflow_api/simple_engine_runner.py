@@ -6498,6 +6498,11 @@ class SimpleEngineRunner:
         task-scoped request marker;
         the current remote operation completes, then the owning worker marks
         the job cancelled before another move, upload, or cleanup action.
+        ``gaps_pending`` is cancellable for the same reason ``completed``
+        already is: a parked root with an open Gap ledger is quiescent (J
+        re-review and external replenishment never hold the writer lock), and
+        cancel-then-cleanup is the documented path to rebuild a root whose
+        durable write facts no longer match the library.
         """
         normalized_reason = reason.strip() or "cancelled by operator"
         immediate_phases = {
@@ -6507,7 +6512,7 @@ class SimpleEngineRunner:
             "retry_wait", "failed", "failed_archive", "failed_identity",
             "failed_planning", "failed_provider", "failed_write",
             "failed_verification", "failed_cleanup", "executing", "verifying",
-            "cleaning", "executed", "completed", "cancelled",
+            "cleaning", "executed", "completed", "cancelled", "gaps_pending",
         }
         try:
             with self.worker_lock():
@@ -6534,7 +6539,7 @@ class SimpleEngineRunner:
                 "planned", "retry_wait", "failed", "failed_archive",
                 "failed_identity", "failed_planning", "failed_provider",
                 "failed_write", "failed_verification", "failed_cleanup",
-                "executed", "completed",
+                "executed", "completed", "gaps_pending",
             }
             if job.phase in inactive_phases:
                 self._request_inactive_cancellation(job, reason=normalized_reason)

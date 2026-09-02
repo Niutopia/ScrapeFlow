@@ -3636,6 +3636,35 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertEqual(restarted.get_job(job.id).phase, "cancelled")
         self.assertFalse(restarted._cancel_request_path(job.id).exists())  # noqa: SLF001
 
+    def test_cancel_closes_a_gaps_pending_root_like_a_completed_one(self) -> None:
+        # ``gaps_pending`` is a quiescent phase (J re-review and external
+        # replenishment never hold the writer lock), and cancel-then-cleanup
+        # is the documented path to rebuild a root whose durable write facts
+        # no longer match the library.  It must be cancellable exactly like
+        # the already-supported ``completed`` phase.
+        runner = SimpleEngineRunner(
+            self.root,
+            alist=self.alist,
+            tmdb=object(),
+            planner=fake_plan,
+            validate=False,
+            executor=lambda _plan: {"ok": True},
+        )
+        job = runner.plan_job(self.request, job_id="engine-gaps-pending-cancel")
+        parked = replace(job, phase="gaps_pending")
+        atomic_write_json(
+            runner._job_path(job.id),  # noqa: SLF001 - persisted phase fixture
+            parked.as_dict(),
+            allow_nan=False,
+        )
+
+        cancelled = runner.cancel_job(job.id, reason="rebuild after revert")
+
+        self.assertEqual(cancelled.phase, "cancelled")
+        self.assertEqual(runner.get_job(job.id).phase, "cancelled")
+        self.assertFalse(runner._cancel_request_path(job.id).exists())  # noqa: SLF001
+        self.assertEqual(self.alist.moves, [])
+
     def test_recovery_readback_marks_fully_written_engine_job_completed(self) -> None:
         runner = SimpleEngineRunner(
             self.root,
