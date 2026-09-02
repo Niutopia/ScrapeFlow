@@ -2519,6 +2519,10 @@ def subtitle_presentation_rank(item: Mapping[str, Any]) -> int:
     return _media_quality.subtitle_presentation_rank(item)
 
 
+def upscaled_4k_release(item: Mapping[str, Any]) -> bool:
+    return _media_quality.upscaled_4k_release(item)
+
+
 def _prefer_highest_resolution_videos(
     items: Sequence[Mapping[str, Any]],
     *,
@@ -2558,6 +2562,28 @@ def _prefer_highest_resolution_videos(
     removed_video_companions: list[tuple[str, str, str, str]] = []
     for bucket_items in video_buckets.values():
         ranks = {id(item): video_resolution_rank(item) for item in bucket_items}
+        # A release that self-identifies as a ``4K Ver.`` upscale is not an
+        # independent UHD source.  When the same bucket also holds a native
+        # release with a positive advertised resolution, the upscale must not
+        # win on its inflated 4K label: it competes as resolution-unlabelled
+        # and is kept at source instead of being written or deleted.
+        upscaled_ids = {
+            id(item) for item in bucket_items if upscaled_4k_release(item)
+        }
+        demoted_upscale_ids: set[int] = set()
+        if upscaled_ids:
+            native_best = max(
+                (
+                    ranks[id(item)]
+                    for item in bucket_items
+                    if id(item) not in upscaled_ids
+                ),
+                default=0,
+            )
+            if native_best > 0:
+                demoted_upscale_ids = upscaled_ids
+                for item_id in upscaled_ids:
+                    ranks[item_id] = 0
         best_rank = max(ranks.values(), default=0)
         best_resolution_items = [
             item for item in bucket_items if ranks[id(item)] == best_rank
@@ -2612,7 +2638,13 @@ def _prefer_highest_resolution_videos(
         preferred_size = _entry_size_value(preferred) or 0
         for item in bucket_items:
             cleanup_kind: str | None = None
-            if ranks[id(item)] < best_rank and (
+            if id(item) in demoted_upscale_ids and item is not preferred:
+                # The upscale lost to a native release: record it for the
+                # stays-at-source problem lane.  It is never a cleanup
+                # candidate, so its companion subtitles keep their normal
+                # (subtitle-track) treatment instead of release deletion.
+                cleanup_kind = "upscaled_4k_duplicate"
+            elif ranks[id(item)] < best_rank and (
                 ranks[id(item)] > 0 or best_rank >= 2160
             ):
                 cleanup_kind = "lower_resolution"
@@ -2738,6 +2770,14 @@ def _prefer_highest_resolution_videos(
     return kept, removed
 
 
+def _upscaled_4k_problem_reason(preferred_source_path: str) -> str:
+    return (
+        "同集号存在原生分辨率 BD 版本 "
+        f"{normalize_remote_path(preferred_source_path)}；"
+        "本文件自标 4K Ver. 属升频版本，不作为胜出版本，保留在源目录"
+    )
+
+
 def _lower_resolution_cleanup_reason(preferred_source_path: str) -> str:
     return (
         "同一 TMDB 集号已有更高清晰度版本 "
@@ -2802,6 +2842,7 @@ def _dedupe_merged_tv_target_variants(plan: Plan) -> None:
 
     removed_ids: set[int] = set()
     cleanup: list[PlannedCleanup] = []
+    problems: list[PlannedProblem] = []
     removed_video_count = 0
     removed_subtitle_count = 0
     preferred_by_key: dict[tuple[str, str], tuple[int, PlannedFile]] = {}
@@ -2814,6 +2855,55 @@ def _dedupe_merged_tv_target_variants(plan: Plan) -> None:
             )
             for item in members
         }
+        # Same demotion as per-subplan selection: a ``4K Ver.`` upscale is not
+        # an independent UHD source and must not beat a native release at a
+        # lower advertised resolution when both reach the same exact target.
+        upscaled_ids = {
+            id(item)
+            for item in members
+            if upscaled_4k_release(
+                {"name": item.original_name, "full_path": item.source_path}
+            )
+        }
+        demoted_upscale_ids: set[int] = set()
+        if upscaled_ids:
+            native_best = max(
+                (
+                    ranks[id(item)]
+                    for item in members
+                    if id(item) not in upscaled_ids
+                ),
+                default=0,
+            )
+            if native_best > 0:
+                demoted_upscale_ids = upscaled_ids
+                for item_id in upscaled_ids:
+                    ranks[item_id] = 0
+        if demoted_upscale_ids:
+            native_members = [
+                item for item in members if id(item) not in demoted_upscale_ids
+            ]
+            native_winner = min(
+                native_members,
+                key=lambda item: (
+                    -ranks[id(item)],
+                    _collision_key(item.source_path),
+                ),
+            )
+            for item in members:
+                if id(item) not in demoted_upscale_ids:
+                    continue
+                removed_ids.add(id(item))
+                problems.append(
+                    PlannedProblem(
+                        source_path=item.source_path,
+                        reason=_upscaled_4k_problem_reason(
+                            native_winner.source_path
+                        ),
+                        stays_at_source=True,
+                    )
+                )
+            members = native_members
         best_rank = max(ranks.values(), default=0)
         winners = [item for item in members if ranks[id(item)] == best_rank]
         if best_rank <= 0 or len(winners) != 1:
@@ -2923,6 +3013,12 @@ def _dedupe_merged_tv_target_variants(plan: Plan) -> None:
         return
     plan.files = [item for item in plan.files if id(item) not in removed_ids]
     plan.cleanup_files = _dedupe_cleanup_files([*plan.cleanup_files, *cleanup])
+    if problems:
+        plan.problem_files = [*plan.problem_files, *problems]
+        plan.warnings.append(
+            f"{len(problems)} 个自标 4K Ver. 的升频副本跨子计划竞争同一坐标；"
+            "已保留原生分辨率版本，升频副本保留在源目录"
+        )
     if removed_video_count:
         plan.warnings.append(
             "合并子计划后发现同一 TMDB 集号的跨目录清晰度副本；"
@@ -7833,6 +7929,15 @@ def build_tv_plan(
                     reason = _same_resolution_cleanup_reason(preferred_source)
                 elif cleanup_kind == "lower_resolution_subtitle":
                     reason = _lower_resolution_subtitle_cleanup_reason(preferred_source)
+                elif cleanup_kind == "upscaled_4k_duplicate":
+                    problem_files.append(
+                        PlannedProblem(
+                            source_path=source_path,
+                            reason=_upscaled_4k_problem_reason(preferred_source),
+                            stays_at_source=True,
+                        )
+                    )
+                    continue
                 else:
                     reason = _lower_resolution_cleanup_reason(preferred_source)
                 cleanup_files.append(
@@ -7861,6 +7966,10 @@ def build_tv_plan(
                 item.get("_duplicate_cleanup_kind") == "lower_resolution_subtitle"
                 for item in lower_resolution_videos
             )
+            upscaled_4k_count = sum(
+                item.get("_duplicate_cleanup_kind") == "upscaled_4k_duplicate"
+                for item in lower_resolution_videos
+            )
             if lower_count:
                 warnings.append(
                     f"{key.display} 存在同一 TMDB 集号的多个清晰度版本；"
@@ -7882,6 +7991,12 @@ def build_tv_plan(
                 warnings.append(
                     f"{key.display} 已计划清理 {lower_subtitle_count} 个"
                     "仅属于低清发布版的重复字幕"
+                )
+            if upscaled_4k_count:
+                warnings.append(
+                    f"{key.display} 存在自标 4K Ver. 的升频版本；"
+                    f"已优先保留原生分辨率版本，{upscaled_4k_count} "
+                    "个升频文件保留在源目录"
                 )
         explicit_special_context = any(_has_special_context(item) for item in groups[key])
         override = episode_overrides.get(key)

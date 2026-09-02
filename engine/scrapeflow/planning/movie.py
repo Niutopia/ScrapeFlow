@@ -38,6 +38,7 @@ _IMPLEMENTATION_NAMES = (
     "_query_from_source",
     "_resource_gap",
     "_same_resolution_cleanup_reason",
+    "_upscaled_4k_problem_reason",
     "bonus_type",
     "build_movie_plan",
     "cleanup_reason",
@@ -273,11 +274,24 @@ def build_movie_plan(
             lower_resolution_videos.extend(removed_part)
     else:
         files, lower_resolution_videos = _prefer_highest_resolution_videos(files)
+    upscaled_4k_problems: list[PlannedProblem] = []
     for item in lower_resolution_videos:
         source_path = normalize_remote_path(str(item["full_path"]))
         source_dir, original_name = split_remote(source_path)
         preferred_source = str(item["_preferred_resolution_source"])
         cleanup_kind = str(item.get("_duplicate_cleanup_kind", "lower_resolution"))
+        if cleanup_kind == "upscaled_4k_duplicate":
+            # A self-labelled ``4K Ver.`` upscale lost to the native release:
+            # it stays at source as an informational problem row, never as a
+            # cleanup candidate with delete authority.
+            upscaled_4k_problems.append(
+                PlannedProblem(
+                    source_path=source_path,
+                    reason=_upscaled_4k_problem_reason(preferred_source),
+                    stays_at_source=True,
+                )
+            )
+            continue
         if cleanup_kind == "burned_subtitle_duplicate":
             reason = _burned_subtitle_cleanup_reason(preferred_source)
         elif cleanup_kind == "same_resolution_duplicate":
@@ -430,7 +444,7 @@ def build_movie_plan(
                 reason="sample/样片文件不参与整理；保留原位待人工确认",
             )
             for item in samples
-        ],
+        ] + upscaled_4k_problems,
         scan_report={
             "deferred_subtitles": [
                 {

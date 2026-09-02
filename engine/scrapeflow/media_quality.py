@@ -114,6 +114,34 @@ def video_resolution_rank(item: Mapping[str, Any]) -> int:
     return 0
 
 
+# A release directory such as ``[Moozzi2] ... [ 4K Ver. ] - TV`` self-identifies
+# as a 4K *version* — an upscale derived from the native-resolution master, not
+# an independent UHD source.  The ``Ver.`` tag is the tell: a native UHD release
+# advertises its resolution (``2160p``/``3840x2160``) without claiming to be a
+# derived version of another release.
+_UPSCALED_4K_RELEASE_RE = re.compile(
+    r"(?:^|[^0-9a-z])4k[\s._-]*ver(?:sion)?\.?(?:$|[^0-9a-z])",
+    re.IGNORECASE,
+)
+
+
+def upscaled_4k_release(item: Mapping[str, Any]) -> bool:
+    """Whether a release path self-identifies as an upscaled 4K version.
+
+    Only the path's own label counts: a ``[ 4K Ver. ]`` directory marks every
+    descendant as a derived upscale.  No external discography lookup is
+    performed here; callers demote such a release only when a native
+    competitor exists in the same comparison bucket.
+    """
+    full_path = unicodedata.normalize(
+        "NFKC", str(item.get("full_path", item.get("name", "")))
+    )
+    for segment in full_path.replace("\\", "/").split("/"):
+        if _UPSCALED_4K_RELEASE_RE.search(segment):
+            return True
+    return False
+
+
 def subtitle_presentation_rank(item: Mapping[str, Any]) -> int:
     """Prefer switchable subtitle tracks over permanently burned-in subtitles.
 
@@ -145,6 +173,7 @@ __all__ = [
     "media_kind",
     "minimum_video_bytes",
     "subtitle_presentation_rank",
+    "upscaled_4k_release",
     "video_resolution_rank",
     "video_size_is_admissible",
 ]
