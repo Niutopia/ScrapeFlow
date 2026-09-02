@@ -1407,11 +1407,15 @@ class PolicyRejectingAList(NoopRemoveEmptyAList):
     Full-width punctuation (``：``/``／``) that the provider itself accepted
     at upload time is refused — the observed AListClient behavior — while
     the raw ``call('remove', ...)`` endpoint still deletes by exact name.
+    The provider's own guard additionally refuses ``..`` runs on every
+    remove path (the observed Quark behavior); renaming the entry to its
+    provider-safe spelling first is the only way through.
     """
 
     def __init__(self, files: dict[str, bytes] | None = None) -> None:
         super().__init__(files)
         self.raw_remove_calls: list[tuple[str, list[str]]] = []
+        self.rename_calls: list[tuple[str, str]] = []
 
     def remove(self, parent: str, names: list[str]) -> bool:
         from engine.scrapeflow.remote_paths import is_provider_safe_basename
@@ -1421,12 +1425,35 @@ class PolicyRejectingAList(NoopRemoveEmptyAList):
             raise ValueError(f"远端文件名不符合 AList 安全命名规则: {unsafe!r}")
         return super().remove(parent, names)
 
+    def rename(self, full_path: str, new_name: str) -> None:
+        parent, _, old_name = full_path.rpartition("/")
+        target = f"{parent.rstrip('/')}/{old_name}"
+        renamed = f"{parent.rstrip('/')}/{new_name}"
+        if target in self.files:
+            self.files[renamed] = self.files.pop(target)
+        elif target in self.dirs:
+            self.dirs.discard(target)
+            self.dirs.add(renamed)
+            for full in list(self.files):
+                if full.startswith(target + "/"):
+                    self.files[full.replace(target, renamed, 1)] = self.files.pop(full)
+        else:
+            raise FileNotFoundError(target)
+        self.rename_calls.append((target, new_name))
+
     def call(self, endpoint: str, body: dict[str, object], *, retryable: bool = False) -> dict[str, object]:
         del retryable
+        if endpoint == "rename":
+            self.rename(str(body.get("path") or ""), str(body.get("name") or ""))
+            return {"code": 200, "message": "success", "data": None}
         if endpoint != "remove":
             raise AssertionError(f"unexpected raw endpoint: {endpoint}")
         parent = str(body.get("dir") or "")
         names = [str(name) for name in (body.get("names") or [])]
+        dot_runs = [name for name in names if ".." in name]
+        if dot_runs:
+            # The provider's own name guard: Quark refuses dot runs.
+            raise RuntimeError("AList remove失败: invalid file name")
         self.raw_remove_calls.append((parent.rstrip("/"), list(names)))
         super().remove(parent, names)
         return {"code": 200, "message": "ok"}
@@ -1650,9 +1677,11 @@ class SourceShellCleanupTests(unittest.TestCase):
                 if data is not None:
                     alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
             # Residuals the plan never claimed: an unsafe-name file, an
-            # unsafe-name directory, and a safe sibling behind them.
+            # unsafe-name directory, a dot-run name the provider itself
+            # refuses to delete, and a safe sibling behind them all.
             alist.files["/incoming/My Show/第01話：序章.mp4"] = b"junk"
             alist.files["/incoming/My Show/外伝／特別篇/safe.txt"] = b"junk"
+            alist.files["/incoming/My Show/O. S. T..cue"] = b"junk"
             alist.dirs.add("/incoming/My Show")
             alist.dirs.add("/incoming/My Show/外伝／特別篇")
             return {"ok": True}
@@ -1665,13 +1694,23 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertIsNone(final.error)
         self.assertNotIn("/incoming/My Show/第01話：序章.mp4", alist.files)
         self.assertNotIn("/incoming/My Show/外伝／特別篇/safe.txt", alist.files)
+        self.assertNotIn("/incoming/My Show/O. S. T..cue", alist.files)
+        self.assertNotIn("/incoming/My Show/O. S. T.cue", alist.files)
         self.assertNotIn("/incoming/My Show/外伝／特別篇", alist.dirs)
         self.assertNotIn("/incoming/My Show", alist.dirs)
-        # The unsafe names went through the raw exact-name call, and the
-        # safe sibling behind them was still reached (no silent walk abort).
+        # The unsafe names went through the raw exact-name call, the dot-run
+        # name went through rename-to-safe + remove, and the safe sibling
+        # behind them was still reached (no silent walk abort).
         raw_names = {name for _parent, names in alist.raw_remove_calls for name in names}
+        strict_names = {name for _parent, names in alist.remove_calls for name in names}
         self.assertIn("第01話：序章.mp4", raw_names)
         self.assertIn("外伝／特別篇", raw_names)
+        # provider_safe_basename collapses the ``..`` run into ``-``.
+        self.assertIn("O. S. T-cue", strict_names)
+        self.assertIn(
+            ("/incoming/My Show/O. S. T..cue", "O. S. T-cue"),
+            alist.rename_calls,
+        )
 
     def test_residual_tree_becomes_job_note_instead_of_silence(self) -> None:
         """A provider that keeps reporting the tree leaves a visible note.

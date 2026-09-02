@@ -33,7 +33,7 @@ from typing import Callable
 
 from engine.scrapeflow.core import _validate_remote_source_basename
 from engine.scrapeflow.intake_source import load_intake_catalog
-from engine.scrapeflow.remote_paths import normalize_remote_path
+from engine.scrapeflow.remote_paths import normalize_remote_path, provider_safe_basename
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
     rebuild_root_boundary_if_unwritten,
@@ -92,9 +92,17 @@ def _remove_intake_entry(alist: object, parent: str, name: str) -> None:
     contract for destinations and moves, but an intake deletion is not a
     rename: the name came from a fresh provider listing and the provider
     accepted it at upload time (full-width ``：``/``／`` titles, dot runs).
-    When the policy validator is the only rejection, retry through the raw
-    exact-name call; separators, control characters, and path segments stay
-    fail-closed through the source-basename contract.
+    Three bounded tiers, each proven by the caller's fresh listing:
+
+    1. the strict ``remove`` — names the rename policy accepts;
+    2. the raw exact-name call — the policy is the only objection (e.g.
+       compatibility punctuation the provider itself accepts);
+    3. rename-to-safe + remove — the provider's own name guard refuses the
+       existing name (Quark rejects ``..`` runs on delete), so the entry is
+       first renamed to its provider-safe spelling and then removed.
+
+    Separators, control characters, and path segments stay fail-closed
+    through the source-basename contract at every tier.
     """
     remove = getattr(alist, "remove", None)
     if callable(remove):
@@ -107,7 +115,26 @@ def _remove_intake_entry(alist: object, parent: str, name: str) -> None:
     if not callable(call):
         raise RuntimeError(f"AList 客户端缺少删除接口，无法删除: {name!r}")
     _validate_remote_source_basename(name)
-    call("remove", {"dir": normalize_remote_path(parent), "names": [name]})
+    try:
+        call("remove", {"dir": normalize_remote_path(parent), "names": [name]})
+        return
+    except Exception as exc:
+        provider_error = exc  # provider-side name guard — try tier 3
+    # Tier 3: rename to the strict provider-safe spelling, then remove the
+    # renamed entry.  The caller's fresh-listing proof still verifies the
+    # original name is gone; a remove that no-ops leaves the renamed entry
+    # visible to the next consumption pass (self-healing, never silent).
+    safe_name = provider_safe_basename(name)
+    if safe_name == name or safe_name in {"未命名", ".", ".."}:
+        raise provider_error
+    rename = getattr(alist, "rename", None)
+    if not callable(rename):
+        raise provider_error
+    rename(posixpath.join(parent, name), safe_name)
+    if callable(remove):
+        remove(parent, [safe_name])
+    else:
+        call("remove", {"dir": normalize_remote_path(parent), "names": [safe_name]})
 
 
 def is_intake_bound_root(state_root: Path, root_task_id: str) -> bool:
