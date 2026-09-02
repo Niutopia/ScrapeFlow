@@ -2165,12 +2165,20 @@ def extract_episode_key(text: str) -> EpisodeKey | None:
             fractional_digits=digits,
         )
 
+    # A named mini-series label (``[Mini Anime 51]``/``Mini Anime 01``) carries
+    # the release's own numbering for that series.  The number is returned as a
+    # special ordinal and later cross-checked against official Season 00 rows:
+    # some releases number the mini-series globally (Re:Zero Break Time 3rd is
+    # [Mini Anime 51]..[66] == TMDB S00E51..E66), others restart it locally per
+    # disc (Frieren [Mini Anime 01]..[11] interleaves other specials).  Only
+    # the official-evidence mappers may promote one of these to a write.
     special_patterns = [
         r"\[\s*(?:SP|SPECIAL|OVA|OAV|OAD)\s*\]\s*\[\s*0*(\d{1,3})\s*\]",
         r"(?:^|[\s._\-\[\]()])(?:OVA|OAV|OAD)[\s._-]*(?:SERIES|系列)[\s._-]*\[?\s*0*(\d{1,3})\s*\]?(?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])(?:SP|SPECIAL|OVA|OAV|OAD)[\s._-]*[\[(]\s*0*(\d{1,3})\s*[\])](?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])(?:SP|SPECIAL|OVA|OAV|OAD)[\s._-]*0*(\d{1,3})(?:$|[\s._\-\[\]()])",
         r"(?:^|[\s._\-\[\]()])TOKUTEN[ ._-]*ANIME[ ._-]*0*(\d{1,3})(?:$|[\s._\-\[\]()])",
+        r"(?:^|[\s._\-\[\]()])(?:MINI[\s._-]*ANIME|ミニアニメ|迷你[动動]画)[\s._-]*\[?\s*0*(\d{1,3})\s*\]?(?:$|[\s._\-\[\]()])",
         r"第\s*0*(\d{1,3})\s*(?:话|集)?\s*(?:特别篇|特典)",
     ]
     for pattern in special_patterns:
@@ -5974,6 +5982,83 @@ def _official_numbered_title_special_run(
     return tuple(
         ordinal_to_episode[ordinal] for ordinal in range(1, run_length + 1)
     )
+
+
+_MINI_ANIME_LABEL_ORDINAL_RE = re.compile(
+    r"(?:^|[\s._\-\[\]()])(?:MINI[\s._-]*ANIME|ミニアニメ|迷你[动動]画)"
+    r"[\s._-]*\[?\s*0*(\d{1,3})\s*\]?(?:$|[\s._\-\[\]()])",
+    re.IGNORECASE,
+)
+
+
+def _map_global_mini_anime_runs(
+    items: list[dict[str, Any]],
+    special_runtimes: Mapping[int, int],
+) -> int:
+    """Re-admit bonus-directory mini-anime videos numbered with global ordinals.
+
+    A mini-series under ``SPs/`` is withheld by the preclassifier because its
+    bare ordinal is usually release-local.  Some releases instead number the
+    series with the *global* Season 00 ordinals and say so on the label
+    (Re:Zero Break Time 3rd: ``[Mini Anime 51]``..``[66]``).  That claim is
+    accepted only when the complete consecutive labeled run starts after 1
+    (a release-local restart always restarts at 1 — start-at-1 runs keep the
+    stricter embedded-official-ordinal reclamation) and coincides exactly
+    with official Season 00 short-extra rows at those same ordinals.  A
+    local restart that interleaves other specials (Frieren
+    ``[Mini Anime 01]``..``[11]``) hits a full-length or missing official
+    row and stays withheld.  Ordinal identity with one contiguous official
+    short run is the evidence; a lone labelled file, a gappy run, or a
+    start-at-1 run proves nothing and stays fail-closed.
+    """
+    if not special_runtimes:
+        return 0
+    labeled: list[tuple[str, dict[str, Any]]] = []
+    for item in items:
+        if Path(str(item.get("name", ""))).suffix.lower() not in VIDEO_EXTS:
+            continue
+        if item.get("_episode_kind_override") is not None:
+            continue
+        name = unicodedata.normalize("NFKC", str(item.get("name", "")))
+        if _MINI_ANIME_LABEL_ORDINAL_RE.search(name):
+            parent, _ = split_remote(
+                normalize_remote_path(str(item.get("full_path", "/")))
+            )
+            labeled.append((parent, item))
+    if not labeled:
+        return 0
+    by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for parent, item in labeled:
+        by_parent[parent].append(item)
+    mapped = 0
+    for parent, members in sorted(
+        by_parent.items(), key=lambda row: _collision_key(row[0])
+    ):
+        by_ordinal: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for item in members:
+            match = _MINI_ANIME_LABEL_ORDINAL_RE.search(
+                unicodedata.normalize("NFKC", str(item.get("name", "")))
+            )
+            if match:
+                by_ordinal[int(match.group(1))].append(item)
+        ordinals = sorted(by_ordinal)
+        if (
+            len(ordinals) < 2
+            or ordinals[0] <= 1
+            or ordinals != list(range(ordinals[0], ordinals[-1] + 1))
+        ):
+            continue
+        if not all(
+            0 < int(special_runtimes.get(number) or 0) <= 10
+            for number in ordinals
+        ):
+            continue
+        for number, number_items in sorted(by_ordinal.items()):
+            for item in number_items:
+                item["_episode_kind_override"] = "special"
+                item["_episode_key_override"] = number
+                mapped += 1
+    return mapped
 
 
 def _map_explicit_special_release_runs(

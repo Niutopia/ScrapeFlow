@@ -49,6 +49,7 @@ _IMPLEMENTATION_NAMES = (
     "_map_disc_extras_by_official_release_runs",
     "_map_explicit_beta_alternate",
     "_map_explicit_special_release_runs",
+    "_map_global_mini_anime_runs",
     "_map_release_label_editions",
     "_map_split_official_special_folder",
     "_map_unnumbered_special_from_subtitle_title",
@@ -860,6 +861,15 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     official_special_air_dates,
                 )
             )
+            mini_anime_count = _map_global_mini_anime_runs(
+                bonus_pool,
+                official_special_runtimes,
+            )
+            if mini_anime_count:
+                special_release_warnings.append(
+                    f"{mini_anime_count} 个以全局 Season 00 集号标注的迷你动画"
+                    "已按官方短片序列映射到 Season 00"
+                )
             reclaimed_bonus_specials = [
                 item
                 for item in bonus_pool
