@@ -720,6 +720,40 @@ def _select_representative_video_files(
     return selected
 
 
+_DISC_IMAGE_TITLE_TOKEN_RE = re.compile(
+    r"(?i)^(?:"
+    r"s\d{1,3}"
+    r"|d\d{1,3}"
+    r"|disc\d{1,3}"
+    r"|season\d{1,3}"
+    r"|第[0-9一二三四五六七八九十百零〇两]{1,5}季"
+    r")$"
+)
+
+
+def _disc_image_title_query(filename: str) -> str | None:
+    """Extract the release-title part of an optical-disc image name.
+
+    ``Shameless.US.S03-DISC1.iso`` titles the work ``Shameless US``; the
+    season and disc ordinals behind it are layout, not identity.  A scope
+    that holds only images has no video filename to query, and the image
+    name is frequently the only romanized title evidence in the whole
+    tree.  The cleaned whole stem stays the fallback when no ordinal
+    token splits it — a movie disc without a season marker still deserves
+    its own query.
+    """
+    stem = _clean_noise_tags(Path(filename).stem)
+    if not stem:
+        return None
+    tokens = [token for token in re.split(r"[\s._\-·]+", stem) if token]
+    for index, token in enumerate(tokens):
+        if _DISC_IMAGE_TITLE_TOKEN_RE.match(token):
+            if index == 0:
+                return None
+            return " ".join(tokens[:index])
+    return stem or None
+
+
 def _owned_season_directory_years(node: SourceNode) -> tuple[int, ...]:
     """Collect years from this unit's own season-labeled subdirectories.
 
@@ -776,7 +810,8 @@ def extract_identity_evidence(
     special_numbered_run_complete = False
     if node is not None:
         owned_season_years = _owned_season_directory_years(node)
-        video_files = [f for f in collect_all_files(node) if f.object_type == "video"]
+        all_files = collect_all_files(node)
+        video_files = [f for f in all_files if f.object_type == "video"]
         if video_files:
             episode_pattern = extract_episode_pattern(video_files)
             (
@@ -822,6 +857,19 @@ def extract_identity_evidence(
                 cleaned_name = _clean_noise_tags(Path(f.name).stem)
                 if cleaned_name and cleaned_name not in representative_names:
                     representative_names.append(cleaned_name)
+        else:
+            # A scope that holds only optical-disc images has no video
+            # filename to mine for a title, yet each image name is an
+            # ordinary release name — frequently the only romanized title
+            # evidence in the whole tree.  The part before the season or
+            # disc ordinal is the work's own title query; the ordinals
+            # themselves stay out of it because no catalogue carries them.
+            for f in all_files:
+                if f.object_type != "disc_image":
+                    continue
+                title_query = _disc_image_title_query(f.name)
+                if title_query and title_query not in representative_names:
+                    representative_names.append(title_query)
 
     # Derive normalized titles
     normalized_titles: list[str] = []

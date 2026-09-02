@@ -410,6 +410,45 @@ _HALF_WIDTH_BRACKET_PACKAGING_RE = re.compile(
 )
 
 
+# A release label marks its edition market inline — ``无耻之徒(美版)``,
+# ``[无耻之徒(美版) 第七季]``, ``[美版原盘 DIY简繁 双语字幕]`` — the same fact
+# a romanized release name encodes as a country token (``Shameless.US.S01``).
+# The vocabulary is deliberately bounded to unambiguous single-country markets,
+# mirroring the bounded genre-bucket list in the query cleaner.
+_EDITION_MARKER_COUNTRIES: Mapping[str, str] = {
+    "美版": "US",
+    "英版": "GB",
+    "日版": "JP",
+    "韩版": "KR",
+    "台版": "TW",
+    "港版": "HK",
+    "俄版": "RU",
+    "法版": "FR",
+    "德版": "DE",
+    "大陆版": "CN",
+}
+
+_EDITION_MARKER_PARENTHETICAL_RE = re.compile(
+    r"[（(]\s*(?:" + "|".join(_EDITION_MARKER_COUNTRIES) + r")\s*[)）]"
+)
+
+
+def _edition_marker_country(value: str) -> str | None:
+    """Read the market a release label declares for its edition.
+
+    For same-titled catalogue siblings — the US remake against the original
+    country's show — the declared market is decisive identity evidence: a
+    candidate whose country of origin matches is aligned, a sibling that does
+    not is misaligned once the pool contains an aligned candidate.  A label
+    without a bounded marker carries no such evidence.
+    """
+    text = str(value or "")
+    for marker, country in _EDITION_MARKER_COUNTRIES.items():
+        if marker in text:
+            return country
+    return None
+
+
 def _unwrap_half_width_title_brackets(text: str) -> str:
     """Keep bracketed titles/aliases; drop bounded release packaging tags.
 
@@ -428,7 +467,13 @@ def _unwrap_half_width_title_brackets(text: str) -> str:
         content = match.group(1).strip()
         if not content:
             return " "
-        if _HALF_WIDTH_BRACKET_PACKAGING_RE.search(content):
+        # An inline parenthetical edition marker (``无耻之徒(美版)``) rides
+        # inside a title-bearing group: the edition vocabulary is packaging
+        # only as a standalone token, so drop the parenthetical from the
+        # packaging probe instead of discarding the whole group — that would
+        # throw away the only title evidence in the label.
+        probe = _EDITION_MARKER_PARENTHETICAL_RE.sub(" ", content)
+        if _HALF_WIDTH_BRACKET_PACKAGING_RE.search(probe):
             return " "
         if not re.search(r"[㐀-鿿぀-ヿ]", content):
             if re.fullmatch(r"[^\s]+", content):
@@ -1750,6 +1795,27 @@ def _score_identity_candidate(
         elif raw.get("movie_form_pool_has_aligned"):
             movie_form_alignment_score = -0.15
 
+    # A release label that declares its edition market (``无耻之徒(美版)``,
+    # ``[美版原盘 …]``) asserts the same fact a romanized release name encodes
+    # as a country token (``Shameless.US.S01``).  For same-titled catalogue
+    # siblings — the US remake against the original country's show — that
+    # declared market is decisive: a candidate whose country of origin matches
+    # is aligned, a sibling that does not is misaligned once the pool contains
+    # an aligned candidate.  Like the movie-form token, the penalty stays
+    # dormant without an aligned sibling so an unmarked pool keeps its
+    # historical scoring — a US pressing of a foreign work must not be
+    # penalized for the label's market note.
+    edition_country_alignment_score = 0.0
+    edition_marker_country = raw.get("edition_marker_country")
+    if edition_marker_country:
+        origin_codes = {
+            str(code) for code in (raw.get("origin_countries") or ())
+        }
+        if str(edition_marker_country) in origin_codes:
+            edition_country_alignment_score = 0.12
+        elif raw.get("edition_pool_has_aligned"):
+            edition_country_alignment_score = -0.15
+
     # An explicit physical OVA/OAV/OAD run can be a separately catalogued TV
     # work. It still does not assert a TMDB season: automatic selection needs
     # both a matching official positive-season count and an official marker in
@@ -1802,7 +1868,8 @@ def _score_identity_candidate(
             + media_type_score
             + context_score
             + episode_structure_score
-            + movie_form_alignment_score,
+            + movie_form_alignment_score
+            + edition_country_alignment_score,
         ),
     )
     season_fragment_score = 0.0
@@ -1869,6 +1936,9 @@ def _score_identity_candidate(
         "media_type_score": round(media_type_score, 6),
         "episode_structure_score": round(episode_structure_score, 6),
         "movie_form_alignment_score": round(movie_form_alignment_score, 6),
+        "edition_country_alignment_score": round(
+            edition_country_alignment_score, 6
+        ),
         "special_marker_score": round(special_marker_score, 6),
         "season_fragment_score": round(season_fragment_score, 6),
         "release_evidence_score": round(release_evidence_score, 6),
@@ -2034,6 +2104,7 @@ def auto_match_tmdb(
     query_year = query_year_match.group(0) if query_year_match else None
     excluded_ids = {int(value) for value in (excluded_tmdb_ids or ())}
     initial_types = [media_type] if media_type in {"tv", "movie", "collection"} else ["tv", "movie"]
+    edition_marker_country = _edition_marker_country(query)
     raw_candidates: list[dict[str, Any]] = []
     searched_types: list[str] = []
 
@@ -2163,6 +2234,32 @@ def auto_match_tmdb(
                 actual_count = details.get("number_of_episodes")
                 if isinstance(actual_count, int) and not isinstance(actual_count, bool):
                     actual_episode_count = actual_count
+            # Same edition-market evidence channel as the evidence path: TV
+            # search rows carry ``origin_country`` natively, movie rows need
+            # the bounded detail probe, and only a marker-bearing query pays
+            # for it.
+            origin_countries: tuple[str, ...] = ()
+            raw_origin = item.get("origin_country")
+            if isinstance(raw_origin, list):
+                origin_countries = tuple(
+                    str(code)
+                    for code in raw_origin
+                    if isinstance(code, str) and len(code) == 2
+                )
+            if not origin_countries and edition_marker_country and index < 5:
+                try:
+                    edition_details = client.get(
+                        f"/{candidate_type}/{tmdb_id}"
+                    )
+                except ApiError:
+                    edition_details = {}
+                detail_origin = edition_details.get("origin_country")
+                if isinstance(detail_origin, list):
+                    origin_countries = tuple(
+                        str(code)
+                        for code in detail_origin
+                        if isinstance(code, str) and len(code) == 2
+                    )
             raw_candidates.append({
                 "media_type": candidate_type,
                 "tmdb_id": tmdb_id,
@@ -2178,6 +2275,8 @@ def auto_match_tmdb(
                 "movie_form_token_in_titles": _titles_carry_movie_form_token(
                     [*titles, *aliases]
                 ),
+                "edition_marker_country": edition_marker_country,
+                "origin_countries": origin_countries,
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
@@ -2193,6 +2292,14 @@ def auto_match_tmdb(
                 bool(item.get("movie_form_token_in_titles"))
                 for item in raw_candidates
             )
+        if raw.get("edition_marker_country"):
+            marker = str(raw["edition_marker_country"])
+            raw["edition_pool_has_aligned"] = any(
+                marker in {
+                    str(code) for code in (item.get("origin_countries") or ())
+                }
+                for item in raw_candidates
+            )
         return _score_identity_candidate(
             raw,
             query_years={query_year} if query_year else set(),
@@ -2204,6 +2311,8 @@ def auto_match_tmdb(
                 "query": query,
                 "matched_query_variant": raw.get("matched_query", query),
                 "query_year": query_year,
+                "edition_marker_country": raw.get("edition_marker_country"),
+                "origin_countries": list(raw.get("origin_countries") or ()),
             },
         )
 
@@ -2774,6 +2883,17 @@ def auto_match_from_evidence(
         if clean_boundary_is_cjk
         else ""
     )
+    # The edition-market marker is read from the unit's own label first, then
+    # from the nearest parent container: a market note on the direct container
+    # describes this unit's release the same way one on the boundary does.
+    # ``parent_labels`` runs from the intake root to the unit's direct
+    # container, so the reversed order is nearest-first.
+    edition_marker_country = _edition_marker_country(boundary_label)
+    if edition_marker_country is None:
+        for parent in reversed(evidence.parent_labels):
+            edition_marker_country = _edition_marker_country(parent)
+            if edition_marker_country is not None:
+                break
     raw_candidates: list[dict[str, Any]] = []
     searched_types: list[str] = []
     # Per-namespace ids surfaced by the combined parent+arc queries.  Those
@@ -3056,6 +3176,31 @@ def auto_match_from_evidence(
                     reference_keys=[*sent_query_keys, *titles, *aliases],
                     query_years=query_years,
                 )
+            # TV search rows carry ``origin_country`` natively; movie rows and
+            # a cached TV miss do not, so a label that declared an edition
+            # market earns a bounded detail probe for its top candidates.
+            origin_countries: tuple[str, ...] = ()
+            raw_origin = item.get("origin_country")
+            if isinstance(raw_origin, list):
+                origin_countries = tuple(
+                    str(code)
+                    for code in raw_origin
+                    if isinstance(code, str) and len(code) == 2
+                )
+            if not origin_countries and edition_marker_country and index < 5:
+                try:
+                    edition_details = client.get(
+                        f"/{candidate_type}/{tmdb_id}"
+                    )
+                except ApiError:
+                    edition_details = {}
+                detail_origin = edition_details.get("origin_country")
+                if isinstance(detail_origin, list):
+                    origin_countries = tuple(
+                        str(code)
+                        for code in detail_origin
+                        if isinstance(code, str) and len(code) == 2
+                    )
             raw_candidates.append({
                 "media_type": candidate_type,
                 "tmdb_id": tmdb_id,
@@ -3071,6 +3216,8 @@ def auto_match_from_evidence(
                 "movie_form_token_in_titles": _titles_carry_movie_form_token(
                     [*titles, *aliases]
                 ),
+                "edition_marker_country": edition_marker_country,
+                "origin_countries": origin_countries,
                 "is_animation": is_animation,
                 "actual_episode_count": actual_episode_count,
                 "season_fragment_entry": season_fragment_entry,
@@ -3104,6 +3251,17 @@ def auto_match_from_evidence(
                 bool(item.get("movie_form_token_in_titles"))
                 for item in raw_candidates
             )
+        if raw.get("edition_marker_country"):
+            # Same dormancy rule for the edition-market marker: a US pressing
+            # of a foreign work must not be penalized when no same-titled
+            # sibling of the declared market is even in the pool.
+            marker = str(raw["edition_marker_country"])
+            raw["edition_pool_has_aligned"] = any(
+                marker in {
+                    str(code) for code in (item.get("origin_countries") or ())
+                }
+                for item in raw_candidates
+            )
         return _score_identity_candidate(
             raw,
             query_years=query_years,
@@ -3123,6 +3281,8 @@ def auto_match_from_evidence(
                 ),
                 "query_years": sorted(query_years),
                 "work_unit_id": evidence.work_unit_id,
+                "edition_marker_country": raw.get("edition_marker_country"),
+                "origin_countries": list(raw.get("origin_countries") or ()),
             },
         )
 

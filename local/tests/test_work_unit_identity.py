@@ -21,13 +21,16 @@ from engine.scrapeflow.boundary_analysis import (
 )
 from engine.scrapeflow.errors import PlanError
 from engine.scrapeflow.identity_matching import (
+    AUTO_MATCH_MIN_MARGIN,
     AutoMatchAmbiguityError,
     _clean_boundary_identity_query,
+    _edition_marker_country,
     _search_query_variants,
     _script_evidence_text,
     _title_from_representative_episode_filename,
     _usable_representative_identity_query,
     auto_match_from_evidence,
+    auto_match_tmdb,
 )
 from engine.scrapeflow.source_inventory import SourceFile, SourceNode
 from engine.scrapeflow.work_units import (
@@ -254,6 +257,52 @@ class TestIdentityEvidence(unittest.TestCase):
         self.assertIsNotNone(evidence.episode_pattern)
         self.assertEqual(evidence.episode_pattern.total_episodes, 2)
         self.assertEqual(evidence.media_shape, "tv")
+
+    def test_disc_image_scope_titles_from_image_names(self) -> None:
+        """A disc-only scope mines its title query from the image names.
+
+        ``Shameless.US.S03-DISC1.iso`` must contribute ``Shameless US`` — the
+        season and disc ordinals behind it are layout, not identity — because
+        an image-only scope has no video filename and the image name is
+        frequently the only romanized title evidence in the whole tree.  The
+        disc's own release year never becomes the work's year evidence.
+        """
+        candidate = WorkCandidate(
+            work_unit_id="unit-disc-scope",
+            boundary_key="/待刮削/无耻之徒/无耻之徒(美版) 第三季",
+            source_paths=("/待刮削/无耻之徒/无耻之徒(美版) 第三季",),
+            display_label="无耻之徒(美版) 第三季",
+            proposed_media_context="unknown",
+            boundary_evidence=BoundaryEvidence(
+                role=DirectoryRole.UNCERTAIN,
+                confidence=1.0,
+                reasons=(),
+                competing_roles=(),
+            ),
+            requires_content_expansion=True,
+        )
+        node = SourceNode(
+            path="/待刮削/无耻之徒/无耻之徒(美版) 第三季",
+            name="无耻之徒(美版) 第三季",
+            files=(
+                SourceFile(
+                    "/p/Shameless.US.S03-DISC1.iso", "Shameless.US.S03-DISC1.iso",
+                    45_000_000_000, "disc_image", "",
+                ),
+                SourceFile(
+                    "/p/Shameless.S09.D01.2018.1080p.BluRay.AVC.DTS-HD.MA.5.1-DIY@Audies.iso",
+                    "Shameless.S09.D01.2018.1080p.BluRay.AVC.DTS-HD.MA.5.1-DIY@Audies.iso",
+                    40_000_000_000, "disc_image", "",
+                ),
+            ),
+            children=(),
+            depth=1,
+        )
+        evidence = extract_identity_evidence(candidate, node)
+        self.assertIn("Shameless US", evidence.representative_names)
+        self.assertIn("Shameless", evidence.representative_names)
+        # the 2018 disc release stamp is not the work's year evidence
+        self.assertNotIn(2018, evidence.years)
 
     def test_meaningful_cjk_tv_boundary_marks_strict_naked_numeric_run(self) -> None:
         """``01.mp4`` … ``12.mp4`` are shape only, never coordinates/titles."""
@@ -685,6 +734,40 @@ class TestIdentityEvidence(unittest.TestCase):
             "有意义中文剧名 [Meaningful Show]",
         )
 
+    def test_boundary_clean_query_keeps_edition_marked_bracket_title(self) -> None:
+        """A bracketed title group survives its inline edition marker.
+
+        ``[无耻之徒(美版) 第七季][DIY 简繁 双语字幕]`` carries the work title in
+        the first bracket group and the packaging vocabulary in the second.
+        The inline ``(美版)`` used to make the packaging probe discard the
+        whole first group, leaving the boundary with no title query at all
+        while its unbracketed sibling (``无耻之徒(美版) 第一季``) kept one.
+        The parenthetical is dropped from the probe, not from the title; a
+        group whose only content is the marker stays packaging.
+        """
+        self.assertEqual(
+            _clean_boundary_identity_query(
+                "[无耻之徒(美版) 第七季][DIY 简繁 双语字幕]"
+            ),
+            "无耻之徒(美版)",
+        )
+        self.assertEqual(
+            _clean_boundary_identity_query("[美版原盘 DIY简繁 双语字幕]"),
+            "",
+        )
+
+    def test_edition_marker_country_reads_bounded_vocabulary(self) -> None:
+        """The edition-market vocabulary maps to single countries only."""
+        self.assertEqual(_edition_marker_country("无耻之徒(美版) 第一季"), "US")
+        self.assertEqual(
+            _edition_marker_country("[无耻之徒 第九季][美版原盘 DIY简繁 双语字幕]"),
+            "US",
+        )
+        self.assertEqual(_edition_marker_country("午夜凶铃(日版)"), "JP")
+        self.assertEqual(_edition_marker_country("无耻之徒(英版)"), "GB")
+        self.assertIsNone(_edition_marker_country("无耻之徒 第一季"))
+        self.assertIsNone(_edition_marker_country("Shameless.S09.D01"))
+
     def test_evidence_serialization_roundtrip(self) -> None:
         ep = EpisodePattern(season_numbers=(1,), episode_numbers=(1, 2), total_episodes=2, has_specials=False)
         ev1 = IdentityEvidence(
@@ -1007,6 +1090,139 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
         self.assertEqual(best.tmdb_id, 172811)
         self.assertEqual(best.status, "confirmed")
         self.assertGreaterEqual(best.confidence, 0.88)
+
+    def test_edition_marker_disambiguates_same_titled_country_siblings(self) -> None:
+        """A declared edition market arbitrates same-titled country siblings.
+
+        The US remake and the UK original of ``无耻之徒`` share both the CJK
+        and the romanized title, so a disc-image scope whose only romanized
+        title evidence is ``Shameless`` ties them at an exact 100%: the bare
+        title query floods the pool with both.  The label's ``(美版)`` marker
+        declares the market — the same fact ``Shameless.US.S01`` encodes — so
+        the US-origin candidate is aligned and wins while the GB sibling is
+        pushed past the ambiguity margin.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Shameless": [
+                    {
+                        "id": 1906,
+                        "name": "无耻之徒",
+                        "original_name": "Shameless",
+                        "first_air_date": "2004-01-10",
+                        "origin_country": ["GB"],
+                    },
+                    {
+                        "id": 34307,
+                        "name": "无耻之徒",
+                        "original_name": "Shameless",
+                        "first_air_date": "2011-01-09",
+                        "origin_country": ["US"],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-shameless-s07",
+            boundary_label="[无耻之徒(美版) 第七季][DIY 简繁 双语字幕]",
+            parent_labels=("无耻之徒",),
+            representative_names=("Shameless",),
+            normalized_titles=(),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.70
+        )
+        self.assertEqual(best.tmdb_id, 34307)
+        self.assertEqual(best.status, "confirmed")
+        uk = next(c for c in candidates if c.tmdb_id == 1906)
+        self.assertGreaterEqual(
+            best.confidence - uk.confidence, AUTO_MATCH_MIN_MARGIN
+        )
+        self.assertEqual(
+            best.score_components.get("edition_country_alignment_score"), 0.12
+        )
+
+    def test_edition_marker_penalty_stays_dormant_without_aligned_sibling(self) -> None:
+        """No aligned sibling in the pool keeps the marker's penalty dormant.
+
+        A US-market pressing of a foreign work must not be punished for the
+        label's market note: without a same-titled candidate of the declared
+        country in the pool, scoring stays exactly as before.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "Shameless": [
+                    {
+                        "id": 1906,
+                        "name": "无耻之徒",
+                        "original_name": "Shameless",
+                        "first_air_date": "2004-01-10",
+                        "origin_country": ["GB"],
+                    },
+                ],
+            },
+        )
+        evidence = IdentityEvidence(
+            work_unit_id="wu-shameless-uk-pressing",
+            boundary_label="[无耻之徒(美版) 第一季][DIY 简繁 双语字幕]",
+            parent_labels=("无耻之徒",),
+            representative_names=("Shameless",),
+            normalized_titles=(),
+            years=(),
+            episode_pattern=None,
+            media_shape="tv",
+            aliases=(),
+        )
+        best, _candidates = auto_match_from_evidence(
+            client, evidence, min_confidence=0.70
+        )
+        self.assertEqual(best.tmdb_id, 1906)
+        self.assertEqual(best.status, "confirmed")
+        self.assertEqual(
+            best.score_components.get("edition_country_alignment_score"), 0.0
+        )
+        self.assertEqual(best.confidence, 1.0)
+
+    def test_query_path_edition_marker_probes_movie_origin(self) -> None:
+        """The query path shares the edition channel and its detail probe.
+
+        Movie search rows do not carry ``origin_country``; a marker-bearing
+        query earns the bounded detail probe so the same-titled remake and
+        original are told apart by their country of origin.
+        """
+        client = FakeTMDBClient(
+            search_results={
+                "午夜凶铃(美版)": [
+                    {
+                        "id": 565,
+                        "title": "午夜凶铃",
+                        "release_date": "2002-10-18",
+                    },
+                    {
+                        "id": 8092,
+                        "title": "午夜凶铃",
+                        "release_date": "1998-01-31",
+                    },
+                ],
+            },
+            details={
+                "/movie/565": {"origin_country": ["US"]},
+                "/movie/8092": {"origin_country": ["JP"]},
+            },
+        )
+        best, candidates = auto_match_tmdb(
+            client, "午夜凶铃(美版)", media_type="movie", min_confidence=0.70
+        )
+        self.assertEqual(best.tmdb_id, 565)
+        self.assertEqual(best.status, "confirmed")
+        original = next(c for c in candidates if c.tmdb_id == 8092)
+        self.assertGreaterEqual(
+            best.confidence - original.confidence, AUTO_MATCH_MIN_MARGIN
+        )
 
     def test_pure_movie_form_label_never_dispatches_standalone_queries(self) -> None:
         """A bare ``剧场版`` must never reach TMDB as its own query.
