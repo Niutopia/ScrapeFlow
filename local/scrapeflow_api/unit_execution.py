@@ -3444,7 +3444,18 @@ def _register_unit_episode_gaps(
         # E3 has an existing work root whose already-present episode tokens
         # are part of the post-write truth.  Never create gaps from merely
         # the new incoming fragment.
-        actual.extend(_fresh_merged_target_episode_tokens(runner, executed_plan))
+        merged_tokens = _fresh_merged_target_episode_tokens(runner, executed_plan)
+        actual.extend(merged_tokens)
+        if not has_video_row:
+            # A subtitle-only merge lane carries no video rows of its own, so
+            # neither the plan nor the bare-bracket source names can prove a
+            # season.  The locked merge target's existing episode tokens are
+            # the durable ownership fact this unit rests on: it deliberately
+            # merged into that root's seasons.
+            for token in merged_tokens:
+                merged_coordinate = parse_gap_token(token)
+                if merged_coordinate is not None:
+                    owned.add(merged_coordinate[0])
     # Only register seasons whose coverage is provable: a season with zero
     # parseable files is unverified, and registering it would recreate the
     # phantom-gap failure (library-present files reported as missing).

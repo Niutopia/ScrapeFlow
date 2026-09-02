@@ -737,6 +737,55 @@ class UnitExecutionTests(unittest.TestCase):
         self.assertEqual(gaps[0]["label"], "Season 04 Fourth Season")
         self.assertEqual(gaps[0]["expected_episode_count"], 10)
 
+    def test_subtitle_only_merge_derives_season_ownership_from_the_merged_root(self) -> None:
+        """纯字幕 merge 车道的季所有权来自归并目标根的既有集号。"""
+        source = "/incoming/rezero"
+        state_root, alist, runner, _p, _e = self._setup(
+            {
+                f"{source}/VCB [51].mkv": FAKE_VIDEO_BYTES,
+                f"{source}/VCB [51].CHS.ass": b"[Script Info]",
+            },
+            library_files={
+                "/library/番剧/Example/Season 01/Show - S01E01 - Title.mkv":
+                    FAKE_VIDEO_BYTES,
+            },
+            tmdb=MultiSeasonTMDB(101, {1: 2}),
+        )
+        root_task_id = "root-subtitle-only-merge"
+        pending = runner.create_pending_job(source, job_id=root_task_id)
+        runner.start_automatic_job(pending.id, target_shelf="anime")
+        analyze_root_boundaries(
+            alist, source, root_task_id=root_task_id, state_root=state_root,
+        )
+        record = replace(
+            load_work_unit_records(state_root, root_task_id)[0],
+            media_context="tv",
+            identity={"media_type": "tv", "tmdb_id": 101},
+            reconciliation_outcome="merge_existing",
+        )
+        executed_plan = {
+            "files": [{
+                "final_name": "Show - S01E01 - Title.zh-CN.ass",
+                "media_kind": "subtitle",
+            }],
+            "target_root": "/library/番剧/Example",
+            "scan_report": {},
+        }
+
+        # Before the fix this raised GapDiscoveryAttention: the plan carries
+        # no video row, the bracketed source name proves no season, and the
+        # merge tokens only reached the coverage set, never the ownership.
+        _register_unit_episode_gaps(
+            runner, state_root, root_task_id, record, executed_plan,
+        )
+        self.assertEqual(
+            {
+                gap.gap_id.rsplit("::", 1)[1]
+                for gap in load_gap_ledger(state_root, root_task_id)
+            },
+            {"S01E02"},
+        )
+
     def test_planner_missing_season_registers_exact_structured_and_legacy_coordinates(self) -> None:
         """J accepts the current field and only the old canonical fallback."""
         for legacy in (False, True):
