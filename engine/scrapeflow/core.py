@@ -2366,12 +2366,44 @@ def parse_ep_files(
             if parent_season is not None
             else None
         )
-        multi_match = None if season_dash_episode or dual_number_episode else (
+        # A release that prints the season-local ordinal and the whole-series
+        # ordinal side by side (``Seikatsu 3 - 1 [ 51 ]``) is dual-numbered.
+        # Reading only the title-adjacent ``3 - 1`` rewrites episode 51 as
+        # episode 1 and silently drops a later season onto the first season's
+        # coordinates, where a higher-resolution copy can even out-rank and
+        # retire the correct episode.  ``extract_episode_key`` and every
+        # sibling release in the same folder read the bracket, so the two
+        # layers must agree: the bracketed whole-series ordinal is the key.
+        season_local_whole_series_episode = (
+            re.search(
+                rf"\b0*{parent_season}\s*-\s*0*(\d{{1,3}})\s*"
+                rf"\[\s*0*(\d{{1,4}})\s*\]",
+                multi_clean,
+                re.IGNORECASE,
+            )
+            if parent_season is not None
+            else None
+        )
+        if season_local_whole_series_episode is not None and int(
+            season_local_whole_series_episode.group(2)
+        ) <= int(season_local_whole_series_episode.group(1)):
+            # ``1 - 01 [ 01 ]`` states the same ordinal twice: there is no
+            # whole-series offset to recover and the ordinary readings apply.
+            season_local_whole_series_episode = None
+        if season_local_whole_series_episode is not None:
+            titled_season_dash_episode = None
+        multi_match = (
             None
-            if titled_season_dash_episode
+            if season_dash_episode
+            or dual_number_episode
+            or season_local_whole_series_episode
             else (
-                MULTI_EPISODE_RE.search(multi_clean)
-                or MULTI_EPISODE_CONCAT_RE.search(multi_clean)
+                None
+                if titled_season_dash_episode
+                else (
+                    MULTI_EPISODE_RE.search(multi_clean)
+                    or MULTI_EPISODE_CONCAT_RE.search(multi_clean)
+                )
             )
         )
         override_key = item.get("_episode_key_override")
@@ -2393,6 +2425,10 @@ def parse_ep_files(
             and override_kind in {"regular", "special"}
             else None
         )
+        if key is None and season_local_whole_series_episode is not None:
+            key = EpisodeKey(
+                "regular", int(season_local_whole_series_episode.group(2))
+            )
         if key is None and titled_season_dash_episode is not None:
             key = EpisodeKey("regular", int(titled_season_dash_episode.group(1)))
         if key is None and release_dash is not None:

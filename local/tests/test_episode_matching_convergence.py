@@ -18,7 +18,7 @@ from engine.scrapeflow.replenishment_matching import (
     release_dash_regular_episode,
     season_markers,
 )
-from engine.scrapeflow.core import extract_episode_key, _filter_media
+from engine.scrapeflow.core import extract_episode_key, parse_ep_files, _filter_media
 from engine.scrapeflow.identity_matching import _query_from_source
 from local.scrapeflow_api.replenishment import (
     _coverage_tokens,
@@ -96,6 +96,53 @@ class EpisodeMatchingConvergenceTests(unittest.TestCase):
         )
         self.assertEqual(season_markers(value), {4})
         self.assertEqual(_season_markers(value), {4})
+
+    def test_season_local_and_whole_series_ordinals_agree_on_the_series_ordinal(
+        self,
+    ) -> None:
+        """``3 - 1 [ 51 ]`` is dual-numbered; the bracket is the series ordinal."""
+
+        def item(name: str, season_dir: str) -> dict[str, object]:
+            return {
+                "name": name,
+                "full_path": f"/staging/{season_dir}/{name}",
+                "size": 1 << 24,
+                "is_dir": False,
+            }
+
+        name = (
+            "[Moozzi2] Re Zero Kara Hajimeru Isekai Seikatsu 3 - 1 [ 51 ] "
+            "(BD 3840x2160 x265-10Bit FLACx2).mkv"
+        )
+        # Both parser layers must read the same ordinal.  When the grouping
+        # parser took the title-adjacent ``3 - 1`` it dropped a third-season
+        # episode onto the first season's coordinate, where a 4K copy could
+        # out-rank and retire the correct broadcast episode.
+        self.assertEqual(extract_episode_key(name).number, 51)
+        self.assertEqual(
+            [key.number for key in parse_ep_files([item(name, "第三季")])],
+            [51],
+        )
+        # A season-local-only release keeps the season-local reading.
+        self.assertEqual(
+            [
+                key.number
+                for key in parse_ep_files(
+                    [item("Youjitsu 3 - 01 [WebRip].mkv", "第三季")]
+                )
+            ],
+            [1],
+        )
+        # One ordinal printed twice carries no whole-series offset.
+        self.assertEqual(
+            [
+                key.number
+                for key in parse_ep_files(
+                    [item("Show 1 - 01 [ 01 ].mkv", "第一季")]
+                )
+            ],
+            [1],
+        )
 
     def test_x_notation_range_has_identical_provider_and_audit_coverage(self) -> None:
         self.assert_converged_integer_coordinate(
