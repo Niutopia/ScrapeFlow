@@ -31,7 +31,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
 
+from engine.scrapeflow.core import _validate_remote_source_basename
 from engine.scrapeflow.intake_source import load_intake_catalog
+from engine.scrapeflow.remote_paths import normalize_remote_path
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
     rebuild_root_boundary_if_unwritten,
@@ -53,6 +55,7 @@ from .root_aggregation import aggregate_root_job
 from .simple_engine_runner import (
     EngineJob,
     EnginePauseRequested,
+    EngineRequestError,
     SimpleEngineRunner,
 )
 from .tmdb_episode_catalog import TmdbEpisodeCatalog
@@ -75,6 +78,36 @@ GAPS_PENDING_PHASE = "gaps_pending"
 
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _trace(message: str) -> None:
+    """Bounded live observability line (mirrors the replenishment tracer)."""
+    print(f"[root-pipeline] {message}", flush=True)
+
+
+def _remove_intake_entry(alist: object, parent: str, name: str) -> None:
+    """Remove one exact intake entry, compatibility punctuation included.
+
+    ``AListClient.remove`` enforces the rename-safety policy — the right
+    contract for destinations and moves, but an intake deletion is not a
+    rename: the name came from a fresh provider listing and the provider
+    accepted it at upload time (full-width ``：``/``／`` titles, dot runs).
+    When the policy validator is the only rejection, retry through the raw
+    exact-name call; separators, control characters, and path segments stay
+    fail-closed through the source-basename contract.
+    """
+    remove = getattr(alist, "remove", None)
+    if callable(remove):
+        try:
+            remove(parent, [name])
+            return
+        except ValueError:
+            pass  # rename policy refused an existing provider name
+    call = getattr(alist, "call", None)
+    if not callable(call):
+        raise RuntimeError(f"AList 客户端缺少删除接口，无法删除: {name!r}")
+    _validate_remote_source_basename(name)
+    call("remove", {"dir": normalize_remote_path(parent), "names": [name]})
 
 
 def is_intake_bound_root(state_root: Path, root_task_id: str) -> bool:
@@ -225,13 +258,17 @@ def _cleanup_consumed_source_root(
     source: str,
     *,
     pause_requested: Callable[[], bool] | None = None,
-) -> list[str]:
+) -> dict[str, object]:
     """Delete a completed root's entire intake tree, residuals included.
 
-    Operator ruling (2026-08-27): the intake area is staging, not storage.
-    Once a root's media is verified in the formal library, the whole source
-    tree — residual themes, MVs, backup subtitles, screenshots, font packs —
-    is deleted by default so the operator never cleans up manually.
+    Operator ruling (2026-08-27, extended 2026-09-02): the intake area is
+    staging, not storage.  Once a root's media is verified in the formal
+    library, the whole source tree — residual themes, MVs, backup subtitles,
+    screenshots, font packs, losing versions, unmapped specials — is deleted
+    by default so the operator never cleans up manually.  A root parked in
+    ``gaps_pending`` is equally terminal for the source tree: the gap ledger
+    is the durable record (缺口只登不补) and no lane ever re-reads the
+    staging tree, so the same consumption applies.
 
     Ownership is proven by the durable catalog binding (S step), never by
     path naming.  Every file delete and directory removal is confirmed
@@ -239,7 +276,8 @@ def _cleanup_consumed_source_root(
     before each remote side effect.  A Quark/AList driver that acknowledges
     a delete without applying it is retried through the bounded parent-name
     remove fallback, and the whole walk simply stops when the provider
-    keeps reporting the tree.
+    keeps reporting the tree — the surviving residual is reported back to
+    the caller instead of failing silently.
     """
     try:
         bound = any(
@@ -249,15 +287,14 @@ def _cleanup_consumed_source_root(
     except Exception:
         bound = False
     if not bound:
-        return []
+        return {"source": source, "removed": [], "failures": [], "source_remaining": True, "unbound": True}
     if not runner.source_directory_exists(source):
         # Already consumed (e.g. archived by an E1 lane): nothing to clean.
-        return []
+        return {"source": source, "removed": [], "failures": [], "source_remaining": False}
     listing = getattr(runner.alist, "list", None)
     remove_empty = getattr(runner.alist, "remove_empty_dir", None)
-    remove = getattr(runner.alist, "remove", None)
-    if not callable(listing) or not callable(remove_empty) or not callable(remove):
-        return []
+    if not callable(listing) or not callable(remove_empty):
+        return {"source": source, "removed": [], "failures": [], "source_remaining": True}
 
     def rows(path: str) -> list[Mapping[str, object]]:
         try:
@@ -271,6 +308,7 @@ def _cleanup_consumed_source_root(
         return list(raw)
 
     removed: list[str] = []
+    failures: list[str] = []
 
     def paused() -> bool:
         """Fail closed if the composition-root pause state is unavailable."""
@@ -283,17 +321,23 @@ def _cleanup_consumed_source_root(
 
     def delete_file(parent: str, name: str) -> bool:
         """Delete one file and prove it disappeared through a fresh listing."""
-        if paused():
-            return False
-        try:
-            remove(parent, [name])
-        except Exception:
-            return False
-        try:
-            after = rows(parent)
-        except Exception:
-            return True
-        return not any(item.get("name") == name for item in after)
+        for _attempt in range(3):
+            if paused():
+                return False
+            try:
+                _remove_intake_entry(runner.alist, parent, name)
+            except Exception:
+                failures.append(posixpath.join(parent, name))
+                return False
+            try:
+                after = rows(parent)
+            except Exception:
+                return True
+            if not any(item.get("name") == name for item in after):
+                return True
+        # The driver keeps acknowledging the delete without applying it.
+        failures.append(posixpath.join(parent, name))
+        return False
 
     def delete_directory(directory: str) -> bool:
         """Remove one directory (empty or not) with bounded retries."""
@@ -319,7 +363,7 @@ def _cleanup_consumed_source_root(
             # deleting; the explicit parent-name remove is the bounded
             # fallback for the driver no-op.
             try:
-                remove(parent, [name])
+                _remove_intake_entry(runner.alist, parent, name)
             except Exception:
                 pass
             try:
@@ -329,6 +373,7 @@ def _cleanup_consumed_source_root(
             if not any(item.get("name") == name for item in parent_rows):
                 removed.append(directory)
                 return True
+        failures.append(directory)
         return False
 
     def visit(directory: str) -> bool:
@@ -364,12 +409,109 @@ def _cleanup_consumed_source_root(
                     return False
         return True
 
+    def source_remaining() -> bool:
+        parent = posixpath.dirname(source) or "/"
+        name = posixpath.basename(source)
+        try:
+            if any(item.get("name") == name for item in rows(parent)):
+                return True
+        except Exception:
+            return False
+        try:
+            return bool(rows(source))
+        except Exception:
+            return False
+
     if not visit(source):
-        return removed
+        # The walk aborted (pause, provider refusal, or an unsafe entry):
+        # never fall back to a bulk recursive delete of an unproven tree.
+        return {
+            "source": source,
+            "removed": removed,
+            "failures": failures[:50],
+            "source_remaining": source_remaining(),
+        }
     # The source root itself: delete it the same way so the intake monitor
     # marks the catalog entry missing on its next scan.
     delete_directory(source)
-    return removed
+
+    return {
+        "source": source,
+        "removed": removed,
+        "failures": failures[:50],
+        "source_remaining": source_remaining(),
+    }
+
+
+def _terminal_source_cleanup(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    job: EngineJob,
+    source: str,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> str | None:
+    """Best-effort terminal source consumption; residual becomes a job note.
+
+    Returns an informational error string when the intake tree survived
+    (partial delete, provider refusal, or pause), ``None`` when nothing
+    remains.  The note never changes the phase: a completed or
+    ``gaps_pending`` root stays terminal either way, and the operator can
+    re-run the consumption through ``POST /api/jobs/<id>/consume-source``.
+    """
+    try:
+        receipt = _cleanup_consumed_source_root(
+            runner,
+            state_root,
+            job.id,
+            source,
+            pause_requested=pause_requested,
+        )
+    except Exception as exc:  # noqa: BLE001 - residual note, never a failure
+        _trace(f"root {job.id} 源清理异常: {redact_error(exc)}")
+        return f"收官清源未完成（清理异常: {redact_error(exc)}），可重跑 consume-source"
+    removed = receipt.get("removed")
+    if not receipt.get("source_remaining"):
+        if isinstance(removed, list) and removed:
+            _trace(f"root {job.id} 源树已消费（{len(removed)} 个目录）")
+        return None
+    failures = receipt.get("failures")
+    detail = f"，失败 {len(failures)} 项" if isinstance(failures, list) and failures else ""
+    _trace(f"root {job.id} 源树仍有残留{detail}")
+    return f"收官清源未完成：源树仍有残留{detail}，可重跑 consume-source"
+
+
+def consume_terminal_source_root(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    job: EngineJob,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Operator-triggered source consumption for one already-terminal root.
+
+    The same engine cleanup the pipeline runs automatically, exposed as an
+    explicit idempotent action for historical terminal roots (and for
+    re-running a consumption that previously left residuals).  The persisted
+    phase never changes; the informational residual note is written or
+    cleared on the job, and the full receipt is returned to the caller.
+    """
+    if job.phase not in {"completed", GAPS_PENDING_PHASE}:
+        raise EngineRequestError(
+            f"只有终态根（completed/gaps_pending）才能清源，当前: {job.phase}"
+        )
+    source = runner._job_ingress_source(job)  # noqa: SLF001 - pipeline composition
+    note = _terminal_source_cleanup(
+        runner, state_root, job, source, pause_requested=pause_requested
+    )
+    updated = _persist_root(runner, job, job.phase, error=note)
+    return {
+        "job_id": job.id,
+        "phase": updated.phase,
+        "source": source,
+        "source_remaining": note is not None,
+        "note": note,
+    }
 
 
 def run_root_pipeline(
@@ -625,27 +767,33 @@ def run_root_pipeline(
     # gaps are a normal N-step hand-off to the selected RootJob's two-tier
     # replenishment lane, not a completed root.
     if aggregate.open_gaps:
-        return _persist_root(runner, job, GAPS_PENDING_PHASE)
+        # Operator ruling 2026-09-02: ``gaps_pending`` is equally terminal for
+        # the intake tree.  The gap ledger is the durable record (缺口只登
+        # 不补) and no lane ever re-reads the staging tree, so the same
+        # consumption applies before the phase is persisted.
+        residual_note = None
+        if not stopped():
+            residual_note = _terminal_source_cleanup(
+                runner, state_root, job, source, pause_requested=stopped
+            )
+        cancelled_job = cancelled()
+        if cancelled_job is not None:
+            return cancelled_job
+        return _persist_root(runner, job, GAPS_PENDING_PHASE, error=residual_note)
     # Post-completion housekeeping: delete the root's entire intake tree,
     # residual resources included (operator ruling 2026-08-27 — the intake
     # area is staging, not storage).  Best-effort: a provider that keeps
-    # reporting the tree simply leaves it for the next pass, and a paused
-    # run skips remote deletes entirely.
+    # reporting the tree leaves a residual note for a consume-source re-run,
+    # and a paused run skips remote deletes entirely.
+    residual_note = None
     if not stopped():
-        try:
-            _cleanup_consumed_source_root(
-                runner,
-                state_root,
-                root_task_id,
-                source,
-                pause_requested=stopped,
-            )
-        except Exception:
-            pass
+        residual_note = _terminal_source_cleanup(
+            runner, state_root, job, source, pause_requested=stopped
+        )
     cancelled_job = cancelled()
     if cancelled_job is not None:
         return cancelled_job
-    return _persist_root(runner, job, "completed")
+    return _persist_root(runner, job, "completed", error=residual_note)
 
 
 def finalize_root_gap_closure(
@@ -676,18 +824,17 @@ def finalize_root_gap_closure(
     # Post-completion housekeeping, identical to the direct-completion path:
     # a root whose gaps closed must not keep its intake tree forever (the
     # operator ruling applies to every completed root, regardless of which
-    # path completed it).  Best-effort, never blocking the phase transition.
-    try:
-        _cleanup_consumed_source_root(
-            runner,
-            state_root,
-            root_task_id,
-            runner._job_ingress_source(job),  # noqa: SLF001 - pipeline composition
-            pause_requested=pause_requested,
-        )
-    except Exception:
-        pass
-    return _persist_root(runner, job, "completed")
+    # path completed it).  Best-effort, never blocking the phase transition;
+    # a surviving residual becomes the job's informational note instead of
+    # being swallowed.
+    residual_note = _terminal_source_cleanup(
+        runner,
+        state_root,
+        job,
+        runner._job_ingress_source(job),  # noqa: SLF001 - pipeline composition
+        pause_requested=pause_requested,
+    )
+    return _persist_root(runner, job, "completed", error=residual_note)
 
 
 def refresh_root_after_j_rereview(

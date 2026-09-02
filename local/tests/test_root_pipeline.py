@@ -37,6 +37,7 @@ from local.scrapeflow_api.root_aggregation import aggregate_root_job
 from local.scrapeflow_api.simple_engine_runner import (
     EngineJobConflictError,
     EnginePauseRequested,
+    EngineRequestError,
     SimpleEngineRunner,
 )
 from local.scrapeflow_api.unit_execution import load_work_acceptance
@@ -173,11 +174,12 @@ class RootPipelineTests(unittest.TestCase):
         shelf: str = "anime",
         planner=None,
         archive_preprocessor: object | None = None,
+        alist_cls=None,
     ):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         state_root = Path(temp.name)
-        alist = IndexAList({**files, **(library_files or {})})
+        alist = (alist_cls or IndexAList)({**files, **(library_files or {})})
         planner_events: list[dict[str, Any]] = []
         executor_events: list[str] = []
         runner = SimpleEngineRunner(
@@ -1043,12 +1045,12 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(second.phase, "completed")
         self.assertEqual(len(alist.move_calls), 1)
 
-    def test_pipeline_registers_existing_gap_and_keeps_source(self) -> None:
+    def test_pipeline_registers_existing_gap_and_consumes_source(self) -> None:
         files = {
             "/incoming/Fate Zero/S01E03.mkv": FAKE_VIDEO_BYTES,
         }
         state_root, alist, runner, planner_events, executor_events = self._setup(
-            files, library_files=_sample_library(),
+            files, library_files=_sample_library(), alist_cls=CleaningIndexAList,
         )
         job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
         root_task_id = job.id
@@ -1090,9 +1092,15 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0].gap_id, f"{records[0].work_unit_id}::missing_episode::S02E01")
         self.assertEqual(gaps[0].status, "open")
-        # Non-empty source stays in intake: no move happened.
+        # Non-empty source stays in intake until the terminal hand-off: no
+        # move happened, but the gaps_pending consumption deletes the tree.
         self.assertEqual(alist.move_calls, [])
-        self.assertIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
+        # Operator ruling 2026-09-02: gaps_pending is terminal for the intake
+        # tree too — the gap ledger is the durable record, the staging tree
+        # is consumed, and no residual note is left on the job.
+        self.assertNotIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
+        self.assertNotIn("/incoming/Fate Zero", alist.dirs)
+        self.assertIsNone(final.error)
 
     def test_pipeline_merges_new_episodes_into_existing_work(self) -> None:
         files = {
@@ -1393,6 +1401,50 @@ class NoopRemoveEmptyAList(CleaningIndexAList):
         return True
 
 
+class PolicyRejectingAList(NoopRemoveEmptyAList):
+    """AList double whose remove() enforces the rename-safety policy.
+
+    Full-width punctuation (``：``/``／``) that the provider itself accepted
+    at upload time is refused — the observed AListClient behavior — while
+    the raw ``call('remove', ...)`` endpoint still deletes by exact name.
+    """
+
+    def __init__(self, files: dict[str, bytes] | None = None) -> None:
+        super().__init__(files)
+        self.raw_remove_calls: list[tuple[str, list[str]]] = []
+
+    def remove(self, parent: str, names: list[str]) -> bool:
+        from engine.scrapeflow.remote_paths import is_provider_safe_basename
+
+        unsafe = [name for name in names if not is_provider_safe_basename(name)]
+        if unsafe:
+            raise ValueError(f"远端文件名不符合 AList 安全命名规则: {unsafe!r}")
+        return super().remove(parent, names)
+
+    def call(self, endpoint: str, body: dict[str, object], *, retryable: bool = False) -> dict[str, object]:
+        del retryable
+        if endpoint != "remove":
+            raise AssertionError(f"unexpected raw endpoint: {endpoint}")
+        parent = str(body.get("dir") or "")
+        names = [str(name) for name in (body.get("names") or [])]
+        self.raw_remove_calls.append((parent.rstrip("/"), list(names)))
+        super().remove(parent, names)
+        return {"code": 200, "message": "ok"}
+
+
+class HostileTreeAList(NoopRemoveEmptyAList):
+    """AList double that acknowledges every delete but deletes nothing.
+
+    The provider keeps reporting the tree no matter what the engine sends,
+    so the walk must stop fail-closed and the residual must surface as the
+    job's informational note instead of a silent partial cleanup.
+    """
+
+    def remove(self, parent: str, names: list[str]) -> bool:
+        self.remove_calls.append((parent.rstrip("/") or "/", list(names)))
+        return True
+
+
 class SourceShellCleanupTests(unittest.TestCase):
     """A completed root's entire intake tree is deleted, residuals included."""
 
@@ -1566,6 +1618,137 @@ class SourceShellCleanupTests(unittest.TestCase):
         self.assertEqual(len(alist.remove_calls), 2)
         self.assertNotIn("/incoming/My Show", alist.dirs)
         self.assertNotIn("/incoming/My Show/Extras", alist.dirs)
+
+    def test_provider_unsafe_names_still_delete_via_exact_call(self) -> None:
+        """Rename policy must not veto deleting an existing intake name.
+
+        Source releases carry full-width ``：``/``／`` the provider itself
+        accepted; the cleanup falls back to the raw exact-name call so one
+        such file can no longer abort the whole walk (the Re:Zero failure).
+        """
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = PolicyRejectingAList(files)
+        executor_events: list[str] = []
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_events.append(str(plan.target_root)) or {"ok": True},
+        )
+        root_task_id = self._root(runner, "/incoming/My Show")
+
+        def executor(plan):
+            executor_events.append(str(plan.target_root))
+            for item in plan.files:
+                data = alist.files.pop(item.source_path, None)
+                if data is not None:
+                    alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
+            # Residuals the plan never claimed: an unsafe-name file, an
+            # unsafe-name directory, and a safe sibling behind them.
+            alist.files["/incoming/My Show/第01話：序章.mp4"] = b"junk"
+            alist.files["/incoming/My Show/外伝／特別篇/safe.txt"] = b"junk"
+            alist.dirs.add("/incoming/My Show")
+            alist.dirs.add("/incoming/My Show/外伝／特別篇")
+            return {"ok": True}
+
+        runner.executor = executor
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertIsNone(final.error)
+        self.assertNotIn("/incoming/My Show/第01話：序章.mp4", alist.files)
+        self.assertNotIn("/incoming/My Show/外伝／特別篇/safe.txt", alist.files)
+        self.assertNotIn("/incoming/My Show/外伝／特別篇", alist.dirs)
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+        # The unsafe names went through the raw exact-name call, and the
+        # safe sibling behind them was still reached (no silent walk abort).
+        raw_names = {name for _parent, names in alist.raw_remove_calls for name in names}
+        self.assertIn("第01話：序章.mp4", raw_names)
+        self.assertIn("外伝／特別篇", raw_names)
+
+    def test_residual_tree_becomes_job_note_instead_of_silence(self) -> None:
+        """A provider that keeps reporting the tree leaves a visible note.
+
+        The phase still completes, but the surviving residual is recorded on
+        the job so the operator can re-run the consumption instead of the
+        old behavior: a silent partial cleanup nobody notices.
+        """
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = HostileTreeAList(files)
+        executor_events: list[str] = []
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=lambda plan: executor_events.append(str(plan.target_root)) or {"ok": True},
+        )
+        root_task_id = self._root(runner, "/incoming/My Show")
+
+        def executor(plan):
+            executor_events.append(str(plan.target_root))
+            for item in plan.files:
+                data = alist.files.pop(item.source_path, None)
+                if data is not None:
+                    alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
+            alist.files["/incoming/My Show/notes.txt"] = b"junk"
+            alist.dirs.add("/incoming/My Show")
+            return {"ok": True}
+
+        runner.executor = executor
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertIsNotNone(final.error)
+        self.assertIn("收官清源未完成", final.error)
+        self.assertIn("/incoming/My Show/notes.txt", alist.files)
+
+    def test_consume_terminal_source_root_operator_action(self) -> None:
+        """The explicit consumption is idempotent and phase-guarded."""
+        from local.scrapeflow_api.root_pipeline import consume_terminal_source_root
+
+        files = {"/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        state_root, alist, runner, _executor_events = self._setup(files)
+        root_task_id = self._root(runner, "/incoming/My Show")
+        final = run_root_pipeline(runner, state_root, root_task_id)
+        self.assertEqual(final.phase, "completed")
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+
+        # Re-running on an already-consumed root is a clean no-op.
+        receipt = consume_terminal_source_root(
+            runner, state_root, runner.get_job(root_task_id)
+        )
+        self.assertFalse(receipt["source_remaining"])
+        self.assertIsNone(receipt["note"])
+        self.assertEqual(receipt["phase"], "completed")
+        self.assertIsNone(runner.get_job(root_task_id).error)
+
+        # A parked root keeps its source until reconciliation resolves.
+        parked_files = {"/incoming/Mystery Show/S01E01.mkv": FAKE_VIDEO_BYTES}
+        park_state, park_alist, park_runner, _ = self._setup(
+            parked_files, tmdb=FakeTMDBClient(),
+        )
+        parked_root = self._root(park_runner, "/incoming/Mystery Show")
+        parked_final = run_root_pipeline(park_runner, park_state, parked_root)
+        self.assertEqual(parked_final.phase, "reconciliation_uncertain")
+        with self.assertRaises(EngineRequestError):
+            consume_terminal_source_root(
+                park_runner, park_state, park_runner.get_job(parked_root)
+            )
+        self.assertIn("/incoming/Mystery Show/S01E01.mkv", park_alist.files)
 
     def test_pause_blocks_every_remote_delete_boundary(self) -> None:
         """Each remote delete gets its own root-scoped pause checkpoint."""

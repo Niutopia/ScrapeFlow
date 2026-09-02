@@ -184,6 +184,46 @@ class SimpleServerTests(unittest.TestCase):
         )
         return root_id
 
+    def test_consume_source_endpoint_deletes_terminal_intake_tree(self) -> None:
+        """POST /api/jobs/<id>/consume-source: engine-owned source cleanup.
+
+        The intake tree of a terminal root (completed/gaps_pending) is
+        deleted through the engine's own proof machinery, the receipt says
+        whether anything remains, and non-terminal roots are refused.
+        """
+        root_id = self.create_root()
+        completed = replace(self.runner.get_job(root_id), phase="completed")
+        atomic_write_json(
+            self.runner._job_path(root_id),  # noqa: SLF001 - durable root fixture
+            completed.as_dict(),
+            allow_nan=False,
+        )
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/consume-source", {}
+        )
+
+        self.assertEqual(status, 200)
+        receipt = payload["consume_source"]
+        self.assertEqual(receipt["job_id"], root_id)
+        self.assertEqual(receipt["phase"], "completed")
+        self.assertEqual(receipt["source"], "/library/待刮削/Example")
+        # FakeAList has no delete interface, so the residual is reported
+        # honestly instead of a silent success.
+        self.assertTrue(receipt["source_remaining"])
+        self.assertIsNotNone(receipt["note"])
+        self.assertIn("收官清源未完成", str(receipt["note"]))
+
+    def test_consume_source_refuses_non_terminal_roots(self) -> None:
+        root_id = self.create_root()
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/consume-source", {}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("只有终态根", str(payload.get("error") or payload))
+
     def test_health_is_small_local_status(self) -> None:
         status, health = self.request("GET", "/api/health")
 

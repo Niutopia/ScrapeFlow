@@ -2065,6 +2065,47 @@ class SimpleApplication:
                 )
             return runner.cleanup_terminal_job(engine_job.id)
 
+    def consume_source_public_job(self, job_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+        """Consume one terminal root's intake source tree (operator ruling).
+
+        The engine cleanup the pipeline runs automatically, exposed as an
+        explicit idempotent operator action for historical terminal roots
+        and for re-running a consumption that previously left residuals.
+        The whole intake tree — losing versions, unmapped specials,
+        non-media — is deleted after intake ownership is proven; the gap
+        ledger stays the durable record.  Only ``completed`` and
+        ``gaps_pending`` roots qualify: attention/parked roots keep their
+        source until their reconciliation is resolved.
+        """
+        if not isinstance(payload, Mapping) or payload:
+            raise EngineRequestError("清源请求必须是空 JSON 对象")
+        engine_job = self._engine_job_or_none(job_id)
+        if engine_job is None:
+            raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        public_phase = str(self.public_engine_job(engine_job).get("phase") or "")
+        if public_phase not in {"completed", "gaps_pending"}:
+            raise EngineRequestError(
+                f"只有终态根（completed/gaps_pending）才能清源，当前: {public_phase}"
+            )
+        with self._automatic_lock:
+            active = self._worker_future
+            if (
+                self._worker_root_job_id == engine_job.id
+                and active is not None
+                and not active.done()
+            ):
+                raise EngineWorkerBusyError("任务仍有活动 worker，不能清源")
+        from local.scrapeflow_api.root_pipeline import consume_terminal_source_root
+
+        runner = self._get_engine_runner()
+        receipt = consume_terminal_source_root(
+            runner,
+            self.state_root,
+            engine_job,
+            pause_requested=lambda: self._root_pause_requested(job_id),
+        )
+        return {"consume_source": receipt}
+
     def repair_public_job_artifacts(
         self,
         job_id: str,
@@ -3031,6 +3072,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(
                         200,
                         {"cleanup": self.application.cleanup_public_job(job_id)},
+                    )
+                    return
+                if operation == "consume-source":
+                    self._send(
+                        200,
+                        self.application.consume_source_public_job(job_id, payload),
                     )
                     return
                 if operation == "repair-artifacts":
