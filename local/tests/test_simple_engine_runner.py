@@ -1408,6 +1408,55 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         with self.assertRaises(FormalTargetConflictError):
             validate_plan(alist, plan)
 
+    def test_a_filled_coordinate_registers_the_runner_up_instead_of_failing(self) -> None:
+        """The winner already moved; its runner-up is recorded, not written."""
+        alist = TargetConflictAList()
+        target_dir = "/library/Show/Season 01"
+        alist.files["/incoming/show/ep01.mp4"] = FAKE_VIDEO_BYTES
+        alist.files["/incoming/show/ep02.mkv"] = FAKE_VIDEO_BYTES
+        alist.files[f"{target_dir}/Show - S01E01.mkv"] = b"winner already moved here"
+
+        def planned(name: str, final: str) -> PlannedFile:
+            return PlannedFile(
+                source_path=f"/incoming/show/{name}",
+                source_dir="/incoming/show",
+                original_name=name,
+                final_name=final,
+                target_dir=target_dir,
+                media_kind="video",
+                source_size=FAKE_VIDEO_SIZE,
+            )
+
+        plan = Plan(
+            mode="tv",
+            source_root="/incoming/show",
+            target_root="/library/Show",
+            files=[
+                planned("ep01.mp4", "Show - S01E01.mp4"),
+                planned("ep02.mkv", "Show - S01E02.mkv"),
+            ],
+            warnings=[],
+            metadata={"tmdb_id": 1, "title": "Show"},
+        )
+
+        validate_plan(alist, plan)
+
+        # E01 keeps the bytes the library already holds; the runner-up stays at
+        # source as a recorded problem and E02 still plans normally.
+        self.assertEqual(
+            [item.final_name for item in plan.files], ["Show - S01E02.mkv"]
+        )
+        self.assertEqual(
+            [item.source_path for item in plan.problem_files],
+            ["/incoming/show/ep01.mp4"],
+        )
+        self.assertIn("跨库质量校验", plan.problem_files[0].reason)
+
+        # An occupant carrying the planned name itself stays terminal.
+        alist.files[f"{target_dir}/Show - S01E02.mkv"] = b"half-written object"
+        with self.assertRaises(FormalTargetConflictError):
+            validate_plan(alist, plan)
+
     def test_wrong_archive_password_is_immediately_terminal_and_preserves_source(self) -> None:
         events: list[str] = []
         source_file = "/incoming/archive/payload.7z"

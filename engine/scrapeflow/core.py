@@ -10612,6 +10612,90 @@ def _planned_companion_key(target_dir: str, final_name: str) -> tuple[str, str]:
     return _collision_key(normalize_remote_path(target_dir)), _collision_key(stem)
 
 
+def _demote_videos_whose_coordinate_holds_other_bytes(
+    alist: AListClient, plan: Plan
+) -> None:
+    """Register, never overwrite, a runner-up whose coordinate is already filled.
+
+    A multi-version source folder resolves to one winner per official episode.
+    Once that winner has been moved into the library, a retry re-derives the
+    plan from what is left at source and promotes the runner-up onto the same
+    coordinate.  Writing it would manufacture a second version of one official
+    episode without the cross-library quality comparison the formal-target
+    guard demands, so the runner-up is not that coordinate's content: it stays
+    at source and is recorded as a planning problem, and the rest of the root
+    keeps planning instead of failing whole.
+
+    Only a provably different-sized occupant is demoted.  An equal-sized one is
+    this task's own already-moved object and must still resume as an exact byte
+    readback; an occupant of unknown size stays with the hard guard.
+    """
+    if not any(item.media_kind == "video" for item in plan.files):
+        return
+    occupants: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for target_dir in sorted(
+        normalize_remote_path(item.target_dir)
+        for item in plan.files
+        if item.media_kind == "video"
+    ):
+        for entry in alist.try_list(target_dir, refresh=True) or []:
+            name = str(entry.get("name", ""))
+            if entry.get("is_dir") or Path(name).suffix.lower() not in VIDEO_EXTS:
+                continue
+            occupants[_planned_companion_key(target_dir, name)].append(entry)
+    if not occupants:
+        return
+    retained: list[PlannedFile] = []
+    demoted: list[tuple[PlannedFile, str]] = []
+    for item in plan.files:
+        if item.media_kind != "video" or item.source_size is None:
+            retained.append(item)
+            continue
+        target_dir = normalize_remote_path(item.target_dir)
+        entries = [
+            entry
+            for entry in occupants.get(
+                _planned_companion_key(target_dir, item.final_name), []
+            )
+            if _collision_key(join_remote(target_dir, str(entry["name"])))
+            != _collision_key(normalize_remote_path(item.source_path))
+            # An occupant carrying the planned name itself is a same-name
+            # conflict: it can equally be a corrupt or half-finished earlier
+            # write, so it stays terminal and is never quietly registered.
+            and _collision_key(str(entry["name"]))
+            != _collision_key(item.final_name)
+        ]
+        sizes = [_entry_size_value(entry) for entry in entries]
+        if not entries or any(
+            size is None or size == item.source_size for size in sizes
+        ):
+            retained.append(item)
+            continue
+        demoted.append(
+            (item, join_remote(target_dir, str(entries[0]["name"])))
+        )
+    if not demoted:
+        return
+    plan.files = retained
+    for item, occupied_path in demoted:
+        plan.problem_files.append(
+            PlannedProblem(
+                source_path=item.source_path,
+                reason=(
+                    "目标坐标已由其他字节占用，未完成跨库质量校验；"
+                    f"保留库内既有版本并留在源目录: {occupied_path}"
+                ),
+                target_path=join_remote(
+                    normalize_remote_path(item.target_dir), item.final_name
+                ),
+            )
+        )
+    plan.warnings.append(
+        f"{len(demoted)} 个视频的目标坐标已由其他字节占用；已保留库内既有版本，"
+        "来源对象留在源目录并记录，不生成重复版本"
+    )
+
+
 def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
     """Keep a subtitle only when its destination has an exact video companion."""
     planned_video_keys = {
@@ -10862,6 +10946,7 @@ def validate_plan(
     # before any destination collision checks.  This keeps direct planner
     # callers and restart/recovery validation on the exact writer input.
     _retain_one_subtitle_track_per_exact_video(plan)
+    _demote_videos_whose_coordinate_holds_other_bytes(alist, plan)
     _demote_unpaired_subtitles(alist, plan)
     _restrict_cleanup_to_allowlist(plan)
     if not plan.files:
