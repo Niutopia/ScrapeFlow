@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import posixpath
 import struct
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
@@ -188,8 +189,11 @@ class DiscInventory:
     ) -> tuple[DiscPlaylist, ...]:
         """Return unambiguous single-clip primary playlists in disc order.
 
-        Backup copies are excluded. A clip may appear at most once among the
-        selected playlists; duplicate or branching playlist evidence remains
+        Backup copies are excluded.  A DIY-authored disc may publish exact
+        duplicate playlists for the same clip — identical in/out spans, only
+        differing in stream-selection tables a clip-level remux cannot see —
+        and those collapse deterministically to the first playlist name.
+        Any other repeat of a clip, or a branching playlist, remains
         fail-closed for the higher-level disc-to-episode mapper.
         """
         stream_ids = {
@@ -198,7 +202,7 @@ class DiscInventory:
             if "/bdmv/stream/" in item.inner_path.casefold()
         }
         selected: list[DiscPlaylist] = []
-        clips: set[str] = set()
+        clips: dict[str, DiscPlayItem] = {}
         for playlist in sorted(
             self.playlists,
             key=lambda item: posixpath.basename(item.inner_path).casefold(),
@@ -214,9 +218,20 @@ class DiscInventory:
                 or play_item.clip_id not in stream_ids
             ):
                 continue
-            if play_item.clip_id in clips:
-                raise DiscImageError("Blu-ray 正片 playlist 对同一 clip 存在歧义")
-            clips.add(play_item.clip_id)
+            seen = clips.get(play_item.clip_id)
+            if seen is not None:
+                if (
+                    seen.in_time != play_item.in_time
+                    or seen.out_time != play_item.out_time
+                    or seen.codec_id != play_item.codec_id
+                ):
+                    raise DiscImageError(
+                        "Blu-ray 正片 playlist 对同一 clip 存在歧义"
+                    )
+                # An exact-duplicate playlist of an already-selected clip
+                # describes the same remux; keep the first name only.
+                continue
+            clips[play_item.clip_id] = play_item
             selected.append(playlist)
         return tuple(selected)
 
@@ -1461,6 +1476,144 @@ def _alist_image_fingerprint(
     return size, version
 
 
+def retrying_alist_range_reader(
+    alist_client: object,
+    *,
+    image_path: str,
+    image_size: int,
+    attempts: int = 6,
+    base_delay: float = 2.0,
+    max_delay: float = 60.0,
+    sleep: Callable[[float], None] | None = None,
+):
+    """Open an exact-Range reader that survives transient transport faults.
+
+    A proxy between the engine and the provider can truncate one Range
+    response mid-transfer (observed in production: a 16 MiB request returned
+    ~2 MiB while re-requesting the same extent succeeded) and a long transfer
+    can outlive the provider read link cached by the plain reader.  This
+    helper wraps the strict reader with a bounded per-extent retry that
+    re-opens the reader (fresh link) before each retry, re-checks the exact
+    length locally, and re-verifies that the image fingerprint still matches
+    so a replaced image can never be spliced into an in-flight transfer.
+
+    Every attempt reads the same extent, so a persistently failing extent
+    still propagates the strict underlying failure after ``attempts`` tries.
+    The fail-closed guarantees of the strict reader are unchanged.
+    """
+    if isinstance(attempts, bool) or attempts <= 0:
+        raise ValueError("attempts 必须为正")
+    if base_delay < 0 or max_delay < 0 or max_delay < base_delay:
+        raise ValueError("重试延迟参数非法")
+    pause = sleep if sleep is not None else time.sleep
+
+    opener = getattr(alist_client, "open_file_range_reader", None)
+    single_reader = getattr(alist_client, "read_file_range", None)
+    if not callable(opener) and not callable(single_reader):
+        raise DiscImageError("AList 客户端缺少严格 HTTP Range 安全接口")
+    statter = getattr(alist_client, "exact_file_info", None)
+    fingerprint = (
+        statter(image_path)
+        if callable(statter)
+        else {"size": image_size, "version": None}
+    )
+    if not isinstance(fingerprint, Mapping) or fingerprint.get("size") != image_size:
+        raise DiscImageError("AList 镜像指纹与展开声明不一致")
+
+    def _open():
+        if callable(opener):
+            return opener(
+                image_path,
+                expected_size=image_size,
+                refresh=True,
+            )
+        return contextlib.nullcontext(
+            lambda offset, length: single_reader(
+                image_path,
+                offset,
+                length,
+                expected_size=image_size,
+                refresh=True,
+            )
+        )
+
+    current: dict[str, object] = {"ctx": None, "reader": None}
+
+    def _drop_reader() -> None:
+        ctx = current["ctx"]
+        current["ctx"] = None
+        current["reader"] = None
+        if ctx is not None:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def managed_reader():
+        try:
+            yield _retrying_read
+        finally:
+            _drop_reader()
+
+    def _retrying_read(offset: int, length: int) -> bytes:
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length <= 0
+            or offset + length > image_size
+        ):
+            raise DiscImageError("重试 Range 请求越过镜像边界")
+        delay = base_delay
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            if attempt:
+                pause(delay)
+                delay = min(delay * 2.0, max_delay)
+                if callable(statter):
+                    fresh = statter(image_path)
+                    if (
+                        not isinstance(fresh, Mapping)
+                        or fresh.get("size") != image_size
+                        or fresh.get("version") != fingerprint.get("version")
+                    ):
+                        raise DiscImageError("AList 镜像在重试期间发生变化")
+            if current["reader"] is None:
+                ctx = _open()
+                try:
+                    current["reader"] = ctx.__enter__()
+                    current["ctx"] = ctx
+                except Exception as exc:
+                    last_error = exc
+                    continue
+            try:
+                data = current["reader"](offset, length)
+            except DiscImageError:
+                raise
+            except Exception as exc:  # bounded transport retry, then propagate
+                last_error = exc
+                _drop_reader()
+                continue
+            if isinstance(data, bytes) and len(data) == length:
+                return data
+            if not isinstance(data, (bytes, bytearray)):
+                _drop_reader()
+                raise DiscImageError("Range 读取返回了非字节载荷")
+            actual = len(data)
+            last_error = DiscImageError(
+                f"Range 响应长度不匹配（重试后仍失败）: "
+                f"offset={offset}, expected={length}, actual={actual}"
+            )
+            _drop_reader()
+        assert last_error is not None
+        raise last_error
+
+    return managed_reader()
+
+
 def _alist_range_context(
     alist_client: object,
     image_path: str,
@@ -1832,5 +1985,6 @@ __all__ = [
     "probe_disc_image",
     "probe_disc_image_via_alist",
     "read_inner_file",
+    "retrying_alist_range_reader",
     "stream_inner_file_via_alist",
 ]

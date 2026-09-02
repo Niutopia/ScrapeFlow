@@ -654,7 +654,7 @@ def test_udf_dangerous_file_identifier_fails_closed(unsafe_name: str) -> None:
         _probe(image, prefer="udf")
 
 
-def test_mpls_duplicate_primary_playlists_for_same_clip_are_ambiguous() -> None:
+def test_mpls_exact_duplicate_primary_playlists_collapse_to_first_name() -> None:
     first = disc_image.parse_mpls(
         _mpls_single_clip(clip_id="00005", seconds=55 * 60),
         inner_path="/BDMV/PLAYLIST/00051.mpls",
@@ -675,6 +675,36 @@ def test_mpls_duplicate_primary_playlists_for_same_clip_are_ambiguous() -> None:
         ),
         structure="bdmv",
         playlists=(first, duplicate),
+    )
+
+    selected = inventory.episode_playlists()
+
+    assert [item.inner_path for item in selected] == [
+        "/BDMV/PLAYLIST/00051.mpls"
+    ]
+
+
+def test_mpls_differing_duplicate_primary_playlists_are_ambiguous() -> None:
+    first = disc_image.parse_mpls(
+        _mpls_single_clip(clip_id="00005", seconds=55 * 60),
+        inner_path="/BDMV/PLAYLIST/00051.mpls",
+    )
+    differing = disc_image.parse_mpls(
+        _mpls_single_clip(clip_id="00005", seconds=54 * 60),
+        inner_path="/BDMV/PLAYLIST/01001.mpls",
+    )
+    inventory = disc_image.DiscInventory(
+        image_path="memory.udf",
+        kind="udf",
+        inner_files=(
+            disc_image.InnerFile(
+                "/BDMV/STREAM/00005.m2ts",
+                3000,
+                ((100, 2),),
+            ),
+        ),
+        structure="bdmv",
+        playlists=(first, differing),
     )
 
     with pytest.raises(disc_image.DiscImageError):
