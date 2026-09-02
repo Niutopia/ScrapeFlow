@@ -1702,6 +1702,86 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         )
         self.assertTrue(all(row["reason"] == "managed_subtitle_lower_priority" for row in deferred))
 
+    def test_current_finalizer_keeps_legacy_track_when_every_managed_proof_fails(self) -> None:
+        # A release's strict SRT candidate can fail its content proof for a
+        # reason that has nothing to do with the legacy tracks beside it —
+        # the Re:Zero Viu sidecars open with a zero-duration 繁化姬 watermark
+        # cue, which the strict parser refuses.  The failed proof must
+        # disqualify only that candidate; the unproven legacy .ass track
+        # stays selectable instead of being vetoed into silence.
+        plan = fake_plan(self.request, self.alist, object())
+        legacy_ass = PlannedFile(
+            source_path="/incoming/movie/外挂字幕/source.zh-CN.ass",
+            source_dir="/incoming/movie/外挂字幕",
+            original_name="source.zh-CN.ass",
+            final_name="Movie (2020).zh-CN.ass",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+        )
+        failed_srt = PlannedFile(
+            source_path="/incoming/movie/外挂字幕/source.Viu.srt",
+            source_dir="/incoming/movie/外挂字幕",
+            original_name="source.Viu.srt",
+            final_name="Movie (2020).zh-CN.srt",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+            subtitle_validation={
+                "status": "unknown", "selection": "unverified", "preference": 99,
+                "reason": "subtitle_complete_srt_required",
+                "source_path": "/incoming/movie/外挂字幕/source.Viu.srt",
+                "source_name": "source.Viu.srt",
+            },
+        )
+        plan.files.extend([legacy_ass, failed_srt])
+
+        finalized = finalize_plan(plan)
+
+        self.assertIn(legacy_ass.source_path, {item.source_path for item in finalized.files})
+        self.assertNotIn(failed_srt.source_path, {item.source_path for item in finalized.files})
+        self.assertEqual(finalized.problem_files, [])
+        self.assertEqual(
+            finalized.scan_report["deferred_subtitles"],
+            [{
+                "source_path": failed_srt.source_path,
+                "planned_target_path": "/library/Movie (2020)/Movie (2020).zh-CN.srt",
+                "action": "defer_until_exact_video_subtitle_closure",
+                "reason": "managed_subtitle_unverified",
+                "preferred_source_path": legacy_ass.source_path,
+            }],
+        )
+
+    def test_current_finalizer_writes_no_subtitle_when_only_failed_managed_candidates_exist(self) -> None:
+        # Fail-closed still governs the managed lane itself: with no legacy
+        # fallback beside an unprovable SRT, nothing is written and the
+        # unverified candidate stays at source as deferred evidence.
+        plan = fake_plan(self.request, self.alist, object())
+        failed_srt = PlannedFile(
+            source_path="/incoming/movie/source.zh-CN.srt",
+            source_dir="/incoming/movie",
+            original_name="source.zh-CN.srt",
+            final_name="Movie (2020).zh-CN.srt",
+            target_dir="/library/Movie (2020)",
+            media_kind="subtitle",
+            source_size=100,
+            subtitle_validation={
+                "status": "unknown", "selection": "unverified", "preference": 99,
+                "reason": "subtitle_complete_srt_required",
+                "source_path": "/incoming/movie/source.zh-CN.srt",
+                "source_name": "source.zh-CN.srt",
+            },
+        )
+        plan.files.append(failed_srt)
+
+        finalized = finalize_plan(plan)
+
+        self.assertNotIn(failed_srt.source_path, {item.source_path for item in finalized.files})
+        self.assertEqual(
+            [row["reason"] for row in finalized.scan_report["deferred_subtitles"]],
+            ["managed_subtitle_unverified"],
+        )
+
     def test_current_finalizer_prefers_normal_release_over_subset_copy(self) -> None:
         plan = fake_plan(self.request, self.alist, object())
         normal = PlannedFile(

@@ -230,6 +230,18 @@ def _subtitle_track_rank(items: list[PlannedFile]) -> tuple[object, ...]:
     )
 
 
+def _managed_proof_satisfied(item: PlannedFile) -> bool:
+    """Whether one subtitle candidate carries a satisfied content proof."""
+    proof = item.subtitle_validation
+    return (
+        isinstance(proof, Mapping)
+        and str(proof.get("status") or "").casefold() == "satisfied"
+        and isinstance(proof.get("preference"), int)
+        and not isinstance(proof.get("preference"), bool)
+        and 0 <= int(proof["preference"]) <= 2
+    )
+
+
 def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
     """Keep one logical subtitle track beside each exact planned video.
 
@@ -266,22 +278,32 @@ def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
         managed_valid_groups = {
             key: items
             for key, items in track_groups.items()
-            if any(
-                isinstance(item.subtitle_validation, Mapping)
-                and str(item.subtitle_validation.get("status") or "").casefold()
-                == "satisfied"
-                and isinstance(item.subtitle_validation.get("preference"), int)
-                and not isinstance(item.subtitle_validation.get("preference"), bool)
-                and 0 <= int(item.subtitle_validation["preference"]) <= 2
-                for item in items
-            )
+            if any(_managed_proof_satisfied(item) for item in items)
         }
         if not managed_present and len(track_groups) <= 1:
             continue
-        # When at least one strict SRT proof exists, every other track—including
-        # an unproven legacy ASS/VTT track—is residual.  If all strict
-        # candidates failed proof, do not write any of those candidates.
-        eligible_groups = managed_valid_groups if managed_present else track_groups
+        # A satisfied strict SRT proof outranks every filename-derived hint,
+        # so while one exists every other track—including an unproven legacy
+        # ASS/VTT track—is residual.  A FAILED proof disqualifies only its own
+        # candidate: an unprovable SRT (a zero-duration conversion watermark
+        # cue, an unreadable body) must never veto the legacy tracks beside
+        # it.  Fail-closed applies to what cannot be proven, not to
+        # everything seen, so the selector falls back to the legacy tracks.
+        unproven_items = {
+            id(item)
+            for items in track_groups.values()
+            for item in items
+            if isinstance(item.subtitle_validation, Mapping)
+            and not _managed_proof_satisfied(item)
+        }
+        if managed_valid_groups:
+            eligible_groups = managed_valid_groups
+        else:
+            eligible_groups = {
+                key: [item for item in items if id(item) not in unproven_items]
+                for key, items in track_groups.items()
+                if any(id(item) not in unproven_items for item in items)
+            }
         if not eligible_groups:
             preferred_key = None
             preferred_items: list[PlannedFile] = []
@@ -296,20 +318,9 @@ def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
                 key=_collision_key,
             )
         for track_key, items in track_groups.items():
-            if track_key == preferred_key:
-                continue
-            group_has_invalid_managed_proof = any(
-                isinstance(item.subtitle_validation, Mapping)
-                and not (
-                    str(item.subtitle_validation.get("status") or "").casefold()
-                    == "satisfied"
-                    and isinstance(item.subtitle_validation.get("preference"), int)
-                    and not isinstance(item.subtitle_validation.get("preference"), bool)
-                    and 0 <= int(item.subtitle_validation["preference"]) <= 2
-                )
-                for item in items
-            )
             for item in items:
+                if track_key == preferred_key and id(item) not in unproven_items:
+                    continue
                 demoted_ids.add(id(item))
                 row = {
                     "source_path": item.source_path,
@@ -317,11 +328,10 @@ def _retain_one_subtitle_track_per_exact_video(plan: Plan) -> None:
                     "action": "defer_until_exact_video_subtitle_closure",
                     "reason": (
                         "managed_subtitle_unverified"
-                        if group_has_invalid_managed_proof
-                        or (managed_present and not managed_valid_groups)
+                        if id(item) in unproven_items
                         else (
                             "managed_subtitle_lower_priority"
-                            if managed_present
+                            if managed_valid_groups
                             else "alternate_subtitle_track"
                         )
                     ),
