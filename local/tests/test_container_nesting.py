@@ -1010,6 +1010,109 @@ class ContainerNestingTests(unittest.TestCase):
         oad_event = next(event for event in events if event["tmdb_id"] == 300)
         self.assertEqual(oad_event["parent_path"], "/library/番剧/Collection/Work (200)")
 
+    def test_collection_label_equal_to_container_root_never_doubles(self) -> None:
+        """A collection whose label IS the container collapses onto it.
+
+        紫罗兰永恒花园's shape: the library already holds the TV work root
+        (so the container candidate is a work root, not a container), a later
+        intake carries only the two films, and TMDB puts both films in the
+        「紫罗兰永恒花园（系列）」 collection whose cleaned label equals the
+        container's own name.  Nesting that collection would create
+        ``/番剧/紫罗兰永恒花园/紫罗兰永恒花园/…`` — a same-named nested
+        duplicate of the shelf rule the 空之境界 anchor case already rejects
+        at the sub-series level.  The members must land directly inside the
+        container.
+        """
+
+        class CollectionTMDB:
+            def get(self, path: str, **_params: object) -> dict[str, object]:
+                if path == "/movie/533514":
+                    return {
+                        "title": "紫罗兰永恒花园 剧场版",
+                        "release_date": "2020-09-18",
+                        "belongs_to_collection": {
+                            "id": 1431054,
+                            "name": "紫罗兰永恒花园（系列）",
+                            "poster_path": "/collection-poster.jpg",
+                            "backdrop_path": "/collection-backdrop.jpg",
+                        },
+                    }
+                if path == "/movie/610892":
+                    return {
+                        "title": "紫罗兰永恒花园外传：永远与自动手记人偶",
+                        "release_date": "2019-09-06",
+                        "belongs_to_collection": {
+                            "id": 1431054,
+                            "name": "紫罗兰永恒花园（系列）",
+                            "poster_path": "/collection-poster.jpg",
+                            "backdrop_path": "/collection-backdrop.jpg",
+                        },
+                    }
+                return {}
+
+        source = "/incoming/紫罗兰永恒花园"
+        files = {
+            # The library work root already exists with its season — the
+            # container candidate is therefore a work root, and the pure
+            # container path names the same directory.
+            "/library/番剧/紫罗兰永恒花园/Season 01/S01E01.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/紫罗兰永恒花园 剧场版 (2020)/movie.mkv": FAKE_VIDEO_BYTES,
+            f"{source}/紫罗兰永恒花园外传-永远与自动手记人偶 (2019)/movie.mkv":
+                FAKE_VIDEO_BYTES,
+        }
+        state_root, _alist, runner, _events = self._setup(files, tmdb=CollectionTMDB())
+        root_id = self._root(runner, source)
+        analyze_root_boundaries(
+            _alist, source,
+            root_task_id=root_id, state_root=state_root,
+        )
+        current = load_work_unit_records(state_root, root_id)
+        self.assertEqual(len(current), 2)
+        revised = []
+        for leaf, tmdb_id, title in (
+            ("紫罗兰永恒花园 剧场版 (2020)", 533514, "紫罗兰永恒花园 剧场版"),
+            ("紫罗兰永恒花园外传-永远与自动手记人偶 (2019)", 610892,
+             "紫罗兰永恒花园外传：永远与自动手记人偶"),
+        ):
+            record = self._record_for_source_leaf(current, leaf)
+            revised.append(replace(
+                record,
+                identity_status="confirmed",
+                identity={
+                    "media_type": "movie",
+                    "tmdb_id": tmdb_id,
+                    "title": title,
+                },
+                reconciliation_outcome="new_work",
+            ))
+        save_work_unit_records(state_root, root_id, revised)
+        current = revised
+
+        layout = _container_layout_targets(
+            runner, runner.get_job(root_id), current,
+        )
+        for record in current:
+            target = layout[record.work_unit_id]
+            self.assertEqual(
+                target["parent_path"], "/library/番剧/紫罗兰永恒花园",
+            )
+            self.assertNotIn(
+                "/紫罗兰永恒花园/紫罗兰永恒花园/",
+                str(target["target_root"]),
+            )
+        roots = {
+            (record.identity or {})["tmdb_id"]:
+                layout[record.work_unit_id]["target_root"]
+            for record in current
+        }
+        self.assertEqual(
+            roots[533514], "/library/番剧/紫罗兰永恒花园/紫罗兰永恒花园 剧场版",
+        )
+        self.assertEqual(
+            roots[610892],
+            "/library/番剧/紫罗兰永恒花园/紫罗兰永恒花园外传-永远与自动手记人偶",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

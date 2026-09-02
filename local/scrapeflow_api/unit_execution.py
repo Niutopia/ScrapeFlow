@@ -1238,10 +1238,14 @@ def _container_layout_targets(
             }
             anchor = next(iter(member_parents)) if len(member_parents) == 1 else None
             base_dir = anchor if anchor else container_parent
-            if anchor is not None and posixpath.basename(
-                anchor.rstrip("/")
-            ) == label:
-                collection_dir = anchor
+            if posixpath.basename(base_dir.rstrip("/")) == label:
+                # A collection whose label equals its family root's own name
+                # IS that root: the anchor case (空之境界's sub-series) and
+                # the container case (紫罗兰永恒花园（系列） inside the
+                # 紫罗兰永恒花园 container) both nest members directly under
+                # the existing directory, never inside a same-named nested
+                # duplicate.
+                collection_dir = base_dir
             else:
                 collection_dir = posixpath.join(base_dir, label)
             for member in members:
