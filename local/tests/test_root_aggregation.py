@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from engine.scrapeflow.gap_ledger import close_gap, discover_episode_gaps
@@ -136,6 +137,34 @@ class RootAggregationTests(unittest.TestCase):
             self.assertNotIn("plan", row)
             self.assertNotIn("summary", row)
             self.assertNotIn("decision_trace", row)
+
+    def test_public_projection_shows_bounded_expansion_provenance(self) -> None:
+        """An expansion-born unit exposes its basis, never its internals."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            unit = replace(
+                _unit("u3", identity_status="confirmed"),
+                disc_expansion={
+                    "basis": "operator-ruling",
+                    "tmdb_id": 34307,
+                    "season": 3,
+                    "source_scope": "/quark/影视/待刮削/无耻之徒/第三季",
+                    "staging_scope": "/quark/影视/ScrapeFlow/展开/r/scope",
+                    "members": [{"episode": index} for index in range(1, 13)],
+                },
+            )
+            row = public_work_unit_row(unit, state_root, "root-agg")
+            provenance = row["disc_expansion"]
+            self.assertEqual(provenance["basis"], "operator-ruling")
+            self.assertEqual(provenance["tmdb_id"], 34307)
+            self.assertEqual(provenance["members"], 12)
+            self.assertNotIn("staging_scope", provenance)
+            self.assertNotIn("members_list", provenance)
+
+            plain = public_work_unit_row(
+                _unit("u4", identity_status="confirmed"), state_root, "root-agg",
+            )
+            self.assertIsNone(plain["disc_expansion"])
 
 
 if __name__ == "__main__":

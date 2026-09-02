@@ -172,6 +172,23 @@ def public_work_unit_row(
         "lane_status": record.lane_status,
         "gap_status": record.gap_status,
         "gap_detail": record.gap_detail,
+        # Bounded provenance for a unit born from the disc-expansion bridge:
+        # the proof basis and roster it was proven against, so an operator
+        # can confirm what produced the staged payload without internal JSON.
+        "disc_expansion": (
+            {
+                "basis": record.disc_expansion.get("basis"),
+                "tmdb_id": record.disc_expansion.get("tmdb_id"),
+                "season": record.disc_expansion.get("season"),
+                "source_scope": record.disc_expansion.get("source_scope"),
+                "members": len(
+                    record.disc_expansion.get("members")
+                    or []
+                ),
+            }
+            if isinstance(record.disc_expansion, dict)
+            else None
+        ),
         "acceptance": (
             {
                 "outcome": result.outcome,

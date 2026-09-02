@@ -41,6 +41,7 @@ from engine.scrapeflow.source_objects import (
     SourceManifest,
     SourceObjectValidationError,
 )
+from engine.scrapeflow.disc_expansion_bridge import validate_unit_scopes_for_root
 from engine.scrapeflow.source_inventory import (
     build_scoped_source_node,
     build_source_inventory,
@@ -400,7 +401,12 @@ def _record_source_scopes(
     """Return the exact non-overlapping intake subtrees owned by a unit."""
     ingress = str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
     try:
-        return validate_source_scope(ingress, record.source_paths)
+        return validate_unit_scopes_for_root(
+            ingress,
+            runner.library_root,
+            str(root_job.id),
+            record,
+        )
     except ValueError as exc:
         raise ValueError(f"单元来源所有权无效: {exc}") from exc
 

@@ -1487,7 +1487,14 @@ class AListClient:
             self._require_success(payload, "AList 零落盘流式上传")
         except (OSError, http.client.HTTPException) as exc:
             target_dir, target_name = split_remote(target_path)
-            for delay in (0, 1, 2, 4, 8):
+            # Provider listings lag behind a committed multi-GB upload by
+            # minutes (empirically ~4 min on quark_uc), so a transport break
+            # after the provider already committed must reconcile over a
+            # similarly long window before declaring failure.
+            delays = [0, 1, 2, 4, 8]
+            if size >= 1024 * 1024 * 1024:
+                delays += [30, 60, 120, 120]
+            for delay in delays:
                 if delay:
                     time.sleep(delay)
                 try:

@@ -224,6 +224,78 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("只有终态根", str(payload.get("error") or payload))
 
+    def _parked_disc_root(self) -> str:
+        root_id = self.create_root()
+        record = WorkUnitRecord(
+            work_unit_id=f"{root_id}::disc",
+            root_task_id=root_id,
+            boundary_key="/library/待刮削/Example",
+            source_paths=("/library/待刮削/Example",),
+            source_revision=1,
+            role="single_work",
+            requires_content_expansion=True,
+        )
+        save_work_unit_records(self.state_root, root_id, [record])
+        return root_id
+
+    def _ruling_payload(self, scope: str) -> dict[str, object]:
+        return {
+            "scope_path": scope,
+            "season": 3,
+            "assignments": [
+                {
+                    "image_path": f"{scope}/D1.iso",
+                    "playlist_inner_path": "/BDMV/PLAYLIST/00051.mpls",
+                    "episode": 1,
+                },
+            ],
+            "operator": "operator",
+            "note": "server test",
+        }
+
+    def test_file_disc_ruling_endpoint_stores_validated_ruling(self) -> None:
+        """POST /api/jobs/<id>/file-disc-ruling: operator ruling channel."""
+        from engine.scrapeflow.disc_expansion_bridge import (
+            disc_rulings_path,
+            load_disc_rulings,
+        )
+
+        root_id = self._parked_disc_root()
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/file-disc-ruling",
+            self._ruling_payload("/library/待刮削/Example"),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["filed"]["assignments"], 1)
+        self.assertEqual(payload["filed"]["season"], 3)
+        rulings = load_disc_rulings(self.state_root, root_id)
+        self.assertIn("/library/待刮削/Example", rulings)
+        self.assertTrue(disc_rulings_path(self.state_root, root_id).exists())
+
+    def test_file_disc_ruling_refuses_scope_without_parked_unit(self) -> None:
+        root_id = self.create_root()  # ledger empty: nothing parked
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/file-disc-ruling",
+            self._ruling_payload("/library/待刮削/Example"),
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("待展开", str(payload.get("error") or payload))
+
+    def test_file_disc_ruling_refuses_malformed_payload(self) -> None:
+        root_id = self._parked_disc_root()
+
+        status, payload = self.request(
+            "POST", f"/api/jobs/{root_id}/file-disc-ruling",
+            {"scope_path": "/library/待刮削/Example"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("格式无效", str(payload.get("error") or payload))
+
     def test_health_is_small_local_status(self) -> None:
         status, health = self.request("GET", "/api/health")
 

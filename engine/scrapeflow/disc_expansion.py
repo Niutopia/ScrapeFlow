@@ -609,7 +609,11 @@ def remux_inner_file_to_matroska(
     The bytes stream from the remote image through ``ffmpeg -c copy`` into
     ``output_path``; nothing is mounted or executed.  The result is probed
     locally before it may be uploaded: it must carry at least one video
-    stream and a duration consistent with the playlist it came from.
+    stream and a duration consistent with the playlist it came from.  The
+    evidence hashes cover the produced file — the object the executor
+    uploads and declares to the provider — never the input stream, because
+    the provider's commit callback verifies the declared hashes against the
+    uploaded object itself.
     """
     if os.path.exists(output_path):
         raise DiscExpansionError(f"本地 remux 缓冲已存在，拒绝覆盖: {output_path}")
@@ -630,8 +634,6 @@ def remux_inner_file_to_matroska(
         "-y",
         output_path,
     ]
-    digest_md5 = hashlib.md5(usedforsecurity=False)
-    digest_sha1 = hashlib.sha1(usedforsecurity=False)
     fed = 0
     process = subprocess.Popen(
         argv,
@@ -648,8 +650,6 @@ def remux_inner_file_to_matroska(
                 image_size=image_size,
                 chunk_bytes=chunk_bytes,
             ):
-                digest_md5.update(chunk)
-                digest_sha1.update(chunk)
                 fed += len(chunk)
                 process.stdin.write(chunk)
             process.stdin.close()
@@ -673,6 +673,19 @@ def remux_inner_file_to_matroska(
         raise DiscExpansionError(
             f"喂给 ffmpeg 的字节数与 clip 大小不符: {fed} != {inner_file.size}"
         )
+    digest_md5 = hashlib.md5(usedforsecurity=False)
+    digest_sha1 = hashlib.sha1(usedforsecurity=False)
+    output_bytes = 0
+    with open(output_path, "rb") as handle:
+        while True:
+            block = handle.read(chunk_bytes)
+            if not block:
+                break
+            digest_md5.update(block)
+            digest_sha1.update(block)
+            output_bytes += len(block)
+    if output_bytes <= 0:
+        raise DiscExpansionError("本地 remux 输出为空，拒绝上传")
     return _probe_local_matroska(
         output_path,
         md5=digest_md5.hexdigest(),
@@ -820,6 +833,8 @@ class DiscExpansionExecutor:
         local_buffer_dir: str,
         chunk_bytes: int = 16 * 1024 * 1024,
         min_free_buffer_bytes: int = 20 * 1024 * 1024 * 1024,
+        readback_attempts: int = 7,
+        readback_interval_seconds: float = 35.0,
         now: Callable[[], str] | None = None,
         sleep: Callable[[float], None] | None = None,
         reader_opener: Callable[..., object] | None = None,
@@ -832,6 +847,11 @@ class DiscExpansionExecutor:
         self.local_buffer_dir = local_buffer_dir
         self.chunk_bytes = chunk_bytes
         self.min_free_buffer_bytes = min_free_buffer_bytes
+        # Provider listings lag behind a committed upload by minutes at
+        # multi-GB sizes (empirically ~4 min on quark_uc), so the post-upload
+        # readback tolerates a bounded window before declaring failure.
+        self.readback_attempts = max(1, readback_attempts)
+        self.readback_interval_seconds = max(0.0, readback_interval_seconds)
         self._now = now or (lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         self._sleep = sleep or time.sleep
         self._reader_opener = reader_opener or retrying_alist_range_reader
@@ -896,6 +916,24 @@ class DiscExpansionExecutor:
         if not callable(statter):
             raise DiscExpansionError("AList 客户端缺少 exact_file_info 安全接口")
         return statter(path)
+
+    def _stat_remote_with_lag(self, path: str) -> Mapping[str, object] | None:
+        """Stat with a bounded wait for provider listing lag.
+
+        The precheck and completed-state paths stay immediate: those files
+        were either visible long ago or must not exist at all.  Only a just
+        committed upload can sit in the provider's visibility window.
+        """
+        remote = self._stat_remote(path)
+        attempts = self.readback_attempts
+        while (
+            remote is None
+            and attempts > 1
+        ):
+            attempts -= 1
+            self._sleep(self.readback_interval_seconds)
+            remote = self._stat_remote(path)
+        return remote
 
     def _upload_stream(self, target_path: str, chunks, *, size: int, md5: str, sha1: str):
         if self._uploader is not None:
@@ -991,7 +1029,7 @@ class DiscExpansionExecutor:
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(buffer_path)
-        remote = self._stat_remote(mapping.target_path)
+        remote = self._stat_remote_with_lag(mapping.target_path)
         if (
             not isinstance(remote, Mapping)
             or remote.get("size") != evidence.output_bytes

@@ -25,6 +25,7 @@ from engine.scrapeflow.gap_ledger import (
     parse_gap_token,
     save_gap_ledger,
 )
+from engine.scrapeflow.disc_expansion_bridge import validate_unit_scopes_for_root
 from engine.scrapeflow.root_boundaries import load_source_snapshot
 from engine.scrapeflow.source_inventory import validate_source_scope
 from engine.scrapeflow.work_units import (
@@ -100,7 +101,12 @@ def _owned_unit_sources(
     """Return every validated, non-overlapping task-owned unit source."""
     ingress = str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
     try:
-        return validate_source_scope(ingress, record.source_paths)
+        return validate_unit_scopes_for_root(
+            ingress,
+            runner.library_root,
+            str(root_job.id),
+            record,
+        )
     except ValueError as exc:
         raise EngineExecutionError(f"单元来源不属于本任务入站目录: {exc}") from exc
 

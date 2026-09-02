@@ -347,3 +347,86 @@ class TestScopeMappingRuling:
                     "filed_at": "t",
                 }
             )
+
+
+class TestRemuxEvidenceHashes:
+    """The declared hashes must cover the produced file, not the input.
+
+    The provider's commit callback verifies the declared md5/sha1 against
+    the uploaded object.  A hash taken over the bytes fed to ffmpeg made
+    every real remux upload fail deterministically with CallbackFailed.
+    """
+
+    HEADER = b"FAKE-MATROSKA-CONTAINER-BYTES"
+
+    def _write_fake_tools(self, tmp_path) -> tuple[str, str]:
+        ffmpeg = tmp_path / "fake-ffmpeg"
+        ffmpeg.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "output = sys.argv[sys.argv.index('-y') + 1]\n"
+            "with open(output, 'wb') as handle:\n"
+            "    handle.write(b'FAKE-MATROSKA-CONTAINER-BYTES')\n"
+            "    while True:\n"
+            "        block = sys.stdin.buffer.read(65536)\n"
+            "        if not block:\n"
+            "            break\n"
+            "        handle.write(block)\n",
+            encoding="utf-8",
+        )
+        ffmpeg.chmod(0o755)
+        ffprobe = tmp_path / "fake-ffprobe"
+        ffprobe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "del sys.argv\n"
+            "print(json.dumps({\n"
+            "    'streams': [\n"
+            "        {'codec_type': 'video'},\n"
+            "        {'codec_type': 'audio'},\n"
+            "    ],\n"
+            "    'format': {'duration': '61.0'},\n"
+            "}))\n",
+            encoding="utf-8",
+        )
+        ffprobe.chmod(0o755)
+        return str(ffmpeg), str(ffprobe)
+
+    def test_evidence_hashes_cover_the_produced_file(self, tmp_path) -> None:
+        import hashlib
+        import os
+
+        from engine.scrapeflow.disc_image import InnerFile
+
+        ffmpeg, _ffprobe = self._write_fake_tools(tmp_path)
+        payload = bytes(range(256)) * 8192  # 2 MiB of structured input
+        image = b"\x00" * 4096 + payload
+        inner = InnerFile(
+            inner_path="/BDMV/STREAM/00001.M2TS",
+            size=len(payload),
+            extents=((2, len(payload) // 2048),),
+        )
+
+        def read_range(offset: int, length: int) -> bytes:
+            return image[offset:offset + length]
+
+        output = tmp_path / "buffer.mkv"
+        evidence = de.remux_inner_file_to_matroska(
+            read_range,
+            inner,
+            image_size=len(image),
+            output_path=str(output),
+            chunk_bytes=256 * 1024,
+            ffmpeg_argv=(ffmpeg,),
+            expected_duration_seconds=61.0,
+        )
+
+        produced = output.read_bytes()
+        assert produced == self.HEADER + payload
+        assert evidence.output_bytes == len(produced)
+        assert evidence.md5 == hashlib.md5(produced).hexdigest()
+        assert evidence.sha1 == hashlib.sha1(produced).hexdigest()
+        # The input-stream hash is a different digest: this is exactly the
+        # mismatch that made the provider reject the commit.
+        assert evidence.md5 != hashlib.md5(payload).hexdigest()
+        del os

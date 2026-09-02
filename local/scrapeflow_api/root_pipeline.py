@@ -32,6 +32,11 @@ from pathlib import Path
 from typing import Callable
 
 from engine.scrapeflow.core import _validate_remote_source_basename
+from engine.scrapeflow.disc_expansion_bridge import (
+    DiscExpansionPauseRequested,
+    expand_root_disc_images,
+    expansion_staging_root,
+)
 from engine.scrapeflow.intake_source import load_intake_catalog
 from engine.scrapeflow.remote_paths import normalize_remote_path, provider_safe_basename
 from engine.scrapeflow.root_boundaries import (
@@ -470,6 +475,122 @@ def _cleanup_consumed_source_root(
     }
 
 
+def _cleanup_expansion_staging_root(
+    runner: SimpleEngineRunner,
+    state_root: Path,
+    job: EngineJob,
+    *,
+    pause_requested: Callable[[], bool] | None = None,
+) -> str | None:
+    """Consume the task-owned expansion staging tree at terminal phase.
+
+    Ownership is path-derived (``ScrapeFlow/展开/<root-task-id>``) and gated
+    on the ledger's expansion provenance.  Every file still present under
+    the staging root must be a declared staged payload of this root — the
+    writer has already moved the verified payloads into the formal library,
+    so any survivor is a redundant copy; anything undeclared keeps the tree
+    alive as a reported residual instead of being blindly deleted.  Each
+    delete is verified through a fresh listing and the pause predicate is
+    re-checked before every remote side effect.
+    """
+    try:
+        records = load_work_unit_records(state_root, job.id)
+    except Exception:
+        return None
+    declared = {
+        str(member.get("staged_path"))
+        for record in records
+        if isinstance(record.disc_expansion, Mapping)
+        for member in (record.disc_expansion.get("members") or [])
+        if isinstance(member, Mapping) and member.get("staged_path")
+    }
+    if not declared:
+        return None
+    staging_root = expansion_staging_root(runner.library_root, job.id)
+    if not runner.source_directory_exists(staging_root):
+        return None
+    listing = getattr(runner.alist, "list", None)
+    remove_empty = getattr(runner.alist, "remove_empty_dir", None)
+    if not callable(listing) or not callable(remove_empty):
+        return "展开 staging 清理缺少 AList 删除接口"
+
+    def paused() -> bool:
+        if not callable(pause_requested):
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            return True
+
+    def rows(path: str) -> list[Mapping[str, object]]:
+        try:
+            raw = listing(path, refresh=True)
+        except TypeError:
+            raw = listing(path)
+        if not isinstance(raw, list):
+            raise RuntimeError(f"AList staging 目录回读格式无效: {path}")
+        return [item for item in raw if isinstance(item, Mapping)]
+
+    undeclared: list[str] = []
+    surviving: list[str] = []
+    directories: list[str] = []
+
+    class _PauseBoundary(Exception):
+        pass
+
+    def walk(path: str) -> None:
+        for item in rows(path):
+            if paused():
+                raise _PauseBoundary()
+            name = str(item.get("name") or "")
+            full = posixpath.join(path, name)
+            if item.get("is_dir"):
+                directories.append(full)
+                walk(full)
+            elif full not in declared:
+                undeclared.append(full)
+            else:
+                # The writer already moved the verified payload into the
+                # formal library; a survivor is a redundant staged copy.
+                surviving.append(full)
+
+    try:
+        walk(staging_root)
+    except _PauseBoundary:
+        return "展开 staging 清理在暂停边界停止，可重跑 consume-source"
+    except Exception as exc:  # noqa: BLE001 - residual note, never a failure
+        _trace(f"root {job.id} 展开 staging 清理异常: {redact_error(exc)}")
+        return f"展开 staging 清理未完成（清理异常: {redact_error(exc)}），可重跑 consume-source"
+    if undeclared:
+        _trace(f"root {job.id} 展开 staging 有未声明残留 {len(undeclared)} 项")
+        return (
+            f"展开 staging 有 {len(undeclared)} 个未声明文件（首个: "
+            f"{undeclared[0]}），需人工核对后清理"
+        )
+    for full in surviving:
+        if paused():
+            return "展开 staging 清理在暂停边界停止，可重跑 consume-source"
+        parent, name = posixpath.split(full)
+        try:
+            _remove_intake_entry(runner.alist, parent, name)
+        except Exception as exc:  # noqa: BLE001 - residual note
+            _trace(f"root {job.id} 展开 staging 残件删除失败: {redact_error(exc)}")
+            return f"展开 staging 残件删除失败（{redact_error(exc)}），可重跑 consume-source"
+    for directory in sorted(directories, key=len, reverse=True) + [staging_root]:
+        if paused():
+            return "展开 staging 清理在暂停边界停止，可重跑 consume-source"
+        try:
+            remove_empty(directory, refresh=True)
+        except TypeError:
+            remove_empty(directory)
+        except Exception:
+            continue
+    if runner.source_directory_exists(staging_root):
+        return "展开 staging 目录壳仍在，可重跑 consume-source"
+    _trace(f"root {job.id} 展开 staging 树已消费")
+    return None
+
+
 def _terminal_source_cleanup(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -621,6 +742,41 @@ def run_root_pipeline(
         # An empty source has no work units; the root is complete with
         # nothing to write.
         return _persist_root(runner, job, "completed")
+
+    # X: read-only disc-image expansion.  B/W parks every scope that holds
+    # an optical-disc image behind an inspection requirement; the bridge
+    # proves the playlist→episode mapping from engine-own evidence (plus a
+    # filed operator ruling that still cannot contradict the discs' own
+    # durations), transfers the proven payloads into task-owned staging
+    # resumably, and replaces the parked record with ordinary staged-tree
+    # records whose scopes the merged B snapshot proves.  A scope that
+    # cannot be proven stays parked as visible root-level attention, and
+    # its siblings proceed undisturbed.
+    expansion_snapshot = load_source_snapshot(state_root, root_task_id)
+    if expansion_snapshot is not None:
+        try:
+            expand_root_disc_images(
+                runner.alist,
+                runner.tmdb,
+                state_root,
+                root_task_id,
+                records,
+                expansion_snapshot,
+                media_root=runner.library_root,
+                prefer_animation=(job.target_shelf == "anime"),
+                pause_requested=stopped,
+            )
+        except DiscExpansionPauseRequested:
+            # A paused expansion deliberately leaves the parked record and
+            # the per-mapping transfer states for fresh-pass recovery.
+            cancelled_job = cancelled()
+            if cancelled_job is not None:
+                return cancelled_job
+            return job
+        cancelled_job = cancelled()
+        if cancelled_job is not None:
+            return cancelled_job
+        records = load_work_unit_records(state_root, root_task_id)
 
     # C/U: confirmed records (including durable operator overrides) are
     # untouched; only pending units are resolved.

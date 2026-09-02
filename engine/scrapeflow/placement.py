@@ -10,6 +10,7 @@ from dataclasses import dataclass
 MEDIA_ROOT = "/quark/影视"
 UNSCRAPED_ROOT = f"{MEDIA_ROOT}/待刮削"
 REPLENISHMENT_ROOT = f"{MEDIA_ROOT}/ScrapeFlow/补源"
+EXPANSION_ROOT = f"{MEDIA_ROOT}/ScrapeFlow/展开"
 CATEGORY_ROOTS = {
     "tv": f"{MEDIA_ROOT}/番剧",
     "series": f"{MEDIA_ROOT}/番剧",
@@ -100,6 +101,7 @@ def validate_routing(
     category_roots = _category_roots(root)
     unscraped_root = f"{root}/待刮削"
     replenishment_root = f"{root}/ScrapeFlow/补源"
+    expansion_root = f"{root}/ScrapeFlow/展开"
     production = _within(source, root) or _within(target, root)
     category_root = next(
         (candidate for candidate in dict.fromkeys(category_roots.values()) if _within(target, candidate)),
@@ -110,9 +112,14 @@ def validate_routing(
         replenishment_source = (
             source != replenishment_root and _within(source, replenishment_root)
         )
-        if not ordinary_source and not replenishment_source:
+        # Task-owned disc-expansion staging is the third legitimate source
+        # lane: the bridge stages proven disc payloads under
+        # ``ScrapeFlow/展开/<root-task-id>/`` and F plans them into the
+        # library exactly like a replenishment lane.
+        expansion_source = source != expansion_root and _within(source, expansion_root)
+        if not ordinary_source and not replenishment_source and not expansion_source:
             raise ValueError(
-                "生产源目录必须是待刮削作品或 ScrapeFlow 补源子目录: "
+                "生产源目录必须是待刮削作品或 ScrapeFlow 补源/展开子目录: "
                 f"{source}"
             )
         if category_root is None or target == category_root:
@@ -158,6 +165,8 @@ def placement_for(
         rule=(
             "system_replenishment_to_direct_category"
             if _within(context.source_root, root + "/ScrapeFlow/补源")
+            else "system_expansion_to_direct_category"
+            if _within(context.source_root, root + "/ScrapeFlow/展开")
             else "unscraped_to_direct_category"
             if context.production_library
             else "test_roots"

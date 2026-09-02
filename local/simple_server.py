@@ -2106,6 +2106,68 @@ class SimpleApplication:
         )
         return {"consume_source": receipt}
 
+    def file_disc_ruling_public_job(
+        self,
+        job_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """File one operator playlist→episode ruling for a parked scope.
+
+        This is the data-level operator channel for scopes whose discs
+        declare no readable episode order: the ruling is stored beside the
+        root's other durable state and the next expansion pass validates it
+        against the same TMDB roster and duration tolerance as the engine's
+        own proof.  It only lands on a scope that is currently parked behind
+        the disc-image inspection requirement, so a wrong-scope filing fails
+        closed instead of silently lying in the store.
+        """
+        from engine.scrapeflow.disc_expansion import ScopeMappingRuling
+        from engine.scrapeflow.disc_expansion_bridge import save_disc_ruling
+        from engine.scrapeflow.work_units import load_work_unit_records
+
+        if not isinstance(payload, Mapping) or not payload:
+            raise EngineRequestError("光盘裁决请求必须是非空 JSON 对象")
+        engine_job = self._engine_job_or_none(job_id)
+        if engine_job is None:
+            raise EngineJobNotFoundError(f"Engine job 不存在: {job_id}")
+        with self._automatic_lock:
+            active = self._worker_future
+            if (
+                self._worker_root_job_id == engine_job.id
+                and active is not None
+                and not active.done()
+            ):
+                raise EngineWorkerBusyError("任务仍有活动 worker，不能登记光盘裁决")
+        data = dict(payload)
+        if not str(data.get("filed_at") or "").strip():
+            data["filed_at"] = datetime.now(UTC).isoformat()
+        try:
+            ruling = ScopeMappingRuling.from_mapping(data)
+        except (TypeError, ValueError) as exc:
+            raise EngineRequestError(f"光盘裁决格式无效: {exc}") from exc
+        records = load_work_unit_records(self.state_root, engine_job.id)
+        parked = [
+            record
+            for record in records
+            if record.requires_content_expansion
+            and record.disc_expansion is None
+            and tuple(record.source_paths) == (ruling.scope_path,)
+        ]
+        if not parked:
+            raise EngineRequestError(
+                "来源范围没有待展开的光盘镜像单元（或已按裁决展开），无法登记: "
+                f"{ruling.scope_path}"
+            )
+        save_disc_ruling(self.state_root, engine_job.id, ruling)
+        return {
+            "filed": {
+                "scope_path": ruling.scope_path,
+                "season": ruling.season,
+                "assignments": len(ruling.assignments),
+                "operator": ruling.operator,
+            }
+        }
+
     def repair_public_job_artifacts(
         self,
         job_id: str,
@@ -3078,6 +3140,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
                     self._send(
                         200,
                         self.application.consume_source_public_job(job_id, payload),
+                    )
+                    return
+                if operation == "file-disc-ruling":
+                    self._send(
+                        200,
+                        self.application.file_disc_ruling_public_job(job_id, payload),
                     )
                     return
                 if operation == "repair-artifacts":

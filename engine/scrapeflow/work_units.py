@@ -885,6 +885,18 @@ class WorkUnitRecord:
     # source scope.  It stays durable so identity overrides, retries, D/E
     # lanes, and F cannot mistake title confirmation for content inspection.
     requires_content_expansion: bool = False
+    # Provenance of a unit born from the read-only disc-image expansion
+    # bridge: the proof basis (duration-dp / operator-ruling), the TMDB
+    # roster it was proven against, and per-episode staged byte facts.  It
+    # is system-derived evidence, never an identity override, and it is the
+    # only reason a source scope may point into task-owned expansion
+    # staging instead of the intake root.
+    disc_expansion: dict[str, Any] | None = None
+    # The original intake scopes whose disc images were consumed to produce
+    # this unit's staged payload.  Terminal source consumption and ledger
+    # rebuilds use these to keep owning the images that are no longer part
+    # of this record's source scope.
+    expanded_from_scopes: tuple[str, ...] = ()
     media_context: str = "unknown"
     identity_status: str = "pending"  # "pending" | "confirmed" | "uncertain" | "failed"
     identity: dict[str, Any] | None = None
@@ -932,6 +944,11 @@ class WorkUnitRecord:
             "display_label": self.display_label,
             "claimed_seasons": list(self.claimed_seasons),
             "requires_content_expansion": self.requires_content_expansion,
+            "disc_expansion": (
+                dict(self.disc_expansion)
+                if self.disc_expansion is not None else None
+            ),
+            "expanded_from_scopes": list(self.expanded_from_scopes),
             "media_context": self.media_context,
             "identity_status": self.identity_status,
             "identity": dict(self.identity) if self.identity else None,
@@ -962,6 +979,7 @@ class WorkUnitRecord:
         cand_list = raw.get("candidate_identities") or ()
         reconciliation_evidence = raw.get("reconciliation_evidence")
         layout_repair = raw.get("layout_repair")
+        disc_expansion = raw.get("disc_expansion")
         return cls(
             work_unit_id=str(raw["work_unit_id"]),
             root_task_id=str(raw["root_task_id"]),
@@ -980,6 +998,15 @@ class WorkUnitRecord:
                 })
             ),
             requires_content_expansion=raw.get("requires_content_expansion") is True,
+            disc_expansion=(
+                dict(disc_expansion)
+                if isinstance(disc_expansion, Mapping) else None
+            ),
+            expanded_from_scopes=tuple(
+                str(value)
+                for value in (raw.get("expanded_from_scopes") or ())
+                if str(value).strip()
+            ),
             media_context=str(raw.get("media_context", "unknown")),
             identity_status=str(raw.get("identity_status", "pending")),
             identity=dict(ident) if isinstance(ident, Mapping) else None,
