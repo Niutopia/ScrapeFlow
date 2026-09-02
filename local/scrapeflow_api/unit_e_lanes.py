@@ -307,9 +307,22 @@ def _register_and_hold_existing_gap_unit(
         raise EngineExecutionError("existing_gap 单元身份无效")
     if record.lane_status in {"existing_gap_registered", "existing_gap_held"}:
         return record
-    # Register precise open gaps, idempotent by gap_id.
+    # Register precise open gaps, idempotent by gap_id.  A coordinate is a
+    # root-level fact: when another unit already holds an open row for the
+    # same (media_type, tmdb_id, season, episode) the gap is already tracked
+    # and this unit must not append a duplicate — the same dedupe
+    # discover_episode_gaps applies.
     ledger = load_gap_ledger(state_root, root_job.id)
     existing_ids = {gap.gap_id for gap in ledger if gap.work_unit_id == record.work_unit_id}
+    open_coordinates = {
+        (gap.media_type, gap.tmdb_id, gap.season, episode)
+        for gap in ledger
+        if gap.kind == "missing_episode"
+        and gap.status == "open"
+        and isinstance(gap.episodes, (list, tuple))
+        for episode in gap.episodes
+        if isinstance(episode, int) and not isinstance(episode, bool)
+    }
     changed = False
     for token in sorted(set(record.uncovered_tokens)):
         coordinate = parse_gap_token(token)
@@ -317,6 +330,8 @@ def _register_and_hold_existing_gap_unit(
             continue
         gap_id = f"{record.work_unit_id}::missing_episode::{token}"
         if gap_id in existing_ids:
+            continue
+        if (media_type, tmdb_id, coordinate[0], coordinate[1]) in open_coordinates:
             continue
         ledger.append(Gap(
             gap_id=gap_id,

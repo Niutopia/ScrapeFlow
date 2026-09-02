@@ -1102,6 +1102,55 @@ class RootPipelineTests(unittest.TestCase):
         self.assertNotIn("/incoming/Fate Zero", alist.dirs)
         self.assertIsNone(final.error)
 
+    def test_existing_gap_lane_never_duplicates_an_open_coordinate_from_another_unit(self) -> None:
+        files = {
+            "/incoming/Fate Zero/S01E03.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, planner_events, executor_events = self._setup(
+            files, library_files=_sample_library(), alist_cls=CleaningIndexAList,
+        )
+        job = self._new_path_root(runner, "/incoming/Fate Zero", "anime")
+        root_task_id = job.id
+        # A sibling unit of THIS root already holds the open S02E01 row: the
+        # coordinate is a root-level fact and the existing-gap lane must not
+        # append a second row for it.
+        from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
+        save_gap_ledger(state_root, root_task_id, [Gap(
+            gap_id="sibling-unit::missing_episode::S02E01",
+            root_task_id=root_task_id,
+            work_unit_id="sibling-unit",
+            kind="missing_episode",
+            media_type="tv",
+            tmdb_id=35507,
+            season=2,
+            episodes=(1,),
+            subtitle_path=None,
+            subtitle_language=None,
+            status="open",
+        )])
+        from engine.scrapeflow.root_boundaries import analyze_root_boundaries
+        analyze_root_boundaries(
+            alist, "/incoming/Fate Zero", root_task_id=root_task_id, state_root=state_root,
+        )
+        records = load_work_unit_records(state_root, root_task_id)
+        apply_work_unit_override(
+            state_root, root_task_id, records[0].work_unit_id,
+            media_type="tv", tmdb_id=35507,
+        )
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "gaps_pending")
+        self.assertEqual(executor_events, [])
+        records = load_work_unit_records(state_root, root_task_id)
+        self.assertEqual(records[0].reconciliation_outcome, "existing_gap")
+        self.assertEqual(records[0].lane_status, "existing_gap_registered")
+        from engine.scrapeflow.gap_ledger import load_gap_ledger
+        gaps = load_gap_ledger(state_root, root_task_id)
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].gap_id, "sibling-unit::missing_episode::S02E01")
+        self.assertEqual(gaps[0].status, "open")
+
     def test_pipeline_merges_new_episodes_into_existing_work(self) -> None:
         files = {
             "/incoming/Fate Zero/S01E11.mkv": FAKE_VIDEO_BYTES,
