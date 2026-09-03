@@ -429,4 +429,198 @@ class TestRemuxEvidenceHashes:
         # The input-stream hash is a different digest: this is exactly the
         # mismatch that made the provider reject the commit.
         assert evidence.md5 != hashlib.md5(payload).hexdigest()
-        del os
+
+
+class TestTransferResilience:
+    """The executor survives provider-side visibility and upload blips.
+
+    Two observed failure classes on quark_uc, both generic: the exact-path
+    stat stays blind past the whole readback window while the refreshed
+    listing already shows the committed object, and a part-level transport
+    blip is retried by the provider proxy with an already-drained reader so
+    the part arrives empty and the upload is rejected with nothing
+    committed.
+    """
+
+    PAYLOAD = b"FAKE-MATROSKA-BYTES" * 4
+
+    class FakeAList:
+        def __init__(self, entries=None):
+            self.entries = entries or []
+            self.list_calls = 0
+
+        def list(self, path, refresh=False):
+            self.list_calls += 1
+            return list(self.entries)
+
+    def _executor(
+        self,
+        tmp_path,
+        *,
+        statter,
+        alist,
+        uploader,
+    ):
+        state_dir = tmp_path / "states"
+        buffer_dir = tmp_path / "buffers"
+        state_dir.mkdir()
+        buffer_dir.mkdir()
+        remux_calls = []
+
+        def fake_remux(read_range, inner_file, **kwargs):
+            remux_calls.append(1)
+            buffer_path = kwargs["output_path"]
+            with open(buffer_path, "wb") as handle:
+                handle.write(self.PAYLOAD)
+            return de.RemuxEvidence(
+                output_path=buffer_path,
+                output_bytes=len(self.PAYLOAD),
+                duration_seconds=61.0,
+                video_streams=1,
+                audio_streams=1,
+                subtitle_streams=0,
+                md5="a" * 32,
+                sha1="b" * 40,
+            )
+
+        import contextlib
+
+        executor = de.DiscExpansionExecutor(
+            alist,
+            state_dir=str(state_dir),
+            local_buffer_dir=str(buffer_dir),
+            chunk_bytes=8,
+            min_free_buffer_bytes=0,
+            readback_attempts=1,
+            readback_interval_seconds=0.0,
+            sleep=lambda _seconds: None,
+            reader_opener=lambda _alist, **_kwargs: contextlib.nullcontext(
+                lambda offset, length: self.PAYLOAD[offset:offset + length]
+            ),
+            statter=statter,
+            uploader=uploader,
+            remux=fake_remux,
+        )
+        return executor, remux_calls
+
+    def _mapping(self):
+        return de.EpisodeMapping(
+            candidate=_candidate(duration_seconds=61 * 60),
+            season=1,
+            episode=1,
+            target_path="/staging/Show/Season 01/Show - S01E01.mkv",
+        )
+
+    def test_readback_accepts_the_refreshed_listing(self, tmp_path) -> None:
+        # The exact-path stat never sees the object; the refreshed listing
+        # does.  The readback must confirm through the second opinion and
+        # the mapping completes instead of failing the window.
+        alist = self.FakeAList([
+            {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD),
+             "is_dir": False},
+        ])
+
+        def uploader(target_path, chunks, **kwargs):
+            for _ in chunks:
+                pass
+
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=uploader,
+        )
+        state = executor.execute_mapping(
+            self._mapping(), inner_file=object()
+        )
+        assert state.status == "completed"
+        assert state.output_bytes == len(self.PAYLOAD)
+        assert alist.list_calls >= 1
+
+    def test_upload_blip_is_retried_from_the_intact_buffer(
+        self, tmp_path
+    ) -> None:
+        # First upload is rejected by the provider proxy (nothing
+        # committed); the buffer is still intact, so the retry streams the
+        # identical bytes and the mapping completes.
+        attempts = []
+        committed = []
+
+        def uploader(target_path, chunks, **kwargs):
+            payload = b"".join(chunks)
+            attempts.append(payload)
+            if len(attempts) == 1:
+                raise RuntimeError("up status: 400 EntityTooSmall")
+            committed.append(1)
+
+        def statter(path):
+            if committed:
+                return {"size": len(self.PAYLOAD)}
+            return None
+
+        class CommitAwareAList(self.FakeAList):
+            def list(self, path, refresh=False):
+                self.list_calls += 1
+                if committed:
+                    return [
+                        {"name": "Show - S01E01.mkv",
+                         "size": len(self.PAYLOAD), "is_dir": False},
+                    ]
+                return []
+
+        alist = CommitAwareAList()
+
+        executor, _remux_calls = self._executor(
+            tmp_path, statter=statter, alist=alist, uploader=uploader
+        )
+        state = executor.execute_mapping(
+            self._mapping(), inner_file=object()
+        )
+        assert state.status == "completed"
+        assert len(attempts) == 2
+        assert attempts[0] == self.PAYLOAD
+        assert attempts[1] == self.PAYLOAD
+
+    def test_committed_despite_error_is_not_reuploaded(self, tmp_path) -> None:
+        # The transport broke after the provider committed: the reconcile
+        # finds the target at the declared size, so no second upload is
+        # attempted and the mapping still completes.
+        calls = []
+
+        def uploader(target_path, chunks, **kwargs):
+            calls.append(1)
+            raise OSError("connection reset after commit")
+
+        alist = self.FakeAList([
+            {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD),
+             "is_dir": False},
+        ])
+
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=uploader,
+        )
+        state = executor.execute_mapping(
+            self._mapping(), inner_file=object()
+        )
+        assert state.status == "completed"
+        assert calls == [1]
+
+    def test_repeated_upload_failure_raises_the_last_error(
+        self, tmp_path
+    ) -> None:
+        def uploader(target_path, chunks, **kwargs):
+            for _ in chunks:
+                pass
+            raise RuntimeError("up status: 400 EntityTooSmall")
+
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=self.FakeAList([]),
+            uploader=uploader,
+        )
+        with pytest.raises(RuntimeError, match="EntityTooSmall"):
+            executor.execute_mapping(self._mapping(), inner_file=object())

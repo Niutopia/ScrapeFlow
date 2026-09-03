@@ -833,7 +833,7 @@ class DiscExpansionExecutor:
         local_buffer_dir: str,
         chunk_bytes: int = 16 * 1024 * 1024,
         min_free_buffer_bytes: int = 20 * 1024 * 1024 * 1024,
-        readback_attempts: int = 20,
+        readback_attempts: int = 30,
         readback_interval_seconds: float = 60.0,
         now: Callable[[], str] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -850,8 +850,10 @@ class DiscExpansionExecutor:
         # Provider listings lag behind a committed upload by minutes at
         # multi-GB sizes (empirically ~4 min on quark_uc for one file, and
         # ~12 min when back-to-back multi-GB uploads land in the same
-        # directory), so the post-upload readback tolerates a bounded window
-        # before declaring failure.
+        # directory; the exact-path stat itself has been observed needing
+        # ~19 minutes, right at the edge of a 20-round window), so the
+        # post-upload readback tolerates a bounded window before declaring
+        # failure.
         self.readback_attempts = max(1, readback_attempts)
         self.readback_interval_seconds = max(0.0, readback_interval_seconds)
         self._now = now or (lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
@@ -919,14 +921,48 @@ class DiscExpansionExecutor:
             raise DiscExpansionError("AList 客户端缺少 exact_file_info 安全接口")
         return statter(path)
 
+    def _listing_second_opinion(
+        self, path: str
+    ) -> Mapping[str, object] | None:
+        """Arbitrate the exact-path stat against the refreshed listing.
+
+        During the post-upload visibility window the provider's exact-path
+        stat can lag behind its own refreshed listing (observed on quark_uc:
+        the listing showed the fully committed object while the stat stayed
+        blind past the whole readback window).  Both speak for the same
+        remote state, so the listing may confirm — never invent — a hit,
+        and only on an exact-name, non-directory match.
+        """
+        lister = getattr(self.alist, "list", None)
+        if not callable(lister):
+            return None
+        parent = posixpath.dirname(path)
+        name = posixpath.basename(path)
+        try:
+            entries = lister(parent, refresh=True)
+        except Exception:  # noqa: BLE001 - a second opinion stays optional
+            return None
+        for entry in entries or []:
+            if (
+                isinstance(entry, Mapping)
+                and not entry.get("is_dir")
+                and str(entry.get("name") or "") == name
+            ):
+                return entry
+        return None
+
     def _stat_remote_with_lag(self, path: str) -> Mapping[str, object] | None:
         """Stat with a bounded wait for provider listing lag.
 
         The precheck and completed-state paths stay immediate: those files
         were either visible long ago or must not exist at all.  Only a just
-        committed upload can sit in the provider's visibility window.
+        committed upload can sit in the provider's visibility window, and
+        each round consults the refreshed listing as a second opinion
+        because the exact-path stat can be the slower of the two indexes.
         """
         remote = self._stat_remote(path)
+        if remote is None:
+            remote = self._listing_second_opinion(path)
         attempts = self.readback_attempts
         while (
             remote is None
@@ -935,6 +971,8 @@ class DiscExpansionExecutor:
             attempts -= 1
             self._sleep(self.readback_interval_seconds)
             remote = self._stat_remote(path)
+            if remote is None:
+                remote = self._listing_second_opinion(path)
         return remote
 
     def _upload_stream(self, target_path: str, chunks, *, size: int, md5: str, sha1: str):
@@ -1013,6 +1051,14 @@ class DiscExpansionExecutor:
                 expected_duration_seconds=candidate.duration_seconds,
             )
         try:
+            # A part-level transport blip inside the provider proxy can
+            # reject an otherwise complete upload (observed on quark_uc: a
+            # broken pipe on one part was retried by the proxy with an
+            # already-drained reader, so the part arrived empty and the
+            # provider answered 400 EntityTooSmall), and a transport break
+            # after commit can fail the request while the object lands
+            # anyway.  The remux buffer is still intact here, so reconcile
+            # the target and retry once when nothing committed.
             def chunks():
                 with open(buffer_path, "rb") as handle:
                     while True:
@@ -1021,13 +1067,32 @@ class DiscExpansionExecutor:
                             break
                         yield block
 
-            self._upload_stream(
-                mapping.target_path,
-                chunks(),
-                size=evidence.output_bytes,
-                md5=evidence.md5,
-                sha1=evidence.sha1,
-            )
+            uploaded = False
+            last_error: Exception | None = None
+            for _attempt in range(2):
+                try:
+                    self._upload_stream(
+                        mapping.target_path,
+                        chunks(),
+                        size=evidence.output_bytes,
+                        md5=evidence.md5,
+                        sha1=evidence.sha1,
+                    )
+                    uploaded = True
+                    break
+                except Exception as exc:  # noqa: BLE001 - reconciled below
+                    last_error = exc
+                    reconciled = self._stat_remote_with_lag(
+                        mapping.target_path
+                    )
+                    if (
+                        isinstance(reconciled, Mapping)
+                        and reconciled.get("size") == evidence.output_bytes
+                    ):
+                        uploaded = True
+                        break
+            if last_error is not None and not uploaded:
+                raise last_error
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(buffer_path)
