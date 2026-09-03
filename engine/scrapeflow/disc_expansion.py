@@ -712,7 +712,7 @@ def _probe_local_matroska(
         ffmpeg_argv[0].replace("ffmpeg", "ffprobe"),
         "-v", "error",
         "-show_entries",
-        "format=duration:stream=codec_type",
+        "format=duration:stream=index,codec_type,duration",
         "-of", "json",
         output_path,
     ]
@@ -739,7 +739,22 @@ def _probe_local_matroska(
     subtitle = sum(1 for s in streams if s.get("codec_type") == "subtitle")
     if video < 1:
         raise DiscExpansionError("remux 结果不含视频轨")
-    duration = float(payload.get("format", {}).get("duration") or 0.0)
+    # The container duration covers every stream; a trailing subtitle track
+    # can extend it past the playlist's clip span (observed on a DIY disc
+    # whose last subtitle lagged the video by ~7s).  The episode's runtime
+    # is the video stream's duration, so gate on that and fall back to the
+    # container duration only when ffprobe reports no per-stream value.
+    duration = 0.0
+    for stream in streams:
+        if stream.get("codec_type") == "video":
+            raw = stream.get("duration")
+            try:
+                candidate = float(raw) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                candidate = 0.0
+            duration = max(duration, candidate)
+    if duration <= 0:
+        duration = float(payload.get("format", {}).get("duration") or 0.0)
     if expected_duration_seconds is not None and (
         duration <= 0
         or abs(duration - expected_duration_seconds) > duration_tolerance_seconds

@@ -392,6 +392,81 @@ class TestRemuxEvidenceHashes:
         ffprobe.chmod(0o755)
         return str(ffmpeg), str(ffprobe)
 
+    def _write_fat_tail_tools(self, tmp_path) -> tuple[str, str]:
+        """ffprobe reports a container overrun by a trailing subtitle track.
+
+        The video stream matches the playlist while a DIY subtitle stream
+        keeps its last timestamp ~7s past the video, stretching the
+        container duration beyond the tolerance.  The remux must pass: the
+        episode runtime is the video stream's duration.
+        """
+        ffmpeg = tmp_path / "fat-tail-ffmpeg"
+        ffmpeg.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "output = sys.argv[sys.argv.index('-y') + 1]\n"
+            "import os\n"
+            "with open(output, 'wb') as handle:\n"
+            "    handle.write(b'FAKE-MATROSKA-CONTAINER-BYTES')\n"
+            "    while True:\n"
+            "        block = sys.stdin.buffer.read(65536)\n"
+            "        if not block:\n"
+            "            break\n"
+            "        handle.write(block)\n",
+            encoding="utf-8",
+        )
+        ffmpeg.chmod(0o755)
+        ffprobe = tmp_path / "fat-tail-ffprobe"
+        ffprobe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "del sys.argv\n"
+            "print(json.dumps({\n"
+            "    'streams': [\n"
+            "        {'index': 0, 'codec_type': 'video',\n"
+            "         'duration': '3465.128'},\n"
+            "        {'index': 1, 'codec_type': 'audio'},\n"
+            "        {'index': 7, 'codec_type': 'subtitle',\n"
+            "         'duration': '3472.512'},\n"
+            "    ],\n"
+            "    'format': {'duration': '3472.512'},\n"
+            "}))\n",
+            encoding="utf-8",
+        )
+        ffprobe.chmod(0o755)
+        return str(ffmpeg), str(ffprobe)
+
+    def test_duration_gate_uses_video_stream_not_container(self, tmp_path) -> None:
+        import hashlib
+
+        from engine.scrapeflow.disc_image import InnerFile
+
+        ffmpeg, _ffprobe = self._write_fat_tail_tools(tmp_path)
+        payload = bytes(range(256)) * 8192  # 2 MiB of structured input
+        image = b"\x00" * 4096 + payload
+        inner = InnerFile(
+            inner_path="/BDMV/STREAM/00016.M2TS",
+            size=len(payload),
+            extents=((2, len(payload) // 2048),),
+        )
+
+        def read_range(offset: int, length: int) -> bytes:
+            return image[offset:offset + length]
+
+        output = tmp_path / "buffer.mkv"
+        evidence = de.remux_inner_file_to_matroska(
+            read_range,
+            inner,
+            image_size=len(image),
+            output_path=str(output),
+            chunk_bytes=256 * 1024,
+            ffmpeg_argv=(ffmpeg,),
+            expected_duration_seconds=3465.170,
+        )
+        # The video stream (3465.128s) is the reported runtime, not the
+        # subtitle-extended container (3472.512s).
+        assert evidence.duration_seconds == pytest.approx(3465.128)
+
     def test_evidence_hashes_cover_the_produced_file(self, tmp_path) -> None:
         import hashlib
         import os
