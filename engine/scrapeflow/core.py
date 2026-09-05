@@ -6618,6 +6618,13 @@ def _map_disc_extras_by_official_release_runs(
     for item in items:
         name = unicodedata.normalize("NFKC", str(item.get("name", "")))
         full_path = str(item.get("full_path", ""))
+        # A bonus video whose own name is theme-classified (``[SP02] NCED
+        # - 04``) is non-story content: the SPxx ordinal is the theme
+        # release's sequence number, never an official Season 00 coordinate.
+        # Re-admitting it by ordinal placed an NCED beside the genuine
+        # prequel special on S00E02 (Mushoku Tensei Moozzi2 shape).
+        if classify_residual(full_path).kind == "theme_video":
+            continue
         # The release filename is the most specific evidence for shared
         # ``字幕备份`` directories.  Looking at generic parents first can
         # incorrectly select the base season before seeing ``2wei/Herz/3rei``.

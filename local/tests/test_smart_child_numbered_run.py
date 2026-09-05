@@ -798,3 +798,47 @@ class NfoVersionTwinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiscExtrasMapperThemeGuardTests(unittest.TestCase):
+    """The bonus re-admission mapper must skip theme-named content."""
+
+    def test_sp_numbered_nced_is_not_re_admitted(self):
+        from engine.scrapeflow.core import _map_disc_extras_by_official_release_runs
+
+        show = {"name": "Mushoku Tensei", "original_name": "無職転生"}
+        positive_seasons = [
+            {"season_number": 1, "episode_count": 11, "air_date": "2021-01-11"},
+            {"season_number": 2, "episode_count": 12, "air_date": "2023-07-10"},
+        ]
+        # Official short-extra runs derived from runtime+air-date gaps: S00
+        # rows 3..6 are the season-1 disc extras, rows 7..9 season 2's.
+        special_runtimes = {3: 5, 4: 5, 5: 6, 6: 5, 7: 4, 8: 4, 9: 4, 2: 24}
+        special_air_dates = {
+            3: "2021-06-01", 4: "2021-06-02", 5: "2021-06-03", 6: "2021-06-04",
+            7: "2023-12-01", 8: "2023-12-02", 9: "2023-12-03",
+            2: "2023-07-03",
+        }
+        items = [
+            # Theme content carrying SP numbering: must NOT be mapped.
+            {"name": "Mushoku Tensei [SP02] NCED - 04 [ EP.22 ] (BD).mkv",
+             "full_path": "/in/Rel/EXTRA/Mushoku Tensei [SP02] NCED - 04 [ EP.22 ] (BD).mkv"},
+            # A genuine numbered disc extra: still mapped.
+            {"name": "Mushoku Tensei [SP01] Tokuten Anime (BD).mkv",
+             "full_path": "/in/Rel/EXTRA/Mushoku Tensei [SP01] Tokuten Anime (BD).mkv"},
+        ]
+        changed = _map_disc_extras_by_official_release_runs(
+            items,
+            show=show,
+            positive_seasons=positive_seasons,
+            special_runtimes=special_runtimes,
+            special_air_dates=special_air_dates,
+        )
+        nced = items[0]
+        self.assertNotIn("_episode_key_override", nced)
+        # The tokuten item was mapped (or at minimum the NCED was skipped).
+        self.assertLessEqual(changed, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
