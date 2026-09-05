@@ -58,7 +58,7 @@ IntakeSource (只读发现)
 6. 简单控制流 + 人工可恢复;
 7. 最后才是抽象与扩展性。
 
-## 2. 唯一主流程 (A→P 产品合同)
+## 2. 唯一主流程 (A→P 产品合同，含 X 光盘展开与终态清源)
 
 下图是 ScrapeFlow 的主流程架构。所有实现与测试均需对齐此链路:
 
@@ -69,7 +69,10 @@ flowchart TD
     B["B 来源快照与目录结构分析<br/>SourceSnapshot + BoundaryAnalysis<br/>识别单作品 / 系列容器 / 电影合集 / 季度"] -->
     W["W 拆分独立作品单元<br/>生成 WorkUnit 集合"]
 
-    W --> C["C 逐作品 TMDB 身份识别<br/>IdentityResolver + IdentityEvidence<br/>综合目录/文件/父容器/季集/年份评分"]
+    W --> X["X 光盘镜像只读展开 (2026-09-02~04)<br/>UDF/ISO9660 HTTP Range 解析<br/>MPLS→集数映射证明：保序 DP / 时长门<br/>无法唯一证明 → 受盘内时长约束的人工裁决<br/>零落盘 remux 至 /ScrapeFlow/展开/&lt;root&gt;<br/>单元 scope 重指向 staging，重入 C"]
+
+    X -->|无法证明且无裁决| U0["U0 该 scope 保持 attention<br/>兄弟 scope 不受阻塞"]
+    X --> C["C 逐作品 TMDB 身份识别<br/>IdentityResolver + IdentityEvidence<br/>综合目录/文件/父容器/季集/年份评分"]
 
     C -->|置信度不足/歧义| U["U uncertain → 单单元挂起<br/>仅阻塞当前 WorkUnit<br/>其余已确认 WorkUnit 继续推进"]
     U -->|用户确认 tmdb_id+type| C
@@ -102,6 +105,7 @@ flowchart TD
     L -->|否| M["M 入库完成阶段结束 (ingest_completed)"]
     L -->|是| N["N 严格两阶补源子系统<br/>Quark 分享 → 本地 Torrent（精确 select-file）<br/>专属 staging → 同一 Engine/Writer → 定向回读闭环"]
     N --> M
+    M --> T["T 终态消费源树与展开 staging<br/>用户裁决 2026-08-27 / 09-02<br/>completed 与 gaps_pending 均消费<br/>/待刮削 是 staging 不是存储<br/>Gap 账本是缺口的唯一持久记录<br/>每次删除以 fresh 回读证明，无法证明=未删"]
 ```
 
 ### 各环节核心规则
@@ -116,6 +120,14 @@ flowchart TD
    - 目录角色枚举包括：`single_work`, `series_container`, `season`, `movie_collection`, `special_group`, `version_group`, `release_group`, `subtitle_group`, `extras_group`, `resource_group`, `uncertain`；
    - 严禁将 Fate、高达等系列容器顶层直接认作单部 TV。
    - **系列容器落盘规则（Fate 式，用户裁决 2026-08-16）**：容器 = 待刮削里用户放入的那一层文件夹，库中只出现一个容器条目，子作品全部嵌套其下，绝不散开。子作品归属只看证据不看名字：同一 TMDB 剧的若干季合并为一个子条目；不同 TMDB 剧各成一个子条目；电影成为容器内的电影子条目。容器命名三级兜底：库里已有同身份容器 → 直接并入；否则用清洗后的用户目录名（剥压制组/分辨率/编号前缀/乱码符号，含连续数字堆或清洗后过短视为不可用）；仍不可用 → 用单元 TMDB 标题。主 TV 单元（容器内唯一 TV 身份，或某 TV 身份占多个季单元而其余 TV 身份各只有一个单元时）拥有容器根，其余单元一律以其真实落盘根为父目录（主系列在根、电影与外传嵌套其下；多 TV 且无主导/纯电影容器：每个子作品嵌套在清洗名容器下）。失败单元重试会退役陈旧终态载体并从当前来源状态重新规划（不再钉死旧计划）。身份或写目标真分不清时维持 fail-closed 挂起。小数集特别篇（`[N.5]`）匹配顺序：官方标题字面含相同小数集号 → 直接认定（跳过季时间线否决）；否则跨正季查找 N/N+1 播出日区间（含季末 N 以下一季首集为上界的跨季边界），命中且节目时长≥18 分钟即认定——这是无数据行的通用机制，覆盖 Vivy 13.5、无头骑士 13.5（含季文件夹内）等；区间证据也失败时，`release_lexicon.FRACTIONAL_SPECIAL_ALIASES` 数据行作为最后兜底（如刀剑神域 24.5/36.5）。补源下载走直连（清空下载子进程的代理环境并开 DHT/PEX/LPD），搜索层才允许使用代理。
+2.5. **X 光盘镜像只读展开（2026-09-02~04 落地，B/W→C 之间的产品相位）**:
+   - 持有光盘镜像的 scope 由 B/W 停车为 `requires_content_expansion`，X 相位逐 scope 处理；
+   - 只读证明：HTTP Range 解析 UDF/ISO9660/BDMV/MPLS，从不挂载、从不执行镜像内容；
+   - 播放列表→集数映射以保序 DP + 时长容差自动证明；无法唯一证明时允许**数据级人工裁决**（受盘内时长约束，不能与盘自身证据矛盾）；
+   - 零落盘传输：镜像内 clip 按 MPLS in/out remux 成 mkv 流式上传至任务专属 staging `/ScrapeFlow/展开/<root-task-id>/`，per-mapping 状态可断点续传，写后 fresh 回读；
+   - 展开完成后该 WorkUnit 的 `source_paths` 重指向 staged scope，合并进 B 快照（含 scope 目录行），随普通 C/D/F/G/H 走完；
+   - 兄弟 scope 互不阻塞：一个 scope 无法证明只 park 自己；
+   - 终态时 staging 树与源树同样被消费（见 T）。
 3. **C/U 作品级身份识别与证据评分**:
    - 匹配器接收结构化 `IdentityEvidence`（边界名、代表文件名、父容器弱证据、年份、媒体形态）；
    - 电影与剧集候选并行评分，记录打分明细与 margin；
@@ -133,6 +145,12 @@ flowchart TD
    - Gap 精确绑定到 `work_unit_id` 与坐标；
    - 补源获取的媒体进入任务专属 staging，生成临时 inventory 重新经过统一 Engine 与 writer；
    - 经定向 fresh listing 证明缺口真实消失后才核销对应 Gap 并清理 staging。
+7. **T 终态消费源树与展开 staging（用户裁决 2026-08-27，扩展 2026-09-02）**:
+   - `/待刮削` 是 staging 不是存储：根到达 `completed` 或 `gaps_pending` 后，整个来源树（含残余主题、MV、备份字幕、截图、字体包、输家版本、未映射特别篇）默认全量删除；
+   - `gaps_pending` 同样终态消费源树：Gap 账本是缺口的唯一持久记录（缺口只登不补），任何车道都不再读源树；
+   - X 展开的 staging 树（`/ScrapeFlow/展开/<root>/`）在写库验收后同样消费；
+   - **fail-closed 证明语义**：每次删除必须以 fresh 回读证明完成；provider 回读失败 = 未删除（记残余、可重跑 consume-source），绝不把「无法证明」当「已删除」；
+   - Gap 账本损坏时全链 fail-closed（聚合/补源/关闭一律停），禁止把损坏账本解释为「没有缺口」。
 
 ## 3. 必须保留的本地安全底线
 
