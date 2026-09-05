@@ -440,7 +440,7 @@ def _planned_tv_episode_nfos_impl(
         return []
 
     output: list[tuple[str, bytes]] = []
-    seen: set[str] = set()
+    seen: dict[str, bytes] = {}
     for item in plan.files:
         if item.media_kind != "video" or is_planned_bonus_fn(item.final_name):
             continue
@@ -474,9 +474,6 @@ def _planned_tv_episode_nfos_impl(
         episode_title = title_tail[1].strip() if len(title_tail) == 2 else stem
         target = join_remote_fn(item.target_dir, f"{stem}.nfo")
         key = collision_key_fn(target)
-        if key in seen:
-            raise plan_error(f"多个视频生成同一集 NFO 目标: {target}")
-        seen.add(key)
         range_fields = (
             f"  <displayepisode>{episode}-{end_episode}</displayepisode>\n"
             if end_episode != episode else ""
@@ -492,6 +489,18 @@ def _planned_tv_episode_nfos_impl(
             f"{range_fields}"
             "</episodedetails>\n"
         ).encode("utf-8")
+        if key in seen:
+            # Same-coordinate version twins (a .mkv and a .mp4 of one
+            # episode share the stem, so their NFO targets are identical)
+            # describe one episode: the first payload stands and the twin
+            # emits nothing.  Only a metadata conflict on the same target
+            # is a real generation bug.
+            if seen[key] != payload:
+                raise plan_error(
+                    f"多个视频生成同一集 NFO 目标且元数据冲突: {target}"
+                )
+            continue
+        seen[key] = payload
         output.append((target, payload))
     return output
 

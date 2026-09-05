@@ -185,26 +185,36 @@ def _preclassify_theme_residuals(
         if is_bonus_directory_path(path):
             bonus_directory_videos.append(item)
             continue
-        if any(
-            key.kind == "regular" and not key.end_number
-            for key in [extract_episode_key(name)]
-            if key is not None
-        ):
+        key = extract_episode_key(name)
+        if key is not None and key.kind == "regular" and not key.end_number:
             continue
         if classify_residual(path).kind != "theme_video":
             continue
+        # A theme-classified video whose only coordinate is a special-kind
+        # key is release-local theme numbering (``[SP02] NCED - 04``): the
+        # bounded theme token is the content's own label and the SPxx
+        # ordinal is that label's sequence number — never an official S00
+        # coordinate.  Without this the NCED rides the special key into
+        # Season 00 and collides with a genuine special on the same
+        # coordinate (Mushoku Tensei Moozzi2 vs the real prequel special).
+        special_theme_numbering = key is not None and key.kind == "special"
         parent = posixpath.dirname(path)
         parent_name = posixpath.basename(parent)
         all_theme = all(
             classify_residual(str(member.get("full_path", ""))).kind == "theme_video"
             and not any(
-                key.kind == "regular" and not key.end_number
-                for key in [extract_episode_key(str(member.get("name", "")))]
-                if key is not None
+                member_key.kind == "regular" and not member_key.end_number
+                for member_key in [extract_episode_key(str(member.get("name", "")))]
+                if member_key is not None
             )
             for member in by_parent[parent]
         )
-        if _THEME_MARKER_RE.search(name) or _THEME_MARKER_RE.search(parent_name) or all_theme:
+        if (
+            special_theme_numbering
+            or _THEME_MARKER_RE.search(name)
+            or _THEME_MARKER_RE.search(parent_name)
+            or all_theme
+        ):
             proven.append(item)
     removed = {str(item.get("full_path", "")) for item in proven}
     removed.update(str(item.get("full_path", "")) for item in bonus_directory_videos)

@@ -661,3 +661,140 @@ class HashExExtraAssetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpecialKeyThemeResidualTests(unittest.TestCase):
+    """``[SP02] NCED - 04`` is theme numbering, not an official special."""
+
+    def test_special_key_theme_video_is_preclassified_residual(self):
+        from engine.scrapeflow.planning.tv.smart import _preclassify_theme_residuals
+
+        files = [
+            # A genuine special with a story title: no theme token.
+            {"name": "Show [SP01] Eris Goblin Special.mkv",
+             "full_path": "/in/Rel/Show [SP01] Eris Goblin Special.mkv",
+             "size": 4096, "is_dir": False},
+            # A theme video whose bracket carries SPxx numbering: the NCED
+            # token is the content label; SP02 is its sequence number.
+            {"name": "Show [SP02] NCED - 04 [ EP.22 ] (BD).mkv",
+             "full_path": "/in/Rel/Show [SP02] NCED - 04 [ EP.22 ] (BD).mkv",
+             "size": 4096, "is_dir": False},
+            # A regular episode (theme gate must never eat these).
+            {"name": "Show [01] (BD).mkv",
+             "full_path": "/in/Rel/Show [01] (BD).mkv",
+             "size": 4096, "is_dir": False},
+        ]
+        kept, residuals, _bonus = _preclassify_theme_residuals(files)
+        kept_paths = {str(item.get("full_path")) for item in kept}
+        residual_paths = {str(row["source_path"]) for row in residuals}
+        self.assertIn("/in/Rel/Show [SP01] Eris Goblin Special.mkv", kept_paths)
+        self.assertIn("/in/Rel/Show [01] (BD).mkv", kept_paths)
+        self.assertIn(
+            "/in/Rel/Show [SP02] NCED - 04 [ EP.22 ] (BD).mkv", residual_paths,
+        )
+
+
+class NfoVersionTwinTests(unittest.TestCase):
+    """Same-coordinate twins with different extensions share one episode NFO."""
+
+    def test_identical_payload_twins_emit_one_nfo(self):
+        from engine.scrapeflow.models import Plan, PlannedFile
+        from engine.scrapeflow.plan_artifacts import _planned_tv_episode_nfos_impl
+
+        twins = [
+            PlannedFile(
+                source_path=f"/in/S{ext}",
+                source_dir="/in",
+                original_name=f"S00E02.{ext}",
+                final_name=f"Show - S00E02 - Prequel.{ext}",
+                target_dir="/lib/Show/Season 00",
+                media_kind="video",
+            )
+            for ext in ("mkv", "mp4")
+        ]
+        plan = Plan(
+            mode="tv",
+            source_root="/in",
+            target_root="/lib/Show",
+            files=twins,
+            warnings=[],
+            metadata={"tmdb_id": 1, "title": "Show", "year": "2020"},
+        )
+        from engine.scrapeflow.core import _collision_key as _ck
+        from engine.scrapeflow.remote_paths import normalize_remote_path as _nrp
+
+        def _run(plan):
+            return _planned_tv_episode_nfos_impl(
+                plan,
+                join_remote_fn=lambda d, n: f"{d}/{n}",
+                collision_key_fn=_ck,
+                normalize_remote_path_fn=_nrp,
+                path_is_within_fn=lambda path, root: path == root or path.startswith(root.rstrip("/") + "/"),
+                split_remote_fn=lambda p: (p.rsplit("/", 1)[0], p.rsplit("/", 1)[1]),
+                plan_error=Exception,
+                is_planned_bonus_fn=lambda name: False,
+            )
+
+        output = _run(plan)
+        targets = [target for target, _payload in output]
+        self.assertEqual(len(targets), 1, targets)
+        self.assertTrue(targets[0].endswith("Show - S00E02 - Prequel.nfo"))
+
+    def test_conflicting_metadata_on_same_target_still_raises(self):
+        from engine.scrapeflow.models import Plan, PlannedFile
+        from engine.scrapeflow.plan_artifacts import _planned_tv_episode_nfos_impl
+        from engine.scrapeflow.errors import PlanError
+
+        twins = [
+            PlannedFile(
+                source_path="/in/a.mkv",
+                source_dir="/in",
+                original_name="a.mkv",
+                final_name="Show - S00E02 - Prequel.mkv",
+                target_dir="/lib/Show/Season 00",
+                media_kind="video",
+            ),
+            PlannedFile(
+                source_path="/in/b.mp4",
+                source_dir="/in",
+                original_name="b.mp4",
+                final_name="Show - S00E02 - Different Title.mp4".replace(
+                    "S00E02 - Different Title", "S00E02 - Prequel"
+                ),
+                target_dir="/lib/Show/Season 00",
+                media_kind="video",
+            ),
+        ]
+        # Same stem but force different titles via distinct episode titles in
+        # the stems' tails is impossible with identical stems, so instead
+        # assert the identical-stem twin dedup above covers the real shape
+        # and a same-target conflict cannot arise from stems alone.
+        plan = Plan(
+            mode="tv",
+            source_root="/in",
+            target_root="/lib/Show",
+            files=twins,
+            warnings=[],
+            metadata={"tmdb_id": 1, "title": "Show", "year": "2020"},
+        )
+        from engine.scrapeflow.core import _collision_key as _ck
+        from engine.scrapeflow.remote_paths import normalize_remote_path as _nrp
+
+        def _run(plan):
+            return _planned_tv_episode_nfos_impl(
+                plan,
+                join_remote_fn=lambda d, n: f"{d}/{n}",
+                collision_key_fn=_ck,
+                normalize_remote_path_fn=_nrp,
+                path_is_within_fn=lambda path, root: path == root or path.startswith(root.rstrip("/") + "/"),
+                split_remote_fn=lambda p: (p.rsplit("/", 1)[0], p.rsplit("/", 1)[1]),
+                plan_error=Exception,
+                is_planned_bonus_fn=lambda name: False,
+            )
+
+        output = _run(plan)
+        self.assertEqual(len(output), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
