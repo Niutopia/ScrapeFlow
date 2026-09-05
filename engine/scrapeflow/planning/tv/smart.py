@@ -670,6 +670,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
         movie_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         unknown_media: list[dict[str, Any]] = []
         child_tv_plans: list[Plan] = []
+        failed_child_plans: list[tuple[list[dict[str, Any]], str]] = []
         retained_future_media: list[dict[str, Any]] = []
         retained_unpublished_season_media: list[tuple[dict[str, Any], int]] = []
         out_of_range_season_by_path: dict[str, int] = {}
@@ -1515,6 +1516,12 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     else:
                         retained.append(item)
                 season_groups[season_number] = retained
+            # Drop groups the propagation just emptied: a leftover empty key
+            # made len(season_groups) >= 2 misread a single-season source as
+            # multi-season and later fed build_tv_plan an empty season.
+            season_groups = defaultdict(
+                list, {s: g for s, g in season_groups.items() if g}
+            )
             remaining_unknown: list[dict[str, Any]] = []
             for item in unknown_media:
                 if item.get("_episode_kind_override") == "special":
@@ -2063,6 +2070,14 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                         )
                         if candidate.status != "confirmed":
                             continue
+                    except ApiError:
+                        # A transient provider failure is NOT evidence that
+                        # the season belongs to the parent show: swallowing
+                        # it here silently merged independent sequels (the
+                        # White Album 2 shape) into the parent's seasons.
+                        # Infrastructure errors propagate for a bounded
+                        # retry, exactly like every other matcher call.
+                        raise
                     except ScraperError:
                         continue
                     if candidate.tmdb_id != kwargs.get("tmdb_id"):
@@ -2514,11 +2529,26 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                             auto_episode_mode=True,
                             **child_args,
                         )
-                except PlanError:
+                except PlanError as exc:
+                    # The child IS an independently confirmed work (identity
+                    # and episode bounds were proven above).  A planning
+                    # failure must surface its files as problem rows for the
+                    # operator, never let them fall through to the parent
+                    # identity's main plan — their episode keys could land
+                    # inside the parent's season bounds and be silently
+                    # planned as the parent's episodes.
+                    failed_child_plans.append((child_files, str(exc)))
+                    independently_routed_paths.update(
+                        str(item["full_path"]) for item in child_files
+                    )
                     continue
                 child_tv_plans.append(child_plan)
                 consumed.update(str(item["full_path"]) for item in child_files)
-            unknown_media = [item for item in unknown_media if str(item["full_path"]) not in consumed]
+            unknown_media = [
+                item for item in unknown_media
+                if str(item["full_path"]) not in consumed
+                and str(item["full_path"]) not in independently_routed_paths
+            ]
         if unknown_media:
             numbered_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for item in unknown_media:
@@ -3128,6 +3158,16 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                         reason="已匹配到独立电影，但没有对应视频；保留原位待人工确认",
                     )
                     for item in orphan_movie_files
+                ] + [
+                    PlannedProblem(
+                        source_path=str(item["full_path"]),
+                        reason=(
+                            "已确认的独立子作品规划失败，保留原位待人工确认"
+                            f"（{reason}）"
+                        ),
+                    )
+                    for child_files, reason in failed_child_plans
+                    for item in child_files
                 ],
                 warnings=list(dict.fromkeys(combined_warnings)),
                 metadata=metadata,
