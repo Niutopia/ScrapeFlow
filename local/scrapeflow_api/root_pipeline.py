@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -529,6 +530,85 @@ def _cleanup_consumed_source_root(
 
     quarantined: list[dict[str, object]] = []
 
+    # Coordinates this root already wrote into the formal library (the
+    # planner's winners).  A source video carrying one of them is a KNOWN
+    # loser of the quality pass — the standing 只留高版本 ruling deletes it
+    # without adjudication.  Built once from the acceptance's target root.
+    library_episode_keys: set[tuple[int, int]] | None = None
+
+    def _library_coordinates() -> set[tuple[int, int]] | None:
+        nonlocal library_episode_keys
+        if library_episode_keys is not None:
+            return library_episode_keys
+        library_episode_keys = set()
+        from local.scrapeflow_api.unit_execution import load_work_acceptance
+        try:
+            for row in load_work_acceptance(state_root, root_task_id):
+                work_root = str(row.target_root or "").rstrip("/")
+                if not work_root:
+                    continue
+                for entry in runner.alist.try_list(work_root, refresh=True) or []:
+                    if not entry.get("is_dir"):
+                        continue
+                    season_name = str(entry.get("name") or "")
+                    season_match = re.fullmatch(r"Season (\d{1,2})", season_name)
+                    if season_match is None:
+                        continue
+                    season = int(season_match.group(1))
+                    for video in runner.alist.try_list(
+                        posixpath.join(work_root, season_name), refresh=True,
+                    ) or []:
+                        if video.get("is_dir"):
+                            continue
+                        token = re.search(
+                            r"(?:^|[ ._\-])S0*(\d{1,3})E0*(\d{1,4})(?:$|[ ._\-])",
+                            str(video.get("name") or ""),
+                        )
+                        if token is not None:
+                            library_episode_keys.add(
+                                (int(token.group(1)), int(token.group(2)))
+                            )
+        except Exception:
+            return library_episode_keys or None
+        return library_episode_keys or None
+
+    def library_covers(child: str) -> bool:
+        """True when the file's own coordinate is already in the library."""
+        keys = _library_coordinates()
+        if not keys:
+            return False
+        name = posixpath.basename(child)
+        explicit = re.search(
+            r"(?:^|[ ._\-])S0*(\d{1,3})E0*(\d{1,4})(?:$|[ ._\-])",
+            name,
+        )
+        if explicit is not None:
+            return (int(explicit.group(1)), int(explicit.group(2))) in keys
+        # A bare ordinal needs its season from the enclosing scope's own
+        # season marker (01./02./03. directories name their season).
+        scope_season = None
+        for segment in reversed(
+            posixpath.dirname(child).split("/")
+        ):
+            season_marker = re.match(r"^0*(\d{1,2})[.．]", segment)
+            if season_marker is None:
+                season_marker = re.search(r"第([一二三四五六七八九十]+)季", segment)
+                if season_marker is not None:
+                    cjk = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+                    token = season_marker.group(1)
+                    scope_season = cjk.get(token)
+                    break
+            else:
+                scope_season = int(season_marker.group(1))
+                break
+        if scope_season is None:
+            return False
+        ordinal = extract_episode_key(name)
+        if ordinal is None or ordinal.kind != "regular":
+            return False
+        return (scope_season, ordinal.number) in keys
+
     def probe_duration(path: str) -> float | None:
         """Bounded duration probe for one unmapped video (None = unproven).
 
@@ -747,6 +827,9 @@ def _cleanup_consumed_source_root(
             if item.get("is_dir") is True:
                 dir_children.append(child)
             elif extension(name) in VIDEO_EXTENSIONS:
+                if library_covers(child):
+                    junk_videos.append(name)
+                    continue
                 duration = probe_duration(child)
                 durations[name] = duration
                 if classify_unmapped_video(child, duration) == UNMAPPED_VIDEO_SUSPECT:

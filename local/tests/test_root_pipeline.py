@@ -1094,21 +1094,13 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(gaps[0].gap_id, f"{records[0].work_unit_id}::missing_episode::S02E01")
         self.assertEqual(gaps[0].status, "open")
         # Non-empty source stays in intake until the terminal hand-off; the
-        # gaps_pending consumption then deletes the tree.  The unmapped
-        # S01E03 (episode-named, planner never wrote it) hits the 2026-09-05
-        # gate: it is quarantined instead of deleted.
-        self.assertEqual(
-            alist.move_calls,
-            [(
-                "/incoming/Fate Zero",
-                "/library/ScrapeFlow/待裁决/Fate Zero",
-                ["S01E03.mkv"],
-            )],
-        )
-        # Operator ruling 2026-09-02: gaps_pending is terminal for the intake
-        # tree too — the gap ledger is the durable record, the staging tree
-        # is consumed, and no residual note is left on the job.  The
-        # quarantine is a success outcome (2026-09-05), not a residual.
+        # gaps_pending consumption then deletes the tree.  The source S01E03
+        # carries a coordinate the library already holds (E01-E10) — a KNOWN
+        # loser under the standing 只留高版本 ruling — so the 2026-09-05
+        # gate deletes it as junk instead of quarantining it for the
+        # operator (adjudication is only for content the library does NOT
+        # hold).  No quarantine move, no residual note.
+        self.assertEqual(alist.move_calls, [])
         self.assertNotIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
         self.assertNotIn("/incoming/Fate Zero", alist.dirs)
         self.assertIsNone(final.error)
