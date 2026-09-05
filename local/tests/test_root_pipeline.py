@@ -1101,7 +1101,7 @@ class RootPipelineTests(unittest.TestCase):
             alist.move_calls,
             [(
                 "/incoming/Fate Zero",
-                f"/library/ScrapeFlow/待裁决/{root_task_id}",
+                "/library/ScrapeFlow/待裁决/Fate Zero",
                 ["S01E03.mkv"],
             )],
         )
@@ -1975,7 +1975,7 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         self.assertEqual(final.phase, "completed")
         # Quarantine is a success outcome: no residual note on the job.
         self.assertIsNone(final.error)
-        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        quarantine = "/library/ScrapeFlow/待裁决/My Show"
         # Suspects landed in quarantine, junk did not.
         self.assertIn(f"{quarantine}/第13话 未放送.mkv", alist.files)
         self.assertIn(f"{quarantine}/小剧场SP01.mkv", alist.files)
@@ -2016,7 +2016,7 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         final = run_root_pipeline(runner, state_root, root_task_id)
 
         self.assertEqual(final.phase, "completed")
-        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        quarantine = "/library/ScrapeFlow/待裁决/My Show"
         self.assertIn(f"{quarantine}/mystery.mkv", alist.files)
         manifest = json.loads(
             alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
@@ -2041,7 +2041,7 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         final = run_root_pipeline(runner, state_root, root_task_id)
 
         self.assertEqual(final.phase, "completed")
-        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        quarantine = "/library/ScrapeFlow/待裁决/My Show"
         self.assertNotIn(f"{quarantine}/menu_clip.mkv", alist.files)
         self.assertNotIn(f"{quarantine}/特典/menu_clip.mkv", alist.files)
         # Flat layout (2026-09-05): no source-structure mirroring subdirs.
@@ -2066,7 +2066,7 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "completed")
         self.assertIsNone(final.error)
-        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        quarantine = "/library/ScrapeFlow/待裁决/My Show"
         # One sp01.mkv at the flat root, the other under its source parent
         # directory's name; both survive.
         flat = f"{quarantine}/sp01.mkv" in alist.files
@@ -2086,3 +2086,31 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         paths = {entry["quarantine_path"] for entry in manifest["entries"]}
         self.assertIn(f"{quarantine}/sp01.mkv", paths)
         self.assertEqual(len(paths), 2)
+
+    def test_recreated_source_name_disambiguates_from_old_root(self) -> None:
+        """A manifest left by a different root under the same folder name
+        routes this root's suspects to a short-id-suffixed directory."""
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/第13话 未放送.mkv": FAKE_VIDEO_BYTES,
+        }
+        durations = {"/incoming/My Show/第13话 未放送.mkv": 1420.0}
+        state_root, alist, runner, root_task_id = self._setup(files, durations)
+        # A prior root (same folder name, different task) already left a
+        # manifest at the plain quarantine directory.
+        old_manifest = {
+            "schema_version": 1,
+            "root_task_id": "engine-000000000000000000000000oldroot",
+            "entries": [],
+        }
+        alist.files["/library/ScrapeFlow/待裁决/My Show/manifest.json"] = json.dumps(
+            old_manifest, ensure_ascii=False,
+        ).encode("utf-8")
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        suffixed = f"/library/ScrapeFlow/待裁决/My Show-{root_task_id[-8:]}"
+        self.assertIn(f"{suffixed}/第13话 未放送.mkv", alist.files)
+        # The old root's manifest is untouched.
+        self.assertIn("/library/ScrapeFlow/待裁决/My Show/manifest.json", alist.files)

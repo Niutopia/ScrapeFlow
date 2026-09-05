@@ -332,10 +332,37 @@ def _cleanup_consumed_source_root(
     when the provider keeps reporting the tree — the surviving residual is
     reported back to the caller instead of failing silently.
     """
+    # Operator ruling 2026-09-05: the quarantine directory is named after
+    # the source folder the operator created in 待刮削 (the natural 作品根
+    # for browsing), not the internal root-task id.  A manifest left by a
+    # *different* root under the same folder name (a consumed source that
+    # was re-created later) disambiguates with a short task-id suffix so
+    # review sets never mix.
     quarantine_root = posixpath.join(
         str(runner.library_root).rstrip("/"),
-        "ScrapeFlow", "待裁决", root_task_id,
+        "ScrapeFlow", "待裁决",
+        posixpath.basename(source.rstrip("/")) or root_task_id,
     )
+    _reader = getattr(runner.alist, "read_file_bytes", None)
+    if callable(_reader):
+        try:
+            try:
+                _payload = _reader(
+                    posixpath.join(quarantine_root, "manifest.json"),
+                    max_bytes=1024 * 1024,
+                )
+            except TypeError:
+                _payload = _reader(
+                    posixpath.join(quarantine_root, "manifest.json")
+                )
+            _loaded = json.loads(_payload.decode("utf-8", "replace"))
+            if (
+                isinstance(_loaded, dict)
+                and str(_loaded.get("root_task_id") or "") not in ("", root_task_id)
+            ):
+                quarantine_root = f"{quarantine_root}-{root_task_id[-8:]}"
+        except Exception:
+            pass
     try:
         bound = any(
             entry.root_task_id == root_task_id and entry.canonical_path == source

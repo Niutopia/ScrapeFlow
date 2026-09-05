@@ -62,7 +62,7 @@ POST /api/batch/retry               {"source_id":"...","shelf":"anime"}
 
 批次清单只是来源顺序与货架的记录，本身不执行任何东西：每个来源都要用 `/api/control/select` 单独授权，一个来源收口后不会自动开始下一个。光盘镜像（ISO/UDF）由 X 相位只读解析并在任务 staging 展开后随普通链路入库；无法唯一证明映射的盘通过数据级人工裁决（`disc-ruling`）处理，未决的 scope 保持 attention 且不阻塞兄弟。归档/EXE 等其它容器在有界检查完成前停留在 attention。明确授权的 replacement 使用服务端生成的精确 manifest，仍复用普通 Planner、单 writer 和 fresh 回读。
 
-终态根（completed / gaps_pending）默认全量消费来源树与展开 staging（`/ScrapeFlow/展开/<root>/`）：`/待刮削` 是 staging 不是存储，Gap 账本是缺口的唯一持久记录；删除以 fresh 回读证明，无法证明时记为残余并可重跑 `consume-source`。消费前对源树中仍在的每个未映射视频过闸门：主题/花絮命名、bonus 目录、短于 5 分钟且无正片语法的随源删除；其余疑似正片级内容（无号 SP、未放送话、web 限定特别篇、≥ 5 分钟或判不出的）移入 `/ScrapeFlow/待裁决/<root>/`（**平铺**，不镜像源目录结构）并附 manifest（文件名/大小/时长/原因/原始路径），待人工裁决，配对字幕随行。
+终态根（completed / gaps_pending）默认全量消费来源树与展开 staging（`/ScrapeFlow/展开/<root>/`）：`/待刮削` 是 staging 不是存储，Gap 账本是缺口的唯一持久记录；删除以 fresh 回读证明，无法证明时记为残余并可重跑 `consume-source`。消费前对源树中仍在的每个未映射视频过闸门：主题/花絮命名、bonus 目录、短于 5 分钟且无正片语法的随源删除；其余疑似正片级内容（无号 SP、未放送话、web 限定特别篇、≥ 5 分钟或判不出的）移入 `/ScrapeFlow/待裁决/<源目录名>/`（**平铺**，不镜像源目录结构；同名旧根残留时后缀短任务号）并附 manifest（文件名/大小/时长/原因/原始路径），待人工裁决，配对字幕随行。
 
 所有变更接口只接受同源本机页面请求。
 
