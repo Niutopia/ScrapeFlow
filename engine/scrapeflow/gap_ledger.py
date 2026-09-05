@@ -183,37 +183,20 @@ def _ledger_path(state_root: Path, root_task_id: str) -> Path:
     return state_root / f"gap_ledger_{root_task_id}.json"
 
 
+class GapLedgerCorrupted(ValueError):
+    """The ledger exists on disk but cannot be proven to parse."""
+
+
 def load_gap_ledger(state_root: Path, root_task_id: str) -> list[Gap]:
-    try:
-        raw = json.loads(
-            _ledger_path(state_root, root_task_id).read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return []
-    if not isinstance(raw, list):
-        return []
-    output: list[Gap] = []
-    for item in raw:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            gap = Gap.from_dict(item)
-        except (KeyError, TypeError, ValueError):
-            continue
-        output.append(gap)
-        if len(output) > MAX_GAPS_PER_LEDGER:
-            break
-    return output
+    """Read one ledger; absence is empty, corruption is an error.
 
-
-def _load_gap_ledger_strict(state_root: Path, root_task_id: str) -> list[Gap]:
-    """Read one ledger without treating corruption as an empty ledger.
-
-    The public/tolerant loader is useful for dashboard aggregation over old
-    local state.  A J-step registration is different: it is about to make a
-    durable claim that missing coordinates were recorded, so an unreadable or
-    malformed existing ledger must stop that claim rather than be silently
-    replaced by an empty list.
+    A root without a ledger yet legitimately has no gaps, so a missing file
+    returns ``[]``.  A file that exists but cannot be parsed must never be
+    silently replaced by an empty list: aggregation, attempts, closes and
+    replenishment all read through this loader, and "corrupt = no gaps"
+    would let a damaged ledger erase the durable 缺口只登不补 record and
+    even flip a root's terminal phase.  Corruption raises
+    :class:`GapLedgerCorrupted` so every consumer fails closed.
     """
     path = _ledger_path(state_root, root_task_id)
     try:
@@ -221,20 +204,32 @@ def _load_gap_ledger_strict(state_root: Path, root_task_id: str) -> list[Gap]:
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("缺口账本无法读取") from exc
+        raise GapLedgerCorrupted("缺口账本无法读取") from exc
     if not isinstance(raw, list):
-        raise ValueError("缺口账本格式无效")
+        raise GapLedgerCorrupted("缺口账本格式无效")
     output: list[Gap] = []
     for item in raw:
         if not isinstance(item, Mapping):
-            raise ValueError("缺口账本包含无效条目")
+            raise GapLedgerCorrupted("缺口账本包含无效条目")
         try:
-            output.append(Gap.from_dict(item))
+            gap = Gap.from_dict(item)
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("缺口账本包含无法验证的条目") from exc
+            raise GapLedgerCorrupted("缺口账本包含无法验证的条目") from exc
+        output.append(gap)
         if len(output) > MAX_GAPS_PER_LEDGER:
-            raise ValueError("缺口账本超过安全上限")
+            raise GapLedgerCorrupted("缺口账本超过安全上限")
     return output
+
+
+def _load_gap_ledger_strict(state_root: Path, root_task_id: str) -> list[Gap]:
+    """Read one ledger without treating corruption as an empty ledger.
+
+    Historical note: this strict variant existed because the public loader
+    was tolerant of corruption.  The public loader now fails closed on
+    corruption itself (absence stays ``[]``), so this function is a
+    semantic alias kept for its existing call sites and docstring clarity.
+    """
+    return load_gap_ledger(state_root, root_task_id)
 
 
 def save_gap_ledger(
@@ -445,6 +440,7 @@ __all__ = [
     "ATTEMPT_STATUSES",
     "Gap",
     "GAP_KINDS",
+    "GapLedgerCorrupted",
     "close_gap",
     "discover_episode_gaps",
     "gap_token",

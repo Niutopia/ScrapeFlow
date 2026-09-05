@@ -141,14 +141,25 @@ class GapLedgerTests(unittest.TestCase):
         self.assertIsNone(parse_gap_token("S02E11.mkv"))
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
+            # Absence is a legitimate empty ledger (a root with no gaps yet).
+            self.assertEqual(load_gap_ledger(state_root, "root-g"), [])
+            # Corruption must never read as "no gaps": every consumer
+            # (aggregation, attempts, closes, replenishment) fails closed
+            # so a damaged ledger cannot erase the durable record or flip
+            # a root's terminal phase.
             (state_root / "gap_ledger_root-g.json").write_text(
                 "{{broken", encoding="utf-8",
             )
-            self.assertEqual(load_gap_ledger(state_root, "root-g"), [])
-            # Dashboard reads remain tolerant, but a new J registration must
-            # fail closed rather than silently replacing corrupted state.
+            with self.assertRaises(ValueError):
+                load_gap_ledger(state_root, "root-g")
             with self.assertRaises(ValueError):
                 self._open_episode_gaps(state_root)
+            # A non-list top level is corruption too, not an empty ledger.
+            (state_root / "gap_ledger_root-g.json").write_text(
+                '{"gaps": []}', encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_gap_ledger(state_root, "root-g")
 
 
 if __name__ == "__main__":
