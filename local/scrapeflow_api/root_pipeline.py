@@ -294,6 +294,39 @@ def _coalesce_confirmed_tv_season_records(
     return merged
 
 
+def _provably_absent(runner: SimpleEngineRunner, path: str) -> bool:
+    """True only when the parent lists fine and the name is absent.
+
+    ``source_directory_exists`` conflates "gone" with "cannot prove it
+    exists" (every provider error returns False).  Terminal consumption
+    must not treat an unprovable listing as an already-consumed source:
+    a Quark outage during consumption would otherwise fabricate a
+    success receipt.  Here a provider error is NOT absence — the caller
+    proceeds to the fail-closed walk instead of the early return.
+    """
+    normalized = str(path).rstrip("/")
+    parent = posixpath.dirname(normalized) or "/"
+    name = posixpath.basename(normalized)
+    if not name:
+        return False
+    listing = getattr(runner.alist, "list", None)
+    if not callable(listing):
+        return False
+    try:
+        try:
+            rows = listing(parent, refresh=True)
+        except TypeError:
+            rows = listing(parent)
+    except Exception:
+        return False
+    if not isinstance(rows, list):
+        return False
+    return not any(
+        isinstance(item, Mapping) and item.get("name") == name
+        for item in rows
+    )
+
+
 def _cleanup_consumed_source_root(
     runner: SimpleEngineRunner,
     state_root: Path,
@@ -372,8 +405,10 @@ def _cleanup_consumed_source_root(
         bound = False
     if not bound:
         return {"source": source, "removed": [], "failures": [], "source_remaining": True, "unbound": True}
-    if not runner.source_directory_exists(source):
+    if _provably_absent(runner, source):
         # Already consumed (e.g. archived by an E1 lane): nothing to clean.
+        # Only a *proven* absence qualifies — an unprovable listing falls
+        # through to the fail-closed walk instead of fabricating success.
         return {"source": source, "removed": [], "failures": [], "source_remaining": False}
     listing = getattr(runner.alist, "list", None)
     remove_empty = getattr(runner.alist, "remove_empty_dir", None)
@@ -589,20 +624,25 @@ def _cleanup_consumed_source_root(
             failures.append(child)
             _trace(f"待裁决移入失败: {child}: {exc}")
             return False
-        # Prove the move exactly like a delete: gone from the source parent
-        # and present under the quarantine target.
+        # Prove the move both ways (fresh readback on each side): gone from
+        # the source parent AND present under the quarantine target.
         try:
             after = rows_proven(directory)
+            target_rows = rows_proven(target_dir)
         except Exception:
             failures.append(child)
             return False
         if any(item.get("name") == name for item in after):
             failures.append(child)
             return False
-        size = next(
-            (int(item.get("size") or 0) for item in after if item.get("name") == name),
-            0,
+        landed = next(
+            (item for item in target_rows if item.get("name") == name), None,
         )
+        if landed is None:
+            failures.append(child)
+            _trace(f"待裁决目标回读缺失: {child}")
+            return False
+        size = int(landed.get("size") or 0)
         quarantined_names.add(name)
         quarantined.append({
             "source_path": child,
@@ -837,7 +877,9 @@ def _cleanup_expansion_staging_root(
     if not declared:
         return None
     staging_root = expansion_staging_root(runner.library_root, job.id)
-    if not runner.source_directory_exists(staging_root):
+    if _provably_absent(runner, staging_root):
+        # Proven absence only: an unprovable listing falls through to the
+        # walk, which reports a residual instead of fabricating success.
         return None
     listing = getattr(runner.alist, "list", None)
     remove_empty = getattr(runner.alist, "remove_empty_dir", None)

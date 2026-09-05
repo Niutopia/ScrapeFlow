@@ -1993,6 +1993,12 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
             entry["source_path"]: entry for entry in manifest["entries"]
         }
         self.assertEqual(len(by_path), 3)
+        # The manifest carries the real landed size, not a stale zero (the
+        # size must come from the post-move target readback).
+        self.assertEqual(
+            by_path["/incoming/My Show/第13话 未放送.mkv"]["size"],
+            len(FAKE_VIDEO_BYTES),
+        )
         self.assertIn("正片级时长", by_path["/incoming/My Show/第13话 未放送.mkv"]["reason"])
         self.assertIn(
             "正片命名", by_path["/incoming/My Show/小剧场SP01.mkv"]["reason"]
@@ -2114,3 +2120,55 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         self.assertIn(f"{suffixed}/第13话 未放送.mkv", alist.files)
         # The old root's manifest is untouched.
         self.assertIn("/library/ScrapeFlow/待裁决/My Show/manifest.json", alist.files)
+
+
+class ProvablyAbsentTests(unittest.TestCase):
+    """F4 regression: an unprovable listing is never "already consumed"."""
+
+    def _alist(self, files, *, fail_parents=()):
+        from local.tests.test_library_index import IndexAList
+
+        class FlakyAList(IndexAList):
+            def list(self, path, refresh=False):
+                if str(path).rstrip("/") in fail_parents:
+                    raise RuntimeError("provider outage")
+                return super().list(path, refresh=refresh)
+
+        return FlakyAList(files)
+
+    def test_absent_when_parent_lists_and_name_missing(self) -> None:
+        from local.scrapeflow_api.root_pipeline import _provably_absent
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+
+        alist = self._alist({"/other/thing.mkv": b"x"})
+        runner = SimpleEngineRunner(
+            Path(tempfile.mkdtemp()), alist=alist, tmdb=None,
+            validate=False, library_root="/library",
+        )
+        self.assertTrue(_provably_absent(runner, "/incoming/Gone Show"))
+
+    def test_present_when_name_listed(self) -> None:
+        from local.scrapeflow_api.root_pipeline import _provably_absent
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+
+        alist = self._alist({"/incoming/My Show/S01E01.mkv": b"x"})
+        runner = SimpleEngineRunner(
+            Path(tempfile.mkdtemp()), alist=alist, tmdb=None,
+            validate=False, library_root="/library",
+        )
+        self.assertFalse(_provably_absent(runner, "/incoming/My Show"))
+
+    def test_provider_outage_is_not_absence(self) -> None:
+        from local.scrapeflow_api.root_pipeline import _provably_absent
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+
+        alist = self._alist(
+            {"/incoming/My Show/S01E01.mkv": b"x"},
+            fail_parents={"/incoming"},
+        )
+        runner = SimpleEngineRunner(
+            Path(tempfile.mkdtemp()), alist=alist, tmdb=None,
+            validate=False, library_root="/library",
+        )
+        # The parent cannot be listed: absence is unprovable, so NOT absent.
+        self.assertFalse(_provably_absent(runner, "/incoming/My Show"))
