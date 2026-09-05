@@ -3591,6 +3591,37 @@ def _planned_tv_episode_numbers(
     return numbers
 
 
+def _library_season_video_name(
+    alist: AListClient,
+    series_dir: str,
+    season: int,
+    episode: int,
+) -> str | None:
+    """One exact library companion video name for a season/episode pair.
+
+    Returns the unique ``S{season}E{episode}`` video under the work root's
+    ``Season NN`` directory, or ``None`` when the season directory or the
+    companion is absent/ambiguous — the caller fails closed on ``None``.
+    """
+    if season is None or episode is None:
+        return None
+    season_dir = join_remote(series_dir, f"Season {season:02d}")
+    pattern = re.compile(
+        rf"(?:^|[ ._-])S0*{season}E0*{episode}(?:$|[ ._-])",
+        re.I,
+    )
+    matches: list[str] = []
+    for item in alist.try_list(season_dir, refresh=True) or []:
+        name = str(item.get("name", ""))
+        if item.get("is_dir") or Path(name).suffix.lower() not in VIDEO_EXTS:
+            continue
+        if pattern.search(Path(name).stem):
+            matches.append(name)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _existing_tv_episode_numbers(
     alist: AListClient,
     series_dir: str,
@@ -8260,6 +8291,74 @@ def build_tv_plan(
             )
         base_name = f"{title} - {episode_token} - {episode_title}"
         group_files = sorted(groups[key], key=lambda x: _collision_key(str(x["full_path"])))
+        # A subtitle filename may carry its own bounded season token
+        # (``Mob Psycho 100 III [01]`` → III → season 3) that contradicts
+        # the season this plan is writing.  Pairing it with this season's
+        # video would mount S3 content beside S2 episodes (the mob-psycho
+        # cross-scope shape); such a sidecar belongs to the token season's
+        # own lane and stays in source instead.
+        from engine.scrapeflow.boundary_analysis import (
+            _season_number_from_directory_name,
+        )
+        foreign_token_subtitles = {
+            str(item["full_path"])
+            for item in group_files
+            if Path(str(item.get("name", ""))).suffix.lower() in SUBTITLE_EXTS
+            and (
+                token := _season_number_from_directory_name(
+                    str(item.get("name", ""))
+                )
+            ) is not None
+            and token != target_season
+        }
+        if foreign_token_subtitles:
+            # Cross-scope sidecar lane (the mob-psycho closure): the token
+            # names another season of the SAME work root.  When the formal
+            # library already holds that season's companion video, mount
+            # the subtitle directly beside it — a library-side install,
+            # never a rename into this plan's season.  Without the library
+            # companion the subtitle stays in source with a problem row:
+            # guessing a target beside nothing would strand it silently.
+            for item in [
+                row
+                for row in group_files
+                if str(row["full_path"]) in foreign_token_subtitles
+            ]:
+                token_value = _season_number_from_directory_name(
+                    str(item.get("name", ""))
+                )
+                companion_name = _library_season_video_name(
+                    alist, series_dir, token_value, key.number
+                )
+                if companion_name is None:
+                    record_problem(
+                        str(item["full_path"]),
+                        "字幕文件名自带的季标记与本计划季不符，"
+                        "且库内该季没有对应视频；保留原位待所属季车道处理",
+                    )
+                    continue
+                companion_stem = Path(companion_name).stem
+                suffix = Path(str(item.get("name", ""))).suffix.lower()
+                language = subtitle_language(str(item.get("name", "")))
+                final_stem = (
+                    f"{companion_stem}.{language}{suffix}"
+                    if language else f"{companion_stem}{suffix}"
+                )
+                planned.append(
+                    _planned_file_from_entry(
+                        item,
+                        final_name=final_stem,
+                        target_dir=join_remote(
+                            series_dir, f"Season {token_value:02d}"
+                        ),
+                        episode_key=f"S{token_value:02d}E{key.number:02d}",
+                    )
+                )
+            group_files = [
+                item
+                for item in group_files
+                if str(item["full_path"]) not in foreign_token_subtitles
+            ]
         part_numbers = sorted({
             int(item["_episode_part_override"])
             for item in group_files

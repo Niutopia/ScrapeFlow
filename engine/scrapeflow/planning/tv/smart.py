@@ -2780,6 +2780,46 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     }
                     if video_numbers == subtitle_numbers:
                         matching_seasons.append(season_number)
+                # The subtitle filenames may carry their own bounded season
+                # token (``Mob Psycho 100 III [01]`` → III → season 3).  A
+                # unanimous token overrides the episode-count match in both
+                # directions: it disambiguates equal-length seasons, and it
+                # refuses an attachment to the enclosing scope's season when
+                # the batch names a different one (the mob-psycho S3-in-S2
+                # shape — attaching to the scope season would place S3
+                # subtitles beside S2 videos).  Disagreeing or absent tokens
+                # keep the pre-existing episode-count-only behaviour.
+                from engine.scrapeflow.boundary_analysis import (
+                    _season_number_from_directory_name,
+                )
+                name_seasons = {
+                    season_token
+                    for season_token in (
+                        _season_number_from_directory_name(
+                            str(item.get("name", ""))
+                        )
+                        for item in subtitle_items
+                    )
+                    if season_token is not None
+                }
+                token_season = (
+                    next(iter(name_seasons))
+                    if len(name_seasons) == 1 else None
+                )
+                if token_season is not None and matching_seasons:
+                    if token_season in matching_seasons:
+                        matching_seasons = [token_season]
+                    elif token_season in season_groups:
+                        # Cross-scope inside the same plan: the token season's
+                        # own group is present (root-level multi-season plan),
+                        # so route the batch to it.
+                        matching_seasons = [token_season]
+                    else:
+                        # The token names a season this plan does not own.
+                        # Never attach to a different season by count alone;
+                        # the batch stays in source for the owning scope's
+                        # lane (or the operator) to mount.
+                        matching_seasons = []
                 if len(matching_seasons) != 1:
                     continue
                 matched_season = matching_seasons[0]

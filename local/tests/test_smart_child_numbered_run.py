@@ -431,3 +431,197 @@ class InWindowPartialAbsoluteRunTests(unittest.TestCase):
             any("E79" in name or "E83" in name for name in season4_targets),
             msg=season4_targets,
         )
+
+
+class BackupSubtitleSeasonTokenTests(unittest.TestCase):
+    """A 备份字幕 batch ambiguous by episode count resolves via filename
+    season tokens (the mob-psycho S2/S3 shape: both 12 episodes)."""
+
+    def _client(self):
+        class TwoEqualSeasonsTMDB:
+            def get(self, path, **params):
+                if path == "/search/tv":
+                    return {"results": []}
+                if path == "/search/movie":
+                    return {"results": []}
+                if path == "/tv/210":
+                    return {
+                        "name": "Northwind Show",
+                        "original_name": "Northwind Show",
+                        "first_air_date": "2019-01-01",
+                        "seasons": [
+                            {"season_number": 2, "episode_count": 12},
+                            {"season_number": 3, "episode_count": 12},
+                        ],
+                    }
+                if path in ("/tv/210/season/2", "/tv/210/season/3"):
+                    season = int(path.rsplit("/", 1)[-1])
+                    return {
+                        "episodes": [
+                            {"episode_number": n, "air_date": "2020-01-01"}
+                            for n in range(1, 13)
+                        ],
+                        "_season": season,
+                    }
+                if path == "/tv/210/alternative_titles":
+                    return {"results": [], "titles": []}
+                return {}
+
+        return TwoEqualSeasonsTMDB()
+
+    def _plan(self, files):
+        return build_tv_plan_smart(
+            alist=_StubAList(),
+            tmdb_client=self._client(),
+            src_path="/incoming/Show",
+            parent_path="/library/番剧",
+            tmdb_id=210,
+            season=2,
+            absolute=False,
+            source_files=files,
+            auto_episode_mode=True,
+            prefer_simplified=True,
+            allow_unmapped=False,
+        )
+
+    def test_cross_scope_batch_never_mounts_to_enclosing_season(self):
+        files = []
+        # The S2 videos being written (this plan owns season 2 only).
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show S02E{n:02d}.mkv",
+                "full_path": f"/incoming/Show/Season 2/Northwind Show S02E{n:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            })
+        # The 备份字幕 batch: bare [NN] ordinals match S2's set exactly, but
+        # every filename carries its own season token "III" → season 3 — a
+        # season this plan does not own.  The batch must NOT mount beside
+        # the S2 videos; it stays out for the owning lane.
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show III [{n:02d}].ass",
+                "full_path": f"/incoming/Show/Season 2/备份字幕/Northwind Show III [{n:02d}].ass",
+                "size": 40960,
+                "is_dir": False,
+            })
+        plan = self._plan(files)
+        subtitle_rows = [
+            item for item in plan.files if item.media_kind == "subtitle"
+        ]
+        self.assertEqual(subtitle_rows, [])
+
+    def test_token_batch_mounts_beside_library_companion(self):
+        """The mob-psycho closure: an III batch inside the S2 scope mounts
+        directly beside the library's S03 videos when they exist."""
+        class LibraryAList(_StubAList):
+            def try_list(self, path, refresh=True):
+                if path == "/library/番剧/Northwind Show/Season 03":
+                    return [
+                        {
+                            "name": (
+                                f"Northwind Show - S03E{n:02d} - 官方集名.mkv"
+                            ),
+                            "is_dir": False,
+                        }
+                        for n in range(1, 13)
+                    ]
+                return []
+
+        files = []
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show S02E{n:02d}.mkv",
+                "full_path": f"/incoming/Show/Season 2/Northwind Show S02E{n:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            })
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show III [{n:02d}].ass",
+                "full_path": f"/incoming/Show/Season 2/备份字幕/Northwind Show III [{n:02d}].ass",
+                "size": 40960,
+                "is_dir": False,
+            })
+        plan = build_tv_plan_smart(
+            alist=LibraryAList(),
+            tmdb_client=self._client(),
+            src_path="/incoming/Show",
+            parent_path="/library/番剧",
+            tmdb_id=210,
+            season=2,
+            absolute=False,
+            source_files=files,
+            auto_episode_mode=True,
+            prefer_simplified=True,
+            allow_unmapped=False,
+        )
+        subtitle_rows = [
+            item for item in plan.files if item.media_kind == "subtitle"
+        ]
+        self.assertEqual(len(subtitle_rows), 12)
+        self.assertTrue(all(
+            row.target_dir.endswith("/Season 03") for row in subtitle_rows
+        ), [row.target_dir for row in subtitle_rows[:2]])
+        # The mounted name follows the library companion's stem exactly.
+        self.assertEqual(
+            subtitle_rows[0].final_name,
+            "Northwind Show - S03E01 - 官方集名.ass",
+        )
+
+    def test_token_batch_without_library_companion_stays_out(self):
+        files = []
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show S02E{n:02d}.mkv",
+                "full_path": f"/incoming/Show/Season 2/Northwind Show S02E{n:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            })
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show III [{n:02d}].ass",
+                "full_path": f"/incoming/Show/Season 2/备份字幕/Northwind Show III [{n:02d}].ass",
+                "size": 40960,
+                "is_dir": False,
+            })
+        plan = self._plan(files)
+        subtitle_rows = [
+            item for item in plan.files if item.media_kind == "subtitle"
+        ]
+        self.assertEqual(subtitle_rows, [])
+        self.assertTrue(any(
+            "季标记" in (problem.reason or "")
+            for problem in plan.problem_files
+        ))
+
+    def test_token_matching_scope_season_pairs_normally(self):
+        """A token that agrees with the plan season is ordinary evidence."""
+        files = []
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show S02E{n:02d}.mkv",
+                "full_path": f"/incoming/Show/Season 2/Northwind Show S02E{n:02d}.mkv",
+                "size": FAKE_VIDEO_SIZE,
+                "is_dir": False,
+            })
+        for n in range(1, 13):
+            files.append({
+                "name": f"Northwind Show II [{n:02d}].ass",
+                "full_path": f"/incoming/Show/Season 2/备份字幕/Northwind Show II [{n:02d}].ass",
+                "size": 40960,
+                "is_dir": False,
+            })
+        plan = self._plan(files)
+        subtitle_rows = [
+            item for item in plan.files if item.media_kind == "subtitle"
+        ]
+        # II == the plan's season 2: all 12 pair beside the S2 videos.
+        self.assertEqual(len(subtitle_rows), 12)
+        self.assertTrue(all(
+            row.target_dir.endswith("/Season 02") for row in subtitle_rows
+        ))
+
+
+if __name__ == "__main__":
+    unittest.main()
