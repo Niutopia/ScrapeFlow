@@ -27,13 +27,16 @@ import json
 import posixpath
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
-from engine.scrapeflow.core import _validate_remote_source_basename
+from engine.scrapeflow.core import (
+    _validate_remote_source_basename,
+    extract_episode_key,
+)
 from engine.scrapeflow.disc_expansion_bridge import (
     DiscExpansionPauseRequested,
     expand_root_disc_images,
@@ -466,8 +469,15 @@ def _cleanup_consumed_source_root(
         raise RuntimeError(f"AList 目录回读失败，删除结果无法证明: {path}: {last}")
 
     def delete_file(parent: str, name: str) -> bool:
-        """Delete one file and prove it disappeared through a fresh listing."""
+        """Delete one file and prove it disappeared through a fresh listing.
+
+        Verification retries are spaced like the quarantine lane's: a Quark
+        delete can be acknowledged while the listing still shows the name
+        for a while, and three immediate reads all landed inside that window.
+        """
         for _attempt in range(3):
+            if _attempt:
+                time.sleep(10.0)
             if paused():
                 return False
             try:
@@ -531,76 +541,119 @@ def _cleanup_consumed_source_root(
     quarantined: list[dict[str, object]] = []
 
     # Coordinates this root already wrote into the formal library (the
-    # planner's winners).  A source video carrying one of them is a KNOWN
-    # loser of the quality pass — the standing 只留高版本 ruling deletes it
-    # without adjudication.  Built once from the acceptance's target root.
-    library_episode_keys: set[tuple[int, int]] | None = None
+    # planner's winners), keyed by the OWNING work unit's target root so a
+    # multi-work root never matches another sibling's coordinates.  A source
+    # video carrying one of its own work's coordinates is a KNOWN loser of
+    # the quality pass — the standing 只留高版本 ruling deletes it without
+    # adjudication.
+    library_keys_by_root: dict[str, set[tuple[int, int]]] = {}
+    work_scopes: list[tuple[str, str]] = []  # (source_path, target_root)
 
-    def _library_coordinates() -> set[tuple[int, int]] | None:
-        nonlocal library_episode_keys
-        if library_episode_keys is not None:
-            return library_episode_keys
-        library_episode_keys = set()
+    def _load_work_scopes() -> None:
+        nonlocal work_scopes
+        if work_scopes:
+            return
         from local.scrapeflow_api.unit_execution import load_work_acceptance
+        acceptance = {}
         try:
             for row in load_work_acceptance(state_root, root_task_id):
-                work_root = str(row.target_root or "").rstrip("/")
-                if not work_root:
-                    continue
-                for entry in runner.alist.try_list(work_root, refresh=True) or []:
-                    if not entry.get("is_dir"):
-                        continue
-                    season_name = str(entry.get("name") or "")
-                    season_match = re.fullmatch(r"Season (\d{1,2})", season_name)
-                    if season_match is None:
-                        continue
-                    season = int(season_match.group(1))
-                    for video in runner.alist.try_list(
-                        posixpath.join(work_root, season_name), refresh=True,
-                    ) or []:
-                        if video.get("is_dir"):
-                            continue
-                        token = re.search(
-                            r"(?:^|[ ._\-])S0*(\d{1,3})E0*(\d{1,4})(?:$|[ ._\-])",
-                            str(video.get("name") or ""),
-                        )
-                        if token is not None:
-                            library_episode_keys.add(
-                                (int(token.group(1)), int(token.group(2)))
-                            )
+                acceptance[row.work_unit_id] = str(row.target_root or "").rstrip("/")
         except Exception:
-            return library_episode_keys or None
-        return library_episode_keys or None
+            return
+        try:
+            for record in load_work_unit_records(state_root, root_task_id):
+                target_root = acceptance.get(record.work_unit_id) or ""
+                for scope in record.source_paths or ():
+                    work_scopes.append((str(scope).rstrip("/"), target_root))
+        except Exception:
+            return
+        work_scopes.sort(key=lambda pair: -len(pair[0]))
+
+    def _library_coordinates(work_root: str) -> set[tuple[int, int]]:
+        keys = library_keys_by_root.get(work_root)
+        if keys is not None:
+            return keys
+        keys: set[tuple[int, int]] = set()
+        try:
+            seasons = runner.alist.try_list(work_root, refresh=True) or []
+        except Exception:
+            # Unprovable enumeration must not be cached: a partially read
+            # tree would permanently shrink the coverage set and mis-route
+            # known losers into quarantine instead of deletion.
+            return set()
+        for entry in seasons:
+            if not entry.get("is_dir"):
+                continue
+            season_name = str(entry.get("name") or "")
+            season_match = re.fullmatch(r"Season (\d{1,2})", season_name)
+            if season_match is None:
+                continue
+            season = int(season_match.group(1))
+            try:
+                videos = runner.alist.try_list(
+                    posixpath.join(work_root, season_name), refresh=True,
+                ) or []
+            except Exception:
+                return set()
+            for video in videos:
+                if video.get("is_dir"):
+                    continue
+                # Same wide boundary class as the explicit-token parse below,
+                # so `[S02E05].mkv`-style brackets count as coordinates.
+                token = re.search(
+                    r"(?:^|[^A-Za-z0-9])S0*(\d{1,3})E0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+                    str(video.get("name") or ""),
+                )
+                if token is not None:
+                    keys.add((int(token.group(1)), int(token.group(2))))
+        library_keys_by_root[work_root] = keys
+        return keys
 
     def library_covers(child: str) -> bool:
         """True when the file's own coordinate is already in the library."""
-        keys = _library_coordinates()
+        _load_work_scopes()
+        child_norm = child.rstrip("/")
+        owning_root = ""
+        for scope, target_root in work_scopes:
+            if child_norm == scope or child_norm.startswith(scope + "/"):
+                owning_root = target_root
+                break
+        if not owning_root:
+            return False
+        keys = _library_coordinates(owning_root)
         if not keys:
             return False
-        name = posixpath.basename(child)
+        name = posixpath.basename(child_norm)
         explicit = re.search(
-            r"(?:^|[ ._\-])S0*(\d{1,3})E0*(\d{1,4})(?:$|[ ._\-])",
+            r"(?:^|[^A-Za-z0-9])S0*(\d{1,3})E0*(\d{1,4})(?:$|[^A-Za-z0-9])",
             name,
         )
         if explicit is not None:
             return (int(explicit.group(1)), int(explicit.group(2))) in keys
-        # A bare ordinal needs its season from the enclosing scope's own
-        # season marker (01./02./03. directories name their season).
+        # A bare ordinal needs its season from a season marker on a segment
+        # INSIDE the owning work's scope.  Segments above the scope (the
+        # operator's queue prefixes like `2. 新番合集/`) are not season
+        # evidence — scanning them injected fake seasons into every bare
+        # ordinal under the tree.
+        scope_for_scan = child_norm
+        for scope, _root in work_scopes:
+            if child_norm == scope or child_norm.startswith(scope + "/"):
+                scope_for_scan = scope
+                break
+        rel_segments = posixpath.relpath(
+            posixpath.dirname(child_norm), scope_for_scan
+        ).split("/")
         scope_season = None
-        for segment in reversed(
-            posixpath.dirname(child).split("/")
-        ):
-            season_marker = re.match(r"^0*(\d{1,2})[.．]", segment)
-            if season_marker is None:
-                season_marker = re.search(r"第([一二三四五六七八九十]+)季", segment)
-                if season_marker is not None:
-                    cjk = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-                           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-                    token = season_marker.group(1)
-                    scope_season = cjk.get(token)
-                    break
-            else:
-                scope_season = int(season_marker.group(1))
+        for segment in reversed(rel_segments):
+            marker = re.match(r"^0*(\d{1,2})[.．]", segment)
+            if marker is not None:
+                scope_season = int(marker.group(1))
+                break
+            cjk_marker = re.search(r"第([一二三四五六七八九十]+)季", segment)
+            if cjk_marker is not None:
+                cjk = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                       "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+                scope_season = cjk.get(cjk_marker.group(1))
                 break
         if scope_season is None:
             return False
@@ -672,11 +725,21 @@ def _cleanup_consumed_source_root(
                     break
                 try:
                     runner.alist.mkdir(current)
-                    break
                 except Exception as exc:  # noqa: BLE001 - retried below
                     last_error = exc
                     if attempt < 2:
                         time.sleep(20.0)
+                    continue
+                # mkdir answered success: prove the directory is actually
+                # visible before caching it as verified, so the batch move
+                # never targets a path still inside the driver's sync window.
+                try:
+                    if runner.alist.try_list(current, refresh=True) is not None:
+                        break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(20.0)
             else:
                 if last_error is not None:
                     failures.append(current)
@@ -725,7 +788,15 @@ def _cleanup_consumed_source_root(
             if name in quarantined_names or (
                 flat_existing is not None and name in flat_existing
             ):
-                parent_tag = posixpath.basename(directory.rstrip("/")) or "源目录"
+                # The disambiguating directory names the file's full source
+                # parent chain relative to this root, not just the immediate
+                # parent basename: two same-named parents (``CD1/SP`` vs
+                # ``CD2/SP``) previously shared one ``SP/`` quarantine
+                # subdir and the second move overwrote the first.
+                rel_parent = posixpath.dirname(
+                    posixpath.relpath(child, source)
+                )
+                parent_tag = re.sub(r"[^\w.-]+", "_", rel_parent) or "源目录"
                 tagged.setdefault(parent_tag, []).append((name, child, reason))
             else:
                 flat_rows.append((name, child, reason))
@@ -741,18 +812,33 @@ def _cleanup_consumed_source_root(
         by_target: dict[str, list[str]] = {}
         for name, _child, _reason, target_dir in moved:
             by_target.setdefault(target_dir, []).append(name)
+        committed: list[tuple[str, str, str, str]] = []
+        _ledger_sizes: dict[str, int] = {}
         for target_dir, names in by_target.items():
             try:
                 runner.alist.move(directory, target_dir, names)
             except Exception as exc:  # noqa: BLE001 - reported as residual
+                # Earlier targets in this batch are already committed
+                # server-side: ledger them before reporting the failure so a
+                # re-run (which will no longer see them in the source) still
+                # knows they were quarantined.
+                _ledger(committed, _ledger_sizes)
                 failures.extend(
                     f"{directory}/{name}" for name in names
                 )
                 _trace(f"待裁决批量移入失败: {directory} → {target_dir}: {exc}")
                 return False
+            committed.extend(
+                row for row in moved if row[3] == target_dir
+            )
         # Bounded observation window over the whole batch: the moves are
-        # already committed server-side; only the listing lags.
+        # already committed server-side; only the listing lags.  Verified
+        # BOTH ways like the single-file lane always promised: gone from the
+        # source side AND present on the target side, with the target read
+        # retried through the same lag window for sizes (a single-shot read
+        # here returned 0 for files still syncing).
         pending = {name for name, _c, _r, _t in moved}
+        landed: set[str] = set()
         sizes: dict[str, int] = {}
         for attempt in range(10):
             if attempt:
@@ -762,35 +848,63 @@ def _cleanup_consumed_source_root(
             except Exception:
                 continue
             pending &= after
-            if not pending:
-                for target_dir in by_target:
-                    try:
-                        target_rows = rows_proven(target_dir)
-                    except Exception:
-                        continue
-                    for item in target_rows:
-                        sizes[str(item.get("name"))] = int(item.get("size") or 0)
+            landed.clear()
+            for target_dir in by_target:
+                try:
+                    target_rows = rows_proven(target_dir)
+                except Exception:
+                    landed = set()  # unprovable: do not half-verify
+                    break
+                for item in target_rows:
+                    n = str(item.get("name"))
+                    landed.add(n)
+                    sizes[n] = int(item.get("size") or 0)
+                    _ledger_sizes[n] = sizes[n]
+            if not pending and landed.issuperset(
+                {name for name, _c, _r, _t in moved}
+            ):
                 break
-        if pending:
-            failures.extend(
-                f"{directory}/{name}" for name in sorted(pending)
+        settled = {name for name, _c, _r, _t in moved} - pending
+        settled &= landed
+        if pending or len(settled) != len(moved):
+            # Partial-success accounting: names that left the source AND
+            # landed are real quarantines even when the batch as a whole
+            # fails — ledger them, then fail the stragglers.
+            _ledger(
+                [row for row in moved if row[0] in settled], _ledger_sizes,
             )
+            stragglers = sorted(
+                name for name, _c, _r, _t in moved if name not in settled
+            )
+            failures.extend(f"{directory}/{name}" for name in stragglers)
             _trace(
-                f"待裁决批量移动回读超窗: {len(pending)} 个仍在源列表"
+                f"待裁决批量移动回读超窗: {len(stragglers)} 个未双向落地"
             )
             return False
-        for name, child, reason, target_dir in moved:
+        _ledger(moved, _ledger_sizes)
+        return True
+
+    ledgered_source_paths: set[str] = set()
+
+    def _ledger(rows, sizes_map) -> None:
+        for name, child, reason, target_dir in rows:
+            # Idempotency keys on the unique SOURCE path: two different
+            # files legitimately share a basename (the collision routing
+            # exists precisely for that), so a name-keyed guard silently
+            # dropped the second file's manifest row.
+            if child in ledgered_source_paths:
+                continue
+            ledgered_source_paths.add(child)
             quarantined_names.add(name)
             quarantined.append({
                 "source_path": child,
                 "relative_path": posixpath.relpath(child, source),
                 "quarantine_path": posixpath.join(target_dir, name),
-                "size": sizes.get(name, 0),
+                "size": sizes_map.get(name, 0),
                 "reason": reason,
                 "moved_at": _now(),
                 "root_task_id": root_task_id,
             })
-        return True
 
     def visit(directory: str) -> bool:
         """Depth-first delete of everything below ``directory``."""
@@ -858,15 +972,30 @@ def _cleanup_consumed_source_root(
         for name in other_files:
             if paused():
                 return False
-            if extension(name) in SUBTITLE_EXTENSIONS and any(
-                name.startswith(stem + ".") for stem in suspect_stems
-            ):
-                # A sidecar subtitle (language tag included) of a
-                # quarantined video moves with the batch.
-                batch.append(
-                    (name, posixpath.join(directory, name), "疑似内容视频的配对字幕")
+            if extension(name) in SUBTITLE_EXTENSIONS:
+                paired_stem = next(
+                    (
+                        stem
+                        for stem in suspect_stems
+                        if name.startswith(stem + ".")
+                        and re.fullmatch(
+                            r"(?:zh-Hans(?:\+ja)?|zh-Hant(?:\+ja)?|zh-CN|zh-TW|"
+                            r"zh-Hans\d*|zh-Hant\d*|chi|chs|cht|eng|jpn|en|ja|"
+                            r"subtitle\d*)(?:\..*)?",
+                            name[len(stem) + 1:],
+                        )
+                    ),
+                    None,
                 )
-                continue
+                if paired_stem is not None:
+                    # A language-tagged sidecar of a quarantined video moves
+                    # with the batch.  The language-shaped remainder stops a
+                    # junk video's prefix (EP01.menu.mkv) from dragging its
+                    # own sidecar in via the shared stem prefix.
+                    batch.append(
+                        (name, posixpath.join(directory, name), "疑似内容视频的配对字幕")
+                    )
+                    continue
             if not delete_file(directory, name):
                 return False
         if not quarantine_batch(directory, batch):
@@ -1133,6 +1262,15 @@ def _terminal_source_cleanup(
         )
     except Exception as exc:  # noqa: BLE001 - residual note, never a failure
         _trace(f"root {job.id} 源清理异常: {redact_error(exc)}")
+        if receipt_out is not None:
+            # The receipt must agree with the note: an aborted cleanup with
+            # no receipt fields previously read as source_remaining=false —
+            # callers treating that field as truth saw a failed consumption
+            # as a success.
+            receipt_out["source_remaining"] = True
+            receipt_out.setdefault("failures", [])
+            receipt_out.setdefault("quarantined", [])
+            receipt_out.setdefault("quarantined_count", 0)
         return f"收官清源未完成（清理异常: {redact_error(exc)}），可重跑 consume-source"
     if receipt_out is not None:
         receipt_out.update(receipt)
@@ -1145,6 +1283,15 @@ def _terminal_source_cleanup(
             _trace(
                 f"root {job.id} 未映射视频闸门：{quarantined_count} 个疑似内容"
                 f"已隔离至 {receipt.get('quarantine_root')}（附 manifest）"
+            )
+        receipt_failures = receipt.get("failures")
+        if isinstance(receipt_failures, list) and receipt_failures:
+            # The tree is consumed but something inside the pass failed
+            # (e.g. the manifest upload): surface it on the note instead of
+            # returning an unqualified clean result.
+            return (
+                f"源树已消费，但 {len(receipt_failures)} 项收尾未完成"
+                "（如待裁决 manifest），可重跑 consume-source"
             )
         # The disc-expansion staging tree is task-owned staging, exactly like
         # the intake tree (same operator ruling: 终态根源树一律消费).  The

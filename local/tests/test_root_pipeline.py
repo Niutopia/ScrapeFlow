@@ -2065,14 +2065,16 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         self.assertEqual(final.phase, "completed")
         self.assertIsNone(final.error)
         quarantine = "/library/ScrapeFlow/待裁决/My Show"
-        # One sp01.mkv at the flat root, the other under its source parent
-        # directory's name; both survive.
+        # One sp01.mkv at the flat root, the other under its full source
+        # parent chain; both survive.
         flat = f"{quarantine}/sp01.mkv" in alist.files
         in_sp = f"{quarantine}/SP/sp01.mkv" in alist.files
         in_tokuten = f"{quarantine}/特典/sp01.mkv" in alist.files
         self.assertTrue(flat)
         self.assertTrue(in_sp or in_tokuten)
         self.assertFalse(in_sp and in_tokuten)
+        # The manifest records the original relative path of each (both files).
+
         # The manifest records the original relative path of each.
         manifest = json.loads(
             alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
@@ -2164,3 +2166,74 @@ class ProvablyAbsentTests(unittest.TestCase):
         )
         # The parent cannot be listed: absence is unprovable, so NOT absent.
         self.assertFalse(_provably_absent(runner, "/incoming/My Show"))
+
+
+class LibraryCoverageScopingTests(unittest.TestCase):
+    """The coverage gate's coordinate scoping (audit re-review regressions)."""
+
+    def test_bounded_ancestor_scan_ignores_queue_prefixes(self):
+        from local.scrapeflow_api.root_pipeline import _cleanup_consumed_source_root
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+        from engine.scrapeflow.intake_source import (
+            upsert_intake_source, save_intake_catalog, bind_root_task,
+        )
+        from engine.scrapeflow.work_units import (
+            WorkUnitRecord, save_work_unit_records,
+        )
+        class LibAList(CleaningIndexAList):
+            def move(self, parent, target, names):
+                for name in names:
+                    self.files[f"{target.rstrip('/')}/{name}"] = self.files.pop(
+                        f"{parent.rstrip('/')}/{name}"
+                    )
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        # The operator's queue prefix `2. 新番合集` must NOT read as season 2:
+        # the bare ordinal [05] under a scope with no season marker stays a
+        # SUSPECT (quarantine), never junk-deleted against S02E05.
+        alist = LibAList({
+            "/incoming/2. 新番合集/Some Show/sp/[05].mkv": FAKE_VIDEO_BYTES,
+            "/library/番剧/Some Show/Season 02/Show - S02E05 - x.mkv": FAKE_VIDEO_BYTES,
+        })
+        alist.video_duration_probe = lambda p: 1420.0
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=None, validate=False,
+            library_root="/library",
+        )
+        catalog, entry = upsert_intake_source([], "/incoming/2. 新番合集/Some Show", present=True)
+        catalog, _ = bind_root_task(catalog, entry.source_id, "root-q")
+        save_intake_catalog(state_root, catalog)
+        save_work_unit_records(state_root, "root-q", [
+            WorkUnitRecord(
+                work_unit_id="unit-q",
+                root_task_id="root-q",
+                boundary_key="/incoming/2. 新番合集/Some Show",
+                source_paths=("/incoming/2. 新番合集/Some Show",),
+                source_revision=1,
+                role="single_work",
+                display_label="Some Show",
+            ),
+        ])
+        import local.scrapeflow_api.unit_execution as ue
+        ue_rows = [ue.WorkAcceptanceResult(
+            work_unit_id="unit-q", outcome="accepted",
+            writer_job_id="job-q", phase="executed",
+            target_root="/library/番剧/Some Show", planned_files=1,
+            error=None, recorded_at="t",
+        )]
+        ue.save_work_acceptance(state_root, "root-q", ue_rows)
+        receipt = _cleanup_consumed_source_root(
+            runner, state_root, "root-q",
+            "/incoming/2. 新番合集/Some Show",
+            pause_requested=lambda: False,
+        )
+        # The queue prefix is ABOVE the owning scope: no season derives, the
+        # file is an unmapped suspect → quarantined, never junk-deleted.
+        self.assertEqual(receipt.get("quarantined_count"), 1, receipt)
+        self.assertEqual(receipt.get("source_remaining"), False)
+
+
+if __name__ == "__main__":
+    unittest.main()
