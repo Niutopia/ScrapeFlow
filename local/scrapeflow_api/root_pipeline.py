@@ -622,6 +622,16 @@ def _terminal_source_cleanup(
     if not receipt.get("source_remaining"):
         if isinstance(removed, list) and removed:
             _trace(f"root {job.id} 源树已消费（{len(removed)} 个目录）")
+        # The disc-expansion staging tree is task-owned staging, exactly like
+        # the intake tree (same operator ruling: 终态根源树一律消费).  The
+        # writer already moved every verified payload into the formal
+        # library; consume it in the same terminal pass so it cannot linger.
+        # Without this call the staging tree survives every terminal root.
+        staging_note = _cleanup_expansion_staging_root(
+            runner, state_root, job, pause_requested=pause_requested,
+        )
+        if staging_note is not None:
+            return staging_note
         return None
     failures = receipt.get("failures")
     detail = f"，失败 {len(failures)} 项" if isinstance(failures, list) and failures else ""
