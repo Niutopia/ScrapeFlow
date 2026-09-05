@@ -927,6 +927,29 @@ def load_root_replenishment_state(
     return _normalize_state(raw)
 
 
+
+def _shrink_state_to_caps(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Trim the documented miss-caches until the state fits the mapping cap.
+
+    A healthy state may legitimately exceed the 256 KiB durable-mapping cap:
+    the miss-caches are bounded at 64 scopes x 512 locators of up to ~128
+    characters each.  Rather than failing the save (which wedged the lane
+    with a ``submitting`` intent and orphaned provider tasks), drop the
+    caches entirely — they are advisory "already reviewed, no hit" evidence,
+    never correctness state — and retry the projection.  Returns ``None``
+    when even a cache-free state cannot be represented.
+    """
+    try:
+        trimmed = dict(state)
+        trimmed.pop(_REVIEWED_TORRENT_MISSES_KEY, None)
+        trimmed.pop(_SEARCH_RESOURCE_MISSES_KEY, None)
+        trimmed.pop(_PANSOU_QUERY_CURSORS_KEY, None)
+        trimmed.pop(_SEARCH_QUERY_CURSORS_KEY, None)
+        return trimmed
+    except Exception:
+        return None
+
+
 def save_root_replenishment_state(
     state_root: Path, root_task_id: str, state: Mapping[str, Any],
 ) -> None:
@@ -938,7 +961,17 @@ def save_root_replenishment_state(
     # never a reason to write a partial replacement state.
     projected, _safe = _durable_mapping(state)
     if projected is None:
-        raise ValueError("补源状态无法安全持久化")
+        # The miss-caches alone are bounded at 64 scopes x 512 locators of
+        # up to ~128 chars each (several MB), so a healthy state can exceed
+        # the historical 256 KiB mapping cap.  Shrink to the documented
+        # per-scope caps before failing: dropping the OLDEST evidence rows
+        # is strictly better than wedging the replenishment lane forever.
+        trimmed = _shrink_state_to_caps(state)
+        if trimmed is None:
+            raise ValueError("补源状态无法安全持久化")
+        projected, _safe = _durable_mapping(trimmed)
+        if projected is None:
+            raise ValueError("补源状态无法安全持久化")
     atomic_write_json(
         _state_path(Path(state_root), root_task_id),
         projected,

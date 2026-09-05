@@ -2306,3 +2306,60 @@ class RootReplenishmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OversizedStateShrinkTests(unittest.TestCase):
+    """M6 regression: a state that exceeds the mapping cap shrinks, not wedges."""
+
+    def test_save_drops_advisory_caches_when_over_cap(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from local.scrapeflow_api.root_replenishment import (
+            _PANSOU_QUERY_CURSORS_KEY,
+            _REVIEWED_TORRENT_MISSES_KEY,
+            _SEARCH_QUERY_CURSORS_KEY,
+            _SEARCH_RESOURCE_MISSES_KEY,
+            load_root_replenishment_state,
+            save_root_replenishment_state,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            # ~64 scopes x 512 locators of 128 chars ≈ the documented worst
+            # case that blows the 256 KiB durable-mapping cap.
+            big_misses = {
+                f"scope-{i:03d}": [
+                    f"torrent:{'a' * 40}" for _ in range(512)
+                ]
+                for i in range(64)
+            }
+            state = {
+                "tier": "quark_share",
+                _REVIEWED_TORRENT_MISSES_KEY: big_misses,
+                _SEARCH_RESOURCE_MISSES_KEY: {},
+                _PANSOU_QUERY_CURSORS_KEY: {},
+                _SEARCH_QUERY_CURSORS_KEY: {},
+            }
+            # Must not raise: the advisory caches are dropped and the
+            # correctness state persists.
+            save_root_replenishment_state(state_root, "root-x", state)
+            loaded = load_root_replenishment_state(state_root, "root-x")
+            self.assertEqual(loaded.get("tier"), "quark_share")
+
+    def test_unrepresentable_state_still_fails_closed(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from local.scrapeflow_api.root_replenishment import (
+            save_root_replenishment_state,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                # A non-serializable object (not a cache) stays fatal.
+                save_root_replenishment_state(
+                    Path(directory), "root-x", {"tier": object()},
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()
