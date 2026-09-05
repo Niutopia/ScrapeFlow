@@ -15,6 +15,7 @@ file persistence.
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import unicodedata
@@ -1142,7 +1143,7 @@ def save_work_unit_records(
     root_task_id: str,
     records: Sequence[WorkUnitRecord],
 ) -> None:
-    """Atomically persist work unit records for a root task."""
+    """Atomically persist work unit records, proven by a strict readback."""
     state_dir.mkdir(parents=True, exist_ok=True)
     target = _records_path(state_dir, root_task_id)
     payload = json.dumps(
@@ -1153,23 +1154,57 @@ def save_work_unit_records(
     with tempfile.NamedTemporaryFile("w", dir=state_dir, delete=False, encoding="utf-8") as tmp:
         tmp.write(payload)
         tmp.flush()
+        os.fsync(tmp.fileno())
         tmp_path = Path(tmp.name)
     tmp_path.replace(target)
+    # The unit ledger is the root's core ownership record.  A write that
+    # cannot be read back exactly is not a write: fail the caller instead
+    # of leaving an unreadable ledger behind.
+    readback = load_work_unit_records(state_dir, root_task_id)
+    if len(readback) != len(records):
+        raise RuntimeError(
+            f"作品单元账本写后回读行数不符: {target} "
+            f"(expected={len(records)}, read={len(readback)})"
+        )
+
+
+class WorkUnitLedgerCorrupted(ValueError):
+    """The unit ledger exists on disk but cannot be proven to parse."""
 
 
 def load_work_unit_records(
     state_dir: Path,
     root_task_id: str,
 ) -> list[WorkUnitRecord]:
-    """Load persisted work unit records for a root task; return empty if absent."""
+    """Load one root's unit ledger; absence is empty, corruption is an error.
+
+    A root that has not reached B/W legitimately has no records yet, so a
+    missing file returns ``[]``.  A file that exists but cannot be parsed
+    must never be silently read as "no units": the pipeline would re-run
+    boundary analysis over a source whose ownership ledger is damaged, and
+    downstream consumers would treat the root as empty.  Corruption raises
+    :class:`WorkUnitLedgerCorrupted` so every consumer fails closed.
+    """
     path = _records_path(state_dir, root_task_id)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [WorkUnitRecord.from_dict(item) for item in data if isinstance(item, Mapping)]
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return []
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkUnitLedgerCorrupted("作品单元账本无法读取") from exc
+    if not isinstance(data, list):
+        raise WorkUnitLedgerCorrupted("作品单元账本格式无效")
+    output: list[WorkUnitRecord] = []
+    for item in data:
+        if not isinstance(item, Mapping):
+            raise WorkUnitLedgerCorrupted("作品单元账本包含无效条目")
+        try:
+            output.append(WorkUnitRecord.from_dict(item))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkUnitLedgerCorrupted(
+                "作品单元账本包含无法验证的条目"
+            ) from exc
+    return output
 
 
 __all__ = [
