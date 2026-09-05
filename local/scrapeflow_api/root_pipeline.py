@@ -600,86 +600,109 @@ def _cleanup_consumed_source_root(
 
     quarantined_names: set[str] = set()
 
-    def quarantine_file(directory: str, name: str, child: str, reason: str) -> bool:
-        """Move one suspect into the quarantine root, FLAT (operator ruling
-        2026-09-05: 平铺方便人工裁决，不镜像源目录结构).
+    def quarantine_batch(
+        directory: str,
+        rows: Sequence[tuple[str, str, str]],
+    ) -> bool:
+        """Move one directory's suspects into the quarantine root, batched.
 
-        A basename that already occupies the flat root — from this batch or
-        a previous partial run — falls back to a disambiguating subdirectory
-        named after the file's source parent directory, so an AList move can
-        never overwrite an earlier quarantine.  The manifest keeps the
-        original relative path for full traceability either way.
+        ``rows`` is (name, child, reason) per file.  All names move in ONE
+        server-side ``alist.move`` call and the batch is verified together:
+        Quark's move-visibility lag (minutes per file, observed during the
+        transfer campaign) is amortized across the whole batch instead of
+        being paid once per file.  Layout stays FLAT (operator ruling
+        2026-09-05): a basename that already occupies the flat root — from
+        this batch or a previous partial run — routes to a disambiguating
+        subdirectory named after the file's source parent directory, so a
+        move can never overwrite an earlier quarantine.
         """
         if paused():
             return False
-        relative = posixpath.relpath(child, source)
-        target_dir = quarantine_root
-        if name in quarantined_names:
-            parent_tag = posixpath.basename(directory.rstrip("/")) or "源目录"
-            target_dir = posixpath.join(quarantine_root, parent_tag)
-        else:
-            # Cross-run safety: a previous partial consumption may have left
-            # the same basename at the flat root.  An unprovable listing also
-            # routes to the disambiguating subdir (fail closed, never move
-            # onto an unproven target).
-            try:
-                existing = rows_proven(quarantine_root)
-            except Exception:
-                existing = None
-            if existing is not None and any(
-                item.get("name") == name for item in existing
+        if not rows:
+            return True
+        if not ensure_quarantine_dir(quarantine_root):
+            return False
+        # Split the batch: names already used in this run need the parent
+        # subdir; the rest share the flat root unless a cross-run leftover
+        # occupies the name (checked against a fresh flat-root listing).
+        try:
+            flat_existing = {
+                str(item.get("name"))
+                for item in rows_proven(quarantine_root)
+            }
+        except Exception:
+            flat_existing = None  # unprovable → route everything to subdirs
+        flat_rows: list[tuple[str, str, str]] = []
+        tagged: dict[str, list[tuple[str, str, str]]] = {}
+        for name, child, reason in rows:
+            if name in quarantined_names or (
+                flat_existing is not None and name in flat_existing
             ):
                 parent_tag = posixpath.basename(directory.rstrip("/")) or "源目录"
-                target_dir = posixpath.join(quarantine_root, parent_tag)
-                if name in quarantined_names:
-                    failures.append(child)
-                    _trace(f"待裁决同名冲突无法消歧: {child}")
-                    return False
-        if not ensure_quarantine_dir(target_dir):
-            return False
-        try:
-            runner.alist.move(directory, target_dir, [name])
-        except Exception as exc:  # noqa: BLE001 - reported as residual
-            failures.append(child)
-            _trace(f"待裁决移入失败: {child}: {exc}")
-            return False
-        # Prove the move both ways, with Quark's move-visibility lag in
-        # mind: a server-side move can leave the source listing showing the
-        # old name for minutes (observed ~4 min per file during the
-        # transfer campaign).  Poll both sides inside a bounded window —
-        # the move itself is not retried, only the observation.
-        landed = None
-        for attempt in range(5):
+                tagged.setdefault(parent_tag, []).append((name, child, reason))
+            else:
+                flat_rows.append((name, child, reason))
+        moved: list[tuple[str, str, str, str]] = []
+        for name, child, reason in flat_rows:
+            moved.append((name, child, reason, quarantine_root))
+        for parent_tag, group in tagged.items():
+            target_dir = posixpath.join(quarantine_root, parent_tag)
+            if not ensure_quarantine_dir(target_dir):
+                return False
+            for name, child, reason in group:
+                moved.append((name, child, reason, target_dir))
+        by_target: dict[str, list[str]] = {}
+        for name, _child, _reason, target_dir in moved:
+            by_target.setdefault(target_dir, []).append(name)
+        for target_dir, names in by_target.items():
+            try:
+                runner.alist.move(directory, target_dir, names)
+            except Exception as exc:  # noqa: BLE001 - reported as residual
+                failures.extend(
+                    f"{directory}/{name}" for name in names
+                )
+                _trace(f"待裁决批量移入失败: {directory} → {target_dir}: {exc}")
+                return False
+        # Bounded observation window over the whole batch: the moves are
+        # already committed server-side; only the listing lags.
+        pending = {name for name, _c, _r, _t in moved}
+        sizes: dict[str, int] = {}
+        for attempt in range(10):
             if attempt:
                 time.sleep(20.0)
             try:
-                after = rows_proven(directory)
-                target_rows = rows_proven(target_dir)
+                after = {str(item.get("name")) for item in rows_proven(directory)}
             except Exception:
                 continue
-            if not any(item.get("name") == name for item in after):
-                landed = next(
-                    (item for item in target_rows
-                     if item.get("name") == name),
-                    None,
-                )
-                if landed is not None:
-                    break
-        if landed is None:
-            failures.append(child)
-            _trace(f"待裁决移动回读超窗: {child}")
+            pending &= after
+            if not pending:
+                for target_dir in by_target:
+                    try:
+                        target_rows = rows_proven(target_dir)
+                    except Exception:
+                        continue
+                    for item in target_rows:
+                        sizes[str(item.get("name"))] = int(item.get("size") or 0)
+                break
+        if pending:
+            failures.extend(
+                f"{directory}/{name}" for name in sorted(pending)
+            )
+            _trace(
+                f"待裁决批量移动回读超窗: {len(pending)} 个仍在源列表"
+            )
             return False
-        size = int(landed.get("size") or 0)
-        quarantined_names.add(name)
-        quarantined.append({
-            "source_path": child,
-            "relative_path": relative,
-            "quarantine_path": posixpath.join(target_dir, name),
-            "size": size,
-            "reason": reason,
-            "moved_at": _now(),
-            "root_task_id": root_task_id,
-        })
+        for name, child, reason, target_dir in moved:
+            quarantined_names.add(name)
+            quarantined.append({
+                "source_path": child,
+                "relative_path": posixpath.relpath(child, source),
+                "quarantine_path": posixpath.join(target_dir, name),
+                "size": sizes.get(name, 0),
+                "reason": reason,
+                "moved_at": _now(),
+                "root_task_id": root_task_id,
+            })
         return True
 
     def visit(directory: str) -> bool:
@@ -731,9 +754,8 @@ def _cleanup_consumed_source_root(
             if not delete_file(directory, name):
                 return False
         suspect_stems = {PurePosixPath(name).stem for name in suspect_videos}
+        batch: list[tuple[str, str, str]] = []
         for name in suspect_videos:
-            if paused():
-                return False
             child = posixpath.join(directory, name)
             duration = durations.get(name)
             if duration is not None and duration >= UNMAPPED_VIDEO_MIN_CONTENT_SECONDS:
@@ -742,8 +764,7 @@ def _cleanup_consumed_source_root(
                 reason = f"未映射视频，正片命名且时长 {duration:.0f}s"
             else:
                 reason = "未映射视频，时长无法证明（fail-closed 保留）"
-            if not quarantine_file(directory, name, child, reason):
-                return False
+            batch.append((name, child, reason))
         for name in other_files:
             if paused():
                 return False
@@ -751,15 +772,15 @@ def _cleanup_consumed_source_root(
                 name.startswith(stem + ".") for stem in suspect_stems
             ):
                 # A sidecar subtitle (language tag included) of a
-                # quarantined video moves with it.
-                if not quarantine_file(
-                    directory, name, posixpath.join(directory, name),
-                    "疑似内容视频的配对字幕",
-                ):
-                    return False
+                # quarantined video moves with the batch.
+                batch.append(
+                    (name, posixpath.join(directory, name), "疑似内容视频的配对字幕")
+                )
                 continue
             if not delete_file(directory, name):
                 return False
+        if not quarantine_batch(directory, batch):
+            return False
         for child in dir_children:
             if paused():
                 return False
