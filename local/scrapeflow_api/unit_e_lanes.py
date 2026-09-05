@@ -266,10 +266,16 @@ def _consume_duplicate_unit(
         if len(unit_sources) > 1 else processed_root
     )
     if record.lane_status == "duplicate_consumed":
+        # The idempotent re-entry readback mirrors the move's own contract:
+        # a directory source lands as a directory, a flat feature file
+        # (movie-package shard) lands as a file.  Hardcoding "directory"
+        # here permanently failed any file-scoped duplicate unit on the
+        # root's next retry/resume.
         for source, name in zip(unit_sources, names):
             if (
                 runner._remote_entry_kind(source) != "missing"
-                or runner._remote_entry_kind(f"{lane_root}/{name}") != "directory"
+                or runner._remote_entry_kind(f"{lane_root}/{name}")
+                not in {"directory", "file"}
             ):
                 raise EngineExecutionError("duplicate 单元消费后回读失败")
         return record

@@ -4222,3 +4222,57 @@ class BroadcastSeasonCoalescingTests(unittest.TestCase):
         merged = coalesce_confirmed_tv_season_work_units(records, self._snapshot(labels))
         self.assertEqual(len(merged), 3, msg=[r.display_label for r in merged])
 
+
+
+class DuplicateLaneIdempotentReentryTests(unittest.TestCase):
+    """A file-scoped duplicate unit must survive E-lane re-entry (audit high).
+
+    The consumption readback used to hardcode the archive target as a
+    directory; a flat feature file (movie-package shard) lands as a *file*,
+    so any retry/resume of a root whose file-scoped duplicate unit was
+    already consumed raised permanently instead of accepting the commit.
+    """
+
+    def test_file_scoped_consumed_unit_passes_reentry_readback(self) -> None:
+        from local.scrapeflow_api.unit_e_lanes import _consume_duplicate_unit
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+        from engine.scrapeflow.work_units import WorkUnitRecord
+        from local.tests.test_simple_engine_runner import FakeAList
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            alist = FakeAList()
+            # Already consumed: source file gone, archive target present as
+            # a FILE (the shape a flat feature file move produces).
+            archive = "/library/ScrapeFlow/归档/root-r/processed"
+            alist.files[f"{archive}/Feature Cut.mkv"] = b"v"
+            runner = SimpleEngineRunner(
+                state_root, alist=alist, tmdb=None, validate=False,
+                library_root="/library",
+            )
+
+            class _RootJob:
+                id = "root-r"
+                summary = {}
+                target_shelf = None
+                request = {"source_path": "/in/Feature Cut.mkv"}
+
+            record = WorkUnitRecord(
+                work_unit_id="unit-1",
+                root_task_id="root-r",
+                boundary_key="/in/Feature Cut.mkv",
+                source_paths=("/in/Feature Cut.mkv",),
+                source_revision=1,
+                role="single_work",
+                display_label="Feature Cut",
+                lane_status="duplicate_consumed",
+            )
+            # Re-entry must accept the committed state, not raise.
+            result = _consume_duplicate_unit(
+                runner, record, _RootJob, pause_requested=None,
+            )
+            self.assertEqual(result.lane_status, "duplicate_consumed")
+
+
+if __name__ == "__main__":
+    unittest.main()
