@@ -28,7 +28,7 @@ import posixpath
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from engine.scrapeflow.core import _validate_remote_source_basename
@@ -38,7 +38,18 @@ from engine.scrapeflow.disc_expansion_bridge import (
     expansion_staging_root,
 )
 from engine.scrapeflow.intake_source import load_intake_catalog
+from engine.scrapeflow.media_policy import (
+    SUBTITLE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    extension,
+)
 from engine.scrapeflow.remote_paths import normalize_remote_path, provider_safe_basename
+from engine.scrapeflow.residual_policy import (
+    UNMAPPED_VIDEO_JUNK,
+    UNMAPPED_VIDEO_MIN_CONTENT_SECONDS,
+    UNMAPPED_VIDEO_SUSPECT,
+    classify_unmapped_video,
+)
 from engine.scrapeflow.root_boundaries import (
     analyze_root_boundaries,
     rebuild_root_boundary_if_unwritten,
@@ -296,21 +307,35 @@ def _cleanup_consumed_source_root(
     Operator ruling (2026-08-27, extended 2026-09-02): the intake area is
     staging, not storage.  Once a root's media is verified in the formal
     library, the whole source tree — residual themes, MVs, backup subtitles,
-    screenshots, font packs, losing versions, unmapped specials — is deleted
-    by default so the operator never cleans up manually.  A root parked in
-    ``gaps_pending`` is equally terminal for the source tree: the gap ledger
-    is the durable record (缺口只登不补) and no lane ever re-reads the
-    staging tree, so the same consumption applies.
+    screenshots, font packs, losing versions — is deleted by default so the
+    operator never cleans up manually.  A root parked in ``gaps_pending``
+    is equally terminal for the source tree: the gap ledger is the durable
+    record (缺口只登不补) and no lane ever re-reads the staging tree, so the
+    same consumption applies.
+
+    Unmapped-video gate (operator ruling 2026-09-05): every video still in
+    the source at consumption time is by definition unwritten.  Theme-named
+    credits, bonus-directory assets, and short non-episode videos are junk
+    and die with the tree.  Everything else — unaired episodes, unnumbered
+    SPs, web-exclusive specials, episode-grade runtimes, or anything the
+    duration probe could not prove — is quarantined to
+    ``/ScrapeFlow/待裁决/<root-task-id>/`` with a manifest instead of being
+    deleted, because the engine can never prove a TMDB-unlisted special is
+    worthless.  A quarantined video's sidecar subtitle moves with it.
 
     Ownership is proven by the durable catalog binding (S step), never by
-    path naming.  Every file delete and directory removal is confirmed
-    through a fresh parent listing; the pause predicate is re-checked
-    before each remote side effect.  A Quark/AList driver that acknowledges
-    a delete without applying it is retried through the bounded parent-name
-    remove fallback, and the whole walk simply stops when the provider
-    keeps reporting the tree — the surviving residual is reported back to
-    the caller instead of failing silently.
+    path naming.  Every file delete, quarantine move, and directory removal
+    is confirmed through a fresh parent listing; the pause predicate is
+    re-checked before each remote side effect.  A Quark/AList driver that
+    acknowledges a delete without applying it is retried through the
+    bounded parent-name remove fallback, and the whole walk simply stops
+    when the provider keeps reporting the tree — the surviving residual is
+    reported back to the caller instead of failing silently.
     """
+    quarantine_root = posixpath.join(
+        str(runner.library_root).rstrip("/"),
+        "ScrapeFlow", "待裁决", root_task_id,
+    )
     try:
         bound = any(
             entry.root_task_id == root_task_id and entry.canonical_path == source
@@ -432,6 +457,103 @@ def _cleanup_consumed_source_root(
         failures.append(directory)
         return False
 
+    quarantined: list[dict[str, object]] = []
+
+    def probe_duration(path: str) -> float | None:
+        """Bounded duration probe for one unmapped video (None = unproven).
+
+        ``video_duration_probe`` on the client is the scenario-double seam;
+        the production ``AListClient`` does not define it and always runs
+        the real bounded ffprobe over a fresh file link.  Any probe failure
+        (infrastructure or no video stream) yields ``None`` so the gate can
+        fail closed.
+        """
+        hook = getattr(runner.alist, "video_duration_probe", None)
+        if callable(hook):
+            try:
+                return float(hook(path))
+            except Exception:
+                return None
+        from engine.scrapeflow.video_admission import (
+            VideoAdmissionError,
+            probe_remote_video_stream,
+        )
+
+        try:
+            verdict = probe_remote_video_stream(runner.alist, path)
+        except VideoAdmissionError:
+            return None
+        raw = verdict.get("duration_seconds")
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def ensure_quarantine_dir(path: str) -> bool:
+        """Materialize one quarantine directory level by level."""
+        if not path.startswith("/"):
+            return False
+        segments = [seg for seg in path.split("/") if seg]
+        current = ""
+        for index, segment in enumerate(segments):
+            current = f"{current}/{segment}"
+            if index < 3:
+                # /quark/影视/ScrapeFlow always exists in practice; probing
+                # it is wasted calls, and mkdir is idempotent for the few
+                # roots where it may not.
+                continue
+            try:
+                probe = runner.alist.try_list(current, refresh=True)
+            except Exception:
+                probe = None
+            if probe is not None:
+                continue
+            try:
+                runner.alist.mkdir(current)
+            except Exception as exc:  # noqa: BLE001 - reported as residual
+                failures.append(current)
+                _trace(f"待裁决目录创建失败: {current}: {exc}")
+                return False
+        return True
+
+    def quarantine_file(directory: str, name: str, child: str, reason: str) -> bool:
+        """Move one suspect into the quarantine tree and prove it landed."""
+        if paused():
+            return False
+        relative = posixpath.relpath(child, source)
+        target_dir = posixpath.dirname(posixpath.join(quarantine_root, relative))
+        if not ensure_quarantine_dir(target_dir):
+            return False
+        try:
+            runner.alist.move(directory, target_dir, [name])
+        except Exception as exc:  # noqa: BLE001 - reported as residual
+            failures.append(child)
+            _trace(f"待裁决移入失败: {child}: {exc}")
+            return False
+        # Prove the move exactly like a delete: gone from the source parent
+        # and present under the quarantine target.
+        try:
+            after = rows_proven(directory)
+        except Exception:
+            failures.append(child)
+            return False
+        if any(item.get("name") == name for item in after):
+            failures.append(child)
+            return False
+        size = next(
+            (int(item.get("size") or 0) for item in after if item.get("name") == name),
+            0,
+        )
+        quarantined.append({
+            "source_path": child,
+            "relative_path": relative,
+            "size": size,
+            "reason": reason,
+            "moved_at": _now(),
+            "root_task_id": root_task_id,
+        })
+        return True
+
     def visit(directory: str) -> bool:
         """Depth-first delete of everything below ``directory``."""
         if paused():
@@ -442,9 +564,18 @@ def _cleanup_consumed_source_root(
             # A directory that cannot be listed cannot be proven deleted;
             # abort the walk so the surviving tree stays a reported residual.
             return False
+        # Unmapped-video gate (operator ruling 2026-09-05): classify every
+        # still-present video, delete the provable junk, quarantine the
+        # suspects together with their sidecar subtitles, and only then
+        # delete the remaining non-video residuals.  Planned media was
+        # already moved out by the writer, so anything still here is
+        # unwritten.
+        suspect_videos: list[str] = []
+        junk_videos: list[str] = []
+        other_files: list[str] = []
+        dir_children: list[str] = []
+        durations: dict[str, float | None] = {}
         for item in entries:
-            if paused():
-                return False
             name = item.get("name")
             if (
                 not isinstance(name, str)
@@ -456,13 +587,58 @@ def _cleanup_consumed_source_root(
                 raise RuntimeError(f"AList 源目录出现不安全条目: {directory}")
             child = posixpath.join(directory, name)
             if item.get("is_dir") is True:
-                if not visit(child):
-                    return False
-                if not delete_directory(child):
-                    return False
+                dir_children.append(child)
+            elif extension(name) in VIDEO_EXTENSIONS:
+                duration = probe_duration(child)
+                durations[name] = duration
+                if classify_unmapped_video(child, duration) == UNMAPPED_VIDEO_SUSPECT:
+                    suspect_videos.append(name)
+                else:
+                    junk_videos.append(name)
             else:
-                if not delete_file(directory, str(name)):
+                other_files.append(name)
+        for name in junk_videos:
+            if paused():
+                return False
+            if not delete_file(directory, name):
+                return False
+        suspect_stems = {PurePosixPath(name).stem for name in suspect_videos}
+        for name in suspect_videos:
+            if paused():
+                return False
+            child = posixpath.join(directory, name)
+            duration = durations.get(name)
+            if duration is not None and duration >= UNMAPPED_VIDEO_MIN_CONTENT_SECONDS:
+                reason = f"未映射视频，正片级时长 {duration:.0f}s"
+            elif duration is not None:
+                reason = f"未映射视频，正片命名且时长 {duration:.0f}s"
+            else:
+                reason = "未映射视频，时长无法证明（fail-closed 保留）"
+            if not quarantine_file(directory, name, child, reason):
+                return False
+        for name in other_files:
+            if paused():
+                return False
+            if extension(name) in SUBTITLE_EXTENSIONS and any(
+                name.startswith(stem + ".") for stem in suspect_stems
+            ):
+                # A sidecar subtitle (language tag included) of a
+                # quarantined video moves with it.
+                if not quarantine_file(
+                    directory, name, posixpath.join(directory, name),
+                    "疑似内容视频的配对字幕",
+                ):
                     return False
+                continue
+            if not delete_file(directory, name):
+                return False
+        for child in dir_children:
+            if paused():
+                return False
+            if not visit(child):
+                return False
+            if not delete_directory(child):
+                return False
         return True
 
     def source_remaining() -> bool:
@@ -479,25 +655,92 @@ def _cleanup_consumed_source_root(
         except Exception:
             return True
 
+    def write_quarantine_manifest() -> bool:
+        """Persist/merge the quarantine manifest beside the moved files."""
+        if not quarantined:
+            return True
+        manifest_path = posixpath.join(quarantine_root, "manifest.json")
+        existing: dict[str, object] = {}
+        reader = getattr(runner.alist, "read_file_bytes", None)
+        if callable(reader):
+            try:
+                try:
+                    payload = reader(manifest_path, max_bytes=1024 * 1024)
+                except TypeError:
+                    payload = reader(manifest_path)
+                loaded = json.loads(payload.decode("utf-8", "replace"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+        rows = existing.get("entries")
+        by_path = {
+            str(row.get("source_path")): row
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict)
+        }
+        for entry in quarantined:
+            by_path[str(entry["source_path"])] = entry
+        manifest = {
+            "schema_version": 1,
+            "root_task_id": root_task_id,
+            "source_root": source,
+            "note": (
+                "未映射疑似内容视频（终态闸门 2026-09-05 裁决）：引擎无法证明"
+                "它们是花絮/垃圾，也未证明到 TMDB 坐标，故不随源树删除。"
+                "人工裁决后可删除本目录或告知归位坐标。"
+            ),
+            "entries": sorted(by_path.values(), key=lambda row: str(row.get("relative_path"))),
+            "updated_at": _now(),
+        }
+        try:
+            runner.alist.upload_bytes(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"),
+                "application/json",
+                overwrite=True,
+            )
+        except TypeError:
+            runner.alist.upload_bytes(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"),
+                "application/json",
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as residual
+            failures.append(manifest_path)
+            _trace(f"待裁决 manifest 写入失败: {exc}")
+            return False
+        return True
+
     if not visit(source):
         # The walk aborted (pause, provider refusal, or an unsafe entry):
         # never fall back to a bulk recursive delete of an unproven tree.
+        # Whatever was quarantined before the abort still gets its manifest:
+        # those files are already out of the source tree.
+        write_quarantine_manifest()
         return {
             "source": source,
             "removed": removed,
             "failures": failures[:50],
             "source_remaining": source_remaining(),
+            "quarantine_root": quarantine_root,
+            "quarantined": [entry["source_path"] for entry in quarantined],
+            "quarantined_count": len(quarantined),
         }
     # The source root itself: delete it the same way so the intake monitor
     # marks the catalog entry missing on its next scan.  An unproven root
     # removal stays visible through source_remaining below.
     delete_directory(source)
+    write_quarantine_manifest()
 
     return {
         "source": source,
         "removed": removed,
         "failures": failures[:50],
         "source_remaining": source_remaining(),
+        "quarantine_root": quarantine_root,
+        "quarantined": [entry["source_path"] for entry in quarantined],
+        "quarantined_count": len(quarantined),
     }
 
 
@@ -624,6 +867,7 @@ def _terminal_source_cleanup(
     source: str,
     *,
     pause_requested: Callable[[], bool] | None = None,
+    receipt_out: dict[str, object] | None = None,
 ) -> str | None:
     """Best-effort terminal source consumption; residual becomes a job note.
 
@@ -632,6 +876,11 @@ def _terminal_source_cleanup(
     remains.  The note never changes the phase: a completed or
     ``gaps_pending`` root stays terminal either way, and the operator can
     re-run the consumption through ``POST /api/jobs/<id>/consume-source``.
+
+    Quarantined unmapped videos (2026-09-05 gate) are a success outcome,
+    not a residual: they are recorded in the receipt (exposed through
+    ``receipt_out`` for the operator endpoint) and traced, and the job's
+    note stays clean.
     """
     try:
         receipt = _cleanup_consumed_source_root(
@@ -644,10 +893,18 @@ def _terminal_source_cleanup(
     except Exception as exc:  # noqa: BLE001 - residual note, never a failure
         _trace(f"root {job.id} 源清理异常: {redact_error(exc)}")
         return f"收官清源未完成（清理异常: {redact_error(exc)}），可重跑 consume-source"
+    if receipt_out is not None:
+        receipt_out.update(receipt)
     removed = receipt.get("removed")
     if not receipt.get("source_remaining"):
         if isinstance(removed, list) and removed:
             _trace(f"root {job.id} 源树已消费（{len(removed)} 个目录）")
+        quarantined_count = receipt.get("quarantined_count") or 0
+        if quarantined_count:
+            _trace(
+                f"root {job.id} 未映射视频闸门：{quarantined_count} 个疑似内容"
+                f"已隔离至 {receipt.get('quarantine_root')}（附 manifest）"
+            )
         # The disc-expansion staging tree is task-owned staging, exactly like
         # the intake tree (same operator ruling: 终态根源树一律消费).  The
         # writer already moved every verified payload into the formal
@@ -685,16 +942,21 @@ def consume_terminal_source_root(
             f"只有终态根（completed/gaps_pending）才能清源，当前: {job.phase}"
         )
     source = runner._job_ingress_source(job)  # noqa: SLF001 - pipeline composition
+    receipt: dict[str, object] = {}
     note = _terminal_source_cleanup(
-        runner, state_root, job, source, pause_requested=pause_requested
+        runner, state_root, job, source,
+        pause_requested=pause_requested, receipt_out=receipt,
     )
     updated = _persist_root(runner, job, job.phase, error=note)
     return {
         "job_id": job.id,
         "phase": updated.phase,
         "source": source,
-        "source_remaining": note is not None,
+        "source_remaining": bool(receipt.get("source_remaining")),
         "note": note,
+        "quarantine_root": receipt.get("quarantine_root"),
+        "quarantined": receipt.get("quarantined") or [],
+        "quarantined_count": receipt.get("quarantined_count") or 0,
     }
 
 

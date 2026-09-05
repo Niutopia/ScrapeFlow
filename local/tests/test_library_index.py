@@ -114,6 +114,31 @@ class IndexAList:
             raise FileNotFoundError(path)
         return {"status": "satisfied", "video_streams": 1}
 
+    def video_duration_probe(self, path: str) -> float:
+        """Duration seam for the terminal unmapped-video gate.
+
+        Defaults to a 90-second clip: cleanup tests treat a non-episode
+        video as short junk, while episode-named videos are quarantined by
+        grammar regardless of duration.  Tests that need a content-grade
+        runtime override this method.
+        """
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return 90.0
+
+    def upload_bytes(
+        self, target_path: str, data: bytes, *args, **kwargs,
+    ) -> None:
+        """Store an uploaded payload (quarantine manifests, artifacts)."""
+        self.files[target_path] = data
+        parent = target_path.rsplit("/", 1)[0]
+        # Materialize the directory chain so listings see the upload.
+        parts = parent.strip("/").split("/")
+        current = ""
+        for part in parts:
+            current += "/" + part
+            self.dirs.add(current)
+
     def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
         del refresh
         return self.list(path)

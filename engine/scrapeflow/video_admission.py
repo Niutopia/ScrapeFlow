@@ -90,7 +90,7 @@ def _run_video_probe(
     if headers:
         command.extend(["-headers", headers])
     command.extend([
-        "-show_entries", "stream=codec_type",
+        "-show_entries", "stream=codec_type:format=duration",
         "-of", "json",
         "-i", source,
     ])
@@ -128,7 +128,22 @@ def _run_video_probe(
     )
     if video_streams < 1:
         raise VideoAdmissionError("video_stream_missing", candidate_invalid=True)
-    return {"status": "satisfied", "video_streams": video_streams}
+    duration_seconds: float | None = None
+    raw_duration = (
+        payload.get("format", {}).get("duration")
+        if isinstance(payload.get("format"), Mapping)
+        else None
+    )
+    if raw_duration is not None:
+        try:
+            duration_seconds = float(raw_duration)
+        except (TypeError, ValueError):
+            duration_seconds = None
+    return {
+        "status": "satisfied",
+        "video_streams": video_streams,
+        "duration_seconds": duration_seconds,
+    }
 
 
 def probe_local_video_stream(

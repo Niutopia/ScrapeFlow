@@ -105,7 +105,7 @@ flowchart TD
     L -->|否| M["M 入库完成阶段结束 (ingest_completed)"]
     L -->|是| N["N 严格两阶补源子系统<br/>Quark 分享 → 本地 Torrent（精确 select-file）<br/>专属 staging → 同一 Engine/Writer → 定向回读闭环"]
     N --> M
-    M --> T["T 终态消费源树与展开 staging<br/>用户裁决 2026-08-27 / 09-02<br/>completed 与 gaps_pending 均消费<br/>/待刮削 是 staging 不是存储<br/>Gap 账本是缺口的唯一持久记录<br/>每次删除以 fresh 回读证明，无法证明=未删"]
+    M --> T["T 终态消费源树与展开 staging<br/>用户裁决 2026-08-27 / 09-02<br/>completed 与 gaps_pending 均消费<br/>/待刮削 是 staging 不是存储<br/>Gap 账本是缺口的唯一持久记录<br/>每次删除以 fresh 回读证明，无法证明=未删<br/>未映射视频闸门 2026-09-05：垃圾随源删<br/>疑似内容隔离至 /ScrapeFlow/待裁决/&lt;root&gt;/ 附 manifest"]
 ```
 
 ### 各环节核心规则
@@ -146,9 +146,10 @@ flowchart TD
    - 补源获取的媒体进入任务专属 staging，生成临时 inventory 重新经过统一 Engine 与 writer；
    - 经定向 fresh listing 证明缺口真实消失后才核销对应 Gap 并清理 staging。
 7. **T 终态消费源树与展开 staging（用户裁决 2026-08-27，扩展 2026-09-02）**:
-   - `/待刮削` 是 staging 不是存储：根到达 `completed` 或 `gaps_pending` 后，整个来源树（含残余主题、MV、备份字幕、截图、字体包、输家版本、未映射特别篇）默认全量删除；
+   - `/待刮削` 是 staging 不是存储：根到达 `completed` 或 `gaps_pending` 后，整个来源树（含残余主题、MV、备份字幕、截图、字体包、输家版本）默认全量删除；
    - `gaps_pending` 同样终态消费源树：Gap 账本是缺口的唯一持久记录（缺口只登不补），任何车道都不再读源树；
    - X 展开的 staging 树（`/ScrapeFlow/展开/<root>/`）在写库验收后同样消费；
+   - **未映射视频闸门（用户裁决 2026-09-05）**：消费时源树里仍在的每个视频都未写库。主题命名（NCOP/NCED/OP/ED/MENU/PV/CM）、bonus 目录内容、探测时长 < 5 分钟且无正片语法的，判垃圾随源删除；**其余一切（无号 SP、未放送话、web 限定特别篇、正片命名、时长 ≥ 5 分钟、或探测失败判不出的）一律不删**，move 至 `/ScrapeFlow/待裁决/<root>/` 并写 manifest（文件名/大小/时长/原因），配对外挂字幕随行；正片级时长（≥ 5 分钟）凌驾一切命名与目录信号——藏在特典目录里的未放送话同样隔离。引擎无法证明 TMDB 未收录的特别篇没有价值，证明不了就不删；
    - **fail-closed 证明语义**：每次删除必须以 fresh 回读证明完成；provider 回读失败 = 未删除（记残余、可重跑 consume-source），绝不把「无法证明」当「已删除」；
    - Gap 账本损坏时全链 fail-closed（聚合/补源/关闭一律停），禁止把损坏账本解释为「没有缺口」。
 

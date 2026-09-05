@@ -28,6 +28,7 @@ from .media_policy import (
     SUBTITLE_EXTENSIONS,
     TEMPORARY_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    extension,
     is_archive_filename,
 )
 
@@ -71,6 +72,66 @@ BONUS_DIRECTORY_SEGMENT_RE = re.compile(
     r"(?:/|$)",
     re.IGNORECASE,
 )
+
+# Episode-like naming for the terminal unmapped-video gate (operator ruling
+# 2026-09-05).  A short video that still carries episode grammar is treated
+# as content: mini-episode web specials (小剧场-style shorts) are 3-5 minute
+# real episodes, while menus, credits, and adverts carry no episode grammar.
+_EPISODE_LIKE_NAMING_RE = re.compile(
+    r"(?:S\s*0*\d{1,2}\s*E\s*0*\d{1,3}"
+    r"|(?:^|[\s._\-\[\]()])E[P]?0*\d{1,3}(?=$|[\s._\-\[\]()])"
+    r"|第\s*0*\d{1,4}\s*[话話集]"
+    r"|\[\s*0*\d{1,3}(?:\.\d)?\s*\]"
+    r"|(?:OVA|OAV|OAD|SP|SPECIAL|特典|特别篇|特別篇)[\s._\-]*0*\d{1,3}"
+    r"|0*\d{1,3}[\s._\-]*(?:OVA|OAV|OAD|SP|SPECIAL|特典|特别篇|特別篇)"
+    r"|未放送|未放映|unair)",
+    re.IGNORECASE,
+)
+_STANDALONE_NUMBER_STEM_RE = re.compile(r"^0*\d{1,3}(?:\.\d)?$")
+
+UNMAPPED_VIDEO_JUNK = "junk"
+UNMAPPED_VIDEO_SUSPECT = "suspect"
+# Operator ruling 2026-09-05: below this duration (and without episode-like
+# naming) an unmapped video is credits/menu/promo material, not content.
+UNMAPPED_VIDEO_MIN_CONTENT_SECONDS = 300.0
+
+
+def classify_unmapped_video(
+    source_path: str,
+    duration_seconds: float | None,
+) -> str:
+    """Gate one still-in-source video at terminal consumption.
+
+    Operator ruling 2026-09-05 (the 未映射特别篇 gate):
+
+    - theme-named (NCOP/NCED/OP/ED/MENU/PV/CM/Trailer) → junk, no probe;
+    - duration ≥ 5 minutes → suspect unconditionally: episode-grade runtime
+      trumps every naming/context signal, so an unaired episode hiding
+      inside a 特典 bonus directory is still quarantined;
+    - shorter than 5 minutes → junk when theme-named, bonus-directory, or
+      carrying no episode grammar; suspect when it carries episode grammar
+      (numbered mini-episodes, 小剧场-style web specials);
+    - unknown duration (probe failed or no video stream) → suspect unless
+      theme-named: the engine never deletes what it cannot prove is junk.
+    """
+    normalized = str(source_path or "").replace("\\", "/")
+    name = PurePosixPath(normalized).name
+    theme = extension(name) in VIDEO_EXTENSIONS and bool(
+        _THEME_VIDEO_RE.search(name)
+    )
+    if duration_seconds is not None and duration_seconds >= UNMAPPED_VIDEO_MIN_CONTENT_SECONDS:
+        return UNMAPPED_VIDEO_SUSPECT
+    if theme:
+        return UNMAPPED_VIDEO_JUNK
+    if duration_seconds is None:
+        return UNMAPPED_VIDEO_SUSPECT
+    # Short (or unknown-length) non-theme video.
+    if is_bonus_directory_path(normalized):
+        return UNMAPPED_VIDEO_JUNK
+    stem = PurePosixPath(name).stem
+    if _EPISODE_LIKE_NAMING_RE.search(name) or _STANDALONE_NUMBER_STEM_RE.fullmatch(stem):
+        return UNMAPPED_VIDEO_SUSPECT
+    return UNMAPPED_VIDEO_JUNK
 
 
 def is_bonus_directory_path(source_path: str) -> bool:

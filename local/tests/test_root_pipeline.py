@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1092,12 +1093,22 @@ class RootPipelineTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0].gap_id, f"{records[0].work_unit_id}::missing_episode::S02E01")
         self.assertEqual(gaps[0].status, "open")
-        # Non-empty source stays in intake until the terminal hand-off: no
-        # move happened, but the gaps_pending consumption deletes the tree.
-        self.assertEqual(alist.move_calls, [])
+        # Non-empty source stays in intake until the terminal hand-off; the
+        # gaps_pending consumption then deletes the tree.  The unmapped
+        # S01E03 (episode-named, planner never wrote it) hits the 2026-09-05
+        # gate: it is quarantined instead of deleted.
+        self.assertEqual(
+            alist.move_calls,
+            [(
+                "/incoming/Fate Zero",
+                f"/library/ScrapeFlow/待裁决/{root_task_id}",
+                ["S01E03.mkv"],
+            )],
+        )
         # Operator ruling 2026-09-02: gaps_pending is terminal for the intake
         # tree too — the gap ledger is the durable record, the staging tree
-        # is consumed, and no residual note is left on the job.
+        # is consumed, and no residual note is left on the job.  The
+        # quarantine is a success outcome (2026-09-05), not a residual.
         self.assertNotIn("/incoming/Fate Zero/S01E03.mkv", alist.files)
         self.assertNotIn("/incoming/Fate Zero", alist.dirs)
         self.assertIsNone(final.error)
@@ -1727,8 +1738,11 @@ class SourceShellCleanupTests(unittest.TestCase):
                     alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
             # Residuals the plan never claimed: an unsafe-name file, an
             # unsafe-name directory, a dot-run name the provider itself
-            # refuses to delete, and a safe sibling behind them all.
-            alist.files["/incoming/My Show/第01話：序章.mp4"] = b"junk"
+            # refuses to delete, and a safe sibling behind them all.  The
+            # unsafe file name deliberately carries no episode grammar: a
+            # 2026-09-05 gate would quarantine an episode-named video
+            # instead of deleting it, and this test exercises deletion.
+            alist.files["/incoming/My Show/特別映像：序章.mp4"] = b"junk"
             alist.files["/incoming/My Show/外伝／特別篇/safe.txt"] = b"junk"
             alist.files["/incoming/My Show/O. S. T..cue"] = b"junk"
             alist.dirs.add("/incoming/My Show")
@@ -1741,7 +1755,7 @@ class SourceShellCleanupTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "completed")
         self.assertIsNone(final.error)
-        self.assertNotIn("/incoming/My Show/第01話：序章.mp4", alist.files)
+        self.assertNotIn("/incoming/My Show/特別映像：序章.mp4", alist.files)
         self.assertNotIn("/incoming/My Show/外伝／特別篇/safe.txt", alist.files)
         self.assertNotIn("/incoming/My Show/O. S. T..cue", alist.files)
         self.assertNotIn("/incoming/My Show/O. S. T.cue", alist.files)
@@ -1752,7 +1766,7 @@ class SourceShellCleanupTests(unittest.TestCase):
         # behind them was still reached (no silent walk abort).
         raw_names = {name for _parent, names in alist.raw_remove_calls for name in names}
         strict_names = {name for _parent, names in alist.remove_calls for name in names}
-        self.assertIn("第01話：序章.mp4", raw_names)
+        self.assertIn("特別映像：序章.mp4", raw_names)
         self.assertIn("外伝／特別篇", raw_names)
         # provider_safe_basename collapses the ``..`` run into ``-``.
         self.assertIn("O. S. T-cue", strict_names)
@@ -1879,3 +1893,154 @@ class SourceShellCleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnmappedVideoQuarantineGateTests(unittest.TestCase):
+    """The terminal unmapped-video gate (operator ruling 2026-09-05).
+
+    Junk (theme-named, bonus-directory, short without episode grammar) dies
+    with the source tree.  Everything the engine cannot prove worthless —
+    episode-named videos, content-grade runtimes, unprobeable files — moves
+    to /ScrapeFlow/待裁决/<root>/ with a manifest, and a quarantined
+    video's sidecar subtitle moves with it.
+    """
+
+    def _setup(self, files: dict[str, bytes], durations: dict[str, float] | None = None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = CleaningIndexAList(files)
+
+        def probe_duration(path: str) -> float:
+            if path not in alist.files:
+                raise FileNotFoundError(path)
+            return durations.get(path, 90.0)
+
+        alist.video_duration_probe = probe_duration
+
+        def executor(plan):
+            for item in plan.files:
+                data = alist.files.pop(item.source_path, None)
+                if data is not None:
+                    alist.files[f"{item.target_dir.rstrip('/')}/{item.final_name}"] = data
+            return {"ok": True}
+
+        runner = SimpleEngineRunner(
+            state_root,
+            alist=alist,
+            tmdb=_confirming_tmdb(),
+            planner=_recording_planner([]),
+            validate=False,
+            library_root="/library",
+            executor=executor,
+        )
+        job = runner.create_root_job(
+            intake_source_id("/incoming/My Show"),
+            source_path="/incoming/My Show",
+            target_shelf="anime",
+        )
+        started = runner.start_automatic_job(job.id, target_shelf="anime")
+        return state_root, alist, runner, started.id
+
+    def test_gate_splits_junk_from_suspects_with_manifest(self) -> None:
+        files = {
+            # a planned episode anchors the unit; the executor moves it out
+            # before terminal consumption, so it never reaches the gate.
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            # junk: theme-named credits
+            "/incoming/My Show/NCOP01.mkv": FAKE_VIDEO_BYTES,
+            # junk: short and no episode grammar
+            "/incoming/My Show/making_of.mkv": FAKE_VIDEO_BYTES,
+            # suspect: unaired episode, episode grammar + content runtime
+            "/incoming/My Show/第13话 未放送.mkv": FAKE_VIDEO_BYTES,
+            # suspect: episode-named even though short (web mini-episode)
+            "/incoming/My Show/小剧场SP01.mkv": FAKE_VIDEO_BYTES,
+            # sidecar subtitle of the quarantined mini-episode moves too
+            "/incoming/My Show/小剧场SP01.zh-Hans.ass": b"subtitle-bytes",
+            # junk: unpaired subtitle dies with the tree
+            "/incoming/My Show/unrelated.ass": b"other-bytes",
+            # non-video residual
+            "/incoming/My Show/poster.jpg": b"jpg",
+        }
+        durations = {
+            "/incoming/My Show/NCOP01.mkv": 90.0,
+            "/incoming/My Show/making_of.mkv": 180.0,
+            "/incoming/My Show/第13话 未放送.mkv": 1420.0,
+            "/incoming/My Show/小剧场SP01.mkv": 240.0,
+        }
+        state_root, alist, runner, root_task_id = self._setup(files, durations)
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        # Quarantine is a success outcome: no residual note on the job.
+        self.assertIsNone(final.error)
+        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        # Suspects landed in quarantine, junk did not.
+        self.assertIn(f"{quarantine}/第13话 未放送.mkv", alist.files)
+        self.assertIn(f"{quarantine}/小剧场SP01.mkv", alist.files)
+        self.assertIn(f"{quarantine}/小剧场SP01.zh-Hans.ass", alist.files)
+        for name in ("NCOP01.mkv", "making_of.mkv", "unrelated.ass", "poster.jpg"):
+            self.assertNotIn(f"/incoming/My Show/{name}", alist.files)
+            self.assertNotIn(f"{quarantine}/{name}", alist.files)
+        # The whole source tree is gone.
+        self.assertNotIn("/incoming/My Show", alist.dirs)
+        # The manifest records every quarantined object with its reason.
+        manifest = json.loads(
+            alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
+        )
+        by_path = {
+            entry["source_path"]: entry for entry in manifest["entries"]
+        }
+        self.assertEqual(len(by_path), 3)
+        self.assertIn("正片级时长", by_path["/incoming/My Show/第13话 未放送.mkv"]["reason"])
+        self.assertIn(
+            "正片命名", by_path["/incoming/My Show/小剧场SP01.mkv"]["reason"]
+        )
+        self.assertEqual(
+            by_path["/incoming/My Show/小剧场SP01.zh-Hans.ass"]["reason"],
+            "疑似内容视频的配对字幕",
+        )
+
+    def test_unprobeable_video_fails_closed_into_quarantine(self) -> None:
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/mystery.mkv": FAKE_VIDEO_BYTES,
+        }
+        state_root, alist, runner, root_task_id = self._setup(files)
+
+        def broken_probe(path: str) -> float:
+            raise RuntimeError("provider link down")
+
+        alist.video_duration_probe = broken_probe
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        self.assertIn(f"{quarantine}/mystery.mkv", alist.files)
+        manifest = json.loads(
+            alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
+        )
+        (entry,) = manifest["entries"]
+        self.assertIn("无法证明", entry["reason"])
+
+    def test_bonus_directory_short_clip_dies_but_episode_runtime_lives(self) -> None:
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/特典/menu_clip.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/特典/未収録エピソード.mkv": FAKE_VIDEO_BYTES,
+        }
+        durations = {
+            "/incoming/My Show/特典/menu_clip.mkv": 60.0,
+            # An unaired episode hiding inside a bonus directory: the
+            # content-grade runtime trumps the directory context.
+            "/incoming/My Show/特典/未収録エピソード.mkv": 1450.0,
+        }
+        state_root, alist, runner, root_task_id = self._setup(files, durations)
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        self.assertNotIn(f"{quarantine}/特典/menu_clip.mkv", alist.files)
+        self.assertIn(f"{quarantine}/特典/未収録エピソード.mkv", alist.files)
