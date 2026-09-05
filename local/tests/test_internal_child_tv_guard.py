@@ -147,3 +147,29 @@ class InternalChildTvGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProvenCoordinateBeatsSupplementalNameTests(unittest.TestCase):
+    """A BD ``24 EXTRA`` special with a proven S00 coordinate is primary."""
+
+    def test_extra_named_special_with_s00_coordinate_passes(self) -> None:
+        plan = _plan(
+            _video(
+                "[Moozzi2] Mushoku Tensei Isekai Ittara Honki Dasu - 24 EXTRA (BD).mkv",
+                "无职转生～到了异世界就拿出真本事～ - S00E01 - 番外篇「艾莉丝的哥布林讨伐」.mkv",
+            ),
+        )
+        self.assertEqual(_internal_child_tv_primary_video_errors(plan), [])
+
+    def test_homeless_extra_content_still_rejected(self) -> None:
+        # No SxxEyy coordinate in the final name: the supplemental heuristic
+        # must still fire for genuinely homeless bonus material.
+        plan = _plan(
+            _video("show bonus.mkv", "show - menu tour.mkv"),
+        )
+        errors = _internal_child_tv_primary_video_errors(plan)
+        self.assertTrue(any("附加内容" in error for error in errors), errors)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -320,11 +320,6 @@ def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
         ):
             errors.append(f"内部 TV child 包含非视频主文件: {label}")
             continue
-        if _internal_child_member_is_supplemental(
-            source_path, original_name, final_name,
-        ):
-            errors.append(f"内部 TV child 包含附加内容: {label}")
-            continue
         source_ids = _internal_child_episode_coordinates(Path(source_path).name)
         original_ids = _internal_child_episode_coordinates(original_name)
         final_ids = _internal_child_episode_coordinates(final_name)
@@ -334,7 +329,19 @@ def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
         # final coordinate the normal planner already derived from the
         # single-season proof.  When the source does carry an explicit
         # token, it still has to agree with the final coordinate.
-        if len(final_ids) != 1:
+        if len(final_ids) == 1:
+            # A unique official coordinate is the planner's proof that this
+            # member is a primary episode — Season 00 specials included.  BD
+            # releases name genuine post-season specials ``24 EXTRA``; the
+            # supplemental-name heuristic must not overrule a proven
+            # coordinate, only catch members the planner left homeless.
+            pass
+        elif _internal_child_member_is_supplemental(
+            source_path, original_name, final_name,
+        ):
+            errors.append(f"内部 TV child 包含附加内容: {label}")
+            continue
+        else:
             errors.append(f"内部 TV child 缺少一致的唯一 episode 映射: {label}")
             continue
         if source_ids and source_ids != final_ids:
