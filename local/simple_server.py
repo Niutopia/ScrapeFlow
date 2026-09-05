@@ -145,10 +145,16 @@ class SimpleApplication:
             "last_registered_count": 0,
             "last_scan_empty": False,
         }
-        # Compatibility hook for focused coordinator tests that replace the
-        # bounded fresh-result method; it is never persisted as control state.
-        self._last_batch_container_present = False
         self._recover_persisted_engine_jobs()
+        # Crash-orphaned atomic-write temporaries are unreachable garbage;
+        # at startup no writer can be mid-flight, so sweep them once.
+        try:
+            from engine.scrapeflow.serialization import sweep_stale_temporaries
+            swept = sweep_stale_temporaries(self.state_root)
+            if swept:
+                print(f"[startup] 清理了 {swept} 个崩溃残留的临时文件", flush=True)
+        except Exception:  # noqa: BLE001 - hygiene only, never blocks start
+            pass
 
     def _recover_persisted_engine_jobs(self) -> None:
         """Recover Engine records without changing the operator control state."""
@@ -722,8 +728,7 @@ class SimpleApplication:
             # crash-recovery record.  A parked technical item cannot claim a
             # historical queued root just because it shares a source path.
             raise EngineJobConflictError("非 active 批次项不能复用已排队 RootJob")
-        if job.phase in {"reconciliation_uncertain", "failed", "queued"}:
-            self._require_prewrite_batch_retry_evidence(job, root_id)
+        self._require_prewrite_batch_retry_evidence(job, root_id)
         # Media count alone cannot prove a retry still refers to the same
         # B/W object set.  Rebuild a bounded fresh SourceManifest directly
         # against the existing root proof; any added, removed, renamed,
@@ -1514,10 +1519,28 @@ class SimpleApplication:
             finalize_root_gap_closure(runner, self.state_root, root_task_id)
         except (EnginePauseRequested, EngineCancellationRequested):
             return
-        except Exception:
+        except Exception as exc:
             # The replenishment runner persists retry/wait state for provider
             # failures.  Never dump a provider exception here: it can contain
-            # an opaque share URL or token.
+            # an opaque share URL or token.  An unexpected local failure
+            # (bug, disk error) still leaves a durable, redacted note on the
+            # job instead of a silent stall the operator cannot see.
+            from engine.scrapeflow.serialization import atomic_write_json
+
+            note_path = self.state_root / f"replenishment_crash_{root_task_id}.json"
+            try:
+                atomic_write_json(
+                    note_path,
+                    {
+                        "root_task_id": root_task_id,
+                        "note": "补源轮异常退出（详见日志时间戳），可重试 resume",
+                        "at": _now(),
+                    },
+                    allow_nan=False,
+                )
+            except Exception:  # noqa: BLE001 - best-effort note only
+                pass
+            print(f"[replenishment] root {root_task_id} 补源轮异常退出（已落崩溃标记）", flush=True)
             return
         finally:
             if runner is not None:

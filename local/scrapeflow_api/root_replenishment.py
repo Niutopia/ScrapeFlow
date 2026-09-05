@@ -812,7 +812,12 @@ def _remember_reviewed_torrent_misses(
         and _SAFE_TORRENT_LOCATOR.fullmatch(locator) is not None
     }
     if request_key not in value and len(value) >= _MAX_REVIEWED_TORRENT_MISS_SCOPES:
-        value.pop(next(iter(value)), None)
+        # Only evict the oldest scope when this round actually contributed
+        # evidence: an empty accept set must not throw away persisted
+        # "reviewed, no coverage" rows for nothing (the quark tier passes an
+        # empty locator set on rounds it does not search torrents).
+        if accepted:
+            value.pop(next(iter(value)), None)
     if accepted:
         value[request_key] = sorted({
             *value.get(request_key, []), *accepted,
@@ -2853,9 +2858,18 @@ def _run_root_subtitle_channel(
             if pause_requested is not None and pause_requested():
                 result["paused"] = True
                 break
+            # The provider may bind a delivery file to a gap outside this
+            # round's pending set (already closed, or still owned by a
+            # recovery intent).  That row is not this round's to finish:
+            # skip it with a visible note instead of KeyErroring the whole
+            # subtitle lane.
+            gap_row = pending.get(gap_id)
+            if gap_row is None:
+                result.setdefault("subtitle_out_of_round", []).append(gap_id)
+                continue
             completed = _finish_subtitle_intent(
                 runner, state_root, root_task_id, state,
-                gap=gap_records[gap_id], gap_row=pending[gap_id],
+                gap=gap_records[gap_id], gap_row=gap_row,
                 request=request, pause_requested=pause_requested,
             )
             outcome = completed.get("outcome")

@@ -5,7 +5,9 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -57,6 +59,35 @@ def _fsync_directory(path: Path) -> None:
         if not strictly_supported and exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRORS:
             return
         raise
+
+
+def sweep_stale_temporaries(root: Path, *, max_age_seconds: float = 3600.0) -> int:
+    """Delete crash-orphaned ``.{name}.{uuid}.tmp`` files under ``root``.
+
+    ``atomic_write_bytes`` unlinks its temporary on every in-process exit
+    path, but a hard crash between create and replace leaves one behind.
+    Called once at service start (when no writer can be mid-flight), this
+    reclaims those orphans.  Only files matching the exact temporary
+    pattern are considered; anything else is untouched.
+    """
+    pattern = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+    now = time.time()
+    removed = 0
+    try:
+        candidates = list(root.rglob(".*.tmp"))
+    except OSError:
+        return 0
+    for candidate in candidates:
+        try:
+            if not pattern.match(candidate.name):
+                continue
+            if now - candidate.stat().st_mtime < max_age_seconds:
+                continue
+            candidate.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None:

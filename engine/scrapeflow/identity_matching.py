@@ -13,7 +13,7 @@ import re
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Collection, Mapping, Sequence, TYPE_CHECKING
+from typing import Any, Collection, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 from .errors import ApiError, PlanError
 from .data.release_lexicon import (

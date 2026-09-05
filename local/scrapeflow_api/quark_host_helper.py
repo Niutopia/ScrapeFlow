@@ -61,6 +61,7 @@ MAX_RENDERER_RESPONSE_BYTES = 1024 * 1024
 # How long a resolved directory fid stays warm: the staging parent chain
 # is stable across attempts, so caching cuts most of the throttled walk.
 _FID_CACHE_TTL_SECONDS = 600.0
+_FID_CACHE_MAX_ENTRIES = 4096
 QUARK_DRIVE_API = "https://drive.quark.cn/1/clouddrive"
 QUARK_SHARE_API = "https://drive-pc.quark.cn/1/clouddrive"
 QUARK_UA = (
@@ -1197,6 +1198,19 @@ return run().catch(() => JSON.stringify({kind: "transport_error"}));
             parent = str(matches[0]["fid"])
             key = mount_path.rstrip("/") + "/" + "/".join(components[: index + 1])
             self._fid_cache[key] = (now + _FID_CACHE_TTL_SECONDS, parent)
+        # Expired entries were previously kept forever (only reads skipped
+        # them), so a long-lived sidecar grew the dict without bound.
+        if len(self._fid_cache) > _FID_CACHE_MAX_ENTRIES:
+            for stale in [
+                k for k, (expires, _parent) in self._fid_cache.items()
+                if expires <= now
+            ]:
+                self._fid_cache.pop(stale, None)
+            if len(self._fid_cache) > _FID_CACHE_MAX_ENTRIES:
+                for oldest in sorted(
+                    self._fid_cache, key=lambda k: self._fid_cache[k][0]
+                )[: len(self._fid_cache) - _FID_CACHE_MAX_ENTRIES]:
+                    self._fid_cache.pop(oldest, None)
         return parent
 
     async def share_save(self, payload: Mapping[str, object]) -> Mapping[str, object]:

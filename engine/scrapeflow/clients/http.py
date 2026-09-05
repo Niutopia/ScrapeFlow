@@ -108,6 +108,20 @@ def redact_sensitive_text(text: str, secrets: Iterable[str] = ()) -> str:
     return cleaned.replace("\r", " ").replace("\n", " ")[:500]
 
 
+def _parse_retry_after(value: object) -> float | None:
+    """Parse a Retry-After header (delay-seconds form only, bounded)."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        return None  # HTTP-date form: fall back to the default backoff
+    if seconds < 0:
+        return None
+    return seconds
+
+
 class JsonHttpClient:
     def __init__(
         self,
@@ -220,6 +234,15 @@ class JsonHttpClient:
                         exc.close()
                     suffix = f"; {detail}" if detail else ""
                     raise ApiError(f"HTTP {exc.code}: {redact_url(url)}{suffix}", status_code=exc.code) from exc
+                if exc.code == 429:
+                    # Honor the provider's Retry-After when present: the
+                    # fixed exponential backoff (≤ 8 s) kept hammering a
+                    # rate-limit window that outlasts it.
+                    retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
+                    exc.close()
+                    if retry_after is not None:
+                        time.sleep(min(retry_after, 60.0))
+                        continue
                 exc.close()
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 last_error = exc
