@@ -397,6 +397,13 @@ def _cleanup_consumed_source_root(
                 quarantine_root = f"{quarantine_root}-{root_task_id[-8:]}"
         except Exception:
             pass
+    # A terminal root can outlive its API process's AList session: the
+    # client logged in at startup and the token expired hours later (the
+    # 無職轉生 saga: every listing raised 尚未登录 AList, fail-closing the
+    # whole cleanup into a permanent residual note while fresh-session probes
+    # kept "proving" the tree was gone).  run_root_pipeline already guards
+    # its read boundary the same way — this is the consume boundary's turn.
+    runner._ensure_authenticated(runner.alist)  # noqa: SLF001 - shared runner guard
     try:
         bound = any(
             entry.root_task_id == root_task_id and entry.canonical_path == source
