@@ -697,6 +697,50 @@ def remux_inner_file_to_matroska(
     )
 
 
+def _video_packet_span_seconds(
+    output_path: str,
+    *,
+    probe_timeout_seconds: float,
+    ffmpeg_argv: Sequence[str],
+) -> float:
+    """First→last video packet timestamp span; 0.0 when unavailable.
+
+    ``ffprobe`` 5.1 does not report a per-stream ``duration`` for Matroska,
+    so the video stream's runtime is derived from its packet timestamps.
+    """
+    probe_argv = [
+        ffmpeg_argv[0].replace("ffmpeg", "ffprobe"),
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time",
+        "-of", "csv=p=0",
+        output_path,
+    ]
+    try:
+        completed = subprocess.run(
+            probe_argv,
+            capture_output=True,
+            timeout=probe_timeout_seconds,
+        )
+    except FileNotFoundError:
+        return 0.0
+    if completed.returncode != 0:
+        return 0.0
+    stamps: list[float] = []
+    for line in completed.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            stamps.append(float(line))
+        except ValueError:
+            continue
+    if len(stamps) < 2:
+        return 0.0
+    span = stamps[-1] - stamps[0]
+    return span if span > 0 else 0.0
+
+
 def _probe_local_matroska(
     output_path: str,
     *,
@@ -742,8 +786,10 @@ def _probe_local_matroska(
     # The container duration covers every stream; a trailing subtitle track
     # can extend it past the playlist's clip span (observed on a DIY disc
     # whose last subtitle lagged the video by ~7s).  The episode's runtime
-    # is the video stream's duration, so gate on that and fall back to the
-    # container duration only when ffprobe reports no per-stream value.
+    # is the video stream's duration, so gate on that.  ffprobe 5.1 does
+    # not emit a per-stream "duration" for Matroska, so the video span is
+    # read from the first/last packet timestamps when the field is absent;
+    # only when neither is available does the container duration stand in.
     duration = 0.0
     for stream in streams:
         if stream.get("codec_type") == "video":
@@ -753,6 +799,11 @@ def _probe_local_matroska(
             except (TypeError, ValueError):
                 candidate = 0.0
             duration = max(duration, candidate)
+    if duration <= 0:
+        duration = _video_packet_span_seconds(
+            output_path, probe_timeout_seconds=probe_timeout_seconds,
+            ffmpeg_argv=ffmpeg_argv,
+        )
     if duration <= 0:
         duration = float(payload.get("format", {}).get("duration") or 0.0)
     if expected_duration_seconds is not None and (
