@@ -330,6 +330,25 @@ def _probe_scope_candidates(
     return candidates
 
 
+def _synthetic_dir_row(path: str) -> dict[str, Any]:
+    """A minimal directory row for the merged B snapshot.
+
+    ``build_scoped_source_node`` matches scopes by exact path, so a staged
+    scope directory needs its own row even though the walk itself only
+    returns children.  The synthetic row mirrors the shape of the walk's
+    directory entries.
+    """
+    normalized = path.rstrip("/")
+    return {
+        "path": "",
+        "virtual_path": normalized,
+        "name": posixpath.basename(normalized),
+        "size": 0,
+        "is_dir": True,
+        "full_path": normalized,
+    }
+
+
 def _merge_snapshot(
     snapshot: Mapping[str, Any],
     staged_rows: Sequence[Mapping[str, Any]],
@@ -576,6 +595,12 @@ def _expand_one_scope(
         raise DiscExpansionBridgeError(
             f"展开 staging 树不可见: {staged_scope}"
         )
+    # The walk lists children only; the converted unit's new source_path IS
+    # the staged scope, so the merged snapshot must carry that directory row
+    # itself (plus any ancestor between the merged root and the scope) or
+    # build_scoped_source_node cannot find the scope and C parks the unit
+    # with 来源范围在 B 快照中不存在.
+    rows.insert(0, _synthetic_dir_row(staged_scope))
     staged_rows.extend(rows)
     staged_node = build_source_inventory(rows, staged_scope)
     candidates_new = analyze_boundaries(staged_node, root_task_id=record.root_task_id)
