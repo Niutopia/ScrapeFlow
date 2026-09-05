@@ -3909,10 +3909,32 @@ class SimpleEngineRunner:
         source_root = _safe_remote_path(
             request.source_path, field="source_path", allow_root=False,
         )
+        # A disc-expansion unit's scopes live in the task-owned expansion
+        # staging tree, not under the ingress source.  The bridge's own
+        # validate_unit_scopes_for_root already admits that second root, so
+        # the planner-side gate must accept the same task-derived tree or
+        # every converted unit fails here with 来源范围不属于 Engine 来源根.
+        from engine.scrapeflow.disc_expansion_bridge import (
+            expansion_staging_root,
+        )
+
+        expansion_roots: set[str] = set()
+        for raw in request.source_scope_paths:
+            probe = _safe_remote_path(raw, field="source_scope_path", allow_root=False)
+            marker = f"{self.library_root.rstrip('/')}/ScrapeFlow/展开/"
+            if probe.startswith(marker):
+                task_id = probe[len(marker):].split("/", 1)[0]
+                expansion_roots.add(
+                    expansion_staging_root(self.library_root, task_id)
+                )
         scopes: list[str] = []
         for raw in request.source_scope_paths:
             scope = _safe_remote_path(raw, field="source_scope_path", allow_root=False)
-            if not (scope == source_root or scope.startswith(source_root + "/")):
+            allowed_roots = [source_root] + list(expansion_roots)
+            if not any(
+                scope == allowed or scope.startswith(allowed + "/")
+                for allowed in allowed_roots
+            ):
                 raise EngineRequestError("来源范围不属于 Engine 来源根")
             if scope in scopes:
                 raise EngineRequestError("来源范围包含重复路径")
