@@ -2995,6 +2995,13 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path, query = self._path()
+        # The read face used to skip the local/origin gate entirely: a DNS
+        # rebinding page (or any client with a foreign Host) could read the
+        # full job/intake/browse metadata although every POST was blocked.
+        # Reads now enforce the same loopback-authority rule as writes; the
+        # Docker healthcheck is a bare TCP connect and is unaffected.
+        if self._reject_nonlocal_request():
+            return
         try:
             if path in {"/", "/index.html"}:
                 self._send_html(200, dashboard_html())
