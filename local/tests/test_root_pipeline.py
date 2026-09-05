@@ -2042,5 +2042,47 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
 
         self.assertEqual(final.phase, "completed")
         quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        self.assertNotIn(f"{quarantine}/menu_clip.mkv", alist.files)
         self.assertNotIn(f"{quarantine}/特典/menu_clip.mkv", alist.files)
-        self.assertIn(f"{quarantine}/特典/未収録エピソード.mkv", alist.files)
+        # Flat layout (2026-09-05): no source-structure mirroring subdirs.
+        self.assertIn(f"{quarantine}/未収録エピソード.mkv", alist.files)
+
+    def test_same_basename_collision_never_overwrites(self) -> None:
+        """Two suspects with the same basename: first takes the flat slot,
+        the second lands in a parent-named disambiguation subdir — an AList
+        move never overwrites an earlier quarantine."""
+        files = {
+            "/incoming/My Show/S01E01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/SP/sp01.mkv": FAKE_VIDEO_BYTES,
+            "/incoming/My Show/特典/sp01.mkv": FAKE_VIDEO_BYTES,
+        }
+        durations = {
+            "/incoming/My Show/SP/sp01.mkv": 1420.0,
+            "/incoming/My Show/特典/sp01.mkv": 1430.0,
+        }
+        state_root, alist, runner, root_task_id = self._setup(files, durations)
+
+        final = run_root_pipeline(runner, state_root, root_task_id)
+
+        self.assertEqual(final.phase, "completed")
+        self.assertIsNone(final.error)
+        quarantine = f"/library/ScrapeFlow/待裁决/{root_task_id}"
+        # One sp01.mkv at the flat root, the other under its source parent
+        # directory's name; both survive.
+        flat = f"{quarantine}/sp01.mkv" in alist.files
+        in_sp = f"{quarantine}/SP/sp01.mkv" in alist.files
+        in_tokuten = f"{quarantine}/特典/sp01.mkv" in alist.files
+        self.assertTrue(flat)
+        self.assertTrue(in_sp or in_tokuten)
+        self.assertFalse(in_sp and in_tokuten)
+        # The manifest records the original relative path of each.
+        manifest = json.loads(
+            alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
+        )
+        relatives = {entry["relative_path"] for entry in manifest["entries"]}
+        self.assertEqual(
+            relatives, {"SP/sp01.mkv", "特典/sp01.mkv"},
+        )
+        paths = {entry["quarantine_path"] for entry in manifest["entries"]}
+        self.assertIn(f"{quarantine}/sp01.mkv", paths)
+        self.assertEqual(len(paths), 2)

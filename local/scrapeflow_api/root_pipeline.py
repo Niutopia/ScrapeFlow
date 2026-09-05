@@ -489,39 +489,71 @@ def _cleanup_consumed_source_root(
         except (TypeError, ValueError):
             return None
 
+    _verified_quarantine_dirs: set[str] = set()
+
     def ensure_quarantine_dir(path: str) -> bool:
-        """Materialize one quarantine directory level by level."""
+        """Materialize one quarantine directory level by level (cached)."""
+        if path in _verified_quarantine_dirs:
+            return True
         if not path.startswith("/"):
             return False
         segments = [seg for seg in path.split("/") if seg]
         current = ""
-        for index, segment in enumerate(segments):
+        for segment in segments:
             current = f"{current}/{segment}"
-            if index < 3:
-                # /quark/影视/ScrapeFlow always exists in practice; probing
-                # it is wasted calls, and mkdir is idempotent for the few
-                # roots where it may not.
+            if current in _verified_quarantine_dirs:
                 continue
             try:
                 probe = runner.alist.try_list(current, refresh=True)
             except Exception:
                 probe = None
-            if probe is not None:
-                continue
-            try:
-                runner.alist.mkdir(current)
-            except Exception as exc:  # noqa: BLE001 - reported as residual
-                failures.append(current)
-                _trace(f"待裁决目录创建失败: {current}: {exc}")
-                return False
+            if probe is None:
+                try:
+                    runner.alist.mkdir(current)
+                except Exception as exc:  # noqa: BLE001 - reported as residual
+                    failures.append(current)
+                    _trace(f"待裁决目录创建失败: {current}: {exc}")
+                    return False
+            _verified_quarantine_dirs.add(current)
         return True
 
+    quarantined_names: set[str] = set()
+
     def quarantine_file(directory: str, name: str, child: str, reason: str) -> bool:
-        """Move one suspect into the quarantine tree and prove it landed."""
+        """Move one suspect into the quarantine root, FLAT (operator ruling
+        2026-09-05: 平铺方便人工裁决，不镜像源目录结构).
+
+        A basename that already occupies the flat root — from this batch or
+        a previous partial run — falls back to a disambiguating subdirectory
+        named after the file's source parent directory, so an AList move can
+        never overwrite an earlier quarantine.  The manifest keeps the
+        original relative path for full traceability either way.
+        """
         if paused():
             return False
         relative = posixpath.relpath(child, source)
-        target_dir = posixpath.dirname(posixpath.join(quarantine_root, relative))
+        target_dir = quarantine_root
+        if name in quarantined_names:
+            parent_tag = posixpath.basename(directory.rstrip("/")) or "源目录"
+            target_dir = posixpath.join(quarantine_root, parent_tag)
+        else:
+            # Cross-run safety: a previous partial consumption may have left
+            # the same basename at the flat root.  An unprovable listing also
+            # routes to the disambiguating subdir (fail closed, never move
+            # onto an unproven target).
+            try:
+                existing = rows_proven(quarantine_root)
+            except Exception:
+                existing = None
+            if existing is not None and any(
+                item.get("name") == name for item in existing
+            ):
+                parent_tag = posixpath.basename(directory.rstrip("/")) or "源目录"
+                target_dir = posixpath.join(quarantine_root, parent_tag)
+                if name in quarantined_names:
+                    failures.append(child)
+                    _trace(f"待裁决同名冲突无法消歧: {child}")
+                    return False
         if not ensure_quarantine_dir(target_dir):
             return False
         try:
@@ -544,9 +576,11 @@ def _cleanup_consumed_source_root(
             (int(item.get("size") or 0) for item in after if item.get("name") == name),
             0,
         )
+        quarantined_names.add(name)
         quarantined.append({
             "source_path": child,
             "relative_path": relative,
+            "quarantine_path": posixpath.join(target_dir, name),
             "size": size,
             "reason": reason,
             "moved_at": _now(),
