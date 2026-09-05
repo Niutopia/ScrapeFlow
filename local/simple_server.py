@@ -2158,11 +2158,28 @@ class SimpleApplication:
         from local.scrapeflow_api.root_pipeline import consume_terminal_source_root
 
         runner = self._get_engine_runner()
+
+        def _explicit_consume_pause_requested() -> bool:
+            """Only a live cancellation stops an explicit terminal cleanup.
+
+            The standing pause is the engine's RESTING state after a run
+            completes — it gates the automatic worker, not the operator's
+            explicit action on an already-terminal root.  Routing it through
+            ``_root_pause_requested`` silently no-opped every consume-source
+            re-run (the walk aborted at its first pause check with an empty
+            failure list, leaving the residual note unchanged).  A
+            cancellation request raised during the walk still stops it.
+            """
+            try:
+                return runner.cancellation_pending(job_id)
+            except (EngineJobNotFoundError, SimpleEngineError):
+                return True
+
         receipt = consume_terminal_source_root(
             runner,
             self.state_root,
             engine_job,
-            pause_requested=lambda: self._root_pause_requested(job_id),
+            pause_requested=_explicit_consume_pause_requested,
         )
         return {"consume_source": receipt}
 
