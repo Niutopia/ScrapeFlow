@@ -3192,6 +3192,18 @@ def _request_for_unit(
         source_path = request.source_path
         if len(fresh_scopes) > 1:
             source_path = str(runner._job_ingress_source(root_job)).rstrip("/")  # noqa: SLF001
+            # An expansion-born unit's scopes sit in the task-owned staging
+            # tree; the common planner root must cover them or every plan
+            # file fails the source_root containment check.  Use the staging
+            # root (all scopes share it) instead of the ingress.
+            if record.disc_expansion is not None:
+                from engine.scrapeflow.disc_expansion_bridge import (
+                    expansion_staging_root,
+                )
+
+                source_path = expansion_staging_root(
+                    runner.library_root, root_task_id,
+                )
         elif scope_kinds.get(fresh_scopes[0]) == "file":
             source_path = posixpath.dirname(fresh_scopes[0]) or "/"
         request = replace(
