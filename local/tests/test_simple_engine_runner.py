@@ -82,6 +82,18 @@ class FakeAList:
         self.renames: list[tuple[str, str]] = []
         self.uploads: list[str] = []
 
+    def video_stream_probe(self, path: str) -> dict[str, object]:
+        """Admission seam for the executor's pre-move ffprobe gate.
+
+        The fake bytes are not real media, so the scenario double answers
+        the bounded video-stream admission itself.  The production
+        ``AListClient`` never defines this hook and always runs the real
+        probe.
+        """
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return {"status": "satisfied", "video_streams": 1}
+
     def exact_file_info(self, path: str) -> dict[str, object] | None:
         value = self.files.get(path)
         return None if value is None else {"size": len(value)}
@@ -4396,6 +4408,73 @@ class SimpleEngineRunnerTests(unittest.TestCase):
         self.assertFalse(any(
             "字母变体" in warning for warning in plan.warnings
         ))
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class VideoStreamAdmissionGateTests(unittest.TestCase):
+    """The pre-move gate rejects non-video payloads before any formal write."""
+
+    def _plan(self, source: str) -> object:
+        from engine.scrapeflow.models import Plan, PlannedFile
+
+        return Plan(
+            mode="tv",
+            source_root=source,
+            target_root="/library/番剧/Work",
+            files=[PlannedFile(
+                source_path=f"{source}/S01E01.mkv",
+                source_dir=source,
+                original_name="S01E01.mkv",
+                final_name="Work - S01E01.mkv",
+                target_dir="/library/番剧/Work",
+                media_kind="video",
+                source_size=FAKE_VIDEO_SIZE,
+            )],
+            warnings=[],
+            metadata={"tmdb_id": 1, "title": "Work", "year": "2020"},
+        )
+
+    def test_rejects_object_without_video_stream(self) -> None:
+        from local.scrapeflow_api.simple_engine_runner import (
+            EngineExecutionError,
+            SimplePlanExecutor,
+        )
+
+        alist = FakeAList()
+        alist.files = {"/in/S01E01.mkv": FAKE_VIDEO_BYTES}
+
+        def rejecting_probe(_path: str) -> dict[str, object]:
+            return {"status": "unsatisfied", "reason": "video_stream_missing"}
+
+        alist.video_stream_probe = rejecting_probe
+        executor = SimplePlanExecutor(alist)
+        with tempfile.TemporaryDirectory():
+            with self.assertRaises(EngineExecutionError) as ctx:
+                executor.execute(self._plan("/in"))
+            self.assertIn("视频流检查未通过", str(ctx.exception))
+            # Nothing moved into the formal library.
+            self.assertEqual(alist.moves, [])
+
+    def test_skips_probe_for_already_moved_source(self) -> None:
+        from local.scrapeflow_api.simple_engine_runner import SimplePlanExecutor
+
+        alist = FakeAList()
+        # Source already consumed by an earlier run: only the target exists.
+        alist.files = {"/library/番剧/Work/Work - S01E01.mkv": FAKE_VIDEO_BYTES}
+
+        def exploding_probe(path: str) -> dict[str, object]:
+            raise AssertionError(f"probe should be skipped, got {path}")
+
+        alist.video_stream_probe = exploding_probe
+        executor = SimplePlanExecutor(alist)
+        # Execution reaches the already-present readback without probing.
+        result = executor.execute(self._plan("/in"))
+        self.assertEqual(
+            result["files"][0]["status"], "already_present",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

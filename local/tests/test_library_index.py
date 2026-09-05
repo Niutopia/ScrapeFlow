@@ -101,6 +101,19 @@ class IndexAList:
             return value[:max_bytes]
         return value
 
+    def video_stream_probe(self, path: str) -> dict[str, object]:
+        """Admission seam for the executor's pre-move ffprobe gate.
+
+        The in-memory bytes are fake payloads that no real ffprobe could
+        admit, so the shared scenario double answers the bounded
+        video-stream admission itself (``SimplePlanExecutor`` consults this
+        hook; the production client never defines it and always runs the
+        real probe).
+        """
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return {"status": "satisfied", "video_streams": 1}
+
     def try_list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
         del refresh
         return self.list(path)

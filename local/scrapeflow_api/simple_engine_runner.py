@@ -148,6 +148,15 @@ class EngineWorkerBusyError(SimpleEngineError):
     """The one local formal writer is currently busy."""
 
 
+def _is_plan_video(item: object, path: str) -> bool:
+    """Whether a plan row is a video, by kind or by either filename."""
+    return bool(
+        getattr(item, "media_kind", None) == "video"
+        or is_video_filename(getattr(item, "original_name", None))
+        or is_video_filename(path)
+    )
+
+
 def _require_admissible_video_size(
     item: object,
     size: object,
@@ -1073,6 +1082,43 @@ class SimplePlanExecutor:
         self.alist = alist
         self.tmdb = tmdb
 
+    def _require_admissible_video_stream(self, path: str, *, stage: str) -> None:
+        """Prove one remote object carries a real video stream (bounded).
+
+        The size gate proves transport consistency, not payload shape.  This
+        runs the shared bounded ffprobe admission over a fresh AList link:
+        infrastructure failures (no ffprobe, no link) fail closed, and a
+        candidate without an explicit video stream is rejected before any
+        move can write it into the formal library.
+
+        ``video_stream_probe`` on the client is the task-local admission
+        seam used by scenario doubles: the production ``AListClient`` does
+        not define it, so production always runs the real bounded ffprobe.
+        """
+        from engine.scrapeflow.video_admission import (
+            VideoAdmissionError,
+            probe_remote_video_stream,
+        )
+
+        hook = getattr(self.alist, "video_stream_probe", None)
+        if callable(hook):
+            verdict = hook(path)
+        else:
+            try:
+                verdict = probe_remote_video_stream(self.alist, path)
+            except VideoAdmissionError as exc:
+                if exc.infrastructure:
+                    raise EngineExecutionError(
+                        f"{stage}视频流检查基础设施不可用 ({exc.reason}): {path}"
+                    ) from exc
+                raise EngineExecutionError(
+                    f"{stage}对象无有效视频流 ({exc.reason}): {path}"
+                ) from exc
+        if str(verdict.get("status") or "").casefold() != "satisfied":
+            raise EngineExecutionError(
+                f"{stage}视频流检查未通过: {path}"
+            )
+
     @staticmethod
     def _entry_size(raw: object) -> int | None:
         if raw is None:
@@ -1740,7 +1786,12 @@ class SimplePlanExecutor:
         _require_cleanup_allowlist(plan, stage="计划执行")
         # Reject every known undersized video before the first move, so a
         # multi-file plan cannot partially write formal media and only then
-        # discover a test fragment later in the same plan.
+        # discover a test fragment later in the same plan.  The same loop
+        # admits every still-present source video through a bounded ffprobe
+        # stream check (contract: 大小门 + 媒体流有效性检查): an extension or
+        # a matching size can never stand in for an actual video stream.  A
+        # source that is already gone was moved by an earlier run of this
+        # same plan and is skipped rather than treated as a probe failure.
         for item in files:
             source_path = str(getattr(item, "source_path"))
             expected = getattr(item, "source_size", None)
@@ -1754,6 +1805,11 @@ class SimplePlanExecutor:
                 _require_admissible_video_size(
                     item, expected, path=source_path, stage="计划",
                 )
+            if (
+                _is_plan_video(item, source_path)
+                and self._exact(source_path) is not None
+            ):
+                self._require_admissible_video_stream(source_path, stage="计划")
         # This must precede the first move: an old persisted plan can contain
         # a bad name late in its list, and discovering it after earlier media
         # writes would recreate the move/rename split that recovery is trying
