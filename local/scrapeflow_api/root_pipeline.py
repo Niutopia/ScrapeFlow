@@ -351,6 +351,24 @@ def _cleanup_consumed_source_root(
         except Exception:
             return True
 
+    def rows_proven(path: str) -> list[Mapping[str, object]]:
+        """List with bounded retries; raise only when unprovable.
+
+        A provider that transiently fails a verification listing gets a few
+        retries, but "cannot list" is never silently interpreted as "already
+        gone" — the caller treats an unprovable listing as an unproven
+        delete and reports it as a residual.
+        """
+        last: Exception | None = None
+        for _attempt in range(3):
+            if paused():
+                raise RuntimeError(f"暂停边界，无法证明目录状态: {path}")
+            try:
+                return rows(path)
+            except Exception as exc:  # noqa: BLE001 - retried, then raised
+                last = exc
+        raise RuntimeError(f"AList 目录回读失败，删除结果无法证明: {path}: {last}")
+
     def delete_file(parent: str, name: str) -> bool:
         """Delete one file and prove it disappeared through a fresh listing."""
         for _attempt in range(3):
@@ -362,9 +380,12 @@ def _cleanup_consumed_source_root(
                 failures.append(posixpath.join(parent, name))
                 return False
             try:
-                after = rows(parent)
+                after = rows_proven(parent)
             except Exception:
-                return True
+                # Unproven is NOT deleted: report the residual so the
+                # operator re-runs consume-source when the provider recovers.
+                failures.append(posixpath.join(parent, name))
+                return False
             if not any(item.get("name") == name for item in after):
                 return True
         # The driver keeps acknowledging the delete without applying it.
@@ -385,9 +406,11 @@ def _cleanup_consumed_source_root(
             except Exception:
                 pass
             try:
-                parent_rows = rows(parent)
+                parent_rows = rows_proven(parent)
             except Exception:
-                return True
+                # Unproven removal is a reported residual, never success.
+                failures.append(directory)
+                return False
             if not any(item.get("name") == name for item in parent_rows):
                 removed.append(directory)
                 return True
@@ -399,9 +422,10 @@ def _cleanup_consumed_source_root(
             except Exception:
                 pass
             try:
-                parent_rows = rows(parent)
+                parent_rows = rows_proven(parent)
             except Exception:
-                return True
+                failures.append(directory)
+                return False
             if not any(item.get("name") == name for item in parent_rows):
                 removed.append(directory)
                 return True
@@ -413,11 +437,11 @@ def _cleanup_consumed_source_root(
         if paused():
             return False
         try:
-            entries = rows(directory)
+            entries = rows_proven(directory)
         except Exception:
-            # A provider that cannot list the directory has nothing more to
-            # delete; treat it as already gone.
-            return True
+            # A directory that cannot be listed cannot be proven deleted;
+            # abort the walk so the surviving tree stays a reported residual.
+            return False
         for item in entries:
             if paused():
                 return False
@@ -442,17 +466,18 @@ def _cleanup_consumed_source_root(
         return True
 
     def source_remaining() -> bool:
+        """Fail closed: an unprovable listing counts as still remaining."""
         parent = posixpath.dirname(source) or "/"
         name = posixpath.basename(source)
         try:
-            if any(item.get("name") == name for item in rows(parent)):
+            if any(item.get("name") == name for item in rows_proven(parent)):
                 return True
         except Exception:
-            return False
+            return True
         try:
-            return bool(rows(source))
+            return bool(rows_proven(source))
         except Exception:
-            return False
+            return True
 
     if not visit(source):
         # The walk aborted (pause, provider refusal, or an unsafe entry):
@@ -464,7 +489,8 @@ def _cleanup_consumed_source_root(
             "source_remaining": source_remaining(),
         }
     # The source root itself: delete it the same way so the intake monitor
-    # marks the catalog entry missing on its next scan.
+    # marks the catalog entry missing on its next scan.  An unproven root
+    # removal stays visible through source_remaining below.
     delete_directory(source)
 
     return {
