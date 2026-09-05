@@ -564,7 +564,10 @@ class SimpleServerTests(unittest.TestCase):
             status, control = self.request("POST", "/api/control/resume", {})
 
         self.assertEqual(status, 200)
-        self.assertEqual(control, {"paused": False, "root_job_id": root_id})
+        self.assertEqual(
+                control,
+                {"paused": False, "root_job_id": root_id, "dispatched": True},
+            )
         self.assertEqual(queued, [root_id])
 
     def test_resume_does_not_backfill_a_completed_planner_gap(self) -> None:

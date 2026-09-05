@@ -273,14 +273,36 @@ class SimpleApplication:
         self._resume_automatic_jobs()
 
     def resume_selected_root_job(self, root_job_id: object | None = None) -> dict[str, object]:
-        """Resume the selected RootJob, optionally selecting it in this call."""
+        """Resume the selected RootJob, optionally selecting it in this call.
+
+        The response reports whether dispatch actually happened: the lone
+        worker slot may still be finishing the previous root, in which case
+        ``dispatched`` is false with a reason instead of a silent no-op the
+        operator only discovers when nothing runs.
+        """
         with self._automatic_lock:
             control = self.control()
             selected = control.get("root_job_id") if root_job_id is None else root_job_id
             selected = self._validate_selected_root_job(selected)
             payload = self._control_state.set(paused=False, root_job_id=selected)
+            active = self._worker_future
+            busy = (
+                self._worker_root_job_id is not None
+                and active is not None
+                and not active.done()
+            )
+        if busy and self._worker_root_job_id != selected:
+            payload = {
+                **payload,
+                "dispatched": False,
+                "reason": (
+                    f"worker 仍在收尾上一任务 {self._worker_root_job_id}；"
+                    "当前任务已选中未暂停，将在其结束后由下一次恢复派工"
+                ),
+            }
+            return payload
         self._resume_after_control_open()
-        return payload
+        return {**payload, "dispatched": True}
 
     # ------------------------------------------------------------------
     # Phase 1: Intake catalog
@@ -1811,6 +1833,21 @@ class SimpleApplication:
         """
         if not isinstance(payload, Mapping):
             raise EngineRequestError("确认请求必须是 JSON 对象")
+        # The confirmation is a lock-free ledger write; the pipeline's own
+        # saves race it when this root's worker is live (the operator's
+        # "confirmed" could be silently overwritten back to uncertain).
+        # Require the worker to be stopped for this root — pausing first is
+        # the documented operator flow.
+        with self._automatic_lock:
+            active = self._worker_future
+            if (
+                self._worker_root_job_id == job_id
+                and active is not None
+                and not active.done()
+            ):
+                raise EngineWorkerBusyError(
+                    "任务运行中不能确认作品单元；请先暂停再确认"
+                )
         unknown = set(payload) - {"tmdb_id", "media_type", "season"}
         if unknown:
             raise EngineRequestError("确认只接受 tmdb_id、media_type 与可选 season")
@@ -2214,6 +2251,21 @@ class SimpleApplication:
         selected = self._validate_selected_root_job(job_id)
         if self.control().get("root_job_id") != selected:
             raise EngineRequestError("请先选择此 RootJob")
+        # A retry rewrites the job to queued and requeues uncertain units in
+        # the shared work-unit ledger while the worker may still be running
+        # this same root — two lock-free ledger writers racing each other.
+        # Refuse while the root's worker is live (same guard as cleanup /
+        # consume-source); the operator retries after it stops or pauses.
+        with self._automatic_lock:
+            active = self._worker_future
+            if (
+                self._worker_root_job_id == engine_job.id
+                and active is not None
+                and not active.done()
+            ):
+                raise EngineWorkerBusyError(
+                    "任务仍在运行，不能重试；请先暂停或等它收口"
+                )
         from local.scrapeflow_api.root_pipeline import is_intake_bound_root
 
         if not is_intake_bound_root(self.state_root, job_id):
