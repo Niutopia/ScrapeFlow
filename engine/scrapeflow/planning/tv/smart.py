@@ -2906,7 +2906,15 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     ]
                     _offset = _hi
                 for item in _only_group:
-                    if extract_episode_key(str(item.get("name", ""))) is None:
+                    item_key = extract_episode_key(str(item.get("name", "")))
+                    # Everything the range filter dropped must land somewhere:
+                    # keyless files AND fractional/special keys (10.5, [SP01])
+                    # previously fell through both filters here and silently
+                    # vanished from every subplan — left in source with no
+                    # problem row.  They join the first season's group so
+                    # the ordinary per-season special/fractional machinery
+                    # handles them.
+                    if item_key is None or item_key.kind != "regular":
                         _split[int(_ordered[0]["season_number"])].append(item)
                 season_groups = defaultdict(
                     list, {s: g for s, g in _split.items() if g}
