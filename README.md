@@ -49,16 +49,20 @@ POST /api/root-jobs                 {"path":"/quark/影视/待刮削/作品","ta
 POST /api/control/select            {"root_job_id":"..."}
 POST /api/control/resume            {"root_job_id":"..."}   # 可省略，恢复当前选择
 POST /api/control/pause             {}
-POST /api/jobs/:id/confirm          {"media_type":"tv","tmdb_id":123,"season":1}
+POST /api/jobs/:id/work-units/:unitId/confirm   {"media_type":"tv","tmdb_id":123,"season":1}
 POST /api/jobs/:id/replenish        {}
 POST /api/jobs/:id/retry            {}
 POST /api/jobs/:id/cancel           {}
 POST /api/jobs/:id/cleanup          {}
+POST /api/jobs/:id/consume-source   {}   # 终态根消费源树与展开 staging，幂等可重跑
+POST /api/jobs/:id/file-disc-ruling {}   # 光盘 scope 的播放列表→集数人工裁决
 POST /api/batch                     {"items":[{"source_id":"...","shelf":"anime"}]}
 POST /api/batch/retry               {"source_id":"...","shelf":"anime"}
 ```
 
-批次清单只是来源顺序与货架的记录，本身不执行任何东西：每个来源都要用 `/api/control/select` 单独授权，一个来源收口后不会自动开始下一个。归档/ISO/EXE 等容器在有界检查完成前只停留在 attention。明确授权的 replacement 使用服务端生成的精确 manifest，仍复用普通 Planner、单 writer 和 fresh 回读。
+批次清单只是来源顺序与货架的记录，本身不执行任何东西：每个来源都要用 `/api/control/select` 单独授权，一个来源收口后不会自动开始下一个。光盘镜像（ISO/UDF）由 X 相位只读解析并在任务 staging 展开后随普通链路入库；无法唯一证明映射的盘通过数据级人工裁决（`disc-ruling`）处理，未决的 scope 保持 attention 且不阻塞兄弟。归档/EXE 等其它容器在有界检查完成前停留在 attention。明确授权的 replacement 使用服务端生成的精确 manifest，仍复用普通 Planner、单 writer 和 fresh 回读。
+
+终态根（completed / gaps_pending）默认全量消费来源树与展开 staging（`/ScrapeFlow/展开/<root>/`）：`/待刮削` 是 staging 不是存储，Gap 账本是缺口的唯一持久记录；删除以 fresh 回读证明，无法证明时记为残余并可重跑 `consume-source`。
 
 所有变更接口只接受同源本机页面请求。
 
