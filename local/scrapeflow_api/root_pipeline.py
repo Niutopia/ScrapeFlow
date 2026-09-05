@@ -643,23 +643,31 @@ def _cleanup_consumed_source_root(
             failures.append(child)
             _trace(f"待裁决移入失败: {child}: {exc}")
             return False
-        # Prove the move both ways (fresh readback on each side): gone from
-        # the source parent AND present under the quarantine target.
-        try:
-            after = rows_proven(directory)
-            target_rows = rows_proven(target_dir)
-        except Exception:
-            failures.append(child)
-            return False
-        if any(item.get("name") == name for item in after):
-            failures.append(child)
-            return False
-        landed = next(
-            (item for item in target_rows if item.get("name") == name), None,
-        )
+        # Prove the move both ways, with Quark's move-visibility lag in
+        # mind: a server-side move can leave the source listing showing the
+        # old name for minutes (observed ~4 min per file during the
+        # transfer campaign).  Poll both sides inside a bounded window —
+        # the move itself is not retried, only the observation.
+        landed = None
+        for attempt in range(5):
+            if attempt:
+                time.sleep(20.0)
+            try:
+                after = rows_proven(directory)
+                target_rows = rows_proven(target_dir)
+            except Exception:
+                continue
+            if not any(item.get("name") == name for item in after):
+                landed = next(
+                    (item for item in target_rows
+                     if item.get("name") == name),
+                    None,
+                )
+                if landed is not None:
+                    break
         if landed is None:
             failures.append(child)
-            _trace(f"待裁决目标回读缺失: {child}")
+            _trace(f"待裁决移动回读超窗: {child}")
             return False
         size = int(landed.get("size") or 0)
         quarantined_names.add(name)
