@@ -19,7 +19,7 @@ from engine.scrapeflow.boundary_analysis import (
     DirectoryRole,
     WorkCandidate,
 )
-from engine.scrapeflow.errors import PlanError
+from engine.scrapeflow.errors import ApiError, PlanError
 from engine.scrapeflow.identity_matching import (
     AUTO_MATCH_MIN_MARGIN,
     AutoMatchAmbiguityError,
@@ -3481,3 +3481,71 @@ if __name__ == "__main__":
                 "第1季 03.mkv"
             )
         )
+
+
+class Detail404GuardTests(unittest.TestCase):
+    """A search-index ghost (detail 404) must never be auto-confirmed."""
+
+    def _ghost_client(self):
+        class GhostTMDB(FakeTMDBClient):
+            def get(self, path, **params):
+                if path in ("/movie/999999", "/tv/999999"):
+                    raise ApiError(
+                        "HTTP 404: themoviedb.org", status_code=404,
+                    )
+                return super().get(path, **params)
+
+        return GhostTMDB(
+            search_results={
+                "虫师": [
+                    {
+                        "id": 999999,
+                        "title": "虫师",
+                        "release_date": "2005-01-01",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+
+    def test_confirmed_ghost_is_dropped_and_match_fails_closed(self) -> None:
+        from engine.scrapeflow.identity_matching import auto_match_tmdb
+
+        client = self._ghost_client()
+        # The search row is a perfect title match, but its detail page 404s.
+        with self.assertRaises(Exception) as ctx:
+            auto_match_tmdb(
+                client, "虫师", media_type="movie", min_confidence=0.7,
+            )
+        # It must fail closed (no candidates / ambiguity), never confirm.
+        self.assertNotIn("999999", str(ctx.exception) or "")
+
+    def test_non_404_probe_failure_still_propagates(self) -> None:
+        from engine.scrapeflow.identity_matching import auto_match_tmdb
+
+        class DownTMDB(FakeTMDBClient):
+            def get(self, path, **params):
+                if path == "/movie/999999":
+                    raise ApiError("HTTP 503: themoviedb.org", status_code=503)
+                return super().get(path, **params)
+
+        client = DownTMDB(
+            search_results={
+                "虫师": [
+                    {
+                        "id": 999999,
+                        "title": "虫师",
+                        "release_date": "2005-01-01",
+                        "genre_ids": [16],
+                    },
+                ],
+            },
+        )
+        with self.assertRaises(ApiError):
+            auto_match_tmdb(
+                client, "虫师", media_type="movie", min_confidence=0.7,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

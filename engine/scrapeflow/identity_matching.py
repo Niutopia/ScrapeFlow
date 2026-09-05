@@ -1994,6 +1994,36 @@ def _score_identity_candidate(
     )
 
 
+def _drop_detail_404_candidates(
+    client: TMDBClient,
+    candidates: Sequence[AutoMatch],
+) -> list[AutoMatch]:
+    """Remove candidates whose TMDB detail page explicitly 404s.
+
+    Only confirmed candidates are probed (uncertain ones already fail
+    selection).  The probe is one bounded ``GET /{type}/{id}`` per surviving
+    candidate; every failure other than a 404 propagates normally so a
+    network blip still retries at the caller's boundary instead of silently
+    shrinking the pool.
+    """
+    getter = getattr(client, "get", None)
+    if not callable(getter):
+        return list(candidates)
+    output: list[AutoMatch] = []
+    for item in candidates:
+        if item.status != "confirmed" or item.media_type not in {"tv", "movie"}:
+            output.append(item)
+            continue
+        try:
+            getter(f"/{item.media_type}/{item.tmdb_id}")
+        except ApiError as exc:
+            if exc.status_code == 404:
+                continue
+            raise
+        output.append(item)
+    return output
+
+
 def _select_auto_match(
     candidates: Sequence[AutoMatch],
     *,
@@ -2342,6 +2372,13 @@ def auto_match_tmdb(
                 score(item) for item in raw_candidates
                 if int(item["tmdb_id"]) not in excluded_ids
             ]
+    # Detail-404 guard (虫师 case): TMDB's search index can return entries
+    # whose detail page no longer resolves (user-deleted or invalid records).
+    # Search confidence alone confirmed such garbage as a real work.  Before
+    # final selection, drop every candidate whose namespace detail probe
+    # 404s; other probe failures (network, timeouts) stay out of the way —
+    # only the provider's explicit "does not exist" disqualifies.
+    candidates = _drop_detail_404_candidates(client, candidates)
     return _select_auto_match(
         candidates,
         query_label=query,
