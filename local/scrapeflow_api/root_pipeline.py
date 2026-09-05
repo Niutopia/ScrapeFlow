@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -554,7 +555,16 @@ def _cleanup_consumed_source_root(
     _verified_quarantine_dirs: set[str] = set()
 
     def ensure_quarantine_dir(path: str) -> bool:
-        """Materialize one quarantine directory level by level (cached)."""
+        """Materialize one quarantine directory level by level (cached).
+
+        The first-ever quarantine root creation rides Quark's directory-sync
+        window: ``mkdir`` can answer ``file is doloading[同名冲突]`` for a
+        chain it is still publishing (observed on the first 無職轉生
+        consumption — the client-level transient retry exhausted inside the
+        sync window).  Re-probe visibility between bounded attempts: the
+        name-conflict flavor means the directory usually already exists and
+        just needs the sync to settle.
+        """
         if path in _verified_quarantine_dirs:
             return True
         if not path.startswith("/"):
@@ -565,16 +575,25 @@ def _cleanup_consumed_source_root(
             current = f"{current}/{segment}"
             if current in _verified_quarantine_dirs:
                 continue
-            try:
-                probe = runner.alist.try_list(current, refresh=True)
-            except Exception:
-                probe = None
-            if probe is None:
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    probe = runner.alist.try_list(current, refresh=True)
+                except Exception:
+                    probe = None
+                if probe is not None:
+                    break
                 try:
                     runner.alist.mkdir(current)
-                except Exception as exc:  # noqa: BLE001 - reported as residual
+                    break
+                except Exception as exc:  # noqa: BLE001 - retried below
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(20.0)
+            else:
+                if last_error is not None:
                     failures.append(current)
-                    _trace(f"待裁决目录创建失败: {current}: {exc}")
+                    _trace(f"待裁决目录创建失败: {current}: {last_error}")
                     return False
             _verified_quarantine_dirs.add(current)
         return True
