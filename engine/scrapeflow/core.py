@@ -204,7 +204,12 @@ EPISODE_THEME_VARIANT_RE = re.compile(
 _NON_STORY_ASSET_RE = re.compile(
     r"\[\s*(?:\w{1,12}\s+)?(?:(?:NC)?(?:OP|ED)(?:\s*(?:\d+|v\d+))?"
     r"(?:[\s_]*EP\s*\d+)?)\s*\]"
-    r"|\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]",
+    r"|\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]"
+    # Japanese BD releases number extras in the same ``#`` ordinal space as
+    # the episodes (``#01``..``#23`` plus ``#EX``/``#EX2``).  A hash-prefixed
+    # EX token is release-local extra content — structurally never a story
+    # episode — so it must not block the plan for the episodes around it.
+    r"|#\s*EX(?:\s*\d+)?(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 BONUS_DIRECTORY_RE = re.compile(

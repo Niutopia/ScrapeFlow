@@ -625,3 +625,39 @@ class BackupSubtitleSeasonTokenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HashExExtraAssetTests(unittest.TestCase):
+    """A ``#EX`` extra must not block the plan for the episodes around it.
+
+    Japanese BD releases number extras in the same ``#`` ordinal space as
+    the episodes (``#01``..``#23`` + ``#EX``); the AI-Raws release shape
+    (無職転生) blocked the whole season unit until ``#EX`` joined the
+    non-story asset grammar.
+    """
+
+    def test_hash_ex_is_non_story_special_context(self):
+        from engine.scrapeflow.core import _has_special_context
+        for name in (
+            "[AI-Raws] 無職転生 #EX (BD HEVC 1920x1080)[A489DFB8].mkv",
+            "[Group] Show #EX2 (BDRip 1080p).mkv",
+        ):
+            self.assertTrue(
+                _has_special_context({"name": name, "full_path": f"/in/{name}"}),
+                name,
+            )
+
+    def test_numbered_hash_and_plain_extra_word_stay_episodes(self):
+        from engine.scrapeflow.core import _has_special_context
+        for name in (
+            "[AI-Raws] 無職転生 #01 (BD HEVC)[06057AC0].mkv",
+            "Some #EXTRA feature.mkv",
+        ):
+            self.assertFalse(
+                _has_special_context({"name": name, "full_path": f"/in/{name}"}),
+                name,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
