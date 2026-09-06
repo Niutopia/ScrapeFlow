@@ -10990,8 +10990,14 @@ def build_batch_plan(
 def _planned_companion_key(target_dir: str, final_name: str) -> tuple[str, str]:
     """Return the destination-level identity shared by a video and subtitles."""
     stem = Path(final_name).stem
+    # Same bilingual-aware suffix grammar as _subtitle_companion_key: the
+    # replenishment lane writes ``.zh-CN-bilingual-ja`` sidecars, and a key
+    # that cannot strip that suffix maps library bilingual tracks to a key
+    # where the track-supersede check never finds them (a second Chinese
+    # track then lands beside the video).
     stem = re.sub(
-        r"\.(?:zh-CN|zh-TW|en|ja)(?:\.\d+)*$|\.subtitle(?:\.\d+|\d*)$",
+        r"\.(?:zh-CN(?:-bilingual-(?:ja|en|ko))?|zh-TW|en|ja)"
+        r"(?:\.\d+)*$|\.subtitle(?:\.\d+|\d*)$",
         "",
         stem,
         flags=re.IGNORECASE,
@@ -11158,10 +11164,23 @@ def _demote_unpaired_subtitles(alist: AListClient, plan: Plan) -> None:
             retained.append(item)
             continue
         if companion in existing_video_keys:
+            # A managed bilingual proof (preference 0 in the validated
+            # payload) outranks any filename-language library track: the
+            # selector's first key is the managed rank, so the demote gate
+            # must honor the same order or a strictly-better candidate gets
+            # silently dropped as "superseded".
+            proven_bilingual = (
+                isinstance(item.subtitle_validation, Mapping)
+                and item.subtitle_validation.get("preference") == 0
+            )
             library_rank = existing_track_ranks.get(companion)
-            if library_rank is not None and (
-                _subtitle_language_rank(subtitle_language(item.final_name))
-                >= library_rank
+            if (
+                not proven_bilingual
+                and library_rank is not None
+                and (
+                    _subtitle_language_rank(subtitle_language(item.final_name))
+                    >= library_rank
+                )
             ):
                 # The library already holds an equal-or-preferred track beside
                 # this existing video (e.g. the migrated CHS winner beside a

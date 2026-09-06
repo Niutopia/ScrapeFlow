@@ -502,10 +502,14 @@ def build_library_index(alist: object, media_root: str) -> LibraryIndex:
                 # Only the three shelf roots refresh; nested listings use the
                 # provider cache.  The writer already performs a fresh exact
                 # readback for content it writes.
+                # The listing call is positional (no refresh kwarg), so a
+                # TypeError retry would be an identical no-op call — the
+                # historical copy-paste. Skip the directory instead of
+                # letting a retry raise through the whole D reconciliation.
                 try:
                     raw_items = listing(current)
                 except TypeError:
-                    raw_items = listing(current)
+                    continue
                 if not isinstance(raw_items, list):
                     continue
                 items: list[Mapping[str, object]] = []

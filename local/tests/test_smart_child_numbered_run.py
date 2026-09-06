@@ -1046,3 +1046,52 @@ class BareEpisodeRangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BilingualCompanionKeyTests(unittest.TestCase):
+    """Library bilingual tracks map to the video's companion key (audit HIGH)."""
+
+    def test_bilingual_suffix_strips_to_video_key(self):
+        from engine.scrapeflow.core import _planned_companion_key
+        video = _planned_companion_key("/d", "Video.mkv")
+        for name in (
+            "Video.zh-CN.ass",
+            "Video.zh-CN-bilingual-ja.srt",
+            "Video.zh-CN-bilingual-en.srt",
+            "Video.subtitle.ass",
+        ):
+            self.assertEqual(_planned_companion_key("/d", name), video, name)
+
+    def test_demote_keeps_proven_bilingual_upgrade(self):
+        """A validated bilingual candidate is never superseded by filename-only rank."""
+        from engine.scrapeflow.core import Plan, PlannedFile, _demote_unpaired_subtitles
+        from local.tests.test_library_index import IndexAList
+
+        # Library: the video + a filename-language track beside it.
+        alist = IndexAList({
+            "/lib/Show/Season 01/Video.mkv": b"v",
+            "/lib/Show/Season 01/Video.zh-CN.ass": b"t",
+        })
+        # Plan: a proven-bilingual candidate (validation preference 0).
+        plan = Plan(
+            mode="tv", source_root="/in", target_root="/lib/Show",
+            files=[PlannedFile(
+                source_path="/in/Video.zh-CN.srt",
+                source_dir="/in",
+                original_name="Video.zh-CN.srt",
+                final_name="Video.zh-CN.srt",
+                target_dir="/lib/Show/Season 01",
+                media_kind="subtitle",
+                subtitle_validation={"preference": 0, "status": "satisfied"},
+            )],
+            cleanup_files=[], problem_files=[], warnings=[], notices=[],
+            metadata={"tmdb_id": 1, "title": "Show", "year": "2020"},
+            decision_trace={}, scan_report={},
+        )
+        _demote_unpaired_subtitles(alist, plan)
+        # The bilingual upgrade must survive.
+        self.assertEqual(len(plan.files), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

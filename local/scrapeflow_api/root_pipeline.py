@@ -757,6 +757,7 @@ def _cleanup_consumed_source_root(
     def quarantine_batch(
         directory: str,
         rows: Sequence[tuple[str, str, str]],
+        durations: Mapping[str, float | None] | None = None,
     ) -> bool:
         """Move one directory's suspects into the quarantine root, batched.
 
@@ -828,6 +829,7 @@ def _cleanup_consumed_source_root(
             by_target.setdefault(target_dir, []).append(name)
         committed: list[tuple[str, str, str, str]] = []
         _ledger_sizes: dict[str, int] = {}
+        batch_durations: dict[str, float | None] = dict(durations or {})
         for target_dir, names in by_target.items():
             try:
                 runner.alist.move(directory, target_dir, names)
@@ -836,7 +838,7 @@ def _cleanup_consumed_source_root(
                 # server-side: ledger them before reporting the failure so a
                 # re-run (which will no longer see them in the source) still
                 # knows they were quarantined.
-                _ledger(committed, _ledger_sizes)
+                _ledger(committed, _ledger_sizes, batch_durations)
                 failures.extend(
                     f"{directory}/{name}" for name in names
                 )
@@ -889,7 +891,7 @@ def _cleanup_consumed_source_root(
             # landed are real quarantines even when the batch as a whole
             # fails — ledger them, then fail the stragglers.
             _ledger(
-                [row for row in moved if row[0] in settled], _ledger_sizes,
+                [row for row in moved if row[0] in settled], _ledger_sizes, batch_durations,
             )
             stragglers = sorted(
                 name for name, _c, _r, _t in moved if name not in settled
@@ -899,12 +901,12 @@ def _cleanup_consumed_source_root(
                 f"待裁决批量移动回读超窗: {len(stragglers)} 个未双向落地"
             )
             return False
-        _ledger(moved, _ledger_sizes)
+        _ledger(moved, _ledger_sizes, batch_durations)
         return True
 
     ledgered_source_paths: set[str] = set()
 
-    def _ledger(rows, sizes_map) -> None:
+    def _ledger(rows, sizes_map, durations_map) -> None:
         for name, child, reason, target_dir in rows:
             # Idempotency keys on the unique SOURCE path: two different
             # files legitimately share a basename (the collision routing
@@ -919,6 +921,7 @@ def _cleanup_consumed_source_root(
                 "relative_path": posixpath.relpath(child, source),
                 "quarantine_path": posixpath.join(target_dir, name),
                 "size": sizes_map.get(name, 0),
+                "duration_seconds": durations_map.get(name),
                 "reason": reason,
                 "moved_at": _now(),
                 "root_task_id": root_task_id,
@@ -1026,7 +1029,7 @@ def _cleanup_consumed_source_root(
                     continue
             if not delete_file(directory, name):
                 return False
-        if not quarantine_batch(directory, batch):
+        if not quarantine_batch(directory, batch, durations):
             return False
         for child in dir_children:
             if paused():
@@ -1104,7 +1107,7 @@ def _cleanup_consumed_source_root(
             )
         except Exception as exc:  # noqa: BLE001 - reported as residual
             failures.append(manifest_path)
-            _trace(f"待裁决 manifest 写入失败: {exc}")
+            _trace(f"待裁决 manifest 写入失败: {redact_error(exc)}")
             return False
         return True
 
