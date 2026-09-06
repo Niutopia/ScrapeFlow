@@ -5463,9 +5463,8 @@ def _acquire(
         # it, prove the remote copy is visible, then drop the local bytes.
         # The local peak footprint is one member (one episode), never the
         # whole pack, so a multi-season remux cannot exhaust the host disk.
-        attempt_deadline = time.monotonic() + _bounded_seconds(
-            "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
-        )
+        # Each member's aria2 run gets the full torrent-timeout budget; the
+        # per-member fail-fast is the BT idle timeout, not a shared deadline.
         # Every member's binding is validated for every selection before any
         # byte moves, so a malformed selection still fails as a clean
         # candidate error with zero partial remote commits.
@@ -5697,7 +5696,9 @@ def _acquire(
                     f"--select-file={int(plan['index'])}",
                     str(plan["torrent_path"]),
                 ]
-                remaining_budget = max(300, int(attempt_deadline - time.monotonic()))
+                remaining_budget = _bounded_seconds(
+                    "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
+                )
                 print(
                     f"[replenishment] 下载成员 {number}/{len(plans)}: "
                     f"{plan['remote_name']}",
