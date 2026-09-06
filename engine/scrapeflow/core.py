@@ -253,6 +253,31 @@ MULTI_EPISODE_RE = re.compile(
     r"(?:^|[^0-9])(?:E|EP)?\s*0*(\d{1,3})\s*[-~+&]\s*(?:E|EP)\s*0*(\d{1,3})(?:$|[^0-9])",
     re.IGNORECASE,
 )
+# The bare ``49-50`` episode-range form (no E markers — common in BD/web
+# packs) needs its own narrowly-guarded pattern: both endpoints plausible
+# episode ordinals, ascending, close together, and NOT followed by a letter
+# (which would make it an ordinal like ``49th`` or a title fragment).
+BARE_EPISODE_RANGE_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])0*(\d{1,3})\s*[-~]\s*0*(\d{1,3})(?![A-Za-z])",
+)
+
+def _bare_episode_range(clean: str) -> "re.Match[str] | None":
+    """Return the bare ``49-50`` range only when it is episode-shaped.
+
+    Both endpoints must be ascending, within 100 of each other, and the
+    match must not be preceded by a year — the guards that keep title
+    fragments and date ranges out. The regex's trailing ``(?!...)``
+    lookahead already rejects ordinal suffixes like ``49th``.
+    """
+    for match in BARE_EPISODE_RANGE_RE.finditer(clean):
+        start, end = int(match.group(1)), int(match.group(2))
+        if not (1 <= start < end <= start + 100):
+            continue
+        prefix = clean[max(0, match.start() - 5):match.start()]
+        if re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)\s*$", prefix):
+            continue
+        return match
+    return None
 MULTI_EPISODE_CONCAT_RE = re.compile(
     r"(?:^|[^A-Za-z0-9])(?:S\d{1,2})?E\s*0*(\d{1,3})E\s*0*(\d{1,3})(?:$|[^0-9])",
     re.IGNORECASE,
@@ -262,7 +287,7 @@ SEASON_DASH_EPISODE_RE = re.compile(
     re.IGNORECASE,
 )
 DUAL_BRACKET_EPISODE_RE = re.compile(
-    r"\[\s*0*(\d{1,3})\s*[_/]\s*0*(\d{1,3})\s*\]",
+    r"\[\s*0*(\d{1,3})\s*[_/\-]\s*0*(\d{1,3})\s*\]",
     re.IGNORECASE,
 )
 SEASON_LOCAL_ABSOLUTE_RE = re.compile(
@@ -2424,6 +2449,7 @@ def parse_ep_files(
                 else (
                     MULTI_EPISODE_RE.search(multi_clean)
                     or MULTI_EPISODE_CONCAT_RE.search(multi_clean)
+                    or _bare_episode_range(multi_clean)
                 )
             )
         )

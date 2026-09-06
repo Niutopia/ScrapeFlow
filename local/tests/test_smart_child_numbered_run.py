@@ -1001,3 +1001,48 @@ class EndNumberRangeRescueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BareEpisodeRangeTests(unittest.TestCase):
+    """Bare ``49-50`` is a multi-episode file, not title debris."""
+
+    def test_bare_range_keeps_end_number(self):
+        from engine.scrapeflow.core import parse_ep_files
+        groups = parse_ep_files([
+            {"name": "Show 49-50.mkv", "full_path": "/in/Show 49-50.mkv",
+             "size": 4096, "is_dir": False},
+        ])
+        (key,) = groups.keys()
+        self.assertEqual((key.kind, key.number, key.end_number),
+                         ("regular", 49, 50))
+
+    def test_year_range_not_episode_range(self):
+        from engine.scrapeflow.core import parse_ep_files
+        groups = parse_ep_files([
+            {"name": "Show 1989-1995.mkv", "full_path": "/in/x.mkv",
+             "size": 4096, "is_dir": False},
+        ])
+        self.assertEqual(list(groups.keys()), [])
+
+    def test_bracket_dash_range_parses(self):
+        from engine.scrapeflow.core import parse_ep_files
+        groups = parse_ep_files([
+            {"name": "[G] Show [49-50].mkv", "full_path": "/in/x.mkv",
+             "size": 4096, "is_dir": False},
+        ])
+        (key,) = groups.keys()
+        self.assertEqual(key.kind, "regular")
+        self.assertEqual(key.number, 49)
+
+    def test_split_rescue_catches_out_of_window_range(self):
+        import re
+        pattern = re.compile(
+            r"(?:^|[^A-Za-z0-9])E?0*(\d{1,4})\s*(?:[-~–—至])\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+            re.I,
+        )
+        self.assertIsNotNone(pattern.search("Show 49-50.mkv"))
+        self.assertIsNotNone(pattern.search("Show E49-E50.mkv"))
+
+
+if __name__ == "__main__":
+    unittest.main()

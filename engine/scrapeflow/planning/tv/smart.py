@@ -3007,7 +3007,7 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     # season's group so the ordinary per-season machinery
                     # handles (or fails closed on) them.
                     range_form = re.search(
-                        r"(?:^|[^A-Za-z0-9])E0*(\d{1,4})\s*[-\u2013-~\u81f3]\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+                        r"(?:^|[^A-Za-z0-9])E?0*(\d{1,4})\s*(?:[-~\u2013\u2014\u81f3])\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
                         str(item.get("name", "")),
                         re.I,
                     )
