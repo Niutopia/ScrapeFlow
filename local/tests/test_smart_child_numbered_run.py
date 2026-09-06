@@ -991,11 +991,11 @@ class EndNumberRangeRescueTests(unittest.TestCase):
         import re as _re
         # The rescue's range regex must catch the E-range form directly.
         pattern = _re.compile(
-            r"(?:^|[^A-Za-z0-9])E0*(\d{1,4})\s*[-–-~至]\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+            r"(?:^|[^A-Za-z0-9])E0*(\d{1,4})\s*[-\u2013\u2014~至]\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
             _re.I,
         )
         self.assertIsNotNone(pattern.search("Show E49-E50.mkv"))
-        self.assertIsNotNone(pattern.search("[Group] Show [49-50].mkv"))
+        self.assertIsNotNone(pattern.search("Show E49~E50.mkv"))
         self.assertIsNone(pattern.search("Show E07.mkv"))
 
 
