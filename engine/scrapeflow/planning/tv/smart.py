@@ -2559,6 +2559,17 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 if str(item["full_path"]) not in consumed
                 and str(item["full_path"]) not in independently_routed_paths
             ]
+            # The main ``files`` list feeds BOTH the split-else main plan and
+            # the bottom build_tv_plan: a failed child's files filtered only
+            # from unknown_media still leaked through those two paths and
+            # could be planned under the parent identity (White Album 2
+            # shape). Purge them from the source list itself.
+            if independently_routed_paths:
+                files = [
+                    item for item in files
+                    if str(item.get("full_path", "")) not in independently_routed_paths
+                ]
+                smart_kwargs["source_files"] = files
         if unknown_media:
             numbered_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for item in unknown_media:
@@ -2988,13 +2999,18 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 for item in _only_group:
                     item_key = extract_episode_key(str(item.get("name", "")))
                     # Everything the range filter dropped must land somewhere:
-                    # keyless files AND fractional/special keys (10.5, [SP01])
-                    # previously fell through both filters here and silently
-                    # vanished from every subplan — left in source with no
-                    # problem row.  They join the first season's group so
-                    # the ordinary per-season special/fractional machinery
-                    # handles them.
-                    if item_key is None or item_key.kind != "regular":
+                    # keyless files, fractional/special keys (10.5, [SP01]),
+                    # AND out-of-window multi-episode ranges (E49-E50 in a
+                    # 1..48 source) previously fell through both filters
+                    # here and silently vanished from every subplan — left
+                    # in source with no problem row.  They join the first
+                    # season's group so the ordinary per-season machinery
+                    # handles (or fails closed on) them.
+                    if (
+                        item_key is None
+                        or item_key.kind != "regular"
+                        or item_key.end_number
+                    ):
                         _split[int(_ordered[0]["season_number"])].append(item)
                 season_groups = defaultdict(
                     list, {s: g for s, g in _split.items() if g}
@@ -3013,6 +3029,15 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                 or next(iter(season_groups)) != int(kwargs.get("season") or 1)
             )
         )
+        # A forced split of a single-season source (preserved subtitle-only
+        # seasons, a season mismatch with the request) leaves token-refused
+        # batches in unknown_media with neither a subplan slot nor a problem
+        # row — the split Plan's problem list only carries subplan/retained
+        # rows. Capture them here for the operator instead of vanishing.
+        orphaned_unknown_media: list[dict[str, Any]] = []
+        if should_split and unknown_media:
+            orphaned_unknown_media.extend(unknown_media)
+            unknown_media = []
         if should_split:
             subplans: list[Plan] = []
             if season_groups:
@@ -3218,6 +3243,12 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     )
                     for child_files, reason in failed_child_plans
                     for item in child_files
+                ] + [
+                    PlannedProblem(
+                        source_path=str(item["full_path"]),
+                        reason="无法归属到任何季计划的未映射媒体，保留原位待人工确认",
+                    )
+                    for item in orphaned_unknown_media
                 ],
                 warnings=list(dict.fromkeys(combined_warnings)),
                 metadata=metadata,

@@ -335,6 +335,10 @@ def _internal_child_tv_primary_video_errors(plan: object) -> list[str]:
             # releases name genuine post-season specials ``24 EXTRA``; the
             # supplemental-name heuristic must not overrule a proven
             # coordinate, only catch members the planner left homeless.
+            # The mapping functions that grant S00 coordinates to
+            # theme-named content (the official-run exception in the disc
+            # mapper) are themselves official-row-evidenced, so a proven
+            # coordinate here is authoritative full stop.
             pass
         elif _internal_child_member_is_supplemental(
             source_path, original_name, final_name,

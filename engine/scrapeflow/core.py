@@ -206,10 +206,11 @@ _NON_STORY_ASSET_RE = re.compile(
     r"(?:[\s_]*EP\s*\d+)?)\s*\]"
     r"|\[\s*0*\d{1,3}\s*(?:[A-OQ-Za-oq-z]|β)\s*\]"
     # Japanese BD releases number extras in the same ``#`` ordinal space as
-    # the episodes (``#01``..``#23`` plus ``#EX``/``#EX2``).  A hash-prefixed
-    # EX token is release-local extra content — structurally never a story
-    # episode — so it must not block the plan for the episodes around it.
-    r"|#\s*EX(?:\s*\d+)?(?![A-Za-z0-9])",
+    # the episodes (``#01``..``#23`` plus ``#EX``/``#EX2``, optionally with
+    # a v2 release-revision tail).  A hash-prefixed EX token is
+    # release-local extra content — structurally never a story episode —
+    # so it must not block the plan for the episodes around it.
+    r"|#\s*EX(?:\s*\d+)?(?:v\d+)?(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 BONUS_DIRECTORY_RE = re.compile(
@@ -6623,8 +6624,35 @@ def _map_disc_extras_by_official_release_runs(
         # release's sequence number, never an official Season 00 coordinate.
         # Re-admitting it by ordinal placed an NCED beside the genuine
         # prequel special on S00E02 (Mushoku Tensei Moozzi2 shape).
-        if classify_residual(full_path).kind == "theme_video":
-            continue
+        # ``classify_residual`` classifies a SUBTITLE by extension first, so
+        # a same-named sidecar (``[SP02] NCED - 04.zh.ass``) never read as
+        # theme_video and still rode the SP ordinal into Season 00 beside a
+        # genuine special: the theme vocabulary applies to any media row's
+        # own name here, video or subtitle.
+        from .residual_policy import _THEME_VIDEO_RE
+        theme_named = classify_residual(full_path).kind == "theme_video" or (
+            _THEME_VIDEO_RE.search(name)
+            and not re.search(r"tokuten", name, re.I)
+        )
+        if theme_named:
+            # TMDB's Season 00 legitimately contains creditless-theme rows
+            # (NCOP/NCED collections).  A theme-named file whose SP ordinal
+            # lands inside the official short run for its source season is
+            # exactly that official row — the run evidence outranks the name
+            # vocabulary.  Everything else stays skipped (the SPxx ordinal
+            # of a theme release is release-local numbering).
+            sp_token = re.search(
+                r"(?:^|[\[ _.-])SP\s*0*(\d{1,2})(?:[\] _.-]|$)", name, re.I,
+            )
+            source_season = item_source_season(item)
+            run = run_by_season.get(source_season or -1)
+            official_row = False
+            if sp_token is not None and run is not None:
+                ordinal = int(sp_token.group(1))
+                if 1 <= ordinal <= len(run):
+                    official_row = True
+            if not official_row:
+                continue
         # The release filename is the most specific evidence for shared
         # ``字幕备份`` directories.  Looking at generic parents first can
         # incorrectly select the base season before seeing ``2wei/Herz/3rei``.
@@ -8339,8 +8367,21 @@ def build_tv_plan(
                 token_value = _season_number_from_directory_name(
                     str(item.get("name", ""))
                 )
+                # A special/fractional key must keep its KIND: a special
+                # mounts beside the official Season 00 row with that number,
+                # not beside the same-numbered regular episode in the token
+                # season. The proven coordinate for the token season is
+                # (token, key.number) ONLY for regular keys.
+                if key.kind == "regular":
+                    target_episode = key.number
+                else:
+                    target_episode = key.number if token_value == 0 else key.number
+                    # Specials route to Season 00 regardless of the token
+                    # season: `Show II SP03` names special 3, whose home is
+                    # S00E03, not S02E03.
+                    token_value = 0
                 companion_name = _library_season_video_name(
-                    alist, series_dir, token_value, key.number
+                    alist, series_dir, token_value, target_episode
                 )
                 if companion_name is None:
                     record_problem(
