@@ -613,7 +613,12 @@ class PanSouDiscovery:
             token=os.getenv("SCRAPEFLOW_PANSOU_TOKEN", "").strip(),
             inspector=inspector,
             transport=transport,
-            timeout=_bounded_float("SCRAPEFLOW_PANSOU_TIMEOUT", 12.0, 1.0, 60.0),
+            # The budget covers this round's queries plus read-only share
+            # inspections.  A broad pack term can return hundreds of links,
+            # most of them expired shares that each cost one fast 404 round
+            # trip; a 60s ceiling left such windows grinding for hours at
+            # ~13 links per round, so the clamp allows a longer read budget.
+            timeout=_bounded_float("SCRAPEFLOW_PANSOU_TIMEOUT", 12.0, 1.0, 600.0),
             max_queries=_bounded_int("SCRAPEFLOW_PANSOU_MAX_QUERIES", 12, 1, 32),
             max_links=_bounded_int("SCRAPEFLOW_PANSOU_MAX_LINKS", 64, 1, 256),
             config_issue=config_issue,
