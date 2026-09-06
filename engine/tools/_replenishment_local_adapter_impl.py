@@ -3988,6 +3988,22 @@ _BITSEARCH_MAX_ROWS = 16
 _BITSEARCH_SITE_TAG = re.compile(r"(?i)^\s*[\[{]?\s*bitsearch(?:\.to)?\s*[\]}]?\s*[-–—: ]?\s*")
 
 
+def _search_index_opener() -> urllib.request.OpenerDirector:
+    """Proxy-aware opener for blocked search indexes.
+
+    Search indexes are the one lane allowed to use the configured HTTP proxy
+    (tracker announces and peer traffic must stay direct — see the aria2
+    invocation).  A missing proxy never falls back to an ambient host proxy:
+    that would be environment drift, not configuration.
+    """
+    proxy = os.getenv("SCRAPEFLOW_HTTP_PROXY") or os.getenv("SCRAPEFLOW_HTTPS_PROXY")
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+        )
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _bitsearch_search_terms(request: Mapping[str, Any], *, maximum: int = 6) -> list[str]:
     """Season-level then bare-title terms for the general-purpose index.
 
@@ -4170,6 +4186,7 @@ def _search_bitsearch(
             page = _fetch_bytes(
                 url, max_bytes=4 * 1024 * 1024,
                 timeout=request_timeout(), attempts=1,
+                opener=_search_index_opener(),
             ).decode("utf-8", "replace")
         except (OSError, RuntimeError, ValueError) as exc:
             infrastructure_failures += 1
