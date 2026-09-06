@@ -31,15 +31,13 @@ MAGNET_REQUIRED_SOURCES = frozenset({
     "nyaa",
     "acg",
 })
-# The magnet search lane is anime-oriented.  A no-candidate exhaustion proof
-# for anime works must therefore cover the full anime index list, while movie
-# and US-TV works only owe the general-purpose sources: demanding completion
-# of anime-only indexes for those shelves would leave their gaps permanently
-# stuck at magnet without adding any real search evidence.
+# The magnet search lane's anime indexes have no movie/US-TV content; the
+# general-purpose index is the only real source for those shelves and a
+# no-candidate proof for them must therefore cover it.
 MAGNET_REQUIRED_SOURCES_BY_SHELF: dict[str, frozenset[str]] = {
     "anime": MAGNET_REQUIRED_SOURCES,
-    "movie": frozenset({"nyaa", "acg"}),
-    "us_tv": frozenset({"nyaa", "acg"}),
+    "movie": frozenset({"bitsearch"}),
+    "us_tv": frozenset({"bitsearch"}),
 }
 
 

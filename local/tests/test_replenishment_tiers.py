@@ -106,7 +106,10 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
         for shelf in ("movie", "us_tv"):
             required = required_sources_for_tier(TIER_LOCAL_MAGNET, shelf)
             self.assertEqual(required, MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf])
-            self.assertTrue(required.issubset(MAGNET_REQUIRED_SOURCES))
+            # The general-purpose index is deliberately outside the anime
+            # index set: movie/US-TV shelves owe it, anime does not.
+            self.assertEqual(required, frozenset({"bitsearch"}))
+            self.assertFalse(required.issubset(MAGNET_REQUIRED_SOURCES))
         self.assertEqual(
             required_sources_for_tier(TIER_LOCAL_MAGNET, None),
             MAGNET_REQUIRED_SOURCES,
@@ -114,7 +117,7 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
 
     def test_configured_subset_is_valid_against_the_canonical_source_set(self) -> None:
         state = {**initial_tier_state(), "tier": TIER_LOCAL_MAGNET}
-        outcome = {
+        general_only = {
             "scope": FAILURE_CANDIDATE,
             "search_complete_no_candidates": True,
             "completed_sources": sorted(MAGNET_REQUIRED_SOURCES_BY_SHELF["movie"]),
@@ -122,11 +125,19 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
             "unchecked_secondary_candidates": 0,
         }
 
-        conservative = apply_tier_outcome(state, dict(outcome))
-        movie = apply_tier_outcome(state, {**outcome, "shelf": "movie"})
+        # Without a shelf the canonical set stays the full anime index list,
+        # so a general-index-only configuration proves nothing there.
+        conservative = apply_tier_outcome(state, dict(general_only))
+        movie = apply_tier_outcome(state, {**general_only, "shelf": "movie"})
+        anime_subset = apply_tier_outcome(state, {
+            **general_only,
+            "completed_sources": ["acg", "nyaa"],
+            "configured_sources": ["acg", "nyaa"],
+        })
 
-        self.assertEqual(conservative["status"], "exhausted")
+        self.assertEqual(conservative["status"], "candidate_failed")
         self.assertEqual(movie["status"], "exhausted")
+        self.assertEqual(anime_subset["status"], "exhausted")
 
     def test_magnet_dynamic_proof_requires_a_nonempty_canonical_configured_set(self) -> None:
         state = {**initial_tier_state(), "tier": TIER_LOCAL_MAGNET}

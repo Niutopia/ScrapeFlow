@@ -636,5 +636,125 @@ class MagnetMetadataResolutionTests(unittest.TestCase):
                     adapter._download_torrent(magnet, destination)
 
 
+class BitSearchSourceTests(unittest.TestCase):
+    """The general-purpose magnet index resolves candidates via DHT only."""
+
+    @staticmethod
+    def _request() -> dict[str, object]:
+        return {
+            "media": {
+                "title": "无耻之徒",
+                "aliases": ["Shameless", "Shameless (US)"],
+                "year": "2011",
+                "tmdb_id": 34307,
+            },
+            "gaps": [{
+                "id": "S11E01", "kind": "missing_episode",
+                "season": 11, "episodes": [1],
+            }],
+        }
+
+    @staticmethod
+    def _page() -> str:
+        return (
+            '<a href="magnet:?xt&#x3D;urn:btih:79CD2AA9A0B923E2C13131653143BA55A9D2CFF7'
+            '&amp;dn&#x3D;%5BBitsearch.to%5D%20Shameless.US.S11">Magnet</a>'
+            '<a href="/download/torrent/79CD2AA9A0B923E2C13131653143BA55A9D2CFF7'
+            '?title=Shameless.US.S11.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb">Torrent</a>'
+            '<a href="magnet:?xt&#x3D;urn:btih:93D92D9A5BEB83AD465F967E740DB912008E3EF3'
+            '&amp;dn&#x3D;%5BBitsearch.to%5D%20Shameless%20UK%202004">Magnet</a>'
+            '<a href="/download/torrent/93D92D9A5BEB83AD465F967E740DB912008E3EF3'
+            '?title=Shameless UK 2004 S01-S11 Complete 1080p ALL4 WEB-DL">Torrent</a>'
+        )
+
+    def test_page_rows_use_full_magnet_hashes_with_clean_titles(self) -> None:
+        rows = adapter._bitsearch_page_rows(self._page())
+
+        self.assertEqual(
+            rows["79cd2aa9a0b923e2c13131653143ba55a9d2cff7"],
+            "Shameless.US.S11.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb",
+        )
+        self.assertEqual(len(rows), 2)
+
+    def test_year_conflicting_same_title_series_is_rejected(self) -> None:
+        request = self._request()
+
+        self.assertTrue(
+            adapter._bitsearch_row_relevant(
+                "Shameless.US.S11.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb", request,
+            ),
+        )
+        # Same title, different series, premiere year predates the work.
+        self.assertFalse(
+            adapter._bitsearch_row_relevant(
+                "Shameless UK 2004 S01-S11 Complete 1080p ALL4 WEB-DL", request,
+            ),
+        )
+        # A pack named by its season year stays acceptable.
+        self.assertTrue(
+            adapter._bitsearch_row_relevant(
+                "Shameless US Season 10 (2019) 1080p WEB-DL", request,
+            ),
+        )
+
+    def test_search_builds_dht_anchored_candidates_and_accounts_misses(self) -> None:
+        request = self._request()
+        manifest = {
+            "root": "Shameless.US.S11",
+            "infohash": "79cd2aa9a0b923e2c13131653143ba55a9d2cff7",
+            "files": {
+                1: {
+                    "path": "Shameless.US.S11E01.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv",
+                    "size": 3_932_748_332,
+                },
+            },
+        }
+        fetched: list[str] = []
+
+        def fake_fetch(url, **_kwargs):
+            fetched.append(url)
+            return self._page().encode()
+
+        def fake_batch(magnet_uris, scratch, **_kwargs):
+            self.assertEqual(len(magnet_uris), 1)
+            self.assertTrue(
+                magnet_uris[0].startswith("magnet:?xt=urn:btih:79cd2aa9a0b9"),
+            )
+            return {"79cd2aa9a0b923e2c13131653143ba55a9d2cff7": manifest}
+
+        with patch.object(adapter, "_fetch_bytes", side_effect=fake_fetch), \
+                patch.object(adapter, "_magnet_metadatas_batch", side_effect=fake_batch):
+            result = adapter._search_bitsearch(
+                request, set(), deadline=adapter.time.monotonic() + 30,
+            )
+
+        self.assertEqual(len(result), 1)
+        candidate = result[0]
+        self.assertTrue(candidate["locator"].startswith("torrent:magnet:?xt=urn:btih:"))
+        self.assertEqual(candidate["acquisition"]["url"], candidate["locator"][len("torrent:"):])
+        self.assertTrue(result.source_exhausted)
+        self.assertEqual(result.infrastructure_failures, 0)
+        self.assertEqual(len(fetched), len(adapter._bitsearch_search_terms(request)))
+
+    def test_unresolved_swarm_is_a_resource_miss_not_an_outage(self) -> None:
+        request = self._request()
+
+        with patch.object(
+            adapter, "_fetch_bytes",
+            return_value=self._page().encode(),
+        ), patch.object(adapter, "_magnet_metadatas_batch", return_value={}):
+            result = adapter._search_bitsearch(
+                request, set(), deadline=adapter.time.monotonic() + 30,
+            )
+
+        self.assertEqual(len(result), 0)
+        self.assertTrue(result.source_exhausted)
+        self.assertEqual(
+            result.resource_failed_locators,
+            ["torrent:79cd2aa9a0b923e2c13131653143ba55a9d2cff7"],
+        )
+        self.assertEqual(result.infrastructure_failures, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -455,6 +455,11 @@ def _candidate_from_share(
     release_name = _safe_text(raw.get("release_name"))
     if parsed is None or not release_name:
         return None
+    if _impl._release_year_conflict(request, release_name):  # noqa: SLF001
+        # Same-title different-series share packs (``无耻之徒 2024`` the movie
+        # against the 2011 series) map cleanly onto episode coordinates; the
+        # shared premiere-year guard keeps them out before inspection.
+        return None
     pwd_id, share_url, url_passcode = parsed
     manifest, file_ids = _manifest(rows)
     gaps = [gap for gap in request.get("gaps") or [] if isinstance(gap, Mapping)]

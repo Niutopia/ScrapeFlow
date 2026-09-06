@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
+import html as html_module
 import json
 import os
 from pathlib import Path
@@ -739,6 +740,10 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
         # source can keep the search set explicit.
         ("Nyaa", _search_nyaa, False,
          "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH", "1"),
+        # The one general-purpose (non-anime) magnet index: without it the
+        # magnet tier has no real source for movie/US-TV works at all.
+        ("BitSearch", _search_bitsearch, False,
+         "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH", "1"),
         ("ACG", _search_acg, True,
          "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH", "1"),
     ]
@@ -1913,6 +1918,29 @@ def _compact_dynamic_search_terms(
     return output
 
 
+_RELEASE_YEAR_TOKEN = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+
+def _release_year_conflict(request: Mapping[str, Any], release_name: str) -> bool:
+    """Reject a release whose explicit year predates the work's premiere.
+
+    A same-title different-series pack (``Shameless UK 2004`` against the US
+    2011 work) maps cleanly onto SxxEyy coordinates, so coordinate matching
+    alone cannot keep it out.  A release year is never earlier than the
+    premiere of the work it belongs to, so a year token below the requested
+    first-air year (with a one-year festival/cross-year grace) is a hard
+    identity disproof.  Season-year pack naming and missing years stay
+    accepted.
+    """
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    raw_year = str(media.get("year") or "").strip()
+    if not re.fullmatch(r"(?:19|20)\d{2}", raw_year):
+        return False
+    first_air = int(raw_year)
+    years = [int(value) for value in _RELEASE_YEAR_TOKEN.findall(release_name)]
+    return bool(years) and min(years) < first_air - 1
+
+
 def _torrent_candidate(
     request: Mapping[str, Any], release_name: str, torrent_url: str,
     manifest: Mapping[str, Any],
@@ -1927,6 +1955,8 @@ def _torrent_candidate(
         else VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS if has_subtitle_gaps
         else VIDEO_EXTENSIONS
     )
+    if _release_year_conflict(request, release_name):
+        return None
     gap_map, file_coverage = _gap_file_map(
         request, release_name, manifest, allowed_payload_extensions=allowed,
     )
@@ -3950,6 +3980,265 @@ def _search_animetosho(
         reviewed_torrent_miss_locators=sorted(reviewed_miss_locators),
         infrastructure_failures=infrastructure_failures,
         query_cursor=query_cursor,
+    )
+
+
+_BITSEARCH_ENDPOINT = "https://bitsearch.to/search?q="
+_BITSEARCH_MAX_ROWS = 16
+_BITSEARCH_SITE_TAG = re.compile(r"(?i)^\s*[\[{]?\s*bitsearch(?:\.to)?\s*[\]}]?\s*[-–—: ]?\s*")
+
+
+def _bitsearch_search_terms(request: Mapping[str, Any], *, maximum: int = 6) -> list[str]:
+    """Season-level then bare-title terms for the general-purpose index.
+
+    Unlike the anime indexes this source indexes season packs, so per-episode
+    queries add nothing; a season token plus the confirmed title is the
+    provider-native grammar.
+    """
+    if maximum < 1:
+        return []
+    bases: list[str] = []
+    seen: set[str] = set()
+    for value in _identity_query_bases(request, prefer_latin_aliases=True):
+        term = _nyaa_safe_query_term(value)
+        if term is None:
+            continue
+        key = _normalized_text(term)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        bases.append(term)
+        if len(bases) >= 4:
+            break
+    if not bases:
+        return []
+    terms: list[str] = []
+    dedup: set[str] = set()
+    for season in _positive_requested_seasons(request, maximum=4):
+        for base in bases[:2]:
+            value = f"{base} S{season:02d}"
+            key = _normalized_text(value)
+            if not key or key in dedup:
+                continue
+            dedup.add(key)
+            terms.append(value)
+    for base in bases[:2]:
+        key = _normalized_text(base)
+        if key and key not in dedup:
+            dedup.add(key)
+            terms.append(base)
+    return terms[:maximum]
+
+
+def _bitsearch_page_rows(page: str) -> dict[str, str]:
+    """Full-infohash rows with a clean release title per hash.
+
+    Only the page's own magnet hrefs are trusted for the infohash.  The
+    ``/download/torrent/`` links carry just a 12-character hash prefix and
+    have been observed serving a *different* torrent than their advertised
+    hash, so they are used purely as the clean-title source, never as the
+    acquisition document.
+    """
+    rows: dict[str, str] = {}
+    for match in re.finditer(r'href="(magnet:\?xt[^"]+)"', page):
+        href = html_module.unescape(match.group(1))
+        info = re.search(r"urn:btih:([0-9a-fA-F]{40})", href)
+        if info is None:
+            continue
+        name_match = re.search(r"[?&]dn=([^&]*)", href)
+        dn = (
+            urllib.parse.unquote_plus(name_match.group(1))
+            if name_match else ""
+        )
+        rows.setdefault(info.group(1).casefold(), _BITSEARCH_SITE_TAG.sub("", dn).strip())
+    for match in re.finditer(
+        r'/download/torrent/([0-9A-Fa-f]{12,40})\?title=([^"]+)"', page,
+    ):
+        prefix = match.group(1).casefold()[:12]
+        title = html_module.unescape(match.group(2)).strip()
+        if not title:
+            continue
+        for infohash in rows:
+            if infohash.startswith(prefix):
+                rows[infohash] = title
+                break
+    return rows
+
+
+def _bitsearch_row_relevant(title: str, request: Mapping[str, Any]) -> bool:
+    """Cheap name prefilter before any DHT metadata resolution."""
+    if not title:
+        return False
+    normalized = _normalized_text(title)
+    bases = [
+        _normalized_text(value)
+        for value in _identity_query_bases(request, prefer_latin_aliases=True)
+        if _normalized_text(value)
+    ]
+    if bases and not any(base in normalized for base in bases):
+        return False
+    return not _release_year_conflict(request, title)
+
+
+def _magnet_metadatas_batch(
+    magnet_uris: Sequence[str],
+    scratch: Path,
+    *,
+    timeout: int = 200,
+    pause_requested: Callable[[], bool] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve several magnets' metadata in one bounded aria2 DHT pass.
+
+    The returned mapping is keyed by each resolved torrent's true infohash.
+    Metadata comes from the swarm itself, so it is anchored to the magnet's
+    identity and cannot be swapped by a hostile download endpoint.
+    """
+    if not magnet_uris:
+        return {}
+    scratch.mkdir(parents=True, exist_ok=True)
+    command = [
+        "aria2c", "--seed-time=0", "--file-allocation=none",
+        "--enable-dht=true", "--enable-peer-exchange=true", "--bt-enable-lpd=true",
+        "--bt-metadata-only=true", "--bt-save-metadata=true",
+        f"--bt-stop-timeout={max(60, min(timeout, 600))}",
+        "--console-log-level=notice", "--summary-interval=0",
+        f"--dir={scratch}",
+        *magnet_uris,
+    ]
+    try:
+        _pause_checkpoint(pause_requested)
+        subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=max(60, timeout + 90),
+            env=_direct_download_env(os.environ),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    manifests: dict[str, dict[str, Any]] = {}
+    for path in scratch.iterdir():
+        if not path.is_file() or path.suffix != ".torrent":
+            continue
+        try:
+            data = path.read_bytes()
+            if len(data) > MAX_TORRENT_BYTES:
+                continue
+            manifest = _torrent_manifest(data)
+        except (OSError, ValueError):
+            continue
+        manifests[manifest["infohash"]] = manifest
+    return manifests
+
+
+def _search_bitsearch(
+    request: Mapping[str, Any], existing_locators: set[str], *,
+    deadline: float | None = None,
+) -> _DynamicSearchResult:
+    """Search the general-purpose BitSearch index for TV/movie works.
+
+    Row discovery is plain HTTP; per-row metadata is resolved from the swarm
+    via DHT (bounded batch), never from the index's own download endpoint.
+    """
+    deadline = deadline or time.monotonic() + _bounded_seconds(
+        "SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT", 45, 10, 300,
+    )
+    metadata_budget = _bounded_seconds(
+        "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_METADATA_TIMEOUT", 200, 60, 600,
+    )
+
+    def request_timeout() -> int:
+        remaining = int(deadline - time.monotonic())
+        return max(1, min(15, remaining))
+
+    terms = _bitsearch_search_terms(request)
+    query_attempts = 0
+    query_responses = 0
+    hit_cap = False
+    infrastructure_failures = 0
+    infrastructure_failure_types: dict[str, int] = {}
+    rows: dict[str, str] = {}
+    excluded_hashes = _locator_infohash_aliases(existing_locators)
+    reviewed_hashes = _locator_infohash_aliases(
+        request.get("reviewed_torrent_miss_locators") or [],
+    )
+    preexcluded_count = 0
+    for term in terms:
+        if time.monotonic() >= deadline:
+            break
+        url = _BITSEARCH_ENDPOINT + urllib.parse.quote_plus(term)
+        query_attempts += 1
+        try:
+            page = _fetch_bytes(
+                url, max_bytes=4 * 1024 * 1024,
+                timeout=request_timeout(), attempts=1,
+            ).decode("utf-8", "replace")
+        except (OSError, RuntimeError, ValueError) as exc:
+            infrastructure_failures += 1
+            code = _network_failure_code(exc)
+            infrastructure_failure_types[code] = (
+                infrastructure_failure_types.get(code, 0) + 1
+            )
+            continue
+        query_responses += 1
+        for infohash, title in _bitsearch_page_rows(page).items():
+            if infohash in excluded_hashes or infohash in reviewed_hashes:
+                preexcluded_count += 1
+                continue
+            if not _bitsearch_row_relevant(title, request):
+                continue
+            rows.setdefault(infohash, title)
+            if len(rows) >= _BITSEARCH_MAX_ROWS:
+                hit_cap = True
+                break
+        if hit_cap:
+            break
+
+    magnets: dict[str, str] = {}
+    for infohash, title in rows.items():
+        dn = urllib.parse.quote(title or infohash)
+        magnet = f"magnet:?xt=urn:btih:{infohash}&dn={dn}"
+        if "&tr=" not in magnet:
+            magnet = magnet + "&tr=" + "&tr=".join(_MAGNET_BOOTSTRAP_TRACKERS)
+        magnets[infohash] = magnet
+
+    candidates: list[dict[str, Any]] = []
+    resource_failed_locators: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="scrapeflow-bitsearch-") as directory:
+        scratch = Path(directory)
+        manifests = _magnet_metadatas_batch(
+            list(magnets.values()), scratch, timeout=metadata_budget,
+        )
+        for infohash, title in rows.items():
+            manifest = manifests.get(infohash)
+            if manifest is None:
+                # No swarm metadata within the bounded DHT window.  This is
+                # a resource miss (dead/unseeded), not an outage.
+                resource_failed_locators.append(f"torrent:{infohash}")
+                continue
+            variants = _torrent_candidate_variants(
+                request, title or (manifest.get("root") or ""),
+                magnets[infohash], manifest,
+                include_local=_local_torrent_available(request),
+            )
+            if variants:
+                candidates.extend(variants)
+            else:
+                resource_failed_locators.append(f"torrent:{infohash}")
+    processed = len(candidates) + len(resource_failed_locators)
+    return _DynamicSearchResult(
+        candidates,
+        query_attempts=query_attempts,
+        query_responses=query_responses,
+        source_exhausted=bool(
+            terms
+            and query_attempts == len(terms)
+            and query_responses == query_attempts
+            and not hit_cap
+            and processed == len(rows)
+            and infrastructure_failures == 0
+        ),
+        resource_failed_locators=resource_failed_locators,
+        infrastructure_failure_types=infrastructure_failure_types,
+        preexcluded_count=preexcluded_count,
     )
 
 
