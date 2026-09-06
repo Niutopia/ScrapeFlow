@@ -5052,15 +5052,21 @@ def _preflight(
         member_pending: list[int] = []
         for index in sorted(indices):
             member_size = int(files[index]["size"])
-            if resume_workspace is not None and _payload_is_complete(
-                resume_workspace / f"download-{offset:02d}"
-                / f"member-{index:03d}" / "payload",
-                acquisition,
-                {index},
-            ):
-                reusable_bytes += member_size
-            else:
-                member_pending.append(member_size)
+            # Batch groups are named by group ordinal, not member index;
+            # a resumed attempt rebuilds the same deterministic grouping, so
+            # a retained group payload is reusable for its whole batch.
+            member_pending.append(member_size)
+        if resume_workspace is not None:
+            candidate_dir = resume_workspace / f"download-{offset:02d}"
+            for group_dir in sorted(candidate_dir.glob("group-*")):
+                payload_dir = group_dir / "payload"
+                for index in indices:
+                    if _payload_is_complete(payload_dir, acquisition, {index}):
+                        reusable_bytes += int(files[index]["size"])
+                        try:
+                            member_pending.remove(int(files[index]["size"]))
+                        except ValueError:
+                            pass
         verified.append({
             "release_name": selection.get("release_name"),
             "torrent": url,
@@ -5074,14 +5080,18 @@ def _preflight(
         })
     free = shutil.disk_usage(workspace).free
     remaining_bytes = selected_bytes - reusable_bytes
-    # The per-member pipeline holds at most one pending member locally at a
-    # time (download → upload → verify → delete), so the capacity floor is
-    # the largest single member, not the whole pack.
+    # The batched pipeline holds at most one group locally at a time
+    # (download → per-member upload/verify → delete), so the capacity floor
+    # is the batch size times the largest single member, not the whole pack.
+    batch_size = _bounded_seconds(
+        "SCRAPEFLOW_REPLENISHMENT_MEMBER_BATCH", 4, 1, 64,
+    )
     pending_member_sizes: list[int] = []
     for row in verified:
         pending_member_sizes.extend(row.get("member_pending_bytes") or [])
-    largest_pending = max(pending_member_sizes, default=0)
-    required = int(largest_pending * 1.15) + 1024 ** 3
+    pending_member_sizes.sort(reverse=True)
+    group_peak = sum(pending_member_sizes[:batch_size])
+    required = int(group_peak * 1.15) + 1024 ** 3
     if free < required:
         raise ReplenishmentInfrastructureError(
             f"补源暂存空间不足: required={required}, free={free}",
@@ -5638,9 +5648,17 @@ def _acquire(
                 else media_staging_root
             )
         delivery_stage = "delivery_upload"
+        # Batch members into groups: requesting a wider piece range lets the
+        # swarm's partial peers serve their fragments (a single-member range
+        # starves: the peers hold pieces across the whole pack).  The batch
+        # size bounds the local peak footprint (batch x largest member).
+        batch_size = _bounded_seconds(
+            "SCRAPEFLOW_REPLENISHMENT_MEMBER_BATCH", 4, 1, 64,
+        )
+        pending: list[dict[str, Any]] = []
         for number, plan in enumerate(plans, start=1):
-            _pause_checkpoint(pause_requested)
             delivery_root = str(plan["delivery_root"])
+            plan["delivery_root_str"] = delivery_root
             target = join_remote(delivery_root, str(plan["remote_name"]))
             committed = client.exact_file_info(target)
             if (
@@ -5668,16 +5686,19 @@ def _acquire(
                     "kind": plan["kind"], "delivery_root": delivery_root,
                     "remote_committed": True,
                 })
-                continue
-            member_dir = plan["candidate_dir"] / f"member-{int(plan['index']):03d}"
-            member_payload = member_dir / "payload"
-            member_payload.mkdir(parents=True, exist_ok=True)
-            if _payload_is_complete(
-                member_payload, plan["acquisition"], {int(plan["index"])},
-            ):
+            else:
+                pending.append(plan)
+        for group_start in range(0, len(pending), batch_size):
+            group = pending[group_start:group_start + batch_size]
+            group_number = group_start // batch_size + 1
+            group_total = (len(pending) + batch_size - 1) // batch_size
+            group_dir = group[0]["candidate_dir"] / f"group-{group_number:03d}"
+            group_payload = group_dir / "payload"
+            group_payload.mkdir(parents=True, exist_ok=True)
+            group_indices = {int(plan["index"]) for plan in group}
+            if _payload_is_complete(group_payload, group[0]["acquisition"], group_indices):
                 print(
-                    f"[replenishment] 复用已验证下载 "
-                    f"{number}/{len(plans)}: {plan['remote_name']}",
+                    f"[replenishment] 复用已验证下载组 {group_number}/{group_total}",
                     flush=True,
                 )
             else:
@@ -5692,16 +5713,18 @@ def _acquire(
                     "--enable-dht=true", "--enable-peer-exchange=true",
                     "--bt-enable-lpd=true",
                     f"--bt-stop-timeout={_bounded_seconds('SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT', 600, 60, 3600)}",
-                    f"--dir={member_payload}",
-                    f"--select-file={int(plan['index'])}",
-                    str(plan["torrent_path"]),
+                    f"--dir={group_payload}",
+                    "--select-file=" + ",".join(
+                        str(int(plan["index"])) for plan in group
+                    ),
+                    str(group[0]["torrent_path"]),
                 ]
-                remaining_budget = _bounded_seconds(
+                budget = _bounded_seconds(
                     "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
                 )
                 print(
-                    f"[replenishment] 下载成员 {number}/{len(plans)}: "
-                    f"{plan['remote_name']}",
+                    f"[replenishment] 下载组 {group_number}/{group_total} "
+                    f"({len(group)} 个成员)",
                     flush=True,
                 )
                 try:
@@ -5709,69 +5732,71 @@ def _acquire(
                     completed = subprocess.run(
                         command, text=True, stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
-                        timeout=remaining_budget,
+                        timeout=budget,
                         env=_direct_download_env(os.environ),
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise ReplenishmentCandidateError(
                         "aria2c 下载超过总时限", stage="candidate_download",
-                        candidate=plan["selection"],
+                        candidate=group[0]["selection"],
                     ) from exc
                 if completed.returncode != 0:
                     tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
                     raise ReplenishmentCandidateError(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
-                        candidate=plan["selection"],
+                        candidate=group[0]["selection"],
                     )
-            _assert_payload_has_no_incomplete_markers(member_payload)
-            source = _find_download(
-                member_payload, str(plan["path"]), int(plan["size"]),
-            )
-            if plan["is_video"]:
-                _verify_video_payload(source, int(plan["size"]), plan["selection"])
-            row: dict[str, Any] = {
-                "gap_ids": list(plan["gaps"]),
-                **({
-                    "companion_for_gap_ids": plan["companion_for_gap_ids"],
-                    "paired_video_index": plan["paired_video_index"],
-                    "paired_video_source_name": plan["paired_video_source_name"],
-                    "subtitle_language": plan["subtitle_language"],
-                } if plan["kind"] == "subtitle" and plan.get("companion_for_gap_ids") else {}),
-                "source": source, "remote_name": plan["remote_name"],
-                "size": int(plan["size"]), "manifest_index": plan["index"],
-                "source_name": plan["path"], "provider_path": plan["path"],
-                "kind": plan["kind"], "delivery_root": delivery_root,
-            }
-            print(
-                f"[replenishment] 上传成员 {number}/{len(plans)}: "
-                f"{plan['remote_name']}",
-                flush=True,
-            )
-            # From the first upload attempt on, an ambiguous failure must be
-            # reconciled rather than retried from scratch: a partial remote
-            # commit can no longer be distinguished from a clean miss.
-            payload_verified = True
-            if pause_requested is None:
-                _automatic_upload(client, delivery_root, row)
-            else:
-                _automatic_upload(
-                    client, delivery_root, row,
-                    pause_requested=pause_requested,
+            _assert_payload_has_no_incomplete_markers(group_payload)
+            for plan in group:
+                _pause_checkpoint(pause_requested)
+                delivery_root = str(plan["delivery_root"])
+                source = _find_download(
+                    group_payload, str(plan["path"]), int(plan["size"]),
                 )
-            # The remote copy must be visible before the local bytes are
-            # dropped, or an interrupted run could lose both at once.
-            if pause_requested is None:
-                _verify_remote_uploads(client, delivery_root, [row])
-            else:
-                _verify_remote_uploads(
-                    client, delivery_root, [row],
-                    pause_requested=pause_requested,
+                if plan["is_video"]:
+                    _verify_video_payload(source, int(plan["size"]), plan["selection"])
+                row: dict[str, Any] = {
+                    "gap_ids": list(plan["gaps"]),
+                    **({
+                        "companion_for_gap_ids": plan["companion_for_gap_ids"],
+                        "paired_video_index": plan["paired_video_index"],
+                        "paired_video_source_name": plan["paired_video_source_name"],
+                        "subtitle_language": plan["subtitle_language"],
+                    } if plan["kind"] == "subtitle" and plan.get("companion_for_gap_ids") else {}),
+                    "source": source, "remote_name": plan["remote_name"],
+                    "size": int(plan["size"]), "manifest_index": plan["index"],
+                    "source_name": plan["path"], "provider_path": plan["path"],
+                    "kind": plan["kind"], "delivery_root": delivery_root,
+                }
+                print(
+                    f"[replenishment] 上传成员 {plan['remote_name']}",
+                    flush=True,
                 )
-            uploaded.append(row)
-            shutil.rmtree(member_dir, ignore_errors=True)
+                # From the first upload attempt on, an ambiguous failure must
+                # be reconciled rather than retried from scratch: a partial
+                # remote commit can no longer be distinguished from a miss.
+                payload_verified = True
+                if pause_requested is None:
+                    _automatic_upload(client, delivery_root, row)
+                else:
+                    _automatic_upload(
+                        client, delivery_root, row,
+                        pause_requested=pause_requested,
+                    )
+                # The remote copy must be visible before the local bytes are
+                # dropped, or an interrupted run could lose both at once.
+                if pause_requested is None:
+                    _verify_remote_uploads(client, delivery_root, [row])
+                else:
+                    _verify_remote_uploads(
+                        client, delivery_root, [row],
+                        pause_requested=pause_requested,
+                    )
+                uploaded.append(row)
+            # The whole group's bytes are proven remotely; free them locally.
+            shutil.rmtree(group_dir, ignore_errors=True)
             print(
-                f"[replenishment] 成员完成并释放本地 "
-                f"{number}/{len(plans)}: {plan['remote_name']}",
+                f"[replenishment] 组完成并释放本地 {group_number}/{group_total}",
                 flush=True,
             )
         delivery_stage = "delivery_visibility"

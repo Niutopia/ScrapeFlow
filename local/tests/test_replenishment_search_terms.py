@@ -851,14 +851,15 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                 if item.startswith("--dir=")
             )
             selected = next(
-                int(item[len("--select-file="):]) for item in command
+                item[len("--select-file="):] for item in command
                 if item.startswith("--select-file=")
             )
             manifest = adapter_._torrent_manifest(Path(command[-1]).read_bytes())
-            row = manifest["files"][selected]
-            target = directory / row["path"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"x" * row["size"])
+            for value in selected.split(","):
+                row = manifest["files"][int(value)]
+                target = directory / row["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x" * row["size"])
             return _Completed()
 
         wrapper = {
@@ -889,7 +890,7 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                     patch.object(adapter_, "_alist_client", return_value=fake_client):
                 return adapter_._acquire(wrapper, workspace, client=fake_client)
 
-    def test_one_member_downloaded_uploaded_and_freed_at_a_time(self) -> None:
+    def test_batch_group_downloaded_uploaded_and_freed(self) -> None:
         fake_client = self._FakeClient()
         aria2_calls: list[list[str]] = []
         deleted: list[Path] = []
@@ -898,23 +899,42 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             deleted.append(Path(path))
 
         import engine.tools._replenishment_local_adapter_impl as adapter_
-        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree):
+        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree), \
+                patch.dict("os.environ", {"SCRAPEFLOW_REPLENISHMENT_MEMBER_BATCH": "2"}):
             delivery = self._run_acquire(fake_client, aria2_calls)
 
-        # Exactly one --select-file per aria2 invocation, once per member.
-        self.assertEqual(len(aria2_calls), 2)
-        self.assertEqual(
-            [c[c.index(next(i for i in c if i.startswith("--select-file=")))] for c in aria2_calls],
-            ["--select-file=1", "--select-file=2"],
+        # One aria2 invocation covering both members as a single group.
+        self.assertEqual(len(aria2_calls), 1)
+        select_arg = next(
+            i for i in aria2_calls[0] if i.startswith("--select-file=")
         )
+        self.assertEqual(select_arg, "--select-file=1,2")
         # Every member landed remotely with its exact size.
         self.assertEqual(len(fake_client.uploads), 2)
         self.assertEqual(len(delivery["files"]), 2)
         self.assertEqual(delivery["files"][0]["gap_ids"], ["S01E01"])
         self.assertEqual(delivery["files"][1]["gap_ids"], ["S01E02"])
-        # Member directories were freed after their verified uploads.
-        member_dirs = [p for p in deleted if p.name.startswith("member-")]
-        self.assertEqual(len(member_dirs), 2)
+        # The group directory was freed after its verified uploads.
+        group_dirs = [p for p in deleted if p.name.startswith("group-")]
+        self.assertEqual(len(group_dirs), 1)
+
+    def test_batch_of_one_keeps_single_member_footprint(self) -> None:
+        fake_client = self._FakeClient()
+        aria2_calls: list[list[str]] = []
+
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        with patch.dict("os.environ", {"SCRAPEFLOW_REPLENISHMENT_MEMBER_BATCH": "1"}):
+            delivery = self._run_acquire(fake_client, aria2_calls)
+
+        # Batch size 1 keeps the strict per-member pipeline: one aria2 run
+        # and one --select-file per member.
+        self.assertEqual(len(aria2_calls), 2)
+        for call, expected in zip(aria2_calls, ("--select-file=1", "--select-file=2")):
+            self.assertEqual(
+                next(i for i in call if i.startswith("--select-file=")), expected,
+            )
+        self.assertEqual(len(fake_client.uploads), 2)
+        self.assertEqual(len(delivery["files"]), 2)
 
     def test_remote_committed_member_skips_download_and_upload(self) -> None:
         fake_client = self._FakeClient()
@@ -976,7 +996,7 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                 @staticmethod
                 def disk_usage(_path):
                     class _Usage:
-                        free = int(4 * 1024 * 1024 * 1.15) + 1024 ** 3
+                        free = int(5 * 1024 * 1024 * 1.15) + 1024 ** 3
                     return _Usage()
             with patch.object(adapter_.shutil, "disk_usage", _TinyDisk.disk_usage), \
                     patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
