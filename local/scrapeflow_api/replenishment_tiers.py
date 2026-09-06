@@ -36,8 +36,8 @@ MAGNET_REQUIRED_SOURCES = frozenset({
 # no-candidate proof for them must therefore cover it.
 MAGNET_REQUIRED_SOURCES_BY_SHELF: dict[str, frozenset[str]] = {
     "anime": MAGNET_REQUIRED_SOURCES,
-    "movie": frozenset({"bitsearch"}),
-    "us_tv": frozenset({"bitsearch"}),
+    "movie": frozenset({"bitsearch", "knaben"}),
+    "us_tv": frozenset({"bitsearch", "knaben"}),
 }
 
 

@@ -680,19 +680,19 @@ class BitSearchSourceTests(unittest.TestCase):
         request = self._request()
 
         self.assertTrue(
-            adapter._bitsearch_row_relevant(
+            adapter._general_index_row_relevant(
                 "Shameless.US.S11.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb", request,
             ),
         )
         # Same title, different series, premiere year predates the work.
         self.assertFalse(
-            adapter._bitsearch_row_relevant(
+            adapter._general_index_row_relevant(
                 "Shameless UK 2004 S01-S11 Complete 1080p ALL4 WEB-DL", request,
             ),
         )
         # A pack named by its season year stays acceptable.
         self.assertTrue(
-            adapter._bitsearch_row_relevant(
+            adapter._general_index_row_relevant(
                 "Shameless US Season 10 (2019) 1080p WEB-DL", request,
             ),
         )
@@ -734,7 +734,7 @@ class BitSearchSourceTests(unittest.TestCase):
         self.assertEqual(candidate["acquisition"]["url"], candidate["locator"][len("torrent:"):])
         self.assertTrue(result.source_exhausted)
         self.assertEqual(result.infrastructure_failures, 0)
-        self.assertEqual(len(fetched), len(adapter._bitsearch_search_terms(request)))
+        self.assertEqual(len(fetched), len(adapter._general_index_search_terms(request)))
 
     def test_unresolved_swarm_is_a_resource_miss_not_an_outage(self) -> None:
         request = self._request()
@@ -1006,6 +1006,51 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                 result = adapter_._preflight(wrapper, workspace / "preflight")
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["selected_files"], 2)
+
+
+class KnabenSourceTests(unittest.TestCase):
+    """The knaben.org meta-index parses title+magnet anchors directly."""
+
+    @staticmethod
+    def _request() -> dict[str, object]:
+        return {
+            "media": {
+                "title": "无耻之徒",
+                "aliases": ["Shameless", "Shameless (US)"],
+                "year": "2011",
+                "tmdb_id": 34307,
+            },
+            "gaps": [{
+                "id": "S10E01", "kind": "missing_episode",
+                "season": 10, "episodes": [1],
+            }],
+        }
+
+    def test_page_rows_pair_titles_with_full_hashes(self) -> None:
+        page = (
+            '<tr data-id="0471981bea7aa70f38dc77b21475e9ef92a9c13c"><td>'
+            '<a title="Shameless.US.S10.1080p.AMZN.WEBRip.DDP5.1.x264-NTb" '
+            'href="magnet:?xt=urn:btih:0471981BEA7AA70F38DC77B21475E9EF92A9C13C'
+            '&amp;dn=Shameless.US.S10&amp;tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce">NTb</a>'
+            '<a title="Shameless UK 2004 S01-S11 Complete" '
+            'href="magnet:?xt=urn:btih:93D92D9A5BEB83AD465F967E740DB912008E3EF3">UK</a>'
+            '</td></tr>'
+        )
+        rows = adapter._knaben_page_rows(page)
+
+        self.assertEqual(
+            rows["0471981bea7aa70f38dc77b21475e9ef92a9c13c"],
+            "Shameless.US.S10.1080p.AMZN.WEBRip.DDP5.1.x264-NTb",
+        )
+        self.assertEqual(len(rows), 2)
+
+    def test_magnet_with_trackers_only_appends_when_absent(self) -> None:
+        magnet = "magnet:?xt=urn:btih:" + "1" * 40
+
+        bare = adapter._magnet_with_trackers(magnet)
+        self.assertIn("&tr=", bare)
+        tracked = adapter._magnet_with_trackers(bare)
+        self.assertEqual(tracked, bare)
 
 
 if __name__ == "__main__":

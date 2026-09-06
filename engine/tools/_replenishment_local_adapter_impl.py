@@ -740,10 +740,14 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
         # source can keep the search set explicit.
         ("Nyaa", _search_nyaa, False,
          "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH", "1"),
-        # The one general-purpose (non-anime) magnet index: without it the
-        # magnet tier has no real source for movie/US-TV works at all.
+        # The general-purpose (non-anime) magnet indexes: without them the
+        # magnet tier has no real source for movie/US-TV works at all.  Two
+        # independent fetch paths for the same shelf keep one blocked index
+        # from silencing the lane.
         ("BitSearch", _search_bitsearch, False,
          "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH", "1"),
+        ("Knaben", _search_knaben, False,
+         "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH", "1"),
         ("ACG", _search_acg, True,
          "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH", "1"),
     ]
@@ -988,9 +992,9 @@ def _network_failure_code(exc: BaseException) -> str:
 
 def _fetch_bytes(
     url: str, *, max_bytes: int, timeout: int = 60, attempts: int = 4,
-    opener: Any | None = None,
+    opener: Any | None = None, user_agent: str = "ScrapeFlow/1.0",
 ) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "ScrapeFlow/1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
     last_error: Exception | None = None
     # When no explicit per-source proxy opener is supplied, stay direct:
     # urllib's default opener would inherit an ambient host proxy.
@@ -3984,6 +3988,10 @@ def _search_animetosho(
 
 
 _BITSEARCH_ENDPOINT = "https://bitsearch.to/search?q="
+_BITSEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) ScrapeFlow/4.0"
+)
 _BITSEARCH_MAX_ROWS = 16
 _BITSEARCH_SITE_TAG = re.compile(r"(?i)^\s*[\[{]?\s*bitsearch(?:\.to)?\s*[\]}]?\s*[-–—: ]?\s*")
 
@@ -3993,10 +4001,18 @@ def _search_index_opener() -> urllib.request.OpenerDirector:
 
     Search indexes are the one lane allowed to use the configured HTTP proxy
     (tracker announces and peer traffic must stay direct — see the aria2
-    invocation).  A missing proxy never falls back to an ambient host proxy:
-    that would be environment drift, not configuration.
+    invocation).  Compose injects that proxy as the standard ``HTTP_PROXY``
+    name translated from ``SCRAPEFLOW_HTTP_PROXY``; accept either spelling.
+    With neither configured, stay explicitly direct rather than inheriting
+    an ambient host proxy by accident.
     """
-    proxy = os.getenv("SCRAPEFLOW_HTTP_PROXY") or os.getenv("SCRAPEFLOW_HTTPS_PROXY")
+    proxy = (
+        os.getenv("SCRAPEFLOW_HTTP_PROXY")
+        or os.getenv("SCRAPEFLOW_HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or ""
+    ).strip()
     if proxy:
         return urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
@@ -4004,7 +4020,7 @@ def _search_index_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _bitsearch_search_terms(request: Mapping[str, Any], *, maximum: int = 6) -> list[str]:
+def _general_index_search_terms(request: Mapping[str, Any], *, maximum: int = 6) -> list[str]:
     """Season-level then bare-title terms for the general-purpose index.
 
     Unlike the anime indexes this source indexes season packs, so per-episode
@@ -4081,7 +4097,7 @@ def _bitsearch_page_rows(page: str) -> dict[str, str]:
     return rows
 
 
-def _bitsearch_row_relevant(title: str, request: Mapping[str, Any]) -> bool:
+def _general_index_row_relevant(title: str, request: Mapping[str, Any]) -> bool:
     """Cheap name prefilter before any DHT metadata resolution."""
     if not title:
         return False
@@ -4158,14 +4174,14 @@ def _search_bitsearch(
         "SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT", 45, 10, 300,
     )
     metadata_budget = _bounded_seconds(
-        "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_METADATA_TIMEOUT", 200, 60, 600,
+        "SCRAPEFLOW_REPLENISHMENT_GENERAL_INDEX_METADATA_TIMEOUT", 200, 60, 600,
     )
 
     def request_timeout() -> int:
         remaining = int(deadline - time.monotonic())
         return max(1, min(15, remaining))
 
-    terms = _bitsearch_search_terms(request)
+    terms = _general_index_search_terms(request)
     query_attempts = 0
     query_responses = 0
     hit_cap = False
@@ -4187,6 +4203,8 @@ def _search_bitsearch(
                 url, max_bytes=4 * 1024 * 1024,
                 timeout=request_timeout(), attempts=1,
                 opener=_search_index_opener(),
+                # The index's WAF rejects non-browser agents with a 500.
+                user_agent=_BITSEARCH_USER_AGENT,
             ).decode("utf-8", "replace")
         except (OSError, RuntimeError, ValueError) as exc:
             infrastructure_failures += 1
@@ -4200,7 +4218,7 @@ def _search_bitsearch(
             if infohash in excluded_hashes or infohash in reviewed_hashes:
                 preexcluded_count += 1
                 continue
-            if not _bitsearch_row_relevant(title, request):
+            if not _general_index_row_relevant(title, request):
                 continue
             rows.setdefault(infohash, title)
             if len(rows) >= _BITSEARCH_MAX_ROWS:
@@ -4257,6 +4275,152 @@ def _search_bitsearch(
         infrastructure_failure_types=infrastructure_failure_types,
         preexcluded_count=preexcluded_count,
     )
+
+
+_KNABEN_ENDPOINT = "https://knaben.org/search/?q="
+
+
+def _knaben_page_rows(page: str) -> dict[str, str]:
+    """Full-infohash rows with the release title from knaben.org.
+
+    Knaben is a meta-index: its anchors pair the release title with a magnet
+    that already carries its own tracker list, so the DHT metadata pass gets
+    announce endpoints for free.
+    """
+    rows: dict[str, str] = {}
+    for match in re.finditer(
+        r'<a title="([^"]+)" href="(magnet:\?xt=urn:btih:([0-9a-fA-F]{40})[^"]*)"',
+        page,
+    ):
+        title = html_module.unescape(match.group(1)).strip()
+        infohash = match.group(3).casefold()
+        rows.setdefault(infohash, title)
+    return rows
+
+
+def _search_knaben(
+    request: Mapping[str, Any], existing_locators: set[str], *,
+    deadline: float | None = None,
+) -> _DynamicSearchResult:
+    """Search the knaben.org meta-index for TV/movie works.
+
+    Same shape as the BitSearch lane: HTTP row discovery through the search
+    proxy, then DHT-anchored metadata resolution; never a downloaded
+    ``.torrent`` from the index itself.
+    """
+    deadline = deadline or time.monotonic() + _bounded_seconds(
+        "SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT", 45, 10, 300,
+    )
+    metadata_budget = _bounded_seconds(
+        "SCRAPEFLOW_REPLENISHMENT_GENERAL_INDEX_METADATA_TIMEOUT", 200, 60, 600,
+    )
+
+    def request_timeout() -> int:
+        remaining = int(deadline - time.monotonic())
+        return max(1, min(15, remaining))
+
+    terms = _general_index_search_terms(request)
+    query_attempts = 0
+    query_responses = 0
+    hit_cap = False
+    infrastructure_failures = 0
+    infrastructure_failure_types: dict[str, int] = {}
+    rows: dict[str, str] = {}
+    excluded_hashes = _locator_infohash_aliases(existing_locators)
+    reviewed_hashes = _locator_infohash_aliases(
+        request.get("reviewed_torrent_miss_locators") or [],
+    )
+    preexcluded_count = 0
+    for term in terms:
+        if time.monotonic() >= deadline:
+            break
+        url = _KNABEN_ENDPOINT + urllib.parse.quote_plus(term)
+        query_attempts += 1
+        try:
+            page = _fetch_bytes(
+                url, max_bytes=4 * 1024 * 1024,
+                timeout=request_timeout(), attempts=1,
+                opener=_search_index_opener(),
+                user_agent=_BITSEARCH_USER_AGENT,
+            ).decode("utf-8", "replace")
+        except (OSError, RuntimeError, ValueError) as exc:
+            infrastructure_failures += 1
+            code = _network_failure_code(exc)
+            infrastructure_failure_types[code] = (
+                infrastructure_failure_types.get(code, 0) + 1
+            )
+            continue
+        query_responses += 1
+        for infohash, title in _knaben_page_rows(page).items():
+            if infohash in excluded_hashes or infohash in reviewed_hashes:
+                preexcluded_count += 1
+                continue
+            if not _general_index_row_relevant(title, request):
+                continue
+            rows.setdefault(infohash, title)
+            if len(rows) >= _BITSEARCH_MAX_ROWS:
+                hit_cap = True
+                break
+        if hit_cap:
+            break
+
+    magnets: dict[str, str] = {}
+    for infohash, title in rows.items():
+        dn = urllib.parse.quote(title or infohash)
+        magnets[infohash] = f"magnet:?xt=urn:btih:{infohash}&dn={dn}"
+
+    candidates: list[dict[str, Any]] = []
+    resource_failed_locators: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="scrapeflow-knaben-") as directory:
+        scratch = Path(directory)
+        # Knaben magnets carry their own trackers; the batch helper keeps
+        # them and only appends the bootstrap list when none are present.
+        manifests = _magnet_metadatas_batch(
+            [
+                _magnet_with_trackers(magnets[infohash])
+                for infohash in rows
+            ],
+            scratch,
+            timeout=metadata_budget,
+        )
+        for infohash, title in rows.items():
+            manifest = manifests.get(infohash)
+            if manifest is None:
+                resource_failed_locators.append(f"torrent:{infohash}")
+                continue
+            variants = _torrent_candidate_variants(
+                request, title or (manifest.get("root") or ""),
+                magnets[infohash], manifest,
+                include_local=_local_torrent_available(request),
+            )
+            if variants:
+                candidates.extend(variants)
+            else:
+                resource_failed_locators.append(f"torrent:{infohash}")
+    processed = len(candidates) + len(resource_failed_locators)
+    return _DynamicSearchResult(
+        candidates,
+        query_attempts=query_attempts,
+        query_responses=query_responses,
+        source_exhausted=bool(
+            terms
+            and query_attempts == len(terms)
+            and query_responses == query_attempts
+            and not hit_cap
+            and processed == len(rows)
+            and infrastructure_failures == 0
+        ),
+        resource_failed_locators=resource_failed_locators,
+        infrastructure_failure_types=infrastructure_failure_types,
+        preexcluded_count=preexcluded_count,
+    )
+
+
+def _magnet_with_trackers(magnet_url: str) -> str:
+    """Append the bootstrap tracker list only when a magnet carries none."""
+    if "&tr=" in magnet_url:
+        return magnet_url
+    return magnet_url + "&tr=" + "&tr=".join(_MAGNET_BOOTSTRAP_TRACKERS)
 
 
 def _search_acg(

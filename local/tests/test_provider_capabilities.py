@@ -124,6 +124,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "1",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
@@ -164,6 +165,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "1",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
@@ -259,6 +261,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "1",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
@@ -288,6 +291,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "1",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
             "SCRAPEFLOW_REPLENISHMENT_DYNAMIC_SEARCH_TIMEOUT": "45",
@@ -324,6 +328,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "1",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
@@ -353,6 +358,7 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH": "0",
+            "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH": "0",
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
@@ -367,7 +373,7 @@ class ProviderCapabilityTests(unittest.TestCase):
              if facts["configured"] is True},
             set(),
         )
-        self.assertEqual(len(result["source_telemetry"]), 8)
+        self.assertEqual(len(result["source_telemetry"]), 9)
 
     def test_torrent_variants_never_project_an_alist_candidate(self) -> None:
         manifest = {

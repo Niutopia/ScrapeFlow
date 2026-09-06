@@ -106,9 +106,9 @@ class ReplenishmentTierPolicyTests(unittest.TestCase):
         for shelf in ("movie", "us_tv"):
             required = required_sources_for_tier(TIER_LOCAL_MAGNET, shelf)
             self.assertEqual(required, MAGNET_REQUIRED_SOURCES_BY_SHELF[shelf])
-            # The general-purpose index is deliberately outside the anime
-            # index set: movie/US-TV shelves owe it, anime does not.
-            self.assertEqual(required, frozenset({"bitsearch"}))
+            # The general-purpose indexes are deliberately outside the
+            # anime index set: movie/US-TV shelves owe them, anime does not.
+            self.assertEqual(required, frozenset({"bitsearch", "knaben"}))
             self.assertFalse(required.issubset(MAGNET_REQUIRED_SOURCES))
         self.assertEqual(
             required_sources_for_tier(TIER_LOCAL_MAGNET, None),
