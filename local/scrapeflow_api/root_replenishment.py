@@ -3388,25 +3388,83 @@ def _recover_video_intents(runner: Any, state_root: Path, root_task_id: str, sta
         if not isinstance(intent.get("delivery"), Mapping):
             task_id = _safe_task_id(intent.get("external_task_id"))
             if (
-                task_id is None
-                or intent["recovery_safe"] is not True
+                intent["recovery_safe"] is not True
                 or intent["phase"] not in {"submitting", "waiting_reconcile"}
             ):
                 _wait_video_intent(state_root, root_task_id, state, intent)
                 result["waiting"] = "waiting_reconcile"
                 return result
-            try:
-                reconcile = getattr(materializer_factory(intent["tier"]), "reconcile_existing_task")
-                delivery = _call_materializer_with_pause(reconcile, intent["request"], [intent["selection"]], staging_root=intent["staging_root"], workspace=Path(intent["workspace"]), alist=runner.alist, external_task_id=task_id, pause_requested=pause_requested)
-            except Exception as exc:
-                if _is_pause_error(exc):
-                    result["paused"] = True
+            if task_id is not None:
+                try:
+                    reconcile = getattr(materializer_factory(intent["tier"]), "reconcile_existing_task")
+                    delivery = _call_materializer_with_pause(reconcile, intent["request"], [intent["selection"]], staging_root=intent["staging_root"], workspace=Path(intent["workspace"]), alist=runner.alist, external_task_id=task_id, pause_requested=pause_requested)
+                except Exception as exc:
+                    if _is_pause_error(exc):
+                        result["paused"] = True
+                        return result
+                    _wait_video_intent(state_root, root_task_id, state, intent, task_id=task_id)
+                    result["waiting"] = "waiting_reconcile"
                     return result
-                _wait_video_intent(state_root, root_task_id, state, intent, task_id=task_id)
+            elif intent["tier"] == TIER_LOCAL_MAGNET:
+                # The local Torrent lane has no external task to query: a
+                # crash mid-acquire leaves only local bytes plus possibly a
+                # few committed staging uploads.  Its acquisition is
+                # idempotent — the per-member pipeline skips remote-committed
+                # and locally-complete members by exact size — so resuming
+                # the same durable attempt is the reconciliation itself.
+                materializer = materializer_factory(intent["tier"])
+                submitting = dict(intent)
+                submitting["phase"] = "submitting"
+                _write_video_intent(state_root, root_task_id, state, attempt_id, submitting)
+                try:
+                    delivery = _call_materializer_with_pause(
+                        materializer.acquire, intent["request"], [intent["selection"]],
+                        staging_root=intent["staging_root"],
+                        workspace=Path(intent["workspace"]),
+                        alist=runner.alist,
+                        pause_requested=pause_requested,
+                    )
+                except Exception as exc:
+                    if _is_pause_error(exc):
+                        _wait_video_intent(state_root, root_task_id, state, submitting)
+                        result["paused"] = True
+                        return result
+                    scope, _external = _classify_error(exc)
+                    if scope == FAILURE_CANDIDATE:
+                        # A clean resource failure (dead swarm, rejected
+                        # payload) drops the durable attempt so a later
+                        # round may search for a different candidate.
+                        _drop_video_intent(state_root, root_task_id, state, attempt_id)
+                        for gap_id in intent["ledger_gap_ids"]:
+                            record_attempt(
+                                state_root, root_task_id, gap_id,
+                                attempt_id=attempt_id,
+                                provider=intent["provider"], tier=intent["tier"],
+                                locator=intent["locator"], status="candidate_failed",
+                                error=_safe_durable_error(exc),
+                            )
+                            result["attempts"].append({
+                                "gap_id": gap_id, "tier": intent["tier"],
+                                "outcome": FAILURE_CANDIDATE,
+                                "candidate_key": intent["locator"],
+                            })
+                        _exclude_locator(state, intent["tier"], intent["locator"])
+                        continue
+                    _wait_video_intent(state_root, root_task_id, state, submitting)
+                    result["waiting"] = "waiting_reconcile"
+                    return result
+            else:
+                _wait_video_intent(state_root, root_task_id, state, intent)
                 result["waiting"] = "waiting_reconcile"
                 return result
             delivery = _video_delivery(delivery, intent)
-            if delivery is None or (delivery.get("external_task_id") not in {None, task_id}):
+            if delivery is None or (
+                # Only the reconcile path owes task-id continuity: it claims
+                # to describe the very external task the intent recorded.  A
+                # re-run local acquire returns fresh truth instead.
+                task_id is not None
+                and delivery.get("external_task_id") not in {None, task_id}
+            ):
                 _wait_video_intent(state_root, root_task_id, state, intent, task_id=task_id)
                 result["waiting"] = "waiting_reconcile"
                 return result

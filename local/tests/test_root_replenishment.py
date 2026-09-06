@@ -1106,7 +1106,13 @@ class RootReplenishmentTests(unittest.TestCase):
             self.assertEqual(second["waiting"], "waiting_reconcile")
 
     def test_crash_after_video_pre_submit_never_reacquires_on_reload(self) -> None:
-        """A torn process after the final pre-call write is recovery-only."""
+        """A torn process after the final pre-call write is recovery-only.
+
+        The local Torrent lane has no external task to query, so recovery
+        resumes the *same* durable attempt by re-running its idempotent
+        acquire (committed members are skipped by exact size).  It must not
+        run a new search or create a second attempt.
+        """
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)
             self._seed_tv_gap(state_root)
@@ -1132,6 +1138,7 @@ class RootReplenishmentTests(unittest.TestCase):
             persisted = load_root_replenishment_state(state_root, "root-1")
             intent = next(iter(persisted["video_intents"].values()))
             self.assertEqual(intent["phase"], "submitting")
+            attempt_before = intent["attempt_id"]
 
             search_calls: list[str] = []
             reloaded = run_root_replenishment(
@@ -1145,13 +1152,12 @@ class RootReplenishmentTests(unittest.TestCase):
             )
 
             self.assertEqual(calls, ["acquire"])
+            # No new search, no new attempt: the reload finished the same one.
             self.assertEqual(search_calls, [])
-            self.assertEqual(reloaded["waiting"], "waiting_reconcile")
+            self.assertEqual(reloaded["waiting"], None)
+            self.assertIn("::missing_episode::S01E02", reloaded["gaps_closed"][0])
             persisted = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(
-                next(iter(persisted["video_intents"].values()))["phase"],
-                "waiting_reconcile",
-            )
+            self.assertNotIn(attempt_before, persisted["video_intents"])
 
     def test_crash_after_video_success_before_receipt_persist_never_reacquires(self) -> None:
         """A lost successful delivery receipt must not create a second task."""
@@ -1211,10 +1217,14 @@ class RootReplenishmentTests(unittest.TestCase):
                 search_runner=lambda _request: (_ for _ in ()).throw(
                     AssertionError("reload must not re-search a torn attempt"),
                 ),
-                materializer_factory=lambda _tier: _FakeMaterializer(),
+                materializer_factory=lambda _tier: SuccessfulDelivery(),
             )
-            self.assertEqual(acquire_calls, ["acquire"])
-            self.assertEqual(second["waiting"], "waiting_reconcile")
+            # The reloaded run re-ran the SAME idempotent acquire (committed
+            # members are skipped by exact size) and completed the attempt —
+            # no new task, no re-search.
+            self.assertEqual(acquire_calls, ["acquire", "acquire"])
+            self.assertEqual(second["waiting"], None)
+            self.assertTrue(second["gaps_closed"])
 
     def test_child_failure_recovers_same_video_attempt_without_new_acquire(self) -> None:
         """A failed child may be resumed, but its provider is never replayed."""
