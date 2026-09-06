@@ -936,3 +936,49 @@ class FailedChildNoLeakTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OfficialRunExceptionCorrelationTests(unittest.TestCase):
+    """The official-row exception needs an episode-correlation veto."""
+
+    def _map(self, items):
+        from engine.scrapeflow.core import _map_disc_extras_by_official_release_runs
+        show = {"name": "Show", "original_name": "Show"}
+        positive_seasons = [
+            {"season_number": 1, "episode_count": 11, "air_date": "2021-01-11"},
+            {"season_number": 2, "episode_count": 12, "air_date": "2023-07-10"},
+        ]
+        special_runtimes = {3: 5, 4: 5, 5: 6, 6: 5, 7: 5, 2: 24}
+        special_air_dates = {
+            3: "2021-06-01", 4: "2021-06-02", 5: "2021-06-03",
+            6: "2021-06-04", 7: "2021-06-05", 2: "2023-07-03",
+        }
+        _map_disc_extras_by_official_release_runs(
+            items, show=show, positive_seasons=positive_seasons,
+            special_runtimes=special_runtimes,
+            special_air_dates=special_air_dates,
+        )
+        return items
+
+    def test_correlation_marker_vetoes_official_row_exception(self):
+        # The NCED for episode 22: ordinal 2 lands in the run, but the
+        # EP.22 correlation proves the ordinal is release-local sequence.
+        items = [{
+            "name": "Show [SP02] NCED - 04 [ EP.22 ].zh.ass",
+            "full_path": "/in/Rel/S01/EXTRA/Show [SP02] NCED - 04 [ EP.22 ].zh.ass",
+        }]
+        self._map(items)
+        self.assertIsNone(items[0].get("_episode_key_override"))
+
+    def test_plain_ordinal_theme_still_uses_official_row(self):
+        # A bare NCOP whose ordinal is in the run IS the official row.
+        items = [{
+            "name": "Show [SP03] NCOP (BD).mkv",
+            "full_path": "/in/Rel/S01/EXTRA/Show [SP03] NCOP (BD).mkv",
+        }]
+        self._map(items)
+        self.assertEqual(items[0].get("_episode_key_override"), 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6637,17 +6637,24 @@ def _map_disc_extras_by_official_release_runs(
         if theme_named:
             # TMDB's Season 00 legitimately contains creditless-theme rows
             # (NCOP/NCED collections).  A theme-named file whose SP ordinal
-            # lands inside the official short run for its source season is
-            # exactly that official row — the run evidence outranks the name
-            # vocabulary.  Everything else stays skipped (the SPxx ordinal
-            # of a theme release is release-local numbering).
+            # lands inside the official short run for its source season CAN
+            # be that official row — but only when the name itself carries
+            # no contradictory episode correlation.  ``NCED - 04 [ EP.22 ]``
+            # explicitly names the ending OF episode 22: the SP ordinal is
+            # the theme release's sequence number, not an S00 coordinate.
+            # Require BOTH the ordinal-in-run AND a name free of episode
+            # correlation markers before the run evidence outranks the
+            # theme vocabulary.
             sp_token = re.search(
                 r"(?:^|[\[ _.-])SP\s*0*(\d{1,2})(?:[\] _.-]|$)", name, re.I,
             )
+            correlated = re.search(
+                r"(?:EP|Episode|\u7b2c)[\s._-]*0*(\d{1,4})", name, re.I,
+            ) or re.search(r"\[\s*E?0*(\d{1,4})\s*\]", name)
             source_season = item_source_season(item)
             run = run_by_season.get(source_season or -1)
             official_row = False
-            if sp_token is not None and run is not None:
+            if sp_token is not None and run is not None and correlated is None:
                 ordinal = int(sp_token.group(1))
                 if 1 <= ordinal <= len(run):
                     official_row = True
