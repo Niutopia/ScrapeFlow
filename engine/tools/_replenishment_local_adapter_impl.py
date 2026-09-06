@@ -5141,8 +5141,14 @@ def _direct_download_env(base: Mapping[str, str]) -> dict[str, str]:
 def _payload_is_complete(
     payload_dir: Path, acquisition: Mapping[str, Any], indices: set[int],
 ) -> bool:
-    """Trust a retained payload only after aria2 finished and every file matches."""
-    if not payload_dir.is_dir() or any(payload_dir.rglob("*.aria2")):
+    """Trust a retained payload only after every selected file exactly matches.
+
+    A retained ``.aria2`` control file is *not* evidence of an incomplete
+    member: aria2 deliberately keeps it for a partially-selected torrent (the
+    selection covers some files, not the whole swarm), so per-member exact
+    sizes remain the only completion proof.
+    """
+    if not payload_dir.is_dir():
         return False
     size_map = acquisition.get("file_size_by_index")
     path_map = acquisition.get("file_path_by_index")
@@ -5158,16 +5164,6 @@ def _payload_is_complete(
     except (KeyError, TypeError, ValueError):
         return False
     return True
-
-
-def _assert_payload_has_no_incomplete_markers(payload_dir: Path) -> None:
-    """Fail before upload if aria2 left any incomplete-file marker behind."""
-    marker = next(payload_dir.rglob("*.aria2"), None) if payload_dir.is_dir() else None
-    if marker is not None:
-        raise ReplenishmentCandidateError(
-            f"aria2 未完成文件仍在补源 payload: {marker.name}",
-            stage="candidate_payload_validation",
-        )
 
 
 def _preflight(
@@ -5927,7 +5923,6 @@ def _acquire(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
                         candidate=group[0]["selection"],
                     )
-            _assert_payload_has_no_incomplete_markers(group_payload)
             for plan in group:
                 _pause_checkpoint(pause_requested)
                 delivery_root = str(plan["delivery_root"])
