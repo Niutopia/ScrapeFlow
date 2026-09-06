@@ -214,9 +214,29 @@ class PanSouDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(second["search_complete_no_candidates"])
         self.assertEqual(second["unchecked_secondary_candidates"], 0)
+        # The share-pack lane reorders deterministic terms: season/bare-show
+        # queries precede per-episode queries because Quark share titles are
+        # pack-level and episode coverage is proven by manifest inspection.
         self.assertEqual(
             [call["payload"]["kw"] for call in calls],
-            ["Example Show S01E01", "Example Show season", "Example Show"],
+            ["Example Show season", "Example Show", "Example Show S01E01"],
+        )
+
+    def test_share_pack_lane_puts_broad_terms_before_episode_terms(self) -> None:
+        discovery, calls = self._discovery(_response(), max_queries=12)
+        with patch(
+            "engine.tools.replenishment_adapter.pansou._impl._compact_dynamic_search_terms",
+            return_value=[
+                "Example Show S01E01", "Alias S01E02", "Example Show S01",
+                "Example Show", "别名标题", "Alias Show",
+            ],
+        ):
+            discovery.run(_request())
+
+        self.assertEqual(
+            [call["payload"]["kw"] for call in calls],
+            ["Example Show S01", "Example Show", "别名标题", "Alias Show",
+             "Example Show S01E01", "Alias S01E02"],
         )
 
     def test_documented_direct_search_response_is_accepted(self) -> None:

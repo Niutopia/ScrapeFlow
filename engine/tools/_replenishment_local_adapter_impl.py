@@ -4343,11 +4343,106 @@ def _repair_nyaa_land_torrent_comment(data: bytes, mirror_url: str) -> bytes:
     return data.replace(malformed, corrected, 1)
 
 
+_MAGNET_URI_PATTERN = re.compile(
+    r"magnet:\?xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})\b[^\s]*",
+)
+# Public trackers bootstrap DHT announces for magnet-only metadata fetches.
+# Peer traffic stays direct; these are announce endpoints only.
+_MAGNET_BOOTSTRAP_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+)
+
+
+def _magnet_metadata(
+    magnet_url: str, destination: Path, *,
+    timeout: int = 240,
+    pause_requested: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Resolve a magnet URI's torrent metadata via a bounded aria2 DHT pass.
+
+    ``--bt-metadata-only`` stops the transfer as soon as the metadata is
+    fetched, so no payload bytes are downloaded and the session never seeds.
+    The saved ``.torrent`` is written to ``destination`` so the normal
+    manifest verification and the later data download share one file.
+    """
+    match = _MAGNET_URI_PATTERN.fullmatch(magnet_url.strip())
+    if match is None:
+        raise ValueError("magnet 地址缺少有效 btih")
+    if len(magnet_url) > 8192:
+        raise ValueError("magnet 地址过长")
+    full_url = magnet_url.strip()
+    if "&tr=" not in full_url:
+        full_url = full_url + "&tr=" + "&tr=".join(_MAGNET_BOOTSTRAP_TRACKERS)
+    workspace = destination.parent
+    workspace.mkdir(parents=True, exist_ok=True)
+    # aria2 names the metadata file after the infohash; run in a scratch dir
+    # so we can find the file regardless of its name, then move it into place.
+    scratch = workspace / f".{destination.name}.magnet"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    command = [
+        "aria2c", "--seed-time=0", "--file-allocation=none",
+        "--enable-dht=true", "--enable-peer-exchange=true", "--bt-enable-lpd=true",
+        "--bt-metadata-only=true", "--bt-save-metadata=true",
+        f"--bt-stop-timeout={max(60, min(timeout, 300))}",
+        "--console-log-level=notice", "--summary-interval=0",
+        f"--dir={scratch}",
+        full_url,
+    ]
+    try:
+        _pause_checkpoint(pause_requested)
+        completed = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=max(60, timeout + 60),
+            env=_direct_download_env(os.environ),
+        )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise TimeoutError("magnet 元数据解析超时") from exc
+    except ReplenishmentPauseRequested:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise
+    saved = None
+    if completed.returncode == 0:
+        for row in sorted(scratch.iterdir()):
+            if row.is_file() and row.suffix == ".torrent":
+                saved = row
+                break
+    if saved is None:
+        tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise RuntimeError(f"magnet 元数据解析失败: {tail}")
+    data = saved.read_bytes()
+    if len(data) > MAX_TORRENT_BYTES:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise ValueError("torrent 元数据超过大小上限")
+    manifest = _torrent_manifest(data)
+    shutil.rmtree(scratch, ignore_errors=True)
+    _pause_checkpoint(pause_requested)
+    destination.write_bytes(data)
+    return manifest
+
+
 def _download_torrent(
     url: str, destination: Path, *, timeout: int = 60, attempts: int = 4,
     opener: Any | None = None,
     pause_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    if url.startswith("magnet:"):
+        # A magnet carries no downloadable .torrent document; its metadata
+        # comes from the swarm itself via a bounded DHT resolution pass.
+        return _magnet_metadata(
+            url, destination,
+            timeout=_bounded_seconds(
+                "SCRAPEFLOW_REPLENISHMENT_MAGNET_METADATA_TIMEOUT", 240, 60, 600,
+            ),
+            pause_requested=pause_requested,
+        )
     if not url.startswith("https://"):
         raise ValueError("torrent 地址需要使用 HTTPS")
     try:

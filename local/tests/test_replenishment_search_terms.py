@@ -562,5 +562,79 @@ class NyaaSearchRegressionTests(unittest.TestCase):
         self.assertNotIn("token=secret", repr(result.infrastructure_failure_types))
 
 
+class MagnetMetadataResolutionTests(unittest.TestCase):
+    """Magnet locators resolve their .torrent via a bounded aria2 DHT pass."""
+
+    def _torrent_bytes(self) -> bytes:
+        # A minimal single-file torrent: announce + info{length, name, piece length, pieces}
+        name = b"Example.Show.S01E01.1080p.mkv"
+        announce = b"udp://tracker.example:1337/announce"
+        # Bencoded dicts must be sorted by key: length < name < piece length < pieces
+        info = (
+            b"d6:lengthi1048576e4:name" + str(len(name)).encode() + b":" + name
+            + b"12:piece lengthi16384e6:pieces20:00000000000000000000e"
+        )
+        return (
+            b"d8:announce" + str(len(announce)).encode() + b":" + announce
+            + b"4:info" + info + b"e"
+        )
+
+    def test_magnet_resolves_metadata_and_writes_torrent_file(self) -> None:
+        magnet = "magnet:?xt=urn:btih:" + "0" * 40
+        commands: list[list[str]] = []
+
+        class _Completed:
+            returncode = 0
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            directory = next(
+                Path(item.removeprefix("--dir=")).resolve()
+                for item in command if item.startswith("--dir=")
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            infohash = magnet.split("urn:btih:")[1][:40]
+            (directory / f"{infohash}.torrent").write_bytes(self._torrent_bytes())
+            return _Completed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candidate-01.torrent"
+            with patch.object(adapter.subprocess, "run", side_effect=fake_run):
+                manifest = adapter._download_torrent(magnet, destination)
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_bytes(), self._torrent_bytes())
+            # The scratch directory must not leak into the workspace.
+            self.assertFalse(destination.with_name(".candidate-01.torrent.magnet").exists())
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--bt-metadata-only=true", commands[0])
+        self.assertIn(magnet, commands[0][-1])
+        self.assertEqual(manifest["files"][1]["path"], "Example.Show.S01E01.1080p.mkv")
+
+    def test_magnet_without_btih_is_rejected_before_any_run(self) -> None:
+        with patch.object(adapter.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                adapter._download_torrent(
+                    "magnet:?xt=urn:sha1:AAAA", Path("/tmp/never.torrent"),
+                )
+        run.assert_not_called()
+
+    def test_magnet_metadata_failure_is_a_candidate_error(self) -> None:
+        magnet = "magnet:?xt=urn:btih:" + "1" * 40
+
+        class _Completed:
+            returncode = 7
+            stdout = "bt metadata timeout"
+
+        def fake_run(command, **_kwargs):
+            return _Completed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candidate-01.torrent"
+            with patch.object(adapter.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(RuntimeError):
+                    adapter._download_torrent(magnet, destination)
+
+
 if __name__ == "__main__":
     unittest.main()

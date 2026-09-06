@@ -52,6 +52,37 @@ _MAX_SHARE_ENTRIES = 4096
 # into unbounded network I/O.
 _MAX_QUERY_PROOF_TERMS = 256
 _SAFE_CURSOR_FINGERPRINT = re.compile(r"^[a-f0-9]{64}$")
+# Quark shares are published as show/season-level packs: their titles almost
+# never carry per-episode tokens, and exact episode coverage is proven later
+# by read-only manifest inspection.  Episode-specific search terms therefore
+# add no precision on this lane while burying the broad pack titles behind
+# many windows of guaranteed-empty queries.
+_SHARE_PACK_EPISODE_MARKER = re.compile(
+    r"(?i)S\d{1,3}E\d{1,4}|\bE\d{2,4}\b|\b\d{1,2}x\d{1,3}\b"
+)
+_SHARE_PACK_SEASON_MARKER = re.compile(
+    r"(?i)\bS\d{1,3}\b|\bseason\s+\d{1,2}\b|第.+季"
+)
+
+
+def _share_pack_term_order(terms: Sequence[str]) -> list[str]:
+    """Reorder deterministic terms for the Quark share-pack lane.
+
+    Pack-level (season, then bare show) terms come first so the first search
+    windows reach the resources this lane can actually consume; per-episode
+    terms keep their deterministic order at the tail for exhaustion proof.
+    """
+    season_level: list[str] = []
+    broad: list[str] = []
+    episode_level: list[str] = []
+    for term in terms:
+        if _SHARE_PACK_EPISODE_MARKER.search(term):
+            episode_level.append(term)
+        elif _SHARE_PACK_SEASON_MARKER.search(term):
+            season_level.append(term)
+        else:
+            broad.append(term)
+    return [*season_level, *broad, *episode_level]
 
 
 class PanSouDiscoveryError(RuntimeError):
@@ -633,10 +664,10 @@ class PanSouDiscovery:
                 configured=True,
             )
         try:
-            all_terms = _impl._compact_dynamic_search_terms(  # noqa: SLF001
+            all_terms = _share_pack_term_order(_impl._compact_dynamic_search_terms(  # noqa: SLF001
                 request,
                 maximum=_MAX_QUERY_PROOF_TERMS,
-            )
+            ))
         except Exception:
             return self._incomplete(
                 "PanSou request term construction failed",
