@@ -756,5 +756,237 @@ class BitSearchSourceTests(unittest.TestCase):
         self.assertEqual(result.infrastructure_failures, 0)
 
 
+class MagnetMemberPipelineTests(unittest.TestCase):
+    """Torrent acquisition downloads, uploads, and frees one member at a time."""
+
+    def _selection(self) -> dict[str, object]:
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        infohash = adapter_._torrent_manifest(self._torrent_bytes())["infohash"]
+        return {
+            "provider": "magnet",
+            "locator": f"torrent:https://example.test/pack.torrent",
+            "release_name": "Example Show S01 1080p",
+            "infohash": infohash,
+            "selected_gap_ids": ["S01E01", "S01E02"],
+            "acquisition": {
+                "kind": "torrent",
+                "url": "https://example.test/pack.torrent",
+                "file_index_by_gap": {"S01E01": [1], "S01E02": [2]},
+                "file_size_by_index": {"1": 2 * 1024 * 1024, "2": 3 * 1024 * 1024},
+                "file_path_by_index": {
+                    "1": "Example.Show.S01E01.1080p.mkv",
+                    "2": "Example.Show.S01E02.1080p.mkv",
+                },
+                "download_bytes": 5 * 1024 * 1024,
+                "selected_download_bytes": 5 * 1024 * 1024,
+            },
+        }
+
+    @staticmethod
+    def _torrent_bytes() -> bytes:
+        def bstr(value: bytes) -> bytes:
+            return str(len(value)).encode() + b":" + value
+
+        def bint(value: int) -> bytes:
+            return b"i" + str(value).encode() + b"e"
+
+        name = b"Example Show S01 1080p"
+        announce = b"udp://tracker.example:1337/announce"
+        f1_path = b"Example.Show.S01E01.1080p.mkv"
+        f2_path = b"Example.Show.S01E02.1080p.mkv"
+        f1 = b"d" + bstr(b"length") + bint(2 * 1024 * 1024) + bstr(b"path") + b"l" + bstr(f1_path) + b"e" + b"e"
+        f2 = b"d" + bstr(b"length") + bint(3 * 1024 * 1024) + bstr(b"path") + b"l" + bstr(f2_path) + b"e" + b"e"
+        # Bencoded dicts must be sorted by key: files < name < piece length < pieces
+        info = (
+            b"d" + bstr(b"files") + b"l" + f1 + f2 + b"e"
+            + bstr(b"name") + bstr(name)
+            + bstr(b"piece length") + bint(16384)
+            + bstr(b"pieces") + bstr(b"0" * 40)
+            + b"e"
+        )
+        return b"d" + bstr(b"announce") + bstr(announce) + bstr(b"info") + info + b"e"
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.token = "fake"
+            self.remote: dict[str, int] = {}
+            self.uploads: list[str] = []
+
+        def login(self) -> None:  # pragma: no cover - token preset
+            pass
+
+        def mkdir(self, path: str) -> None:
+            pass
+
+        def exact_file_info(self, path: str) -> dict[str, object] | None:
+            if path in self.remote:
+                return {"name": path.rsplit("/", 1)[-1], "size": self.remote[path]}
+            return None
+
+        def upload_file(self, target: str, source: Path, content_type: str = "") -> None:
+            self.remote[target] = source.stat().st_size
+            self.uploads.append(target)
+
+        def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+            prefix = path.rstrip("/") + "/"
+            return [
+                {"name": name.rsplit("/", 1)[-1], "size": size, "is_dir": False}
+                for name, size in self.remote.items()
+                if name.startswith(prefix)
+            ]
+
+    def _run_acquire(self, fake_client, aria2_calls, *, preexisting=None):
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        class _Completed:
+            returncode = 0
+            stdout = "ok"
+
+        def fake_run(command, **kwargs):
+            aria2_calls.append(command)
+            # Emulate aria2: materialize exactly the selected member under
+            # the --dir given, honouring the manifest's real paths.
+            directory = next(
+                Path(item[len("--dir="):]) for item in command
+                if item.startswith("--dir=")
+            )
+            selected = next(
+                int(item[len("--select-file="):]) for item in command
+                if item.startswith("--select-file=")
+            )
+            manifest = adapter_._torrent_manifest(Path(command[-1]).read_bytes())
+            row = manifest["files"][selected]
+            target = directory / row["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x" * row["size"])
+            return _Completed()
+
+        wrapper = {
+            "request": {
+                "gaps": [
+                    {"id": "S01E01", "kind": "missing_episode", "season": 1, "episodes": [1]},
+                    {"id": "S01E02", "kind": "missing_episode", "season": 1, "episodes": [2]},
+                ],
+            },
+            "selection": {"selections": [self._selection()]},
+            "automatic_staging_root": "/quark/影视/ScrapeFlow/补源/root-x/attempt-1",
+            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            torrent_path = workspace / "preflight" / "candidate-01.torrent"
+            torrent_path.parent.mkdir(parents=True)
+            torrent_path.write_bytes(self._torrent_bytes())
+            if preexisting:
+                preexisting(workspace)
+            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
+                    patch.object(adapter_, "_verify_video_payload"), \
+                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                    patch.object(
+                        adapter_, "_download_torrent",
+                        return_value=adapter_._torrent_manifest(self._torrent_bytes()),
+                    ), \
+                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                return adapter_._acquire(wrapper, workspace, client=fake_client)
+
+    def test_one_member_downloaded_uploaded_and_freed_at_a_time(self) -> None:
+        fake_client = self._FakeClient()
+        aria2_calls: list[list[str]] = []
+        deleted: list[Path] = []
+
+        def watch_rmtree(path, **kwargs):
+            deleted.append(Path(path))
+
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree):
+            delivery = self._run_acquire(fake_client, aria2_calls)
+
+        # Exactly one --select-file per aria2 invocation, once per member.
+        self.assertEqual(len(aria2_calls), 2)
+        self.assertEqual(
+            [c[c.index(next(i for i in c if i.startswith("--select-file=")))] for c in aria2_calls],
+            ["--select-file=1", "--select-file=2"],
+        )
+        # Every member landed remotely with its exact size.
+        self.assertEqual(len(fake_client.uploads), 2)
+        self.assertEqual(len(delivery["files"]), 2)
+        self.assertEqual(delivery["files"][0]["gap_ids"], ["S01E01"])
+        self.assertEqual(delivery["files"][1]["gap_ids"], ["S01E02"])
+        # Member directories were freed after their verified uploads.
+        member_dirs = [p for p in deleted if p.name.startswith("member-")]
+        self.assertEqual(len(member_dirs), 2)
+
+    def test_remote_committed_member_skips_download_and_upload(self) -> None:
+        fake_client = self._FakeClient()
+        # Member 1 is already committed remotely from an earlier interrupted
+        # attempt; only member 2 should download and upload now.
+        staging = "/quark/影视/ScrapeFlow/补源/root-x/attempt-1"
+        fake_client.remote[f"{staging}/S01E01 - Example.Show.S01E01.1080p.mkv"] = 2 * 1024 * 1024
+        aria2_calls: list[list[str]] = []
+
+        delivery = self._run_acquire(fake_client, aria2_calls)
+
+        self.assertEqual(len(aria2_calls), 1)
+        self.assertEqual(
+            aria2_calls[0][
+                aria2_calls[0].index(next(i for i in aria2_calls[0] if i.startswith("--select-file=")))
+            ],
+            "--select-file=2",
+        )
+        self.assertEqual(len(fake_client.uploads), 1)
+        self.assertEqual(len(delivery["files"]), 2)
+
+    def test_legacy_bulk_payload_directory_is_reclaimed(self) -> None:
+        fake_client = self._FakeClient()
+        aria2_calls: list[list[str]] = []
+        removed: list[Path] = []
+
+        def preexisting(workspace: Path) -> None:
+            legacy = workspace / "download-01" / "payload" / "stale"
+            legacy.mkdir(parents=True)
+            (legacy / "old.mkv").write_bytes(b"0" * 1024)
+
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        real_rmtree = adapter_.shutil.rmtree
+
+        def watch_rmtree(path, **kwargs):
+            removed.append(Path(path))
+            real_rmtree(path, **kwargs)
+
+        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree):
+            self._run_acquire(fake_client, aria2_calls, preexisting=preexisting)
+
+        self.assertIn(workspace_marker := "payload", [p.name for p in removed])
+
+    def test_preflight_capacity_floor_is_one_member_not_the_pack(self) -> None:
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        wrapper = {
+            "request": {"gaps": [{"id": "S01E01", "kind": "missing_episode"}]},
+            "selection": {"selections": [self._selection()]},
+            "automatic_staging_root": "/quark/影视/ScrapeFlow/补源/root-x/attempt-1",
+            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "preflight").mkdir()
+            (workspace / "preflight" / "candidate-01.torrent").write_bytes(
+                self._torrent_bytes(),
+            )
+            class _TinyDisk:
+                @staticmethod
+                def disk_usage(_path):
+                    class _Usage:
+                        free = int(4 * 1024 * 1024 * 1.15) + 1024 ** 3
+                    return _Usage()
+            with patch.object(adapter_.shutil, "disk_usage", _TinyDisk.disk_usage), \
+                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                    patch.object(adapter_, "_download_torrent", return_value=adapter_._torrent_manifest(self._torrent_bytes())):
+                # A disk holding only ~one member + headroom must pass for a
+                # two-member pack (the old whole-pack floor would reject it).
+                result = adapter_._preflight(wrapper, workspace / "preflight")
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["selected_files"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

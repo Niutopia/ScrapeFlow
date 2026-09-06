@@ -5049,12 +5049,18 @@ def _preflight(
         byte_count = sum(int(files[index]["size"]) for index in indices)
         selected_bytes += byte_count
         selected_files += len(indices)
-        if resume_workspace is not None and _payload_is_complete(
-            resume_workspace / f"download-{offset:02d}" / "payload",
-            acquisition,
-            indices,
-        ):
-            reusable_bytes += byte_count
+        member_pending: list[int] = []
+        for index in sorted(indices):
+            member_size = int(files[index]["size"])
+            if resume_workspace is not None and _payload_is_complete(
+                resume_workspace / f"download-{offset:02d}"
+                / f"member-{index:03d}" / "payload",
+                acquisition,
+                {index},
+            ):
+                reusable_bytes += member_size
+            else:
+                member_pending.append(member_size)
         verified.append({
             "release_name": selection.get("release_name"),
             "torrent": url,
@@ -5062,12 +5068,20 @@ def _preflight(
             "selected_indices": sorted(indices),
             "selected_files": len(indices),
             "selected_bytes": byte_count,
+            "member_pending_bytes": sorted(member_pending, reverse=True),
             "torrent_path": str(torrent_path),
             "manifest": manifest,
         })
     free = shutil.disk_usage(workspace).free
     remaining_bytes = selected_bytes - reusable_bytes
-    required = int(remaining_bytes * 1.15) + 1024 ** 3
+    # The per-member pipeline holds at most one pending member locally at a
+    # time (download → upload → verify → delete), so the capacity floor is
+    # the largest single member, not the whole pack.
+    pending_member_sizes: list[int] = []
+    for row in verified:
+        pending_member_sizes.extend(row.get("member_pending_bytes") or [])
+    largest_pending = max(pending_member_sizes, default=0)
+    required = int(largest_pending * 1.15) + 1024 ** 3
     if free < required:
         raise ReplenishmentInfrastructureError(
             f"补源暂存空间不足: required={required}, free={free}",
@@ -5445,22 +5459,41 @@ def _acquire(
                 pause_requested=pause_requested,
             )
         bundle = selection_wrapper["selection"]
+        # X-phase shape: acquire one member at a time — download it, upload
+        # it, prove the remote copy is visible, then drop the local bytes.
+        # The local peak footprint is one member (one episode), never the
+        # whole pack, so a multi-season remux cannot exhaust the host disk.
+        attempt_deadline = time.monotonic() + _bounded_seconds(
+            "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
+        )
+        # Every member's binding is validated for every selection before any
+        # byte moves, so a malformed selection still fails as a clean
+        # candidate error with zero partial remote commits.
+        plans: list[dict[str, Any]] = []
         for offset, selection in enumerate(bundle["selections"], start=1):
+            if not isinstance(selection, Mapping):
+                raise ReplenishmentCandidateError(
+                    "补源选择项格式无效", stage="artifact_validation",
+                )
             candidate_dir = workspace / f"download-{offset:02d}"
-            payload_dir = candidate_dir / "payload"
             _pause_checkpoint(pause_requested)
-            payload_dir.mkdir(parents=True, exist_ok=True)
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            # A pre-pipeline attempt may have left a bulk-layout payload
+            # directory behind.  Its single aria2 control file cannot serve
+            # per-member resume, so reclaim the space instead of keeping it.
+            legacy_payload = candidate_dir / "payload"
+            if legacy_payload.exists():
+                print(
+                    f"[replenishment] 清理旧批量下载布局 "
+                    f"{offset}/{len(bundle['selections'])}",
+                    flush=True,
+                )
+                shutil.rmtree(legacy_payload, ignore_errors=True)
             verified = preflight["candidates"][offset - 1]
             manifest = verified["manifest"]
             torrent_path = Path(verified["torrent_path"])
             try:
                 indices, by_index = _verify_manifest(selection, manifest)
-            except ValueError as exc:
-                raise ReplenishmentCandidateError(
-                    str(exc), stage="candidate_manifest", candidate=selection,
-                ) from exc
-            acquisition = selection["acquisition"]
-            try:
                 companion_by_index = _selected_companion_indices(
                     selection,
                     selected_gap_ids={
@@ -5471,60 +5504,12 @@ def _acquire(
                 raise ReplenishmentCandidateError(
                     str(exc), stage="candidate_manifest", candidate=selection,
                 ) from exc
-            if _payload_is_complete(payload_dir, acquisition, indices):
-                print(
-                    f"[replenishment] 复用已验证下载 {offset}/{len(bundle['selections'])}: "
-                    f"{selection.get('release_name')}",
-                    flush=True,
-                )
-            else:
-                command = [
-                    "aria2c", "--seed-time=0", "--file-allocation=none",
-                    "--allow-overwrite=true", "--auto-file-renaming=false",
-                    "--summary-interval=60", "--console-log-level=notice",
-                    # In mainland deployments the HTTP proxy exists for the
-                    # blocked search indexes only; tracker announces and peer
-                    # traffic must stay direct.  DHT/PEX/LPD give the swarm a
-                    # chance even when every tracker is unreachable.
-                    "--enable-dht=true", "--enable-peer-exchange=true",
-                    "--bt-enable-lpd=true",
-                    f"--bt-stop-timeout={_bounded_seconds('SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT', 600, 60, 3600)}",
-                    f"--dir={payload_dir}", f"--select-file={','.join(str(i) for i in sorted(indices))}",
-                    str(torrent_path),
-                ]
-                print(f"[replenishment] 下载候选 {offset}/{len(bundle['selections'])}: {selection.get('release_name')}", flush=True)
-                try:
-                    _pause_checkpoint(pause_requested)
-                    completed = subprocess.run(
-                        command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        timeout=_bounded_seconds(
-                            "SCRAPEFLOW_REPLENISHMENT_TORRENT_TIMEOUT", 21600, 300, 86400,
-                        ),
-                        env=_direct_download_env(os.environ),
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    raise ReplenishmentCandidateError(
-                        "aria2c 下载超过总时限", stage="candidate_download",
-                        candidate=selection,
-                    ) from exc
-                if completed.returncode != 0:
-                    tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
-                    raise ReplenishmentCandidateError(
-                        f"aria2c 下载失败: {tail}", stage="candidate_download",
-                        candidate=selection,
-                    )
-            _assert_payload_has_no_incomplete_markers(payload_dir)
+            acquisition = selection["acquisition"]
             size_map = acquisition["file_size_by_index"]
             path_map = acquisition["file_path_by_index"]
             for index in sorted(indices):
                 expected_size = int(size_map[str(index)])
                 relative_path = str(path_map[str(index)])
-                try:
-                    source = _find_download(payload_dir, relative_path, expected_size)
-                except ValueError as exc:
-                    raise ReplenishmentCandidateError(
-                        str(exc), stage="candidate_payload_validation", candidate=selection,
-                    ) from exc
                 gaps = sorted(set(by_index.get(index, [])))
                 companion_for = sorted(set(companion_by_index.get(index, [])))
                 if companion_for and gaps:
@@ -5532,6 +5517,7 @@ def _acquire(
                         "伴随字幕与直接 gap 绑定冲突",
                         stage="candidate_payload_validation", candidate=selection,
                     )
+                extension = Path(relative_path).suffix.casefold()
                 if companion_for:
                     if len(companion_for) != 1:
                         raise ReplenishmentCandidateError(
@@ -5550,73 +5536,70 @@ def _acquire(
                         )
                     paired_video_index = paired_indices[0]
                     paired_video_path = path_map.get(str(paired_video_index))
-                    extension = source.suffix.casefold()
                     if (
                         extension not in SUBTITLE_EXTENSIONS
                         or _is_supplemental_video_path(relative_path)
                         or not isinstance(paired_video_path, str)
                     ):
                         raise ReplenishmentCandidateError(
-                            f"伴随字幕不是可配对的字幕格式: {source.name}",
+                            f"伴随字幕不是可配对的字幕格式: {relative_path}",
                             stage="candidate_payload_validation", candidate=selection,
                         )
                     remote_file = _safe_name(
-                        f"{paired_gap_id} - {source.stem}", limit=170,
+                        f"{paired_gap_id} - {Path(relative_path).stem}", limit=170,
                     ) + extension
-                    uploaded.append({
-                        "gap_ids": [paired_gap_id],
+                    plan = {
+                        "kind": "subtitle", "gaps": [paired_gap_id],
                         "companion_for_gap_ids": [paired_gap_id],
                         "paired_video_index": paired_video_index,
                         "paired_video_source_name": paired_video_path,
-                        "source_name": relative_path, "provider_path": relative_path,
-                        "manifest_index": index, "source": source,
-                        "remote_name": remote_file, "size": expected_size,
-                        "kind": "subtitle", "subtitle_language": "zh",
-                    })
-                    continue
-                gap_prefix = "+".join(gaps)
-                extension = source.suffix.casefold()
-                kinds = {request_gap_kinds.get(gap_id) for gap_id in gaps}
-                if not gaps or None in kinds or "" in kinds:
-                    raise ReplenishmentCandidateError(
-                        "选中文件缺少受审计缺口绑定",
-                        stage="candidate_payload_validation",
-                        candidate=selection,
-                    )
-                if kinds == {"missing_subtitle"}:
-                    allowed_extensions = SUBTITLE_EXTENSIONS
-                elif "missing_subtitle" not in kinds:
-                    allowed_extensions = VIDEO_EXTENSIONS
+                        "subtitle_language": "zh",
+                    }
                 else:
-                    # A manifest member must be either a video move or one
-                    # exact subtitle sidecar.  Sharing it across both lanes
-                    # would defeat the formal-library pairing proof.
-                    raise ReplenishmentCandidateError(
-                        "选中文件同时绑定媒体和字幕缺口",
-                        stage="candidate_payload_validation",
-                        candidate=selection,
-                    )
-                if extension not in allowed_extensions:
-                    raise ReplenishmentCandidateError(
-                        f"选中文件不是本次缺口支持的媒体格式: {source.name}",
-                        stage="candidate_payload_validation",
-                        candidate=selection,
-                    )
-                if extension in VIDEO_EXTENSIONS:
-                    _verify_video_payload(source, expected_size, selection)
-                remote_file = _safe_name(f"{gap_prefix} - {source.stem}", limit=170) + extension
-                uploaded.append({
-                    "gap_ids": gaps, "source": source, "remote_name": remote_file,
-                    "size": expected_size, "manifest_index": index,
-                    "source_name": relative_path, "provider_path": relative_path,
-                    "kind": "subtitle" if extension in SUBTITLE_EXTENSIONS else "video",
+                    gap_prefix = "+".join(gaps)
+                    kinds = {request_gap_kinds.get(gap_id) for gap_id in gaps}
+                    if not gaps or None in kinds or "" in kinds:
+                        raise ReplenishmentCandidateError(
+                            "选中文件缺少受审计缺口绑定",
+                            stage="candidate_payload_validation", candidate=selection,
+                        )
+                    if kinds == {"missing_subtitle"}:
+                        allowed_extensions = SUBTITLE_EXTENSIONS
+                    elif "missing_subtitle" not in kinds:
+                        allowed_extensions = VIDEO_EXTENSIONS
+                    else:
+                        # A manifest member must be either a video move or one
+                        # exact subtitle sidecar.  Sharing it across both lanes
+                        # would defeat the formal-library pairing proof.
+                        raise ReplenishmentCandidateError(
+                            "选中文件同时绑定媒体和字幕缺口",
+                            stage="candidate_payload_validation", candidate=selection,
+                        )
+                    if extension not in allowed_extensions:
+                        raise ReplenishmentCandidateError(
+                            f"选中文件不是本次缺口支持的媒体格式: {relative_path}",
+                            stage="candidate_payload_validation", candidate=selection,
+                        )
+                    remote_file = _safe_name(
+                        f"{gap_prefix} - {Path(relative_path).stem}", limit=170,
+                    ) + extension
+                    plan = {
+                        "kind": "subtitle" if extension in SUBTITLE_EXTENSIONS else "video",
+                        "gaps": gaps,
+                    }
+                plan.update({
+                    "offset": offset, "index": index, "size": expected_size,
+                    "path": relative_path, "remote_name": remote_file,
+                    "candidate_dir": candidate_dir, "torrent_path": torrent_path,
+                    "acquisition": acquisition, "selection": selection,
+                    "is_video": extension in VIDEO_EXTENSIONS,
                 })
-        if not uploaded:
+                plans.append(plan)
+        if not plans:
             raise ReplenishmentCandidateError(
                 "没有可上传的补源媒体或字幕",
                 stage="candidate_payload_validation",
             )
-        payload_verified = True
         delivery_stage = "delivery_connect"
         _pause_checkpoint(pause_requested)
         client = client or _alist_client()
@@ -5634,8 +5617,8 @@ def _acquire(
                 remote_root,
                 pause_requested=pause_requested,
             )
-        has_video = any(row.get("kind") == "video" for row in uploaded)
-        has_subtitle = any(row.get("kind") == "subtitle" for row in uploaded)
+        has_video = any(plan["kind"] == "video" for plan in plans)
+        has_subtitle = any(plan["kind"] == "subtitle" for plan in plans)
         # A mixed provider candidate must never expose its subtitle members
         # to the child Engine planner.  The planner is deliberately strict
         # about subtitle companions and could otherwise turn a sidecar for an
@@ -5650,23 +5633,146 @@ def _acquire(
             client.mkdir(media_staging_root)
             _pause_checkpoint(pause_requested)
             client.mkdir(subtitle_staging_root)
-        for row in uploaded:
-            row["delivery_root"] = (
-                subtitle_staging_root if row.get("kind") == "subtitle"
+        for plan in plans:
+            plan["delivery_root"] = (
+                subtitle_staging_root if plan["kind"] == "subtitle"
                 else media_staging_root
             )
         delivery_stage = "delivery_upload"
-        for offset, row in enumerate(uploaded, start=1):
-            print(f"[replenishment] 上传 {offset}/{len(uploaded)}: {row['remote_name']}", flush=True)
+        for number, plan in enumerate(plans, start=1):
+            _pause_checkpoint(pause_requested)
+            delivery_root = str(plan["delivery_root"])
+            target = join_remote(delivery_root, str(plan["remote_name"]))
+            committed = client.exact_file_info(target)
+            if (
+                committed is not None
+                and int(committed.get("size") or 0) == int(plan["size"])
+            ):
+                # A previously interrupted attempt already proved this member
+                # remotely; skip both its download and its upload.
+                print(
+                    f"[replenishment] 复用远端已提交成员 "
+                    f"{number}/{len(plans)}: {plan['remote_name']}",
+                    flush=True,
+                )
+                uploaded.append({
+                    "gap_ids": list(plan["gaps"]),
+                    **({
+                        "companion_for_gap_ids": plan["companion_for_gap_ids"],
+                        "paired_video_index": plan["paired_video_index"],
+                        "paired_video_source_name": plan["paired_video_source_name"],
+                        "subtitle_language": plan["subtitle_language"],
+                    } if plan["kind"] == "subtitle" and plan.get("companion_for_gap_ids") else {}),
+                    "source": None, "remote_name": plan["remote_name"],
+                    "size": int(plan["size"]), "manifest_index": plan["index"],
+                    "source_name": plan["path"], "provider_path": plan["path"],
+                    "kind": plan["kind"], "delivery_root": delivery_root,
+                    "remote_committed": True,
+                })
+                continue
+            member_dir = plan["candidate_dir"] / f"member-{int(plan['index']):03d}"
+            member_payload = member_dir / "payload"
+            member_payload.mkdir(parents=True, exist_ok=True)
+            if _payload_is_complete(
+                member_payload, plan["acquisition"], {int(plan["index"])},
+            ):
+                print(
+                    f"[replenishment] 复用已验证下载 "
+                    f"{number}/{len(plans)}: {plan['remote_name']}",
+                    flush=True,
+                )
+            else:
+                command = [
+                    "aria2c", "--seed-time=0", "--file-allocation=none",
+                    "--allow-overwrite=true", "--auto-file-renaming=false",
+                    "--summary-interval=60", "--console-log-level=notice",
+                    # In mainland deployments the HTTP proxy exists for the
+                    # blocked search indexes only; tracker announces and peer
+                    # traffic must stay direct.  DHT/PEX/LPD give the swarm a
+                    # chance even when every tracker is unreachable.
+                    "--enable-dht=true", "--enable-peer-exchange=true",
+                    "--bt-enable-lpd=true",
+                    f"--bt-stop-timeout={_bounded_seconds('SCRAPEFLOW_REPLENISHMENT_BT_IDLE_TIMEOUT', 600, 60, 3600)}",
+                    f"--dir={member_payload}",
+                    f"--select-file={int(plan['index'])}",
+                    str(plan["torrent_path"]),
+                ]
+                remaining_budget = max(300, int(attempt_deadline - time.monotonic()))
+                print(
+                    f"[replenishment] 下载成员 {number}/{len(plans)}: "
+                    f"{plan['remote_name']}",
+                    flush=True,
+                )
+                try:
+                    _pause_checkpoint(pause_requested)
+                    completed = subprocess.run(
+                        command, text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=remaining_budget,
+                        env=_direct_download_env(os.environ),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise ReplenishmentCandidateError(
+                        "aria2c 下载超过总时限", stage="candidate_download",
+                        candidate=plan["selection"],
+                    ) from exc
+                if completed.returncode != 0:
+                    tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
+                    raise ReplenishmentCandidateError(
+                        f"aria2c 下载失败: {tail}", stage="candidate_download",
+                        candidate=plan["selection"],
+                    )
+            _assert_payload_has_no_incomplete_markers(member_payload)
+            source = _find_download(
+                member_payload, str(plan["path"]), int(plan["size"]),
+            )
+            if plan["is_video"]:
+                _verify_video_payload(source, int(plan["size"]), plan["selection"])
+            row: dict[str, Any] = {
+                "gap_ids": list(plan["gaps"]),
+                **({
+                    "companion_for_gap_ids": plan["companion_for_gap_ids"],
+                    "paired_video_index": plan["paired_video_index"],
+                    "paired_video_source_name": plan["paired_video_source_name"],
+                    "subtitle_language": plan["subtitle_language"],
+                } if plan["kind"] == "subtitle" and plan.get("companion_for_gap_ids") else {}),
+                "source": source, "remote_name": plan["remote_name"],
+                "size": int(plan["size"]), "manifest_index": plan["index"],
+                "source_name": plan["path"], "provider_path": plan["path"],
+                "kind": plan["kind"], "delivery_root": delivery_root,
+            }
+            print(
+                f"[replenishment] 上传成员 {number}/{len(plans)}: "
+                f"{plan['remote_name']}",
+                flush=True,
+            )
+            # From the first upload attempt on, an ambiguous failure must be
+            # reconciled rather than retried from scratch: a partial remote
+            # commit can no longer be distinguished from a clean miss.
+            payload_verified = True
             if pause_requested is None:
-                _automatic_upload(client, str(row["delivery_root"]), row)
+                _automatic_upload(client, delivery_root, row)
             else:
                 _automatic_upload(
-                    client,
-                    str(row["delivery_root"]),
-                    row,
+                    client, delivery_root, row,
                     pause_requested=pause_requested,
                 )
+            # The remote copy must be visible before the local bytes are
+            # dropped, or an interrupted run could lose both at once.
+            if pause_requested is None:
+                _verify_remote_uploads(client, delivery_root, [row])
+            else:
+                _verify_remote_uploads(
+                    client, delivery_root, [row],
+                    pause_requested=pause_requested,
+                )
+            uploaded.append(row)
+            shutil.rmtree(member_dir, ignore_errors=True)
+            print(
+                f"[replenishment] 成员完成并释放本地 "
+                f"{number}/{len(plans)}: {plan['remote_name']}",
+                flush=True,
+            )
         delivery_stage = "delivery_visibility"
         grouped_uploads: dict[str, list[dict[str, Any]]] = {}
         for row in uploaded:
