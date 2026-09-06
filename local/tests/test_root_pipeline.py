@@ -2244,3 +2244,81 @@ class LibraryCoverageScopingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuarkPathologySeamTests(unittest.TestCase):
+    """The fake's injected quark pathologies themselves behave correctly."""
+
+    def test_upload_bytes_refuses_overwrite_by_default(self):
+        from local.tests.test_library_index import IndexAList
+
+        alist = IndexAList({"/in/a.nfo": b"old"})
+        with self.assertRaises(FileExistsError):
+            alist.upload_bytes("/in/a.nfo", b"new")
+        # explicit overwrite passes through like production
+        alist.upload_bytes("/in/a.nfo", b"new", overwrite=True)
+        self.assertEqual(alist.files["/in/a.nfo"], b"new")
+
+    def test_move_lag_keeps_source_listing_stale(self):
+        from local.tests.test_library_index import IndexAList
+
+        alist = IndexAList({"/in/x/sp01.mkv": b"v"})
+        alist.move_lag_seconds = 60.0
+        alist.move("/in/x", "/q", ["sp01.mkv"])
+        # target already holds the data (the move is committed)...
+        self.assertIn("/q/sp01.mkv", alist.files)
+        # ...but the source listing still shows the ghost name.
+        names = [str(r.get("name")) for r in alist.list("/in/x")]
+        self.assertIn("sp01.mkv", names)
+
+    def test_move_lag_expires(self):
+        import time
+        from local.tests.test_library_index import IndexAList
+
+        alist = IndexAList({"/in/x/sp01.mkv": b"v"})
+        alist.move_lag_seconds = 0.05
+        alist.move("/in/x", "/q", ["sp01.mkv"])
+        time.sleep(0.08)
+        names = [str(r.get("name")) for r in alist.list("/in/x")]
+        self.assertNotIn("sp01.mkv", names)
+
+    def test_batch_observation_window_survives_move_lag(self):
+        """quarantine_batch's per-target landing check rides out a lag.
+
+        The lag window here (0.3s) is much shorter than the batch's own
+        20s spacing, so the first attempt lands after the ghosts expire —
+        exactly how the production window absorbs minutes of real lag.
+        """
+        from local.tests.test_library_index import IndexAList
+        from local.scrapeflow_api.root_pipeline import _cleanup_consumed_source_root
+        from local.scrapeflow_api.simple_engine_runner import SimpleEngineRunner
+        from engine.scrapeflow.intake_source import (
+            upsert_intake_source, save_intake_catalog, bind_root_task,
+        )
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state_root = Path(temp.name)
+        alist = CleaningIndexAList({"/in/My Show/[01].mkv": b"v" * 4096})
+        alist.video_duration_probe = lambda p: 90.0
+        # Real pathology: source listing lags the committed move.
+        alist.move_lag_seconds = 0.3
+        runner = SimpleEngineRunner(
+            state_root, alist=alist, tmdb=None, validate=False,
+            library_root="/library",
+        )
+        catalog, entry = upsert_intake_source([], "/in/My Show", present=True)
+        catalog, _ = bind_root_task(catalog, entry.source_id, "root-lag")
+        save_intake_catalog(state_root, catalog)
+        receipt = _cleanup_consumed_source_root(
+            runner, state_root, "root-lag", "/in/My Show",
+            pause_requested=lambda: False,
+        )
+        # The episode-named file is a suspect; the lag must not turn it
+        # into a false straggler — the observation window rides it out.
+        self.assertEqual(receipt.get("quarantined_count"), 1, receipt)
+        self.assertEqual(receipt.get("failures"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

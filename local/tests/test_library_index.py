@@ -52,6 +52,14 @@ class IndexAList:
         # without ``modified`` (the default read shape); tests that need
         # exact-manifest drift set an entry, then change it.
         self.modified: dict[str, str] = {}
+        # Quark-pathology seams (default OFF = the historical instant
+        # behavior, so the 1500+ existing tests are unaffected):
+        # ``move_lag_seconds`` — after a move the source listing keeps
+        # showing the old name for this long (observed minutes-per-file on
+        # the real provider).
+        self.move_lag_seconds: float = 0.0
+        self._ghost_entries: dict[str, list[tuple[str, int]]] = {}
+        self._ghost_expiry: dict[str, float] = {}
         for full_path in self.files:
             parts = full_path.strip("/").split("/")[:-1]
             current = ""
@@ -129,7 +137,18 @@ class IndexAList:
     def upload_bytes(
         self, target_path: str, data: bytes, *args, **kwargs,
     ) -> None:
-        """Store an uploaded payload (quarantine manifests, artifacts)."""
+        """Store an uploaded payload with the REAL no-overwrite contract.
+
+        The production AListClient refuses a same-name target by default
+        (``Overwrite: false``).  The historical double silently overwrote,
+        which meant the "target exists = stop" invariant was only ever
+        exercised in test_simple_engine_runner.py.  Callers that genuinely
+        need replacement pass ``overwrite=True`` exactly like production.
+        """
+        if target_path in self.files and not kwargs.get("overwrite"):
+            raise FileExistsError(
+                f"目标已存在，拒绝覆盖（测试假件已对齐生产行为）: {target_path}"
+            )
         self.files[target_path] = data
         parent = target_path.rsplit("/", 1)[0]
         # Materialize the directory chain so listings see the upload.
@@ -161,9 +180,67 @@ class IndexAList:
                 if full_path == src or full_path.startswith(src + "/"):
                     moved[full_path[len(src):]] = payload
                     del self.files[full_path]
+            # Quark's real move: the data is already at the target, but the
+            # SOURCE listing keeps showing the old name for a while.  With
+            # ``move_lag_seconds`` = 0 (the default) the ghost window is
+            # empty and the double behaves instantly as it always did.
             for relative, payload in moved.items():
                 self.files[dst + relative] = payload
+            if self.move_lag_seconds > 0:
+                import time as _t
+
+                self._ghost_entries.setdefault(parent, []).extend(
+                    (name, sum(len(p) for p in moved.values()))
+                    for _ in [0]
+                )
+                self._ghost_expiry[parent] = (
+                    _t.monotonic() + self.move_lag_seconds
+                )
         return True
+
+    def list(self, path: str, refresh: bool = False) -> list[dict[str, object]]:
+        del refresh
+        normalized = path.rstrip("/") or "/"
+        prefix = normalized.rstrip("/") + "/"
+        directory_paths: set[str] = set()
+        for full_path in self.files:
+            parts = full_path.strip("/").split("/")[:-1]
+            current = ""
+            for part in parts:
+                current += "/" + part
+                directory_paths.add(current)
+        directory_paths |= self.dirs
+        rows: dict[str, dict[str, object]] = {}
+        for directory in directory_paths:
+            if not directory.startswith(prefix):
+                continue
+            remainder = directory[len(prefix):]
+            if remainder and "/" not in remainder:
+                rows[remainder] = {"name": remainder, "is_dir": True}
+        for full_path, value in self.files.items():
+            if not full_path.startswith(prefix):
+                continue
+            remainder = full_path[len(prefix):]
+            if remainder and "/" not in remainder:
+                row: dict[str, object] = {
+                    "name": remainder,
+                    "is_dir": False,
+                    "size": len(value),
+                }
+                if full_path in self.modified:
+                    row["modified"] = self.modified[full_path]
+                rows[remainder] = row
+        # Quark move-lag ghosts: during the window the source parent's
+        # listing still shows the moved names (the provider's listing has
+        # not caught up with the already-committed move).
+        import time as _t
+
+        now = _t.monotonic()
+        expiry = self._ghost_expiry.get(normalized)
+        if expiry is not None and now < expiry:
+            for name, size in self._ghost_entries.get(normalized, []):
+                rows.setdefault(name, {"name": name, "is_dir": False, "size": size})
+        return [rows[name] for name in sorted(rows)]
 
 
 class StrictBareEpisodeTMDB:
