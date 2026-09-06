@@ -1416,15 +1416,30 @@ class CleaningIndexAList(IndexAList):
         return True
 
     def remove_empty_dir(self, path: str) -> bool:
+        import time as _t
+
         normalized = path.rstrip("/") or "/"
         self.remove_empty_calls.append(normalized)
+        # Quark doloading shell: the removal is acknowledged (True) while
+        # the directory stays listed for the window.  Callers that trust
+        # the return value see success; only a fresh listing tells the
+        # truth (無職轉生 root-shell incident).
+        if (
+            self.shell_removal_lag > 0
+            and normalized not in self._shell_ghost_expiry
+        ):
+            self._shell_ghost_expiry[normalized] = (
+                _t.monotonic() + self.shell_removal_lag
+            )
         prefix = normalized.rstrip("/") + "/"
         if any(name.startswith(prefix) for name in self.files):
             return False
         if any(name.startswith(prefix) and name != normalized for name in self.dirs):
             return False
         if normalized in self.dirs:
-            self.dirs.discard(normalized)
+            expiry = self._shell_ghost_expiry.get(normalized)
+            if expiry is None or _t.monotonic() >= expiry:
+                self.dirs.discard(normalized)
             return True
         return False
 
@@ -2318,6 +2333,65 @@ class QuarkPathologySeamTests(unittest.TestCase):
         # into a false straggler — the observation window rides it out.
         self.assertEqual(receipt.get("quarantined_count"), 1, receipt)
         self.assertEqual(receipt.get("failures"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class QuarkPathologySeamTests2(unittest.TestCase):
+    """The second batch of learned pathologies (each from a real incident)."""
+
+    def test_mkdir_sync_conflict_then_success(self):
+        from local.tests.test_library_index import IndexAList
+
+        alist = IndexAList()
+        alist.mkdir_sync_conflicts = 2
+        raised = 0
+        for _ in range(2):
+            try:
+                alist.ensure_directory("/q/new")
+            except RuntimeError:
+                raised += 1
+        # third call succeeds
+        self.assertTrue(alist.ensure_directory("/q/new"))
+        self.assertEqual(raised, 2)
+
+    def test_partial_move_commits_subset(self):
+        from local.tests.test_library_index import IndexAList
+
+        alist = IndexAList({
+            f"/in/x/file{n}.mkv": b"v" for n in range(4)
+        })
+        alist.move_partial_fraction = 0.5
+        alist.move("/in/x", "/q", [f"file{n}.mkv" for n in range(4)])
+        # first half committed to target...
+        self.assertIn("/q/file0.mkv", alist.files)
+        self.assertIn("/q/file1.mkv", alist.files)
+        # ...second half still at source — the caller must verify per name.
+        self.assertIn("/in/x/file2.mkv", alist.files)
+        self.assertIn("/in/x/file3.mkv", alist.files)
+
+    def test_shell_removal_lag_keeps_dir_listed(self):
+        import time
+        from local.tests.test_library_index import IndexAList
+
+        class Cleaning(CleaningIndexAList):
+            pass
+
+        alist = Cleaning({"/in/My Show/junk.mkv": b"v"})
+        # delete the file first so the dir is empty
+        alist.remove("/in/My Show", ["junk.mkv"])
+        alist.shell_removal_lag = 0.3
+        ok = alist.remove_empty_dir("/in/My Show")
+        self.assertTrue(ok)  # acknowledged...
+        # ...but the dir is still listed during the window
+        dirs = [d for d in alist.dirs if d == "/in/My Show"]
+        self.assertIn("/in/My Show", alist.dirs)
+        time.sleep(0.35)
+        # after expiry the next removal actually clears it
+        self.assertTrue(alist.remove_empty_dir("/in/My Show"))
+        self.assertNotIn("/in/My Show", alist.dirs)
 
 
 if __name__ == "__main__":

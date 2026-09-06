@@ -53,13 +53,33 @@ class IndexAList:
         # exact-manifest drift set an entry, then change it.
         self.modified: dict[str, str] = {}
         # Quark-pathology seams (default OFF = the historical instant
-        # behavior, so the 1500+ existing tests are unaffected):
+        # behavior, so the 1500+ existing tests are unaffected).  Each seam
+        # mirrors a failure actually observed in production, learned the same
+        # way the scraper engine learns: a real incident gets checked into
+        # the double so the bug class cannot regress silently.
+        #
         # ``move_lag_seconds`` — after a move the source listing keeps
         # showing the old name for this long (observed minutes-per-file on
         # the real provider).
         self.move_lag_seconds: float = 0.0
         self._ghost_entries: dict[str, list[tuple[str, int]]] = {}
         self._ghost_expiry: dict[str, float] = {}
+        # ``mkdir_sync_conflicts`` — how many mkdir calls answer
+        # ``file is doloading[同名冲突]`` before succeeding: the first
+        # creation of a directory chain rides the provider's publish
+        # window (無職轉生 quarantine-root incident, 4af59e8).
+        self.mkdir_sync_conflicts: int = 0
+        self._mkdir_calls: int = 0
+        # ``move_partial_fraction`` — a batch move commits only this
+        # fraction of the names (server-side half-commit; the caller must
+        # verify per-name and ledger what landed, 0c986ce's committed-list
+        # accounting).  0.0 = all names move.
+        self.move_partial_fraction: float = 0.0
+        # ``shell_removal_lag`` — remove_empty_dir answers True but the
+        # directory stays listed this long (the doloading shell;
+        # 無職轉生 root-shell incident). 0.0 = instant.
+        self.shell_removal_lag: float = 0.0
+        self._shell_ghost_expiry: dict[str, float] = {}
         for full_path in self.files:
             parts = full_path.strip("/").split("/")[:-1]
             current = ""
@@ -163,6 +183,21 @@ class IndexAList:
         return self.list(path)
 
     def ensure_directory(self, path: str) -> bool:
+        import time as _t
+
+        # Quark's first-creation sync window: mkdir answers success from
+        # the driver's viewpoint while the chain is still publishing, and
+        # an immediate re-create races with "same-name conflict".  The
+        # caller must re-probe visibility — never trust mkdir alone.
+        while (
+            self.mkdir_sync_conflicts > 0
+            and self._mkdir_calls < self.mkdir_sync_conflicts
+        ):
+            self._mkdir_calls += 1
+            raise RuntimeError(
+                f"mkdir失败: file is doloading[同名冲突] ({path})"
+            )
+        self._mkdir_calls += 1
         self.dirs.add(path.rstrip("/") or "/")
         return True
 
@@ -170,6 +205,12 @@ class IndexAList:
         parent = parent.rstrip("/")
         target = target.rstrip("/")
         self.move_calls.append((parent, target, list(names)))
+        # Server-side half-commit: the provider acknowledged the batch but
+        # only the first k names actually moved.  The caller's per-name
+        # verification — not the move's return value — is the truth.
+        if self.move_partial_fraction > 0:
+            k = max(0, int(len(names) * (1.0 - self.move_partial_fraction)))
+            names = list(names[:k])
         for name in names:
             src = f"{parent}/{name}"
             dst = f"{target}/{name}"
