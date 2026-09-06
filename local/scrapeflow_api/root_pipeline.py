@@ -716,12 +716,14 @@ def _cleanup_consumed_source_root(
             if current in _verified_quarantine_dirs:
                 continue
             last_error: Exception | None = None
+            visible = False
             for attempt in range(3):
                 try:
                     probe = runner.alist.try_list(current, refresh=True)
                 except Exception:
                     probe = None
                 if probe is not None:
+                    visible = True
                     break
                 try:
                     runner.alist.mkdir(current)
@@ -735,16 +737,18 @@ def _cleanup_consumed_source_root(
                 # never targets a path still inside the driver's sync window.
                 try:
                     if runner.alist.try_list(current, refresh=True) is not None:
+                        visible = True
                         break
                 except Exception:
                     pass
                 if attempt < 2:
                     time.sleep(20.0)
-            else:
-                if last_error is not None:
-                    failures.append(current)
-                    _trace(f"待裁决目录创建失败: {current}: {last_error}")
-                    return False
+            if not visible:
+                if last_error is None:
+                    last_error = RuntimeError("创建后目录不可见")
+                failures.append(current)
+                _trace(f"待裁决目录创建失败: {current}: {last_error}")
+                return False
             _verified_quarantine_dirs.add(current)
         return True
 
@@ -796,13 +800,17 @@ def _cleanup_consumed_source_root(
                 rel_parent = posixpath.dirname(
                     posixpath.relpath(child, source)
                 )
-                # Replace each path SEGMENT's unsafe run with '_', keep the
-                # separators: distinct chains (``第一季 SP`` vs ``第一季/SP``)
-                # never collide after sanitization.
+                # Sanitize each path segment, then append a short digest of
+                # the ORIGINAL pre-sanitize chain: two chains that sanitize
+                # to the same form (``CD 1/SP`` vs ``CD_1/SP``) must still
+                # not collide.  The digest keeps names stable and short.
+                import hashlib as _hl
+                _digest = _hl.sha1(rel_parent.encode("utf-8")).hexdigest()[:8]
                 parent_tag = "/".join(
                     re.sub(r"[^\w.-]+", "_", seg) or "源目录"
                     for seg in rel_parent.split("/")
                 ) or "源目录"
+                parent_tag = f"{parent_tag}-{_digest}"
                 tagged.setdefault(parent_tag, []).append((name, child, reason))
             else:
                 flat_rows.append((name, child, reason))
@@ -854,18 +862,22 @@ def _cleanup_consumed_source_root(
             except Exception:
                 continue
             pending &= after
-            landed.clear()
+            # Track landings PER TARGET: one unprovable directory must not
+            # discard the evidence already gathered for its siblings — the
+            # source-side pending keeps its best round for exactly this
+            # reason, and the two sides now agree.
+            round_landed: set[str] = set()
             for target_dir in by_target:
                 try:
                     target_rows = rows_proven(target_dir)
                 except Exception:
-                    landed = set()  # unprovable: do not half-verify
-                    break
+                    continue
                 for item in target_rows:
                     n = str(item.get("name"))
-                    landed.add(n)
+                    round_landed.add(n)
                     sizes[n] = int(item.get("size") or 0)
                     _ledger_sizes[n] = sizes[n]
+            landed |= round_landed
             if not pending and landed.issuperset(
                 {name for name, _c, _r, _t in moved}
             ):
@@ -979,25 +991,35 @@ def _cleanup_consumed_source_root(
             if paused():
                 return False
             if extension(name) in SUBTITLE_EXTENSIONS:
-                paired_stem = next(
+                # A sidecar of a quarantined video moves with the batch when
+                # its remainder after the video stem is EMPTY (bare sidecar)
+                # or language-shaped (the bounded player convention).  The
+                # shape check keeps a junk video's prefix (EP01.menu.mkv →
+                # EP01.menu.srt) from dragging its own sidecar in, while
+                # never DELETING a sidecar whose remainder is merely unusual
+                # (sc/tc/cn/tw/combos) — an unpaired-looking sidecar falls
+                # back to quarantine, the same preserve-to-adjudicate
+                # semantics its video got, not deletion.
+                remainder = next(
                     (
-                        stem
+                        name[len(stem) + 1:]
                         for stem in suspect_stems
                         if name.startswith(stem + ".")
-                        and re.fullmatch(
-                            r"(?:zh-Hans(?:\+ja)?|zh-Hant(?:\+ja)?|zh-CN|zh-TW|"
-                            r"zh-Hans\d*|zh-Hant\d*|chi|chs|cht|eng|jpn|en|ja|"
-                            r"subtitle\d*)(?:\..*)?",
-                            name[len(stem) + 1:],
-                        )
                     ),
                     None,
                 )
-                if paired_stem is not None:
-                    # A language-tagged sidecar of a quarantined video moves
-                    # with the batch.  The language-shaped remainder stops a
-                    # junk video's prefix (EP01.menu.mkv) from dragging its
-                    # own sidecar in via the shared stem prefix.
+                if remainder is not None and not re.fullmatch(
+                    r"(?:[A-Za-z]{2,8}(?:[+&][A-Za-z]{2,8})*|"
+                    r"zh[-.]?(?:Hans|Hant|CN|TW)?|subtitle\d*)"
+                    r"(?:\.[A-Za-z0-9]{1,8})*",
+                    remainder,
+                ):
+                    batch.append(
+                        (name, posixpath.join(directory, name),
+                         "疑似内容视频的配对字幕（非惯用语言标记，一并保留）")
+                    )
+                    continue
+                if remainder is not None:
                     batch.append(
                         (name, posixpath.join(directory, name), "疑似内容视频的配对字幕")
                     )

@@ -8374,19 +8374,15 @@ def build_tv_plan(
                 token_value = _season_number_from_directory_name(
                     str(item.get("name", ""))
                 )
-                # A special/fractional key must keep its KIND: a special
-                # mounts beside the official Season 00 row with that number,
-                # not beside the same-numbered regular episode in the token
-                # season. The proven coordinate for the token season is
-                # (token, key.number) ONLY for regular keys.
-                if key.kind == "regular":
-                    target_episode = key.number
-                else:
-                    target_episode = key.number if token_value == 0 else key.number
-                    # Specials route to Season 00 regardless of the token
-                    # season: `Show II SP03` names special 3, whose home is
-                    # S00E03, not S02E03.
+                # The token names the file's TRUE season (that is the whole
+                # point of the cross-scope lane); the plan's own `mapped`
+                # coordinate describes the plan's season and is exactly the
+                # WRONG reference for a foreign-token file.  Route by
+                # (token, key.number), with special-kind keys always at
+                # home in Season 00 (`Show II SP03` → S00E03, not S02E03).
+                if key.kind != "regular":
                     token_value = 0
+                target_episode = key.number
                 companion_name = _library_season_video_name(
                     alist, series_dir, token_value, target_episode
                 )

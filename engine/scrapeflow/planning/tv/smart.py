@@ -3006,10 +3006,21 @@ def build_tv_plan_smart(*, auto_episode_mode: bool, **kwargs: Any) -> Plan:
                     # in source with no problem row.  They join the first
                     # season's group so the ordinary per-season machinery
                     # handles (or fails closed on) them.
+                    range_form = re.search(
+                        r"(?:^|[^A-Za-z0-9])E0*(\d{1,4})\s*[-\u2013-~\u81f3]\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+                        str(item.get("name", "")),
+                        re.I,
+                    )
+                    in_window = (
+                        item_key is not None
+                        and item_key.kind == "regular"
+                        and not item_key.end_number
+                        and _lo <= item_key.number <= _hi
+                    )
                     if (
                         item_key is None
                         or item_key.kind != "regular"
-                        or item_key.end_number
+                        or (range_form is not None and not in_window)
                     ):
                         _split[int(_ordered[0]["season_number"])].append(item)
                 season_groups = defaultdict(

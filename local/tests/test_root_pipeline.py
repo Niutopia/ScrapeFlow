@@ -2067,15 +2067,17 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         quarantine = "/library/ScrapeFlow/待裁决/My Show"
         # One sp01.mkv at the flat root, the other under its full source
         # parent chain; both survive.
-        flat = f"{quarantine}/sp01.mkv" in alist.files
-        in_sp = f"{quarantine}/SP/sp01.mkv" in alist.files
-        in_tokuten = f"{quarantine}/特典/sp01.mkv" in alist.files
-        self.assertTrue(flat)
-        self.assertTrue(in_sp or in_tokuten)
-        self.assertFalse(in_sp and in_tokuten)
+        # One sp01.mkv in the flat slot, the other under a digest-suffixed
+        # tagged directory: count files by NAME across the whole quarantine
+        # tree instead of pinning exact paths.
+        quarantined_files = [
+            key for key in alist.files
+            if key.startswith(f"{quarantine}/") and key.endswith("sp01.mkv")
+        ]
+        self.assertEqual(len(quarantined_files), 2, quarantined_files)
+        self.assertIn(f"{quarantine}/sp01.mkv", quarantined_files)
+        self.assertEqual(sum(1 for k in quarantined_files if k == f"{quarantine}/sp01.mkv"), 1)
         # The manifest records the original relative path of each (both files).
-
-        # The manifest records the original relative path of each.
         manifest = json.loads(
             alist.files[f"{quarantine}/manifest.json"].decode("utf-8")
         )
@@ -2083,9 +2085,14 @@ class UnmappedVideoQuarantineGateTests(unittest.TestCase):
         self.assertEqual(
             relatives, {"SP/sp01.mkv", "特典/sp01.mkv"},
         )
+        # The flat slot holds one file; the other's tagged dir now carries a
+        # digest suffix, so assert by identity of the file name only.
         paths = {entry["quarantine_path"] for entry in manifest["entries"]}
         self.assertIn(f"{quarantine}/sp01.mkv", paths)
         self.assertEqual(len(paths), 2)
+        other = next(p for p in paths if p != f"{quarantine}/sp01.mkv")
+        self.assertTrue(other.startswith(f"{quarantine}/"))
+        self.assertTrue(other.endswith("sp01.mkv"))
 
     def test_recreated_source_name_disambiguates_from_old_root(self) -> None:
         """A manifest left by a different root under the same folder name

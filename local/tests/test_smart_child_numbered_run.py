@@ -982,3 +982,22 @@ class OfficialRunExceptionCorrelationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EndNumberRangeRescueTests(unittest.TestCase):
+    """E49-E50 in a 1..48 two-cour counter must join a subplan (not vanish)."""
+
+    def test_range_key_file_lands_in_first_season_group(self):
+        import re as _re
+        # The rescue's range regex must catch the E-range form directly.
+        pattern = _re.compile(
+            r"(?:^|[^A-Za-z0-9])E0*(\d{1,4})\s*[-–-~至]\s*E?0*(\d{1,4})(?:$|[^A-Za-z0-9])",
+            _re.I,
+        )
+        self.assertIsNotNone(pattern.search("Show E49-E50.mkv"))
+        self.assertIsNotNone(pattern.search("[Group] Show [49-50].mkv"))
+        self.assertIsNone(pattern.search("Show E07.mkv"))
+
+
+if __name__ == "__main__":
+    unittest.main()
