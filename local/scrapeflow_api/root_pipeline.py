@@ -796,7 +796,13 @@ def _cleanup_consumed_source_root(
                 rel_parent = posixpath.dirname(
                     posixpath.relpath(child, source)
                 )
-                parent_tag = re.sub(r"[^\w.-]+", "_", rel_parent) or "源目录"
+                # Replace each path SEGMENT's unsafe run with '_', keep the
+                # separators: distinct chains (``第一季 SP`` vs ``第一季/SP``)
+                # never collide after sanitization.
+                parent_tag = "/".join(
+                    re.sub(r"[^\w.-]+", "_", seg) or "源目录"
+                    for seg in rel_parent.split("/")
+                ) or "源目录"
                 tagged.setdefault(parent_tag, []).append((name, child, reason))
             else:
                 flat_rows.append((name, child, reason))
