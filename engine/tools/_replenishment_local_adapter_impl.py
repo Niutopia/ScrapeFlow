@@ -276,6 +276,7 @@ def _torrent_candidate(
     return candidate
 
 from engine.tools.replenishment_search_terms import (  # noqa: F401
+    _animetosho_release_priority,
     _source_episode_release_priority,
     _animetosho_requested_gap_tokens,
     _S00_TITLE_PREFLIGHT_LIMIT,
