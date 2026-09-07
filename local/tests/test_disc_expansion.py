@@ -239,6 +239,96 @@ class TestScopeMappingRuling:
             "/staging/root/season-3/Season 03/作品 - S03E02.mkv"
         )
 
+    def test_ruling_may_skip_bonus_candidates(self) -> None:
+        # A DIY disc whose extra feature survived the duration selection has
+        # more candidates than roster episodes — without an explicit skip
+        # the ruling was structurally inapplicable in exactly the scenario
+        # the rescue lane exists for.
+        candidates = _s03_style_candidates() + [
+            _candidate(
+                duration_seconds=1_800,
+                playlist="/BDMV/PLAYLIST/00999.mpls",
+                image="memory://s03d1.iso",
+            ),
+        ]
+        ruling = de.ScopeMappingRuling.from_mapping(
+            {
+                "scope_path": "/source/season-3",
+                "season": 3,
+                "assignments": _s03_style_ruling().as_dict()["assignments"],
+                "skipped": [
+                    {
+                        "image_path": "memory://s03d1.iso",
+                        "playlist_inner_path": "/BDMV/PLAYLIST/00999.mpls",
+                    }
+                ],
+                "operator": "operator",
+                "note": "00999 是制作花絮特典，不映射集号",
+                "filed_at": "2026-09-07T00:00:00+08:00",
+            }
+        )
+        plan = de.apply_scope_mapping_ruling(
+            scope_path="/source/season-3",
+            season=3,
+            roster=_roster([58, 55, 53, 51, 56, 54], season=3),
+            candidates=candidates,
+            ruling=ruling,
+            staging_root="/staging/root",
+            work_name="作品",
+        )
+        assert plan.proven
+        assert [m.episode for m in plan.mappings] == [1, 2, 3, 4, 5, 6]
+        assert plan.skipped_playlists == ("/BDMV/PLAYLIST/00999.mpls",)
+
+    def test_ruling_without_skip_must_still_cover_every_candidate(self) -> None:
+        # Legacy shape (no skipped key): an extra candidate is still a set
+        # mismatch, never a silent partial ruling.
+        candidates = _s03_style_candidates() + [
+            _candidate(
+                duration_seconds=1_800,
+                playlist="/BDMV/PLAYLIST/00999.mpls",
+                image="memory://s03d1.iso",
+            ),
+        ]
+        with pytest.raises(ValueError, match="集合与镜像候选不一致"):
+            de.apply_scope_mapping_ruling(
+                scope_path="/source/season-3",
+                season=3,
+                roster=_roster([58, 55, 53, 51, 56, 54], season=3),
+                candidates=candidates,
+                ruling=_s03_style_ruling(),
+                staging_root="/staging/root",
+                work_name="作品",
+            )
+
+    def test_assignment_and_skip_on_same_playlist_is_rejected(self) -> None:
+        ruling = de.ScopeMappingRuling.from_mapping(
+            {
+                "scope_path": "/source/season-3",
+                "season": 3,
+                "assignments": _s03_style_ruling().as_dict()["assignments"],
+                "skipped": [
+                    {
+                        "image_path": "memory://s03d1.iso",
+                        "playlist_inner_path": "/BDMV/PLAYLIST/00051.mpls",
+                    }
+                ],
+                "operator": "operator",
+                "note": "自相矛盾的裁决",
+                "filed_at": "2026-09-07T00:00:00+08:00",
+            }
+        )
+        with pytest.raises(ValueError, match="既指定集号又跳过"):
+            de.apply_scope_mapping_ruling(
+                scope_path="/source/season-3",
+                season=3,
+                roster=_roster([58, 55, 53, 51, 56, 54], season=3),
+                candidates=_s03_style_candidates(),
+                ruling=ruling,
+                staging_root="/staging/root",
+                work_name="作品",
+            )
+
     def test_wrong_scope_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="别的来源范围"):
             de.apply_scope_mapping_ruling(

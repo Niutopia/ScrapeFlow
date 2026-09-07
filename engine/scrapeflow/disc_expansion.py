@@ -401,6 +401,11 @@ class ScopeMappingRuling:
     confirm one assignment as durable data.  The engine never invents this:
     the ruling is validated against the same roster and duration tolerance
     as the proof, and its provenance travels with the plan.
+
+    ``skipped`` names the bonus playlists the operator explicitly leaves
+    unmapped — a DIY disc whose extra features survived the duration
+    selection otherwise makes the ruling structurally inapplicable (the
+    assignments can cover the roster without covering every candidate).
     """
 
     scope_path: str
@@ -409,9 +414,10 @@ class ScopeMappingRuling:
     operator: str
     note: str
     filed_at: str
+    skipped: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "scope_path": self.scope_path,
             "season": self.season,
             "assignments": [
@@ -426,6 +432,15 @@ class ScopeMappingRuling:
             "note": self.note,
             "filed_at": self.filed_at,
         }
+        if self.skipped:
+            payload["skipped"] = [
+                {
+                    "image_path": image_path,
+                    "playlist_inner_path": path,
+                }
+                for image_path, path in self.skipped
+            ]
+        return payload
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> "ScopeMappingRuling":
@@ -450,6 +465,23 @@ class ScopeMappingRuling:
             if isinstance(episode, bool) or not isinstance(episode, int):
                 raise ValueError(f"裁决条目 {path} 的集号不是整数")
             assignments.append((image_path, path, episode))
+        skipped: list[tuple[str, str]] = []
+        raw_skipped = data.get("skipped")
+        if raw_skipped is not None:
+            if not isinstance(raw_skipped, Sequence) or isinstance(
+                raw_skipped, (str, bytes)
+            ):
+                raise ValueError("裁决 skipped 必须是序列")
+            for item in raw_skipped:
+                if not isinstance(item, Mapping):
+                    raise ValueError("裁决 skipped 条目必须是对象")
+                image_path = item.get("image_path")
+                path = item.get("playlist_inner_path")
+                if not isinstance(image_path, str) or not image_path:
+                    raise ValueError("裁决 skipped 条目缺少 image_path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("裁决 skipped 条目缺少 playlist_inner_path")
+                skipped.append((image_path, path))
         season = data.get("season")
         scope_path = data.get("scope_path")
         operator = data.get("operator")
@@ -472,6 +504,7 @@ class ScopeMappingRuling:
             operator=operator,
             note=note,
             filed_at=filed_at,
+            skipped=tuple(skipped),
         )
 
 
@@ -488,10 +521,14 @@ def apply_scope_mapping_ruling(
 ) -> ScopeExpansionPlan:
     """Turn one operator ruling into mappings, or explain why it is invalid.
 
-    The ruling must address exactly this scope's candidates, cover the roster
-    bijectively, and remain within the same duration tolerance the automatic
-    proof uses — a ruling that contradicts the disc's own durations is
-    rejected so the operator lane can never launder a wrong mapping.
+    The ruling must address every candidate of this scope — either by an
+    assignment or (for bonus playlists the duration selection let through)
+    by an explicit skip — cover the roster bijectively through its
+    assignments, and remain within the same duration tolerance the
+    automatic proof uses.  A ruling that contradicts the disc's own
+    durations is rejected so the operator lane can never launder a wrong
+    mapping; a candidate that is neither assigned nor skipped is an
+    incomplete ruling, never a silent partial one.
     """
     if not candidates:
         raise ValueError("镜像内没有可展开的正片 playlist，裁决无事可裁")
@@ -512,11 +549,21 @@ def apply_scope_mapping_ruling(
         (image_path.casefold(), path.casefold())
         for image_path, path, _episode in ruling.assignments
     ]
+    skipped_keys = [
+        (image_path.casefold(), path.casefold())
+        for image_path, path in ruling.skipped
+    ]
+    if len(set(skipped_keys)) != len(skipped_keys):
+        raise ValueError("裁决的 skipped 序列存在重复")
+    overlap = set(ruled_keys) & set(skipped_keys)
+    if overlap:
+        raise ValueError(f"裁决对同一 playlist 既指定集号又跳过: {sorted(overlap)[:3]}")
     if len(set(ruled_keys)) != len(ruled_keys):
         raise ValueError("裁决对同一 playlist 给出了多个集号")
-    if set(ruled_keys) != set(by_playlist):
-        missing = sorted(set(by_playlist) - set(ruled_keys))
-        extra = sorted(set(ruled_keys) - set(by_playlist))
+    addressed = set(ruled_keys) | set(skipped_keys)
+    if addressed != set(by_playlist):
+        missing = sorted(set(by_playlist) - addressed)
+        extra = sorted(addressed - set(by_playlist))
         raise ValueError(
             "裁决的 playlist 集合与镜像候选不一致"
             f"（缺 {missing[:3]} 多 {extra[:3]}）"
@@ -566,6 +613,9 @@ def apply_scope_mapping_ruling(
         season=season,
         mappings=tuple(mappings),
         basis="operator-ruling",
+        skipped_playlists=tuple(
+            by_playlist[key].playlist_inner_path for key in skipped_keys
+        ),
     )
 
 
