@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from engine.tools import _replenishment_local_adapter_impl as adapter
+from engine.tools import replenishment_search_sources as search_sources
 
 
 def _request() -> dict[str, object]:
@@ -70,12 +71,12 @@ class AnimeToshoPaginationTests(unittest.TestCase):
                 }]
             return []
 
-        with patch.object(adapter, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
-            adapter, "_animetosho_search_terms", return_value=["Mashle"],
-        ), patch.object(adapter, "_identity_query_bases", return_value=[]), patch.object(
-            adapter, "_fetch_bytes", side_effect=fetch,
-        ), patch.object(adapter, "_download_torrent", side_effect=download), patch.object(
-            adapter, "_torrent_candidate_variants", side_effect=variants,
+        with patch.object(search_sources, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
+            search_sources, "_animetosho_search_terms", return_value=["Mashle"],
+        ), patch.object(search_sources, "_identity_query_bases", return_value=[]), patch.object(
+            search_sources, "_fetch_bytes", side_effect=fetch,
+        ), patch.object(search_sources, "_download_torrent", side_effect=download), patch.object(
+            search_sources, "_torrent_candidate_variants", side_effect=variants,
         ):
             result = adapter._search_animetosho(
                 request, set(), deadline=adapter.time.monotonic() + 100,
@@ -126,13 +127,13 @@ class AnimeToshoPaginationTests(unittest.TestCase):
                 }]
             return []
 
-        with patch.object(adapter.time, "monotonic", side_effect=monotonic), patch.object(
-            adapter, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1,
-        ), patch.object(adapter, "_animetosho_search_terms", return_value=["Mashle"]), patch.object(
-            adapter, "_identity_query_bases", return_value=[]
-        ), patch.object(adapter, "_fetch_bytes", side_effect=fetch), patch.object(
-            adapter, "_download_torrent", side_effect=download,
-        ), patch.object(adapter, "_torrent_candidate_variants", side_effect=variants):
+        with patch.object(search_sources.time, "monotonic", side_effect=monotonic), patch.object(
+            search_sources, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1,
+        ), patch.object(search_sources, "_animetosho_search_terms", return_value=["Mashle"]), patch.object(
+            search_sources, "_identity_query_bases", return_value=[]
+        ), patch.object(search_sources, "_fetch_bytes", side_effect=fetch), patch.object(
+            search_sources, "_download_torrent", side_effect=download,
+        ), patch.object(search_sources, "_torrent_candidate_variants", side_effect=variants):
             result = adapter._search_animetosho(
                 request, set(), deadline=10.0,
             )
@@ -169,12 +170,12 @@ class AnimeToshoPaginationTests(unittest.TestCase):
                 return [{"provider": "magnet", "locator": f"torrent:{torrent_url}"}]
             return []
 
-        with patch.object(adapter, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
-            adapter, "_animetosho_search_terms", return_value=["Mashle S01E13"],
-        ), patch.object(adapter, "_identity_query_bases", return_value=[]), patch.object(
-            adapter, "_fetch_bytes", side_effect=fetch,
-        ), patch.object(adapter, "_download_torrent", side_effect=download), patch.object(
-            adapter, "_torrent_candidate_variants", side_effect=variants,
+        with patch.object(search_sources, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
+            search_sources, "_animetosho_search_terms", return_value=["Mashle S01E13"],
+        ), patch.object(search_sources, "_identity_query_bases", return_value=[]), patch.object(
+            search_sources, "_fetch_bytes", side_effect=fetch,
+        ), patch.object(search_sources, "_download_torrent", side_effect=download), patch.object(
+            search_sources, "_torrent_candidate_variants", side_effect=variants,
         ):
             first = adapter._search_animetosho(
                 request, set(), deadline=adapter.time.monotonic() + 100,
@@ -188,12 +189,12 @@ class AnimeToshoPaginationTests(unittest.TestCase):
         request["search_cursors"] = {"animetosho": first.query_cursor}
         request["reviewed_torrent_miss_locators"] = first.reviewed_torrent_miss_locators
 
-        with patch.object(adapter, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
-            adapter, "_animetosho_search_terms", return_value=["Mashle S01E13"],
-        ), patch.object(adapter, "_identity_query_bases", return_value=[]), patch.object(
-            adapter, "_fetch_bytes", side_effect=fetch,
-        ), patch.object(adapter, "_download_torrent", side_effect=download), patch.object(
-            adapter, "_torrent_candidate_variants", side_effect=variants,
+        with patch.object(search_sources, "_ANIMETOSHO_MAX_PAGES_PER_RUN", 1), patch.object(
+            search_sources, "_animetosho_search_terms", return_value=["Mashle S01E13"],
+        ), patch.object(search_sources, "_identity_query_bases", return_value=[]), patch.object(
+            search_sources, "_fetch_bytes", side_effect=fetch,
+        ), patch.object(search_sources, "_download_torrent", side_effect=download), patch.object(
+            search_sources, "_torrent_candidate_variants", side_effect=variants,
         ):
             second = adapter._search_animetosho(
                 request, set(), deadline=adapter.time.monotonic() + 100,
@@ -224,9 +225,9 @@ class AnimeToshoPaginationTests(unittest.TestCase):
         }
         request["search_cursors"] = {"animetosho": cursor}
 
-        with patch.object(adapter, "_animetosho_search_terms", return_value=["Mashle"]), patch.object(
-            adapter, "_identity_query_bases", return_value=[]
-        ), patch.object(adapter, "_fetch_bytes", return_value=b"not-json"):
+        with patch.object(search_sources, "_animetosho_search_terms", return_value=["Mashle"]), patch.object(
+            search_sources, "_identity_query_bases", return_value=[]
+        ), patch.object(search_sources, "_fetch_bytes", return_value=b"not-json"):
             result = adapter._search_animetosho(
                 request, set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -252,9 +253,9 @@ class AnimeToshoPaginationTests(unittest.TestCase):
             calls.append(url)
             return b"[]"
 
-        with patch.object(adapter, "_animetosho_search_terms", return_value=terms), patch.object(
-            adapter, "_identity_query_bases", return_value=[]
-        ), patch.object(adapter, "_fetch_bytes", side_effect=fetch):
+        with patch.object(search_sources, "_animetosho_search_terms", return_value=terms), patch.object(
+            search_sources, "_identity_query_bases", return_value=[]
+        ), patch.object(search_sources, "_fetch_bytes", side_effect=fetch):
             result = adapter._search_animetosho(
                 request, set(), deadline=adapter.time.monotonic() + 100,
             )

@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 from engine.tools import _replenishment_local_adapter_impl as adapter
+from engine.tools import replenishment_search_sources as search_sources
 from local.scrapeflow_api.replenishment_bridge import gap_ledger_requests
 
 
@@ -272,10 +273,10 @@ class NyaaSearchRegressionTests(unittest.TestCase):
                 }]
             return []
 
-        with patch.object(adapter, "_nyaa_search_terms", return_value=["Mashle"]), \
-             patch.object(adapter, "_fetch_bytes", return_value=self._rss(rows)), \
-             patch.object(adapter, "_download_torrent", side_effect=download), \
-             patch.object(adapter, "_torrent_candidate_variants", side_effect=variants):
+        with patch.object(search_sources, "_nyaa_search_terms", return_value=["Mashle"]), \
+             patch.object(search_sources, "_fetch_bytes", return_value=self._rss(rows)), \
+             patch.object(search_sources, "_download_torrent", side_effect=download), \
+             patch.object(search_sources, "_torrent_candidate_variants", side_effect=variants):
             result = adapter._search_nyaa(
                 self._request(), set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -315,9 +316,9 @@ class NyaaSearchRegressionTests(unittest.TestCase):
                 }]
             return []
 
-        with patch.object(adapter, "_fetch_bytes", side_effect=fetch), \
-             patch.object(adapter, "_download_torrent", side_effect=download), \
-             patch.object(adapter, "_torrent_candidate_variants", side_effect=variants):
+        with patch.object(search_sources, "_fetch_bytes", side_effect=fetch), \
+             patch.object(search_sources, "_download_torrent", side_effect=download), \
+             patch.object(search_sources, "_torrent_candidate_variants", side_effect=variants):
             result = adapter._search_nyaa(
                 request, set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -377,10 +378,10 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             downloaded.append(url)
             return {"infohash": f"{len(downloaded):040x}"}
 
-        with patch.object(adapter, "_nyaa_search_terms", return_value=["Alpha"]), \
-             patch.object(adapter, "_fetch_bytes", return_value=self._rss(rows)), \
-             patch.object(adapter, "_download_torrent", side_effect=download), \
-             patch.object(adapter, "_torrent_candidate_variants", return_value=[]):
+        with patch.object(search_sources, "_nyaa_search_terms", return_value=["Alpha"]), \
+             patch.object(search_sources, "_fetch_bytes", return_value=self._rss(rows)), \
+             patch.object(search_sources, "_download_torrent", side_effect=download), \
+             patch.object(search_sources, "_torrent_candidate_variants", return_value=[]):
             result = adapter._search_nyaa(
                 self._request(), set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -409,7 +410,7 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             return self._rss([])
 
         current = dict(request)
-        with patch.object(adapter, "_fetch_bytes", side_effect=fetch):
+        with patch.object(search_sources, "_fetch_bytes", side_effect=fetch):
             for _round in range(16):
                 queried_windows.append([])
                 result = adapter._search_nyaa(
@@ -455,7 +456,7 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             )
             return self._rss([])
 
-        with patch.object(adapter, "_fetch_bytes", side_effect=fetch):
+        with patch.object(search_sources, "_fetch_bytes", side_effect=fetch):
             first = adapter._search_nyaa(
                 request, set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -480,8 +481,8 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             adapter._NYAA_MAX_LOGICAL_QUERY_TERMS,
         )]
         current = self._request()
-        with patch.object(adapter, "_nyaa_search_terms", return_value=terms), \
-             patch.object(adapter, "_fetch_bytes", return_value=self._rss([])):
+        with patch.object(search_sources, "_nyaa_search_terms", return_value=terms), \
+             patch.object(search_sources, "_fetch_bytes", return_value=self._rss([])):
             for _round in range(16):
                 result = adapter._search_nyaa(
                     current, set(), deadline=adapter.time.monotonic() + 100,
@@ -505,12 +506,12 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             downloaded.append(url)
             return {"infohash": infohash}
 
-        with patch.object(adapter, "_nyaa_search_terms", return_value=["Alpha"]), \
-             patch.object(adapter, "_fetch_bytes", return_value=self._rss_with_infohash([
+        with patch.object(search_sources, "_nyaa_search_terms", return_value=["Alpha"]), \
+             patch.object(search_sources, "_fetch_bytes", return_value=self._rss_with_infohash([
                  ("[Fixture] Alpha - 01", torrent_url, infohash),
              ])), \
-             patch.object(adapter, "_download_torrent", side_effect=download), \
-             patch.object(adapter, "_torrent_candidate_variants", return_value=[]):
+             patch.object(search_sources, "_download_torrent", side_effect=download), \
+             patch.object(search_sources, "_torrent_candidate_variants", return_value=[]):
             first = adapter._search_nyaa(
                 request, set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -526,8 +527,8 @@ class NyaaSearchRegressionTests(unittest.TestCase):
         self.assertTrue(second.source_exhausted)
 
     def test_nyaa_non_rss_document_is_infrastructure_incomplete(self) -> None:
-        with patch.object(adapter, "_nyaa_search_terms", return_value=["Alpha"]), \
-             patch.object(adapter, "_fetch_bytes", return_value=b"<html />"):
+        with patch.object(search_sources, "_nyaa_search_terms", return_value=["Alpha"]), \
+             patch.object(search_sources, "_fetch_bytes", return_value=b"<html />"):
             result = adapter._search_nyaa(
                 self._request(), set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -549,8 +550,8 @@ class NyaaSearchRegressionTests(unittest.TestCase):
             return b"<rss><channel /></rss>"
 
         with patch.object(
-            adapter, "_nyaa_search_terms", return_value=["Alpha S01E13", "Alpha S01"],
-        ), patch.object(adapter, "_fetch_bytes", side_effect=fetch):
+            search_sources, "_nyaa_search_terms", return_value=["Alpha S01E13", "Alpha S01"],
+        ), patch.object(search_sources, "_fetch_bytes", side_effect=fetch):
             result = adapter._search_nyaa(
                 self._request(), set(), deadline=adapter.time.monotonic() + 100,
             )
@@ -773,8 +774,8 @@ class BitSearchSourceTests(unittest.TestCase):
             )
             return {"79cd2aa9a0b923e2c13131653143ba55a9d2cff7": manifest}, 0
 
-        with patch.object(adapter, "_fetch_bytes", side_effect=fake_fetch), \
-                patch.object(adapter, "_magnet_metadatas_batch", side_effect=fake_batch):
+        with patch.object(search_sources, "_fetch_bytes", side_effect=fake_fetch), \
+                patch.object(search_sources, "_magnet_metadatas_batch", side_effect=fake_batch):
             result = adapter._search_bitsearch(
                 request, set(), deadline=adapter.time.monotonic() + 30,
             )
@@ -794,10 +795,10 @@ class BitSearchSourceTests(unittest.TestCase):
         # NOT claim exhaustion — the rows the index returned were dropped by
         # our own window, and the telemetry carries dht_window_cold.
         with patch.object(
-            adapter, "_fetch_bytes",
+            search_sources, "_fetch_bytes",
             return_value=self._page().encode(),
         ), patch.object(
-            adapter, "_magnet_metadatas_batch", return_value=({}, 2),
+            search_sources, "_magnet_metadatas_batch", return_value=({}, 2),
         ):
             result = adapter._search_bitsearch(
                 request, set(), deadline=adapter.time.monotonic() + 30,

@@ -682,3 +682,34 @@ def _download_torrent(
     return manifest
 
 
+# A provider manifest is untrusted evidence.  These members can carry an
+# episode-looking token while being an opening/ending, preview, sample,
+# bonus, scan or other supplemental payload.  They must never be selected as
+# the one primary video for an audited ``missing_episode`` gap.  Keep the
+# expression delimiter-aware so ordinary words such as ``Extraordinary`` do
+# not accidentally become a rejection, while still failing closed for the
+# common directory and release-name spellings.
+_SUPPLEMENTAL_VIDEO_PATH_RE = re.compile(
+    r"(?i)(?:^|[/\\\s._\-\[\](){}])"
+    r"(?:bonus(?:es)?|extra(?:s)?|sample(?:s)?|scan(?:s)?|"
+    r"menu|preview(?:s)?|trailer(?:s)?|teaser(?:s)?|featurette(?:s)?|"
+    r"behind[ ._\-]*the[ ._\-]*scenes|"
+    r"ncop|nced|pv|cm|creditless|op|ed)"
+    r"(?=$|[/\\\s._\-\[\](){}])"
+)
+def _is_supplemental_video_path(path: str) -> bool:
+    """Return whether a manifest path is recognizably non-primary media."""
+    normalized = str(path or "").replace("\\", "/")
+    return bool(_SUPPLEMENTAL_VIDEO_PATH_RE.search(normalized))
+def _is_ordinary_primary_video_path(path: str) -> bool:
+    """Check path shape which remains meaningful after selection serialization."""
+    return (
+        Path(path).suffix.casefold() in VIDEO_EXTENSIONS
+        and not _is_supplemental_video_path(path)
+        and len(_expanded_episode_ids(path)) <= 1
+    )
+def _base32_infohash(hex_hash: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", hex_hash):
+        return ""
+    import base64
+    return base64.b32encode(bytes.fromhex(hex_hash)).decode("ascii").rstrip("=").casefold()

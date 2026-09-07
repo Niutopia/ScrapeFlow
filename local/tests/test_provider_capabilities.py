@@ -22,6 +22,7 @@ from engine.scrapeflow.replenishment_acquisition import (
     acquisition_lane,
 )
 from engine.tools import _replenishment_local_adapter_impl as torrent_adapter
+from engine.tools import replenishment_search_sources as search_sources
 from engine.tools.replenishment_adapter.search import (
     ReplenishmentSearchService,
     candidate_variants,
@@ -139,9 +140,9 @@ class ProviderCapabilityTests(unittest.TestCase):
             return b"<rss><channel /></rss>"
 
         with patch.dict("os.environ", flags, clear=False), patch.object(
-            torrent_adapter, "_dmhy_search_terms",
+            search_sources, "_dmhy_search_terms",
             return_value=["Alpha S1", "Alpha S01E13"],
-        ), patch.object(torrent_adapter, "_fetch_bytes", side_effect=fetch):
+        ), patch.object(search_sources, "_fetch_bytes", side_effect=fetch):
             result = torrent_adapter._search(_request())
 
         facts = result["source_telemetry"]["DMHY"]
@@ -170,9 +171,9 @@ class ProviderCapabilityTests(unittest.TestCase):
             "SCRAPEFLOW_REPLENISHMENT_CATALOG": "",
         }
         with patch.dict("os.environ", flags, clear=False), patch.object(
-            torrent_adapter, "_dmhy_search_terms", return_value=["Alpha S1"],
+            search_sources, "_dmhy_search_terms", return_value=["Alpha S1"],
         ), patch.object(
-            torrent_adapter, "_fetch_bytes", return_value=b"<rss><channel>",
+            search_sources, "_fetch_bytes", return_value=b"<rss><channel>",
         ):
             result = torrent_adapter._search(_request())
 
