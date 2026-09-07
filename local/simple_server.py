@@ -1547,18 +1547,27 @@ class SimpleApplication:
                 self._consume_root_cancellation(runner, root_task_id)
 
     def replenishment_view(self, job_id: str) -> dict[str, object]:
-        """Read-only P14 preview: aggregate, tier state and bridged requests."""
+        """Read-only P14 preview: aggregate, tier state and bridged requests.
+
+        The tier state crosses this boundary only through its bounded
+        projection (``public_replenishment_tier_state``): the dashboard must
+        not couple to the durable state file's raw shape, which the lane
+        refactor is free to change behind the projection.
+        """
         runner = self._get_engine_runner()
         job = runner.get_job(job_id)
         from local.scrapeflow_api.replenishment_bridge import gap_ledger_requests
         from local.scrapeflow_api.root_replenishment import (
             load_root_replenishment_state,
+            public_replenishment_tier_state,
         )
         return {
             "root_task_id": job_id,
             "phase": self.public_engine_job(job).get("phase", job.phase),
             "aggregate": aggregate_root_job(self.state_root, job_id).as_dict(),
-            "tier_state": load_root_replenishment_state(self.state_root, job_id),
+            "tier_state": public_replenishment_tier_state(
+                load_root_replenishment_state(self.state_root, job_id)
+            ),
             "requests": gap_ledger_requests(self.state_root, job_id),
         }
 

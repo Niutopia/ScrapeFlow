@@ -906,6 +906,76 @@ def _normalize_state(raw: Mapping[str, Any]) -> dict[str, Any]:
     return state
 
 
+_PUBLIC_ATTEMPT_LIMIT = 50
+_PUBLIC_TEXT_CHARS = 200
+_PUBLIC_SAMPLE_LIMIT = 3
+_PUBLIC_SOURCE_LIMIT = 8
+
+
+def public_replenishment_tier_state(
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bounded web projection of one root's replenishment tier state.
+
+    The dashboard must never couple to the durable state file's raw shape:
+    the lane is headed for a refactor, and this projection is the stable
+    contract between the two — the same role ``public_work_unit_row`` plays
+    for work units.  Every field is whitelisted and bounded; unknown keys
+    are dropped, so internal refactors can change the durable shape freely
+    as long as this projection keeps resolving.
+    """
+    attempts = state.get("attempt_log")
+    attempt_rows: list[dict[str, Any]] = []
+    if isinstance(attempts, list):
+        for raw in attempts[-_PUBLIC_ATTEMPT_LIMIT:]:
+            if not isinstance(raw, Mapping):
+                continue
+            attempt_rows.append({
+                "gap_id": str(raw.get("gap_id") or ""),
+                "tier": str(raw.get("tier") or ""),
+                "outcome": str(raw.get("outcome") or ""),
+                "error": str(raw.get("error") or "")[:_PUBLIC_TEXT_CHARS],
+                "recorded_at": str(raw.get("recorded_at") or ""),
+            })
+    failures: dict[str, dict[str, Any]] = {}
+    raw_failures = state.get("candidate_failures_by_provider")
+    if isinstance(raw_failures, Mapping):
+        for provider, entries in raw_failures.items():
+            if not isinstance(entries, (list, tuple)):
+                continue
+            failures[str(provider)] = {
+                "count": len(entries),
+                "samples": [
+                    str(item)[:_PUBLIC_TEXT_CHARS]
+                    for item in entries[:_PUBLIC_SAMPLE_LIMIT]
+                ],
+            }
+    exhaustion: dict[str, dict[str, Any]] = {}
+    raw_exhaustion = state.get("exhaustion_proof_by_provider")
+    if isinstance(raw_exhaustion, Mapping):
+        for provider, proof in raw_exhaustion.items():
+            if not isinstance(proof, Mapping):
+                continue
+            exhaustion[str(provider)] = {
+                "type": str(proof.get("type") or ""),
+                "completed_sources": [
+                    str(item) for item in (proof.get("completed_sources") or [])
+                    if isinstance(item, (str, int))
+                ][:_PUBLIC_SOURCE_LIMIT],
+            }
+    return {
+        "tier": str(state.get("tier") or ""),
+        "waiting": str(state.get("waiting") or ""),
+        "last_error_scope": str(state.get("last_error_scope") or ""),
+        "updated_at": str(state.get("updated_at") or ""),
+        "last_attempt_at": str(state.get("last_attempt_at") or ""),
+        "attempt_count": len(attempts) if isinstance(attempts, list) else 0,
+        "attempt_log": attempt_rows,
+        "candidate_failures_by_provider": failures,
+        "exhaustion_proof_by_provider": exhaustion,
+    }
+
+
 def load_root_replenishment_state(
     state_root: Path, root_task_id: str,
 ) -> dict[str, Any]:

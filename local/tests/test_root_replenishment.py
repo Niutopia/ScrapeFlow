@@ -2373,3 +2373,83 @@ class OversizedStateShrinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublicTierStateProjectionTest(unittest.TestCase):
+    """The web reads the tier state only through its bounded projection."""
+
+    def test_projection_is_whitelisted_and_bounded(self) -> None:
+        from local.scrapeflow_api.root_replenishment import (
+            public_replenishment_tier_state,
+        )
+
+        fat_state = {
+            "tier": "magnet",
+            "waiting": "waiting_reconcile",
+            "last_error_scope": "candidate",
+            "updated_at": "2026-09-07T01:42:19Z",
+            "last_attempt_at": "2026-09-06T23:43:39Z",
+            "attempt_log": [
+                {
+                    "gap_id": f"gap::{i}",
+                    "tier": "magnet",
+                    "outcome": "in_doubt",
+                    "error": "x" * 500,
+                    "recorded_at": f"2026-09-07T00:00:{i:02d}Z",
+                    "secret_internal_field": "must not leak",
+                }
+                for i in range(120)
+            ] + ["not-a-mapping"],
+            "candidate_failures_by_provider": {
+                "magnet": [f"torrent:magnet:?xt=urn:btih:{n}" for n in range(9)],
+                "broken": "not-a-list",
+            },
+            "exhaustion_proof_by_provider": {
+                "quark_share": {
+                    "type": "search_complete_no_candidates",
+                    "completed_sources": ["pansou", "knaben", "bitsearch"],
+                },
+            },
+            "internal_miss_caches": {"anything": ["else"]},
+        }
+        projection = public_replenishment_tier_state(fat_state)
+
+        self.assertEqual(projection["tier"], "magnet")
+        self.assertEqual(projection["waiting"], "waiting_reconcile")
+        self.assertEqual(projection["attempt_count"], 121)
+        # The trailing junk entry consumes one of the 50 tail slots — the
+        # projection stays bounded either way.
+        self.assertEqual(len(projection["attempt_log"]), 49)
+        # Newest tail kept; unknown attempt fields dropped; errors bounded.
+        self.assertEqual(projection["attempt_log"][-1]["gap_id"], "gap::119")
+        self.assertNotIn(
+            "secret_internal_field", projection["attempt_log"][-1],
+        )
+        self.assertEqual(
+            max(len(row["error"]) for row in projection["attempt_log"]), 200,
+        )
+        # Failures summarized by count with bounded samples; junk dropped.
+        self.assertEqual(
+            projection["candidate_failures_by_provider"]["magnet"]["count"], 9,
+        )
+        self.assertEqual(
+            len(projection["candidate_failures_by_provider"]["magnet"]["samples"]), 3,
+        )
+        self.assertNotIn("broken", projection["candidate_failures_by_provider"])
+        self.assertEqual(
+            projection["exhaustion_proof_by_provider"]["quark_share"]["type"],
+            "search_complete_no_candidates",
+        )
+        # Unknown top-level keys never cross the boundary.
+        self.assertNotIn("internal_miss_caches", projection)
+
+    def test_projection_of_a_fresh_state_stays_web_shaped(self) -> None:
+        from local.scrapeflow_api.root_replenishment import (
+            initial_tier_state,
+            public_replenishment_tier_state,
+        )
+
+        projection = public_replenishment_tier_state(initial_tier_state())
+        for key in ("tier", "waiting", "attempt_log", "updated_at"):
+            self.assertIn(key, projection)
+        self.assertEqual(projection["attempt_log"], [])
