@@ -5162,6 +5162,28 @@ def _direct_download_env(base: Mapping[str, str]) -> dict[str, str]:
     return cleaned
 
 
+_LOCAL_DOWNLOAD_FAILURE_SIGNATURES = (
+    # aria2 surfaces local errno text on host-side failures; a zero-byte
+    # download whose tail matches one of these never proved the resource
+    # bad — the host could not even open the file it was writing.
+    "no space left",
+    "cannot open",
+    "permission denied",
+    "read-only",
+    "input/output error",
+    "disk quota",
+)
+
+
+def _looks_like_local_download_failure(tail: str) -> bool:
+    """Whether an aria2 failure tail carries host-side errno evidence."""
+    folded = str(tail).casefold()
+    return any(
+        signature in folded
+        for signature in _LOCAL_DOWNLOAD_FAILURE_SIGNATURES
+    )
+
+
 def _payload_bytes(payload_dir: Path) -> int:
     """Sum retained media bytes, ignoring aria2 control files."""
     if not payload_dir.is_dir():
@@ -5981,6 +6003,15 @@ def _acquire(
                             f"aria2c 下载未完成但已有部分进度；保留断点等待下个 seeder 窗口: {tail}",
                             stage="candidate_download",
                         )
+                    if _looks_like_local_download_failure(tail):
+                        # Zero bytes plus host-side errno evidence: the
+                        # download never proved anything about the resource.
+                        # Excluding the locator here would burn a good
+                        # candidate on a full disk.
+                        raise ReplenishmentInfrastructureError(
+                            f"aria2c 下载失败且呈本地故障特征；保留断点等待重试: {tail}",
+                            stage="candidate_download",
+                        )
                     raise ReplenishmentCandidateError(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
                         candidate=group[0]["selection"],
@@ -6085,8 +6116,15 @@ def _acquire(
                 raise
             raise ReplenishmentDeliveryError(str(exc), stage=delivery_stage) from exc
         # Capacity/dependency/orchestration failures do not invalidate bytes
-        # retained by a previous attempt. Candidate failures do.
-        if not isinstance(exc, ReplenishmentInfrastructureError):
+        # retained by a previous attempt.  Candidate failures do.  An
+        # *unclassified* failure (an AList ApiError, an OSError, a config
+        # ValueError) may be this host's fault just as much as the typed
+        # infrastructure errors: keep the workspace so a resumed attempt
+        # continues from the retained bytes — the orchestrator classifies
+        # anything untyped as infrastructure and retries without excluding
+        # the locator.  Wiping here would replay the 4e55e59 incident family
+        # through the AList channel.
+        if isinstance(exc, ReplenishmentCandidateError):
             _pause_checkpoint(pause_requested)
             shutil.rmtree(workspace, ignore_errors=True)
         raise

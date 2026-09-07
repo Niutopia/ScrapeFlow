@@ -994,6 +994,143 @@ class MagnetMemberPipelineTests(unittest.TestCase):
         self.assertEqual(len(fake_client.uploads), 2)
         self.assertEqual(len(delivery["files"]), 2)
 
+    def test_unclassified_failure_preserves_workspace_tree(self) -> None:
+        # Same scenario, but asserting on the filesystem itself: the whole
+        # run happens inside the harness's temp workspace, so capture it.
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        class _FlakyClient(self._FakeClient):
+            def exact_file_info(self, path: str):
+                raise RuntimeError("ApiError: AList 瞬时不可用")
+
+        fake_client = _FlakyClient()
+        seen: dict[str, Path] = {}
+
+        original_run = self._run_acquire
+
+        def capture_run(client, aria2_calls, *, preexisting=None):
+            with tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                seen["workspace"] = workspace
+                retained = (
+                    workspace / "download-01" / "group-001" / "payload"
+                    / "Example.Show.S01E01.1080p.mkv"
+                )
+                retained.parent.mkdir(parents=True, exist_ok=True)
+                retained.write_bytes(b"resume-bytes" * 1024)
+                torrent_path = workspace / "preflight" / "candidate-01.torrent"
+                torrent_path.parent.mkdir(parents=True)
+                torrent_path.write_bytes(self._torrent_bytes())
+
+                class _Completed:
+                    returncode = 0
+                    stdout = "ok"
+
+                def fake_run(command, **kwargs):
+                    aria2_calls.append(command)
+                    return _Completed()
+
+                wrapper = self._wrapper()
+                with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
+                        patch.object(adapter_, "_verify_video_payload"), \
+                        patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                        patch.object(
+                            adapter_, "_download_torrent",
+                            return_value=adapter_._torrent_manifest(self._torrent_bytes()),
+                        ), \
+                        patch.object(adapter_, "_alist_client", return_value=client):
+                    try:
+                        adapter_._acquire(wrapper, workspace, client=client)
+                    except RuntimeError as exc:
+                        seen["error"] = exc
+                        # Assert INSIDE the tempdir context: the context
+                        # manager itself reclaims the directory on exit.
+                        self.assertNotIsInstance(
+                            exc, adapter_.ReplenishmentCandidateError,
+                        )
+                        self.assertTrue(
+                            torrent_path.exists(),
+                            "unclassified failure must keep the attempt workspace",
+                        )
+                        self.assertTrue(
+                            retained.exists(),
+                            "retained resume bytes must survive an unclassified failure",
+                        )
+                        return
+                    raise AssertionError("expected the flaky client to fail the run")
+
+        capture_run(fake_client, [])
+        self.assertIsNotNone(seen.get("error"))
+
+    def test_zero_byte_local_failure_is_infrastructure(self) -> None:
+        # Zero payload + host-side errno evidence (a full disk) must not
+        # permanently exclude the locator: the download never proved the
+        # resource bad.
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        fake_client = self._FakeClient()
+        aria2_calls: list[list[str]] = []
+
+        class _Completed:
+            returncode = 1
+            stdout = (
+                "Download aborted"
+                " [FileSyncController#write] errno=28: No space left on device"
+            )
+
+        def fake_run(command, **kwargs):
+            aria2_calls.append(command)
+            return _Completed()
+
+        wrapper = self._wrapper()
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            torrent_path = workspace / "preflight" / "candidate-01.torrent"
+            torrent_path.parent.mkdir(parents=True)
+            torrent_path.write_bytes(self._torrent_bytes())
+            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
+                    patch.object(adapter_, "_verify_video_payload"), \
+                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                    patch.object(
+                        adapter_, "_download_torrent",
+                        return_value=adapter_._torrent_manifest(self._torrent_bytes()),
+                    ), \
+                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                with self.assertRaises(adapter_.ReplenishmentInfrastructureError):
+                    adapter_._acquire(wrapper, workspace, client=fake_client)
+
+    def test_zero_byte_dead_swarm_still_excludes_candidate(self) -> None:
+        # The default stays: zero payload without local-failure evidence is
+        # a dead resource verdict and permanently excludes the locator.
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        fake_client = self._FakeClient()
+        aria2_calls: list[list[str]] = []
+
+        class _Completed:
+            returncode = 1
+            stdout = "bt-stop-timeout reached; no peers"
+
+        def fake_run(command, **kwargs):
+            aria2_calls.append(command)
+            return _Completed()
+
+        wrapper = self._wrapper()
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            torrent_path = workspace / "preflight" / "candidate-01.torrent"
+            torrent_path.parent.mkdir(parents=True)
+            torrent_path.write_bytes(self._torrent_bytes())
+            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
+                    patch.object(adapter_, "_verify_video_payload"), \
+                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                    patch.object(
+                        adapter_, "_download_torrent",
+                        return_value=adapter_._torrent_manifest(self._torrent_bytes()),
+                    ), \
+                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                with self.assertRaises(adapter_.ReplenishmentCandidateError):
+                    adapter_._acquire(wrapper, workspace, client=fake_client)
+
     def test_remote_committed_member_skips_download_and_upload(self) -> None:
         fake_client = self._FakeClient()
         # Member 1 is already committed remotely from an earlier interrupted
