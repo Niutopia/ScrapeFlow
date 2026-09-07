@@ -1501,6 +1501,8 @@ class LibraryIndexTests(unittest.TestCase):
             )[0]
             self.assertEqual(record.reconciliation_outcome, "uncertain")
             self.assertIsNone(record.reconciliation_evidence)
+
+    def test_season_scoped_same_marker_ova_run_proves_s00_coordinates(self) -> None:
         """A season-confirmed same-marker OVA run proves its S00 coordinates.
 
         ``W 4k 某剧 第三季OVA`` holds ``[12(OVA)]``/``[13(OVA)]`` with no
@@ -1969,6 +1971,8 @@ class LibraryIndexTests(unittest.TestCase):
             self.assertEqual(record.reconciliation_outcome, "merge_existing")
             self.assertEqual(record.matched_work_root, "/library/番剧/示例剧")
             self.assertIsNone(record.attention)
+
+    def test_naked_numeric_proof_ignores_zero_episode_future_placeholder(self) -> None:
         """TMDB's zero-episode announced season has no coordinate to infer."""
         with tempfile.TemporaryDirectory() as directory:
             state_root = Path(directory)

@@ -1791,6 +1791,8 @@ class UnitExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "D 纯方括号集号 季集证据"):
                 _request_for_unit(runner, record, root_task_id, state_root)
             self.assertEqual(alist.move_calls, [])
+
+    def test_release_dash_proof_stops_a_widening_manifest_after_the_fingerprint(self) -> None:
         """The F handoff may not widen after its fresh D proof.
 
         The injected fourth file appears after the release-dash proof and the
@@ -3237,7 +3239,8 @@ class MultiSeasonAbsoluteMapTests(unittest.TestCase):
         )[0]
         self.assertIsNone(record.reconciliation_evidence)
 
-
+    def test_single_season_absolute_run_skips_the_map_bridge(self) -> None:
+        """A 24-file run inside one season needs no multi-season map."""
         files = {
             f"/incoming/sao/[TUDO] Sword Art Online II [{i:02d}][Ma10p].mkv": FAKE_VIDEO_BYTES
             for i in range(1, 25)

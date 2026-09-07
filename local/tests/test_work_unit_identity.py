@@ -3464,10 +3464,6 @@ class TestAutoMatchFromEvidence(unittest.TestCase):
                 "representative filename query must precede parent combinations",
             )
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_chinese_season_ordinal_filename_yields_title_query(self) -> None:
         """``东京喰种 第1季 03.mkv`` has explicit CJK season coordinates."""
         self.assertEqual(

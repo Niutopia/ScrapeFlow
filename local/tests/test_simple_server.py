@@ -1312,10 +1312,6 @@ class SelectOwnershipIsolationTests(SimpleServerTests):
             self.application.select_root_job(root_id)
         self.assertEqual(self.application.control(), before)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_boundary_rebuild_discards_automatic_uncertain_parks(self) -> None:
         """An operator source change may discard automatic D=uncertain parks.
 
@@ -1530,3 +1526,7 @@ if __name__ == "__main__":
 
         self.assertEqual(status, 400)
         self.assertIn("对账或写入", str(payload.get("error", "")))
+
+
+if __name__ == "__main__":
+    unittest.main()
