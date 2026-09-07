@@ -648,6 +648,23 @@ def _expand_one_scope(
         raise DiscExpansionBridgeError(
             f"展开 staging 树不可见: {staged_scope}"
         )
+    # Completeness invariant: every proven mapping's target must appear in
+    # the walked tree.  A provider listing that lags behind its own commit
+    # would otherwise yield a partial season — the planner would write a
+    # short prefix, J would register phantom gaps, and the terminal
+    # consumption would delete the never-written staged file as a declared
+    # survivor.  A lag parks the scope for a retry instead.
+    row_paths = {str(row.get("full_path") or "") for row in rows}
+    missing_targets = [
+        mapping.target_path
+        for mapping in plan.mappings
+        if mapping.target_path not in row_paths
+    ]
+    if missing_targets:
+        raise DiscExpansionBridgeError(
+            "展开 staging 树缺少已传输的映射目标（列表滞后）: "
+            f"{missing_targets[:3]}"
+        )
     # The walk lists children only; the converted unit's new source_path IS
     # the staged scope, so the merged snapshot must carry that directory row
     # itself (the merge then completes every ancestor between the merged

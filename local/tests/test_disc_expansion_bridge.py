@@ -598,6 +598,30 @@ class TestExpandRootDiscImages:
         assert converted[0].source_paths[0].startswith(STAGING_ROOT)
         assert converted[0].source_paths[0] != parked[0].source_paths[0]
 
+    def test_walk_missing_a_transferred_target_parks_the_scope(self, wired) -> None:
+        # Completeness invariant: a provider listing lagging behind its own
+        # commit would walk a partial season; the planner would write a
+        # short prefix, register phantom gaps, and the terminal consumption
+        # would delete the never-written staged file.  The invariant parks
+        # the scope for a retry instead.
+        original_list = wired.alist.list
+
+        def lagging_list(path, refresh=False):
+            entries = original_list(path, refresh=refresh)
+            return [
+                entry for entry in entries
+                if entry.get("name") != "无耻之徒 - S01E02.mkv"
+            ]
+
+        wired.monkeypatch.setattr(wired.alist, "list", lagging_list)
+        updated, changed = self._run(wired, [_parked_record()])
+        assert changed is False
+        parked = updated[0]
+        assert parked.requires_content_expansion
+        assert parked.attention is not None
+        assert "缺少已传输的映射目标" in parked.attention
+        assert "S01E02" in parked.attention
+
     def test_merged_tree_reaches_both_scopes_from_widened_root(self, wired) -> None:
         # The production shape: the ingress snapshot is rooted at the intake
         # directory (its walk lists children only), so widening the merged
