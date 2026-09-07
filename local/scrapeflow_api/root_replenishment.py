@@ -3046,6 +3046,201 @@ def _remove_attempt_workspace_tree(workspace_value: object) -> None:
         pass
 
 
+def _consume_remote_staging_tree(
+    runner: Any, path: str, *, pause_requested: Callable[[], bool] | None,
+) -> str | None:
+    """Consume one task-owned remote attempt staging tree, verified.
+
+    Mirrors the disc-expansion lane's terminal staging consumption: the tree
+    lives under ``ScrapeFlow/补源/<root>/<attempt>`` and is task-owned by
+    construction; once the owning intent is terminal its surviving files are
+    redundant copies (the child plan moved the verified payloads into the
+    formal library) and the whole tree is residue.  Every removal is
+    verified against a refreshed listing, and the quark
+    acknowledge-without-delete no-op falls back to an explicit parent-name
+    remove.  Returns a residual note when something survived or the walk
+    hit the pause boundary.
+    """
+    alist = getattr(runner, "alist", None)
+    listing = getattr(alist, "list", None)
+    remove = getattr(alist, "remove", None)
+    remove_empty = getattr(alist, "remove_empty_dir", None)
+    if not callable(listing) or not callable(remove) or not callable(remove_empty):
+        return "远端补源清理缺少 AList 接口"
+
+    def paused() -> bool:
+        if pause_requested is None:
+            return False
+        try:
+            return bool(pause_requested())
+        except Exception:
+            return True
+
+    def rows(directory: str) -> list[Mapping[str, Any]]:
+        try:
+            raw = listing(directory, refresh=True)
+        except TypeError:
+            raw = listing(directory)
+        if not isinstance(raw, list):
+            raise RuntimeError(f"远端补源目录列表无效: {directory}")
+        return [row for row in raw if isinstance(row, Mapping)]
+
+    class _PauseBoundary(Exception):
+        pass
+
+    parent, name = posixpath.split(path.rstrip("/"))
+    try:
+        if not any(
+            str(row.get("name") or "") == name and row.get("is_dir")
+            for row in rows(parent)
+        ):
+            return None
+    except _PauseBoundary:
+        return "远端补源清理在暂停边界停止，可重跑"
+    except Exception as exc:  # noqa: BLE001 - residual note
+        return f"远端补源清理未完成（{exc}），可重跑"
+
+    directories: list[str] = []
+    survivors: list[str] = []
+
+    def walk(directory: str) -> None:
+        for row in rows(directory):
+            if paused():
+                raise _PauseBoundary()
+            entry_name = str(row.get("name") or "")
+            full = posixpath.join(directory, entry_name)
+            if row.get("is_dir"):
+                directories.append(full)
+                walk(full)
+            else:
+                survivors.append(full)
+
+    try:
+        walk(path)
+    except _PauseBoundary:
+        return "远端补源清理在暂停边界停止，可重跑"
+    except Exception as exc:  # noqa: BLE001 - residual note
+        return f"远端补源清理未完成（{exc}），可重跑"
+
+    for full in survivors:
+        if paused():
+            return "远端补源清理在暂停边界停止，可重跑"
+        file_parent, file_name = posixpath.split(full)
+        removed = False
+        for _attempt in range(2):
+            try:
+                remove(file_parent, [file_name])
+            except Exception:  # noqa: BLE001 - verified below either way
+                pass
+            try:
+                if not any(
+                    str(row.get("name") or "") == file_name
+                    for row in rows(file_parent)
+                ):
+                    removed = True
+                    break
+            except Exception as exc:  # noqa: BLE001 - residual note
+                return f"远端补源清理未完成（{exc}），可重跑"
+        if not removed:
+            return f"远端补源残件删除失败（{full}），可重跑"
+
+    for directory in sorted(directories, key=len, reverse=True) + [path.rstrip("/")]:
+        if paused():
+            return "远端补源清理在暂停边界停止，可重跑"
+        dir_parent, dir_name = posixpath.split(directory)
+        gone = False
+        for _attempt in range(2):
+            try:
+                remove_empty(directory, refresh=True)
+            except TypeError:
+                remove_empty(directory)
+            except Exception:  # noqa: BLE001 - verified below either way
+                pass
+            try:
+                if not any(
+                    str(row.get("name") or "") == dir_name and row.get("is_dir")
+                    for row in rows(dir_parent)
+                ):
+                    gone = True
+                    break
+                # The quark driver acknowledged without deleting; the
+                # explicit parent-name remove is the bounded fallback.
+                remove(dir_parent, [dir_name])
+                if not any(
+                    str(row.get("name") or "") == dir_name and row.get("is_dir")
+                    for row in rows(dir_parent)
+                ):
+                    gone = True
+                    break
+            except Exception:  # noqa: BLE001 - verified next attempt
+                continue
+        if not gone:
+            return f"远端补源目录壳未消失（{directory}），可重跑"
+    return None
+
+
+def _consume_attempt_remote_staging(
+    runner: Any, intent: Mapping[str, Any],
+    *, pause_requested: Callable[[], bool] | None,
+) -> None:
+    """Consume one terminal attempt's remote staging tree, best-effort."""
+    staging_root = _bounded_path(intent.get("staging_root"))
+    if staging_root is None:
+        return
+    note = _consume_remote_staging_tree(
+        runner, staging_root, pause_requested=pause_requested,
+    )
+    if note is not None:
+        _trace(f"补源远端 staging 清理残注: {note}")
+
+
+def _sweep_orphan_remote_attempts(
+    runner: Any, root_task_id: str, state: Mapping[str, Any],
+    *, pause_requested: Callable[[], bool] | None,
+) -> None:
+    """Consume remote attempt trees no durable intent references.
+
+    The measured residue: eight empty attempt shells under one root whose
+    attempts all died in the local download phase.  Post-terminal
+    replenishment never re-enters the terminal source-consumption path, so
+    without this sweep those trees outlive the root forever.  Only
+    attempt-id-shaped names under the root's own staging namespace are
+    ever touched.
+    """
+    listing = getattr(getattr(runner, "alist", None), "list", None)
+    if not callable(listing):
+        return
+    root = f"{str(runner.library_root).rstrip('/')}{_STAGING_NAMESPACE}/{root_task_id}"
+    live = set(_video_intents(state)) | {
+        str(intent.get("attempt_id") or "")
+        for intent in (state.get(_SUBTITLE_INTENTS_KEY) or {}).values()
+        if isinstance(intent, Mapping)
+    }
+    try:
+        try:
+            entries = listing(root, refresh=True)
+        except TypeError:
+            entries = listing(root)
+    except Exception:  # noqa: BLE001 - nothing to sweep is not an error
+        return
+    if not isinstance(entries, list):
+        return
+    for row in entries:
+        name = str(row.get("name") or "") if isinstance(row, Mapping) else ""
+        if (
+            not name
+            or name in live
+            or _ATTEMPT_DIR_NAME_RE.fullmatch(name) is None
+        ):
+            continue
+        note = _consume_remote_staging_tree(
+            runner, posixpath.join(root, name), pause_requested=pause_requested,
+        )
+        if note is not None:
+            _trace(f"补源远端孤儿清扫残注: {note}")
+            return
+
+
 def _sweep_orphan_attempt_workspaces(
     state_root: Path, root_task_id: str, state: Mapping[str, Any],
 ) -> None:
@@ -3479,6 +3674,7 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
     if not gaps:
         _drop_video_intent(state_root, root_task_id, state, str(intent["attempt_id"]))
         _remove_attempt_workspace_tree(intent.get("workspace"))
+        _consume_attempt_remote_staging(runner, intent, pause_requested=pause_requested)
         return {"outcome": "closed", "attempts": [], "gaps_closed": []}
     if pause_requested is not None and pause_requested():
         return {"outcome": "paused", "attempts": [], "gaps_closed": []}
@@ -3544,6 +3740,7 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
         return {"outcome": "waiting_reconcile", "attempts": attempts, "gaps_closed": closed}
     _drop_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]))
     _remove_attempt_workspace_tree(pending.get("workspace"))
+    _consume_attempt_remote_staging(runner, pending, pause_requested=pause_requested)
     return {"outcome": "closed", "attempts": attempts, "gaps_closed": closed}
 
 
@@ -3608,6 +3805,7 @@ def _recover_video_intents(runner: Any, state_root: Path, root_task_id: str, sta
                         # round may search for a different candidate.
                         _drop_video_intent(state_root, root_task_id, state, attempt_id)
                         _remove_attempt_workspace_tree(intent.get("workspace"))
+                        _consume_attempt_remote_staging(runner, intent, pause_requested=pause_requested)
                         for gap_id in intent["ledger_gap_ids"]:
                             record_attempt(
                                 state_root, root_task_id, gap_id,
@@ -3743,6 +3941,7 @@ def run_root_replenishment(
         state.update({"updated_at": _now(), "waiting": "waiting_reconcile"})
         _sync_video_in_flight(state)
         _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
+        _sweep_orphan_remote_attempts(runner, root_task_id, state, pause_requested=materializer_pause)
         save_root_replenishment_state(state_root, root_task_id, state)
         return {
             "tier": tier, "tier_before": tier, "requests_built": 0,
@@ -3816,6 +4015,7 @@ def run_root_replenishment(
         state["waiting"] = merged_waiting(None)
         _sync_video_in_flight(state)
         _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
+        _sweep_orphan_remote_attempts(runner, root_task_id, state, pause_requested=materializer_pause)
         save_root_replenishment_state(state_root, root_task_id, state)
         noop = _noop_result(state, tier)
         noop["attempts"] = recovered_attempts
@@ -3842,6 +4042,7 @@ def run_root_replenishment(
         state.update({"updated_at": _now(), "waiting": waiting})
         _sync_video_in_flight(state)
         _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
+        _sweep_orphan_remote_attempts(runner, root_task_id, state, pause_requested=materializer_pause)
         save_root_replenishment_state(state_root, root_task_id, state)
         return attach_subtitle_result({"tier": tier, "tier_before": tier, "requests_built": 0, "attempts": reconcile_attempts, "gaps_closed": reconcile_closed, "state": state, "waiting": waiting})
 
@@ -4125,6 +4326,7 @@ def run_root_replenishment(
                 if scope == FAILURE_CANDIDATE:
                     _drop_video_intent(state_root, root_task_id, state, attempt_id)
                     _remove_attempt_workspace_tree(intent.get("workspace"))
+                    _consume_attempt_remote_staging(runner, intent, pause_requested=materializer_pause)
                     # Keep the provider's bounded, redacted diagnostic in the
                     # attempt ledger.  A generic label such as "provider
                     # rejected" is not enough to distinguish a bad torrent
@@ -4279,6 +4481,7 @@ def run_root_replenishment(
     state["waiting"] = waiting
     _sync_video_in_flight(state)
     _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
+    _sweep_orphan_remote_attempts(runner, root_task_id, state, pause_requested=materializer_pause)
     _trace(f"end root={root_task_id} tier={state.get('tier')} waiting={waiting} closed={len(gaps_closed)}")
     for entry in attempts:
         _append_attempt_log(state, {

@@ -2632,3 +2632,116 @@ class AttemptLedgerNoiseTests(unittest.TestCase):
         self.assertEqual(kind, "window")
         self.assertIn("bitsearch", message)
         self.assertNotIn("acg", message)
+
+
+class _RemoteTreeAList(IndexAList):
+    """Files-dict AList double with verified remove/remove_empty semantics."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.empty_dir_noop = False
+
+    def add_tree(self, path: str, *, files: int = 1) -> None:
+        current = ""
+        for part in path.strip("/").split("/"):
+            current += "/" + part
+            self.dirs.add(current)
+        for index in range(files):
+            self.files[f"{path}/member-{index:02d}.mkv"] = b"x" * (index + 1)
+
+    def remove(self, parent: str, names: list[str]) -> None:
+        for name in names:
+            full = f"{parent.rstrip('/')}/{name}"
+            self.files.pop(full, None)
+            self.dirs.discard(full)
+
+    def remove_empty_dir(self, path: str, refresh: bool = False) -> None:
+        del refresh
+        if self.empty_dir_noop:
+            return  # quark acknowledges without deleting
+        if not self.list(path):
+            self.dirs.discard(path.rstrip("/"))
+
+
+class RemoteStagingLifecycleTests(unittest.TestCase):
+    """Remote attempt trees get the same lifecycle as local workspaces."""
+
+    ROOT = "root-r"
+    LIVE = "f" * 32
+    ORPHAN = "e" * 32
+
+    def _runner(self, alist) -> SimpleEngineRunner:
+        return SimpleEngineRunner(
+            Path(tempfile.mkdtemp()),
+            alist=alist,
+            tmdb=FakeTMDBClient(search_results={}),
+            planner=lambda plan: {"ok": True},
+            executor=lambda plan: {"ok": True},
+            validate=False,
+            library_root="/library",
+        )
+
+    def test_consume_removes_the_whole_tree(self) -> None:
+        alist = _RemoteTreeAList()
+        alist.add_tree(f"/library/ScrapeFlow/补源/{self.ROOT}/{self.LIVE}/media", files=2)
+        runner = self._runner(alist)
+        note = root_replenishment._consume_remote_staging_tree(
+            runner,
+            f"/library/ScrapeFlow/补源/{self.ROOT}/{self.LIVE}",
+            pause_requested=None,
+        )
+        self.assertIsNone(note)
+        self.assertEqual(alist.files, {})
+        self.assertNotIn(
+            f"/library/ScrapeFlow/补源/{self.ROOT}/{self.LIVE}", alist.dirs,
+        )
+        # The root's own staging dir survives: other attempts may live there.
+        self.assertIn(f"/library/ScrapeFlow/补源/{self.ROOT}", alist.dirs)
+
+    def test_consume_survives_quark_noop_empty_dir(self) -> None:
+        alist = _RemoteTreeAList()
+        alist.empty_dir_noop = True
+        alist.add_tree(f"/library/ScrapeFlow/补源/{self.ROOT}/{self.ORPHAN}", files=1)
+        runner = self._runner(alist)
+        note = root_replenishment._consume_remote_staging_tree(
+            runner,
+            f"/library/ScrapeFlow/补源/{self.ROOT}/{self.ORPHAN}",
+            pause_requested=None,
+        )
+        self.assertIsNone(note)
+        self.assertEqual(alist.files, {})
+        self.assertNotIn(
+            f"/library/ScrapeFlow/补源/{self.ROOT}/{self.ORPHAN}", alist.dirs,
+        )
+
+    def test_sweep_consumes_only_orphan_attempt_trees(self) -> None:
+        alist = _RemoteTreeAList()
+        base = f"/library/ScrapeFlow/补源/{self.ROOT}"
+        alist.add_tree(f"{base}/{self.LIVE}", files=1)
+        alist.add_tree(f"{base}/{self.ORPHAN}", files=1)
+        alist.add_tree(f"{base}/operator-notes", files=1)
+        runner = self._runner(alist)
+        state = {"video_intents": {self.LIVE: {"phase": "waiting_reconcile"}}}
+
+        root_replenishment._sweep_orphan_remote_attempts(
+            runner, self.ROOT, state, pause_requested=None,
+        )
+
+        self.assertIn(f"{base}/{self.LIVE}/member-00.mkv", alist.files)
+        self.assertNotIn(f"{base}/{self.ORPHAN}/member-00.mkv", alist.files)
+        self.assertIn(f"{base}/operator-notes/member-00.mkv", alist.files)
+        self.assertIn(f"{base}/{self.LIVE}", alist.dirs)
+
+    def test_terminal_drop_sites_wire_remote_consumption(self) -> None:
+        import inspect
+
+        source = inspect.getsource(root_replenishment)
+        self.assertEqual(source.count("_remove_attempt_workspace_tree("), 5)
+        self.assertEqual(
+            source.count("_consume_attempt_remote_staging("), 5,
+            "each terminal drop consumes the attempt's remote staging tree",
+        )
+        self.assertEqual(
+            source.count("_sweep_orphan_remote_attempts("), 5,
+            "definition plus four round-end sweep sites",
+        )
