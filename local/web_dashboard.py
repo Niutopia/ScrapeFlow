@@ -638,6 +638,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     <div class="forge-command-actions">
       <button type="button" class="forge-button forge-button--quiet" id="controlButton">恢复</button>
       <button type="button" class="forge-button forge-button--quiet" id="refreshButton">刷新</button>
+      <button type="button" class="forge-button forge-button--quiet" id="orphanButton" title="清除指向已删除任务的孤儿选择">清除孤儿选择</button>
     </div>
   </div>
 </header>
@@ -647,6 +648,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     <div class="forge-view-tabs">
       <button type="button" class="forge-view-tab is-active" role="tab" aria-selected="true" aria-controls="sourceView" data-view="sources">待选区</button>
       <button type="button" class="forge-view-tab" role="tab" aria-selected="false" aria-controls="tasksView" data-view="tasks">任务</button>
+      <button type="button" class="forge-view-tab" role="tab" aria-selected="false" aria-controls="browseView" data-view="browse">库浏览</button>
     </div>
   </nav>
 
@@ -693,6 +695,21 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
       <button type="button" class="forge-button forge-button--signal" id="createButton">＋ 创建任务</button>
     </div>
     <div class="forge-source-list" id="sourceStrip"><div class="forge-empty">正在读取来源</div></div>
+  </section>
+
+  <section class="forge-section" id="browseView" hidden>
+    <div class="forge-source-toolbar">
+      <div><h2>库浏览</h2><p id="browseStamp">只读视图 · 不提供删除或移动</p></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button type="button" class="forge-button forge-button--quiet" id="browseRefresh" title="夸克列表可能滞后数分钟，强制刷新走新索引">强制刷新</button>
+      </div>
+    </div>
+    <div class="forge-gap-table" style="margin-bottom:10px">
+      <table><thead><tr><th>快捷入口</th></tr></thead><tbody><tr><td id="browseQuickLinks"></td></tr></tbody></table>
+    </div>
+    <div id="browseCrumbs" style="padding:4px 0 10px;font-family:var(--forge-font-mono);font-size:12px;color:var(--forge-muted)"></div>
+    <div class="forge-table-head" aria-hidden="true"><span>名称</span><span>类型</span><span>大小</span><span>修改时间</span></div>
+    <div class="forge-job-board" id="browseBoard"><div class="forge-empty">选择快捷入口或输入路径</div></div>
   </section>
 </main>
 
@@ -762,7 +779,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
   function savedView(){
     try {
       var saved = window.sessionStorage.getItem(viewStorageKey);
-      return saved === "tasks" || saved === "sources" ? saved : "sources";
+      return saved === "tasks" || saved === "sources" || saved === "browse" ? saved : "sources";
     } catch(error) {
       return "sources";
     }
@@ -773,7 +790,8 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
   var state = {
     jobs:[], sources:[], units:{}, replenishment:{}, health:null, intakeRefreshedAt:null,
     view:savedView(), filter:"all", unitFilter:"all", busy:false, loading:false, healthError:false,
-    drawerJobId:null, selectedSource:null, selectedShelf:"anime", pendingAction:null
+    drawerJobId:null, selectedSource:null, selectedShelf:"anime", pendingAction:null,
+    browsePath:null, browseData:null, browseBusy:false
   };
   var terminal = new Set(["completed","executed","cancelled"]);
   var attention = new Set([
@@ -1268,13 +1286,16 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
   }
   function renderView(){
     var isTasks = state.view === "tasks";
-    $("#sourceView").hidden = isTasks;
+    var isBrowse = state.view === "browse";
+    $("#sourceView").hidden = isTasks || isBrowse;
     $("#tasksView").hidden = !isTasks;
+    $("#browseView").hidden = !isBrowse;
     $$(".forge-view-tab").forEach(function(tab){
       var active = tab.dataset.view === state.view;
       tab.classList.toggle("is-active",active);
       tab.setAttribute("aria-selected",active ? "true" : "false");
     });
+    if(isBrowse && !state.browseData){ loadBrowse(); }
   }
   function renderAll(){
     updateHeader();
@@ -1565,6 +1586,35 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
         '</div></form>';
     }
 
+    var rulingHtml = "";
+    if(unit.requires_content_expansion){
+      var rulingScope = unit.boundary_key || "";
+      var assignmentRows = "";
+      for(var ri = 0; ri < 6; ri++){
+        assignmentRows +=
+          '<div style="display:flex;gap:6px;margin-bottom:4px">' +
+          '<input type="text" class="forge-input forge-input--mono" placeholder="/BDMV/PLAYLIST/00051.mpls" data-ruling-playlist style="flex:1">' +
+          '<input type="number" class="forge-input forge-input--mono" placeholder="集号" min="1" data-ruling-episode style="width:84px">' +
+          '</div>';
+      }
+      var skippedRows = "";
+      for(var si = 0; si < 3; si++){
+        skippedRows +=
+          '<input type="text" class="forge-input forge-input--mono" placeholder="/BDMV/PLAYLIST/00999.mpls（特典，选填）" data-ruling-skipped style="width:100%;margin-bottom:4px">';
+      }
+      rulingHtml = '<form class="forge-manual-confirm" data-ruling-form="1" data-job="' + esc(state.drawerJobId) + '" data-scope="' + esc(rulingScope) + '">' +
+        '<div class="forge-manual-confirm__label"><span>光盘集号裁决（操作员通道）</span>' +
+        '<small>镜像自身证不出保序映射时使用；每条裁决都会按 TMDB 集时长容差复核，与盘面时长矛盾的裁决会被拒绝。必须先暂停任务。</small></div>' +
+        '<div class="forge-manual-inputs" style="flex-wrap:wrap">' +
+        '<input type="number" class="forge-input forge-input--mono forge-input--season" placeholder="季号" min="1" required data-ruling-season>' +
+        '</div>' +
+        '<div style="margin-top:8px"><strong style="font-size:12px">playlist → 集号（至少一条）</strong>' + assignmentRows + '</div>' +
+        '<div style="margin-top:8px"><strong style="font-size:12px">显式跳过的特典 playlist（选填）</strong>' + skippedRows + '</div>' +
+        '<div style="margin-top:8px"><input type="text" class="forge-input" placeholder="依据说明（必填，如：分盘序号与官方片单核对）" required data-ruling-note style="width:100%"></div>' +
+        '<div style="margin-top:8px"><button type="submit" class="forge-button forge-button--small forge-button--signal">提交裁决</button></div>' +
+        '</form>';
+    }
+
     var metaItems = [];
     if(unit.identity && unit.identity.title){
       var tmdbType = unit.identity.media_type === "movie" ? "movie" : "tv";
@@ -1606,7 +1656,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     return '<div class="forge-unit" data-unit-card="' + esc(unit.work_unit_id) + '"><div class="forge-unit__top"><div><strong>' +
       esc(unit.display_label || unit.boundary_key || "未命名单元") + '</strong><small>' +
       esc(unit.boundary_key || unit.work_unit_id || "") + "</small></div>" + chip(status) +
-      "</div>" + metaHtml + candidateHtml + manualHtml + "</div>";
+      "</div>" + metaHtml + candidateHtml + manualHtml + rulingHtml + "</div>";
   }
 
   function renderDrawer(){
@@ -1654,6 +1704,14 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     }
     if(isTerminalJob(job)){
       actions += '<button type="button" class="forge-button forge-button--quiet" data-action="cleanup" data-job="' + esc(job.id) + '">清理任务记录</button>';
+    }
+    if(isAttentionJob(job) || isTerminalJob(job)){
+      actions += '<button type="button" class="forge-button forge-button--quiet" data-action="rebuild-uncertain" data-job="' + esc(job.id) + '" title="只重建 C 未决的单元边界">重建未决单元</button>';
+      actions += '<button type="button" class="forge-button forge-button--quiet" data-action="rebuild-boundaries" data-job="' + esc(job.id) + '" title="零写入根重新推导全部边界（有写入事实的根会被拒绝）">重建边界</button>';
+      actions += '<button type="button" class="forge-button forge-button--quiet" data-action="repair-artifacts" data-job="' + esc(job.id) + '" title="补写缺失的 NFO 与海报">修复元数据</button>';
+    }
+    if(isAttentionJob(job) || (job.phase && String(job.phase).indexOf("failed") === 0)){
+      actions += '<button type="button" class="forge-button forge-button--quiet" data-action="reopen-orphan" data-job="' + esc(job.id) + '" title="IntakeSource 指向已删除任务时恢复绑定">解除孤儿绑定</button>';
     }
     if(isCancellableJob(job)){
       actions += '<button type="button" class="forge-button forge-button--danger" data-action="cancel" data-job="' + esc(job.id) + '">取消任务</button>';
@@ -1875,7 +1933,203 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
       successMessage:"已请求取消任务"
     });
   }
+  function rebuildUncertainUnits(jobId){
+    askForConfirmation({
+      title:"重建未决单元边界",
+      message:"只重新推导身份未决（uncertain）单元的边界。",
+      hint:"适用于引擎修复后重跑同一形状的来源；有写入事实的单元不受影响。需要先暂停任务。",
+      confirmLabel:"重建未决单元",
+      path:"/api/jobs/" + encodeURIComponent(jobId) + "/rebuild-uncertain-units",
+      payload:{},
+      successMessage:"已重建未决单元边界"
+    });
+  }
+  function rebuildBoundaries(jobId){
+    askForConfirmation({
+      title:"重建任务边界",
+      message:"零写入的根重新推导全部工作单元边界。",
+      hint:"已有任何写入事实（carrier/车道/缺口/已决 D）的根会被拒绝——那是 cancel + cleanup + 重建的领地。",
+      confirmLabel:"重建边界",
+      path:"/api/jobs/" + encodeURIComponent(jobId) + "/rebuild-boundaries",
+      payload:{},
+      successMessage:"已重建任务边界"
+    });
+  }
+  function reopenOrphan(jobId){
+    askForConfirmation({
+      title:"解除孤儿绑定",
+      message:"此来源的 IntakeSource 指向已删除的任务，恢复其建任务能力。",
+      hint:"需要被删任务的原始 JSON 作证据（备份或墓碑里找）；没有证据时服务器会拒绝。",
+      confirmLabel:"解除孤儿绑定",
+      path:"/api/jobs/" + encodeURIComponent(jobId) + "/reopen-orphan",
+      payload:{},
+      successMessage:"已解除孤儿绑定"
+    });
+  }
+  function repairArtifacts(jobId){
+    askForConfirmation({
+      title:"修复元数据",
+      message:"为已入库的作品补写缺失的 NFO 与海报。",
+      hint:"只补缺失项，不覆盖已有文件；写后走同一回读核验。",
+      confirmLabel:"修复元数据",
+      path:"/api/jobs/" + encodeURIComponent(jobId) + "/repair-artifacts",
+      payload:{},
+      successMessage:"已提交元数据修复"
+    });
+  }
+  function clearOrphanSelection(){
+    askForConfirmation({
+      title:"清除孤儿选择",
+      message:"清除指向已删除任务的调度选择？",
+      hint:"仅当当前选中根指向已不存在的任务时使用；不清除媒体与账本。",
+      confirmLabel:"清除选择",
+      path:"/api/control/clear-orphan-selection",
+      payload:{},
+      successMessage:"已清除孤儿选择"
+    });
+  }
+  function submitRulingForm(event){
+    var form = event.target.closest("[data-ruling-form]");
+    if(!form){ return; }
+    event.preventDefault();
+    var jobId = form.dataset.job;
+    var scopePath = form.dataset.scope;
+    var seasonInput = form.querySelector("[data-ruling-season]");
+    var noteInput = form.querySelector("[data-ruling-note]");
+    var season = Number(seasonInput ? seasonInput.value : 0);
+    if(!season || season <= 0){
+      toast("请输入有效的季号",true);
+      return;
+    }
+    var assignments = [];
+    var playlistInputs = form.querySelectorAll("[data-ruling-playlist]");
+    var episodeInputs = form.querySelectorAll("[data-ruling-episode]");
+    for(var i = 0; i < playlistInputs.length; i++){
+      var playlist = (playlistInputs[i].value || "").trim();
+      var episode = Number(episodeInputs[i] ? episodeInputs[i].value : 0);
+      if(!playlist && !episode){ continue; }
+      if(!playlist || !episode || episode <= 0){
+        toast("裁决行必须同时填 playlist 路径和正整数集号",true);
+        return;
+      }
+      assignments.push({ playlist_inner_path: playlist, episode: episode });
+    }
+    if(!assignments.length){
+      toast("至少填一条 playlist → 集号 裁决",true);
+      return;
+    }
+    var skipped = [];
+    form.querySelectorAll("[data-ruling-skipped]").forEach(function(input){
+      var value = (input.value || "").trim();
+      if(value){ skipped.push(value); }
+    });
+    var payload = {
+      scope_path: scopePath,
+      season: season,
+      assignments: assignments,
+      operator: "web-console",
+      note: (noteInput ? noteInput.value : "").trim()
+    };
+    if(!payload.note){
+      toast("请填写依据说明",true);
+      return;
+    }
+    if(skipped.length){ payload.skipped = skipped; }
+    var submitBtn = form.querySelector('button[type="submit"]');
+    if(submitBtn){
+      submitBtn.disabled = true;
+      submitBtn.textContent = "提交中…";
+    }
+    api("/api/jobs/" + encodeURIComponent(jobId) + "/file-disc-ruling",{
+      method:"POST", body: JSON.stringify(payload)
+    }).then(function(){
+      toast("已登记光盘集号裁决");
+      return load();
+    }).then(function(){ renderDrawer(); }).catch(function(error){
+      toast(error.message,true);
+    }).finally(function(){
+      if(submitBtn){
+        submitBtn.disabled = false;
+        submitBtn.textContent = "提交裁决";
+      }
+    });
+  }
+  function browseQuickLinks(){
+    var links = [
+      { label:"番剧", path:"/quark/影视/番剧" },
+      { label:"欧美剧", path:"/quark/影视/欧美剧" },
+      { label:"电影", path:"/quark/影视/电影" },
+      { label:"待刮削", path:"/quark/影视/待刮削" },
+      { label:"展开 staging", path:"/quark/影视/ScrapeFlow/展开" },
+      { label:"补源 staging", path:"/quark/影视/ScrapeFlow/补源" },
+      { label:"归档", path:"/quark/影视/ScrapeFlow/归档" }
+    ];
+    return links.map(function(link){
+      return '<button type="button" class="forge-button forge-button--small forge-button--quiet" data-browse-path="' +
+        esc(link.path) + '">' + esc(link.label) + '</button>';
+    }).join(" ");
+  }
+  function loadBrowse(path, refresh){
+    if(state.browseBusy){ return; }
+    state.browseBusy = true;
+    var target = path || state.browsePath || "/quark/影视";
+    var query = "?path=" + encodeURIComponent(target) + (refresh ? "&refresh=1" : "");
+    api("/api/browse" + query).then(function(data){
+      state.browsePath = String(data.path || target);
+      state.browseData = data;
+      renderBrowse();
+    }).catch(function(error){
+      toast(error.message,true);
+      $("#browseBoard").innerHTML = '<div class="forge-empty">读取失败：' + esc(error.message) + '</div>';
+    }).finally(function(){ state.browseBusy = false; });
+  }
+  function renderBrowse(){
+    var board = $("#browseBoard");
+    if(!board){ return; }
+    $("#browseQuickLinks").innerHTML = browseQuickLinks();
+    var data = state.browseData;
+    if(!data){
+      board.innerHTML = '<div class="forge-empty">正在读取</div>';
+      return;
+    }
+    var crumbs = '<button type="button" class="forge-button forge-button--small forge-button--quiet" data-browse-path="/">/</button>';
+    var cumulative = "";
+    String(data.path || "").split("/").forEach(function(part){
+      if(!part){ return; }
+      cumulative += "/" + part;
+      crumbs += ' / <button type="button" class="forge-button forge-button--small forge-button--quiet" data-browse-path="' +
+        esc(cumulative) + '">' + esc(part) + '</button>';
+    });
+    if(data.parent){
+      crumbs = '<button type="button" class="forge-button forge-button--small forge-button--quiet" data-browse-path="' +
+        esc(data.parent) + '">↑ 上一级</button> · ' + crumbs;
+    }
+    $("#browseCrumbs").innerHTML = crumbs;
+    function sizeText(value){
+      var size = Number(value);
+      if(!isFinite(size) || size <= 0){ return "-"; }
+      if(size >= 1024 * 1024 * 1024){ return (size / (1024 * 1024 * 1024)).toFixed(2) + " GB"; }
+      if(size >= 1024 * 1024){ return (size / (1024 * 1024)).toFixed(1) + " MB"; }
+      if(size >= 1024){ return (size / 1024).toFixed(0) + " KB"; }
+      return size + " B";
+    }
+    var rows = (data.directories || []).map(function(entry){
+      return '<div class="forge-job-row" data-browse-path="' + esc(entry.path) + '" style="cursor:pointer">' +
+        '<span><strong>📁 ' + esc(entry.name) + '</strong></span><span>目录</span><span>-</span><span>' +
+        esc(entry.modified || "-") + '</span></div>';
+    }).concat((data.files || []).map(function(entry){
+      return '<div class="forge-job-row" style="cursor:default"><span>' + esc(entry.name) + '</span>' +
+        '<span>文件</span><span>' + sizeText(entry.size) + '</span><span>' + esc(entry.modified || "-") + '</span></div>';
+    }));
+    board.innerHTML = rows.length ? rows.join("") :
+      '<div class="forge-empty">此目录为空</div>';
+  }
   function handleManualConfirm(event){
+    var rulingForm = event.target.closest("[data-ruling-form]");
+    if(rulingForm){
+      submitRulingForm(event);
+      return;
+    }
     var form = event.target.closest("[data-manual-form]");
     if(!form){ return; }
     event.preventDefault();
@@ -2016,6 +2270,10 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     if(name === "cleanup"){ cleanupJob(action.dataset.job); }
     if(name === "replenish"){ replenishJob(action.dataset.job); }
     if(name === "cancel"){ cancelJob(action.dataset.job); }
+    if(name === "rebuild-uncertain"){ rebuildUncertainUnits(action.dataset.job); }
+    if(name === "rebuild-boundaries"){ rebuildBoundaries(action.dataset.job); }
+    if(name === "reopen-orphan"){ reopenOrphan(action.dataset.job); }
+    if(name === "repair-artifacts"){ repairArtifacts(action.dataset.job); }
     if(name === "confirm"){ confirmCandidate(action); }
   }
   $("#jobBoard").addEventListener("click",function(event){
@@ -2049,6 +2307,24 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
   $("#attentionList").addEventListener("click",actionClick);
   $("#drawerBody").addEventListener("click",actionClick);
   $("#drawerBody").addEventListener("submit",handleManualConfirm);
+  $("#orphanButton").addEventListener("click",function(){
+    if(state.busy){ return; }
+    clearOrphanSelection();
+  });
+  $("#browseRefresh").addEventListener("click",function(){
+    loadBrowse(null, true);
+  });
+  function browseClick(event){
+    var target = event.target.closest("[data-browse-path]");
+    if(!target){ return; }
+    event.preventDefault();
+    event.stopPropagation();
+    loadBrowse(target.dataset.browsePath, false);
+  }
+  $("#browseBoard").addEventListener("click",browseClick);
+  $("#browseCrumbs").addEventListener("click",browseClick);
+  var quickLinksEl = $("#browseQuickLinks");
+  if(quickLinksEl){ quickLinksEl.addEventListener("click",browseClick); }
   $("#drawerBody").addEventListener("change",function(event){
     var typeSelect = event.target.closest("[data-manual-type]");
     if(typeSelect){

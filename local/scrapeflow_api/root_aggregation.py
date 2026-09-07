@@ -147,6 +147,7 @@ def public_work_unit_row(
     return {
         "work_unit_id": record.work_unit_id,
         "boundary_key": record.boundary_key,
+        "requires_content_expansion": bool(record.requires_content_expansion),
         "display_label": (
             str(record.display_label or "").strip()
             or str(record.boundary_key).rstrip("/").rsplit("/", 1)[-1]

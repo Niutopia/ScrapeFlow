@@ -2052,6 +2052,7 @@ class SimpleApplication:
                 "path": full_path,
                 "is_dir": bool(raw.get("is_dir")),
                 "size": raw.get("size"),
+                "modified": str(raw.get("modified") or ""),
                 "selectable": True,
             }
             (directories if row["is_dir"] else files).append(row)
