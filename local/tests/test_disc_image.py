@@ -765,3 +765,62 @@ def test_inner_file_ranges_reject_incomplete_extent_coverage() -> None:
 
     with pytest.raises(disc_image.DiscImageError):
         tuple(disc_image.iter_inner_file_ranges(inner))
+
+
+def _poisoned_first_fid_image(mutate) -> _MemoryImage:
+    """A valid plain UDF image whose first FID tag carries one poisoned field.
+
+    The tag checksum is re-fixed after the mutation so the failure lands on
+    the intended field check, not on the checksum itself — the adversarial
+    gates ① (CRC length binding) and ② (TagLocation) have no negative
+    coverage otherwise: every fixture builder only ever emits valid tags.
+    """
+    image = _plain_udf((_UdfFile("A.M2TS"),))
+    fid_lba = 400 + 50  # partition_start + directory_lbn
+    sector = bytearray(image.data[fid_lba * _SECTOR : (fid_lba + 1) * _SECTOR])
+    mutate(sector)
+    sector[4] = (sum(sector[0:4]) + sum(sector[5:16])) & 0xFF
+    image.put(fid_lba, sector)
+    return image
+
+
+def test_udf_fid_rejects_zero_crc_length() -> None:
+    def mutate(sector: bytearray) -> None:
+        struct.pack_into("<H", sector, 10, 0)
+
+    with pytest.raises(disc_image.DiscImageError, match="DescriptorCRCLength"):
+        _probe(_poisoned_first_fid_image(mutate), prefer="udf")
+
+
+def test_udf_fid_rejects_crc_length_that_would_bleed_into_the_next_fid() -> None:
+    # The first FID record for "A.M2TS" is 48 bytes; a crc_length of 48
+    # would cover 16 bytes past the descriptor — into the next record.
+    def mutate(sector: bytearray) -> None:
+        struct.pack_into("<H", sector, 10, 48)
+
+    with pytest.raises(disc_image.DiscImageError, match="DescriptorCRCLength"):
+        _probe(_poisoned_first_fid_image(mutate), prefer="udf")
+
+
+def test_udf_fid_rejects_wrong_tag_location() -> None:
+    def mutate(sector: bytearray) -> None:
+        struct.pack_into("<I", sector, 12, 449)  # not the directory LBN (50)
+
+    with pytest.raises(disc_image.DiscImageError, match="TagLocation"):
+        _probe(_poisoned_first_fid_image(mutate), prefer="udf")
+
+
+def test_udf_file_entry_rejects_extents_longer_than_information_length() -> None:
+    partition_start = 100
+    lbn = 3
+    entry = _udf_file_entry(
+        lbn=lbn,
+        file_type=_UDF_FILE,
+        information_length=_SECTOR,
+        extents=((2 * _SECTOR, 20),),
+    )
+    _, reader = _reader_for_sector(partition_start + lbn, entry)
+    parser = _plain_udf_parser(reader, partition_start=partition_start)
+
+    with pytest.raises(disc_image.DiscImageError):
+        parser._file_entry(lbn, 0)

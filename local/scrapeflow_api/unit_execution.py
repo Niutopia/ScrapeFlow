@@ -3124,6 +3124,9 @@ def _request_for_unit(
         # source_declared_seasons only and never collapse to one season.
         payload["season"] = record.claimed_seasons[0]
     request = EngineRequest.from_mapping(payload)
+    # Internal-only anchor: the planner-side scope gate admits the task's
+    # expansion staging tree by this id, never by what a scope path claims.
+    request = replace(request, root_task_id=root_task_id)
     if record.claimed_seasons:
         request = replace(
             request,

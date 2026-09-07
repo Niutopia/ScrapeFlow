@@ -668,6 +668,11 @@ class EngineRequest:
     # provide them.
     source_files: tuple[Mapping[str, object], ...] | None = None
     source_scope_paths: tuple[str, ...] = ()
+    # The root task this request was built for.  Anchors the expansion-
+    # staging admission in ``_validated_source_scope_paths``: a scope path
+    # claiming another task's 展开 tree must fail even before the bridge's
+    # authoritative scope gate runs.  Internal-only, like the fields above.
+    root_task_id: str | None = None
     # Positive seasons B/W proved inside a single owned work root.  This is
     # not a TMDB or operator override: F uses it only to retain a subtitle-only
     # declared season at source while J later checks the official gap.
@@ -691,6 +696,7 @@ class EngineRequest:
             or "allow_release_dash_ordinal" in payload
             or "allow_release_title_ordinal" in payload
             or "episode_map_path" in payload
+            or "root_task_id" in payload
         ):
             raise EngineRequestError("WorkUnit 内部范围仅允许由服务端流程生成")
         source = _safe_remote_path(payload.get("source_path"), field="source_path", allow_root=False)
@@ -776,7 +782,13 @@ class EngineRequest:
         raw_release_dash_ordinal = raw.pop("allow_release_dash_ordinal", False)
         raw_release_title_ordinal = raw.pop("allow_release_title_ordinal", False)
         raw_episode_map_path = raw.pop("episode_map_path", None)
+        raw_root_task_id = raw.pop("root_task_id", None)
         request = cls.from_mapping(raw)
+        root_task_id: str | None = None
+        if raw_root_task_id is not None:
+            if not isinstance(raw_root_task_id, str) or not raw_root_task_id:
+                raise EngineRequestError("持久化 root_task_id 必须是非空字符串")
+            root_task_id = raw_root_task_id
         if type(raw_release_dash_ordinal) is not bool:
             raise EngineRequestError("持久化 release-dash 集号开关必须是布尔值")
         if type(raw_release_title_ordinal) is not bool:
@@ -822,6 +834,7 @@ class EngineRequest:
                 allow_release_dash_ordinal=raw_release_dash_ordinal,
                 allow_release_title_ordinal=raw_release_title_ordinal,
                 episode_map_path=episode_map_path,
+                root_task_id=root_task_id,
             )
         if not isinstance(raw_scopes, (list, tuple)):
             raise EngineRequestError("持久化来源范围必须是路径列表")
@@ -845,6 +858,7 @@ class EngineRequest:
             allow_release_dash_ordinal=raw_release_dash_ordinal,
             allow_release_title_ordinal=raw_release_title_ordinal,
             episode_map_path=episode_map_path,
+            root_task_id=root_task_id,
         )
 
 
@@ -3986,14 +4000,25 @@ class SimpleEngineRunner:
         )
 
         expansion_roots: set[str] = set()
-        for raw in request.source_scope_paths:
-            probe = _safe_remote_path(raw, field="source_scope_path", allow_root=False)
+        if request.root_task_id is not None:
+            # The request knows its own root: anchor the admission on it, so
+            # a scope path claiming another task's staging tree fails here
+            # instead of relying on the bridge gate alone.
+            expansion_roots.add(
+                expansion_staging_root(self.library_root, request.root_task_id)
+            )
+        else:
+            # Carriers persisted before the anchor field carry no root id;
+            # keep the historical per-scope marker parse for them.  The
+            # bridge's authoritative gate still re-derives the real root.
             marker = f"{self.library_root.rstrip('/')}/ScrapeFlow/展开/"
-            if probe.startswith(marker):
-                task_id = probe[len(marker):].split("/", 1)[0]
-                expansion_roots.add(
-                    expansion_staging_root(self.library_root, task_id)
-                )
+            for raw in request.source_scope_paths:
+                probe = _safe_remote_path(raw, field="source_scope_path", allow_root=False)
+                if probe.startswith(marker):
+                    task_id = probe[len(marker):].split("/", 1)[0]
+                    expansion_roots.add(
+                        expansion_staging_root(self.library_root, task_id)
+                    )
         scopes: list[str] = []
         for raw in request.source_scope_paths:
             scope = _safe_remote_path(raw, field="source_scope_path", allow_root=False)

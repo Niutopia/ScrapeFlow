@@ -1764,28 +1764,35 @@ def parse_mpls(data: bytes, *, inner_path: str = "") -> DiscPlaylist:
     """Parse the bounded play-item table needed for episode evidence."""
     if len(data) < 32 or data[:4] != b"MPLS":
         raise DiscImageError("Blu-ray playlist 头部异常")
-    playlist_start = struct.unpack_from(">I", data, 8)[0]
-    if playlist_start + 10 > len(data):
-        raise DiscImageError("Blu-ray playlist 区段越界")
-    item_count = struct.unpack_from(">H", data, playlist_start + 6)[0]
-    if item_count > 4096:
-        raise DiscImageError("Blu-ray playlist 项目过多")
-    offset = playlist_start + 10
-    items: list[DiscPlayItem] = []
-    for _ in range(item_count):
-        if offset + 22 > len(data):
-            raise DiscImageError("Blu-ray play item 截断")
-        item_length = struct.unpack_from(">H", data, offset)[0]
-        item_end = offset + 2 + item_length
-        if item_length < 20 or item_end > len(data):
-            raise DiscImageError("Blu-ray play item 长度异常")
-        clip_id = data[offset + 2 : offset + 7].decode("ascii", errors="strict")
-        codec_id = data[offset + 7 : offset + 11].decode("ascii", errors="strict")
-        in_time, out_time = struct.unpack_from(">II", data, offset + 14)
-        if out_time < in_time:
-            raise DiscImageError("Blu-ray play item 时间范围异常")
-        items.append(DiscPlayItem(clip_id, codec_id, in_time, out_time))
-        offset = item_end
+    try:
+        playlist_start = struct.unpack_from(">I", data, 8)[0]
+        if playlist_start + 10 > len(data):
+            raise DiscImageError("Blu-ray playlist 区段越界")
+        item_count = struct.unpack_from(">H", data, playlist_start + 6)[0]
+        if item_count > 4096:
+            raise DiscImageError("Blu-ray playlist 项目过多")
+        offset = playlist_start + 10
+        items: list[DiscPlayItem] = []
+        for _ in range(item_count):
+            if offset + 22 > len(data):
+                raise DiscImageError("Blu-ray play item 截断")
+            item_length = struct.unpack_from(">H", data, offset)[0]
+            item_end = offset + 2 + item_length
+            if item_length < 20 or item_end > len(data):
+                raise DiscImageError("Blu-ray play item 长度异常")
+            clip_id = data[offset + 2 : offset + 7].decode("ascii", errors="strict")
+            codec_id = data[offset + 7 : offset + 11].decode("ascii", errors="strict")
+            in_time, out_time = struct.unpack_from(">II", data, offset + 14)
+            if out_time < in_time:
+                raise DiscImageError("Blu-ray play item 时间范围异常")
+            items.append(DiscPlayItem(clip_id, codec_id, in_time, out_time))
+            offset = item_end
+    except DiscImageError:
+        raise
+    except (UnicodeDecodeError, struct.error, ValueError) as exc:
+        # A malformed table must surface as the module's own typed failure,
+        # never leak a raw parser exception through the read-only proof.
+        raise DiscImageError(f"Blu-ray playlist 结构损坏: {inner_path}") from exc
     return DiscPlaylist(inner_path=inner_path, play_items=tuple(items))
 
 

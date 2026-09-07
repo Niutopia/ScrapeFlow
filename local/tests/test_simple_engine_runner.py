@@ -4478,3 +4478,86 @@ class VideoStreamAdmissionGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpansionScopeGateAnchorTest(unittest.TestCase):
+    """The planner-side expansion admission anchors on the request's root.
+
+    The historical gate parsed the task id out of each scope path's 展开
+    marker, so a scope claiming ANOTHER task's staging tree was admitted
+    here and only rejected later by the bridge's authoritative gate.  A
+    request that knows its own root must fail foreign staging scopes at
+    this layer too.
+    """
+
+    LIBRARY_ROOT = "/library"
+
+    def _runner(self) -> SimpleEngineRunner:
+        return SimpleEngineRunner(
+            self._tmp,
+            alist=SimpleNamespace(),
+            tmdb=object(),
+            planner=lambda _req: {},
+            validate=False,
+        )
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = Path(tempfile.mkdtemp())
+
+    def _request(self, *, root_task_id, scopes, source_path):
+        return replace(
+            EngineRequest.from_mapping({
+                "source_path": source_path,
+                "parent_path": "/library/番剧",
+                "media_type": "tv",
+            }),
+            source_files=({"path": scopes[0], "name": "x.mkv"},),
+            source_scope_paths=tuple(scopes),
+            root_task_id=root_task_id,
+        )
+
+    def test_foreign_task_staging_scope_is_rejected(self) -> None:
+        runner = self._runner()
+        foreign_scope = (
+            f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-foreign/第一季/Season 01"
+        )
+        request = self._request(
+            root_task_id="engine-mine",
+            scopes=[foreign_scope],
+            source_path=f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-mine/第一季",
+        )
+        with self.assertRaises(EngineRequestError):
+            runner._validated_source_scope_paths(request)
+
+    def test_own_task_staging_scope_is_admitted(self) -> None:
+        runner = self._runner()
+        own_scope = (
+            f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-mine/第一季/Season 01"
+        )
+        request = self._request(
+            root_task_id="engine-mine",
+            scopes=[own_scope],
+            source_path=f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-mine/第一季",
+        )
+        self.assertEqual(
+            runner._validated_source_scope_paths(request),
+            (own_scope,),
+        )
+
+    def test_legacy_request_without_anchor_keeps_marker_parse(self) -> None:
+        # Carriers persisted before the anchor field: the historical
+        # per-scope marker parse still admits the scope's own task tree.
+        runner = self._runner()
+        scope = (
+            f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-old/第一季/Season 01"
+        )
+        request = self._request(
+            root_task_id=None,
+            scopes=[scope],
+            source_path=f"{self.LIBRARY_ROOT}/ScrapeFlow/展开/engine-old/第一季",
+        )
+        self.assertEqual(
+            runner._validated_source_scope_paths(request),
+            (scope,),
+        )
