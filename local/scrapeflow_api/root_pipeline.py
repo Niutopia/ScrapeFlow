@@ -1246,17 +1246,58 @@ def _cleanup_expansion_staging_root(
         except Exception as exc:  # noqa: BLE001 - residual note
             _trace(f"root {job.id} 展开 staging 残件删除失败: {redact_error(exc)}")
             return f"展开 staging 残件删除失败（{redact_error(exc)}），可重跑 consume-source"
+    def remove_directory(directory: str) -> bool:
+        """Remove one staging directory with the proven delete ladder.
+
+        Mirrors the intake lane's ``delete_directory``: quark sometimes
+        acknowledges ``remove_empty_directory`` without applying it (the
+        09-05 closure measured exactly this on the staging shells), so each
+        attempt is verified against a fresh parent listing and an explicit
+        parent-name remove is the bounded fallback for the driver no-op.
+        """
+        parent = posixpath.dirname(directory) or "/"
+        name = posixpath.basename(directory)
+        for _attempt in range(3):
+            if paused():
+                return False
+            try:
+                remove_empty(directory, refresh=True)
+            except TypeError:
+                remove_empty(directory)
+            except Exception:  # noqa: BLE001 - verified below either way
+                pass
+            try:
+                parent_rows = rows(parent)
+            except Exception:
+                return False
+            if not any(item.get("name") == name for item in parent_rows):
+                return True
+            # The driver acknowledged the delete without applying it; the
+            # explicit parent-name remove is the bounded fallback.
+            try:
+                _remove_intake_entry(runner.alist, parent, name)
+            except Exception:  # noqa: BLE001 - verified below either way
+                pass
+            try:
+                parent_rows = rows(parent)
+            except Exception:
+                return False
+            if not any(item.get("name") == name for item in parent_rows):
+                return True
+        return False
+
+    shells: list[str] = []
     for directory in sorted(directories, key=len, reverse=True) + [staging_root]:
         if paused():
             return "展开 staging 清理在暂停边界停止，可重跑 consume-source"
-        try:
-            remove_empty(directory, refresh=True)
-        except TypeError:
-            remove_empty(directory)
-        except Exception:
-            continue
-    if runner.source_directory_exists(staging_root):
-        return "展开 staging 目录壳仍在，可重跑 consume-source"
+        if not remove_directory(directory):
+            shells.append(directory)
+    if shells:
+        _trace(f"root {job.id} 展开 staging 目录壳未消失 {len(shells)} 个")
+        return (
+            f"展开 staging 有 {len(shells)} 个目录壳未消失（首个: "
+            f"{shells[0]}），可重跑 consume-source"
+        )
     _trace(f"root {job.id} 展开 staging 树已消费")
     return None
 

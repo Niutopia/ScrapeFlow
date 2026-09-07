@@ -956,6 +956,34 @@ class TestCleanupExpansionStagingRoot:
         # Every staging directory was offered for removal.
         assert f"{STAGING_ROOT}/{SCOPE_BASENAME}/Season 01" in alist.empty_dir_calls
 
+    def test_quark_noop_empty_dir_falls_back_to_explicit_remove(self, tmp_path) -> None:
+        # The 09-05 closure pathology: quark acknowledges
+        # remove_empty_directory without applying it, so the shells never
+        # disappear on retries alone.  The proven delete ladder verifies
+        # each removal against a fresh parent listing and falls back to the
+        # explicit parent-name remove.
+        class QuirkAList(DiscAList):
+            def remove_empty_dir(self, path, refresh=False):
+                # Acknowledged but never applied — the quark no-op.
+                self.empty_dir_calls.append(path)
+
+            def remove(self, parent, names):
+                for name in names:
+                    full = f"{parent.rstrip('/')}/{name}"
+                    self.removed.append(full)
+                    self.files.pop(full, None)
+                    self.dirs.discard(full)
+
+        alist = QuirkAList({})
+        alist.add_file(STAGED_FILE, b"x" * 10)
+        note = self._cleanup(tmp_path, alist)
+        assert note is None
+        assert STAGED_FILE not in alist.files
+        assert alist.empty_dir_calls, "the no-op path was exercised"
+        assert not any(
+            path.startswith(STAGING_ROOT) for path in alist.dirs
+        ), "every staging shell was actually removed by the fallback"
+
     def test_undeclared_file_keeps_the_tree(self, tmp_path) -> None:
         stray = f"{STAGING_ROOT}/{SCOPE_BASENAME}/Season 01/不明的残留.mkv"
         alist = DiscAList({})
