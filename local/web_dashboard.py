@@ -930,7 +930,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
       }
     }
 
-    var dHasConflict = (job.phase === "reconciliation_uncertain") || units.some(function(u){ return u.reconciliation_outcome === "uncertain"; });
+    var dHasConflict = (job.engine_phase === "reconciliation_uncertain") || units.some(function(u){ return u.reconciliation_outcome === "uncertain"; });
     var dState = "pending";
     var dText = "待对账";
     if(bState === "done"){
@@ -1469,6 +1469,9 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
           candidate: '<span style="color:var(--forge-faint)">[排除] 无效资源</span>',
           infrastructure: '<span style="color:var(--forge-alert)">[重试] 网络异常</span>',
           in_doubt: '<span style="color:var(--forge-alert)">[对账] 存疑锁定</span>',
+          closed: '<span style="color:var(--forge-ready)">[闭环] 缺口已核销</span>',
+          paused: '<span style="color:var(--forge-faint)">[暂停] 等待恢复</span>',
+          waiting_reconcile: '<span style="color:var(--forge-alert)">[对账] 等待安全对账</span>',
           succeeded: '<span style="color:var(--forge-ready)">[成功] 命中入库</span>'
         };
         var outText = outcomeMap[item.outcome] || ('<span>' + esc(item.outcome || "尝试") + '</span>');
