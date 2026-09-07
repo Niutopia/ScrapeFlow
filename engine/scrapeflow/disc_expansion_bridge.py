@@ -349,6 +349,43 @@ def _synthetic_dir_row(path: str) -> dict[str, Any]:
     }
 
 
+def _complete_ancestor_dir_rows(
+    rows: list[dict[str, Any]],
+    merged_root: str,
+) -> None:
+    """Synthesize the directory rows the merged tree needs to stay reachable.
+
+    ``build_source_inventory`` descends only through directory rows, so a
+    snapshot widened to a common ancestor must carry every intermediate
+    directory between that root and each row's parent.  Both contributing
+    walks list children only — the ingress snapshot never carried its own
+    root chain, and the staging walk starts at the staged scope — so without
+    this completion every row sits on a broken chain and C parks every unit
+    with 来源范围在 B 快照中不存在 (the 无耻之徒 09-05 production deadlock,
+    then rescued by a manual snapshot patch).  Idempotent: a path that
+    already exists as a directory row is never duplicated.
+    """
+    root = str(merged_root).rstrip("/") or "/"
+    known = {
+        str(row.get("full_path") or "").rstrip("/")
+        for row in rows
+        if row.get("is_dir")
+    }
+    if root != "/":
+        known.add(root)
+    missing: list[str] = []
+    for row in rows:
+        current = posixpath.dirname(
+            str(row.get("full_path") or "").rstrip("/")
+        )
+        while current.startswith("/") and current != root:
+            if current not in known:
+                known.add(current)
+                missing.append(current)
+            current = posixpath.dirname(current)
+    rows.extend(_synthetic_dir_row(path) for path in missing)
+
+
 def _merge_snapshot(
     snapshot: Mapping[str, Any],
     staged_rows: Sequence[Mapping[str, Any]],
@@ -359,10 +396,14 @@ def _merge_snapshot(
     The merged root is the common ancestor of the ingress root and the
     task's staging root, so every row stays a real provider path and every
     record scope — ingress or staged — validates against the same snapshot.
+    The ancestor directory rows between the merged root and each row's
+    parent are synthesized so the widened tree stays reachable from its own
+    root.
     """
     merged_root = _common_ancestor(str(snapshot["root"]), staging_root)
     rows = list(snapshot.get("rows") or [])
     rows.extend(dict(row) for row in staged_rows)
+    _complete_ancestor_dir_rows(rows, merged_root)
     merged: dict[str, Any] = {"root": merged_root, "rows": rows}
     snapshot_id = f"{merged_root}:expansion:{len(rows)}"
     try:
@@ -597,9 +638,9 @@ def _expand_one_scope(
         )
     # The walk lists children only; the converted unit's new source_path IS
     # the staged scope, so the merged snapshot must carry that directory row
-    # itself (plus any ancestor between the merged root and the scope) or
-    # build_scoped_source_node cannot find the scope and C parks the unit
-    # with 来源范围在 B 快照中不存在.
+    # itself (the merge then completes every ancestor between the merged
+    # root and the scope) or build_scoped_source_node cannot find the scope
+    # and C parks the unit with 来源范围在 B 快照中不存在.
     rows.insert(0, _synthetic_dir_row(staged_scope))
     staged_rows.extend(rows)
     staged_node = build_source_inventory(rows, staged_scope)

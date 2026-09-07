@@ -545,6 +545,99 @@ class TestExpandRootDiscImages:
         assert again == updated
         assert wired.executor.calls == [(1, 1), (1, 2)]
 
+    def test_merged_tree_reaches_both_scopes_from_widened_root(self, wired) -> None:
+        # The production shape: the ingress snapshot is rooted at the intake
+        # directory (its walk lists children only), so widening the merged
+        # root to the media root orphans BOTH chains — the ingress scope and
+        # the staged scope — unless the merge synthesizes the missing
+        # ancestor directory rows.  Regression for the 09-05 production
+        # deadlock where every unit parked 来源范围在 B 快照中不存在 and the
+        # closure was rescued by a manual snapshot patch.
+        from engine.scrapeflow.root_boundaries import load_source_snapshot
+        from engine.scrapeflow.source_inventory import (
+            collect_all_files,
+        )
+
+        media_root = "/media/影视"
+        ingress = f"{media_root}/待刮削/无耻之徒"
+        nested_scope = f"{ingress}/{SCOPE_BASENAME}"
+        nested_image = f"{nested_scope}/DISC1.iso"
+        # Fresh doubles: the wired fixture's alist is bound to the flat path
+        # shape, and IndexAList derives its dirs from the files at birth.
+        alist = DiscAList({nested_image: b"i" * IMAGE_SIZE})
+        executor = FakeExecutor(alist)
+        snapshot = {
+            "root": ingress,
+            "rows": [
+                {"name": SCOPE_BASENAME, "is_dir": True, "full_path": nested_scope},
+                {"name": "DISC1.iso", "is_dir": False, "size": IMAGE_SIZE, "full_path": nested_image},
+            ],
+        }
+        updated, changed = bridge.expand_root_disc_images(
+            alist,
+            SimpleNamespace(),
+            wired.state_root,
+            ROOT_TASK,
+            [_parked_record(nested_scope)],
+            snapshot,
+            media_root=media_root,
+            executor=executor,
+            roster_loader=_roster_loader(),
+        )
+        assert changed is True
+        converted = [r for r in updated if r.disc_expansion is not None]
+        assert len(converted) == 1
+
+        merged = load_source_snapshot(wired.state_root, ROOT_TASK)
+        assert merged is not None
+        assert merged["root"] == media_root
+        inventory = build_source_inventory(merged["rows"], merged["root"])
+        # The staged scope resolves from the widened root, files included.
+        staged_paths = list(converted[0].source_paths)
+        staged_node = build_scoped_source_node(
+            inventory, staged_paths,
+            boundary_key=staged_paths[0],
+            display_label=SCOPE_BASENAME,
+        )
+        staged_files = [f.path for f in collect_all_files(staged_node)]
+        assert any(p.endswith("无耻之徒 - S01E01.mkv") for p in staged_files)
+        assert any(p.endswith("无耻之徒 - S01E02.mkv") for p in staged_files)
+        # The ingress-side scope (a parked sibling re-entering the pipeline)
+        # resolves too — its own ancestor chain was completed.
+        build_scoped_source_node(
+            inventory, [nested_scope],
+            boundary_key=nested_scope,
+            display_label=SCOPE_BASENAME,
+        )
+
+    def test_merge_snapshot_ancestor_completion_is_idempotent(self) -> None:
+        ingress = "/media/影视/待刮削/无耻之徒"
+        staged_scope = f"{STAGING_ROOT}/{SCOPE_BASENAME}"
+        snapshot = {
+            "root": ingress,
+            "rows": [
+                {"name": SCOPE_BASENAME, "is_dir": True, "full_path": f"{ingress}/{SCOPE_BASENAME}"},
+            ],
+        }
+        staged_rows = [
+            bridge._synthetic_dir_row(staged_scope),
+            {"name": "Season 01", "is_dir": True, "full_path": f"{staged_scope}/Season 01"},
+        ]
+        first = bridge._merge_snapshot(snapshot, staged_rows, STAGING_ROOT)
+        again = bridge._merge_snapshot(first, [], STAGING_ROOT)
+        paths = [str(row.get("full_path")) for row in again["rows"]]
+        assert len(paths) == len(set(paths))
+        # Both ancestor chains exist exactly once after the second merge.
+        for ancestor in (
+            "/media/影视/待刮削",
+            ingress,
+            "/media/影视/ScrapeFlow",
+            "/media/影视/ScrapeFlow/展开",
+            "/media/影视/ScrapeFlow/展开/" + ROOT_TASK,
+        ):
+            assert paths.count(ancestor) == 1
+
+
     def test_unprovable_scope_parks_without_ruling(self, wired) -> None:
         # The roster runtimes drift far out of tolerance, so the discs alone
         # cannot prove the mapping and no ruling is on file.
