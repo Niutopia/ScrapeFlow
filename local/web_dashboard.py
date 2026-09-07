@@ -1498,6 +1498,22 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
       '<p class="forge-label" style="margin-top:10px">待闭环缺口明细（' + gapRows.length + '）</p>' +
       gapTableHtml +
       attemptHtml +
+      '<details class="forge-details" style="margin-top:10px"><summary>直供资源登记（操作员通道）</summary>' +
+      '<form data-catalog-form="1" data-job="' + esc(state.drawerJobId) + '">' +
+      '<div class="forge-manual-inputs" style="flex-wrap:wrap;margin-top:6px">' +
+      '<input type="number" class="forge-input forge-input--mono forge-input--id" placeholder="TMDB ID" min="1" required data-catalog-tmdb>' +
+      '<input type="text" class="forge-input" placeholder="发布名 release_name" required data-catalog-release style="flex:1;min-width:220px">' +
+      '<select class="forge-select" data-catalog-resolution>' +
+      '<option value="2160p">2160p</option><option value="1080p" selected>1080p</option>' +
+      '<option value="720p">720p</option><option value="unknown">未知</option></select>' +
+      '</div>' +
+      '<input type="text" class="forge-input forge-input--mono" placeholder="magnet:?xt=urn:btih:…（必填）" required data-catalog-magnet style="width:100%;margin-top:6px">' +
+      '<textarea class="forge-input forge-input--mono" data-catalog-acquisition rows="4" placeholder="选填：acquisition 附加 JSON（gap↔文件索引映射等），形如 {&quot;kind&quot;:&quot;torrent&quot;,&quot;url&quot;:&quot;magnet:…&quot;,&quot;file_index_by_gap&quot;:{&quot;S10E01&quot;:[1]}}" style="width:100%;margin-top:6px;font-size:12px"></textarea>' +
+      '<div style="display:flex;gap:8px;margin-top:6px;align-items:center">' +
+      '<button type="submit" class="forge-button forge-button--small forge-button--signal">登记直供候选</button>' +
+      '<button type="button" class="forge-button forge-button--small forge-button--danger" data-catalog-remove="1">按 infohash 移除</button>' +
+      '<input type="text" class="forge-input forge-input--mono" placeholder="infohash（移除用）" data-catalog-infohash style="width:220px">' +
+      '</div></form></details>' +
       '</div>';
   }
 
@@ -2058,6 +2074,70 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
       }
     });
   }
+  function submitCatalogForm(event){
+    var form = event.target.closest("[data-catalog-form]");
+    if(!form){ return; }
+    event.preventDefault();
+    var isRemove = event.submitter && event.submitter.getAttribute("data-catalog-remove") === "1";
+    var tmdbInput = form.querySelector("[data-catalog-tmdb]");
+    var tmdbId = Number(tmdbInput ? tmdbInput.value : 0);
+    if(!tmdbId || tmdbId <= 0){
+      toast("请输入有效的 TMDB 正整数 ID",true);
+      return;
+    }
+    var payload = { tmdb_id: tmdbId };
+    if(isRemove){
+      var hashInput = form.querySelector("[data-catalog-infohash]");
+      var infohash = (hashInput ? hashInput.value : "").trim();
+      if(!infohash){
+        toast("移除需要 infohash",true);
+        return;
+      }
+      payload.action = "remove";
+      payload.infohash = infohash;
+    } else {
+      var releaseInput = form.querySelector("[data-catalog-release]");
+      var magnetInput = form.querySelector("[data-catalog-magnet]");
+      var resolutionSelect = form.querySelector("[data-catalog-resolution]");
+      var acquisitionText = form.querySelector("[data-catalog-acquisition]");
+      var release = (releaseInput ? releaseInput.value : "").trim();
+      var magnet = (magnetInput ? magnetInput.value : "").trim();
+      if(!release || !magnet){
+        toast("发布名与 magnet 链接必填",true);
+        return;
+      }
+      var candidate = {
+        provider: "magnet",
+        release_name: release,
+        locator: magnet.indexOf("torrent:") === 0 ? magnet : ("torrent:" + magnet),
+        resolution: resolutionSelect ? resolutionSelect.value : "unknown",
+      };
+      var extraText = (acquisitionText ? acquisitionText.value : "").trim();
+      if(extraText){
+        try {
+          candidate.acquisition = JSON.parse(extraText);
+        } catch(error){
+          toast("acquisition 附加 JSON 无法解析: " + error.message,true);
+          return;
+        }
+      }
+      payload.action = "add";
+      payload.candidate = candidate;
+    }
+    var submitBtn = event.submitter || form.querySelector('button[type="submit"]');
+    if(submitBtn){ submitBtn.disabled = true; }
+    api("/api/replenishment/catalog",{
+      method:"POST", body: JSON.stringify(payload)
+    }).then(function(result){
+      toast(isRemove
+        ? (result.removed ? "已移除直供候选" : "未找到该 infohash")
+        : "已登记直供候选（" + (result.project_candidates || 1) + " 条在册）");
+    }).catch(function(error){
+      toast(error.message,true);
+    }).finally(function(){
+      if(submitBtn){ submitBtn.disabled = false; }
+    });
+  }
   function browseQuickLinks(){
     var links = [
       { label:"番剧", path:"/quark/影视/番剧" },
@@ -2132,6 +2212,11 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
     var rulingForm = event.target.closest("[data-ruling-form]");
     if(rulingForm){
       submitRulingForm(event);
+      return;
+    }
+    var catalogForm = event.target.closest("[data-catalog-form]");
+    if(catalogForm){
+      submitCatalogForm(event);
       return;
     }
     var form = event.target.closest("[data-manual-form]");

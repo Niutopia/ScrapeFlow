@@ -1571,6 +1571,46 @@ class SimpleApplication:
             "requests": gap_ledger_requests(self.state_root, job_id),
         }
 
+    def replenishment_catalog_write(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Add or remove one operator-supplied replenishment candidate.
+
+        The catalog is the operator's direct-supply channel; until now its
+        only write surface was hand-editing a JSON file inside the container
+        with zero validation.  The path comes from the deployment env, never
+        from the payload, and the write is atomic so a concurrently running
+        search round reads either the old or the new document.
+        """
+        from local.scrapeflow_api.replenishment import (
+            CatalogWriteError,
+            remove_catalog_candidate,
+            upsert_catalog_candidate,
+        )
+        if not isinstance(payload, Mapping) or not payload:
+            raise EngineRequestError("直供目录请求必须是非空 JSON 对象")
+        unknown = set(payload) - {"action", "tmdb_id", "candidate", "infohash"}
+        if unknown:
+            raise EngineRequestError(f"直供目录请求含未知字段: {sorted(unknown)}")
+        action = str(payload.get("action") or "add").strip().casefold()
+        if action not in {"add", "remove"}:
+            raise EngineRequestError("action 只接受 add 或 remove")
+        tmdb_id = payload.get("tmdb_id")
+        if isinstance(tmdb_id, str) and tmdb_id.isdigit():
+            tmdb_id = int(tmdb_id)
+        raw_path = os.getenv("SCRAPEFLOW_REPLENISHMENT_CATALOG", "").strip()
+        if not raw_path:
+            raise EngineRequestError("部署未配置 SCRAPEFLOW_REPLENISHMENT_CATALOG")
+        catalog_path = Path(raw_path)
+        try:
+            if action == "add":
+                return upsert_catalog_candidate(
+                    catalog_path, tmdb_id, payload.get("candidate"),
+                )
+            return remove_catalog_candidate(
+                catalog_path, tmdb_id, infohash=payload.get("infohash"),
+            )
+        except CatalogWriteError as exc:
+            raise EngineRequestError(f"直供候选无效: {exc}") from exc
+
     def trigger_root_replenishment(self, job_id: str) -> dict[str, object]:
         """Queue missing media for the selected, running RootJob."""
         from local.scrapeflow_api.root_pipeline import is_intake_bound_root
@@ -3167,6 +3207,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._send(200, self.application.retry_batch_item(payload))
             elif path == "/api/replacements":
                 raise EngineRequestError("replacement manifest 只能由服务端 fresh 盘点生成")
+            elif path == "/api/replenishment/catalog":
+                self._send(
+                    200, self.application.replenishment_catalog_write(payload),
+                )
             elif path == "/api/control/pause":
                 self._send(200, self.application.set_paused(True, self._optional_reason(payload)))
             elif path == "/api/control/select":

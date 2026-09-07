@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 import base64
 import json
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 import unicodedata
 import copy
+
+from engine.scrapeflow.serialization import atomic_write_json
 
 from engine.scrapeflow.replenishment_acquisition import (
     AcquisitionRouteError, acquisition_lane,
@@ -2262,3 +2264,240 @@ def select_replenishment_candidates(
             "unchecked_current_tier_candidate_count": unchecked_current_tier,
         } if selection_tier is not None else {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Operator-supplied catalog write surface
+# ---------------------------------------------------------------------------
+
+_CATALOG_MAGNET_LOCATOR_RE = re.compile(
+    r"^torrent:magnet:\?xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})\b[^\s]*$"
+)
+_CATALOG_CANDIDATE_KEYS = frozenset({
+    "provider", "release_name", "locator", "infohash", "resolution",
+    "availability", "files", "file_coverage", "acquisition",
+})
+_CATALOG_MAX_LIST = 4096
+_CATALOG_MAX_STRING = 512
+
+
+class CatalogWriteError(ValueError):
+    """An operator-supplied catalog candidate is malformed."""
+
+
+def _catalog_btih(locator: object) -> str | None:
+    if not isinstance(locator, str):
+        return None
+    match = _CATALOG_MAGNET_LOCATOR_RE.match(locator.strip())
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def _catalog_validated_candidate(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one operator-supplied candidate against the read-side shape.
+
+    The search adapter only ever consumes ``provider == "magnet"`` rows with
+    a torrent acquisition, so the write surface accepts exactly that lane.
+    Every field the selection funnel reads is shape-checked here — a typo
+    like ``relese_name`` fails loudly at write time instead of silently
+    never matching at selection time.
+    """
+    if not isinstance(candidate, Mapping):
+        raise CatalogWriteError("candidate 必须是 JSON 对象")
+    unknown = set(candidate) - _CATALOG_CANDIDATE_KEYS
+    if unknown:
+        raise CatalogWriteError(f"candidate 含未知字段: {sorted(unknown)[:5]}")
+    provider = candidate.get("provider")
+    if str(provider or "").strip().casefold() != "magnet":
+        raise CatalogWriteError("直供候选只接受 magnet 车道")
+    release_name = candidate.get("release_name")
+    if (
+        not isinstance(release_name, str)
+        or not release_name.strip()
+        or len(release_name) > _CATALOG_MAX_STRING
+    ):
+        raise CatalogWriteError("release_name 必须是非空字符串(≤512 字符)")
+    locator = candidate.get("locator")
+    btih = _catalog_btih(locator)
+    if btih is None:
+        raise CatalogWriteError(
+            "locator 必须是 torrent:magnet:?xt=urn:btih:<40位十六进制> 形式",
+        )
+    infohash = candidate.get("infohash")
+    if infohash is not None:
+        if (
+            not isinstance(infohash, str)
+            or infohash.strip().lower() != btih
+        ):
+            raise CatalogWriteError("infohash 与 locator 的 btih 不一致")
+    entry: dict[str, Any] = {
+        "provider": "magnet",
+        "release_name": release_name.strip(),
+        "locator": locator.strip(),
+        "infohash": btih,
+    }
+    for optional in ("resolution", "availability"):
+        value = candidate.get(optional)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 64:
+            raise CatalogWriteError(f"{optional} 必须是非空短字符串")
+        entry[optional] = value.strip()
+    for optional in ("files", "file_coverage"):
+        value = candidate.get(optional)
+        if value is None:
+            continue
+        if (
+            not isinstance(value, list)
+            or len(value) > _CATALOG_MAX_LIST
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item) > _CATALOG_MAX_STRING
+                for item in value
+            )
+        ):
+            raise CatalogWriteError(f"{optional} 必须是字符串列表")
+        entry[optional] = [item.strip() for item in value]
+    acquisition = candidate.get("acquisition")
+    if acquisition is not None:
+        if not isinstance(acquisition, Mapping):
+            raise CatalogWriteError("acquisition 必须是 JSON 对象")
+        if str(acquisition.get("kind") or "").strip().casefold() != "torrent":
+            raise CatalogWriteError("acquisition.kind 只接受 torrent")
+        url = acquisition.get("url")
+        if _catalog_btih(f"torrent:{url}" if isinstance(url, str) else None) != btih:
+            raise CatalogWriteError("acquisition.url 的 btih 必须与 locator 一致")
+        for key in ("file_index_by_gap", "file_size_by_index", "file_path_by_index"):
+            mapping = acquisition.get(key)
+            if mapping is None:
+                continue
+            if not isinstance(mapping, Mapping) or len(mapping) > _CATALOG_MAX_LIST:
+                raise CatalogWriteError(f"acquisition.{key} 必须是有界对象")
+            for name, value in mapping.items():
+                if not isinstance(name, str) or not name.strip():
+                    raise CatalogWriteError(f"acquisition.{key} 键必须是字符串")
+                if key == "file_index_by_gap":
+                    if (
+                        not isinstance(value, list)
+                        or not value
+                        or any(
+                            isinstance(item, bool)
+                            or not isinstance(item, int)
+                            or item <= 0
+                            for item in value
+                        )
+                    ):
+                        raise CatalogWriteError(
+                            "acquisition.file_index_by_gap 值必须是正整数列表",
+                        )
+                elif key == "file_size_by_index":
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                    ):
+                        raise CatalogWriteError(
+                            "acquisition.file_size_by_index 值必须是正整数",
+                        )
+                else:
+                    if (
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or len(value) > _CATALOG_MAX_STRING
+                    ):
+                        raise CatalogWriteError(
+                            "acquisition.file_path_by_index 值必须是路径字符串",
+                        )
+        entry["acquisition"] = copy.deepcopy(dict(acquisition))
+    return entry
+
+
+def _load_catalog_document(catalog_path: Path) -> dict[str, Any]:
+    document: dict[str, Any]
+    try:
+        raw = json.loads(Path(catalog_path).read_text(encoding="utf-8"))
+        document = raw if isinstance(raw, dict) else {}
+    except FileNotFoundError:
+        document = {}
+    projects = document.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+    document["projects"] = projects
+    return document
+
+
+def upsert_catalog_candidate(
+    catalog_path: Path, tmdb_id: int, candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add or replace one operator-supplied candidate, idempotently.
+
+    The same infohash in the same project is replaced, never duplicated —
+    the operator may refine the coverage maps of a live candidate at any
+    time and the next search round reads the update.
+    """
+    if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+        raise CatalogWriteError("tmdb_id 必须是正整数")
+    entry = _catalog_validated_candidate(candidate)
+    catalog_path = Path(catalog_path)
+    document = _load_catalog_document(catalog_path)
+    projects: dict[str, Any] = document["projects"]
+    project = projects.get(str(tmdb_id))
+    if not isinstance(project, dict):
+        project = {}
+    rows = project.get("candidates")
+    if not isinstance(rows, list):
+        rows = []
+    rows = [
+        row for row in rows
+        if not (
+            isinstance(row, dict)
+            and str(row.get("infohash") or "").lower() == entry["infohash"]
+        )
+    ]
+    rows.append(entry)
+    rows.sort(key=lambda row: str(row.get("infohash") or ""))
+    projects[str(tmdb_id)] = {"candidates": rows}
+    atomic_write_json(catalog_path, document, allow_nan=False)
+    return {
+        "stored": entry,
+        "project_candidates": len(rows),
+        "replaced": True,
+    }
+
+
+def remove_catalog_candidate(
+    catalog_path: Path, tmdb_id: int, *, infohash: object = None,
+) -> dict[str, Any]:
+    """Remove one candidate by infohash; an emptied project disappears."""
+    if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+        raise CatalogWriteError("tmdb_id 必须是正整数")
+    normalized = infohash.strip().lower() if isinstance(infohash, str) else ""
+    if not normalized:
+        raise CatalogWriteError("必须提供要移除的 infohash")
+    catalog_path = Path(catalog_path)
+    document = _load_catalog_document(catalog_path)
+    projects: dict[str, Any] = document["projects"]
+    project = projects.get(str(tmdb_id))
+    if not isinstance(project, dict):
+        return {"removed": False, "project_candidates": 0}
+    rows = project.get("candidates")
+    if not isinstance(rows, list):
+        rows = []
+    kept = [
+        row for row in rows
+        if not (
+            isinstance(row, dict)
+            and str(row.get("infohash") or "").lower() == normalized
+        )
+    ]
+    removed = len(kept) < len(rows)
+    if kept:
+        projects[str(tmdb_id)] = {"candidates": kept}
+    else:
+        projects.pop(str(tmdb_id), None)
+    atomic_write_json(catalog_path, document, allow_nan=False)
+    return {"removed": removed, "project_candidates": len(kept)}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -1373,3 +1374,81 @@ class OperatorSuppliedPreferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CatalogWriteSurfaceTests(unittest.TestCase):
+    """The operator-supply catalog finally has a validated write surface."""
+
+    MAGNET = "torrent:magnet:?xt=urn:btih:" + "ab" * 20 + "&dn=Test.Release"
+
+    def _candidate(self, **overrides):
+        base = {
+            "provider": "magnet",
+            "release_name": "Test.Release.1080p-GROUP",
+            "locator": self.MAGNET,
+            "resolution": "1080p",
+        }
+        base.update(overrides)
+        return base
+
+    def test_add_derives_infohash_and_replaces_idempotently(self) -> None:
+        from local.scrapeflow_api.replenishment import (
+            remove_catalog_candidate,
+            upsert_catalog_candidate,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            first = upsert_catalog_candidate(path, 34307, self._candidate())
+            self.assertEqual(first["stored"]["infohash"], "ab" * 20)
+            second = upsert_catalog_candidate(
+                path, 34307,
+                self._candidate(release_name="Test.Release.1080p.v2"),
+            )
+            self.assertEqual(second["project_candidates"], 1)
+            self.assertEqual(second["stored"]["release_name"], "Test.Release.1080p.v2")
+            removed = remove_catalog_candidate(path, 34307, infohash="AB" * 20)
+            self.assertTrue(removed["removed"])
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["projects"], {},
+                "emptied project disappears",
+            )
+
+    def test_write_rejects_wrong_lane_and_typos_and_bad_acquisition(self) -> None:
+        from local.scrapeflow_api.replenishment import (
+            CatalogWriteError,
+            upsert_catalog_candidate,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            for bad in (
+                self._candidate(provider="quark_share"),
+                self._candidate(relese_name="typo"),
+                self._candidate(locator="magnet:?xt=urn:btih:zz"),
+                self._candidate(infohash="cd" * 20),
+                self._candidate(acquisition={"kind": "http", "url": "x"}),
+                self._candidate(acquisition={
+                    "kind": "torrent",
+                    "url": "magnet:?xt=urn:btih:" + "cd" * 20,
+                    "file_index_by_gap": {"S01E01": [0]},
+                }),
+            ):
+                with self.assertRaises(CatalogWriteError):
+                    upsert_catalog_candidate(path, 34307, bad)
+            self.assertFalse(path.exists(), "rejected writes persist nothing")
+
+    def test_validated_acquisition_maps_pass_through(self) -> None:
+        from local.scrapeflow_api.replenishment import upsert_catalog_candidate
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            result = upsert_catalog_candidate(path, 999, self._candidate(
+                acquisition={
+                    "kind": "torrent",
+                    "url": "magnet:?xt=urn:btih:" + "ab" * 20,
+                    "file_index_by_gap": {"S10E01": [3]},
+                    "file_size_by_index": {"3": 11502449200},
+                    "file_path_by_index": {"3": "Show/S10E01.mkv"},
+                },
+            ))
+            stored = result["stored"]["acquisition"]
+            self.assertEqual(stored["file_index_by_gap"], {"S10E01": [3]})
+            self.assertEqual(stored["file_size_by_index"], {"3": 11502449200})
