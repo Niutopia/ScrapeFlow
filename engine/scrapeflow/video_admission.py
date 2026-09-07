@@ -104,7 +104,13 @@ def _run_video_probe(
             timeout=FFPROBE_WALL_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise VideoAdmissionError("ffprobe_timeout") from exc
+        # A wall-clock timeout under load is a window fault, not a payload
+        # verdict: the same object probes fine on a quieter host.  Classify
+        # it with the execution errors so the lane retries instead of
+        # permanently excluding the candidate.
+        raise VideoAdmissionError(
+            "ffprobe_timeout", infrastructure=True,
+        ) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise VideoAdmissionError("ffprobe_execution_error", infrastructure=True) from exc
     if getattr(completed, "returncode", None) != 0:

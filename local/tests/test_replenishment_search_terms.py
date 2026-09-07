@@ -635,6 +635,56 @@ class MagnetMetadataResolutionTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     adapter._download_torrent(magnet, destination)
 
+    def test_magnet_metadata_timeout_is_infra_not_candidate(self) -> None:
+        # A hung aria2 killed past its own bt-stop window is the same DHT
+        # cold-window fault as the rc!=0 variant (741abde); the timeout must
+        # not slip into _preflight's OSError branch and permanently exclude
+        # the locator.
+        magnet = "magnet:?xt=urn:btih:" + "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candidate-01.torrent"
+            with patch.object(
+                adapter.subprocess, "run",
+                side_effect=adapter.subprocess.TimeoutExpired("aria2c", 300),
+            ):
+                with self.assertRaises(adapter.MagnetMetadataUnavailable):
+                    adapter._magnet_metadata(magnet, destination)
+            self.assertFalse(
+                destination.with_name(".candidate-01.torrent.magnet").exists(),
+                "scratch must be reclaimed on the timeout path",
+            )
+
+    def test_magnet_metadata_scratch_is_reclaimed_on_parse_failure(self) -> None:
+        # A malformed .torrent that survives the size cap must not leak its
+        # scratch directory when the manifest parser rejects it.
+        magnet = "magnet:?xt=urn:btih:" + "2" * 40
+
+        class _Completed:
+            returncode = 0
+            stdout = "ok"
+
+        scratch_name = ".candidate-01.torrent.magnet"
+
+        def fake_run(command, **_kwargs):
+            scratch = Path(command[command.index(f"--dir={scratch_name}") + 1]) \
+                if False else None
+            # Locate the scratch dir from the --dir flag and drop a bogus
+            # .torrent into it before "aria2" reports success.
+            for flag in command:
+                if isinstance(flag, str) and flag.startswith("--dir="):
+                    scratch = Path(flag[len("--dir="):])
+            scratch.mkdir(parents=True, exist_ok=True)
+            (scratch / "bogus.torrent").write_bytes(b"not-a-bencoded-dict")
+            return _Completed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candidate-01.torrent"
+            with patch.object(adapter.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(ValueError):
+                    adapter._magnet_metadata(magnet, destination)
+            leaked = destination.parent / scratch_name
+            self.assertFalse(leaked.exists(), "parse failure must reclaim the scratch")
+
 
 class BitSearchSourceTests(unittest.TestCase):
     """The general-purpose magnet index resolves candidates via DHT only."""

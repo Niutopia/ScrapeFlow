@@ -4886,7 +4886,14 @@ def _magnet_metadata(
         )
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(scratch, ignore_errors=True)
-        raise TimeoutError("magnet 元数据解析超时") from exc
+        # A hung aria2 killed past its own bt-stop window is the same DHT
+        # cold-window fault as a non-zero exit: the resource itself is
+        # unproven, so the caller must retry later instead of excluding it.
+        # (A bare TimeoutError is an OSError and would fall into the
+        # candidate branch of _preflight's except chain.)
+        raise MagnetMetadataUnavailable(
+            "magnet 元数据解析超时: DHT 窗口内未取回元数据",
+        ) from exc
     except ReplenishmentPauseRequested:
         shutil.rmtree(scratch, ignore_errors=True)
         raise
@@ -4900,12 +4907,16 @@ def _magnet_metadata(
         tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
         shutil.rmtree(scratch, ignore_errors=True)
         raise MagnetMetadataUnavailable(f"magnet 元数据解析失败: {tail}")
-    data = saved.read_bytes()
-    if len(data) > MAX_TORRENT_BYTES:
+    try:
+        data = saved.read_bytes()
+        if len(data) > MAX_TORRENT_BYTES:
+            raise ValueError("torrent 元数据超过大小上限")
+        manifest = _torrent_manifest(data)
+    finally:
+        # The scratch must not outlive this function on ANY exit — a leaked
+        # parse failure dir would only be reclaimed by the next same-named
+        # attempt, if one ever comes.
         shutil.rmtree(scratch, ignore_errors=True)
-        raise ValueError("torrent 元数据超过大小上限")
-    manifest = _torrent_manifest(data)
-    shutil.rmtree(scratch, ignore_errors=True)
     _pause_checkpoint(pause_requested)
     destination.write_bytes(data)
     return manifest

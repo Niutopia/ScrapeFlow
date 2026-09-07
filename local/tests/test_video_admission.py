@@ -115,6 +115,10 @@ class VideoAdmissionTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.reason, "ffprobe_timeout")
         self.assertFalse(raised.exception.candidate_invalid)
+        # The timeout is the probing host's window, not the payload's
+        # verdict: without this flag the replenishment lane permanently
+        # excludes the candidate and wipes its retained bytes.
+        self.assertTrue(raised.exception.infrastructure)
 
 
 if __name__ == "__main__":
