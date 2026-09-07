@@ -2110,6 +2110,12 @@ def select_replenishment_candidates(
         candidate["resolution"] = _normalized_quality(
             candidate.get("resolution") or release_name
         )
+        # Operator-supplied resources express acquisition intent; keep the
+        # marker through validation for the ranking preference below.
+        if candidate.get("operator_supplied") is True:
+            candidate["operator_supplied"] = True
+        else:
+            candidate.pop("operator_supplied", None)
         candidate["coverage"] = sorted(coverage)
         identity = (provider, locator_key)
         current = valid_by_identity.get(identity)
@@ -2119,6 +2125,7 @@ def select_replenishment_candidates(
         reject(provider, "duplicate_locator")
         combined = sorted(set(current["coverage"]) | set(candidate["coverage"]))
         preferred = max((current, candidate), key=lambda item: (
+            1 if item.get("operator_supplied") is True else 0,
             _swarm_preference(item),
             len(item.get("coverage") or []),
             1 if item.get("availability") == "verified" else 0,
@@ -2156,6 +2163,7 @@ def select_replenishment_candidates(
         ]
         known_720 = [row for row in pool if row["resolution"] == "720p"]
         winner = max(high or known_720 or pool, key=lambda row: (
+            1 if row.get("operator_supplied") is True else 0,
             _swarm_preference(row),
             _timestamp(row.get("updated_at")),
             QUALITY_ORDER[str(row["resolution"])],

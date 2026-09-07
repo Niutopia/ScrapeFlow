@@ -721,7 +721,12 @@ def _search(request: Mapping[str, Any]) -> dict[str, Any]:
                         continue
                     candidate = dict(row)
                     if str(candidate.get("provider") or "") in ACTIVE_PROVIDERS:
-                        output.extend(_catalog_torrent_candidate_variants(candidate))
+                        for variant in _catalog_torrent_candidate_variants(candidate):
+                            # The operator supplied this resource by hand; it
+                            # expresses acquisition intent and outranks equal
+                            # index-discovered rows in the selector.
+                            variant["operator_supplied"] = True
+                            output.append(variant)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         warnings.append(f"已核验候选目录不可用: {type(exc).__name__}")
 

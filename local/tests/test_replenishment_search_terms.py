@@ -1124,5 +1124,65 @@ class PartialProgressClassificationTests(unittest.TestCase):
             )
 
 
+class OperatorSuppliedPreferenceTests(unittest.TestCase):
+    """A hand-fed catalog resource outranks equal index discoveries."""
+
+    def test_operator_supplied_wins_equal_ranking(self) -> None:
+        from local.scrapeflow_api.replenishment import select_replenishment_candidates
+        request = {
+            "media": {"title": "Example Show", "aliases": ["Example Show"], "year": "2020"},
+            "gaps": [{"id": "S01E01", "kind": "missing_episode", "season": 1, "episodes": [1]}],
+        }
+        base = {
+            "provider": "magnet",
+            "resolution": "1080p",
+            "availability": "metadata_verified",
+            "acquisition": {"kind": "torrent"},
+        }
+
+        def row(name, **extra):
+            return {
+                **base, "release_name": name,
+                "locator": f"torrent:magnet:?xt=urn:btih:{abs(hash(name)) % 10**40:040d}",
+                "file_coverage": ["S01E01"],
+                "files": [f"{name}.S01E01.mkv"],
+                "acquisition": {
+                    "kind": "torrent", "url": "magnet:?xt=urn:btih:"
+                    + f"{abs(hash(name)) % 10**40:040d}",
+                    "file_index_by_gap": {"S01E01": [1]},
+                    "file_size_by_index": {"1": 1024 * 1024},
+                    "file_path_by_index": {"1": f"{name}.S01E01.mkv"},
+                    "download_bytes": 1024 * 1024,
+                    "selected_download_bytes": 1024 * 1024,
+                },
+                **extra,
+            }
+
+        discovered = row("Example.Show.S01.1080p.WEBRip.x265-Index")
+        supplied = row("Example.Show.S01.1080p.BluRay.Remux-Operator", operator_supplied=True)
+
+        selection = select_replenishment_candidates(
+            request, [discovered, supplied], current_tier="magnet",
+        )
+        self.assertEqual(selection["status"], "complete")
+        self.assertEqual(len(selection["selections"]), 1)
+        self.assertEqual(
+            selection["selections"][0]["release_name"],
+            "Example.Show.S01.1080p.BluRay.Remux-Operator",
+        )
+
+        # Without the marker the same pair falls back to the ordinary
+        # ranking (alphabetical here), proving the marker is what decides.
+        plain = select_replenishment_candidates(
+            request,
+            [discovered, {**supplied, "operator_supplied": None}],
+            current_tier="magnet",
+        )
+        self.assertNotIn(
+            "operator_supplied",
+            {k: v for k, v in plain["selections"][0].items()},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
