@@ -5138,6 +5138,20 @@ def _direct_download_env(base: Mapping[str, str]) -> dict[str, str]:
     return cleaned
 
 
+def _payload_bytes(payload_dir: Path) -> int:
+    """Sum retained media bytes, ignoring aria2 control files."""
+    if not payload_dir.is_dir():
+        return 0
+    total = 0
+    for path in payload_dir.rglob("*"):
+        if path.is_file() and path.suffix != ".aria2":
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
 def _payload_is_complete(
     payload_dir: Path, acquisition: Mapping[str, Any], indices: set[int],
 ) -> bool:
@@ -5913,12 +5927,29 @@ def _acquire(
                         env=_direct_download_env(os.environ),
                     )
                 except subprocess.TimeoutExpired as exc:
+                    if _payload_bytes(group_payload) > 0:
+                        # Bytes already flowed in this attempt: the swarm is
+                        # intermittent, not dead.  Keep the workspace (the
+                        # group control file resumes) and retry in a later
+                        # window instead of excluding a good resource.
+                        raise ReplenishmentInfrastructureError(
+                            "aria2c 下载超时但已有部分进度；保留断点等待下个 seeder 窗口",
+                            stage="candidate_download",
+                        ) from exc
                     raise ReplenishmentCandidateError(
                         "aria2c 下载超过总时限", stage="candidate_download",
                         candidate=group[0]["selection"],
                     ) from exc
                 if completed.returncode != 0:
                     tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
+                    if _payload_bytes(group_payload) > 0:
+                        # A partial download (typically the BT idle-stop after
+                        # seeders left mid-window) proves the resource serves
+                        # bytes; classify the window, not the candidate.
+                        raise ReplenishmentInfrastructureError(
+                            f"aria2c 下载未完成但已有部分进度；保留断点等待下个 seeder 窗口: {tail}",
+                            stage="candidate_download",
+                        )
                     raise ReplenishmentCandidateError(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
                         candidate=group[0]["selection"],

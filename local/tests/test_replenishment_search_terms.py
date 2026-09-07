@@ -806,6 +806,24 @@ class MagnetMemberPipelineTests(unittest.TestCase):
         )
         return b"d" + bstr(b"announce") + bstr(announce) + bstr(b"info") + info + b"e"
 
+    @staticmethod
+    def _wrapper() -> dict[str, object]:
+        return {
+            "request": {
+                "gaps": [
+                    {"id": "S01E01", "kind": "missing_episode", "season": 1, "episodes": [1]},
+                    {"id": "S01E02", "kind": "missing_episode", "season": 1, "episodes": [2]},
+                ],
+            },
+            "selection": {"selections": [MagnetMemberPipelineTests._selection_static()]},
+            "automatic_staging_root": "/quark/影视/ScrapeFlow/补源/root-x/attempt-1",
+            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
+        }
+
+    @staticmethod
+    def _selection_static() -> dict[str, object]:
+        return MagnetMemberPipelineTests()._selection()
+
     class _FakeClient:
         def __init__(self) -> None:
             self.token = "fake"
@@ -862,17 +880,7 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                 target.write_bytes(b"x" * row["size"])
             return _Completed()
 
-        wrapper = {
-            "request": {
-                "gaps": [
-                    {"id": "S01E01", "kind": "missing_episode", "season": 1, "episodes": [1]},
-                    {"id": "S01E02", "kind": "missing_episode", "season": 1, "episodes": [2]},
-                ],
-            },
-            "selection": {"selections": [self._selection()]},
-            "automatic_staging_root": "/quark/影视/ScrapeFlow/补源/root-x/attempt-1",
-            "automatic_staging_parent": "/quark/影视/ScrapeFlow/补源",
-        }
+        wrapper = self._wrapper()
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             torrent_path = workspace / "preflight" / "candidate-01.torrent"
@@ -1051,6 +1059,69 @@ class KnabenSourceTests(unittest.TestCase):
         self.assertIn("&tr=", bare)
         tracked = adapter._magnet_with_trackers(bare)
         self.assertEqual(tracked, bare)
+
+
+class PartialProgressClassificationTests(unittest.TestCase):
+    """An intermittent swarm is a window problem, not a bad resource."""
+
+    def _run_with_aria2(self, *, returncode, stdout, partial):
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        class _Completed:
+            pass
+
+        def fake_run(command, **_kwargs):
+            directory = next(
+                Path(item[len("--dir="):]) for item in command
+                if item.startswith("--dir=")
+            )
+            if partial:
+                (directory / "partial.mkv").write_bytes(b"x" * 1024)
+            completed = _Completed()
+            completed.returncode = returncode
+            completed.stdout = stdout
+            return completed
+
+        fake_client = MagnetMemberPipelineTests._FakeClient()
+        aria2_calls: list[list[str]] = []
+        with patch.object(
+            adapter_.subprocess, "run", side_effect=fake_run,
+        ), patch.object(
+            adapter_, "_verify_video_payload",
+        ), patch.object(
+            adapter_.shutil, "which", return_value="/usr/bin/aria2c",
+        ), patch.object(
+            adapter_, "_download_torrent",
+            return_value=adapter_._torrent_manifest(
+                MagnetMemberPipelineTests._torrent_bytes(),
+            ),
+        ), patch.object(
+            adapter_, "_alist_client", return_value=fake_client,
+        ):
+            adapter_._acquire(
+                MagnetMemberPipelineTests._wrapper(), Path(tempfile.mkdtemp()),
+                client=fake_client,
+            )
+
+    def test_partial_progress_is_infrastructure_and_keeps_workspace(self) -> None:
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        with patch.object(
+            adapter_.shutil, "rmtree",
+            side_effect=lambda p, **k: (_ for _ in ()).throw(
+                AssertionError("workspace must not be removed"),
+            ) if "group-" in str(p) else None,
+        ):
+            with self.assertRaises(adapter_.ReplenishmentInfrastructureError):
+                self._run_with_aria2(
+                    returncode=7, stdout="INPR 347KiB/s", partial=True,
+                )
+
+    def test_zero_progress_stays_a_candidate_failure(self) -> None:
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+        with self.assertRaises(adapter_.ReplenishmentCandidateError):
+            self._run_with_aria2(
+                returncode=7, stdout="no peers", partial=False,
+            )
 
 
 if __name__ == "__main__":
