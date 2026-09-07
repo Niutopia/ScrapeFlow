@@ -1460,6 +1460,47 @@ class CatalogWriteSurfaceTests(unittest.TestCase):
             self.assertEqual(stored["file_index_by_gap"], {"S10E01": [3]})
             self.assertEqual(stored["file_size_by_index"], {"3": 11502449200})
 
+    def test_search_surfaces_operator_catalog_row_with_all_sources_disabled(self) -> None:
+        """The written catalog must reach ``_search`` as an operator-supplied row.
+
+        This drives the real catalog read path (``_catalog_torrent_candidate_variants``)
+        instead of only the write surface; a missing import there is a runtime
+        ``NameError`` that no other test reaches.
+        """
+        from local.scrapeflow_api.replenishment import upsert_catalog_candidate
+        flags = {
+            name: "0" for name in (
+                "SCRAPEFLOW_REPLENISHMENT_ANIMETOSHO_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_TOKYOTOSHO_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_SUBSPLEASE_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_MIKAN_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_DMHY_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_NYAA_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_BITSEARCH_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_KNABEN_SEARCH",
+                "SCRAPEFLOW_REPLENISHMENT_ACG_SEARCH",
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            upsert_catalog_candidate(path, 34307, self._candidate(
+                acquisition={
+                    "kind": "torrent",
+                    "url": "magnet:?xt=urn:btih:" + "ab" * 20,
+                },
+            ))
+            flags["SCRAPEFLOW_REPLENISHMENT_CATALOG"] = str(path)
+            with patch.dict("os.environ", flags, clear=False):
+                result = adapter._search({
+                    "media": {"tmdb_id": 34307, "title": "Test", "aliases": ["Test"]},
+                    "gaps": [{"kind": "missing_episode", "season": 1, "episodes": [1]}],
+                })
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(len(result["candidates"]), 1)
+        row = result["candidates"][0]
+        self.assertEqual(row["locator"], self.MAGNET)
+        self.assertTrue(row["operator_supplied"])
+
 
 class CrossGroupAdoptionTests(unittest.TestCase):
     """Drift-fix regressions: retained members are keyed by path, not group."""

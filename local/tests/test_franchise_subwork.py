@@ -170,7 +170,7 @@ class LetterVariantBracketOrdinalTests(unittest.TestCase):
             self.assertEqual(key.display, expected, name)
 
     def test_theme_asset_with_ep_usage_annotation_is_unparsed(self) -> None:
-        """``[NCOP03_EP58]`` is a creditless opening used FROM episode 58.
+        r"""``[NCOP03_EP58]`` is a creditless opening used FROM episode 58.
 
         The ``EP`` annotation marks the usage range of a theme asset, not the
         asset's own ordinal.  The asset vocabulary must recognize the

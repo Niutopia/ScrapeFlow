@@ -3359,6 +3359,8 @@ class SimpleEngineRunner:
                 "removed_gap": removed_gap,
                 "removed_staging": removed_staging,
                 "removed_archive_staging": removed_archive_staging,
+                "removed_replenishment": removed_replenishment,
+                "removed_subtitle_replenishment": removed_subtitle_replenishment,
                 "identity_tombstone": str(tombstone_path) if tombstone_path else None,
                 "formal_library_touched": False,
             }

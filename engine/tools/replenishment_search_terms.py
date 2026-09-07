@@ -14,6 +14,11 @@ import re
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
+from engine.scrapeflow.provider_capabilities import (
+    ACQUISITION_TORRENT,
+    PROVIDER_LOCAL_MAGNET,
+    candidate_capability_error,
+)
 from engine.scrapeflow.replenishment_matching import (
     coverage_tokens as _coverage_tokens,
     expanded_episode_ids as _expanded_episode_ids,

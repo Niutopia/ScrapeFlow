@@ -35,6 +35,7 @@ from .disc_expansion import (
     PlaylistCandidate,
     ScopeExpansionPlan,
     ScopeMappingRuling,
+    SeasonEpisodeRoster,
     apply_scope_mapping_ruling,
     collect_playlist_candidates,
     derive_scope_expansion,
@@ -150,14 +151,13 @@ def fetch_season_roster(
     tmdb_client: Any,
     tmdb_id: int,
     season: int,
-) -> "SeasonEpisodeRoster | None":
+) -> SeasonEpisodeRoster | None:
     """Fetch one season's episode roster from TMDB.
 
     A season with no episodes returns ``None`` (nothing to prove against).
     An episode without a published runtime keeps ``None`` so the mapping
     proof fails closed on it.
     """
-    from .disc_expansion import SeasonEpisodeRoster
 
     payload = tmdb_client.get(f"/tv/{int(tmdb_id)}/season/{int(season)}")
     episodes_raw = payload.get("episodes")
@@ -245,11 +245,6 @@ def _scope_identity(
         min_confidence=min_confidence,
         prefer_animation=prefer_animation,
     )
-    identity = {
-        "media_type": best.media_type,
-        "tmdb_id": best.tmdb_id,
-        "title": best.title,
-    }
     if best.media_type != "tv":
         raise DiscExpansionBridgeError(
             f"光盘镜像范围匹配到非剧集身份: {best.title}"
