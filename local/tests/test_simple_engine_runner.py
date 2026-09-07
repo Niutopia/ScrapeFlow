@@ -2520,7 +2520,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
     def test_provider_payload_admission_rejects_tiny_file_before_ffprobe(self) -> None:
         selection = {"provider": "test", "locator": "magnet:?xt=urn:btih:test"}
         with patch(
-            "engine.tools._replenishment_local_adapter_impl._ffprobe_archive_video"
+            "engine.tools.replenishment_acquire._ffprobe_archive_video"
         ) as probe, self.assertRaisesRegex(
             ReplenishmentCandidateError, "正式库准入下限",
         ):
@@ -2530,7 +2530,7 @@ class SimpleEngineRunnerTests(unittest.TestCase):
     def test_provider_payload_admission_requires_a_video_stream(self) -> None:
         selection = {"provider": "test", "locator": "magnet:?xt=urn:btih:test"}
         with patch.dict("os.environ", {"SCRAPEFLOW_MIN_VIDEO_BYTES": "1048576"}), patch(
-            "engine.tools._replenishment_local_adapter_impl._ffprobe_archive_video"
+            "engine.tools.replenishment_acquire._ffprobe_archive_video"
         ) as probe:
             _verify_video_payload(
                 Path("/tmp/admissible-size.mkv"), minimum_video_bytes(), selection,

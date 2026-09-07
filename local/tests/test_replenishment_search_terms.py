@@ -14,6 +14,7 @@ from engine.scrapeflow.gap_ledger import Gap, save_gap_ledger
 from engine.scrapeflow.work_units import WorkUnitRecord, save_work_unit_records
 from engine.tools import _replenishment_local_adapter_impl as adapter
 from engine.tools import replenishment_search_sources as search_sources
+from engine.tools import replenishment_acquire as acquire_mod
 from local.scrapeflow_api.replenishment_bridge import gap_ledger_requests
 
 
@@ -945,14 +946,14 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             torrent_path.write_bytes(self._torrent_bytes())
             if preexisting:
                 preexisting(workspace)
-            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
-                    patch.object(adapter_, "_verify_video_payload"), \
-                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+            with patch.object(acquire_mod.subprocess, "run", side_effect=fake_run), \
+                    patch.object(acquire_mod, "_verify_video_payload"), \
+                    patch.object(acquire_mod.shutil, "which", return_value="/usr/bin/aria2c"), \
                     patch.object(
-                        adapter_, "_download_torrent",
+                        acquire_mod, "_download_torrent",
                         return_value=adapter_._torrent_manifest(self._torrent_bytes()),
                     ), \
-                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                    patch.object(acquire_mod, "_alist_client", return_value=fake_client):
                 return adapter_._acquire(wrapper, workspace, client=fake_client)
 
     def test_batch_group_downloaded_uploaded_and_freed(self) -> None:
@@ -964,7 +965,7 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             deleted.append(Path(path))
 
         import engine.tools._replenishment_local_adapter_impl as adapter_
-        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree), \
+        with patch.object(acquire_mod.shutil, "rmtree", side_effect=watch_rmtree), \
                 patch.dict("os.environ", {"SCRAPEFLOW_REPLENISHMENT_MEMBER_BATCH": "2"}):
             delivery = self._run_acquire(fake_client, aria2_calls)
 
@@ -1037,14 +1038,14 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                     return _Completed()
 
                 wrapper = self._wrapper()
-                with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
-                        patch.object(adapter_, "_verify_video_payload"), \
-                        patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+                with patch.object(acquire_mod.subprocess, "run", side_effect=fake_run), \
+                        patch.object(acquire_mod, "_verify_video_payload"), \
+                        patch.object(acquire_mod.shutil, "which", return_value="/usr/bin/aria2c"), \
                         patch.object(
-                            adapter_, "_download_torrent",
+                            acquire_mod, "_download_torrent",
                             return_value=adapter_._torrent_manifest(self._torrent_bytes()),
                         ), \
-                        patch.object(adapter_, "_alist_client", return_value=client):
+                        patch.object(acquire_mod, "_alist_client", return_value=client):
                     try:
                         adapter_._acquire(wrapper, workspace, client=client)
                     except RuntimeError as exc:
@@ -1094,14 +1095,14 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             torrent_path = workspace / "preflight" / "candidate-01.torrent"
             torrent_path.parent.mkdir(parents=True)
             torrent_path.write_bytes(self._torrent_bytes())
-            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
-                    patch.object(adapter_, "_verify_video_payload"), \
-                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+            with patch.object(acquire_mod.subprocess, "run", side_effect=fake_run), \
+                    patch.object(acquire_mod, "_verify_video_payload"), \
+                    patch.object(acquire_mod.shutil, "which", return_value="/usr/bin/aria2c"), \
                     patch.object(
-                        adapter_, "_download_torrent",
+                        acquire_mod, "_download_torrent",
                         return_value=adapter_._torrent_manifest(self._torrent_bytes()),
                     ), \
-                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                    patch.object(acquire_mod, "_alist_client", return_value=fake_client):
                 with self.assertRaises(adapter_.ReplenishmentInfrastructureError):
                     adapter_._acquire(wrapper, workspace, client=fake_client)
 
@@ -1127,14 +1128,14 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             torrent_path = workspace / "preflight" / "candidate-01.torrent"
             torrent_path.parent.mkdir(parents=True)
             torrent_path.write_bytes(self._torrent_bytes())
-            with patch.object(adapter_.subprocess, "run", side_effect=fake_run), \
-                    patch.object(adapter_, "_verify_video_payload"), \
-                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
+            with patch.object(acquire_mod.subprocess, "run", side_effect=fake_run), \
+                    patch.object(acquire_mod, "_verify_video_payload"), \
+                    patch.object(acquire_mod.shutil, "which", return_value="/usr/bin/aria2c"), \
                     patch.object(
-                        adapter_, "_download_torrent",
+                        acquire_mod, "_download_torrent",
                         return_value=adapter_._torrent_manifest(self._torrent_bytes()),
                     ), \
-                    patch.object(adapter_, "_alist_client", return_value=fake_client):
+                    patch.object(acquire_mod, "_alist_client", return_value=fake_client):
                 with self.assertRaises(adapter_.ReplenishmentCandidateError):
                     adapter_._acquire(wrapper, workspace, client=fake_client)
 
@@ -1175,7 +1176,7 @@ class MagnetMemberPipelineTests(unittest.TestCase):
             removed.append(Path(path))
             real_rmtree(path, **kwargs)
 
-        with patch.object(adapter_.shutil, "rmtree", side_effect=watch_rmtree):
+        with patch.object(acquire_mod.shutil, "rmtree", side_effect=watch_rmtree):
             self._run_acquire(fake_client, aria2_calls, preexisting=preexisting)
 
         self.assertIn(workspace_marker := "payload", [p.name for p in removed])
@@ -1200,9 +1201,9 @@ class MagnetMemberPipelineTests(unittest.TestCase):
                     class _Usage:
                         free = int(5 * 1024 * 1024 * 1.15) + 1024 ** 3
                     return _Usage()
-            with patch.object(adapter_.shutil, "disk_usage", _TinyDisk.disk_usage), \
-                    patch.object(adapter_.shutil, "which", return_value="/usr/bin/aria2c"), \
-                    patch.object(adapter_, "_download_torrent", return_value=adapter_._torrent_manifest(self._torrent_bytes())):
+            with patch.object(acquire_mod.shutil, "disk_usage", _TinyDisk.disk_usage), \
+                    patch.object(acquire_mod.shutil, "which", return_value="/usr/bin/aria2c"), \
+                    patch.object(acquire_mod, "_download_torrent", return_value=adapter_._torrent_manifest(self._torrent_bytes())):
                 # A disk holding only ~one member + headroom must pass for a
                 # two-member pack (the old whole-pack floor would reject it).
                 result = adapter_._preflight(wrapper, workspace / "preflight")
@@ -1281,16 +1282,16 @@ class PartialProgressClassificationTests(unittest.TestCase):
         with patch.object(
             adapter_.subprocess, "run", side_effect=fake_run,
         ), patch.object(
-            adapter_, "_verify_video_payload",
+            acquire_mod, "_verify_video_payload",
         ), patch.object(
             adapter_.shutil, "which", return_value="/usr/bin/aria2c",
         ), patch.object(
-            adapter_, "_download_torrent",
+            acquire_mod, "_download_torrent",
             return_value=adapter_._torrent_manifest(
                 MagnetMemberPipelineTests._torrent_bytes(),
             ),
         ), patch.object(
-            adapter_, "_alist_client", return_value=fake_client,
+            acquire_mod, "_alist_client", return_value=fake_client,
         ):
             adapter_._acquire(
                 MagnetMemberPipelineTests._wrapper(), Path(tempfile.mkdtemp()),
