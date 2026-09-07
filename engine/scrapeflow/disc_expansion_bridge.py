@@ -30,6 +30,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .disc_expansion import (
     DiscExpansionError,
+    DiscExpansionPauseRequested,
     DiscExpansionExecutor,
     PlaylistCandidate,
     ScopeExpansionPlan,
@@ -61,10 +62,6 @@ from .work_units import (
 
 class DiscExpansionBridgeError(RuntimeError):
     """A bridge-level failure that parks one scope without touching siblings."""
-
-
-class DiscExpansionPauseRequested(RuntimeError):
-    """The expansion stopped at a pause boundary; state stays resumable."""
 
 
 def expansion_staging_root(media_root: str, root_task_id: str) -> str:
@@ -452,6 +449,7 @@ def expand_root_disc_images(
             alist,
             state_dir=str(state_root / f"disc-expansion-{root_task_id}"),
             local_buffer_dir=str(state_root / "expansion-buffers"),
+            pause_requested=pause_requested,
         )
 
     inventory_node = build_source_inventory(
@@ -695,6 +693,7 @@ def _expand_one_scope(
 
 __all__ = [
     "DiscExpansionBridgeError",
+    "DiscExpansionPauseRequested",
     "disc_rulings_path",
     "expansion_staging_root",
     "expand_root_disc_images",

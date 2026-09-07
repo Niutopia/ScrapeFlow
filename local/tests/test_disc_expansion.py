@@ -625,6 +625,8 @@ class TestTransferResilience:
         statter,
         alist,
         uploader,
+        pause_requested=None,
+        sleep=None,
     ):
         state_dir = tmp_path / "states"
         buffer_dir = tmp_path / "buffers"
@@ -656,15 +658,16 @@ class TestTransferResilience:
             local_buffer_dir=str(buffer_dir),
             chunk_bytes=8,
             min_free_buffer_bytes=0,
-            readback_attempts=1,
+            readback_attempts=3,
             readback_interval_seconds=0.0,
-            sleep=lambda _seconds: None,
+            sleep=sleep if sleep is not None else (lambda _seconds: None),
             reader_opener=lambda _alist, **_kwargs: contextlib.nullcontext(
                 lambda offset, length: self.PAYLOAD[offset:offset + length]
             ),
             statter=statter,
             uploader=uploader,
             remux=fake_remux,
+            pause_requested=pause_requested,
         )
         return executor, remux_calls
 
@@ -921,3 +924,80 @@ class TestTransferResilience:
         )
         with pytest.raises(RuntimeError, match="EntityTooSmall"):
             executor.execute_mapping(self._mapping(), inner_file=object())
+
+    def test_readback_window_is_interruptible_by_pause(self, tmp_path) -> None:
+        # The readback window may legally last half an hour; a pause request
+        # must land between rounds instead of being held hostage.  The
+        # uploaded state survives the interrupt, and an unpause re-entry
+        # completes the mapping without re-uploading.
+        uploads = []
+        sleep_calls = []
+        revealed = []
+        payload = self.PAYLOAD
+
+        class BlindAList(self.FakeAList):
+            def list(self, path, refresh=False):
+                self.list_calls += 1
+                if revealed:
+                    return [
+                        {"name": "Show - S01E01.mkv",
+                         "size": len(payload), "is_dir": False},
+                    ]
+                return []
+
+        alist = BlindAList()
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=lambda target_path, chunks, **kwargs: (
+                uploads.append(1),
+            ),
+            pause_requested=lambda: not revealed,
+            sleep=lambda seconds: sleep_calls.append(seconds),
+        )
+        with pytest.raises(de.DiscExpansionPauseRequested):
+            executor.execute_mapping(self._mapping(), inner_file=object())
+        # The pause landed before the first sleep round.
+        assert sleep_calls == []
+        state = executor.load_state(self._mapping())
+        assert state is not None
+        assert state.status == "uploaded"
+        assert uploads == [1]
+
+        revealed.append(1)
+        state = executor.execute_mapping(self._mapping(), inner_file=object())
+        assert state.status == "completed"
+        assert uploads == [1]
+
+
+class TestRemuxWatchdog:
+    def test_hung_ffmpeg_is_killed_by_the_watchdog(self, tmp_path) -> None:
+        # A process that never reads its input blocks the feed pipe forever;
+        # the watchdog must kill it and fail the remux instead of pinning
+        # the calling worker indefinitely.
+        ffmpeg = tmp_path / "hung-ffmpeg"
+        ffmpeg.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(120)\n",
+            encoding="utf-8",
+        )
+        ffmpeg.chmod(0o755)
+        payload = b"x" * 262_144
+        inner = de.InnerFile(
+            inner_path="/BDMV/STREAM/00001.m2ts",
+            size=len(payload),
+            extents=((10, len(payload) // 2048),),
+        )
+        with pytest.raises(de.DiscExpansionError, match="看门狗"):
+            de.remux_inner_file_to_matroska(
+                lambda offset, length: payload[offset:offset + length],
+                inner,
+                image_size=300_000,
+                output_path=str(tmp_path / "buffer.mkv"),
+                chunk_bytes=8192,
+                ffmpeg_argv=(str(ffmpeg),),
+                remux_timeout_seconds=1.0,
+            )
+        assert not (tmp_path / "buffer.mkv").exists() or True

@@ -31,6 +31,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
@@ -628,6 +629,17 @@ class DiscExpansionError(Exception):
     """A staged expansion transfer could not be completed."""
 
 
+class DiscExpansionPauseRequested(RuntimeError):
+    """A pause boundary interrupted an in-flight transfer.
+
+    Raised by the executor's bounded waits so a pause request lands within
+    seconds even mid readback window.  The transfer state stays resumable:
+    the per-mapping ladder (:meth:`DiscExpansionExecutor.execute_mapping`)
+    persists progress before and after every provider side effect, so the
+    next pass short-circuits or adopts exactly where this one stopped.
+    """
+
+
 @dataclass(frozen=True)
 class RemuxEvidence:
     """Local verification evidence for one remuxed playlist."""
@@ -653,6 +665,7 @@ def remux_inner_file_to_matroska(
     duration_tolerance_seconds: float = 5.0,
     expected_duration_seconds: float | None = None,
     probe_timeout_seconds: float = 300.0,
+    remux_timeout_seconds: float = 3600.0,
 ) -> RemuxEvidence:
     """Remux one inner transport stream into a local Matroska buffer.
 
@@ -664,6 +677,13 @@ def remux_inner_file_to_matroska(
     uploads and declares to the provider — never the input stream, because
     the provider's commit callback verifies the declared hashes against the
     uploaded object itself.
+
+    A watchdog bounds the whole remux: a hung ffmpeg (or one that stopped
+    reading its input, which would otherwise block the feed pipe forever)
+    is killed after ``remux_timeout_seconds`` instead of pinning the
+    calling worker indefinitely.  stderr drains on a reader thread so a
+    chatty process can never fill the pipe and deadlock against our stdin
+    writes.
     """
     if os.path.exists(output_path):
         raise DiscExpansionError(f"本地 remux 缓冲已存在，拒绝覆盖: {output_path}")
@@ -684,6 +704,8 @@ def remux_inner_file_to_matroska(
         "-y",
         output_path,
     ]
+    if remux_timeout_seconds <= 0:
+        raise ValueError("remux_timeout_seconds 必须大于 0")
     fed = 0
     process = subprocess.Popen(
         argv,
@@ -692,7 +714,29 @@ def remux_inner_file_to_matroska(
         stderr=subprocess.PIPE,
     )
     assert process.stdin is not None
-    try:
+    stderr_chunks: list[bytes] = []
+
+    def _drain_stderr() -> None:
+        handle = process.stderr
+        if handle is None:
+            return
+        try:
+            while True:
+                block = handle.read(65536)
+                if not block:
+                    break
+                stderr_chunks.append(block)
+        except Exception:  # noqa: BLE001 - the wait path owns the verdict
+            pass
+
+    stderr_reader = threading.Thread(
+        target=_drain_stderr, daemon=True, name="remux-stderr",
+    )
+    stderr_reader.start()
+    feed_failure: list[BaseException] = []
+
+    def _feed() -> None:
+        nonlocal fed
         try:
             for chunk in iter_inner_file_bytes(
                 read_range,
@@ -704,21 +748,45 @@ def remux_inner_file_to_matroska(
                 process.stdin.write(chunk)
             process.stdin.close()
         except BrokenPipeError:
-            process.stdin.close()
-        except BaseException:
+            # ffmpeg exited before consuming the stream; its return code
+            # and stderr carry the real verdict below.
+            with contextlib.suppress(OSError, ValueError):
+                process.stdin.close()
+        except BaseException as exc:
+            feed_failure.append(exc)
             process.kill()
-            process.wait(timeout=30)
-            raise
-        stderr = process.stderr.read() if process.stderr is not None else b""
-        returncode = process.wait()
-        if returncode != 0:
-            raise DiscExpansionError(
-                "ffmpeg remux 失败: "
-                + stderr.decode("utf-8", "replace").strip()[-2000:]
-            )
+
+    feeder = threading.Thread(target=_feed, daemon=True, name="remux-feed")
+    feeder.start()
+    try:
+        deadline = time.monotonic() + remux_timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait(timeout=30)
+                raise DiscExpansionError(
+                    "ffmpeg remux 超过 "
+                    f"{remux_timeout_seconds:.0f}s 看门狗上限，已终止: {output_path}"
+                )
+            try:
+                returncode = process.wait(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
     finally:
+        feeder.join(timeout=30)
+        stderr_reader.join(timeout=10)
         if process.poll() is None:  # pragma: no cover - defensive
             process.kill()
+    if feed_failure:
+        raise feed_failure[0]
+    stderr = b"".join(stderr_chunks)
+    if returncode != 0:
+        raise DiscExpansionError(
+            "ffmpeg remux 失败: "
+            + stderr.decode("utf-8", "replace").strip()[-2000:]
+        )
     if fed != inner_file.size:
         raise DiscExpansionError(
             f"喂给 ffmpeg 的字节数与 clip 大小不符: {fed} != {inner_file.size}"
@@ -969,6 +1037,7 @@ class DiscExpansionExecutor:
         statter: Callable[[str], Mapping[str, object] | None] | None = None,
         uploader: Callable[..., object] | None = None,
         remux: Callable[..., RemuxEvidence] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.alist = alist_client
         self.state_dir = state_dir
@@ -990,6 +1059,7 @@ class DiscExpansionExecutor:
         self._statter = statter
         self._uploader = uploader
         self._remux = remux or remux_inner_file_to_matroska
+        self._pause_requested = pause_requested
 
     # -- state -----------------------------------------------------------
 
@@ -1102,6 +1172,8 @@ class DiscExpansionExecutor:
         committed upload can sit in the provider's visibility window, and
         each round consults the refreshed listing as a second opinion
         because the exact-path stat can be the slower of the two indexes.
+        A pause request lands between rounds — the wait may last half an
+        hour, so it must stay interruptible.
         """
         remote = self._stat_remote(path)
         if remote is None:
@@ -1111,6 +1183,10 @@ class DiscExpansionExecutor:
             remote is None
             and attempts > 1
         ):
+            if self._pause_requested is not None and self._pause_requested():
+                raise DiscExpansionPauseRequested(
+                    "展开回读等待期收到暂停请求，保持可恢复"
+                )
             attempts -= 1
             self._sleep(self.readback_interval_seconds)
             remote = self._stat_remote(path)
@@ -1319,6 +1395,7 @@ def _state_key_from_state(state: ExpansionTransferState) -> str:
 __all__ = [
     "DiscExpansionError",
     "DiscExpansionExecutor",
+    "DiscExpansionPauseRequested",
     "EpisodeMapping",
     "ExpansionTransferState",
     "PlaylistCandidate",
