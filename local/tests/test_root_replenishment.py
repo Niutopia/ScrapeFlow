@@ -2453,3 +2453,100 @@ class PublicTierStateProjectionTest(unittest.TestCase):
         for key in ("tier", "waiting", "attempt_log", "updated_at"):
             self.assertIn(key, projection)
         self.assertEqual(projection["attempt_log"], [])
+
+
+class WorkspaceLifecycleTests(unittest.TestCase):
+    """Attempt workspaces are reclaimed, never accumulated.
+
+    The 09-07 production state measured tens of GB of unreferenced local
+    attempt directories: the adapter frees only group payloads, and neither
+    the terminal paths nor the job cleanup endpoint touched these trees.
+    """
+
+    ROOT = "root-ws"
+
+    def _state_root(self, directory: str) -> Path:
+        return Path(directory)
+
+    def test_sweep_removes_unreferenced_attempts_only(self) -> None:
+        from local.scrapeflow_api import root_replenishment as rr
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = self._state_root(directory)
+            video_root = state_root / "replenishment_workspace" / self.ROOT
+            subtitle_root = (
+                state_root / "subtitle_replenishment_workspace" / self.ROOT
+            )
+            live_video = "a" * 32
+            corpse_video = "b" * 32
+            live_subtitle = f"subtitle-{'c' * 32}"
+            corpse_subtitle = f"subtitle-{'d' * 32}"
+            for root, names in (
+                (video_root, [live_video, corpse_video, "operator-notes.txt"]),
+                (subtitle_root, [live_subtitle, corpse_subtitle]),
+            ):
+                for name in names:
+                    (root / name).mkdir(parents=True, exist_ok=True)
+                    (root / name / "payload.bin").write_bytes(b"x" * 16)
+            state = {
+                "video_intents": {live_video: {"phase": "waiting_reconcile"}},
+                "subtitle_intents": {
+                    "gap-1": {"phase": "waiting_reconcile", "attempt_id": live_subtitle},
+                },
+            }
+
+            rr._sweep_orphan_attempt_workspaces(state_root, self.ROOT, state)
+
+            self.assertTrue((video_root / live_video).exists())
+            self.assertFalse((video_root / corpse_video).exists())
+            self.assertTrue((video_root / "operator-notes.txt").exists())
+            self.assertTrue((subtitle_root / live_subtitle).exists())
+            self.assertFalse((subtitle_root / corpse_subtitle).exists())
+
+    def test_sweep_removes_empty_root_shell(self) -> None:
+        from local.scrapeflow_api import root_replenishment as rr
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = self._state_root(directory)
+            video_root = state_root / "replenishment_workspace" / self.ROOT
+            (video_root / ("e" * 32)).mkdir(parents=True)
+
+            rr._sweep_orphan_attempt_workspaces(state_root, self.ROOT, {})
+
+            self.assertFalse(video_root.exists())
+            self.assertFalse(
+                (state_root / "replenishment_workspace" / "other-root").exists()
+            )
+
+    def test_finished_drop_removes_attempt_workspace(self) -> None:
+        from local.scrapeflow_api import root_replenishment as rr
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "attempt-x"
+            workspace.mkdir()
+            (workspace / "payload.bin").write_bytes(b"x")
+
+            rr._remove_attempt_workspace_tree(str(workspace))
+            self.assertFalse(workspace.exists())
+
+            # Symlinks and malformed paths are left in place.
+            other = Path(directory) / "real"
+            other.mkdir()
+            link = Path(directory) / "link"
+            link.symlink_to(other)
+            rr._remove_attempt_workspace_tree(str(link))
+            self.assertTrue(link.exists())
+            rr._remove_attempt_workspace_tree("not-a-path")
+            rr._remove_attempt_workspace_tree(None)
+
+    def test_cleanup_endpoint_removes_replenishment_workspaces(self) -> None:
+        # The job cleanup path treats the two workspace trees like the gap
+        # and staging trees: owned, guarded by the active-replenishment
+        # check, and removed once the root is safe to forget.
+        import inspect as _inspect
+
+        from local.scrapeflow_api import simple_engine_runner as ser
+
+        body = _inspect.getsource(ser.SimpleEngineRunner.cleanup_terminal_job)
+        self.assertIn("replenishment_workspace", body)
+        self.assertIn("subtitle_replenishment_workspace", body)

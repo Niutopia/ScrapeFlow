@@ -60,6 +60,7 @@ import inspect
 import json
 import posixpath
 import re
+import shutil
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -3005,6 +3006,87 @@ def _video_paths(runner: Any, state_root: Path, root_task_id: str, attempt_id: s
     return staging, workspace, f"replenishment-{attempt_id}"
 
 
+_ATTEMPT_DIR_NAME_RE = re.compile(r"^(?:subtitle-)?[0-9a-f]{32}$")
+
+
+def _remove_attempt_workspace_tree(workspace_value: object) -> None:
+    """Remove one finished attempt's local workspace, boundary-checked.
+
+    The orchestrator owns the workspace once its intent ends: the adapter
+    only frees group payload directories mid-attempt.  A symlink or a
+    non-directory at the exact path is left for the operator — never follow.
+    """
+    workspace = _bounded_path(workspace_value)
+    if workspace is None:
+        return
+    path = Path(workspace)
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _sweep_orphan_attempt_workspaces(
+    state_root: Path, root_task_id: str, state: Mapping[str, Any],
+) -> None:
+    """Reclaim attempt workspaces no durable intent references.
+
+    Superseded and abandoned attempts accumulate local bytes forever
+    otherwise: the adapter frees only group payload directories, and neither
+    the lane's terminal paths nor the job cleanup endpoint historically
+    touched these trees (tens of GB of unreferenced corpses were measured on
+    one root).  Only exact attempt-id-shaped directory names directly under
+    the root's own workspace are ever removed; anything else is left for the
+    operator.
+    """
+    state_root = Path(state_root)
+    video_attempts = set(_video_intents(state))
+    subtitle_attempts = {
+        str(intent.get("attempt_id") or "")
+        for intent in (state.get(_SUBTITLE_INTENTS_KEY) or {}).values()
+        if isinstance(intent, Mapping)
+    }
+    for root, live_names in (
+        (
+            state_root / "replenishment_workspace" / root_task_id,
+            video_attempts,
+        ),
+        (
+            state_root / "subtitle_replenishment_workspace" / root_task_id,
+            subtitle_attempts,
+        ),
+    ):
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        swept_everything = True
+        for entry in entries:
+            name = entry.name
+            if (
+                name in live_names
+                or _ATTEMPT_DIR_NAME_RE.fullmatch(name) is None
+                or entry.is_symlink()
+            ):
+                swept_everything = False
+                continue
+            try:
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    swept_everything = False
+            except OSError:
+                swept_everything = False
+        if swept_everything:
+            # An empty root shell is task-owned residue too.
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
+
 def _video_intents(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     intents = state.get(_VIDEO_INTENTS_KEY)
     if not isinstance(intents, dict):
@@ -3378,6 +3460,7 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
     gaps = _video_gaps(state_root, root_task_id, intent)
     if not gaps:
         _drop_video_intent(state_root, root_task_id, state, str(intent["attempt_id"]))
+        _remove_attempt_workspace_tree(intent.get("workspace"))
         return {"outcome": "closed", "attempts": [], "gaps_closed": []}
     if pause_requested is not None and pause_requested():
         return {"outcome": "paused", "attempts": [], "gaps_closed": []}
@@ -3442,6 +3525,7 @@ def _resume_video_intent(runner: Any, state_root: Path, root_task_id: str, state
         _wait_video_intent(state_root, root_task_id, state, pending)
         return {"outcome": "waiting_reconcile", "attempts": attempts, "gaps_closed": closed}
     _drop_video_intent(state_root, root_task_id, state, str(pending["attempt_id"]))
+    _remove_attempt_workspace_tree(pending.get("workspace"))
     return {"outcome": "closed", "attempts": attempts, "gaps_closed": closed}
 
 
@@ -3505,6 +3589,7 @@ def _recover_video_intents(runner: Any, state_root: Path, root_task_id: str, sta
                         # payload) drops the durable attempt so a later
                         # round may search for a different candidate.
                         _drop_video_intent(state_root, root_task_id, state, attempt_id)
+                        _remove_attempt_workspace_tree(intent.get("workspace"))
                         for gap_id in intent["ledger_gap_ids"]:
                             record_attempt(
                                 state_root, root_task_id, gap_id,
@@ -3639,6 +3724,7 @@ def run_root_replenishment(
     if video_recovery["paused"] or video_recovery["waiting"]:
         state.update({"updated_at": _now(), "waiting": "waiting_reconcile"})
         _sync_video_in_flight(state)
+        _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
         save_root_replenishment_state(state_root, root_task_id, state)
         return {
             "tier": tier, "tier_before": tier, "requests_built": 0,
@@ -3711,6 +3797,7 @@ def run_root_replenishment(
         state["updated_at"] = _now()
         state["waiting"] = merged_waiting(None)
         _sync_video_in_flight(state)
+        _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
         save_root_replenishment_state(state_root, root_task_id, state)
         noop = _noop_result(state, tier)
         noop["attempts"] = recovered_attempts
@@ -3736,6 +3823,7 @@ def run_root_replenishment(
             _append_attempt_log(state, {"gap_id": entry["gap_id"], "tier": entry["tier"], "outcome": entry["outcome"], "candidate_key": entry.get("candidate_key"), "recorded_at": _now()})
         state.update({"updated_at": _now(), "waiting": waiting})
         _sync_video_in_flight(state)
+        _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
         save_root_replenishment_state(state_root, root_task_id, state)
         return attach_subtitle_result({"tier": tier, "tier_before": tier, "requests_built": 0, "attempts": reconcile_attempts, "gaps_closed": reconcile_closed, "state": state, "waiting": waiting})
 
@@ -3998,6 +4086,7 @@ def run_root_replenishment(
                 scope, task_id = _classify_error(exc)
                 if scope == FAILURE_CANDIDATE:
                     _drop_video_intent(state_root, root_task_id, state, attempt_id)
+                    _remove_attempt_workspace_tree(intent.get("workspace"))
                     # Keep the provider's bounded, redacted diagnostic in the
                     # attempt ledger.  A generic label such as "provider
                     # rejected" is not enough to distinguish a bad torrent
@@ -4151,6 +4240,7 @@ def run_root_replenishment(
     state["updated_at"] = _now()
     state["waiting"] = waiting
     _sync_video_in_flight(state)
+    _sweep_orphan_attempt_workspaces(state_root, root_task_id, state)
     _trace(f"end root={root_task_id} tier={state.get('tier')} waiting={waiting} closed={len(gaps_closed)}")
     for entry in attempts:
         _append_attempt_log(state, {

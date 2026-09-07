@@ -3334,6 +3334,18 @@ class SimpleEngineRunner:
             removed_archive_staging = self._remove_owned_local_tree(
                 archive_staging_root, safe_id, label="archive local staging"
             )
+            # The replenishment workspaces are task-owned local trees just
+            # like the three above; the active-replenishment guard in
+            # _validate_cleanup_root has already refused this cleanup while
+            # any lane work is unfinished.
+            removed_replenishment = self._remove_owned_local_tree(
+                self.state_root / "replenishment_workspace",
+                safe_id, label="replenishment workspace",
+            )
+            removed_subtitle_replenishment = self._remove_owned_local_tree(
+                self.state_root / "subtitle_replenishment_workspace",
+                safe_id, label="subtitle replenishment workspace",
+            )
             removed_children: list[str] = []
             for child_id, path in child_paths:
                 path.unlink()
