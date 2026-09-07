@@ -498,6 +498,9 @@ def expand_root_disc_images(
                 staged_rows=staged_rows,
             ))
             changed = True
+        except DiscExpansionPauseRequested:
+            # The pause boundary is a root-level control flow, never a park.
+            raise
         except DiscExpansionBridgeError as exc:
             updated.append(_park_with(record, str(exc)))
         except DiscExpansionError as exc:
@@ -507,6 +510,17 @@ def expand_root_disc_images(
             # siblings keep expanding.  A probe failure is not a root-level
             # failure, and the park reason keeps the evidence visible.
             updated.append(_park_with(record, f"光盘镜像探测失败: {exc}"))
+        except Exception as exc:  # noqa: BLE001 - scope isolation is the contract
+            # The module promises one scope's failure never touches its
+            # siblings, but identity ties (AutoMatchAmbiguityError is a
+            # PlanError) and transient AList/TMDB transport errors (ApiError)
+            # are none of the three typed failures above — without this
+            # backstop they escape the per-scope boundary and fail the whole
+            # root.  Park the scope with the evidence instead.
+            updated.append(_park_with(
+                record,
+                f"光盘展开意外失败: {type(exc).__name__}: {exc}",
+            ))
     if changed:
         persist_root_boundary_analysis(
             state_root,

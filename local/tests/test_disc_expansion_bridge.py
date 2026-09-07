@@ -545,6 +545,59 @@ class TestExpandRootDiscImages:
         assert again == updated
         assert wired.executor.calls == [(1, 1), (1, 2)]
 
+    def test_identity_tie_parks_one_scope_without_failing_the_root(self, wired) -> None:
+        # AutoMatchAmbiguityError is a PlanError, none of the bridge's three
+        # typed failures — historically it escaped the per-scope boundary and
+        # failed the whole root.  The module's contract says the scope parks
+        # and its siblings keep expanding.
+        from engine.scrapeflow.identity_matching import AutoMatchAmbiguityError
+
+        scope2 = f"{INGRESS}/无耻之徒 第二季"
+        image2 = f"{scope2}/DISC1.iso"
+        alist = DiscAList({IMAGE: b"i" * IMAGE_SIZE, image2: b"i" * IMAGE_SIZE})
+        executor = FakeExecutor(alist)
+        snapshot = {
+            "root": INGRESS,
+            "rows": [
+                {"name": SCOPE_BASENAME, "is_dir": True, "full_path": SCOPE},
+                {"name": "DISC1.iso", "is_dir": False, "size": IMAGE_SIZE, "full_path": IMAGE},
+                {"name": posixpath.basename(scope2), "is_dir": True, "full_path": scope2},
+                {"name": "DISC1.iso", "is_dir": False, "size": IMAGE_SIZE, "full_path": image2},
+            ],
+        }
+        def identity(_tmdb, scoped_node, _record, **_kwargs):
+            if str(scoped_node.path) == SCOPE:
+                raise AutoMatchAmbiguityError(
+                    "自动匹配前两名证据无法区分，拒绝自动选择: "
+                    "tv/1906 无耻之徒 (100.0%); tv/34307 无耻之徒 (100.0%)",
+                    candidates=[],
+                )
+            return (34307, "无耻之徒")
+
+        wired.monkeypatch.setattr(bridge, "_scope_identity", identity)
+        updated, changed = bridge.expand_root_disc_images(
+            alist,
+            SimpleNamespace(),
+            wired.state_root,
+            ROOT_TASK,
+            [_parked_record(SCOPE), _parked_record(scope2)],
+            snapshot,
+            media_root=INGRESS,
+            executor=executor,
+            roster_loader=_roster_loader(),
+        )
+        assert changed is True
+        parked = [r for r in updated if r.attention and "意外失败" in r.attention]
+        assert len(parked) == 1
+        assert parked[0].source_paths == (SCOPE,)
+        assert parked[0].requires_content_expansion
+        assert "无法区分" in parked[0].attention
+        assert "AutoMatchAmbiguityError" in parked[0].attention
+        converted = [r for r in updated if r.disc_expansion is not None]
+        assert len(converted) == 1
+        assert converted[0].source_paths[0].startswith(STAGING_ROOT)
+        assert converted[0].source_paths[0] != parked[0].source_paths[0]
+
     def test_merged_tree_reaches_both_scopes_from_widened_root(self, wired) -> None:
         # The production shape: the ingress snapshot is rooted at the intake
         # directory (its walk lists children only), so widening the merged
@@ -933,3 +986,4 @@ class TestCleanupExpansionStagingRoot:
         assert note is not None and "暂停边界" in note
         assert STAGED_FILE in alist.files
         assert alist.removed == []
+
