@@ -835,7 +835,7 @@ class ExpansionTransferState:
     season: int
     episode: int
     target_path: str
-    status: str  # "pending" | "completed" | "failed"
+    status: str  # "pending" | "uploading" | "uploaded" | "completed" | "failed"
     inner_size: int = 0
     duration_seconds: float = 0.0
     output_bytes: int = 0
@@ -885,10 +885,22 @@ class DiscExpansionExecutor:
     """Transfer proven mappings into task-owned remote staging, resumably.
 
     Each mapping keeps a small JSON state record beside the task's other
-    durable state.  A completed record plus an exact-size remote object
-    short-circuits the transfer, so an interrupted expansion resumes without
-    re-reading gigabytes.  A partial local buffer is always discarded: an
-    ffmpeg output cannot be resumed safely.
+    durable state, advancing ``pending → uploading → uploaded → completed``:
+
+    - the deterministic remux evidence (size and hashes of the produced
+      file) is persisted *before* the upload starts, so a crash mid-upload
+      still leaves the evidence on disk;
+    - the state flips to ``uploaded`` the moment the provider commits;
+    - only a successful readback marks ``completed``.
+
+    A target that already exists at precheck is reconciled against that
+    evidence by the size gate: our own committed upload from an attempt
+    whose state was never saved is adopted (re-remuxing once if the state
+    was lost, since the remux is deterministic), while a foreign or
+    divergent object stays a hard refusal.  A completed record plus an
+    exact-size remote object short-circuits the transfer, so an interrupted
+    expansion resumes without re-reading gigabytes.  A partial local buffer
+    is always discarded: an ffmpeg output cannot be resumed safely.
     """
 
     def __init__(
@@ -1017,6 +1029,21 @@ class DiscExpansionExecutor:
                 return entry
         return None
 
+    def _stat_remote_with_second_opinion(
+        self, path: str
+    ) -> Mapping[str, object] | None:
+        """One exact stat plus one refreshed-listing check, without waiting.
+
+        For an object that should long be visible — a completed mapping's
+        target, or a precheck hit from an earlier attempt — a transiently
+        blind exact stat is arbitrated by a single refreshed listing.  The
+        bounded visibility window is reserved for just-committed uploads.
+        """
+        remote = self._stat_remote(path)
+        if remote is None:
+            remote = self._listing_second_opinion(path)
+        return remote
+
     def _stat_remote_with_lag(self, path: str) -> Mapping[str, object] | None:
         """Stat with a bounded wait for provider listing lag.
 
@@ -1082,7 +1109,9 @@ class DiscExpansionExecutor:
         """Transfer one mapping; idempotent for completed mappings."""
         state = self.load_state(mapping)
         if state is not None and state.status == "completed":
-            remote = self._stat_remote(mapping.target_path)
+            remote = self._stat_remote_with_second_opinion(
+                mapping.target_path
+            )
             if (
                 isinstance(remote, Mapping)
                 and remote.get("size") == state.output_bytes
@@ -1098,84 +1127,134 @@ class DiscExpansionExecutor:
         if os.path.exists(buffer_path):
             os.remove(buffer_path)
         self._require_free_buffer_space(candidate.clip_size)
-        remote_precheck = self._stat_remote(mapping.target_path)
-        if remote_precheck is not None:
-            raise DiscExpansionError(
-                f"展开 staging 目标已存在，拒绝覆盖: {mapping.target_path}"
-            )
-        with self._reader_opener(
-            self.alist,
-            image_path=candidate.image_path,
-            image_size=candidate.image_size,
-        ) as read_range:
-            evidence = self._remux(
-                read_range,
-                inner_file,
-                image_size=candidate.image_size,
-                output_path=buffer_path,
-                chunk_bytes=self.chunk_bytes,
-                expected_duration_seconds=candidate.duration_seconds,
-            )
         try:
-            # A part-level transport blip inside the provider proxy can
-            # reject an otherwise complete upload (observed on quark_uc: a
-            # broken pipe on one part was retried by the proxy with an
-            # already-drained reader, so the part arrived empty and the
-            # provider answered 400 EntityTooSmall), and a transport break
-            # after commit can fail the request while the object lands
-            # anyway.  The remux buffer is still intact here, so reconcile
-            # the target and retry once when nothing committed.
-            def chunks():
-                with open(buffer_path, "rb") as handle:
-                    while True:
-                        block = handle.read(self.chunk_bytes)
-                        if not block:
-                            break
-                        yield block
+            evidence: RemuxEvidence | None = None
+            remote_precheck = self._stat_remote_with_second_opinion(
+                mapping.target_path
+            )
+            if remote_precheck is not None:
+                # The target already exists: either our own committed upload
+                # from an attempt whose state was never saved, or a foreign
+                # object.  A saved state (uploading/uploaded) carries the
+                # remux evidence; without one, the deterministic remux
+                # recomputes it.  The size gate decides — a match adopts our
+                # object, a mismatch is a hard refusal that never overwrites.
+                if state.output_bytes <= 0:
+                    with self._reader_opener(
+                        self.alist,
+                        image_path=candidate.image_path,
+                        image_size=candidate.image_size,
+                    ) as read_range:
+                        evidence = self._remux(
+                            read_range,
+                            inner_file,
+                            image_size=candidate.image_size,
+                            output_path=buffer_path,
+                            chunk_bytes=self.chunk_bytes,
+                            expected_duration_seconds=candidate.duration_seconds,
+                        )
+                    expected_bytes = evidence.output_bytes
+                else:
+                    expected_bytes = state.output_bytes
+                if remote_precheck.get("size") != expected_bytes:
+                    raise DiscExpansionError(
+                        "展开 staging 目标已存在且大小与确定性 remux 证据不符，"
+                        f"拒绝覆盖: {mapping.target_path}"
+                        f"（远端 {remote_precheck.get('size')}"
+                        f" != 期望 {expected_bytes}）"
+                    )
+                if evidence is not None:
+                    state.inner_size = candidate.clip_size
+                    state.duration_seconds = evidence.duration_seconds
+                    state.output_bytes = evidence.output_bytes
+                    state.md5 = evidence.md5
+                    state.sha1 = evidence.sha1
+                state.status = "uploaded"
+                state.updated_at = self._now()
+                self._save_state(state)
+            elif state.status != "uploaded":
+                with self._reader_opener(
+                    self.alist,
+                    image_path=candidate.image_path,
+                    image_size=candidate.image_size,
+                ) as read_range:
+                    evidence = self._remux(
+                        read_range,
+                        inner_file,
+                        image_size=candidate.image_size,
+                        output_path=buffer_path,
+                        chunk_bytes=self.chunk_bytes,
+                        expected_duration_seconds=candidate.duration_seconds,
+                    )
+                # Persist the evidence before the first byte leaves: a crash
+                # mid-upload leaves the deterministic proof on disk, so the
+                # next pass can reconcile a committed target by size alone.
+                state.inner_size = candidate.clip_size
+                state.duration_seconds = evidence.duration_seconds
+                state.output_bytes = evidence.output_bytes
+                state.md5 = evidence.md5
+                state.sha1 = evidence.sha1
+                state.status = "uploading"
+                state.updated_at = self._now()
+                self._save_state(state)
 
-            uploaded = False
-            last_error: Exception | None = None
-            for _attempt in range(2):
-                try:
-                    self._upload_stream(
-                        mapping.target_path,
-                        chunks(),
-                        size=evidence.output_bytes,
-                        md5=evidence.md5,
-                        sha1=evidence.sha1,
-                    )
-                    uploaded = True
-                    break
-                except Exception as exc:  # noqa: BLE001 - reconciled below
-                    last_error = exc
-                    reconciled = self._stat_remote_with_lag(
-                        mapping.target_path
-                    )
-                    if (
-                        isinstance(reconciled, Mapping)
-                        and reconciled.get("size") == evidence.output_bytes
-                    ):
+                # A part-level transport blip inside the provider proxy can
+                # reject an otherwise complete upload (observed on quark_uc: a
+                # broken pipe on one part was retried by the proxy with an
+                # already-drained reader, so the part arrived empty and the
+                # provider answered 400 EntityTooSmall), and a transport break
+                # after commit can fail the request while the object lands
+                # anyway.  The remux buffer is still intact here, so reconcile
+                # the target and retry once when nothing committed.
+                def chunks():
+                    with open(buffer_path, "rb") as handle:
+                        while True:
+                            block = handle.read(self.chunk_bytes)
+                            if not block:
+                                break
+                            yield block
+
+                uploaded = False
+                last_error: Exception | None = None
+                for _attempt in range(2):
+                    try:
+                        self._upload_stream(
+                            mapping.target_path,
+                            chunks(),
+                            size=evidence.output_bytes,
+                            md5=evidence.md5,
+                            sha1=evidence.sha1,
+                        )
                         uploaded = True
                         break
-            if last_error is not None and not uploaded:
-                raise last_error
+                    except Exception as exc:  # noqa: BLE001 - reconciled below
+                        last_error = exc
+                        reconciled = self._stat_remote_with_lag(
+                            mapping.target_path
+                        )
+                        if (
+                            isinstance(reconciled, Mapping)
+                            and reconciled.get("size") == evidence.output_bytes
+                        ):
+                            uploaded = True
+                            break
+                if last_error is not None and not uploaded:
+                    raise last_error
+                state.status = "uploaded"
+                state.updated_at = self._now()
+                self._save_state(state)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(buffer_path)
         remote = self._stat_remote_with_lag(mapping.target_path)
         if (
             not isinstance(remote, Mapping)
-            or remote.get("size") != evidence.output_bytes
+            or remote.get("size") != state.output_bytes
         ):
             raise DiscExpansionError(
                 f"展开上传后回读失败: {mapping.target_path}"
             )
         state.status = "completed"
-        state.inner_size = candidate.clip_size
-        state.duration_seconds = evidence.duration_seconds
-        state.output_bytes = evidence.output_bytes
-        state.md5 = evidence.md5
-        state.sha1 = evidence.sha1
         state.updated_at = self._now()
         self._save_state(state)
         return state

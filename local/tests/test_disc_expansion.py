@@ -659,19 +659,61 @@ class TestTransferResilience:
     def test_committed_despite_error_is_not_reuploaded(self, tmp_path) -> None:
         # The transport broke after the provider committed: the reconcile
         # finds the target at the declared size, so no second upload is
-        # attempted and the mapping still completes.
+        # attempted and the mapping still completes.  The listing only
+        # reveals the object after the upload attempt (the precheck must
+        # not adopt it before this run has even tried).
         calls = []
+        committed = []
+        payload = self.PAYLOAD
 
         def uploader(target_path, chunks, **kwargs):
             calls.append(1)
+            for _ in chunks:
+                pass
+            committed.append(1)
             raise OSError("connection reset after commit")
+
+        class LaggingAList(self.FakeAList):
+            def list(self, path, refresh=False):
+                self.list_calls += 1
+                if committed:
+                    return [
+                        {"name": "Show - S01E01.mkv",
+                         "size": len(payload), "is_dir": False},
+                    ]
+                return []
+
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=LaggingAList(),
+            uploader=uploader,
+        )
+        state = executor.execute_mapping(
+            self._mapping(), inner_file=object()
+        )
+        assert state.status == "completed"
+        assert calls == [1]
+
+    def test_target_from_crashed_attempt_is_adopted_by_the_size_gate(
+        self, tmp_path
+    ) -> None:
+        # The E03 trap: a previous attempt committed the upload and died
+        # before any state was saved.  The precheck finds the target, the
+        # deterministic remux recomputes the evidence, the size gate proves
+        # the object is ours, and the mapping completes without re-uploading.
+        uploads = []
+
+        def uploader(target_path, chunks, **kwargs):
+            uploads.append(1)
+            for _ in chunks:
+                pass
 
         alist = self.FakeAList([
             {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD),
              "is_dir": False},
         ])
-
-        executor, _remux_calls = self._executor(
+        executor, remux_calls = self._executor(
             tmp_path,
             statter=lambda _path: None,
             alist=alist,
@@ -681,7 +723,97 @@ class TestTransferResilience:
             self._mapping(), inner_file=object()
         )
         assert state.status == "completed"
-        assert calls == [1]
+        assert state.output_bytes == len(self.PAYLOAD)
+        assert remux_calls == [1]
+        assert uploads == []
+
+    def test_foreign_target_size_is_a_hard_refusal(self, tmp_path) -> None:
+        # A pre-existing object whose size disagrees with the deterministic
+        # remux evidence is not ours: never overwrite, park with the sizes.
+        uploads = []
+
+        def uploader(target_path, chunks, **kwargs):
+            uploads.append(1)
+            for _ in chunks:
+                pass
+
+        alist = self.FakeAList([
+            {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD) + 1,
+             "is_dir": False},
+        ])
+        executor, _remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=uploader,
+        )
+        with pytest.raises(de.DiscExpansionError, match="拒绝覆盖"):
+            executor.execute_mapping(self._mapping(), inner_file=object())
+        assert uploads == []
+
+    def _saved_state(self, executor, mapping, *, status):
+        state = de.ExpansionTransferState.from_mapping(mapping)
+        state.status = status
+        state.inner_size = 20_000_000_000
+        state.duration_seconds = 61.0
+        state.output_bytes = len(self.PAYLOAD)
+        state.md5 = "a" * 32
+        state.sha1 = "b" * 40
+        state.updated_at = "2026-09-03T00:00:00Z"
+        executor._save_state(state)
+        return state
+
+    def test_uploaded_state_completes_via_readback_without_rework(
+        self, tmp_path
+    ) -> None:
+        # Crash between the provider commit and the readback: the saved
+        # "uploaded" state plus the size-gated readback completes the
+        # mapping with neither a remux nor an upload.
+        uploads = []
+        alist = self.FakeAList([
+            {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD),
+             "is_dir": False},
+        ])
+        executor, remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=lambda target_path, chunks, **kwargs: (
+                uploads.append(1),
+            ),
+        )
+        mapping = self._mapping()
+        self._saved_state(executor, mapping, status="uploaded")
+        state = executor.execute_mapping(mapping, inner_file=object())
+        assert state.status == "completed"
+        assert remux_calls == []
+        assert uploads == []
+
+    def test_uploading_state_adopts_committed_target_without_remux(
+        self, tmp_path
+    ) -> None:
+        # Crash mid-upload after the provider had already committed: the
+        # pre-upload "uploading" state carries the evidence, so the
+        # precheck's size gate adopts the target without any rework.
+        uploads = []
+        alist = self.FakeAList([
+            {"name": "Show - S01E01.mkv", "size": len(self.PAYLOAD),
+             "is_dir": False},
+        ])
+        executor, remux_calls = self._executor(
+            tmp_path,
+            statter=lambda _path: None,
+            alist=alist,
+            uploader=lambda target_path, chunks, **kwargs: (
+                uploads.append(1),
+            ),
+        )
+        mapping = self._mapping()
+        self._saved_state(executor, mapping, status="uploading")
+        state = executor.execute_mapping(mapping, inner_file=object())
+        assert state.status == "completed"
+        assert remux_calls == []
+        assert uploads == []
 
     def test_repeated_upload_failure_raises_the_last_error(
         self, tmp_path
