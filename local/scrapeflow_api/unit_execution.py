@@ -20,7 +20,7 @@ import posixpath
 import re
 import unicodedata
 import uuid
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from engine.scrapeflow.boundary_analysis import (
     _SEASON_EPISODE_RE,

@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 class ReplenishmentDeliveryError(RuntimeError):
     """The verified payload is reusable; only cloud delivery failed."""
