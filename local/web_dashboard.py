@@ -1469,6 +1469,7 @@ button:focus-visible,[role="button"]:focus-visible,input:focus-visible,select:fo
           candidate: '<span style="color:var(--forge-faint)">[排除] 无效资源</span>',
           infrastructure: '<span style="color:var(--forge-alert)">[重试] 网络异常</span>',
           in_doubt: '<span style="color:var(--forge-alert)">[对账] 存疑锁定</span>',
+          window_pending: '<span style="color:var(--forge-faint)">[窗口] 搜索预算未翻完，下轮继续</span>',
           closed: '<span style="color:var(--forge-ready)">[闭环] 缺口已核销</span>',
           paused: '<span style="color:var(--forge-faint)">[暂停] 等待恢复</span>',
           waiting_reconcile: '<span style="color:var(--forge-alert)">[对账] 等待安全对账</span>',

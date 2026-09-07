@@ -627,9 +627,9 @@ class RootReplenishmentTests(unittest.TestCase):
                 search_runner=clean_incomplete_search,
             )
             state = load_root_replenishment_state(state_root, "root-1")
-            ledger_attempt_status = load_gap_ledger(
+            ledger_attempts = load_gap_ledger(
                 state_root, "root-1",
-            )[0].attempts[-1].status
+            )[0].attempts
             second = run_root_replenishment(
                 self._runner(state_root),
                 state_root,
@@ -639,8 +639,11 @@ class RootReplenishmentTests(unittest.TestCase):
 
         self.assertEqual(first["tier"], "quark_share")
         self.assertEqual(first["waiting"], "retry_wait")
-        self.assertEqual(first["attempts"][0]["outcome"], "candidate")
-        self.assertEqual(ledger_attempt_status, "candidate_failed")
+        # A bounded window that has not finished paging is a window fact, not
+        # a resource verdict: state log carries window_pending and the gap
+        # ledger keeps no candidate_failed history for it.
+        self.assertEqual(first["attempts"][0]["outcome"], "window_pending")
+        self.assertEqual(len(ledger_attempts), 0)
         self.assertEqual(second["tier"], "quark_share")
         self.assertEqual(len(seen), 2)
         self.assertNotIn("reviewed_resource_miss_locators", seen[0])
@@ -714,14 +717,13 @@ class RootReplenishmentTests(unittest.TestCase):
 
             self.assertEqual(result["tier"], "quark_share")
             self.assertEqual(result["waiting"], "retry_wait")
-            attempt = load_gap_ledger(state_root, "root-1")[0].attempts[0]
-            self.assertEqual(attempt.status, "infrastructure")
+            # A disabled required source is deployment configuration, not a
+            # per-gap event: the tier stays fail-closed (retry_wait) but no
+            # per-gap ledger noise is written.
             self.assertEqual(
-                attempt.error,
-                "pansou 发现器未配置或已禁用；保持当前层等待重试",
+                len(load_gap_ledger(state_root, "root-1")[0].attempts), 0,
             )
-            state = load_root_replenishment_state(state_root, "root-1")
-            self.assertEqual(state["attempt_log"][-1]["error"], attempt.error)
+            self.assertEqual(result["attempts"], [])
 
     def test_search_exception_without_locator_retries_same_tier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2550,3 +2552,83 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         body = _inspect.getsource(ser.SimpleEngineRunner.cleanup_terminal_job)
         self.assertIn("replenishment_workspace", body)
         self.assertIn("subtitle_replenishment_workspace", body)
+
+
+class AttemptLedgerNoiseTests(unittest.TestCase):
+    """The bounded attempt log must carry resource verdicts, not rounds."""
+
+    def test_exhaustion_proof_round_writes_no_per_gap_attempts(self) -> None:
+        # The proof is durable in exhaustion_proof_by_provider; re-logging it
+        # per gap every round evicted real evidence from the 200-entry log
+        # (60 empty candidate entries measured across 5 rounds in
+        # production).
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            self_deprecated = RootReplenishmentTests()
+            self_deprecated._seed_tv_gap(state_root)
+
+            def exhausted_search(_request):
+                return {
+                    "candidates": [],
+                    "search_complete_no_candidates": True,
+                    "completed_sources": ["pansou"],
+                    "unchecked_secondary_candidates": 0,
+                }
+
+            result = run_root_replenishment(
+                self_deprecated._runner(state_root),
+                state_root,
+                "root-1",
+                search_runner=exhausted_search,
+            )
+            self.assertEqual(result["attempts"], [])
+            self.assertEqual(result["tier"], "magnet")
+
+            state = load_root_replenishment_state(state_root, "root-1")
+            self.assertEqual(state["attempt_log"], [])
+            self.assertEqual(
+                state["exhaustion_proof_by_provider"]["quark_share"]["type"],
+                "search_complete_no_candidates",
+            )
+            self.assertEqual(len(load_gap_ledger(state_root, "root-1")[0].attempts), 0)
+
+    def test_incomplete_reason_reports_only_required_sources(self) -> None:
+        # A US-TV work on the magnet tier must not be told to enable anime
+        # indexes: the message consults only the shelf's required sources.
+        from local.scrapeflow_api.replenishment_tiers import TIER_LOCAL_MAGNET
+
+        evidence = {
+            "source_telemetry": {
+                "acg": {"configured": False, "infrastructure_failures": 0},
+                "animetosho": {"configured": False, "infrastructure_failures": 0},
+                "dmhy": {"configured": False, "infrastructure_failures": 0},
+                "bitsearch": {
+                    "configured": True,
+                    "status": "incomplete",
+                    "infrastructure_failures": 2,
+                },
+                "knaben": {
+                    "configured": True,
+                    "status": "incomplete",
+                    "infrastructure_failures": 0,
+                },
+            },
+        }
+        message, kind = root_replenishment._incomplete_search_reason(
+            TIER_LOCAL_MAGNET, evidence, shelf="us_tv",
+        )
+        self.assertEqual(kind, "unavailable")
+        self.assertIn("bitsearch", message)
+        self.assertNotIn("acg", message)
+        self.assertNotIn("animetosho", message)
+        self.assertNotIn("dmhy", message)
+
+        # With bitsearch healthy, the same evidence reads as a bounded
+        # window on the required sources — still no anime-index noise.
+        evidence["source_telemetry"]["bitsearch"]["infrastructure_failures"] = 0
+        message, kind = root_replenishment._incomplete_search_reason(
+            TIER_LOCAL_MAGNET, evidence, shelf="us_tv",
+        )
+        self.assertEqual(kind, "window")
+        self.assertIn("bitsearch", message)
+        self.assertNotIn("acg", message)

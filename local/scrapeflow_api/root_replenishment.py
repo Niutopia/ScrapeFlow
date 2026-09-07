@@ -1670,50 +1670,68 @@ def _search_evidence_is_clean_incomplete(
     return True
 
 
-def _incomplete_search_reason(evidence: Mapping[str, Any] | None) -> str:
-    """Describe an incomplete search without persisting provider text.
+def _incomplete_search_reason(
+    tier: str,
+    evidence: Mapping[str, Any] | None,
+    *,
+    shelf: str | None,
+) -> tuple[str, str]:
+    """Describe an incomplete search through this tier's required sources.
 
-    Search responses may contain opaque share URLs or provider-provided error
-    strings.  The bridge retains only closed telemetry fields, so use those
-    facts to make a same-tier retry visible in both the state and per-gap
-    attempt ledger without leaking credentials.
+    Only the sources that can actually prove this tier exhausted for this
+    shelf are consulted for the message: reporting an anime index's
+    configuration on a US-TV work sends the operator chasing an irrelevant
+    switch.  Returns ``(message, kind)`` where ``kind`` is one of
+    ``disabled`` (deployment configuration), ``unavailable`` (a real
+    outage), ``window`` (bounded paging not finished), or ``unproven``
+    (malformed evidence).
     """
+    unproven = ("补源搜索未提供可验证的完成证明；保持当前层等待重试", "unproven")
     if not isinstance(evidence, Mapping):
-        return "补源搜索未提供可验证的完成证明；保持当前层等待重试"
+        return unproven
     telemetry = evidence.get("source_telemetry")
-    if isinstance(telemetry, Mapping):
-        disabled = sorted(
-            str(source)
-            for source, raw in telemetry.items()
-            if isinstance(source, str)
-            and isinstance(raw, Mapping)
-            and raw.get("configured") is False
+    if not isinstance(telemetry, Mapping):
+        return unproven
+    required = required_sources_for_tier(tier, shelf)
+    rows = {
+        str(source): raw
+        for source, raw in telemetry.items()
+        if isinstance(source, str)
+        and isinstance(raw, Mapping)
+        and str(source) in required
+    }
+    disabled = sorted(
+        name for name, raw in rows.items()
+        if raw.get("configured") is False
+    )
+    if disabled:
+        return (
+            f"{', '.join(disabled[:3])} 发现器未配置或已禁用；保持当前层等待重试",
+            "disabled",
         )
-        if disabled:
-            return f"{', '.join(disabled[:3])} 发现器未配置或已禁用；保持当前层等待重试"
-        unavailable = sorted(
-            str(source)
-            for source, raw in telemetry.items()
-            if isinstance(source, str)
-            and isinstance(raw, Mapping)
-            and isinstance(raw.get("infrastructure_failures"), int)
-            and not isinstance(raw.get("infrastructure_failures"), bool)
-            and raw.get("infrastructure_failures", 0) > 0
+    unavailable = sorted(
+        name for name, raw in rows.items()
+        if isinstance(raw.get("infrastructure_failures"), int)
+        and not isinstance(raw.get("infrastructure_failures"), bool)
+        and raw.get("infrastructure_failures", 0) > 0
+    )
+    if unavailable:
+        return (
+            f"{', '.join(unavailable[:3])} 搜索基础设施不可用；保持当前层等待重试",
+            "unavailable",
         )
-        if unavailable:
-            return f"{', '.join(unavailable[:3])} 搜索基础设施不可用；保持当前层等待重试"
-        bounded = sorted(
-            str(source)
-            for source, raw in telemetry.items()
-            if isinstance(source, str)
-            and isinstance(raw, Mapping)
-            and raw.get("configured") is True
-            and raw.get("status") == "incomplete"
-            and raw.get("infrastructure_failures") == 0
+    bounded = sorted(
+        name for name, raw in rows.items()
+        if raw.get("configured") is True
+        and raw.get("status") == "incomplete"
+        and raw.get("infrastructure_failures") == 0
+    )
+    if bounded:
+        return (
+            f"{', '.join(bounded[:3])} 搜索窗口未穷尽（window_pending）；保持当前层等待重试",
+            "window",
         )
-        if bounded:
-            return f"{', '.join(bounded[:3])} 只读分享检查尚未穷尽；保持当前层等待重试"
-    return "补源搜索未提供可验证的完成证明；保持当前层等待重试"
+    return unproven
 
 
 def _noop_result(state: dict[str, Any], tier: str) -> dict[str, Any]:
@@ -3986,38 +4004,58 @@ def run_root_replenishment(
                 )
                 if clean_incomplete:
                     hit_clean_incomplete = True
-                    failure_scope = FAILURE_CANDIDATE
                 else:
                     hit_infrastructure = True
-                    failure_scope = FAILURE_INFRASTRUCTURE
-                failure_detail = _incomplete_search_reason(evidence)
+                failure_detail, reason_kind = _incomplete_search_reason(
+                    tier, evidence, shelf=shelf,
+                )
                 _trace(
                     f"no exhaustion proof root={root_task_id} tier={tier} "
-                    f"tmdb={tmdb_id}",
+                    f"tmdb={tmdb_id} kind={reason_kind}",
                 )
             for row in request.get("gaps") or []:
                 token = str(row.get("id") or "")
                 for gap in by_token.get(token, ()):
-                    if not proof_complete:
-                        record_attempt(
-                            state_root,
-                            root_task_id,
-                            gap.gap_id,
-                            attempt_id=uuid.uuid4().hex,
-                            provider=_TIER_PROVIDER.get(tier, tier),
-                            tier=tier,
-                            locator=None,
-                            status=_attempt_status(failure_scope),
-                            error=failure_detail,
-                        )
+                    if proof_complete:
+                        # The exhaustion proof is already durable in the tier
+                        # state (exhaustion_proof_by_provider).  Re-logging
+                        # it per gap every round only evicts real evidence
+                        # from the bounded attempt log.
+                        continue
+                    if clean_incomplete:
+                        # A bounded window that has not finished paging is a
+                        # window fact, not a resource verdict: the state log
+                        # carries it as ``window_pending`` and the gap
+                        # ledger keeps its candidate_failed history for real
+                        # resource rejections only.
+                        attempts.append({
+                            "gap_id": gap.gap_id,
+                            "tier": tier,
+                            "outcome": "window_pending",
+                            "error": failure_detail,
+                        })
+                        continue
+                    if reason_kind == "disabled":
+                        # A disabled required source is deployment
+                        # configuration, not a per-gap event: the tier stays
+                        # fail-closed, but no per-gap record is written.
+                        continue
+                    record_attempt(
+                        state_root,
+                        root_task_id,
+                        gap.gap_id,
+                        attempt_id=uuid.uuid4().hex,
+                        provider=_TIER_PROVIDER.get(tier, tier),
+                        tier=tier,
+                        locator=None,
+                        status="infrastructure",
+                        error=failure_detail,
+                    )
                     attempts.append({
                         "gap_id": gap.gap_id,
                         "tier": tier,
-                        "outcome": (
-                            FAILURE_CANDIDATE
-                            if proof_complete else failure_scope
-                        ),
-                        **({"error": failure_detail} if not proof_complete else {}),
+                        "outcome": FAILURE_INFRASTRUCTURE,
+                        "error": failure_detail,
                     })
             continue
 
