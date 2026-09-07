@@ -194,6 +194,7 @@ _NYAA_MAX_MANIFEST_INSPECTIONS = 32
 _SAFE_INFRA_FAILURE_CODES = frozenset({
     "connection_refused",
     "connection_reset",
+    "dht_window_cold",
     "dns_failure",
     "network_error",
     "os_error",
@@ -4123,15 +4124,18 @@ def _magnet_metadatas_batch(
     *,
     timeout: int = 200,
     pause_requested: Callable[[], bool] | None = None,
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], int]:
     """Resolve several magnets' metadata in one bounded aria2 DHT pass.
 
     The returned mapping is keyed by each resolved torrent's true infohash.
     Metadata comes from the swarm itself, so it is anchored to the magnet's
-    identity and cannot be swapped by a hostile download endpoint.
+    identity and cannot be swapped by a hostile download endpoint.  The
+    second return value counts magnets the window could not resolve: a cold
+    DHT window is a *window* fact, and the callers report it as
+    infrastructure telemetry instead of silently dropping the rows.
     """
     if not magnet_uris:
-        return {}
+        return {}, 0
     scratch.mkdir(parents=True, exist_ok=True)
     command = [
         "aria2c", "--seed-time=0", "--file-allocation=none",
@@ -4142,6 +4146,7 @@ def _magnet_metadatas_batch(
         f"--dir={scratch}",
         *magnet_uris,
     ]
+    batch_failed = False
     try:
         _pause_checkpoint(pause_requested)
         subprocess.run(
@@ -4150,7 +4155,9 @@ def _magnet_metadatas_batch(
             env=_direct_download_env(os.environ),
         )
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        # A cold DHT window resolved nothing or the runner died: the
+        # unresolved count below carries that fact into telemetry.
+        batch_failed = True
     manifests: dict[str, dict[str, Any]] = {}
     for path in scratch.iterdir():
         if not path.is_file() or path.suffix != ".torrent":
@@ -4163,7 +4170,17 @@ def _magnet_metadatas_batch(
         except (OSError, ValueError):
             continue
         manifests[manifest["infohash"]] = manifest
-    return manifests
+    resolved_hashes = {
+        str(manifest.get("infohash") or "").lower() for manifest in manifests.values()
+    }
+    unresolved = 0
+    for uri in magnet_uris:
+        match = _MAGNET_URI_PATTERN.search(uri)
+        if match is not None and match.group(1).lower() not in resolved_hashes:
+            unresolved += 1
+    if batch_failed and not manifests:
+        unresolved = max(unresolved, len(magnet_uris))
+    return manifests, unresolved
 
 
 def _search_bitsearch(
@@ -4244,9 +4261,17 @@ def _search_bitsearch(
     resource_failed_locators: list[str] = []
     with tempfile.TemporaryDirectory(prefix="scrapeflow-bitsearch-") as directory:
         scratch = Path(directory)
-        manifests = _magnet_metadatas_batch(
+        manifests, dht_unresolved = _magnet_metadatas_batch(
             list(magnets.values()), scratch, timeout=metadata_budget,
         )
+        if dht_unresolved:
+            # A cold DHT window dropped rows the index did return; count it
+            # as infrastructure so the lane reads "window not finished"
+            # instead of silently "no candidates".
+            infrastructure_failures += 1
+            infrastructure_failure_types["dht_window_cold"] = (
+                infrastructure_failure_types.get("dht_window_cold", 0) + 1
+            )
         for infohash, title in rows.items():
             manifest = manifests.get(infohash)
             if manifest is None:
@@ -4380,7 +4405,7 @@ def _search_knaben(
         scratch = Path(directory)
         # Knaben magnets carry their own trackers; the batch helper keeps
         # them and only appends the bootstrap list when none are present.
-        manifests = _magnet_metadatas_batch(
+        manifests, dht_unresolved = _magnet_metadatas_batch(
             [
                 _magnet_with_trackers(magnets[infohash])
                 for infohash in rows
@@ -4388,6 +4413,11 @@ def _search_knaben(
             scratch,
             timeout=metadata_budget,
         )
+        if dht_unresolved:
+            infrastructure_failures += 1
+            infrastructure_failure_types["dht_window_cold"] = (
+                infrastructure_failure_types.get("dht_window_cold", 0) + 1
+            )
         for infohash, title in rows.items():
             manifest = manifests.get(infohash)
             if manifest is None:
@@ -5583,13 +5613,53 @@ def _automatic_upload(
     client.upload_file(target, source, content_type)
 
 
+def _find_retained_member(
+    candidate_dir: Path, relative_path: str, size: int,
+) -> Path | None:
+    """Locate one completed member in any retained group of the candidate.
+
+    A resumed attempt regroups the pending members (remote-committed ones
+    drop out), so a member completed inside an OLD group-NNN directory is
+    invisible to the new group's payload check.  The retained bytes are
+    keyed by the manifest's exact relative path and size — never by the
+    group ordinal, which drifts on every regroup.
+    """
+    if not candidate_dir.is_dir():
+        return None
+    suffix = relative_path.replace("\\", "/")
+    try:
+        for payload in sorted(candidate_dir.glob("group-*/payload")):
+            for path in payload.rglob("*"):
+                if (
+                    path.is_file()
+                    and path.as_posix().endswith(suffix)
+                    and path.stat().st_size == size
+                ):
+                    return path
+    except OSError:
+        return None
+    return None
+
+
 def _find_download(payload: Path, relative_path: str, size: int) -> Path:
     suffix = relative_path.replace("\\", "/")
     basename = Path(relative_path).name
+    # The exact relative path from the manifest is the primary key: two
+    # files in different subdirectories of one pack may share a name and a
+    # size (season packs do this), and a name+size scan cannot tell them
+    # apart.  Only when the exact suffix is absent (a pack flattened by a
+    # prior tool) does the basename+size scan stand in.
+    exact = [
+        path for path in payload.rglob("*")
+        if path.is_file() and path.as_posix().endswith(suffix) and path.stat().st_size == size
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        raise ValueError(f"下载文件定位结果异常: {relative_path}; matches={len(exact)}")
     candidates = [
         path for path in payload.rglob("*")
-        if path.is_file() and path.name == basename
-        and path.as_posix().endswith(suffix) and path.stat().st_size == size
+        if path.is_file() and path.name == basename and path.stat().st_size == size
     ]
     if len(candidates) != 1:
         raise ValueError(f"下载文件定位结果异常: {relative_path}; matches={len(candidates)}")
@@ -5939,13 +6009,39 @@ def _acquire(
             group_dir = group[0]["candidate_dir"] / f"group-{group_number:03d}"
             group_payload = group_dir / "payload"
             group_payload.mkdir(parents=True, exist_ok=True)
-            group_indices = {int(plan["index"]) for plan in group}
-            if _payload_is_complete(group_payload, group[0]["acquisition"], group_indices):
+            # A resumed attempt regrouped the pending members, so a member
+            # completed inside an OLD group is invisible to this group's
+            # payload check.  Before declaring anything pending for aria2,
+            # adopt any retained completed member from any group of this
+            # candidate — matched by exact manifest path and size, never by
+            # group ordinal.  Adopted members flow straight into the upload
+            # loop below.
+            adopted: list[dict[str, Any]] = []
+            still_pending: list[dict[str, Any]] = []
+            for plan in group:
+                candidate_dir = Path(plan["candidate_dir"])
+                source = _find_retained_member(
+                    candidate_dir, str(plan["path"]), int(plan["size"]),
+                )
+                if source is not None:
+                    plan["adopted_source"] = source
+                    adopted.append(plan)
+                else:
+                    still_pending.append(plan)
+            group_indices = {int(plan["index"]) for plan in still_pending}
+            if (
+                not still_pending
+                or _payload_is_complete(
+                    group_payload, group[0]["acquisition"], group_indices,
+                )
+            ):
                 print(
                     f"[replenishment] 复用已验证下载组 {group_number}/{group_total}",
                     flush=True,
                 )
+                group = still_pending
             else:
+                group = still_pending
                 command = [
                     "aria2c", "--seed-time=0", "--file-allocation=none",
                     "--allow-overwrite=true", "--auto-file-renaming=false",
@@ -6016,12 +6112,16 @@ def _acquire(
                         f"aria2c 下载失败: {tail}", stage="candidate_download",
                         candidate=group[0]["selection"],
                     )
-            for plan in group:
+            for plan in adopted + list(group):
                 _pause_checkpoint(pause_requested)
                 delivery_root = str(plan["delivery_root"])
-                source = _find_download(
-                    group_payload, str(plan["path"]), int(plan["size"]),
-                )
+                adopted_source = plan.get("adopted_source")
+                if adopted_source is not None:
+                    source = Path(adopted_source)
+                else:
+                    source = _find_download(
+                        group_payload, str(plan["path"]), int(plan["size"]),
+                    )
                 if plan["is_video"]:
                     _verify_video_payload(source, int(plan["size"]), plan["selection"])
                 row: dict[str, Any] = {

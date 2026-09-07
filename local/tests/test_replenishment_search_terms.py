@@ -771,7 +771,7 @@ class BitSearchSourceTests(unittest.TestCase):
             self.assertTrue(
                 magnet_uris[0].startswith("magnet:?xt=urn:btih:79cd2aa9a0b9"),
             )
-            return {"79cd2aa9a0b923e2c13131653143ba55a9d2cff7": manifest}
+            return {"79cd2aa9a0b923e2c13131653143ba55a9d2cff7": manifest}, 0
 
         with patch.object(adapter, "_fetch_bytes", side_effect=fake_fetch), \
                 patch.object(adapter, "_magnet_metadatas_batch", side_effect=fake_batch):
@@ -790,21 +790,26 @@ class BitSearchSourceTests(unittest.TestCase):
     def test_unresolved_swarm_is_a_resource_miss_not_an_outage(self) -> None:
         request = self._request()
 
+        # The whole batch unresolved (a cold DHT window): the source must
+        # NOT claim exhaustion — the rows the index returned were dropped by
+        # our own window, and the telemetry carries dht_window_cold.
         with patch.object(
             adapter, "_fetch_bytes",
             return_value=self._page().encode(),
-        ), patch.object(adapter, "_magnet_metadatas_batch", return_value={}):
+        ), patch.object(
+            adapter, "_magnet_metadatas_batch", return_value=({}, 2),
+        ):
             result = adapter._search_bitsearch(
                 request, set(), deadline=adapter.time.monotonic() + 30,
             )
 
         self.assertEqual(len(result), 0)
-        self.assertTrue(result.source_exhausted)
-        self.assertEqual(
-            result.resource_failed_locators,
-            ["torrent:79cd2aa9a0b923e2c13131653143ba55a9d2cff7"],
+        self.assertFalse(result.source_exhausted)
+        self.assertGreaterEqual(
+            result.infrastructure_failure_types.get("dht_window_cold", 0), 1,
+            "the cold DHT window must be visible in telemetry",
         )
-        self.assertEqual(result.infrastructure_failures, 0)
+        self.assertGreaterEqual(result.infrastructure_failures, 1)
 
 
 class MagnetMemberPipelineTests(unittest.TestCase):
@@ -1452,3 +1457,112 @@ class CatalogWriteSurfaceTests(unittest.TestCase):
             stored = result["stored"]["acquisition"]
             self.assertEqual(stored["file_index_by_gap"], {"S10E01": [3]})
             self.assertEqual(stored["file_size_by_index"], {"3": 11502449200})
+
+
+class CrossGroupAdoptionTests(unittest.TestCase):
+    """Drift-fix regressions: retained members are keyed by path, not group."""
+
+    def test_find_download_prefers_exact_relative_path(self) -> None:
+        # Two same-named, same-sized members in different subdirectories:
+        # the exact manifest path is the primary key; a name+size scan alone
+        # could never tell them apart (the old burn-locator path).
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = Path(directory)
+            for folder in ("disc1", "disc2"):
+                target = payload / folder / "Show.S01E01.mkv"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(b"x" * 1024)
+            found = adapter_._find_download(
+                payload, "disc2/Show.S01E01.mkv", 1024,
+            )
+            self.assertEqual(found.parent.name, "disc2")
+
+    def test_find_download_falls_back_to_basename_when_flattened(self) -> None:
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = Path(directory)
+            target = payload / "Show.S01E02.mkv"
+            target.write_bytes(b"y" * 2048)
+            found = adapter_._find_download(
+                payload, "nested/missing/Show.S01E02.mkv", 2048,
+            )
+            self.assertEqual(found, target)
+
+    def test_find_retained_member_adopts_across_groups(self) -> None:
+        # The drift scenario: the member completed in group-001 but the
+        # regrouped pending list placed it in group-002.  The retained bytes
+        # are found by exact path+size regardless of the group ordinal.
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        with tempfile.TemporaryDirectory() as directory:
+            candidate_dir = Path(directory)
+            retained = (
+                candidate_dir / "group-001" / "payload"
+                / "Example.Show.S01E01.1080p.mkv"
+            )
+            retained.parent.mkdir(parents=True)
+            retained.write_bytes(b"z" * 4096)
+            empty = candidate_dir / "group-002" / "payload"
+            empty.mkdir(parents=True)
+
+            found = adapter_._find_retained_member(
+                candidate_dir, "Example.Show.S01E01.1080p.mkv", 4096,
+            )
+            self.assertEqual(found, retained)
+            self.assertIsNone(
+                adapter_._find_retained_member(
+                    candidate_dir, "Example.Show.S01E01.1080p.mkv", 4097,
+                ),
+            )
+            self.assertIsNone(
+                adapter_._find_retained_member(
+                    candidate_dir / "no-such", "any.mkv", 1,
+                ),
+            )
+
+    def test_magnet_metadatas_batch_reports_unresolved_count(self) -> None:
+        # The window fact crosses the adapter boundary: magnets the DHT
+        # window could not resolve are counted, not silently dropped.  The
+        # resolved manifest's true infohash (sha1 of the bencoded info) is
+        # what keys the returned mapping.
+        import engine.tools._replenishment_local_adapter_impl as adapter_
+
+        torrent_bytes = self._single_file_torrent()
+        resolved_hash = adapter_._torrent_manifest(torrent_bytes)["infohash"]
+        unresolved_hash = "b" * 40
+        magnet = "magnet:?xt=urn:btih:{hash}&dn=Name"
+        # The scratch file name is irrelevant — aria2 names it after the
+        # infohash, and the helper indexes by the manifest's own hash.
+        seed_name = "resolved.torrent"
+
+        def fake_run(command, **_kwargs):
+            directory = next(
+                Path(item[len("--dir="):]) for item in command
+                if item.startswith("--dir=")
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / seed_name).write_bytes(torrent_bytes)
+            return type("_C", (), {"returncode": 0, "stdout": "ok"})()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                adapter.subprocess, "run", side_effect=fake_run,
+            ):
+                manifests, unresolved = adapter._magnet_metadatas_batch(
+                    [
+                        magnet.format(hash=resolved_hash),
+                        magnet.format(hash=unresolved_hash),
+                    ],
+                    Path(directory),
+                    timeout=60,
+                )
+        self.assertIn(resolved_hash, manifests)
+        self.assertNotIn(unresolved_hash, manifests)
+        self.assertEqual(unresolved, 1)
+
+    @staticmethod
+    def _single_file_torrent() -> bytes:
+        return MagnetMemberPipelineTests._torrent_bytes()
