@@ -22,6 +22,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
+import urllib.error
 import urllib.request
 
 from engine.scraper import AListClient, join_remote

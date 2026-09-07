@@ -10,35 +10,20 @@ is retained until the coordinator proves formal-library convergence.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import hashlib
-from html.parser import HTMLParser
-import html as html_module
 import json
 import os
 from pathlib import Path
-import posixpath
 import re
 import shutil
-import socket
-import ssl
 import subprocess
 import sys
-import tempfile
 import time
-from typing import Any, Callable, Iterable, Mapping, Sequence
-import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-import xml.etree.ElementTree as ET
+from typing import Any, Callable, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine.scraper import AListClient, ApiError, ScraperError, join_remote, split_remote
 from engine.scrapeflow.provider_capabilities import (
     ACTIVE_PROVIDERS,
     ACQUISITION_TORRENT,
@@ -95,10 +80,6 @@ from engine.scrapeflow.media_quality import (
 )
 
 from engine.scrapeflow.serialization import atomic_write_json
-from engine.scrapeflow.video_admission import (
-    VideoAdmissionError,
-    probe_local_video_stream,
-)
 
 
 from engine.tools.replenishment_search_terms import (  # noqa: F401

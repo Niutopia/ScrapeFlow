@@ -8,10 +8,8 @@ direction is strictly downward (common ← everything), so no cycle can form.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from html.parser import HTMLParser
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
@@ -93,16 +91,7 @@ def _pause_checkpoint(pause_requested: Callable[[], bool] | None) -> None:
         )
 
 
-from engine.scrapeflow.replenishment_matching import (
-    coverage_tokens as _coverage_tokens,
-    expanded_episode_ids as _expanded_episode_ids,
-    normalized_text as _normalized_text,
-    season_markers as _season_markers,
-)
-from engine.scrapeflow.media_quality import (
-    minimum_video_bytes,
-    video_size_is_admissible,
-)
+from engine.scrapeflow.replenishment_matching import expanded_episode_ids as _expanded_episode_ids
 from engine.scrapeflow.media_policy import (
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,

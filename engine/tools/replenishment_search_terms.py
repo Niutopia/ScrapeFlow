@@ -11,11 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
-from engine.scrapeflow.media_policy import VIDEO_EXTENSIONS
 from engine.scrapeflow.replenishment_matching import (
     coverage_tokens as _coverage_tokens,
     expanded_episode_ids as _expanded_episode_ids,

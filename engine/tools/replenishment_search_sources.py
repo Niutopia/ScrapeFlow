@@ -15,13 +15,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import html
 import html as html_module
 import json
 import os
 import re
-import shutil
-import subprocess
 import tempfile
 import time
 import unicodedata
@@ -37,10 +34,8 @@ from engine.tools.replenishment_common import (
     _DynamicSearchResult,
     _MAGNET_BOOTSTRAP_TRACKERS,
     _acg_http_opener,
-    _bencode,
     _base32_infohash,
     _bounded_seconds,
-    _direct_download_env,
     _download_torrent,
     _fetch_bytes,
     _is_ordinary_primary_video_path,
@@ -48,13 +43,6 @@ from engine.tools.replenishment_common import (
     _magnet_metadatas_batch,
     _network_failure_code,
     _nyaa_torrent_mirror_url,
-    _pause_checkpoint,
-    _safe_infrastructure_failure_types,
-    _torrent_manifest,
-    ReplenishmentCandidateError,
-    ReplenishmentInfrastructureError,
-    ReplenishmentPauseRequested,
-    MagnetMetadataUnavailable,
     SUBTITLE_EXTENSIONS,
     VIDEO_EXTENSIONS,
 )
@@ -68,7 +56,6 @@ from engine.scrapeflow.replenishment_matching import (
     expanded_episode_ids as _expanded_episode_ids,
     season_markers as _season_markers,
 )
-from engine.scrapeflow.media_policy import VIDEO_EXTENSIONS as _VIDEO_EXTENSIONS
 from engine.tools.replenishment_search_terms import (
     _DMHY_MAX_QUERY_TERMS,
     _DMHY_MAX_QUERY_TERM_LENGTH,
@@ -76,7 +63,6 @@ from engine.tools.replenishment_search_terms import (
     _NYAA_MAX_LOGICAL_QUERY_TERMS,
     _NYAA_MAX_MANIFEST_INSPECTIONS,
     _NYAA_MAX_QUERY_TERMS,
-    _NYAA_MAX_QUERY_TERM_LENGTH,
     _NYAA_MAX_RSS_ROWS_PER_QUERY,
     _S00_TITLE_PREFLIGHT_GENERIC_KEYS,
     _S00_TITLE_PREFLIGHT_KEY_LIMIT,
@@ -88,12 +74,10 @@ from engine.tools.replenishment_search_terms import (
     _compact_dynamic_search_terms,
     _explicit_episode_search_terms,
     _identity_query_bases,
-    _nyaa_logical_search_terms,
     _nyaa_release_priority,
     _nyaa_request_cursor,
     _nyaa_request_fingerprint,
     _nyaa_safe_query_term,
-    _optional_episode_title_search_terms,
     _positive_requested_seasons,
     _release_year_conflict,
     _requested_episode_targets,
