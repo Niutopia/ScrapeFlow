@@ -4676,6 +4676,14 @@ def _search_subsplease(
     )
 
 
+class MagnetMetadataUnavailable(RuntimeError):
+    """The swarm did not serve its metadata within the bounded DHT window.
+
+    This is a window verdict (cold DHT bootstrap, seeders offline), never a
+    resource verdict: the same magnet may resolve minutes later.
+    """
+
+
 class _BDecoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -4891,7 +4899,7 @@ def _magnet_metadata(
     if saved is None:
         tail = " ".join(completed.stdout.splitlines()[-8:])[:1200]
         shutil.rmtree(scratch, ignore_errors=True)
-        raise RuntimeError(f"magnet 元数据解析失败: {tail}")
+        raise MagnetMetadataUnavailable(f"magnet 元数据解析失败: {tail}")
     data = saved.read_bytes()
     if len(data) > MAX_TORRENT_BYTES:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -5237,6 +5245,13 @@ def _preflight(
             indices, _by_index = _verify_manifest(selection, manifest)
         except ReplenishmentPauseRequested:
             raise
+        except MagnetMetadataUnavailable as exc:
+            # The DHT window did not reach the swarm; the resource itself is
+            # unproven either way, so retry later without excluding it.
+            raise ReplenishmentInfrastructureError(
+                f"magnet 元数据本窗口不可得，等待重试: {exc}",
+                stage="candidate_preflight",
+            ) from exc
         except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
             raise ReplenishmentCandidateError(
                 str(exc), stage="candidate_preflight", candidate=selection,
