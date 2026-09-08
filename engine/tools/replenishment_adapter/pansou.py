@@ -570,6 +570,64 @@ def quark_share_inspector(
     return inspect
 
 
+def _request_excluded_locators(request: Mapping[str, Any]) -> set[str]:
+    excluded_rows = request.get("excluded_candidates")
+    return {
+        str(row.get("locator") or "")
+        for row in excluded_rows if isinstance(row, Mapping)
+    } if isinstance(excluded_rows, list) else set()
+
+
+def _operator_catalog_rows(request: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Return operator-supplied Quark share rows from the direct-supply catalog.
+
+    Catalog ``quark_share`` rows are hand-pasted links.  A missing,
+    unconfigured, or unreadable catalog simply means no operator rows; it
+    never blocks the PanSou lane and never raises.
+    """
+    media = request.get("media") if isinstance(request.get("media"), Mapping) else {}
+    tmdb_id = media.get("tmdb_id")
+    if type(tmdb_id) is not int or tmdb_id <= 0:
+        return []
+    raw_path = os.getenv("SCRAPEFLOW_REPLENISHMENT_CATALOG", "").strip()
+    if not raw_path:
+        return []
+    try:
+        document = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    projects = document.get("projects") if isinstance(document, Mapping) else {}
+    project = projects.get(str(tmdb_id)) if isinstance(projects, Mapping) else None
+    rows = project.get("candidates") if isinstance(project, Mapping) else None
+    output: list[dict[str, str]] = []
+    if not isinstance(rows, list):
+        return output
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("provider") or "").strip() != PROVIDER_QUARK_SHARE:
+            continue
+        release_name = row.get("release_name")
+        if not isinstance(release_name, str) or not release_name.strip():
+            continue
+        parsed = _quark_share(row.get("locator"))
+        if parsed is None:
+            continue
+        _pwd_id, share_url, url_passcode = parsed
+        passcode = row.get("passcode")
+        if not isinstance(passcode, str):
+            passcode = url_passcode
+        passcode = passcode.strip()
+        if passcode and _SAFE_SHARE_PASSCODE.fullmatch(passcode) is None:
+            continue
+        output.append({
+            "url": share_url,
+            "passcode": passcode,
+            "release_name": release_name.strip(),
+        })
+    return output
+
+
 class PanSouDiscovery:
     """Bounded official-API search plus exact read-only share inspection."""
 
@@ -585,6 +643,7 @@ class PanSouDiscovery:
         max_queries: int = 4,
         max_links: int = 64,
         config_issue: str = "",
+        refresh: bool = False,
     ) -> None:
         self.enabled = bool(enabled)
         self.url = url
@@ -595,6 +654,10 @@ class PanSouDiscovery:
         self.max_queries = max(1, min(12, int(max_queries)))
         self.max_links = max(1, min(256, int(max_links)))
         self.config_issue = config_issue
+        # 2026-09-08 实测:索引收录的分享链接到补源时几乎全死(5/5 已被
+        # 取消)。refresh=true 让 PanSou 现场重抓源站,牺牲查询时延换链接
+        # 新鲜度;默认关,部署可用 SCRAPEFLOW_PANSOU_REFRESH=1 打开。
+        self.refresh = bool(refresh)
 
     @classmethod
     def from_env(
@@ -627,6 +690,9 @@ class PanSouDiscovery:
             max_queries=_bounded_int("SCRAPEFLOW_PANSOU_MAX_QUERIES", 12, 1, 32),
             max_links=_bounded_int("SCRAPEFLOW_PANSOU_MAX_LINKS", 64, 1, 256),
             config_issue=config_issue,
+            refresh=os.getenv(
+                "SCRAPEFLOW_PANSOU_REFRESH", "0",
+            ).strip().casefold() in _TRUE_VALUES,
         )
 
     @staticmethod
@@ -660,18 +726,123 @@ class PanSouDiscovery:
             "active_search_lane": "quark_share",
         }
 
+    def _operator_candidates(
+        self,
+        request: Mapping[str, Any],
+        excluded: set[str],
+        reviewed_misses: set[str],
+        deadline: float,
+    ) -> dict[str, Any]:
+        """Inspect operator-supplied catalog shares; report every outcome.
+
+        Catalog rows are hand-supplied, so unlike index rows each outcome is
+        surfaced as a warning: an expired link or a manifest that does not
+        cover the gaps is something the operator must see, not a silent miss.
+        """
+        stats: dict[str, Any] = {
+            "candidates": [],
+            "warnings": [],
+            "expired_locators": [],
+            "inspected_share_count": 0,
+        }
+        inspector = self.inspector
+        if inspector is None:
+            return stats
+        for raw in _operator_catalog_rows(request):
+            parsed = _quark_share(raw.get("url"))
+            if parsed is None:
+                continue
+            pwd_id, _share_url, _url_passcode = parsed
+            locator = f"{PROVIDER_QUARK_SHARE}:{pwd_id}"
+            if locator in excluded or locator in reviewed_misses:
+                continue
+            if time.monotonic() >= deadline:
+                stats["warnings"].append(
+                    "operator-supplied share inspection window exhausted",
+                )
+                break
+            stats["inspected_share_count"] += 1
+            try:
+                manifest_rows = inspector(pwd_id, raw["passcode"])
+            except QuarkShareExpiredError:
+                stats["expired_locators"].append(locator)
+                stats["warnings"].append(
+                    f"operator-supplied share expired: {pwd_id}",
+                )
+                continue
+            except Exception as exc:
+                stats["warnings"].append(
+                    "operator-supplied share inspection failed: "
+                    f"{type(exc).__name__}",
+                )
+                continue
+            candidate = _candidate_from_share(request, raw, manifest_rows)
+            if candidate is None:
+                stats["warnings"].append(
+                    f"operator-supplied share does not cover the gaps: {pwd_id}",
+                )
+                continue
+            # The operator supplied this link by hand; it expresses
+            # acquisition intent and outranks equal index-discovered rows.
+            candidate["operator_supplied"] = True
+            stats["candidates"].append(candidate)
+        return stats
+
+    def _operator_or_incomplete(
+        self,
+        reason: str,
+        *,
+        configured: bool,
+        operator: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return operator candidates when the PanSou index itself is unusable.
+
+        A disabled, unconfigured, or failing index must not hide
+        operator-supplied candidates.  The search stays marked incomplete so
+        the tier ladder keeps its truthful exhaustion semantics for the
+        index lane while the hand-supplied evidence still reaches selection.
+        """
+        base = self._incomplete(reason, configured=configured)
+        candidates = list(operator["candidates"])
+        if not candidates and not operator["warnings"]:
+            return base
+        base["candidates"] = candidates
+        base["warnings"] = [reason, *operator["warnings"]]
+        telemetry = base["source_telemetry"]["PanSou"]
+        telemetry.update({
+            "operator_supplied_count": len(candidates),
+            "operator_expired_locators": list(operator["expired_locators"]),
+            "operator_inspected_share_count": operator["inspected_share_count"],
+        })
+        return base
+
     def run(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        if not self.enabled:
-            reason = self.config_issue or "PanSou discovery is disabled"
-            return self._incomplete(reason, configured=False)
-        try:
-            endpoint = _pansou_endpoint(self.url)
-        except PanSouDiscoveryError as exc:
-            return self._incomplete(str(exc), configured=False)
+        # Operator-supplied catalog shares run before every PanSou gate: the
+        # direct-supply lane expresses acquisition intent by hand and must not
+        # depend on the index being configured, reachable, or even enabled.
+        deadline = time.monotonic() + self.timeout
+        excluded = _request_excluded_locators(request)
+        reviewed_misses = _reviewed_resource_miss_locators(request)
         if self.inspector is None:
+            # The read-only inspector gates both lanes: operator-supplied
+            # shares and index rows share the same manifest inspection.
             return self._incomplete(
                 "PanSou has no read-only Quark share inspector",
                 configured=True,
+            )
+        operator = self._operator_candidates(
+            request, excluded, reviewed_misses, deadline,
+        )
+        if not self.enabled:
+            reason = self.config_issue or "PanSou discovery is disabled"
+            return self._operator_or_incomplete(
+                reason, configured=False, operator=operator,
+            )
+        try:
+            endpoint = _pansou_endpoint(self.url)
+        except PanSouDiscoveryError as exc:
+            return self._operator_or_incomplete(
+                str(exc), configured=False, operator=operator,
             )
         try:
             all_terms = _share_pack_term_order(_impl._compact_dynamic_search_terms(  # noqa: SLF001
@@ -679,12 +850,17 @@ class PanSouDiscovery:
                 maximum=_MAX_QUERY_PROOF_TERMS,
             ))
         except Exception:
-            return self._incomplete(
+            return self._operator_or_incomplete(
                 "PanSou request term construction failed",
                 configured=True,
+                operator=operator,
             )
         if not all_terms:
-            return self._incomplete("PanSou request has no safe search term", configured=True)
+            return self._operator_or_incomplete(
+                "PanSou request has no safe search term",
+                configured=True,
+                operator=operator,
+            )
         # Searches are deliberately windowed across explicit retries.  The
         # cursor is request-scoped and contains only a deterministic-term
         # fingerprint plus a bounded offset; malformed/stale cursors fail
@@ -715,19 +891,12 @@ class PanSouDiscovery:
             1 if len(all_terms) == _MAX_QUERY_PROOF_TERMS and end_offset == len(all_terms) else 0
         )
 
-        excluded_rows = request.get("excluded_candidates")
-        excluded = {
-            str(row.get("locator") or "")
-            for row in excluded_rows if isinstance(row, Mapping)
-        } if isinstance(excluded_rows, list) else set()
-        reviewed_misses = _reviewed_resource_miss_locators(request)
         attempts = 0
         responses = 0
         unchecked = unchecked_query_terms
         raw_by_locator: dict[str, dict[str, str]] = {}
         warnings: list[str] = []
         infrastructure_failures = 0
-        deadline = time.monotonic() + self.timeout
         invalid_share_count = 0
         for index, term in enumerate(terms):
             if time.monotonic() >= deadline:
@@ -738,7 +907,7 @@ class PanSouDiscovery:
                 "kw": term,
                 "res": "all",
                 "src": "all",
-                "refresh": False,
+                "refresh": self.refresh,
                 "cloud_types": ["quark"],
             }
             try:
@@ -791,6 +960,8 @@ class PanSouDiscovery:
         resource_failures: list[str] = []
         reviewed_resource_misses: list[str] = []
         inspected = 0
+        expired_shares = 0
+        uncovered_shares = 0
         for index, (locator, raw) in enumerate(raw_links):
             parsed = _quark_share(raw.get("url"))
             if parsed is None:
@@ -812,6 +983,7 @@ class PanSouDiscovery:
             except QuarkShareExpiredError:
                 resource_failures.append(locator)
                 reviewed_resource_misses.append(locator)
+                expired_shares += 1
                 inspected += 1
                 continue
             except (QuarkBridgeError, OSError, TimeoutError) as exc:
@@ -833,8 +1005,18 @@ class PanSouDiscovery:
             if candidate is None:
                 resource_failures.append(locator)
                 reviewed_resource_misses.append(locator)
+                uncovered_shares += 1
                 continue
             candidates.append(candidate)
+        # 死链率摘要:让"找不到"可解释——索引返回了多少、检查了多少、
+        # 多少已死、多少清单不覆盖,一眼可读(2026-09-08 实测索引死链
+        # 率近 100%,这行是排障的第一落点)。
+        if inspected:
+            warnings.append(
+                f"PanSou 本窗检查 {inspected} 个分享:"
+                f"{expired_shares} 死链,{uncovered_shares} 清单不覆盖,"
+                f"{len(candidates)} 可用"
+            )
 
         # A materializer-failed locator is not a fresh zero-result search.
         # The policy's 30-distinct-resource rule must remain the only way for
@@ -854,6 +1036,12 @@ class PanSouDiscovery:
             and infrastructure_failures == 0
             and unchecked == 0
         )
+        # Operator-supplied candidates join before the no-candidate verdict:
+        # hand-supplied evidence means the lane produced candidates even when
+        # the index window itself returned nothing, and the tier ladder must
+        # not advance past them as if this lane were empty.
+        candidates = [*operator["candidates"], *candidates]
+        warnings.extend(operator["warnings"])
         no_candidates = source_exhausted and not candidates
         # A cursor may advance only after this whole window's deterministic
         # terms and every returned share have been accounted for.  Transport,
@@ -885,6 +1073,11 @@ class PanSouDiscovery:
             "preexcluded_candidate_count": preexcluded,
             "invalid_share_count": invalid_share_count,
             "inspected_share_count": inspected,
+            "expired_share_count": expired_shares,
+            "uncovered_share_count": uncovered_shares,
+            "operator_supplied_count": len(operator["candidates"]),
+            "operator_expired_locators": list(operator["expired_locators"]),
+            "operator_inspected_share_count": operator["inspected_share_count"],
             "status": "complete" if source_exhausted else "incomplete",
         }
         return {

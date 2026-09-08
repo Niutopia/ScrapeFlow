@@ -1169,6 +1169,101 @@ class SimpleServerTests(unittest.TestCase):
         make_inspector.assert_called_once_with(self.remote, "/library")
         from_env.assert_called_once_with(inspector=inspector)
 
+    def test_queued_work_parks_behind_winding_down_worker(self) -> None:
+        """A resume landing in the wind-down window must park, not vanish.
+
+        2026-09-08 双实锤:worker 在收尾时 resume 被静默丢弃,只能二次恢复
+        (补踢)救回。现在第二个请求入挂起位,槽位释放后自动派工,最新胜出。
+        """
+        root_id = self.create_root()
+        self.application._control_state.set(paused=False, root_job_id=root_id)  # noqa: SLF001
+        entered = threading.Event()
+        release = threading.Event()
+        ran: list[str] = []
+
+        def first_worker(_root_job_id: str) -> None:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3))
+
+        def second_worker(root_job_id: str) -> None:
+            ran.append("second:" + root_job_id)
+
+        def third_worker(root_job_id: str) -> None:
+            ran.append("third:" + root_job_id)
+
+        self.assertEqual(
+            "queued",
+            self.application._queue_selected_work(root_id, first_worker),  # noqa: SLF001
+        )
+        first_future = self.application._worker_future  # noqa: SLF001
+        self.assertIsNotNone(first_future)
+        self.assertTrue(entered.wait(timeout=3))
+
+        # 第二个请求撞上收尾窗口:排队而非丢弃。
+        self.assertEqual(
+            "queued-behind-worker",
+            self.application._queue_selected_work(root_id, second_worker),  # noqa: SLF001
+        )
+        parked = self.application._pending_worker_request  # noqa: SLF001
+        self.assertIsNotNone(parked)
+        self.assertEqual(parked[0], root_id)
+
+        # 最新请求胜出:替换挂起位。
+        self.assertEqual(
+            "queued-behind-worker",
+            self.application._queue_selected_work(root_id, third_worker),  # noqa: SLF001
+        )
+        self.assertEqual(
+            self.application._pending_worker_request[1], third_worker,  # noqa: SLF001
+        )
+
+        release.set()
+        assert first_future is not None
+        first_future.result(timeout=3)
+        # 无人二次恢复,挂起请求自动派工。
+        deadline = time.monotonic() + 3
+        while not ran and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(ran, [f"third:{root_id}"])
+        self.assertIsNone(self.application._pending_worker_request)  # noqa: SLF001
+        self.assertIsNone(self.application._worker_future)  # noqa: SLF001
+
+    def test_parked_request_dies_when_paused_before_slot_release(self) -> None:
+        """挂起位在派工时刻用当前控制状态重新校验:排队后暂停即作废。"""
+        root_id = self.create_root()
+        self.application._control_state.set(paused=False, root_job_id=root_id)  # noqa: SLF001
+        entered = threading.Event()
+        release = threading.Event()
+        ran: list[str] = []
+
+        def first_worker(_root_job_id: str) -> None:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3))
+
+        def second_worker(root_job_id: str) -> None:
+            ran.append(root_job_id)
+
+        self.assertEqual(
+            "queued",
+            self.application._queue_selected_work(root_id, first_worker),  # noqa: SLF001
+        )
+        first_future = self.application._worker_future  # noqa: SLF001
+        self.assertTrue(entered.wait(timeout=3))
+        self.assertEqual(
+            "queued-behind-worker",
+            self.application._queue_selected_work(root_id, second_worker),  # noqa: SLF001
+        )
+        # 排队后操作员暂停:释放时挂起请求必须被丢弃。
+        self.application.set_paused(True, "test")
+        release.set()
+        assert first_future is not None
+        first_future.result(timeout=3)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(ran, [])
+        self.assertIsNone(self.application._pending_worker_request)  # noqa: SLF001
+
     def test_dashboard_uses_simple_health_and_controls(self) -> None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(self.base + "/", timeout=3) as response:

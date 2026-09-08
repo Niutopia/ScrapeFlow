@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
 import unittest
 import tempfile
 from pathlib import Path
@@ -1379,6 +1383,57 @@ class OperatorSuppliedPreferenceTests(unittest.TestCase):
         )
 
 
+class InterruptibleDownloadCommandTests(unittest.TestCase):
+    """_run_download_command:暂停即刻终止,超时保持 TimeoutExpired 契约。"""
+
+    def _sleep_command(self, seconds: float) -> list[str]:
+        return [
+            sys.executable, "-c",
+            f"import time; print('started', flush=True); time.sleep({seconds})",
+        ]
+
+    def test_pause_terminates_immediately_with_checkpoint_semantics(self) -> None:
+        from engine.tools.replenishment_acquire import _run_download_command
+        from engine.tools.replenishment_common import ReplenishmentPauseRequested
+
+        started = time.monotonic()
+        pause_calls = {"count": 0}
+
+        def pause_requested() -> bool:
+            pause_calls["count"] += 1
+            # 首次轮询未暂停,第二次起置位:模拟下载中途按下暂停。
+            return pause_calls["count"] > 1
+
+        with self.assertRaises(ReplenishmentPauseRequested):
+            _run_download_command(
+                self._sleep_command(60), 300,
+                pause_requested=pause_requested, env=dict(os.environ),
+            )
+        # 一分钟的长眠必须在一个数量级于秒的窗口内被打断。
+        self.assertLess(time.monotonic() - started, 15)
+
+    def test_deadline_raises_original_timeout_contract(self) -> None:
+        from engine.tools.replenishment_acquire import _run_download_command
+
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _run_download_command(
+                self._sleep_command(60), 1,
+                pause_requested=lambda: False, env=dict(os.environ),
+            )
+        self.assertLess(time.monotonic() - started, 15)
+
+    def test_normal_completion_captures_stdout(self) -> None:
+        from engine.tools.replenishment_acquire import _run_download_command
+
+        completed = _run_download_command(
+            [sys.executable, "-c", "print('done', flush=True)"], 30,
+            pause_requested=lambda: False, env=dict(os.environ),
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("done", completed.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1459,6 +1514,68 @@ class CatalogWriteSurfaceTests(unittest.TestCase):
             stored = result["stored"]["acquisition"]
             self.assertEqual(stored["file_index_by_gap"], {"S10E01": [3]})
             self.assertEqual(stored["file_size_by_index"], {"3": 11502449200})
+
+    def test_add_quark_share_candidate_splits_pwd_url(self) -> None:
+        from local.scrapeflow_api.replenishment import (
+            upsert_catalog_candidate,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            result = upsert_catalog_candidate(path, 34307, {
+                "provider": "quark_share",
+                "release_name": "无耻之徒 第十季 1080P",
+                "locator": "https://pan.quark.cn/s/Ab3xYz9qKm/?pwd=ab12",
+            })
+            stored = result["stored"]
+            self.assertEqual(stored["provider"], "quark_share")
+            self.assertEqual(stored["locator"], "https://pan.quark.cn/s/Ab3xYz9qKm")
+            self.assertEqual(stored["infohash"], "Ab3xYz9qKm")
+            self.assertEqual(stored["passcode"], "ab12")
+            # 同一分享重复投喂按分享 ID 幂等替换;省略提取码则不再携带。
+            again = upsert_catalog_candidate(path, 34307, {
+                "provider": "quark_share",
+                "release_name": "无耻之徒 第十季 1080P v2",
+                "locator": "https://pan.quark.cn/s/Ab3xYz9qKm",
+            })
+            self.assertEqual(again["project_candidates"], 1)
+            self.assertNotIn("passcode", again["stored"])
+
+    def test_quark_share_write_rejects_bad_shapes(self) -> None:
+        from local.scrapeflow_api.replenishment import (
+            CatalogWriteError,
+            upsert_catalog_candidate,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            for bad in (
+                # 缺 release_name
+                {"provider": "quark_share",
+                 "locator": "https://pan.quark.cn/s/Ab3xYz9qKm"},
+                # 分享 ID 过短
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "https://pan.quark.cn/s/short"},
+                # 非 https
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "http://pan.quark.cn/s/Ab3xYz9qKm"},
+                # 多余查询参数
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "https://pan.quark.cn/s/Ab3xYz9qKm?pwd=ab12&x=1"},
+                # 提取码字符集
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "https://pan.quark.cn/s/Ab3xYz9qKm",
+                 "passcode": "bad code!"},
+                # infohash 与分享 ID 不一致
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "https://pan.quark.cn/s/Ab3xYz9qKm",
+                 "infohash": "different"},
+                # magnet 专属字段不得混入 quark_share 行
+                {"provider": "quark_share", "release_name": "x",
+                 "locator": "https://pan.quark.cn/s/Ab3xYz9qKm",
+                 "resolution": "1080p"},
+            ):
+                with self.assertRaises(CatalogWriteError):
+                    upsert_catalog_candidate(path, 34307, bad)
+            self.assertFalse(path.exists(), "rejected writes persist nothing")
 
     def test_search_surfaces_operator_catalog_row_with_all_sources_disabled(self) -> None:
         """The written catalog must reach ``_search`` as an operator-supplied row.

@@ -2275,10 +2275,17 @@ _CATALOG_MAGNET_LOCATOR_RE = re.compile(
 )
 _CATALOG_CANDIDATE_KEYS = frozenset({
     "provider", "release_name", "locator", "infohash", "resolution",
-    "availability", "files", "file_coverage", "acquisition",
+    "availability", "files", "file_coverage", "acquisition", "passcode",
 })
 _CATALOG_MAX_LIST = 4096
 _CATALOG_MAX_STRING = 512
+# 与引擎侧 _quark_share/_SAFE_SHARE_PASSCODE 的接受面保持一致:仅裸分享
+# URL 或恰好一个 ?pwd= 提取码参数,其余查询串/fragment 一律拒绝。
+_CATALOG_QUARK_SHARE_URL = re.compile(
+    r"https://pan\.quark\.cn/s/(?P<pwd_id>[A-Za-z0-9_-]{6,128})"
+    r"/?(?:\?pwd=(?P<pwd>[A-Za-z0-9_-]{1,128}))?$"
+)
+_CATALOG_QUARK_SHARE_PASSCODE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 class CatalogWriteError(ValueError):
@@ -2294,16 +2301,78 @@ def _catalog_btih(locator: object) -> str | None:
     return match.group(1).lower()
 
 
+def _catalog_validated_quark_share(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one hand-pasted Quark share candidate.
+
+    The share ID doubles as the catalog's dedup key (the magnet lane's
+    ``infohash`` slot), so an operator can replace the coverage of a live
+    candidate by re-adding the same URL.  The manifest itself is read
+    read-only by the search adapter at selection time — never at write time.
+    """
+    unknown = set(candidate) - {
+        "provider", "release_name", "locator", "infohash", "passcode",
+    }
+    if unknown:
+        raise CatalogWriteError(
+            f"quark_share 直供候选含未知字段: {sorted(unknown)[:5]}",
+        )
+    release_name = candidate.get("release_name")
+    if (
+        not isinstance(release_name, str)
+        or not release_name.strip()
+        or len(release_name) > _CATALOG_MAX_STRING
+    ):
+        raise CatalogWriteError("release_name 必须是非空字符串(≤512 字符)")
+    locator = candidate.get("locator")
+    match = (
+        _CATALOG_QUARK_SHARE_URL.fullmatch(locator.strip())
+        if isinstance(locator, str) and locator.strip() else None
+    )
+    if match is None:
+        raise CatalogWriteError(
+            "locator 必须是 https://pan.quark.cn/s/<分享ID> 形式"
+            "(可带恰好一个 ?pwd= 提取码)",
+        )
+    pwd_id = match.group("pwd_id")
+    url_passcode = match.group("pwd") or ""
+    passcode = candidate.get("passcode")
+    if passcode is None or (
+        isinstance(passcode, str) and not passcode.strip()
+    ):
+        passcode = url_passcode
+    if not isinstance(passcode, str) or (
+        passcode and _CATALOG_QUARK_SHARE_PASSCODE.fullmatch(passcode) is None
+    ):
+        raise CatalogWriteError("passcode 只接受 [A-Za-z0-9_-] 字符或省略")
+    infohash = candidate.get("infohash")
+    if infohash is not None and (
+        not isinstance(infohash, str)
+        or infohash.strip().lower() != pwd_id.lower()
+    ):
+        raise CatalogWriteError("infohash 与分享 ID 不一致")
+    entry: dict[str, Any] = {
+        "provider": "quark_share",
+        "release_name": release_name.strip(),
+        "locator": f"https://pan.quark.cn/s/{pwd_id}",
+        "infohash": pwd_id,
+    }
+    if passcode:
+        entry["passcode"] = passcode
+    return entry
+
+
 def _catalog_validated_candidate(
     candidate: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate one operator-supplied candidate against the read-side shape.
 
-    The search adapter only ever consumes ``provider == "magnet"`` rows with
-    a torrent acquisition, so the write surface accepts exactly that lane.
-    Every field the selection funnel reads is shape-checked here — a typo
-    like ``relese_name`` fails loudly at write time instead of silently
-    never matching at selection time.
+    The magnet lane keeps its torrent-only surface; the quark_share lane
+    accepts hand-pasted share URLs that the search adapter inspects
+    read-only at selection time.  Every field the selection funnel reads is
+    shape-checked here — a typo like ``relese_name`` fails loudly at write
+    time instead of silently never matching at selection time.
     """
     if not isinstance(candidate, Mapping):
         raise CatalogWriteError("candidate 必须是 JSON 对象")
@@ -2311,8 +2380,11 @@ def _catalog_validated_candidate(
     if unknown:
         raise CatalogWriteError(f"candidate 含未知字段: {sorted(unknown)[:5]}")
     provider = candidate.get("provider")
-    if str(provider or "").strip().casefold() != "magnet":
-        raise CatalogWriteError("直供候选只接受 magnet 车道")
+    normalized_provider = str(provider or "").strip().casefold()
+    if normalized_provider == "quark_share":
+        return _catalog_validated_quark_share(candidate)
+    if normalized_provider != "magnet":
+        raise CatalogWriteError("直供候选只接受 magnet 或 quark_share 车道")
     release_name = candidate.get("release_name")
     if (
         not isinstance(release_name, str)
@@ -2455,7 +2527,9 @@ def upsert_catalog_candidate(
         row for row in rows
         if not (
             isinstance(row, dict)
-            and str(row.get("infohash") or "").lower() == entry["infohash"]
+            # 分享 ID 保留大小写(夸克分享 ID 大小写敏感),去重键必须
+            # 双侧归一;磁力 btih 本就小写,行为不变。
+            and str(row.get("infohash") or "").lower() == entry["infohash"].lower()
         )
     ]
     rows.append(entry)

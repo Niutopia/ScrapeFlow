@@ -138,6 +138,10 @@ class SimpleApplication:
         self._worker_executor: ThreadPoolExecutor | None = None
         self._worker_future: Future[object] | None = None
         self._worker_root_job_id: str | None = None
+        # 一个挂起派工位:resume 撞上 lone worker 收尾窗口时,请求在此排队,
+        # 槽位释放后自动派工——不再需要操作员二次恢复(补踢)。
+        # 最新请求胜出;派工时刻用当前控制状态重新校验,暂停即作废。
+        self._pending_worker_request: tuple[str, Callable[[str], None]] | None = None
         self._closed = threading.Event()
         self._intake_status: dict[str, object] = {
             "last_scan_at": None,
@@ -298,12 +302,16 @@ class SimpleApplication:
                 and not active.done()
             )
         if busy and self._worker_root_job_id != selected:
+            # worker 在收尾上一根;新根的派工请求入挂起位,槽位释放后
+            # 自动接续,操作员无需二次恢复。
+            self._resume_after_control_open()
             payload = {
                 **payload,
                 "dispatched": False,
+                "queued_behind_worker": True,
                 "reason": (
                     f"worker 仍在收尾上一任务 {self._worker_root_job_id}；"
-                    "当前任务已选中未暂停，将在其结束后由下一次恢复派工"
+                    "当前任务已排队，worker 释放后自动派工"
                 ),
             }
             return payload
@@ -1220,18 +1228,36 @@ class SimpleApplication:
             return self._worker_executor
 
     def _clear_worker_slot(self, future: Future[object]) -> None:
-        """Release the one local worker slot after its task has stopped."""
-        finished_root: str | None = None
+        """Release the one local worker slot after its task has stopped.
+
+        A parked resume fires here: the slot is free, and the request was
+        explicitly authorized by an operator resume that landed while the
+        previous worker was still winding down.  The request is re-validated
+        against the *current* control state, so a pause that arrived after
+        the park simply drops it.  A finished RootJob still never advances
+        to another one on its own: without a parked request this callback
+        performs no queue advance of its own.
+        """
+        pending: tuple[str, Callable[[str], None]] | None = None
         with self._automatic_lock:
             if self._worker_future is future:
-                finished_root = self._worker_root_job_id
                 self._worker_future = None
                 self._worker_root_job_id = None
-        # The worker slot is released above.  A finished RootJob never starts
-        # another one: the next source is authorized explicitly through the S
-        # step (``/api/control/select``), so this callback performs no queue
-        # advance of its own.
-        del finished_root
+            if self._worker_future is None and self._pending_worker_request is not None:
+                pending = self._pending_worker_request
+                self._pending_worker_request = None
+        if pending is None:
+            return
+        root_job_id, worker = pending
+        if self._closed.is_set() or not self._automatic_root_allowed(root_job_id):
+            return
+        status = self._queue_selected_work(root_job_id, worker)
+        if status != "queued":
+            # Another dispatch won the race for the slot; park the request
+            # again so that winner's own completion callback picks it up.
+            with self._automatic_lock:
+                if self._pending_worker_request is None:
+                    self._pending_worker_request = (root_job_id, worker)
 
     def _queue_selected_work(
         self,
@@ -1250,7 +1276,12 @@ class SimpleApplication:
             # item.  Submitting over that narrow window would overwrite the
             # Future reference and allow two completion paths to race.
             if active is not None:
-                return "already-running"
+                # Park instead of dropping: this used to be a silent no-op
+                # that only a second manual resume could recover from.  The
+                # parked request auto-dispatches from _clear_worker_slot and
+                # is dropped there if the control state has moved on.
+                self._pending_worker_request = (root_job_id, worker)
+                return "queued-behind-worker"
             future = self._worker_pool().submit(worker, root_job_id)
             self._worker_future = future
             self._worker_root_job_id = root_job_id
@@ -1623,7 +1654,11 @@ class SimpleApplication:
         if aggregate_root_job(self.state_root, job_id).open_gaps <= 0:
             raise EngineRequestError("根任务当前没有待闭环缺口")
         status = self._queue_root_replenishment(job_id)
-        return {"queued": status == "queued", "status": status, "root_task_id": job_id}
+        return {
+            "queued": status in {"queued", "queued-behind-worker"},
+            "status": status,
+            "root_task_id": job_id,
+        }
 
     def _validate_automatic_source(self, source: str) -> str:
         normalized = source.strip().rstrip("/")

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from engine.scrapeflow.quark_fast_save_bridge import QuarkShareExpiredError
 from engine.tools.replenishment_adapter.pansou import (
     PanSouDiscovery,
     quark_share_inspector,
@@ -525,6 +530,186 @@ class PanSouDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["completed_sources"], [])
         self.assertEqual(result["failure_scope"], "infrastructure")
         self.assertGreater(result["unchecked_secondary_candidates"], 0)
+
+
+class OperatorCatalogShareTests(unittest.TestCase):
+    """Operator-supplied catalog shares run before every PanSou gate."""
+
+    SHARE_URL = "https://pan.quark.cn/s/operShr01"
+    PASSCODE = "abcd12"
+
+    def _write_catalog(self, directory: str, rows: list[dict[str, object]]) -> Path:
+        path = Path(directory) / "catalog.json"
+        path.write_text(
+            json.dumps({"projects": {"123": {"candidates": rows}}}),
+            encoding="utf-8",
+        )
+        return path
+
+    def _operator_row(self, **overrides) -> dict[str, object]:
+        base = {
+            "provider": "quark_share",
+            "release_name": "Example Show S01E01 1080p",
+            "locator": self.SHARE_URL,
+            "passcode": self.PASSCODE,
+        }
+        base.update(overrides)
+        return base
+
+    def _discovery(self, *, enabled, inspector, transport=None) -> PanSouDiscovery:
+        return PanSouDiscovery(
+            enabled=enabled,
+            url="http://pansou:8888" if enabled else "",
+            token="fixture-token",
+            inspector=inspector,
+            transport=transport or (lambda *_args, **_kwargs: {
+                "code": 0, "message": "success", "data": {
+                    "total": 0, "results": [], "merged_by_type": {"quark": []},
+                },
+            }),
+            timeout=10,
+        )
+
+    def test_operator_share_runs_with_index_disabled(self) -> None:
+        inspected: list[tuple[str, str]] = []
+
+        def inspector(pwd_id: str, passcode: str):
+            inspected.append((pwd_id, passcode))
+            return [{
+                "file_id": "share-fid-1",
+                "path": "Example.Show.S01E01.1080p.mkv",
+                "size": 2_000_000,
+            }]
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._write_catalog(directory, [self._operator_row()])
+            with patch.dict(os.environ, {
+                "SCRAPEFLOW_REPLENISHMENT_CATALOG": str(catalog),
+            }):
+                result = self._discovery(
+                    enabled=False, inspector=inspector,
+                ).run(_request())
+        self.assertEqual(inspected, [("operShr01", self.PASSCODE)])
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertTrue(result["candidates"][0]["operator_supplied"])
+        self.assertFalse(result["search_complete"])
+        telemetry = result["source_telemetry"]["PanSou"]
+        self.assertEqual(telemetry["operator_supplied_count"], 1)
+        self.assertTrue(
+            any("expired" not in w and "disabled" in w for w in result["warnings"]),
+        )
+
+    def test_operator_expired_share_surfaces_warning(self) -> None:
+        def inspector(_pwd_id: str, _passcode: str):
+            raise QuarkShareExpiredError("share cancelled")
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._write_catalog(directory, [self._operator_row()])
+            with patch.dict(os.environ, {
+                "SCRAPEFLOW_REPLENISHMENT_CATALOG": str(catalog),
+            }):
+                result = self._discovery(
+                    enabled=False, inspector=inspector,
+                ).run(_request())
+        self.assertEqual(result["candidates"], [])
+        self.assertTrue(
+            any("operator-supplied share expired: operShr01" in w
+                for w in result["warnings"]),
+        )
+        telemetry = result["source_telemetry"]["PanSou"]
+        self.assertEqual(telemetry["operator_expired_locators"], [
+            "quark_share:operShr01",
+        ])
+
+    def test_operator_locator_excluded_is_not_inspected(self) -> None:
+        def inspector(_pwd_id: str, _passcode: str):
+            raise AssertionError("excluded operator share must not be inspected")
+
+        request = _request()
+        request["excluded_candidates"] = [
+            {"locator": "quark_share:operShr01"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._write_catalog(directory, [self._operator_row()])
+            with patch.dict(os.environ, {
+                "SCRAPEFLOW_REPLENISHMENT_CATALOG": str(catalog),
+            }):
+                result = self._discovery(
+                    enabled=False, inspector=inspector,
+                ).run(request)
+        self.assertEqual(result["candidates"], [])
+
+    def test_operator_share_merges_ahead_of_index_rows(self) -> None:
+        def inspector(pwd_id: str, passcode: str):
+            if pwd_id == "indexShr01":
+                assert passcode == ""
+            return [{
+                "file_id": f"fid-{pwd_id}",
+                "path": "Example.Show.S01E01.1080p.mkv",
+                "size": 2_000_000,
+            }]
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._write_catalog(directory, [self._operator_row()])
+            with patch.dict(os.environ, {
+                "SCRAPEFLOW_REPLENISHMENT_CATALOG": str(catalog),
+            }):
+                result = self._discovery(
+                    enabled=True,
+                    inspector=inspector,
+                    transport=lambda *_args, **_kwargs: _response(
+                        "https://pan.quark.cn/s/indexShr01",
+                    ),
+                ).run(_request())
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertTrue(result["candidates"][0]["operator_supplied"])
+        self.assertNotIn(
+            "operator_supplied",
+            result["candidates"][1],
+        )
+
+    def test_dead_link_summary_warning_makes_misses_readable(self) -> None:
+        def inspector(_pwd_id: str, _passcode: str):
+            raise QuarkShareExpiredError("share cancelled")
+
+        result = self._discovery(
+            enabled=True, inspector=inspector,
+            transport=lambda *_args, **_kwargs: _response(
+                "https://pan.quark.cn/s/indexShr01",
+            ),
+        ).run(_request())
+        self.assertTrue(
+            any("本窗检查 1 个分享:1 死链,0 清单不覆盖,0 可用" in w
+                for w in result["warnings"]),
+        )
+        telemetry = result["source_telemetry"]["PanSou"]
+        self.assertEqual(telemetry["expired_share_count"], 1)
+        self.assertEqual(telemetry["uncovered_share_count"], 0)
+
+    def test_refresh_env_flag_flows_into_query_payload(self) -> None:
+        payloads: list[dict[str, object]] = []
+
+        def transport(_endpoint, payload, _token, _timeout):
+            payloads.append(dict(payload))
+            return {
+                "code": 0, "message": "success", "data": {
+                    "total": 0, "results": [], "merged_by_type": {"quark": []},
+                },
+            }
+
+        with patch.dict(os.environ, {
+            "SCRAPEFLOW_PANSOU_ENABLED": "1",
+            "SCRAPEFLOW_PANSOU_URL": "http://pansou:8888",
+            "SCRAPEFLOW_PANSOU_REFRESH": "1",
+        }):
+            discovery = PanSouDiscovery.from_env(
+                inspector=lambda _pwd_id, _passcode: [],
+                transport=transport,
+            )
+            result = discovery.run(_request())
+        self.assertTrue(payloads)
+        self.assertTrue(all(p["refresh"] is True for p in payloads))
+        self.assertTrue(result["search_complete"])
 
 
 if __name__ == "__main__":

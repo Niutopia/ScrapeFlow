@@ -19,6 +19,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -706,6 +707,71 @@ def _ensure_automatic_staging_root(
     ):
         _pause_checkpoint(pause_requested)
         client.mkdir(directory)
+def _run_download_command(
+    command: list[str], timeout: float, *,
+    pause_requested: Callable[[], bool],
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one aria2c download with pause- and deadline-aware waiting.
+
+    ``subprocess.run`` blocks until aria2c exits on its own — up to the full
+    torrent budget — so a pause that lands inside that window could only
+    take effect after the whole window (2026-09-08: the wind-down crawl
+    held the worker slot for an hour despite a pause).  Poll instead: a
+    pause request terminates aria2c immediately; SIGTERM lets it save the
+    ``.aria2`` checkpoint so the next attempt resumes byte-exactly, and the
+    standard pause checkpoint then aborts the round.  The deadline keeps the
+    original ``TimeoutExpired`` contract for its caller.
+    """
+    process = subprocess.Popen(
+        command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env,
+    )
+    output: list[str] = []
+
+    def _drain() -> None:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            output.append(line)
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    deadline_ts = time.monotonic() + timeout
+    while True:
+        try:
+            process.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if pause_requested():
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            reader.join(timeout=5)
+            # 暂停走标准断点语义:控制文件已由 SIGTERM 保全,下一次尝试
+            # 字节精确续传。若此刻 pause 又被撤回,断点部分进度交给下方
+            # returncode 分支按"已有部分进度"的窗口语义处理。
+            _pause_checkpoint(pause_requested)
+            raise ReplenishmentPauseRequested("下载中被暂停,aria2c 断点已保存")
+        if time.monotonic() >= deadline_ts:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            reader.join(timeout=5)
+            raise subprocess.TimeoutExpired(command, timeout)
+    reader.join(timeout=5)
+    return subprocess.CompletedProcess(
+        command, process.returncode, stdout="".join(output),
+    )
+
+
 def _acquire(
     selection_wrapper: Mapping[str, Any],
     workspace: Path,
@@ -1062,12 +1128,21 @@ def _acquire(
                 )
                 try:
                     _pause_checkpoint(pause_requested)
-                    completed = subprocess.run(
-                        command, text=True, stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        timeout=budget,
-                        env=_direct_download_env(os.environ),
-                    )
+                    if pause_requested is None:
+                        completed = subprocess.run(
+                            command, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            timeout=budget,
+                            env=_direct_download_env(os.environ),
+                        )
+                    else:
+                        # 带 pause 回调的生产路径走可中断执行:暂停即刻
+                        # SIGTERM aria2c(断点保全),不再等满整个预算窗。
+                        completed = _run_download_command(
+                            command, budget,
+                            pause_requested=pause_requested,
+                            env=_direct_download_env(os.environ),
+                        )
                 except subprocess.TimeoutExpired as exc:
                     if _payload_bytes(group_payload) > 0:
                         # Bytes already flowed in this attempt: the swarm is
@@ -1134,26 +1209,49 @@ def _acquire(
                     f"[replenishment] 上传成员 {plan['remote_name']}",
                     flush=True,
                 )
-                # From the first upload attempt on, an ambiguous failure must
-                # be reconciled rather than retried from scratch: a partial
-                # remote commit can no longer be distinguished from a miss.
-                payload_verified = True
-                if pause_requested is None:
-                    _automatic_upload(client, delivery_root, row)
-                else:
-                    _automatic_upload(
-                        client, delivery_root, row,
-                        pause_requested=pause_requested,
-                    )
-                # The remote copy must be visible before the local bytes are
-                # dropped, or an interrupted run could lose both at once.
-                if pause_requested is None:
-                    _verify_remote_uploads(client, delivery_root, [row])
-                else:
-                    _verify_remote_uploads(
-                        client, delivery_root, [row],
-                        pause_requested=pause_requested,
-                    )
+                # 2026-09-08 教训:11GB 单集上传流式约 35 分钟 + 响应等待
+                # 最长约 50 分钟,全程零日志,监控只能靠字节探测猜死活。
+                # 每 5 分钟一行时间心跳,证明成员仍在处理中。
+                heartbeat_stop = threading.Event()
+
+                def _heartbeat(member_name: str) -> None:
+                    elapsed = 0
+                    while not heartbeat_stop.wait(300):
+                        elapsed += 300
+                        print(
+                            f"[replenishment] 上传进行中 {member_name}"
+                            f" 已 {elapsed // 60} 分钟",
+                            flush=True,
+                        )
+
+                heartbeat = threading.Thread(
+                    target=_heartbeat, args=(plan["remote_name"],),
+                    daemon=True,
+                )
+                heartbeat.start()
+                try:
+                    # From the first upload attempt on, an ambiguous failure must
+                    # be reconciled rather than retried from scratch: a partial
+                    # remote commit can no longer be distinguished from a miss.
+                    payload_verified = True
+                    if pause_requested is None:
+                        _automatic_upload(client, delivery_root, row)
+                    else:
+                        _automatic_upload(
+                            client, delivery_root, row,
+                            pause_requested=pause_requested,
+                        )
+                    # The remote copy must be visible before the local bytes are
+                    # dropped, or an interrupted run could lose both at once.
+                    if pause_requested is None:
+                        _verify_remote_uploads(client, delivery_root, [row])
+                    else:
+                        _verify_remote_uploads(
+                            client, delivery_root, [row],
+                            pause_requested=pause_requested,
+                        )
+                finally:
+                    heartbeat_stop.set()
                 uploaded.append(row)
             # The whole group's bytes are proven remotely; free them locally.
             shutil.rmtree(group_dir, ignore_errors=True)
