@@ -62,6 +62,12 @@ _IMPLEMENTATION_NAMES = (
     "_unique_backup_subtitle_release_owners",
     "_tmdb_long_season_block_counts",
 )
+# Class names used only in annotations.  They are bound as direct value
+# references (the movie planner's pattern), never as call dispatchers.
+_VALUE_NAMES = (
+    "AListClient",
+    "TMDBClient",
+)
 
 
 def _make_runtime_dispatch(name: str):
@@ -1424,6 +1430,9 @@ def bind_compat_runtime(runtime: ModuleType) -> None:
     _RUNTIME = runtime
     VIDEO_EXTS = runtime.VIDEO_EXTS
     SUBTITLE_EXTS = runtime.SUBTITLE_EXTS
+    for name in _VALUE_NAMES:
+        if hasattr(runtime, name):
+            globals()[name] = getattr(runtime, name)
     for name in _IMPLEMENTATION_NAMES:
         implementation = globals()[name]
         if getattr(implementation, "__tv_runtime_dispatch__", False):
